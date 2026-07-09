@@ -1,3 +1,8 @@
+//! kloop-protocol — the zero-dependency leaf every other crate stands on:
+//! canonical wire types (Anthropic Messages shape), streaming events, usage
+//! accounting, and shared error markers. Nothing here knows about networks,
+//! filesystems, or the agent loop.
+
 use serde::Deserialize;
 use serde::Serialize;
 

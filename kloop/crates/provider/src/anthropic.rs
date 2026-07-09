@@ -11,10 +11,10 @@ use tokio::sync::mpsc;
 
 use super::is_overflow_message;
 use super::sse::SseParser;
-use crate::types::ContentBlock;
-use crate::types::OverflowError;
-use crate::types::StreamEvent;
-use crate::types::Usage;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::OverflowError;
+use kloop_protocol::StreamEvent;
+use kloop_protocol::Usage;
 
 #[derive(Default)]
 struct BlockAcc {

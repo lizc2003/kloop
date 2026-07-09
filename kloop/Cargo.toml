@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/protocol", "crates/provider", "crates/core", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,8 @@ edition = "2021"
 
 [workspace.dependencies]
 kloop-core = { path = "crates/core" }
+kloop-protocol = { path = "crates/protocol" }
+kloop-provider = { path = "crates/provider" }
 
 anyhow = "1"
 futures = "0.3"

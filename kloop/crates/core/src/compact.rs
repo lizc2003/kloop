@@ -8,9 +8,9 @@ use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::estimate_message_tokens;
 use crate::history::History;
-use crate::types::ContentBlock;
-use crate::types::Message;
-use crate::types::StreamEvent;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::StreamEvent;
 
 /// Cap on how much of the output limit the growth estimate reserves.
 const OUTPUT_GROWTH_CAP: u64 = 20_000;

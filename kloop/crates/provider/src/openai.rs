@@ -11,12 +11,12 @@ use tokio::sync::mpsc;
 
 use super::is_overflow_message;
 use super::sse::SseParser;
-use crate::types::ContentBlock;
-use crate::types::Message;
-use crate::types::OverflowError;
-use crate::types::Role;
-use crate::types::StreamEvent;
-use crate::types::Usage;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::OverflowError;
+use kloop_protocol::Role;
+use kloop_protocol::StreamEvent;
+use kloop_protocol::Usage;
 
 /// Translate canonical (Anthropic-shaped) history into chat/completions messages.
 pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {

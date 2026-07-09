@@ -1,14 +1,13 @@
 [package]
-name = "kloop"
+name = "kloop-provider"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-kloop-core = { workspace = true }
 kloop-protocol = { workspace = true }
-kloop-provider = { workspace = true }
 
 anyhow = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }

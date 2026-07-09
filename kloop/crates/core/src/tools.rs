@@ -17,9 +17,9 @@ use crate::agent::EndReason;
 use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::History;
-use crate::types::ContentBlock;
-use crate::types::Message;
-use crate::types::ToolDef;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::ToolDef;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_dispatch_patches_every_tool_use() {
-        use crate::provider::Provider;
+        use kloop_provider::Provider;
 
         struct NullUi;
         impl Ui for NullUi {

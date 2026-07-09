@@ -17,10 +17,10 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
-use kloop_core::provider::Provider;
-use kloop_core::types::ContentBlock;
-use kloop_core::types::Message;
 use kloop_core::Config;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_provider::Provider;
 
 fn config_from_env(mock: bool) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;

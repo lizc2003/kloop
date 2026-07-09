@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::provider::Provider;
+use kloop_provider::Provider;
 
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.

@@ -12,13 +12,13 @@ use crate::history::History;
 use crate::tools::dispatch_tools;
 use crate::tools::tool_defs;
 use crate::tools::ToolCtx;
-use crate::types::ContentBlock;
-use crate::types::Message;
-use crate::types::OverflowError;
-use crate::types::StreamEvent;
-use crate::types::ToolDef;
-use crate::types::Usage;
-use crate::types::MAX_OUTPUT_TOKENS;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::OverflowError;
+use kloop_protocol::StreamEvent;
+use kloop_protocol::ToolDef;
+use kloop_protocol::Usage;
+use kloop_protocol::MAX_OUTPUT_TOKENS;
 
 pub trait Ui: Send + Sync {
     fn text_delta(&self, s: &str);
@@ -341,8 +341,8 @@ async fn sample_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Provider;
-    use crate::types::Role;
+    use kloop_protocol::Role;
+    use kloop_provider::Provider;
     use serde_json::json;
 
     struct NullUi;
@@ -508,7 +508,7 @@ mod tests {
     /// (turn 3), with no user-visible error.
     #[tokio::test]
     async fn overflow_compacts_and_retries() {
-        use crate::provider::MockTurn;
+        use kloop_provider::MockTurn;
         let provider = Provider::mock_scripted(vec![
             MockTurn::Overflow,
             MockTurn::Blocks(vec![ContentBlock::Text {
@@ -543,7 +543,7 @@ mod tests {
     /// error instead of looping.
     #[tokio::test]
     async fn repeated_overflow_surfaces_error() {
-        use crate::provider::MockTurn;
+        use kloop_provider::MockTurn;
         let provider = Provider::mock_scripted(vec![
             MockTurn::Overflow,
             MockTurn::Blocks(vec![ContentBlock::Text {
@@ -578,7 +578,7 @@ mod tests {
     /// the turn mid-thought.
     #[tokio::test]
     async fn truncated_response_recovers_with_continuation() {
-        use crate::provider::MockTurn;
+        use kloop_provider::MockTurn;
         let provider = Provider::mock_scripted(vec![
             MockTurn::Truncated(text("part one, cut off mid-")),
             MockTurn::Blocks(text("part two, complete.")),
@@ -608,7 +608,7 @@ mod tests {
     /// whatever text arrived instead of looping.
     #[tokio::test]
     async fn truncation_recovery_is_bounded() {
-        use crate::provider::MockTurn;
+        use kloop_provider::MockTurn;
         let provider = Provider::mock_scripted(vec![
             MockTurn::Truncated(text("cut 1")),
             MockTurn::Truncated(text("cut 2")),
@@ -640,7 +640,7 @@ mod tests {
     /// the fallback model instead of surfacing an error.
     #[tokio::test]
     async fn fallback_model_takes_over_after_retries() {
-        use crate::provider::MockTurn;
+        use kloop_provider::MockTurn;
         struct NoteUi(std::sync::Mutex<Vec<String>>);
         impl Ui for NoteUi {
             fn text_delta(&self, _: &str) {}

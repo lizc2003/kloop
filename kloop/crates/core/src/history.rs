@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use crate::types::ContentBlock;
-use crate::types::Message;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
 
 /// Offload ids are process-global so a sub-agent's spills never clobber the
 /// parent's files in the shared offload directory.
@@ -101,7 +101,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Role;
+    use kloop_protocol::Role;
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("kloop-test-{}-{tag}", std::process::id()))

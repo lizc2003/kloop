@@ -13,12 +13,12 @@ use anyhow::Result;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::types::ContentBlock;
-use crate::types::Message;
-use crate::types::OverflowError;
-use crate::types::StreamEvent;
-use crate::types::ToolDef;
-use crate::types::MAX_OUTPUT_TOKENS;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::OverflowError;
+use kloop_protocol::StreamEvent;
+use kloop_protocol::ToolDef;
+use kloop_protocol::MAX_OUTPUT_TOKENS;
 
 /// One scripted Mock response: content blocks, a truncated response, or a
 /// provider error.

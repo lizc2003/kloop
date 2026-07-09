@@ -461,6 +461,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kloop-core",
+ "kloop-protocol",
+ "kloop-provider",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -472,11 +474,31 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
- "reqwest",
- "serde",
+ "kloop-protocol",
+ "kloop-provider",
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "kloop-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kloop-provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "kloop-protocol",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
