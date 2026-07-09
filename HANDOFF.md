@@ -32,19 +32,13 @@
 4. cc 的公式移植前先想小参数退化(predictive 负阈值教训)。
 5. 压缩/重写类操作失败时必须保证原数据原封不动,测试锁死这一点。
 
-## 四、Phase 2 待做(本会话的活)
+## 四、Phase 2 待做(按 plan 逐会话推进)
 
-范围(MVP 时明确推迟的):**TUI、MCP、hooks、权限系统、多轮会话持久化**;外加一个便宜收尾:**CI**(GitHub Actions:fmt --check / clippy -D warnings / test)。
+**工作方式:`docs/plan/` 一个编号文件 = 一个会话的任务。** 1–5 是已完成的历史记录(✅ 标注),6 起是待做;每个 plan 文件自带目标、设计要点、参考指针、测试与完成标准。新会话开场:读本文件 + 对应 plan 文件,开工前把 plan 里标注"开工时定/问用户"的点先问清。
 
-建议顺序与参考指针(顺序未与用户确认,开工前问一句):
-1. **CI** —— 半小时的活,先落。
-2. **会话持久化**(rollout/resume)—— 参考 codex `codex-rs/rollout`;kloop 已有 append-only 历史,落盘格式建议 JSONL 逐 Message;注意 usage 锚点与 offload 指针的恢复语义。
-3. **权限系统** —— 参考 cc 的 canUseTool / codex 的 approvals;kloop 现状是 bash 裸跑,最小形态:工具执行前回调 `Ui::confirm`(或新 trait),配 allowlist;与并发安全分类(tools.rs 的 bash_is_readonly)天然衔接。
-4. **TUI** —— 新 crate `crates/tui`(ratatui),复用 Ui trait 的缝;cli 保留纯 REPL 模式。
-5. **MCP** —— 新 crate,`server__tool` 命名(两参考库收敛解);deferred 工具 + tool_search 是配套项。
-6. **hooks** —— 参考 codex hooks crate;kloop 最小形态:turn 前后 + 工具前后四个挂点。
+当前进度:下一个是 **`docs/plan/6-ci.md`**,其后 7-会话持久化、8-权限、9-TUI、10-MCP、11-hooks(顺序可与用户重新商定)。
 
-每做完一项:cargo fmt + test 全绿 + 一次 commit(信息里写清楚验证方式);行为变更同步改 README。
+每完成一个 plan:cargo fmt + clippy + test 全绿 + commit(信息写清验证方式);行为变更同步改 README;把该 plan 文件补上"✅ 已完成 + 结果摘要 + 提交号",作为历史留档;新发现的教训写进本文件第三节。
 
 ## 五、代码风格约定(沿用)
 
