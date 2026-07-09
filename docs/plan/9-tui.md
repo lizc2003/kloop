@@ -1,4 +1,4 @@
-# Plan 9 — TUI ✅(24842ac;真 key 手工验收挂账)
+# Plan 9 — TUI ✅(24842ac;真 key 验收已过,双轨)
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex `codex-rs/tui`(ratatui)的整体形态,但只做最小可用。
 
@@ -40,12 +40,14 @@ fmt/clippy/test 全绿;真 key 手工验收:流式输出、工具状态、Ctrl+C
 - 单测按计划守两条线:Ui→channel 事件序列契约;cell→行纯函数渲染。另覆盖 App 状态折叠、confirm 排队与键盘捕获、中断/退出命令。
 - 无 key 自动化冒烟(`script` PTY + 假 Anthropic SSE 服务):进出 alt screen 干净、状态行渲染、流式 delta 分帧渲染、工具行 ✓、turn 收尾回 idle、**运行中 Ctrl+C → [interrupted] 回 idle**、Ctrl+D 干净退出(exit 0)。
 
-**挂账 — 真 key 手工验收清单**(需要真终端 + 真 key,自动化无法替代):
+**真 key 验收(已过,2026-07-09)**:方法 = Python PTY 驱动真实 binary(openpty + TIOCSWINSZ resize + SIGWINCH),对 ANSI 输出做 mini VT100 屏幕重建(宽字符占两列),按"屏幕内容"断言——ratatui 差分渲染会把字符串拆碎写入,字节流匹配不可用,这是本次验收学到的硬教训。claude 系(claude-sonnet-5,代理)全清单 + chat 系(gpt-5.4-mini)流式与工具行:
 
-- [ ] 流式输出连贯不闪烁
-- [ ] 工具状态行:运行中 … → ✓/✗
-- [ ] 权限弹层 y/a/p/n 各按一遍;p 落 config.toml 且 transcript 出现保存 note
-- [ ] Ctrl+C 中断运行中的 turn,历史合法可续
-- [ ] resize 不花屏,窄终端换行正常(中文宽度)
-- [ ] `--resume` 进 TUI 继续旧会话
-- [ ] `--plain` 行为与之前一致
+- [x] 流式输出:增量分帧渲染,双轨
+- [x] 工具状态行:运行中 … → ✓(成功)/ ✗(拒绝、中断)
+- [x] 权限弹层 y/a/p/n 各按一遍;p 落 config.toml(`bash(touch *)`)且 transcript 出现保存 note;n 拒绝后模型改道(DENIED-OK),文件确实未创建
+- [x] Ctrl+C 中断运行中的 turn(含弹层挂起时),[interrupted] 后下一 turn 正常
+- [x] resize 50/120 列全量重绘不花屏,行宽不超,中文宽字符换行正确;PageUp/PageDown 滚动正常
+- [x] `--resume` 进 TUI,上下文延续(模型准确复述旧会话内容)
+- [x] `--plain` 行为与之前一致,exit 0
+
+**已知 UX 缺口(验收发现,未修)**:`--resume` 后转录区空白——历史在、上下文有效,但旧消息不回显(plain REPL 同样不回显,TUI 里空屏更迷惑)。修法明确:从恢复的 History 预填 App cells(纯函数,可测),待用户拍板是否做。
