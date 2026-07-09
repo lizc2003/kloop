@@ -125,34 +125,41 @@ pub fn is_concurrency_safe(name: &str, input: &Value) -> bool {
 }
 
 fn bash_is_readonly(cmd: &str) -> bool {
+    let segments = bash_segments(cmd);
+    !segments.is_empty() && segments.iter().all(|seg| segment_is_readonly(seg))
+}
+
+/// Split a shell command on `;`, `&&` and `|` into trimmed segments. Shared
+/// with the permission gate: safe-to-parallelize and safe-to-run are two
+/// verdicts over the same decomposition.
+pub(crate) fn bash_segments(cmd: &str) -> Vec<String> {
+    cmd.replace("&&", ";")
+        .replace('|', ";")
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub(crate) fn segment_is_readonly(seg: &str) -> bool {
     const SAFE: &[&str] = &[
         "ls", "cat", "rg", "grep", "find", "head", "tail", "wc", "pwd", "which", "file", "stat",
         "tree", "du", "echo",
     ];
     const GIT_SAFE: &[&str] = &["status", "log", "diff", "show", "branch"];
-    let normalized = cmd.replace("&&", ";").replace('|', ";");
-    let segments: Vec<&str> = normalized
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
+    if seg.contains('>') {
         return false;
     }
-    segments.iter().all(|seg| {
-        if seg.contains('>') {
-            return false;
-        }
-        let mut tokens = seg.split_whitespace();
-        let Some(first) = tokens.next() else {
-            return false;
-        };
-        if first == "git" {
-            tokens.next().is_some_and(|sub| GIT_SAFE.contains(&sub))
-        } else {
-            SAFE.contains(&first)
-        }
-    })
+    let mut tokens = seg.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if first == "git" {
+        tokens.next().is_some_and(|sub| GIT_SAFE.contains(&sub))
+    } else {
+        SAFE.contains(&first)
+    }
 }
 
 /// Execute one round of tool calls. Consecutive concurrency-safe calls run as
@@ -207,9 +214,15 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
     let summary: String = input.to_string().chars().take(120).collect();
     ctx.ui.note(&format!("{name} {summary}"));
+    let gated = async {
+        if !ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
+            bail!("{name}: user denied permission for this call; take a different approach or ask the user how to proceed");
+        }
+        execute_tool(&name, &input, &ctx).await
+    };
     tokio::select! {
         _ = ctx.cancel.cancelled() => interrupted(&id),
-        r = execute_tool(&name, &input, &ctx) => match r {
+        r = gated => match r {
             Ok(content) => ContentBlock::ToolResult {
                 tool_use_id: id,
                 content,
@@ -427,6 +440,7 @@ mod tests {
                 offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
                 context_window: None,
                 fallback_model: None,
+                permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -706,6 +720,7 @@ mod tests {
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
                 context_window: None,
                 fallback_model: None,
+                permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             }),
             ui: Arc::new(NullUi),
             cancel,

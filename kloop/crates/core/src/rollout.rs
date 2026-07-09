@@ -564,6 +564,7 @@ mod tests {
                 offload_dir: dir.to_path_buf(),
                 context_window: None,
                 fallback_model: None,
+                permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             })
         };
         let path = temp_file("restart");

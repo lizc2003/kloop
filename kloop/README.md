@@ -86,9 +86,34 @@ Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
 <id>` a specific one, `--list-sessions` shows what's on disk.
 
+## Permissions (Phase 2, third slice)
+
+Every tool call passes a layered gate before executing
+(`crates/core/src/permissions.rs`) — rules first, asking last:
+
+1. **Read-only passes outright**: `read_file`, `read_offloaded`, `task`
+   (the sub-agent's own calls are gated individually), and bash commands
+   whose every segment is read-only — the same classification concurrency
+   batching uses.
+2. **Allowlist**: `AGENT_ALLOW` is a comma-separated rule list, e.g.
+   `AGENT_ALLOW='write_file,bash(cargo *)'`. A bare tool name pre-approves
+   the tool; `bash(<pattern>)` pre-approves command segments whose leading
+   tokens match (trailing `*` = any remainder, no `*` = exact). In a chained
+   command every segment must be read-only or allowlisted.
+3. **Ask**: everything else goes to the interactive prompt — `y` allow once,
+   `a` allow for the rest of the session (cached per tool name; per
+   command-segment head for bash, so an approved `cargo` never smuggles in a
+   later `cargo build && rm x`), `n` deny.
+
+A denial is not a turn abort: the model receives an `is_error` `tool_result`
+("user denied permission…") and can take another approach. Sub-agents share
+the parent's approval cache and prompt through the same seam, tagged
+`[sub-agent]`. `--yolo` disables the gate entirely (`--mock` implies it —
+nobody is at the keyboard).
+
 ## Deliberately out of scope (Phase 2 remainder)
 
-TUI, MCP, hooks, permission system.
+TUI, MCP, hooks.
 
 ## Running
 
@@ -108,6 +133,10 @@ OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 cargo run -- --list-sessions   # what's on disk, most recent first
 cargo run -- --resume          # continue the most recent session
 cargo run -- --resume <id>     # continue a specific session
+
+# permissions
+AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
+cargo run -- --yolo                                # no gating (development)
 ```
 
 REPL: type a task; Ctrl+C interrupts the running turn (history is patched and
@@ -116,7 +145,7 @@ see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 71 tests across the workspace:
+`cargo test` runs 82 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -131,7 +160,10 @@ see Session persistence above.
   rebuild/failure-leaves-history-untouched/boundary pairing, and agent-loop
   end-to-end over the Mock provider: tool batching, predictive + reactive
   compaction, truncation continuation, retry/fallback, max-rounds,
-  pre-cancelled abort, sub-agent round-trip; rollout round-trip, envelope
+  pre-cancelled abort, sub-agent round-trip, denied-tool-continues-turn;
+  permission layering (read-only pass, allowlist tool/prefix/exact matching,
+  session cache granularity, rule parsing, approver ask counts); rollout
+  round-trip, envelope
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full
@@ -170,12 +202,14 @@ crates/core/        kloop-core — the agent, network-free
                     usage-anchored token estimation
   src/tools.rs      bash, read/write/edit file, read_offloaded, task;
                     concurrency-safety classification + batched dispatch
+  src/permissions.rs rule-then-ask execution gate: allowlist, session
+                    approval cache, Approver seam
   src/compact.rs    predictive threshold math + compaction rewrite
   src/rollout.rs    session persistence: JSONL append, compacted markers,
                     replay + orphan repair on resume
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/cli/         kloop — the binary
-  src/main.rs       REPL, env config, StdoutUi, --mock demo,
-                    session selection (--resume, --list-sessions)
+  src/main.rs       REPL, env config, StdoutUi, CliApprover (y/a/n prompt),
+                    --mock demo, session selection (--resume, --list-sessions)
 ```

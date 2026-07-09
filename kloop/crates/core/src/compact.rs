@@ -162,6 +162,7 @@ mod tests {
             offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
             context_window: Some(200_000),
             fallback_model: None,
+            permissions: Arc::new(crate::permissions::Permissions::allow_all()),
         })
     }
 

@@ -379,6 +379,7 @@ mod tests {
             offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
             context_window: None,
             fallback_model: None,
+            permissions: Arc::new(crate::permissions::Permissions::allow_all()),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -455,6 +456,7 @@ mod tests {
             offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
             context_window: Some(window),
             fallback_model: None,
+            permissions: Arc::new(crate::permissions::Permissions::allow_all()),
         })
     }
 
@@ -765,6 +767,56 @@ mod tests {
         assert_eq!(outcome.reason, EndReason::Aborted);
         assert_eq!(outcome.rounds, 0);
         assert_eq!(history.messages().len(), 1, "nothing recorded after abort");
+    }
+
+    /// A denied tool call becomes an is_error tool_result the model can react
+    /// to — the turn continues instead of ending.
+    #[tokio::test]
+    async fn denied_tool_call_continues_the_turn() {
+        use crate::permissions::{Approver, Decision, Permissions};
+        use std::pin::Pin;
+
+        struct DenyAll;
+        impl Approver for DenyAll {
+            fn confirm(
+                &self,
+                _: String,
+            ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
+                Box::pin(async { Decision::Deny })
+            }
+        }
+
+        let provider = Provider::mock(vec![
+            vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "write_file".into(),
+                input: json!({"path": "should-not-exist", "content": "x"}),
+            }],
+            vec![ContentBlock::Text {
+                text: "understood, taking another approach".into(),
+            }],
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "denied")).clone();
+        cfg.permissions = Arc::new(Permissions::new("", Arc::new(DenyAll)).unwrap());
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("write a file"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "understood, taking another approach");
+        assert_eq!(outcome.rounds, 2);
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &history.messages()[2].content[0]
+        else {
+            panic!("expected a tool result for the denied call");
+        };
+        assert!(is_error);
+        assert!(content.contains("denied"), "got: {content}");
+        assert!(!std::path::Path::new("should-not-exist").exists());
     }
 
     /// The task tool spawns a sub-agent that consumes its own turns from the

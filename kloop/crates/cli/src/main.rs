@@ -21,6 +21,9 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
+use kloop_core::permissions::Approver;
+use kloop_core::permissions::Decision;
+use kloop_core::permissions::Permissions;
 use kloop_core::rollout::load_session;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::Rollout;
@@ -40,6 +43,7 @@ enum SessionChoice {
 #[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
     mock: bool,
+    yolo: bool,
     list_sessions: bool,
     session: SessionChoice,
 }
@@ -47,6 +51,7 @@ struct CliArgs {
 fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
+        yolo: false,
         list_sessions: false,
         session: SessionChoice::New,
     };
@@ -54,6 +59,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
     while i < args.len() {
         match args[i].as_str() {
             "--mock" => parsed.mock = true,
+            "--yolo" => parsed.yolo = true,
             "--list-sessions" => parsed.list_sessions = true,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
@@ -64,7 +70,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                     _ => SessionChoice::ResumeLatest,
                 };
             }
-            other => bail!("unknown argument '{other}' (--mock | --resume [id] | --list-sessions)"),
+            other => bail!(
+                "unknown argument '{other}' (--mock | --yolo | --resume [id] | --list-sessions)"
+            ),
         }
         i += 1;
     }
@@ -214,8 +222,16 @@ fn open_history(
     Ok((history, id))
 }
 
-fn config_from_env(mock: bool) -> Result<Config> {
+fn config_from_env(mock: bool, yolo: bool) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    // --mock runs a canned turn with nobody at the keyboard, so it implies
+    // --yolo; otherwise gate on AGENT_ALLOW rules + interactive approval.
+    let permissions = if mock || yolo {
+        Arc::new(Permissions::allow_all())
+    } else {
+        let allow = std::env::var("AGENT_ALLOW").unwrap_or_default();
+        Arc::new(Permissions::new(&allow, Arc::new(CliApprover)).context("invalid AGENT_ALLOW")?)
+    };
     let system = format!(
         "You are a coding agent working in a CLI. Use the provided tools to inspect and \
              modify files and run commands; keep answers short. Current working directory: {}",
@@ -239,6 +255,7 @@ fn config_from_env(mock: bool) -> Result<Config> {
         offload_dir,
         context_window,
         fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
+        permissions,
     };
     if mock {
         return Ok(Config {
@@ -290,6 +307,38 @@ fn config_from_env(mock: bool) -> Result<Config> {
                 )
             }
         }
+    }
+}
+
+/// Interactive y/a/n prompt on the terminal. The REPL's own stdin reader is
+/// idle while a turn runs, so a direct blocking read is safe; if the turn is
+/// Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
+/// subsequent input line — accepted edge for a line-based REPL.
+struct CliApprover;
+
+impl Approver for CliApprover {
+    fn confirm(
+        &self,
+        description: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
+        Box::pin(async move {
+            print!("\n[approve?] {description}\n  y = allow once / a = allow for this session / n = deny > ");
+            let _ = std::io::stdout().flush();
+            let line = tokio::task::spawn_blocking(|| {
+                let mut buf = String::new();
+                std::io::stdin().read_line(&mut buf).map(|_| buf)
+            })
+            .await;
+            match line {
+                Ok(Ok(answer)) => match answer.trim().to_lowercase().as_str() {
+                    "y" | "yes" => Decision::Allow,
+                    "a" | "always" => Decision::AllowSession,
+                    _ => Decision::Deny,
+                },
+                // Reader died or stdin closed: the safe answer is no.
+                _ => Decision::Deny,
+            }
+        })
     }
 }
 
@@ -352,7 +401,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cfg = Arc::new(config_from_env(args.mock)?);
+    let cfg = Arc::new(config_from_env(args.mock, args.yolo)?);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
     let (mut history, session_id) = open_history(&cfg, &args.session, &sessions_dir)?;
 
@@ -425,6 +474,7 @@ mod tests {
             parse_args(&[]).unwrap(),
             CliArgs {
                 mock: false,
+                yolo: false,
                 list_sessions: false,
                 session: SessionChoice::New,
             }
@@ -433,6 +483,7 @@ mod tests {
             parse_args(&strings(&["--mock", "--resume"])).unwrap(),
             CliArgs {
                 mock: true,
+                yolo: false,
                 list_sessions: false,
                 session: SessionChoice::ResumeLatest,
             }
@@ -441,14 +492,16 @@ mod tests {
             parse_args(&strings(&["--resume", "20260709-120000"])).unwrap(),
             CliArgs {
                 mock: false,
+                yolo: false,
                 list_sessions: false,
                 session: SessionChoice::Resume("20260709-120000".into()),
             }
         );
         assert_eq!(
-            parse_args(&strings(&["--list-sessions"])).unwrap(),
+            parse_args(&strings(&["--list-sessions", "--yolo"])).unwrap(),
             CliArgs {
                 mock: false,
+                yolo: true,
                 list_sessions: true,
                 session: SessionChoice::New,
             }
