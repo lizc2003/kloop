@@ -42,6 +42,7 @@
 - OpenAI-compat(用户代理 + gpt-5.4-mini):工具调用、多轮续跑、offload 落盘→模型主动 read_offloaded 回读、task 子 agent 全部跑通。
 - Anthropic 原生 SSE(taijiaicloud 代理,Bedrock 后端 claude-sonnet-5):流式 text_delta、input_json_delta 累积、多轮工具、offload 闭环全部跑通。注意 `ANTHROPIC_BASE_URL` 不含 `/v1`(适配器自己拼 `/v1/messages`)。
 另:子 agent 的文本已不再流式输出到主 UI(depth>0 静音,产出走 tool result 返回)。
+- **编辑工具数据点(P0 相关)**:同一个"修 buggy.py 并验证"任务,gpt-5.4-mini 和 claude-sonnet-5 都是首试即过——先 read_file,再精准 old_string/new_string 的 edit_file(唯一匹配、无重写全文),bash 验证输出。连 mini 档的 GPT 都能用好 Edit 形态,apply_patch 不构成选型约束。
 
 原计划(已按此完成,留作参照):
 - `Cargo.toml` — 依赖:anyhow, futures, reqwest(json/stream/rustls-tls), serde, serde_json, tokio(full 等价特性集), tokio-util
