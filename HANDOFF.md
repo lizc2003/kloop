@@ -21,7 +21,7 @@
 2. **claude-code**(TS,~/work/claude-code,逆向重实现版):赢在生存层——七层上下文防线(含 predictive/reactive 压缩)、丰富恢复语义(输出截断升级重试、fallback 模型、孤儿 tool_result 修补、Terminal 原因枚举)、专用工具(Read/Edit/Grep/Glob)+ `isConcurrencySafe(input)` 按入参动态并发(只读批并发上限 10)、子 agent 递归复用同一 query() 循环。
 3. **claw-code**(github.com/ultraworkers/claw-code,agent 自治维护的 Rust 克隆,已精读 11.6 万行):**不可作底座**。约 60% 真实/25% 孤儿/15% 表演;压缩是假的(不调模型,关键词模板套 Claude Code `<summary>` 戏服,触发数学错误)、工具严格串行、Worker/Cron 是内存模拟。仅三样值得抄:mock-anthropic-service + JSON 输出契约测试纪律;`openai_compat.rs` 的 tool_calls 流式翻译状态机(对多模型适配有直接参考价值);压缩边界回退避免切开 tool_use/tool_result 对。
 4. 两边独立收敛的"必然解"(直接照抄不必发明):tool_use 有无判续跑(别信 stop_reason)、deferred 工具+tool_search、超长输出落盘+回读工具、MCP `server__tool` 命名。
-5. 总战略建议(用户尚未最终拍板):优先在 codex fork 上吸收 cc 之长(P1 predictive/reactive 压缩 → P2 恢复语义 → P3 工具形态),MVP 是并行的验证实验。**P0 悬而未决的问题:目标模型是谁**——决定编辑工具选型(apply_patch vs Edit)和上游可合并性还值不值。
+5. 总战略建议:优先在 codex fork 上吸收 cc 之长(P1 predictive/reactive 压缩 → P2 恢复语义 → P3 工具形态),MVP 是并行的验证实验。**P0 已拍板(2026-07-09,用户确认)**:① 编辑工具选 Edit(old_string/new_string)形态,不迁就 apply_patch(实测连 gpt-5.4-mini 都首试即过;将来按模型切换靠 model_info 画像机制);② 目标模型双轨,Claude(sonnet-5)为主、OpenAI-compat 为副;③ codex 上游从"可合并性"降级为"可跟随性"(定期 rebase 吸收基础设施修复,不追求功能层对齐)。下一步:总战略 P1——在 codex fork 上做 predictive/reactive 压缩。
 
 ## 三、MVP 要验证的 5 个赌注
 
