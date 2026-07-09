@@ -22,6 +22,7 @@ use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
 use kloop_core::rollout::load_session;
+use kloop_core::rollout::resume_session;
 use kloop_core::rollout::Rollout;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
@@ -206,10 +207,10 @@ fn open_history(
             .context("no saved sessions to resume")?,
     };
     let id = session_id_of(&resume_path);
-    let messages = load_session(&resume_path)
+    let (messages, rollout) = resume_session(&resume_path)
         .with_context(|| format!("cannot read session file {}", resume_path.display()))?;
     println!("[resumed session {id}: {} message(s)]", messages.len());
-    let history = History::resume(cfg.offload_dir.clone(), messages, Rollout::new(resume_path));
+    let history = History::resume(cfg.offload_dir.clone(), messages, rollout);
     Ok((history, id))
 }
 

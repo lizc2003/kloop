@@ -60,12 +60,23 @@ being written. Compaction appends a `compacted` marker line carrying the full
 replacement history (the codex rollout pattern): the file stays append-only
 and auditable, and replay just swaps in the replacement and keeps reading.
 
+Every line carries an envelope — `id` (`{session}#{seq}`, no rand
+dependency), `parent` (previous line's id, linked across resumed runs), `ts`
+(unix ms). Replay is linear today; the chain is the schema foundation for
+rewind/forking later, laid down now because adding it after files exist would
+mean a format migration. Unknown fields are ignored on read (locked by test),
+so the format grows additively.
+
 Resume replays the file, then makes the history legal and consistent again:
 
-- orphaned `tool_use` blocks (session killed before results landed) get the
-  same `is_error` "interrupted" results the live interrupt path uses;
-- a malformed tail line (crash mid-append) truncates to the last intact line
-  instead of failing;
+- pairing is repaired in both directions (as in claude-code): unanswered
+  `tool_use` blocks get the same `is_error` "interrupted" results the live
+  interrupt path uses, and stray `tool_result` blocks answering nothing are
+  dropped;
+- a torn tail (crash mid-append) is truncated to the last intact line —
+  physically, before appending resumes, so the partial bytes can't merge
+  with the next line and orphan everything after (read-only paths like
+  `--list-sessions` never modify the file);
 - the process-global offload counter advances past every `off-NNNN.txt`
   already on disk, so new spills never clobber files the resumed history
   points at (usage anchors are not persisted — the estimate re-anchors on
@@ -105,7 +116,7 @@ see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 65 tests across the workspace:
+`cargo test` runs 71 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -120,10 +131,11 @@ see Session persistence above.
   rebuild/failure-leaves-history-untouched/boundary pairing, and agent-loop
   end-to-end over the Mock provider: tool batching, predictive + reactive
   compaction, truncation continuation, retry/fallback, max-rounds,
-  pre-cancelled abort, sub-agent round-trip; rollout round-trip, compacted
-  marker replay, orphan repair on resume, malformed-tail truncation, offload
-  counter sync, and a full persist → restart → resume turn over the Mock
-  provider.
+  pre-cancelled abort, sub-agent round-trip; rollout round-trip, envelope
+  chain (ids link across restarts, no collisions), compacted marker replay,
+  two-way pairing repair on resume, torn-tail physical truncation,
+  unknown-field forward compatibility, offload counter sync, and a full
+  persist → restart → resume turn over the Mock provider.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day).
 

@@ -73,8 +73,10 @@ impl History {
 
     /// Persistence must never take down the live session: a failed write
     /// drops the rollout and the session continues in memory only.
-    fn persist(&mut self, write: impl FnOnce(&Rollout) -> std::io::Result<()>) {
-        let Some(rollout) = &self.rollout else { return };
+    fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {
+        let Some(rollout) = &mut self.rollout else {
+            return;
+        };
         if let Err(e) = write(rollout) {
             eprintln!("[session persistence failed ({e}); continuing without it]");
             self.rollout = None;
@@ -278,13 +280,14 @@ mod tests {
     fn resumed_history_installs_items_without_reappending() {
         let dir = temp_dir("resume");
         let session = dir.join("session.jsonl");
-        let rollout = Rollout::new(session.clone());
+        let mut rollout = Rollout::new(session.clone());
         rollout
             .append_message(&Message::user_text("earlier"))
             .unwrap();
+        drop(rollout);
 
-        let items = crate::rollout::load_session(&session).unwrap();
-        let mut h = History::resume(dir.clone(), items, Rollout::new(session.clone()));
+        let (items, resumed) = crate::rollout::resume_session(&session).unwrap();
+        let mut h = History::resume(dir.clone(), items, resumed);
         assert_eq!(h.messages(), &[Message::user_text("earlier")]);
         // New records append after the resumed content, once each.
         h.record(Message::user_text("later"));
