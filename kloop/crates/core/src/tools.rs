@@ -115,50 +115,24 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
 }
 
 /// Concurrency safety by name AND input: read-only tools are always safe,
-/// bash is safe only when every command segment is a known read-only command.
+/// bash is safe only when the parsed command sequence is word-only and every
+/// argv is a known read-only command (same analysis the permission gate
+/// uses — safe-to-parallelize and safe-to-run are two verdicts over one
+/// decomposition).
 pub fn is_concurrency_safe(name: &str, input: &Value) -> bool {
     match name {
         "read_file" | "read_offloaded" => true,
-        "bash" => input["command"].as_str().is_some_and(bash_is_readonly),
+        "bash" => {
+            input["command"]
+                .as_str()
+                .is_some_and(|cmd| match crate::shell::analyze_bash(cmd) {
+                    crate::shell::BashAnalysis::Commands(cmds) => {
+                        !cmds.is_empty() && cmds.iter().all(|c| crate::shell::argv_is_readonly(c))
+                    }
+                    crate::shell::BashAnalysis::Opaque => false,
+                })
+        }
         _ => false,
-    }
-}
-
-fn bash_is_readonly(cmd: &str) -> bool {
-    let segments = bash_segments(cmd);
-    !segments.is_empty() && segments.iter().all(|seg| segment_is_readonly(seg))
-}
-
-/// Split a shell command on `;`, `&&` and `|` into trimmed segments. Shared
-/// with the permission gate: safe-to-parallelize and safe-to-run are two
-/// verdicts over the same decomposition.
-pub(crate) fn bash_segments(cmd: &str) -> Vec<String> {
-    cmd.replace("&&", ";")
-        .replace('|', ";")
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-pub(crate) fn segment_is_readonly(seg: &str) -> bool {
-    const SAFE: &[&str] = &[
-        "ls", "cat", "rg", "grep", "find", "head", "tail", "wc", "pwd", "which", "file", "stat",
-        "tree", "du", "echo",
-    ];
-    const GIT_SAFE: &[&str] = &["status", "log", "diff", "show", "branch"];
-    if seg.contains('>') {
-        return false;
-    }
-    let mut tokens = seg.split_whitespace();
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-    if first == "git" {
-        tokens.next().is_some_and(|sub| GIT_SAFE.contains(&sub))
-    } else {
-        SAFE.contains(&first)
     }
 }
 
@@ -215,8 +189,8 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let summary: String = input.to_string().chars().take(120).collect();
     ctx.ui.note(&format!("{name} {summary}"));
     let gated = async {
-        if !ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
-            bail!("{name}: user denied permission for this call; take a different approach or ask the user how to proceed");
+        if let Err(reason) = ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
+            bail!(reason);
         }
         execute_tool(&name, &input, &ctx).await
     };
@@ -684,7 +658,21 @@ mod tests {
         ));
         assert!(is_concurrency_safe("bash", &bash_input("git log -5")));
 
-        // unsafe: redirect, unknown command, unsafe git subcommand, empty
+        // unsafe: substitution, newline/background chaining, redirect,
+        // unknown command, unsafe git subcommand, empty
+        assert!(!is_concurrency_safe(
+            "bash",
+            &bash_input("cat $(rm -rf /tmp/x)")
+        ));
+        assert!(!is_concurrency_safe("bash", &bash_input("ls `evil`")));
+        assert!(!is_concurrency_safe(
+            "bash",
+            &bash_input("ls\nrm -rf /tmp/x")
+        ));
+        assert!(!is_concurrency_safe(
+            "bash",
+            &bash_input("ls & rm -rf /tmp/x")
+        ));
         assert!(!is_concurrency_safe(
             "bash",
             &bash_input("echo hi > out.txt")

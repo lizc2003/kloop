@@ -43,6 +43,37 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 - **配对修补 cc 是双向的**(`ensureToolResultPairing`,messages.ts:5580):正向补合成错误块、反向删引用不存在 tool_use 的孤儿 tool_result,且是每次发请求前的防御校验,不只恢复时用。kloop 7b 起同为双向(恢复时)。
 - cc 的性能工程(chunked 读、RSS 优化、200 文件缓存)是规模驱动,不改格式可后补,不属于底子。
 
+## 权限系统对比(2026-07-09,plan 8 调研;kloop 已按此实现)
+
+两家深调后的收敛点与分歧(细节可再查:cc `src/utils/permissions/permissions.ts:1179` 的
+`hasPermissionsToUseToolInner`、`packages/builtin-tools/.../bashPermissions.ts`;codex
+`codex-rs/shell-command/`、`core/src/exec_policy.rs`、`core/src/tools/orchestrator.rs`):
+
+- **管线次序是 cc 的精华**:deny 规则 → 工具自查 → content-ask/safetyCheck → bypass → allow
+  规则 → 兜底 ask。两条不变量:deny 永远先于 allow;敏感检查(`.git/`、shell rc、`.claude/`)
+  在 bypass 之前——bypass 模式也拦不住。kloop 照搬。
+- **bash 解析两家都上真语法树**(cc 新路径 tree-sitter AST + Haiku 注入分类器兜底;codex
+  tree-sitter-bash word-only 白名单遍历)。codex 的遍历纪律:允许的节点仅
+  program/list/pipeline/command/word/string/raw_string/number/concatenation,运算符仅
+  `&& || ; |`;子 shell/重定向/替换/赋值前缀一律 bail → 不可分析。手写 `&&`/`;` 字符串拆分
+  就是注入洞的温床(kloop 自己踩过三个)。kloop 直接移植 codex 版(`core/src/shell.rs`)。
+- **只读分类器要审查选项不只看名字**(codex):`find -exec/-delete`、`rg --pre/-z`、
+  `base64 -o`、`sed` 仅 `-n Np`、git 全局选项注入(`-C`/`-c`/`--git-dir`/`--exec-path`,子命令
+  `--output`/`--ext-diff`)、`git branch` 仅列表形。安全/危险是**两个独立分类器**(危险 =
+  `rm -f/-rf`、`sudo <cmd>` 递归),中间地带才是"要不要问"的判定区。
+- **匹配的非对称性**(cc):allow 前缀规则不匹配复合命令(按段各自判);deny 必须匹配复合
+  命令(任一段命中即拒)且匹配前剥 env 前缀/wrapper 到不动点,防 `FOO=1 rm` / `sudo rm` 绕过。
+- **"always allow" 记前缀不记整条**(cc):bash 记两词前缀(`Bash(git commit:*)`),文件记
+  目录 glob(`Edit(dir/**)`);落盘进 settings 的 allow/deny/ask 三数组,session 级只进内存。
+- **拒绝 = is_error tool_result + 改道引导文案,turn 继续**;只有 abort 才终止(两家一致)。
+  codex 的决策枚举更丰富(Approved/ApprovedForSession/ApprovedExecpolicyAmendment/Denied/
+  TimedOut/Abort),批准请求走 per-call oneshot channel,掉线默认 Abort(fail-safe)。
+- **codex 独有、kloop 暂不做**:sandbox 与 approval 双轴配合(受限沙箱内不问、失败后
+  "升级为询问再裸跑"的 escalation 环)、execve 拦截级 execpolicy、Starlark 规则文件、
+  自动规则修正(带 `bash`/`sudo`/`python -c` 这类 BANNED_PREFIX 黑名单)。这些依赖沙箱
+  基建,等 kloop 有沙箱再回来抄。cc 独有暂不做:AI 分类器 auto 模式、updatedInput 改写、
+  permission modes 全集(kloop 只取 default/acceptEdits/bypass 三档)。
+
 ## 预演记录(codex fork,2026-07-09)
 
 kloop 的压缩设计曾先在 codex fork 上完整实现过一轮(分支 `codex/worktree/predictive_reactive_compaction`,提交 57c746ef7,Buildbot 绿,未合入 main):predictive 插在 `run_pre_sampling_compact`、reactive 插在采样错误分支、Feature 双旗标、compact_fork_tests.rs 四个集成测试。价值:验证了设计、抓出小窗口负阈值盲点。教训:kloop 才是项目,参考库不用于开发。

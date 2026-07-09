@@ -89,27 +89,65 @@ dependency); `--resume` picks the most recently modified session, `--resume
 ## Permissions (Phase 2, third slice)
 
 Every tool call passes a layered gate before executing
-(`crates/core/src/permissions.rs`) — rules first, asking last:
+(`crates/core/src/permissions.rs`), shaped after claude-code's permission
+pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
-1. **Read-only passes outright**: `read_file`, `read_offloaded`, `task`
-   (the sub-agent's own calls are gated individually), and bash commands
-   whose every segment is read-only — the same classification concurrency
-   batching uses.
-2. **Allowlist**: `AGENT_ALLOW` is a comma-separated rule list, e.g.
-   `AGENT_ALLOW='write_file,bash(cargo *)'`. A bare tool name pre-approves
-   the tool; `bash(<pattern>)` pre-approves command segments whose leading
-   tokens match (trailing `*` = any remainder, no `*` = exact). In a chained
-   command every segment must be read-only or allowlisted.
-3. **Ask**: everything else goes to the interactive prompt — `y` allow once,
-   `a` allow for the rest of the session (cached per tool name; per
-   command-segment head for bash, so an approved `cargo` never smuggles in a
-   later `cargo build && rm x`), `n` deny.
+```
+deny rules → safety checks → ask rules → bypass → read-only self-verdict
+→ acceptEdits → allow rules → session cache → ask the user
+```
 
-A denial is not a turn abort: the model receives an `is_error` `tool_result`
-("user denied permission…") and can take another approach. Sub-agents share
-the parent's approval cache and prompt through the same seam, tagged
-`[sub-agent]`. `--yolo` disables the gate entirely (`--mock` implies it —
-nobody is at the keyboard).
+Two invariants carried over from claude-code: **deny always beats allow**,
+and **safety checks are immune to bypass mode**.
+
+**Bash decisions run on a real parse tree** (`crates/core/src/shell.rs`,
+tree-sitter-bash): a script qualifies only when every node is a plain
+word-only command joined by `&&`/`||`/`;`/`|`/newline; `bash -c "…"` is
+unwrapped and analyzed recursively. Subshells, redirections, command/process
+substitution, expansions, and variable-assignment prefixes make the script
+*opaque* — never auto-approved, never allow-rule-matchable, never cached; it
+always goes to the human. The read-only classifier vets options, not just
+names (`find -delete`, `rg --pre`, `git -C`/`--git-dir`/`log --output`,
+`base64 -o`, `sed` beyond `-n Np` all disqualify), and the independent
+dangerous classifier (`rm -rf`, `sudo …`) forces a confirmation even when an
+allow rule or bypass mode would otherwise pass — wrappers (`sudo`, `env`,
+`timeout`, `nice`, `xargs`) are stripped before deny/danger matching so they
+can't smuggle a command past a rule.
+
+**Rules** live in `.kloop/config.toml` and env vars (comma-separated
+`AGENT_ALLOW` / `AGENT_DENY` / `AGENT_ASK` append on top):
+
+```toml
+[permissions]
+allow = ["bash(cargo *)", "write_file(src/**)", "edit_file"]
+deny  = ["bash(git push *)", "read_file(**/*.pem)"]
+ask   = ["bash(cargo publish *)"]   # always confirm, even if allowed
+```
+
+`tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
+leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
+per segment — in a chain every segment must be read-only or allowed, while a
+single denied segment poisons the whole chain; `write_file(<glob>)` /
+`edit_file(<glob>)` / `read_file(<glob>)` match the lexically-normalized
+path (and its cwd-relative form) with `**` globs.
+
+**File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
+directories, shell/git rc files, and `.env*` are sensitive — confirmed every
+time, immune to allow rules, acceptEdits, and bypass. Writes escaping the
+working directory never auto-pass in acceptEdits.
+
+**Asking**: `y` allow once · `a` allow for this session (cached per two-word
+bash prefix — approving `git commit` never covers `git rebase` — or per
+parent directory for file writes) · `p` allow always (appends the suggested
+rule, e.g. `bash(cargo build *)`, to `.kloop/config.toml`) · `n` deny. A
+denial is not a turn abort: the model receives an `is_error` `tool_result`
+and is told to take another approach. Sub-agents share the parent's rules
+and cache and prompt through the same seam, tagged `[sub-agent]`.
+
+**Modes**: default (ask for anything unvouched-for), `--accept-edits`
+(file writes inside the working directory auto-pass), `--yolo` (bypass:
+everything passes *except* deny rules and safety checks). `--mock` disables
+the gate entirely — nobody is at the keyboard.
 
 ## Deliberately out of scope (Phase 2 remainder)
 
@@ -134,9 +172,11 @@ cargo run -- --list-sessions   # what's on disk, most recent first
 cargo run -- --resume          # continue the most recent session
 cargo run -- --resume <id>     # continue a specific session
 
-# permissions
+# permissions (rules also live in .kloop/config.toml — see Permissions)
 AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
-cargo run -- --yolo                                # no gating (development)
+AGENT_DENY='bash(git push *)' cargo run            # hard-block rules
+cargo run -- --accept-edits                        # auto-allow cwd file writes
+cargo run -- --yolo                                # bypass (deny/safety still apply)
 ```
 
 REPL: type a task; Ctrl+C interrupts the running turn (history is patched and
@@ -145,7 +185,7 @@ see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 82 tests across the workspace:
+`cargo test` runs 95 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -161,15 +201,20 @@ see Session persistence above.
   end-to-end over the Mock provider: tool batching, predictive + reactive
   compaction, truncation continuation, retry/fallback, max-rounds,
   pre-cancelled abort, sub-agent round-trip, denied-tool-continues-turn;
-  permission layering (read-only pass, allowlist tool/prefix/exact matching,
-  session cache granularity, rule parsing, approver ask counts); rollout
-  round-trip, envelope
+  shell analysis contracts (word-only parsing, quote/concatenation
+  unwrapping, opaque-construct rejection, `bash -c` unwrap, read-only option
+  vetting, git option-injection, dangerous-through-wrappers); permission
+  pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
+  safety checks, sensitive paths never cached, ask-rules-over-allow,
+  acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
+  persistence, opaque never cacheable); rollout round-trip, envelope
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full
   persist → restart → resume turn over the Mock provider.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
-  known dates, leap day).
+  known dates, leap day), permission-config round-trip (load/persist/merge,
+  unrelated-section preservation, malformed rejection).
 
 Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
 exercising all five bets), and with a real key both adapters have been
@@ -202,14 +247,17 @@ crates/core/        kloop-core — the agent, network-free
                     usage-anchored token estimation
   src/tools.rs      bash, read/write/edit file, read_offloaded, task;
                     concurrency-safety classification + batched dispatch
-  src/permissions.rs rule-then-ask execution gate: allowlist, session
-                    approval cache, Approver seam
+  src/shell.rs      tree-sitter-bash word-only analysis, read-only and
+                    dangerous classifiers, wrapper stripping
+  src/permissions.rs the layered execution gate: deny/ask/allow rules,
+                    safety checks, modes, session cache, Approver seam
   src/compact.rs    predictive threshold math + compaction rewrite
   src/rollout.rs    session persistence: JSONL append, compacted markers,
                     replay + orphan repair on resume
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/cli/         kloop — the binary
-  src/main.rs       REPL, env config, StdoutUi, CliApprover (y/a/n prompt),
-                    --mock demo, session selection (--resume, --list-sessions)
+  src/main.rs       REPL, env config, StdoutUi, CliApprover (y/a/p/n prompt),
+                    .kloop/config.toml rule load/persist, --mock demo,
+                    session selection (--resume, --list-sessions)
 ```

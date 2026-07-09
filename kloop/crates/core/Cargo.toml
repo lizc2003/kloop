@@ -9,7 +9,10 @@ kloop-provider = { workspace = true }
 
 anyhow = { workspace = true }
 futures = { workspace = true }
+globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }

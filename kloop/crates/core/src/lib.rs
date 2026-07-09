@@ -15,6 +15,7 @@ pub mod config;
 pub mod history;
 pub mod permissions;
 pub mod rollout;
+pub mod shell;
 pub mod tools;
 
 pub use config::Config;

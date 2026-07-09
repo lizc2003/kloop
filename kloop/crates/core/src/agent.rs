@@ -773,14 +773,16 @@ mod tests {
     /// to — the turn continues instead of ending.
     #[tokio::test]
     async fn denied_tool_call_continues_the_turn() {
-        use crate::permissions::{Approver, Decision, Permissions};
+        use crate::permissions::{
+            Approver, ConfirmRequest, Decision, Mode, PermissionRules, Permissions,
+        };
         use std::pin::Pin;
 
         struct DenyAll;
         impl Approver for DenyAll {
             fn confirm(
                 &self,
-                _: String,
+                _: ConfirmRequest,
             ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
                 Box::pin(async { Decision::Deny })
             }
@@ -797,7 +799,16 @@ mod tests {
             }],
         ]);
         let mut cfg = (*compaction_cfg(provider, 200_000, "denied")).clone();
-        cfg.permissions = Arc::new(Permissions::new("", Arc::new(DenyAll)).unwrap());
+        cfg.permissions = Arc::new(
+            Permissions::new(
+                Mode::Default,
+                &PermissionRules::default(),
+                std::env::temp_dir(),
+                Some(Arc::new(DenyAll)),
+                None,
+            )
+            .unwrap(),
+        );
         let cfg = Arc::new(cfg);
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
@@ -815,7 +826,7 @@ mod tests {
             panic!("expected a tool result for the denied call");
         };
         assert!(is_error);
-        assert!(content.contains("denied"), "got: {content}");
+        assert!(content.contains("declined"), "got: {content}");
         assert!(!std::path::Path::new("should-not-exist").exists());
     }
 

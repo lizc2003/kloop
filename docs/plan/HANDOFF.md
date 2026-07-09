@@ -18,12 +18,12 @@
 - 压缩双防线:predictive(采样前预判 当前+增长预留 是否爆窗,增长 = min(输出上限,20k)+15k,**窗口≤预留时跳过**)+ reactive(溢出错误 downcast OverflowError,每 turn 压缩一次重试)。压缩 = 模型写交接摘要 + 保留约 2k token 近期原文,边界绝不切开 tool_use/tool_result 对,失败不动历史。
 - 恢复语义:流式重试 3 次(指数退避 + 纳秒抖动)、fallback 模型(AGENT_FALLBACK_MODEL,每 turn 切一次)、截断续跑(stop_reason=max_tokens/length 且无 tool_use 时注入续跑提示,限 3 次;这是 stop_reason 的唯一合法用途)、中断孤儿修补、EndReason 四态。
 - token 记账:provider 回传 usage(Anthropic message_start/delta;OpenAI include_usage,usage 块在 finish_reason 后到)锚点 + 其后消息 chars/4 估算;压缩后锚点作废。
-- 权限门(`core/src/permissions.rs`,**真实 API 交互验证待补**):每次工具执行前分层判定——只读工具/只读 bash 直接放行(与并发安全分类共用 `bash_segments`/`segment_is_readonly`)→ `AGENT_ALLOW` allowlist(裸工具名 / `bash(前缀 *)`,链式命令每段都须只读或命中)→ 会话批准缓存(按工具名;bash 按每段首 token)→ 独立 `Approver` trait 询问(类型擦除 future,不动同步 Ui;CLI 实现 y/a/n 阻塞读,Ctrl+C 打断询问时孤儿读可能吞掉下一行输入——已接受的边角)。拒绝 = is_error tool_result,turn 继续。`Permissions` 以 Arc 挂在 Config 上,子 agent 天然继承缓存、描述带 `[sub-agent]`。CLI `--yolo` 全放行,`--mock` 隐含之。
+- 权限门(`core/src/permissions.rs` + `core/src/shell.rs`,**真实 API 交互验证待补**):cc 形态管线——deny 规则 → 安全检查(危险命令 `rm -rf`/`sudo`、敏感路径 `.git`/`.kloop`/`.ssh`/rc/`.env*`,**bypass 免疫**)→ ask 规则 → bypass → 只读自查 → acceptEdits(cwd 内文件写)→ allow 规则 → 会话缓存 → `Approver` trait 询问(类型擦除 future)。不变量:deny 永远先于 allow。bash 判定跑在 tree-sitter-bash word-only 白名单遍历上(移植 codex shell-command;子 shell/重定向/替换/赋值 → Opaque,永不自动放行/命中 allow/进缓存;`bash -c` 递归解包;只读分类器审查选项含 git 全局选项注入;deny/危险匹配前剥 sudo/env/timeout/xargs wrapper)。规则三形态:`tool` / `bash(tokens [*])`(按段,allow 全段须覆盖、deny 任一段命中)/ `write_file|edit_file|read_file(glob)`(globset,词法规范化路径 + cwd 相对双匹配)。规则来源 `.kloop/config.toml` `[permissions]` allow/deny/ask + `AGENT_ALLOW`/`AGENT_DENY`/`AGENT_ASK` 叠加。询问 y/a/p/n:a = 会话缓存(bash 两词前缀签名、文件按父目录);p = 追加建议规则(`bash(git commit *)` 形)进 config.toml(toml::Table 往返,保留无关段落,不保注释)。拒绝 = is_error tool_result + 改道引导,turn 继续。`Permissions` Arc 挂 Config,子 agent 继承,描述带 `[sub-agent]`/`[destructive]`/`[sensitive path]` 标签。CLI:`--accept-edits`、`--yolo`(= bypass,deny/安全检查仍生效)、`--mock` 才是完全无门。CLI 阻塞读边角:Ctrl+C 打断询问时孤儿读可能吞掉下一行输入(已接受)。调研结论沉淀在 `refs/README.md` 权限系统对比一节;沙箱/escalation/execpolicy 等待有沙箱基建再抄。
 - 会话持久化(`core/src/rollout.rs`):`.kloop/sessions/{id}.jsonl` 逐条写透(History 可挂 Rollout;写失败降级纯内存);每行带信封 id(`{stem}#{seq}`,无 rand)/ parent(上一行 id,跨恢复续链)/ ts,重放线性但链是未来 rewind/fork 的 schema 地基,未知字段读取忽略(前向兼容,测试锁死);压缩追加 compacted 标记内嵌完整替换历史(仿 codex rollout),文件保持 append-only;恢复(`resume_session`)= 重放 + 双向配对修补(正向补 interrupted、反向删孤儿 tool_result)+ 坏尾**物理**截断 + offload 计数器 fetch_max 同步;`load_session` 只读不动文件;usage 锚点不落盘,首次采样重锚定。CLI `--resume [id]` / `--list-sessions`,session id 为 UTC 时间戳(手写 civil_from_days,无 chrono);子 agent 历史不持久化。
 
-**测试**:82 个。protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / permissions 分层判定、规则解析、缓存粒度、询问计数、拒绝后续跑 / history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数与时间戳。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
+**测试**:95 个。protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / shell 解析契约(word-only、引号拼接、不透明构造、`bash -c` 解包、选项审查、git 注入、wrapper 穿透)/ permissions 管线(deny 胜 allow 与 bypass、安全检查 bypass 免疫、敏感路径不可缓存、ask 规则胜 allow、acceptEdits 边界、glob 规则、两词缓存、AllowAlways 持久化、Opaque 不可缓存)/ history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数、时间戳、config 往返。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
 
-**运行**:真 key 用 `ANTHROPIC_API_KEY`+`ANTHROPIC_BASE_URL`(不含 /v1,适配器自己拼 /v1/messages)或 `OPENAI_API_KEY`+`OPENAI_BASE_URL`+`AGENT_MODEL`;可选 `AGENT_CONTEXT_WINDOW`(默认 200000,off 关压缩)、`AGENT_FALLBACK_MODEL`、`AGENT_PROVIDER`、`AGENT_ALLOW`(权限 allowlist)。
+**运行**:真 key 用 `ANTHROPIC_API_KEY`+`ANTHROPIC_BASE_URL`(不含 /v1,适配器自己拼 /v1/messages)或 `OPENAI_API_KEY`+`OPENAI_BASE_URL`+`AGENT_MODEL`;可选 `AGENT_CONTEXT_WINDOW`(默认 200000,off 关压缩)、`AGENT_FALLBACK_MODEL`、`AGENT_PROVIDER`、`AGENT_ALLOW`/`AGENT_DENY`/`AGENT_ASK`(权限规则,叠加在 `.kloop/config.toml` 之上)。
 
 ## 三、沉淀的实现教训(新代码沿用)
 
@@ -34,6 +34,7 @@
 5. 压缩/重写类操作失败时必须保证原数据原封不动,测试锁死这一点。
 6. 追加型文件的坏尾必须**物理**截断再续写:只做逻辑跳过的话,追加会和半行拼接成一行,之后的数据全部不可达(plan 7 潜伏 bug,7b 修复)。
 7. 磁盘 schema 是基础模块里最难改的部分:演化字段(id/parent/ts)要在有存量文件之前落上;性能工程不改格式,可以后补。
+8. 安全判定别手写 shell 拆分:字符串 replace/split 版一天内被找出三个注入洞(`$()`、换行、单 `&`),补丁式修补追不完;正解是 tree-sitter 白名单遍历 + "解析不了 = 不可分析 = 永不自动放行"。凡是"分类后放行"的逻辑,分类器必须是白名单而非黑名单。
 
 ## 四、进度
 

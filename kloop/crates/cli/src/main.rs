@@ -22,7 +22,10 @@ use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
+use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::permissions::Mode;
+use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::load_session;
 use kloop_core::rollout::resume_session;
@@ -44,6 +47,7 @@ enum SessionChoice {
 struct CliArgs {
     mock: bool,
     yolo: bool,
+    accept_edits: bool,
     list_sessions: bool,
     session: SessionChoice,
 }
@@ -52,6 +56,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
         yolo: false,
+        accept_edits: false,
         list_sessions: false,
         session: SessionChoice::New,
     };
@@ -60,6 +65,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
         match args[i].as_str() {
             "--mock" => parsed.mock = true,
             "--yolo" => parsed.yolo = true,
+            "--accept-edits" => parsed.accept_edits = true,
             "--list-sessions" => parsed.list_sessions = true,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
@@ -71,7 +77,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                 };
             }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --resume [id] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --resume [id] | --list-sessions)"
             ),
         }
         i += 1;
@@ -222,16 +228,125 @@ fn open_history(
     Ok((history, id))
 }
 
-fn config_from_env(mock: bool, yolo: bool) -> Result<Config> {
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
-    // --mock runs a canned turn with nobody at the keyboard, so it implies
-    // --yolo; otherwise gate on AGENT_ALLOW rules + interactive approval.
-    let permissions = if mock || yolo {
-        Arc::new(Permissions::allow_all())
-    } else {
-        let allow = std::env::var("AGENT_ALLOW").unwrap_or_default();
-        Arc::new(Permissions::new(&allow, Arc::new(CliApprover)).context("invalid AGENT_ALLOW")?)
+const PERMISSIONS_CONFIG: &str = ".kloop/config.toml";
+
+/// Rules from `.kloop/config.toml` `[permissions]` (allow/deny/ask string
+/// arrays), with AGENT_ALLOW / AGENT_DENY / AGENT_ASK (comma-separated)
+/// appended on top.
+fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
+    let mut rules = PermissionRules::default();
+    if let Ok(raw) = std::fs::read_to_string(config_path) {
+        let value: toml::Table = raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        let read = |key: &str, out: &mut Vec<String>| -> Result<()> {
+            let Some(entries) = value.get("permissions").and_then(|p| p.get(key)) else {
+                return Ok(());
+            };
+            let list = entries
+                .as_array()
+                .with_context(|| format!("permissions.{key} must be an array of strings"))?;
+            for entry in list {
+                out.push(
+                    entry
+                        .as_str()
+                        .with_context(|| format!("permissions.{key} must be an array of strings"))?
+                        .to_string(),
+                );
+            }
+            Ok(())
+        };
+        read("allow", &mut rules.allow)?;
+        read("deny", &mut rules.deny)?;
+        read("ask", &mut rules.ask)?;
+    }
+    let env = |var: &str, out: &mut Vec<String>| {
+        if let Ok(raw) = std::env::var(var) {
+            out.extend(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_string),
+            );
+        }
     };
+    env("AGENT_ALLOW", &mut rules.allow);
+    env("AGENT_DENY", &mut rules.deny);
+    env("AGENT_ASK", &mut rules.ask);
+    Ok(rules)
+}
+
+/// Append allow rules to `[permissions].allow`, preserving everything else
+/// in the file (toml::Value round-trip; comments are not preserved).
+fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
+    let mut table: toml::Table = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?,
+        Err(_) => toml::Table::new(),
+    };
+    let permissions = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("[permissions] must be a table")?;
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("permissions.allow must be an array")?;
+    for rule in new_rules {
+        if !allow.iter().any(|v| v.as_str() == Some(rule)) {
+            allow.push(toml::Value::String(rule.clone()));
+        }
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(config_path, toml::to_string_pretty(&table)?)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn build_permissions(args: &CliArgs) -> Result<Permissions> {
+    // --mock runs a canned turn with nobody at the keyboard: no gating at
+    // all. --yolo is bypass mode — deny rules and safety checks still apply.
+    if args.mock {
+        return Ok(Permissions::allow_all());
+    }
+    let mode = if args.yolo {
+        Mode::Bypass
+    } else if args.accept_edits {
+        Mode::AcceptEdits
+    } else {
+        Mode::Default
+    };
+    let config_path = PathBuf::from(PERMISSIONS_CONFIG);
+    let rules = load_permission_rules(&config_path)?;
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let persist =
+        Box::new(
+            move |rules: &[String]| match persist_allow_rules(&config_path, rules) {
+                Ok(()) => eprintln!(
+                    "\x1b[2m[saved to {PERMISSIONS_CONFIG}: {}]\x1b[0m",
+                    rules.join(", ")
+                ),
+                Err(e) => eprintln!("\x1b[2m[failed to save allow rule: {e:#}]\x1b[0m"),
+            },
+        );
+    Permissions::new(
+        mode,
+        &rules,
+        cwd,
+        Some(Arc::new(CliApprover)),
+        Some(persist),
+    )
+    .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
+}
+
+fn config_from_env(args: &CliArgs) -> Result<Config> {
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let permissions = Arc::new(build_permissions(args)?);
     let system = format!(
         "You are a coding agent working in a CLI. Use the provided tools to inspect and \
              modify files and run commands; keep answers short. Current working directory: {}",
@@ -257,7 +372,7 @@ fn config_from_env(mock: bool, yolo: bool) -> Result<Config> {
         fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
         permissions,
     };
-    if mock {
+    if args.mock {
         return Ok(Config {
             provider: Arc::new(Provider::mock(mock_demo_turns())),
             ..base
@@ -310,19 +425,26 @@ fn config_from_env(mock: bool, yolo: bool) -> Result<Config> {
     }
 }
 
-/// Interactive y/a/n prompt on the terminal. The REPL's own stdin reader is
-/// idle while a turn runs, so a direct blocking read is safe; if the turn is
-/// Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
+/// Interactive y/a/p/n prompt on the terminal. The REPL's own stdin reader
+/// is idle while a turn runs, so a direct blocking read is safe; if the turn
+/// is Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
 /// subsequent input line — accepted edge for a line-based REPL.
 struct CliApprover;
 
 impl Approver for CliApprover {
     fn confirm(
         &self,
-        description: String,
+        req: ConfirmRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
         Box::pin(async move {
-            print!("\n[approve?] {description}\n  y = allow once / a = allow for this session / n = deny > ");
+            let options = match &req.remember_rules {
+                Some(rules) => format!(
+                    "y = allow once / a = allow for this session / p = allow always (saves {} to {PERMISSIONS_CONFIG}) / n = deny",
+                    rules.join(", ")
+                ),
+                None => "y = allow once / n = deny".to_string(),
+            };
+            print!("\n[approve?] {}\n  {options} > ", req.description);
             let _ = std::io::stdout().flush();
             let line = tokio::task::spawn_blocking(|| {
                 let mut buf = String::new();
@@ -330,9 +452,13 @@ impl Approver for CliApprover {
             })
             .await;
             match line {
+                // 'a'/'p' on a non-remember-able call degrade to allow-once
+                // in the gate (it ignores the remember part), matching the
+                // user's evident intent to allow.
                 Ok(Ok(answer)) => match answer.trim().to_lowercase().as_str() {
                     "y" | "yes" => Decision::Allow,
                     "a" | "always" => Decision::AllowSession,
+                    "p" | "persist" => Decision::AllowAlways,
                     _ => Decision::Deny,
                 },
                 // Reader died or stdin closed: the safe answer is no.
@@ -401,7 +527,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cfg = Arc::new(config_from_env(args.mock, args.yolo)?);
+    let cfg = Arc::new(config_from_env(&args)?);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
     let (mut history, session_id) = open_history(&cfg, &args.session, &sessions_dir)?;
 
@@ -475,6 +601,7 @@ mod tests {
             CliArgs {
                 mock: false,
                 yolo: false,
+                accept_edits: false,
                 list_sessions: false,
                 session: SessionChoice::New,
             }
@@ -484,6 +611,7 @@ mod tests {
             CliArgs {
                 mock: true,
                 yolo: false,
+                accept_edits: false,
                 list_sessions: false,
                 session: SessionChoice::ResumeLatest,
             }
@@ -493,20 +621,65 @@ mod tests {
             CliArgs {
                 mock: false,
                 yolo: false,
+                accept_edits: false,
                 list_sessions: false,
                 session: SessionChoice::Resume("20260709-120000".into()),
             }
         );
         assert_eq!(
-            parse_args(&strings(&["--list-sessions", "--yolo"])).unwrap(),
+            parse_args(&strings(&["--list-sessions", "--yolo", "--accept-edits"])).unwrap(),
             CliArgs {
                 mock: false,
                 yolo: true,
+                accept_edits: true,
                 list_sessions: true,
                 session: SessionChoice::New,
             }
         );
         assert!(parse_args(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn permission_config_round_trip_and_merge() {
+        let dir = std::env::temp_dir().join(format!("kloop-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file: empty rules, no error.
+        assert_eq!(
+            load_permission_rules(&path).unwrap(),
+            PermissionRules::default()
+        );
+
+        // Persist into a file that has unrelated content to preserve.
+        std::fs::write(
+            &path,
+            "[provider]\nname = \"anthropic\"\n\n[permissions]\ndeny = [\"bash(git push *)\"]\n",
+        )
+        .unwrap();
+        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap();
+        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap(); // dedup
+
+        let rules = load_permission_rules(&path).unwrap();
+        assert_eq!(
+            rules,
+            PermissionRules {
+                allow: vec!["bash(cargo build *)".into()],
+                deny: vec!["bash(git push *)".into()],
+                ask: vec![],
+            }
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("[provider]"),
+            "unrelated sections preserved:\n{raw}"
+        );
+        assert_eq!(raw.matches("cargo build").count(), 1, "no duplicate rule");
+
+        // Malformed arrays are an error, not a silent skip.
+        std::fs::write(&path, "[permissions]\nallow = \"not-an-array\"\n").unwrap();
+        assert!(load_permission_rules(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
