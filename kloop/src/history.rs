@@ -19,6 +19,9 @@ pub struct History {
     items: Vec<Message>,
     offload_dir: PathBuf,
     cap: usize,
+    /// (items recorded at that point, total context tokens the provider
+    /// reported for the request covering them). Anchors the estimate.
+    usage_anchor: Option<(usize, u64)>,
 }
 
 impl History {
@@ -27,6 +30,7 @@ impl History {
             items: Vec::new(),
             offload_dir,
             cap: 8000,
+            usage_anchor: None,
         }
     }
 
@@ -45,6 +49,32 @@ impl History {
         &self.items
     }
 
+    /// Record the provider-reported total context size (input + output) for
+    /// the request whose response is the most recently recorded item.
+    pub fn note_usage(&mut self, total_tokens: u64) {
+        self.usage_anchor = Some((self.items.len(), total_tokens));
+    }
+
+    /// Current context size: the last real usage anchor plus a ~4 chars/token
+    /// estimate for everything recorded after it.
+    pub fn estimated_tokens(&self) -> u64 {
+        let (anchored_len, anchored_tokens) = self.usage_anchor.unwrap_or((0, 0));
+        let tail: u64 = self.items[anchored_len.min(self.items.len())..]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+        anchored_tokens + tail
+    }
+
+    /// Compaction is the one sanctioned rewrite of the otherwise append-only
+    /// history. The usage anchor no longer describes the new items, so it is
+    /// dropped and the estimate runs purely on the char heuristic until the
+    /// next sampled response re-anchors it.
+    pub fn replace_all(&mut self, items: Vec<Message>) {
+        self.items = items;
+        self.usage_anchor = None;
+    }
+
     fn spill(&mut self, content: &str) -> String {
         let id = format!("off-{:04}", NEXT_OFFLOAD_ID.fetch_add(1, Ordering::Relaxed));
         let head: String = content.chars().take(HEAD_CHARS).collect();
@@ -60,6 +90,12 @@ impl History {
         };
         format!("{head}\n…[truncated]…\n{tail}\n{pointer}")
     }
+}
+
+/// ~4 chars/token heuristic over the serialized wire form, ceiling division.
+pub fn estimate_message_tokens(message: &Message) -> u64 {
+    let bytes = serde_json::to_string(message).map_or(0, |s| s.len());
+    (bytes as u64).div_ceil(4)
 }
 
 #[cfg(test)]

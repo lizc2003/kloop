@@ -14,9 +14,19 @@ use tokio::sync::mpsc;
 use crate::sse::SseParser;
 use crate::types::ContentBlock;
 use crate::types::Message;
+use crate::types::OverflowError;
 use crate::types::Role;
 use crate::types::StreamEvent;
 use crate::types::ToolDef;
+use crate::types::Usage;
+use crate::types::MAX_OUTPUT_TOKENS;
+
+/// One scripted Mock response: either content blocks or a provider error.
+pub enum MockTurn {
+    Blocks(Vec<ContentBlock>),
+    /// The request is rejected for exceeding the context window.
+    Overflow,
+}
 
 pub enum Provider {
     Anthropic {
@@ -29,12 +39,25 @@ pub enum Provider {
     },
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
     Mock {
-        turns: Mutex<VecDeque<Vec<ContentBlock>>>,
+        turns: Mutex<VecDeque<MockTurn>>,
     },
+}
+
+/// Provider-agnostic detection of "request too large for the context window"
+/// error payloads.
+fn is_overflow_message(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
 }
 
 impl Provider {
     pub fn mock(turns: Vec<Vec<ContentBlock>>) -> Self {
+        Self::mock_scripted(turns.into_iter().map(MockTurn::Blocks).collect())
+    }
+
+    pub fn mock_scripted(turns: Vec<MockTurn>) -> Self {
         Provider::Mock {
             turns: Mutex::new(turns.into()),
         }
@@ -52,12 +75,19 @@ impl Provider {
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(64);
         match self.as_ref() {
             Provider::Mock { turns } => {
-                let blocks = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
-                    vec![ContentBlock::Text {
+                let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
+                    MockTurn::Blocks(vec![ContentBlock::Text {
                         text: "mock exhausted".into(),
-                    }]
+                    }])
                 });
                 tokio::spawn(async move {
+                    let blocks = match turn {
+                        MockTurn::Blocks(blocks) => blocks,
+                        MockTurn::Overflow => {
+                            let _ = tx.send(Err(anyhow::Error::new(OverflowError))).await;
+                            return;
+                        }
+                    };
                     for block in &blocks {
                         if let ContentBlock::Text { text } = block {
                             let _ = tx.send(Ok(StreamEvent::TextDelta(text.clone()))).await;
@@ -66,7 +96,12 @@ impl Provider {
                     for block in blocks {
                         let _ = tx.send(Ok(StreamEvent::BlockDone(block))).await;
                     }
-                    let _ = tx.send(Ok(StreamEvent::Done { stop_reason: None })).await;
+                    let _ = tx
+                        .send(Ok(StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        }))
+                        .await;
                 });
             }
             Provider::Anthropic { key, base } => {
@@ -74,7 +109,7 @@ impl Provider {
                 let key = key.clone();
                 let body = json!({
                     "model": model,
-                    "max_tokens": 8192,
+                    "max_tokens": MAX_OUTPUT_TOKENS,
                     "system": system,
                     "messages": messages,
                     "tools": tools.iter().map(|t| json!({
@@ -95,6 +130,8 @@ impl Provider {
                 let key = key.clone();
                 let body = json!({
                     "model": model,
+                    "max_tokens": MAX_OUTPUT_TOKENS,
+                    "stream_options": {"include_usage": true},
                     "messages": to_openai_messages(system, messages),
                     "tools": tools.iter().map(|t| json!({
                         "type": "function",
@@ -144,6 +181,9 @@ async fn anthropic_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if is_overflow_message(&text) {
+            return Err(anyhow::Error::new(OverflowError));
+        }
         bail!("anthropic http {status}: {text}");
     }
 
@@ -153,6 +193,8 @@ async fn anthropic_stream(
     // inserted, so their deltas fall through harmlessly.
     let mut open: HashMap<u64, AnthropicBlockAcc> = HashMap::new();
     let mut stop_reason: Option<String> = None;
+    let mut input_tokens: Option<u64> = None;
+    let mut output_tokens: Option<u64> = None;
 
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk?;
@@ -162,6 +204,11 @@ async fn anthropic_stream(
                 Err(_) => continue,
             };
             match v["type"].as_str().unwrap_or_default() {
+                "message_start" => {
+                    if let Some(n) = v["message"]["usage"]["input_tokens"].as_u64() {
+                        input_tokens = Some(n);
+                    }
+                }
                 "content_block_start" => {
                     let index = v["index"].as_u64().unwrap_or(0);
                     let cb = &v["content_block"];
@@ -225,16 +272,28 @@ async fn anthropic_stream(
                     if let Some(r) = v["delta"]["stop_reason"].as_str() {
                         stop_reason = Some(r.to_string());
                     }
+                    // Cumulative output tokens ride on message_delta events.
+                    if let Some(n) = v["usage"]["output_tokens"].as_u64() {
+                        output_tokens = Some(n);
+                    }
                 }
                 "message_stop" => {
+                    let usage = input_tokens.map(|input| Usage {
+                        input_tokens: input,
+                        output_tokens: output_tokens.unwrap_or(0),
+                    });
                     let _ = tx
                         .send(Ok(StreamEvent::Done {
                             stop_reason: stop_reason.take(),
+                            usage,
                         }))
                         .await;
                     return Ok(());
                 }
                 "error" => {
+                    if is_overflow_message(&v["error"].to_string()) {
+                        return Err(anyhow::Error::new(OverflowError));
+                    }
                     bail!("anthropic stream error: {}", v["error"]);
                 }
                 _ => {}
@@ -338,6 +397,9 @@ async fn openai_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if is_overflow_message(&text) {
+            return Err(anyhow::Error::new(OverflowError));
+        }
         bail!("openai-compat http {status}: {text}");
     }
 
@@ -346,6 +408,7 @@ async fn openai_stream(
     let mut text = String::new();
     let mut calls: Vec<OpenAiCallAcc> = Vec::new();
     let mut stop_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
     let mut finished = false;
 
     'outer: while let Some(chunk) = byte_stream.next().await {
@@ -360,7 +423,18 @@ async fn openai_stream(
                 Err(_) => continue,
             };
             if !v["error"].is_null() {
+                if is_overflow_message(&v["error"].to_string()) {
+                    return Err(anyhow::Error::new(OverflowError));
+                }
                 bail!("openai-compat stream error: {}", v["error"]);
+            }
+            // With include_usage the final pre-[DONE] chunk carries usage and
+            // empty choices.
+            if v["usage"].is_object() {
+                usage = Some(Usage {
+                    input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                });
             }
             let delta = &v["choices"][0]["delta"];
             if let Some(piece) = delta["content"].as_str() {
@@ -389,11 +463,10 @@ async fn openai_stream(
             }
             if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
                 stop_reason = Some(r.to_string());
+                // Keep reading: with include_usage the usage chunk arrives
+                // after finish_reason, before [DONE].
                 finished = true;
             }
-        }
-        if finished {
-            break;
         }
     }
 
@@ -420,6 +493,6 @@ async fn openai_stream(
             })))
             .await;
     }
-    let _ = tx.send(Ok(StreamEvent::Done { stop_reason })).await;
+    let _ = tx.send(Ok(StreamEvent::Done { stop_reason, usage })).await;
     Ok(())
 }

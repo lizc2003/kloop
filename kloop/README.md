@@ -27,9 +27,33 @@ clock-nanosecond jitter, no `rand` dependency), `CancellationToken`
 interruption, and orphan patching — on interrupt every unanswered `tool_use`
 gets an `is_error` `tool_result` so history stays legal.
 
-## Deliberately out of scope (Phase 2)
+## Compaction (Phase 2, first slice)
 
-Compaction, TUI, MCP, hooks, permission system, multi-session persistence.
+Two complementary defenses keep long sessions inside the context window
+(`src/compact.rs`), both validated first in a dry run on a production codex
+fork:
+
+- **Predictive**: before each sampling round, estimate the current context
+  (provider-reported usage anchors a ~4 chars/token heuristic for anything
+  recorded after it) plus one round of growth (output cap bounded at 20k +
+  15k tool-result reserve); compact BEFORE the request when it would overflow.
+  Windows at or below the growth reserve skip prediction — a non-positive
+  threshold would mean "always compact".
+- **Reactive**: a request rejected as too large (`prompt is too long` /
+  `context_length_exceeded`) compacts once per turn and retries; a second
+  overflow surfaces as an error instead of looping.
+
+Compaction itself asks the model for a structured handoff summary, keeps a
+~2k-token recent tail verbatim (never splitting a tool_use/tool_result pair
+at the boundary), and replaces the rest with the summary — the one
+sanctioned rewrite of the append-only history.
+
+`AGENT_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
+`off` disables compaction).
+
+## Deliberately out of scope (Phase 2 remainder)
+
+TUI, MCP, hooks, permission system, multi-session persistence.
 
 ## Running
 

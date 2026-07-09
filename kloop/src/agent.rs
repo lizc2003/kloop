@@ -6,14 +6,18 @@ use std::time::UNIX_EPOCH;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::compact;
 use crate::history::History;
 use crate::tools::dispatch_tools;
 use crate::tools::tool_defs;
 use crate::tools::ToolCtx;
 use crate::types::ContentBlock;
 use crate::types::Message;
+use crate::types::OverflowError;
 use crate::types::StreamEvent;
 use crate::types::ToolDef;
+use crate::types::Usage;
+use crate::types::MAX_OUTPUT_TOKENS;
 use crate::Config;
 
 pub trait Ui: Send + Sync {
@@ -50,10 +54,72 @@ pub async fn run_turn(
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
+    let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
+    // Overflow is recovered at most once per turn: compact, then retry. A
+    // second overflow after a successful compaction surfaces as an error.
+    let mut overflow_compact_attempted = false;
     for round in 0..cfg.max_rounds {
-        let blocks = match sample_with_retry(cfg, history.messages(), &tools, ui, cancel, stream_text).await
+        // Predictive: compact BEFORE sampling when this round's estimated
+        // growth would overflow the window — don't wait to be rejected.
+        if let Some(window) = cfg.context_window {
+            if history.messages().len() >= 2
+                && compact::predicted_overflow(history.estimated_tokens(), growth, window)
+            {
+                ui.note("predicted context overflow; compacting history");
+                if let Err(e) = compact::run_compaction(cfg, history, ui, cancel).await {
+                    if cancel.is_cancelled() {
+                        return TurnOutcome {
+                            reason: EndReason::Aborted,
+                            final_text: String::new(),
+                            rounds: round,
+                        };
+                    }
+                    // Predictive failure is not fatal: fall through and let
+                    // the request itself succeed or overflow reactively.
+                    ui.note(&format!("predictive compaction failed: {e:#}"));
+                }
+            }
+        }
+
+        let (blocks, usage) = match sample_with_retry(
+            cfg,
+            history.messages(),
+            &tools,
+            ui,
+            cancel,
+            stream_text,
+        )
+        .await
         {
-            Sampled::Blocks(blocks) => blocks,
+            Sampled::Blocks(blocks, usage) => (blocks, usage),
+            Sampled::Overflow => {
+                if cfg.context_window.is_none() || overflow_compact_attempted {
+                    return TurnOutcome {
+                        reason: EndReason::Error(
+                            "context window exceeded (compaction unavailable or already tried)"
+                                .into(),
+                        ),
+                        final_text: String::new(),
+                        rounds: round,
+                    };
+                }
+                overflow_compact_attempted = true;
+                ui.note("context window exceeded; compacting and retrying");
+                match compact::run_compaction(cfg, history, ui, cancel).await {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        return TurnOutcome {
+                            reason: if cancel.is_cancelled() {
+                                EndReason::Aborted
+                            } else {
+                                EndReason::Error(format!("reactive compaction failed: {e:#}"))
+                            },
+                            final_text: String::new(),
+                            rounds: round,
+                        }
+                    }
+                }
+            }
             Sampled::Cancelled => {
                 return TurnOutcome {
                     reason: EndReason::Aborted,
@@ -70,6 +136,11 @@ pub async fn run_turn(
             }
         };
         history.record(Message::assistant(blocks.clone()));
+        if let Some(usage) = usage {
+            // input + output = full context size at this request; anchors the
+            // char-heuristic estimate for items recorded after this point.
+            history.note_usage(usage.total());
+        }
 
         let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()
@@ -122,13 +193,15 @@ pub async fn run_turn(
 }
 
 enum Sampled {
-    Blocks(Vec<ContentBlock>),
+    Blocks(Vec<ContentBlock>, Option<Usage>),
+    Overflow,
     Cancelled,
     Failed(String),
 }
 
 enum SampleError {
     Cancelled,
+    Overflow,
     Retryable(String),
 }
 
@@ -144,8 +217,11 @@ async fn sample_with_retry(
 ) -> Sampled {
     for attempt in 0..MAX_ATTEMPTS {
         match sample_once(cfg, messages, tools, ui, cancel, stream_text).await {
-            Ok(blocks) => return Sampled::Blocks(blocks),
+            Ok((blocks, usage)) => return Sampled::Blocks(blocks, usage),
             Err(SampleError::Cancelled) => return Sampled::Cancelled,
+            // Retrying an oversized request verbatim can never succeed; hand
+            // it straight to the reactive compaction path.
+            Err(SampleError::Overflow) => return Sampled::Overflow,
             Err(SampleError::Retryable(e)) => {
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Sampled::Failed(e);
@@ -178,7 +254,7 @@ async fn sample_once(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
-) -> Result<Vec<ContentBlock>, SampleError> {
+) -> Result<(Vec<ContentBlock>, Option<Usage>), SampleError> {
     let mut rx = cfg.provider.stream(&cfg.model, &cfg.system, messages, tools);
     let mut blocks = Vec::new();
     loop {
@@ -186,14 +262,19 @@ async fn sample_once(
             _ = cancel.cancelled() => return Err(SampleError::Cancelled),
             event = rx.recv() => match event {
                 None => return Err(SampleError::Retryable("stream closed early".into())),
-                Some(Err(e)) => return Err(SampleError::Retryable(format!("{e:#}"))),
+                Some(Err(e)) => {
+                    if e.downcast_ref::<OverflowError>().is_some() {
+                        return Err(SampleError::Overflow);
+                    }
+                    return Err(SampleError::Retryable(format!("{e:#}")));
+                }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
                     if stream_text {
                         ui.text_delta(&t);
                     }
                 }
                 Some(Ok(StreamEvent::BlockDone(b))) => blocks.push(b),
-                Some(Ok(StreamEvent::Done { .. })) => return Ok(blocks),
+                Some(Ok(StreamEvent::Done { usage, .. })) => return Ok((blocks, usage)),
             }
         }
     }
@@ -238,6 +319,7 @@ mod tests {
             system: "test".into(),
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
+            context_window: None,
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -302,6 +384,129 @@ mod tests {
                 content: "(no output)".into(),
                 is_error: false,
             }
+        );
+    }
+
+    fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
+        Arc::new(Config {
+            provider: Arc::new(provider),
+            model: "mock".into(),
+            system: "test".into(),
+            max_rounds: 10,
+            offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
+            context_window: Some(window),
+        })
+    }
+
+    /// Predictive: a fat history under a small (but > growth reserve) window
+    /// triggers compaction BEFORE the sampling request. Mock turn 1 serves
+    /// the summary, turn 2 the actual reply.
+    #[tokio::test]
+    async fn predictive_compaction_fires_before_sampling() {
+        let provider = Provider::mock(vec![
+            vec![ContentBlock::Text {
+                text: "summary of everything so far".into(),
+            }],
+            vec![ContentBlock::Text {
+                text: "final answer".into(),
+            }],
+        ]);
+        // growth = 8192 + 15_000 = 23_192; window 30_000 → threshold ≈ 6_808
+        // tokens ≈ 27k chars. Two fat user messages blow past it.
+        let cfg = compaction_cfg(provider, 30_000, "predictive");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("x".repeat(30_000)));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "y".repeat(30_000),
+        }]));
+        history.record(Message::user_text("now answer briefly"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "final answer");
+        let msgs = history.messages();
+        // [summary, ...kept tail..., assistant reply]; the fat prefix is gone.
+        let ContentBlock::Text { text } = &msgs[0].content[0] else {
+            panic!("expected text summary at history start");
+        };
+        assert!(
+            text.starts_with(crate::compact::SUMMARY_PREFIX),
+            "history should start with the compaction summary"
+        );
+        assert!(
+            history.estimated_tokens() < 5_000,
+            "compaction should have shrunk the history, got {} tokens",
+            history.estimated_tokens()
+        );
+    }
+
+    /// Reactive: the first sampling request is rejected as too large; the
+    /// loop compacts once (mock turn 2 = summary) and retries successfully
+    /// (turn 3), with no user-visible error.
+    #[tokio::test]
+    async fn overflow_compacts_and_retries() {
+        use crate::provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Overflow,
+            MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "summary of everything so far".into(),
+            }]),
+            MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "recovered answer".into(),
+            }]),
+        ]);
+        // Large window: predictive stays silent, only the reactive path runs.
+        let cfg = compaction_cfg(provider, 200_000, "reactive");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("earlier context"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "earlier reply".into(),
+        }]));
+        history.record(Message::user_text("the request that overflows"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "recovered answer");
+        let ContentBlock::Text { text } = &history.messages()[0].content[0] else {
+            panic!("expected text summary at history start");
+        };
+        assert!(text.starts_with(crate::compact::SUMMARY_PREFIX));
+    }
+
+    /// A second overflow after a successful compaction must surface as an
+    /// error instead of looping.
+    #[tokio::test]
+    async fn repeated_overflow_surfaces_error() {
+        use crate::provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Overflow,
+            MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "summary".into(),
+            }]),
+            MockTurn::Overflow,
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "reactive-repeat");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("earlier context"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "earlier reply".into(),
+        }]));
+        history.record(Message::user_text("still too big"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert!(
+            matches!(outcome.reason, EndReason::Error(_)),
+            "second overflow must not loop, got {:?}",
+            outcome.reason
         );
     }
 }

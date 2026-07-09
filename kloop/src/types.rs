@@ -58,6 +58,39 @@ impl Message {
     }
 }
 
+/// Maximum output tokens requested per sampling call; also feeds the
+/// per-round growth estimate used by predictive compaction.
+pub const MAX_OUTPUT_TOKENS: u64 = 8192;
+
+/// Real token usage reported by the provider for one sampling call.
+/// input + output = the full context size at that request, which anchors
+/// the char-heuristic estimate for messages recorded afterwards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl Usage {
+    pub fn total(self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+/// The provider rejected the request for exceeding the context window.
+/// Detected via anyhow downcast so the agent can compact and retry instead
+/// of treating it as a transient error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverflowError;
+
+impl std::fmt::Display for OverflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("context window exceeded")
+    }
+}
+
+impl std::error::Error for OverflowError {}
+
 /// Events emitted by a provider while one sampling request streams.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
@@ -68,7 +101,10 @@ pub enum StreamEvent {
     /// Stream finished cleanly. stop_reason is informational only: the loop
     /// decides continuation from the presence of tool_use blocks, never from
     /// stop_reason (unreliable across providers).
-    Done { stop_reason: Option<String> },
+    Done {
+        stop_reason: Option<String>,
+        usage: Option<Usage>,
+    },
 }
 
 /// JSON-schema spec for one tool, provider-agnostic.

@@ -1,4 +1,5 @@
 mod agent;
+mod compact;
 mod history;
 mod provider;
 mod sse;
@@ -32,6 +33,8 @@ pub struct Config {
     pub system: String,
     pub max_rounds: usize,
     pub offload_dir: PathBuf,
+    /// Usable context window in tokens; None disables compaction entirely.
+    pub context_window: Option<u64>,
 }
 
 impl Config {
@@ -43,12 +46,21 @@ impl Config {
             cwd.display()
         );
         let offload_dir = PathBuf::from(".kloop/offload");
+        // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
+        let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
+            Some("off") | Some("0") => None,
+            Some(raw) => Some(raw.parse::<u64>().context(
+                "AGENT_CONTEXT_WINDOW must be a token count or 'off'",
+            )?),
+            None => Some(200_000),
+        };
         let base = Self {
             provider: Arc::new(Provider::mock(vec![])),
             model: "mock".into(),
             system,
             max_rounds: 30,
             offload_dir,
+            context_window,
         };
         if mock {
             return Ok(Config {
