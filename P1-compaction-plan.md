@@ -1,5 +1,8 @@
 # P1 设计:codex fork 的 predictive / reactive 压缩
 
+> **✅ 已实现(2026-07-09)**:分支 `codex/worktree/predictive_reactive_compaction`,提交 `57c746ef7`,Buildbot `codex-macos-aarch64-debug` #66 SUCCESS。
+> 实现偏差与发现:① 增长预留(35k)可能大于小窗口,阈值为负会"永远触发"——已加守卫(窗口 ≤ 预留时跳过 predictive,交给普通阈值层),这是 cc 因生产窗口够大而从未暴露的盲点;② 两个新行为各有 Feature 旗标(`predictive_compaction` / `compact_on_context_overflow`,默认开);③ Codex 专属集成测试按仓库约定放独立 `compact_fork_tests.rs`;④ 本地测试必须 `just test`(设 RUST_MIN_STACK),裸 cargo test 栈溢出;⑤ P1-c(压缩内部按整轮丢弃 + get_context_remaining 增强)未做,留待后续。
+
 > 依据:2026-07-09 对 codex 与 claude-code(逆向版)两边压缩机制的全量调研。
 > 所有 codex 路径相对 `refs/codex/`,cc 路径相对 `~/work/claude-code/`。
 
