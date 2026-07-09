@@ -1,6 +1,6 @@
-# Plan 7 — 会话持久化(rollout / resume)
+# Plan 7 — 会话持久化(rollout / resume)✅ 已完成(2026-07-09)
 
-> 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex `codex-rs/rollout` crate 的思路(JSONL 逐条追加),但按 kloop 体量做最小版。
+> 历史记录。参考:codex `codex-rs/rollout` crate 的思路(JSONL 逐条追加),按 kloop 体量做了最小版。
 
 ## 目标
 
@@ -31,3 +31,13 @@
 ## 完成标准
 
 fmt/clippy/test 全绿;真实跑一次:对话 → exit → --resume → 模型能引用上次内容(用 mock 或真 key 验证);README 更新。
+
+## 结果
+
+提交 `47f165a`:
+
+- 压缩落盘的"二选一"按用户指示看了参考项目定案:codex 是压缩标记行 + 继续追加,标记内嵌完整替换历史(`CompactedItem.replacement_history`),重放读到标记整体替换(`rollout/src/list.rs:1380`)——照此实现,文件保持 append-only 可审计,恢复不需要重跑压缩逻辑。
+- `crates/core/src/rollout.rs`:行格式 `{"type":"message",...}` / `{"type":"compacted","replacement":[...]}`;load 截断到最后完整行;恢复后跑孤儿修补(复用 tools.rs 的 interrupted)。History 挂可选 Rollout 写透(record/replace_all),写失败降级纯内存不打断会话;`History::resume` 直接装入不重写文件,并 fetch_max 同步 offload 计数器。子 agent 历史不持久化。
+- CLI:`--resume [id]` / `--list-sessions`;session id 用 UTC 时间戳 `YYYYMMDD-HHMMSS`(手写 civil_from_days,不引 chrono/rand),同秒冲突加序号;`--resume` 无 id 按 mtime 取最近。
+- 测试 54 → 65:往返、压缩标记重放、孤儿修补(全缺 + 部分缺就地补齐)、坏尾行截断、计数器不撞旧文件、写透一致性、跨"重启"的完整 persist → resume 回合(mock)。
+- 实跑验证:`--mock` → `--mock --resume` × 2 + `--list-sessions`;其中一次进程被 SIGPIPE 中途杀掉,恢复保住完整前缀并补齐配对——意外验证了崩溃恢复路径;三次运行 offload 文件 off-0001..0006 无覆盖。
