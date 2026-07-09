@@ -1,6 +1,6 @@
 # Plan 1 — MVP:五个架构赌注 ✅ 已完成(2026-07-09)
 
-> 历史记录。详细过程见 `docs/HANDOFF-mvp.md`。
+> 历史记录。调研结论见 `refs/README.md`;原始交接文档在 git 历史(commit `91dfa0b` 前后的 HANDOFF.md)。
 
 ## 任务
 

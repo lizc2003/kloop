@@ -1,6 +1,6 @@
 # Plan 2 — 压缩双防线(predictive / reactive)✅ 已完成(2026-07-09)
 
-> 历史记录。设计与 codex 预演详见 `docs/P1-compaction-plan.md`。
+> 历史记录。cc 设计参考与 codex 预演记录见 `refs/README.md`;原始设计文档在 git 历史(P1-compaction-plan.md)。
 
 ## 任务
 
