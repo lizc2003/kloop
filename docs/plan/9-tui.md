@@ -50,4 +50,4 @@ fmt/clippy/test 全绿;真 key 手工验收:流式输出、工具状态、Ctrl+C
 - [x] `--resume` 进 TUI,上下文延续(模型准确复述旧会话内容)
 - [x] `--plain` 行为与之前一致,exit 0
 
-**已知 UX 缺口(验收发现,未修)**:`--resume` 后转录区空白——历史在、上下文有效,但旧消息不回显(plain REPL 同样不回显,TUI 里空屏更迷惑)。修法明确:从恢复的 History 预填 App cells(纯函数,可测),待用户拍板是否做。
+**验收发现的 UX 缺口(已修)**:`--resume` 后转录区空白——历史在、上下文有效,但旧消息不回显。修复:`cells_from_history`(纯函数,app.rs)把恢复的 History 重放成 cells——用户/助手文本直出,tool_use 按配对 tool_result 的 is_error 还原 ✓/✗(孤儿按 ✗),tool_result 正文不进转录,末尾加 `[resumed session — N message(s)]` note;单测锁形状,PTY 场景真 key 复验(旧会话完整重现 + 模型答对旧上下文问题)。

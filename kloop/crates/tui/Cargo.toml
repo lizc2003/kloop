@@ -14,3 +14,6 @@ ratatui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 unicode-width = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

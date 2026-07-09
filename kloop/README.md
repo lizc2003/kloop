@@ -172,6 +172,11 @@ interrupts the running turn or clears the input when idle, Ctrl+D quits,
 Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom on
 send). `--plain` keeps the old line-based REPL.
 
+`--resume` replays the saved session into the transcript (user/assistant
+text plus tool status rows re-derived from the recorded tool_use/tool_result
+pairs), so a resumed session starts with its conversation visible instead of
+a blank screen.
+
 ## Deliberately out of scope (Phase 2 remainder)
 
 MCP, hooks.
@@ -211,7 +216,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 115 tests across the workspace:
+`cargo test` runs 116 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).

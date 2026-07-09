@@ -11,6 +11,9 @@ use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::Role;
 use tokio::sync::oneshot;
 
 use crate::events::AgentEvent;
@@ -231,6 +234,59 @@ impl App {
     }
 }
 
+/// Replay a resumed session's history into transcript cells so `--resume`
+/// shows the conversation instead of a blank screen. Tool calls collapse to
+/// the same status rows the live path produces: paired result's `is_error`
+/// decides ✓/✗, and an unpaired call renders as failed (resume repair marks
+/// orphans as interrupted errors anyway). Tool-result blocks themselves are
+/// skipped — their content is history-internal.
+pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
+    let result_errors: HashMap<&str, bool> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => Some((tool_use_id.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    let mut cells = Vec::new();
+    for message in messages {
+        for block in &message.content {
+            match (message.role, block) {
+                (Role::User, ContentBlock::Text { text }) => {
+                    cells.push(Cell::User(text.clone()));
+                }
+                (Role::Assistant, ContentBlock::Text { text }) => {
+                    cells.push(Cell::Assistant(text.clone()));
+                }
+                (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
+                    cells.push(Cell::Tool {
+                        name: name.clone(),
+                        // Same 120-char cap as the live tool_start summary.
+                        summary: input.to_string().chars().take(120).collect(),
+                        status: match result_errors.get(id.as_str()) {
+                            Some(false) => ToolStatus::Ok,
+                            Some(true) | None => ToolStatus::Failed,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if !cells.is_empty() {
+        cells.push(Cell::Note(format!(
+            "resumed session — {} message(s)",
+            messages.len()
+        )));
+    }
+    cells
+}
+
 fn byte_index(s: &str, char_index: usize) -> usize {
     s.char_indices()
         .nth(char_index)
@@ -377,6 +433,83 @@ mod tests {
         assert_eq!(app.confirms.front().unwrap().req.description, "second");
         app.on_key(key(KeyCode::Char('n')));
         assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
+    }
+
+    #[test]
+    fn history_replays_into_cells_with_tool_status_pairing() {
+        use serde_json::json;
+        let messages = vec![
+            Message::user_text("do two things"),
+            Message::assistant(vec![
+                ContentBlock::Text {
+                    text: "on it".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "t2".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "x"}),
+                },
+            ]),
+            Message::tool_results(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "big output not shown".into(),
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "t2".into(),
+                    content: "declined".into(),
+                    is_error: true,
+                },
+            ]),
+            Message::assistant(vec![
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+                // Orphaned call (no result recorded): renders as failed.
+                ContentBlock::ToolUse {
+                    id: "t3".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "true"}),
+                },
+            ]),
+        ];
+        assert_eq!(
+            cells_from_history(&messages),
+            vec![
+                Cell::User("do two things".into()),
+                Cell::Assistant("on it".into()),
+                Cell::Tool {
+                    name: "bash".into(),
+                    summary: r#"{"command":"ls"}"#.into(),
+                    status: ToolStatus::Ok,
+                },
+                Cell::Tool {
+                    name: "write_file".into(),
+                    summary: r#"{"path":"x"}"#.into(),
+                    status: ToolStatus::Failed,
+                },
+                Cell::Assistant("done".into()),
+                Cell::Tool {
+                    name: "bash".into(),
+                    summary: r#"{"command":"true"}"#.into(),
+                    status: ToolStatus::Failed,
+                },
+                Cell::Note("resumed session — 4 message(s)".into()),
+            ],
+            "tool_result content stays out of the transcript; only status pairs back"
+        );
+
+        assert_eq!(
+            cells_from_history(&[]),
+            vec![],
+            "fresh session: no cells, no note"
+        );
     }
 
     #[tokio::test]

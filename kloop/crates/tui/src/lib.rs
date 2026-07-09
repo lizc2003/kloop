@@ -60,6 +60,10 @@ pub async fn run(
         Arc::new(move |s: &str| note_ui.note(s)),
     )?);
 
+    // Snapshot before the worker takes History: a resumed session replays
+    // into the transcript instead of starting on a blank screen.
+    let resumed_cells = app::cells_from_history(history.messages());
+
     let (turn_tx, turn_rx) = mpsc::unbounded_channel();
     let worker = tokio::spawn(agent_worker(
         cfg,
@@ -70,7 +74,7 @@ pub async fn run(
     ));
 
     let mut terminal = setup_terminal()?;
-    let result = ui_loop(&mut terminal, event_rx, turn_tx, session_id).await;
+    let result = ui_loop(&mut terminal, event_rx, turn_tx, session_id, resumed_cells).await;
     restore_terminal();
     // The worker holds the session rollout; aborting mid-write is equivalent
     // to a killed session, which resume already repairs.
@@ -124,8 +128,10 @@ async fn ui_loop(
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     turns: mpsc::UnboundedSender<Turn>,
     session_id: String,
+    resumed_cells: Vec<app::Cell>,
 ) -> Result<()> {
     let mut app = App::new(session_id);
+    app.cells = resumed_cells;
     let mut keys = EventStream::new();
     let mut current_cancel: Option<CancellationToken> = None;
     loop {
