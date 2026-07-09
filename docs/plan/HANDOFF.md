@@ -8,10 +8,10 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–9 完成)
+## 二、当前状态(plan 1–9、12 完成)
 
-**结构**:Cargo workspace,五 crate 严格单向依赖链(详见 `kloop/README.md` Layout 节):
-`kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← `kloop-tui`(ratatui 前端,独占终端)← `kloop`(cli,解析参数后分发)。
+**结构**:Cargo workspace,六 crate,到 core 为止严格单链,其上两个平级前端(详见 `kloop/README.md` Layout 节):
+`kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发)。
 
 **能力**(全部真实 API 验证过,除注明):
 - 5 个原始赌注:append-only 历史 + 录入时 offload(>8000 字符落盘 + 指针 + read_offloaded 回读)、tool_use 有无判续跑、按入参动态并发(连续安全调用并发批)、task 子 agent 递归复用 run_turn(深度限 1)、provider 适配缝(Anthropic SSE / OpenAI-compat / Mock)。
@@ -20,9 +20,10 @@
 - token 记账:provider 回传 usage(Anthropic message_start/delta;OpenAI include_usage,usage 块在 finish_reason 后到)锚点 + 其后消息 chars/4 估算;压缩后锚点作废。
 - 权限门(`core/src/permissions.rs` + `core/src/shell.rs`;双轨真实 API 全流程验证过,记录见 plan 8):cc 形态管线——deny 规则 → 安全检查(危险命令 `rm -rf`/`sudo`、敏感路径 `.git`/`.kloop`/`.ssh`/rc/`.env*`,**bypass 免疫**)→ ask 规则 → bypass → 只读自查 → acceptEdits(cwd 内文件写)→ allow 规则 → 会话缓存 → `Approver` trait 询问(类型擦除 future)。不变量:deny 永远先于 allow。bash 判定跑在 tree-sitter-bash word-only 白名单遍历上(移植 codex shell-command;子 shell/重定向/替换/赋值 → Opaque,永不自动放行/命中 allow/进缓存;`bash -c` 递归解包;只读分类器审查选项含 git 全局选项注入;deny/危险匹配前剥 sudo/env/timeout/xargs wrapper)。规则三形态:`tool` / `bash(tokens [*])`(按段,allow 全段须覆盖、deny 任一段命中)/ `write_file|edit_file|read_file(glob)`(globset,词法规范化路径 + cwd 相对双匹配)。规则来源 `.kloop/config.toml` `[permissions]` allow/deny/ask + `AGENT_ALLOW`/`AGENT_DENY`/`AGENT_ASK` 叠加。询问 y/a/p/n:a = 会话缓存(bash 两词前缀签名、文件按父目录);p = 追加建议规则(`bash(git commit *)` 形)进 config.toml(toml::Table 往返,保留无关段落,不保注释)。拒绝 = is_error tool_result + 改道引导,turn 继续。`Permissions` Arc 挂 Config,子 agent 继承,描述带 `[sub-agent]`/`[destructive]`/`[sensitive path]` 标签。CLI:`--accept-edits`、`--yolo`(= bypass,deny/安全检查仍生效)、`--mock` 才是完全无门。CLI 阻塞读边角:Ctrl+C 打断询问时孤儿读可能吞掉下一行输入(已接受)。调研结论沉淀在 `refs/README.md` 权限系统对比一节;沙箱/escalation/execpolicy 等待有沙箱基建再抄。
 - TUI(`crates/tui`,默认入口;`--plain` 保留裸 REPL,`--mock` 仍走 plain 保持无交互验证命令可用):alternate screen 全屏 + 自维护 cell 缓冲 + 滚动偏移(codex 的 inline viewport 靠 ~35KB vendored CustomTerminal + 自写 scroll-region 机制,对最小可用太重,弃用;见教训 9)。`ChannelUi` 同时实现 `Ui`+`Approver`,事件经 mpsc 进 UI 循环,审批走 oneshot 回传(sender 丢弃 = Deny);agent 在独立 tokio task 持有 History;`App` 纯状态机(delta 聚合、工具行 …/✓/✗、confirm VecDeque 排队、按键→Command);渲染纯函数(CJK 宽度 wrap/truncate、工具行折叠、y/a/p/n 居中弹层);delta 攒批重绘;panic hook 恢复终端。core 配套:`Ui` 加 `tool_start`/`tool_end` 默认方法(默认退化为 note,plain 零改动)。真 key 验收已过(双轨,方法与结果见 plan 9 完成记录)。`--resume` 重放旧会话进转录区(`cells_from_history`:工具行按 tool_result 配对还原 ✓/✗,孤儿 ✗)。
+- server 模式(`crates/server`,cli `--serve`;plan 12,真 key 验收已过):stdio 类 JSON-RPC(信封仿 codex app-server,无 "jsonrpc" 字段),多会话并行——`thread/start|resume|list`、`turn/start|interrupt`;每 thread 独立 task 持有 History(与 tui/plain 共用 `.kloop/sessions/`,会话可互换)+ 独立 Permissions(审批缓存不跨 thread,Config 由 cli 工厂闭包按 thread 构造);通知按 thread 标记(turn/started、text/delta、note、tool/started、tool/completed、turn/completed);审批 = server→client 请求(`srv-{n}` 独立 id 空间),回复 decision 四值,丢失/EOF = deny;`--mock --serve` 可无 key 全协议演示。坑:同秒双 `thread/start` id 相撞(rollout 懒创建),修法 = 选定 id 立即建空文件占位。
 - 会话持久化(`core/src/rollout.rs`):`.kloop/sessions/{id}.jsonl` 逐条写透(History 可挂 Rollout;写失败降级纯内存);每行带信封 id(`{stem}#{seq}`,无 rand)/ parent(上一行 id,跨恢复续链)/ ts,重放线性但链是未来 rewind/fork 的 schema 地基,未知字段读取忽略(前向兼容,测试锁死);压缩追加 compacted 标记内嵌完整替换历史(仿 codex rollout),文件保持 append-only;恢复(`resume_session`)= 重放 + 双向配对修补(正向补 interrupted、反向删孤儿 tool_result)+ 坏尾**物理**截断 + offload 计数器 fetch_max 同步;`load_session` 只读不动文件;usage 锚点不落盘,首次采样重锚定。CLI `--continue`(最近会话)/ `--resume`(无 id = 编号列表选择,UI 启动前 stdio 交互)/ `--resume <id>` / `--list-sessions`,session id 为 UTC 时间戳(手写 civil_from_days,无 chrono);子 agent 历史不持久化。
 
-**测试**:115 个。tui 事件契约(Ui→channel 序列、confirm 往返、丢 sender=Deny)/ App 状态折叠 / 纯渲染(CJK wrap、工具行折叠、输入光标窗口)/ protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / shell 解析契约(word-only、引号拼接、不透明构造、`bash -c` 解包、选项审查、git 注入、wrapper 穿透)/ permissions 管线(deny 胜 allow 与 bypass、安全检查 bypass 免疫、敏感路径不可缓存、ask 规则胜 allow、acceptEdits 边界、glob 规则、两词缓存、AllowAlways 持久化、Opaque 不可缓存)/ history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数、时间戳、config 往返。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
+**测试**:126 个。server wire 契约 + duplex 协议测试(流式/审批往返/并行不串/同秒 id/忙拒绝/interrupt/协议错误韧性/跨重启 resume)/ tui 事件契约(Ui→channel 序列、confirm 往返、丢 sender=Deny)/ App 状态折叠 / 纯渲染(CJK wrap、工具行折叠、输入光标窗口)/ protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / shell 解析契约(word-only、引号拼接、不透明构造、`bash -c` 解包、选项审查、git 注入、wrapper 穿透)/ permissions 管线(deny 胜 allow 与 bypass、安全检查 bypass 免疫、敏感路径不可缓存、ask 规则胜 allow、acceptEdits 边界、glob 规则、两词缓存、AllowAlways 持久化、Opaque 不可缓存)/ history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数、时间戳、config 往返。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
 
 **运行**:真 key 用 `ANTHROPIC_API_KEY`+`ANTHROPIC_BASE_URL`(不含 /v1,适配器自己拼 /v1/messages)或 `OPENAI_API_KEY`+`OPENAI_BASE_URL`+`AGENT_MODEL`;可选 `AGENT_CONTEXT_WINDOW`(默认 200000,off 关压缩)、`AGENT_FALLBACK_MODEL`、`AGENT_PROVIDER`、`AGENT_ALLOW`/`AGENT_DENY`/`AGENT_ASK`(权限规则,叠加在 `.kloop/config.toml` 之上)。
 
@@ -40,4 +41,4 @@
 
 ## 四、进度
 
-下一个:**plan 10(MCP)**,其后 11-hooks(顺序可与用户重新商定)。plan 9 无挂账(真 key 验收已过,双轨;resume 转录回显已修并复验)。
+下一个:**plan 10(MCP)**,其后 11-hooks(顺序可与用户重新商定;12-server 已提前完成)。plan 9/12 无挂账(真 key 验收已过;plan 9 双轨,plan 12 claude 系 + mock 全协议)。
