@@ -1,0 +1,11 @@
+# Rust build artifacts
+kloop/target/
+
+# agent runtime offload output
+.kloop/
+kloop/.kloop/
+
+# reference material (local copies of other repos, not ours to version) —
+# keep only our own guide
+refs/*
+!refs/README.md
