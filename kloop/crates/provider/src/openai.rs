@@ -207,3 +207,84 @@ pub(super) async fn stream(
     let _ = tx.send(Ok(StreamEvent::Done { stop_reason, usage })).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whole-object contract for the history translation: system first,
+    /// assistant text + tool_calls with serialized arguments, tool results
+    /// (error-prefixed when failed) BEFORE any trailing user text.
+    #[test]
+    fn translates_canonical_history_to_chat_messages() {
+        let messages = vec![
+            Message::user_text("do the thing"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "on it".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "file.txt".into(),
+                        is_error: false,
+                    },
+                    ContentBlock::Text {
+                        text: "and hurry".into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t2".into(),
+                    content: "boom".into(),
+                    is_error: true,
+                }],
+            },
+        ];
+        assert_eq!(
+            to_openai_messages("be brief", &messages),
+            vec![
+                json!({"role": "system", "content": "be brief"}),
+                json!({"role": "user", "content": "do the thing"}),
+                json!({
+                    "role": "assistant",
+                    "content": "on it",
+                    "tool_calls": [{
+                        "id": "t1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"},
+                    }],
+                }),
+                json!({"role": "tool", "tool_call_id": "t1", "content": "file.txt"}),
+                json!({"role": "user", "content": "and hurry"}),
+                json!({"role": "tool", "tool_call_id": "t2", "content": "[error] boom"}),
+            ]
+        );
+    }
+
+    /// A tool-calls-only assistant message must serialize content as null,
+    /// not an empty string.
+    #[test]
+    fn assistant_without_text_has_null_content() {
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        }])];
+        let out = to_openai_messages("s", &messages);
+        assert!(out[1]["content"].is_null());
+    }
+}

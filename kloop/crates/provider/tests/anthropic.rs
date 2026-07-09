@@ -1,0 +1,211 @@
+//! HTTP contract tests for the Anthropic SSE adapter: scripted wire events
+//! in, StreamEvent sequences out. What the live API validated once, these
+//! keep validated forever.
+
+use std::sync::Arc;
+
+use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
+use kloop_protocol::OverflowError;
+use kloop_protocol::StreamEvent;
+use kloop_protocol::Usage;
+use kloop_provider::Provider;
+use serde_json::json;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+
+fn sse_body(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {}\n\n", e["type"].as_str().unwrap(), e))
+        .collect()
+}
+
+async fn mount_sse(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(body, "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn collect(provider: Provider) -> Vec<anyhow::Result<StreamEvent>> {
+    let provider = Arc::new(provider);
+    let mut rx = provider.stream("test-model", "system", &[Message::user_text("hi")], &[]);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    events
+}
+
+fn anthropic(server: &MockServer) -> Provider {
+    Provider::Anthropic {
+        key: "test-key".into(),
+        base: server.uri(),
+    }
+}
+
+#[tokio::test]
+async fn streams_text_and_tool_use_with_usage() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 120}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"comm"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "and\":\"ls\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 30}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    let ok: Vec<StreamEvent> = events.into_iter().map(|e| e.unwrap()).collect();
+
+    // Deltas stream through, blocks finalize accumulated, Done carries
+    // stop_reason + usage.
+    assert!(matches!(&ok[0], StreamEvent::TextDelta(t) if t == "hel"));
+    assert!(matches!(&ok[1], StreamEvent::TextDelta(t) if t == "lo"));
+    assert!(
+        matches!(&ok[2], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "hello")
+    );
+    assert!(matches!(
+        &ok[3],
+        StreamEvent::BlockDone(ContentBlock::ToolUse { id, name, input })
+            if id == "t1" && name == "bash" && input == &json!({"command": "ls"})
+    ));
+    assert!(matches!(
+        &ok[4],
+        StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
+            if r == "tool_use" && *u == Usage { input_tokens: 120, output_tokens: 30 }
+    ));
+    assert_eq!(ok.len(), 5);
+}
+
+#[tokio::test]
+async fn unknown_block_kinds_are_ignored() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ok"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    // Only the text block survives: delta + done + Done.
+    assert_eq!(ok.len(), 3);
+    assert!(matches!(&ok[1], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "ok"));
+}
+
+#[tokio::test]
+async fn malformed_tool_input_falls_back_to_empty_object() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{not json"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(
+        &ok[0],
+        StreamEvent::BlockDone(ContentBlock::ToolUse { input, .. }) if input == &json!({})
+    ));
+}
+
+#[tokio::test]
+async fn http_overflow_maps_to_overflow_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let err = events.into_iter().next().unwrap().unwrap_err();
+    assert!(
+        err.downcast_ref::<OverflowError>().is_some(),
+        "expected OverflowError, got: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn stream_error_event_surfaces_as_error() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "try later"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let err = events.into_iter().next().unwrap().unwrap_err();
+    assert!(err.downcast_ref::<OverflowError>().is_none());
+    assert!(format!("{err:#}").contains("overloaded_error"));
+}
+
+/// A stream that dies without message_stop closes the channel with no Done —
+/// the agent treats that as retryable.
+#[tokio::test]
+async fn stream_without_message_stop_closes_channel_cleanly() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    // TextDelta only; no BlockDone (block never stopped), no Done, no error.
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].as_ref().unwrap(),
+        StreamEvent::TextDelta(t) if t == "partial"
+    ));
+}

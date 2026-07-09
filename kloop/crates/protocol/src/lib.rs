@@ -119,3 +119,84 @@ pub struct ToolDef {
     pub description: &'static str,
     pub schema: serde_json::Value,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The wire-format contract with the Anthropic Messages API: exact JSON
+    /// shapes, including tag names and the is_error omission rule.
+    #[test]
+    fn content_block_wire_format() {
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Text { text: "hi".into() }).unwrap(),
+            json!({"type": "text", "text": "hi"})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!({"command": "ls"}),
+            })
+            .unwrap(),
+            json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}})
+        );
+        // is_error omitted when false, present when true.
+        assert_eq!(
+            serde_json::to_value(ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "ok".into(),
+                is_error: false,
+            })
+            .unwrap(),
+            json!({"type": "tool_result", "tool_use_id": "t1", "content": "ok"})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "bad".into(),
+                is_error: true,
+            })
+            .unwrap(),
+            json!({"type": "tool_result", "tool_use_id": "t1", "content": "bad", "is_error": true})
+        );
+    }
+
+    #[test]
+    fn message_serde_roundtrip() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::ToolUse {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "pwd"}),
+                },
+            ],
+        };
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, msg);
+        // Roles serialize lowercase.
+        assert!(wire.contains("\"role\":\"assistant\""));
+    }
+
+    #[test]
+    fn message_constructors_set_roles() {
+        assert_eq!(Message::user_text("x").role, Role::User);
+        assert_eq!(Message::assistant(vec![]).role, Role::Assistant);
+        // Tool results ride on a user message per the wire contract.
+        assert_eq!(Message::tool_results(vec![]).role, Role::User);
+    }
+
+    #[test]
+    fn usage_total_sums_both_directions() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 42,
+        };
+        assert_eq!(usage.total(), 142);
+    }
+}

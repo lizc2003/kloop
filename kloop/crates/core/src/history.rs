@@ -136,6 +136,68 @@ mod tests {
     }
 
     #[test]
+    fn estimated_tokens_anchor_math() {
+        let mut h = History::new(temp_dir("anchor"));
+        h.record(Message::user_text("earlier message"));
+        // Provider reports the real context size for everything so far.
+        h.note_usage(1_000);
+        assert_eq!(h.estimated_tokens(), 1_000);
+        // Items after the anchor add their char-heuristic estimate on top.
+        let tail = Message::user_text("x".repeat(400));
+        let tail_estimate = estimate_message_tokens(&tail);
+        h.record(tail.clone());
+        assert_eq!(h.estimated_tokens(), 1_000 + tail_estimate);
+        // Compaction (replace_all) invalidates the anchor: pure estimate again.
+        h.replace_all(vec![tail.clone()]);
+        assert_eq!(h.estimated_tokens(), tail_estimate);
+    }
+
+    #[test]
+    fn offload_ids_unique_across_histories() {
+        // Parent and sub-agent share the offload dir; the process-global
+        // counter must keep their spill files from clobbering each other.
+        let dir = temp_dir("shared");
+        let mut a = History::new(dir.clone());
+        let mut b = History::new(dir.clone());
+        a.record(tool_result("a".repeat(9_000)));
+        b.record(tool_result("b".repeat(9_000)));
+        let id_of = |h: &History| {
+            let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
+                panic!("expected tool result");
+            };
+            let start = content.find("id=off-").expect("pointer has id") + 3;
+            content[start..start + 8].to_string()
+        };
+        assert_ne!(id_of(&a), id_of(&b));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_oversized_blocks_in_a_message_are_offloaded() {
+        let mut h = History::new(temp_dir("mixed"));
+        h.record(Message::tool_results(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "small".into(),
+                content: "tiny".into(),
+                is_error: false,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "big".into(),
+                content: "z".repeat(9_000),
+                is_error: false,
+            },
+        ]));
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
+            panic!()
+        };
+        assert_eq!(content, "tiny");
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[1] else {
+            panic!()
+        };
+        assert!(content.contains("read_offloaded"));
+    }
+
+    #[test]
     fn small_tool_result_kept_verbatim() {
         let mut h = History::new(temp_dir("small"));
         h.record(tool_result("hello".into()));

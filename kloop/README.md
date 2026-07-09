@@ -73,17 +73,29 @@ OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 REPL: type a task; Ctrl+C interrupts the running turn (history is patched and
 stays legal); `exit` or Ctrl+D quits.
 
-## Verification checklist
+## Verification
 
-- `cargo test` — SSE parser, offload spill + pointer, concurrency-safety
-  classification, cancelled-dispatch orphan patching, and a Mock end-to-end
-  turn asserting the exact history shape (concurrent batch → sequential call →
-  final text).
-- `cargo run -- --mock` — six scripted rounds: concurrent read-only batch,
-  oversized output offloaded, `read_offloaded` round-trip, sub-agent spawn,
-  final text.
-- With a real key: ask for something requiring a few commands; confirm
-  streaming text, tool batching notes on stderr, and Ctrl+C interruption.
+`cargo test` runs 54 tests across the workspace:
+
+- **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
+  omission rule, role casing, serde round-trip).
+- **kloop-provider** — history-translation unit tests plus wiremock HTTP
+  contract tests for both adapters: scripted SSE event sequences in,
+  `StreamEvent` sequences asserted out — delta accumulation, usage capture,
+  overflow-error mapping, malformed-input fallbacks, mid-stream death.
+- **kloop-core** — every tool's execute path (output/exit capture, timeout
+  kill, line numbering, parent-dir creation, edit ambiguity, offload id
+  validation, depth guard), dispatch ordering + orphan patching +
+  mid-execution cancel, history offload + usage-anchor math, compaction
+  rebuild/failure-leaves-history-untouched/boundary pairing, and agent-loop
+  end-to-end over the Mock provider: tool batching, predictive + reactive
+  compaction, truncation continuation, retry/fallback, max-rounds,
+  pre-cancelled abort, sub-agent round-trip.
+
+Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
+exercising all five bets), and with a real key both adapters have been
+exercised live including offload round-trips, mid-session predictive
+compaction, and truncation recovery.
 
 ## Layout
 

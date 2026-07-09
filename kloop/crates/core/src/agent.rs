@@ -676,4 +676,134 @@ mod tests {
             "expected a fallback-switch note, got {notes:?}"
         );
     }
+
+    /// Transient provider errors are retried in place; the turn still
+    /// completes without any fallback configured.
+    #[tokio::test]
+    async fn retry_recovers_from_transient_errors() {
+        use kloop_provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Error("blip 1".into()),
+            MockTurn::Error("blip 2".into()),
+            MockTurn::Blocks(text("made it")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "retry");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("hello"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "made it");
+    }
+
+    /// Three failures with no fallback exhaust the retry budget and surface
+    /// the error.
+    #[tokio::test]
+    async fn retries_exhausted_without_fallback_error_out() {
+        use kloop_provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Error("down 1".into()),
+            MockTurn::Error("down 2".into()),
+            MockTurn::Error("down 3".into()),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "exhausted");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("hello"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert!(
+            matches!(&outcome.reason, EndReason::Error(e) if e.contains("down 3")),
+            "expected the last error surfaced, got {:?}",
+            outcome.reason
+        );
+    }
+
+    /// A model that never stops calling tools is cut off at max_rounds, with
+    /// history left legal (every tool_use answered).
+    #[tokio::test]
+    async fn endless_tool_calls_hit_max_rounds() {
+        let provider = Provider::mock(vec![
+            vec![tool_use("t1", "echo 1")],
+            vec![tool_use("t2", "echo 2")],
+            vec![tool_use("t3", "echo 3")],
+            vec![tool_use("t4", "echo 4")],
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "maxrounds")).clone();
+        cfg.max_rounds = 3;
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("loop forever"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::MaxRounds);
+        assert_eq!(outcome.rounds, 3);
+        // 1 user + 3 * (assistant + tool_results): every round paired.
+        assert_eq!(history.messages().len(), 7);
+    }
+
+    /// A token cancelled before the turn starts aborts before sampling.
+    #[tokio::test]
+    async fn pre_cancelled_turn_aborts_immediately() {
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "never sampled".into(),
+        }]]);
+        let cfg = compaction_cfg(provider, 200_000, "precancel");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("hello"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(outcome.rounds, 0);
+        assert_eq!(history.messages().len(), 1, "nothing recorded after abort");
+    }
+
+    /// The task tool spawns a sub-agent that consumes its own turns from the
+    /// same provider and returns its final text as the tool result.
+    #[tokio::test]
+    async fn subagent_roundtrip_returns_final_text() {
+        let provider = Provider::mock(vec![
+            // main agent round 1: spawn the sub-agent
+            vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "task".into(),
+                input: json!({"prompt": "sub work"}),
+            }],
+            // consumed by the sub-agent's own run_turn
+            vec![ContentBlock::Text {
+                text: "sub result".into(),
+            }],
+            // main agent round 2: wrap up
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "subagent");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("delegate"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(
+            history.messages()[2],
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "sub result".into(),
+                is_error: false,
+            }]),
+            "the sub-agent's final text is the tool result"
+        );
+    }
 }

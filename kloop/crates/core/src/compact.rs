@@ -147,6 +147,104 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct NullUi;
+    impl Ui for NullUi {
+        fn text_delta(&self, _: &str) {}
+        fn note(&self, _: &str) {}
+    }
+
+    fn compact_test_cfg(provider: kloop_provider::Provider, tag: &str) -> Arc<Config> {
+        Arc::new(Config {
+            provider: Arc::new(provider),
+            model: "mock".into(),
+            system: "test".into(),
+            max_rounds: 5,
+            offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
+            context_window: Some(200_000),
+            fallback_model: None,
+        })
+    }
+
+    fn seeded_history(offload_dir: std::path::PathBuf) -> History {
+        let mut h = History::new(offload_dir);
+        h.record(Message::user_text("old request"));
+        h.record(Message::assistant(vec![ContentBlock::Text {
+            text: "old work ".repeat(1_500), // ~3.4k tokens: exceeds keep budget
+        }]));
+        h.record(Message::user_text("current request"));
+        h
+    }
+
+    #[tokio::test]
+    async fn run_compaction_rebuilds_history_around_summary() {
+        let provider = kloop_provider::Provider::mock(vec![vec![ContentBlock::Text {
+            text: "what happened so far".into(),
+        }]]);
+        let cfg = compact_test_cfg(provider, "rebuild");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+        run_compaction(&cfg, &mut history, &ui, &CancellationToken::new())
+            .await
+            .expect("compaction should succeed");
+
+        let msgs = history.messages();
+        // [summary, ...kept tail] — the fat prefix is summarized away and the
+        // kept tail survives verbatim.
+        assert_eq!(
+            msgs[0],
+            Message::user_text(format!("{SUMMARY_PREFIX}what happened so far"))
+        );
+        assert_eq!(msgs.last().unwrap(), &Message::user_text("current request"));
+        assert!(msgs.len() < 4);
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_leaves_history_untouched() {
+        let provider =
+            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Error(
+                "summarizer unavailable".into(),
+            )]);
+        let cfg = compact_test_cfg(provider, "fail");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        let before = history.messages().to_vec();
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+
+        assert!(result.is_err());
+        assert_eq!(history.messages(), &before[..], "history must be untouched");
+    }
+
+    #[tokio::test]
+    async fn empty_summary_is_rejected() {
+        let provider =
+            kloop_provider::Provider::mock(vec![vec![ContentBlock::Text { text: "   ".into() }]]);
+        let cfg = compact_test_cfg(provider, "empty");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        let before = history.messages().to_vec();
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+
+        assert!(result.is_err());
+        assert_eq!(history.messages(), &before[..]);
+    }
+
+    #[tokio::test]
+    async fn too_short_history_is_not_compacted() {
+        let provider = kloop_provider::Provider::mock(vec![]);
+        let cfg = compact_test_cfg(provider, "short");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("only message"));
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+
+        assert!(result.is_err());
+        assert_eq!(history.messages().len(), 1);
+    }
+
     #[test]
     fn growth_is_bounded_output_plus_tool_spike() {
         assert_eq!(max_turn_growth(8_192), 8_192 + TOOL_RESULT_GROWTH_ESTIMATE);
