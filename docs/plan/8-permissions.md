@@ -2,7 +2,9 @@
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 canUseTool 回调形态、codex 的 approvals;按 kloop 体量做最小版。
 
-**落地记录(两轮)**:第一轮按"最小版"做了 规则分层 + AGENT_ALLOW + 会话缓存 + Approver trait(abe3510);用户要求"按最优的来"后深调 cc/codex 权限系统(结论沉淀 `refs/README.md` 权限对比节)重做:cc 管线(deny → 安全检查[bypass 免疫] → ask 规则 → bypass → 只读 → acceptEdits → allow → 缓存 → 询问)、bash 判定移植 codex tree-sitter-bash word-only 遍历(新 `core/src/shell.rs`,替换掉一天内被抓出三个注入洞的手写字符串拆分)、只读分类器选项级审查、独立危险分类器、deny 匹配剥 wrapper、路径 glob 规则 + 敏感路径清单、`.kloop/config.toml` + 三个 env 的规则来源、y/a/p/n(a 两词前缀会话缓存,p 持久化建议规则回 config)、`--accept-edits`/`--yolo`(bypass 语义)。fmt/clippy/test 全绿(95 个),--mock + config 冒烟验证过;**真实 API 交互验证(询问出现、y 放行、n 拒绝后模型调整、p 落盘)待用户给 key 后补做**。
+**落地记录(两轮)**:第一轮按"最小版"做了 规则分层 + AGENT_ALLOW + 会话缓存 + Approver trait(abe3510);用户要求"按最优的来"后深调 cc/codex 权限系统(结论沉淀 `refs/README.md` 权限对比节)重做:cc 管线(deny → 安全检查[bypass 免疫] → ask 规则 → bypass → 只读 → acceptEdits → allow → 缓存 → 询问)、bash 判定移植 codex tree-sitter-bash word-only 遍历(新 `core/src/shell.rs`,替换掉一天内被抓出三个注入洞的手写字符串拆分)、只读分类器选项级审查、独立危险分类器、deny 匹配剥 wrapper、路径 glob 规则 + 敏感路径清单、`.kloop/config.toml` + 三个 env 的规则来源、y/a/p/n(a 两词前缀会话缓存,p 持久化建议规则回 config)、`--accept-edits`/`--yolo`(bypass 语义)。fmt/clippy/test 全绿(95 个),--mock + config 冒烟验证过。
+
+**真实 API 验证(2026-07-09,expect 驱动 PTY,双轨)**:claude 系(claude-sonnet-5)与 openai-compat(gpt-5.4)各自跑通——询问出现且描述正确;y 放行(文件内容精确);n 后模型收到拒绝并按指令回 CANNOT-WRITE、文件未创建;只读 `ls` 不弹询问;`p` 落盘 `write_file(notes/**)` 进 config.toml 且新会话即时生效;`rm -rf` 带 `[destructive]` 标签强制询问;`AGENT_DENY='bash(rm *)'` 不弹询问直接拒、模型改道回 BLOCKED、目标目录完好。expect 脚本在会话 scratchpad(未入库);key 未落任何提交文件。
 
 ## 目标
 
