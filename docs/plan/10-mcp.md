@@ -1,6 +1,6 @@
 # Plan 10 — MCP 客户端 ✅(299d165)
 
-> 完成记录:按设计落地,含 ToolDef String 重构、`crates/mcp`(纯 wire,只依赖 protocol)、core `ToolSource` 缝、cli 胶水(`[mcp.servers]` 解析 + `{server}__{tool}` 命名 + 适配器)。调研结论(cc/codex/claw 对比:换行分帧、必发 initialized、原始名调用、`-` 折 `_` 的原因)沉淀在 HANDOFF 能力条目与教训 9/10。143 测试全绿;无 key 下真实 filesystem server 握手+14 工具清单验证过。**挂账:真模型 `tools/call` 闭环验收(需 API key,问用户)。**
+> 完成记录:按设计落地,含 ToolDef String 重构、`crates/mcp`(纯 wire,只依赖 protocol)、core `ToolSource` 缝、cli 胶水(`[mcp.servers]` 解析 + `{server}__{tool}` 命名 + 适配器)。调研结论(cc/codex/claw 对比:换行分帧、必发 initialized、原始名调用、`-` 折 `_` 的原因)沉淀在 HANDOFF 能力条目与教训 9/10。143 测试全绿。真 key 验收(双轨全过):官方 filesystem server(`npx -y @modelcontextprotocol/server-filesystem sandbox`)+ `AGENT_ALLOW` 预放行,claude-sonnet-5 与 gpt-5.4-mini 均首试正确走 `fs__list_allowed_directories` → `fs__read_text_file` 并精确读回 sandbox 文件内容;allow 规则对 MCP 名字生效、`fs__` 前缀路由与原始名调用全程正确。验收中发现并修复:握手超时 10s 会被 `npx -y` 的 registry 重查(实测 13s+)误杀,改 30s(与两参考库一致)。
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:两参考库收敛的 `server__tool` 命名;codex 的 mcp crate 形态。
 

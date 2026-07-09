@@ -32,8 +32,10 @@ use tokio::sync::oneshot;
 /// this client accepts whatever comes back (minimal-client stance).
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// initialize / notifications must answer promptly on a healthy server.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `npx -y ...` servers re-resolve against the registry on every start —
+/// 13s cold-ish starts measured in the wild. 30s matches both reference
+/// implementations' startup timeouts.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// tools/list can be slower on servers that generate schemas lazily.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the built-in bash tool's default budget.
