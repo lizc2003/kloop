@@ -26,7 +26,7 @@ fmt/clippy/test 全绿;真 key 手工验收:流式输出、工具状态、Ctrl+C
 
 **实现**(新 crate `crates/tui`,依赖 core/protocol;cli 依赖 tui 分发):
 
-- 渲染形态:**alternate screen 全屏 + 自维护 cell 缓冲 + 滚动偏移**,不是 codex 的 inline viewport——那套依赖 fork 版 ratatui 的 scroll-region 私有 feature(codex 把 ratatui/crossterm 都 patch 成了 nornagon fork),不值得为最小可用引入。代价是历史不进终端原生 scrollback。
+- 渲染形态:**alternate screen 全屏 + 自维护 cell 缓冲 + 滚动偏移**,不是 codex 的 inline viewport。后者的移植成本不在它的依赖 fork(核实过:ratatui fork 仅 +`expose set_viewport_area` 一个提交,crossterm fork 仅 +`query_fg/bg_color`;scrolling-regions 在上游 ratatui 0.29 本来就有),而在它 vendor 的 ~35KB CustomTerminal(ratatui Terminal 魔改副本)+ insert_history 自写 SetScrollRegion/ResetScrollRegion 命令 + resize reflow 那套机制——对最小可用太重。代价是历史不进终端原生 scrollback。
 - 结构(借鉴 codex 的分层,调研结论已入 `refs/README.md` 风格的对比不再重复):
   - `events.rs`:`AgentEvent` 枚举 + `ChannelUi` 同时实现 `Ui` 和 `Approver`,全部经 unbounded mpsc 进 UI 循环;审批决定走 oneshot 回传,**sender 被丢 = Deny**。
   - `app.rs`:纯状态机。cell 流(User/Assistant/Tool/Note),delta 聚进最后一个开放 Assistant cell,工具行/note 会关闭它保序;confirm 用 VecDeque 排队(并发批可能连发);按键 → `Command`(Submit/Interrupt/Quit)交给循环执行副作用。
