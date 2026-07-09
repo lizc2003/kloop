@@ -1,6 +1,6 @@
 # Plan 10 — MCP 客户端
 
-> 一个会话完成。开工前先读根目录 HANDOFF.md。参考:两参考库收敛的 `server__tool` 命名;codex 的 mcp crate 形态。
+> 一个会话完成。开工前先读根目录 CLAUDE.md(会话启动自动加载)。参考:两参考库收敛的 `server__tool` 命名;codex 的 mcp crate 形态。
 
 ## 目标
 

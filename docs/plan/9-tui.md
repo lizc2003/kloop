@@ -1,6 +1,6 @@
 # Plan 9 — TUI
 
-> 一个会话完成。开工前先读根目录 HANDOFF.md。参考:codex `codex-rs/tui`(ratatui)的整体形态,但只做最小可用。
+> 一个会话完成。开工前先读根目录 CLAUDE.md(会话启动自动加载)。参考:codex `codex-rs/tui`(ratatui)的整体形态,但只做最小可用。
 
 ## 目标
 
