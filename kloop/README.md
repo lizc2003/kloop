@@ -87,13 +87,24 @@ stays legal); `exit` or Ctrl+D quits.
 
 ## Layout
 
+Cargo workspace, two crates:
+
 ```
-src/types.rs     canonical wire types (Anthropic Messages shape) + StreamEvent
-src/sse.rs       incremental SSE parser
-src/provider.rs  Anthropic / OpenAI-compat / Mock adapters behind one seam
-src/history.rs   append-only history with record-time offloading
-src/tools.rs     bash, read/write/edit file, read_offloaded, task (sub-agent);
-                 concurrency-safety classification + batched dispatch
-src/agent.rs     run_turn loop, sampling with retry, Ui trait
-src/main.rs      REPL, Config::from_env, --mock demo script
+crates/core/                 kloop-core — the library
+  src/types.rs               canonical wire types (Anthropic Messages shape),
+                             StreamEvent, Usage, OverflowError
+  src/config.rs              Config (construction is the caller's concern)
+  src/history.rs             append-only history, record-time offloading,
+                             usage-anchored token estimation
+  src/provider/mod.rs        Provider enum + seam; Mock with scripted turns
+  src/provider/anthropic.rs  Anthropic native SSE adapter
+  src/provider/openai.rs     OpenAI-compat chat/completions translation
+  src/provider/sse.rs        incremental SSE parser
+  src/tools.rs               bash, read/write/edit file, read_offloaded, task;
+                             concurrency-safety classification + batched dispatch
+  src/compact.rs             predictive threshold math + compaction rewrite
+  src/agent.rs               run_turn loop, retry/fallback/truncation recovery, Ui
+
+crates/cli/                  kloop — the binary
+  src/main.rs                REPL, env config, StdoutUi, --mock demo
 ```

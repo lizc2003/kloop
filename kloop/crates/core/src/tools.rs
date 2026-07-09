@@ -15,11 +15,11 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::run_turn;
 use crate::agent::EndReason;
 use crate::agent::Ui;
+use crate::config::Config;
 use crate::history::History;
 use crate::types::ContentBlock;
 use crate::types::Message;
 use crate::types::ToolDef;
-use crate::Config;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
 
@@ -175,16 +175,17 @@ pub async fn dispatch_tools(
         if ctx.cancel.is_cancelled() {
             results.extend(batch.iter().map(|(id, _, _)| interrupted(id)));
         } else if safe {
-            let futs = batch
-                .iter()
-                .map(|(id, name, input)| run_one(id.clone(), name.clone(), input.clone(), ctx.clone()));
+            let futs = batch.iter().map(|(id, name, input)| {
+                run_one(id.clone(), name.clone(), input.clone(), ctx.clone())
+            });
             results.extend(futures::future::join_all(futs).await);
         } else {
             for (id, name, input) in batch {
                 if ctx.cancel.is_cancelled() {
                     results.push(interrupted(id));
                 } else {
-                    results.push(run_one(id.clone(), name.clone(), input.clone(), ctx.clone()).await);
+                    results
+                        .push(run_one(id.clone(), name.clone(), input.clone(), ctx.clone()).await);
                 }
             }
         }
@@ -410,21 +411,39 @@ mod tests {
     #[test]
     fn concurrency_safety_by_name_and_input() {
         assert!(is_concurrency_safe("read_file", &json!({"path": "x"})));
-        assert!(is_concurrency_safe("read_offloaded", &json!({"id": "off-0001"})));
-        assert!(!is_concurrency_safe("write_file", &json!({"path": "x", "content": ""})));
+        assert!(is_concurrency_safe(
+            "read_offloaded",
+            &json!({"id": "off-0001"})
+        ));
+        assert!(!is_concurrency_safe(
+            "write_file",
+            &json!({"path": "x", "content": ""})
+        ));
         assert!(!is_concurrency_safe("edit_file", &json!({})));
         assert!(!is_concurrency_safe("task", &json!({"prompt": "x"})));
 
         // read-only commands, incl. pipes and chains of safe segments
         assert!(is_concurrency_safe("bash", &bash_input("ls -la")));
-        assert!(is_concurrency_safe("bash", &bash_input("cat a.txt | grep foo")));
-        assert!(is_concurrency_safe("bash", &bash_input("pwd && git status; wc -l f")));
+        assert!(is_concurrency_safe(
+            "bash",
+            &bash_input("cat a.txt | grep foo")
+        ));
+        assert!(is_concurrency_safe(
+            "bash",
+            &bash_input("pwd && git status; wc -l f")
+        ));
         assert!(is_concurrency_safe("bash", &bash_input("git log -5")));
 
         // unsafe: redirect, unknown command, unsafe git subcommand, empty
-        assert!(!is_concurrency_safe("bash", &bash_input("echo hi > out.txt")));
+        assert!(!is_concurrency_safe(
+            "bash",
+            &bash_input("echo hi > out.txt")
+        ));
         assert!(!is_concurrency_safe("bash", &bash_input("rm -rf /tmp/x")));
-        assert!(!is_concurrency_safe("bash", &bash_input("ls && make build")));
+        assert!(!is_concurrency_safe(
+            "bash",
+            &bash_input("ls && make build")
+        ));
         assert!(!is_concurrency_safe("bash", &bash_input("git push")));
         assert!(!is_concurrency_safe("bash", &bash_input("   ")));
         assert!(!is_concurrency_safe("bash", &json!({})));
@@ -459,7 +478,11 @@ mod tests {
         let results = dispatch_tools(
             vec![
                 ("t1".into(), "bash".into(), bash_input("ls")),
-                ("t2".into(), "write_file".into(), json!({"path": "x", "content": "y"})),
+                (
+                    "t2".into(),
+                    "write_file".into(),
+                    json!({"path": "x", "content": "y"}),
+                ),
             ],
             &ctx,
         )

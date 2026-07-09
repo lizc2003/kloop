@@ -1,0 +1,12 @@
+[package]
+name = "kloop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kloop-core = { workspace = true }
+
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

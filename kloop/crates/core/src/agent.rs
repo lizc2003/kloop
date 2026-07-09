@@ -7,6 +7,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::compact;
+use crate::config::Config;
 use crate::history::History;
 use crate::tools::dispatch_tools;
 use crate::tools::tool_defs;
@@ -18,7 +19,6 @@ use crate::types::StreamEvent;
 use crate::types::ToolDef;
 use crate::types::Usage;
 use crate::types::MAX_OUTPUT_TOKENS;
-use crate::Config;
 
 pub trait Ui: Send + Sync {
     fn text_delta(&self, s: &str);
@@ -177,7 +177,8 @@ pub async fn run_turn(
             // model to continue, a bounded number of times per turn. (A
             // truncated response WITH tool calls needs no special handling:
             // the loop continues naturally and the model resumes itself.)
-            if is_truncated(stop_reason.as_deref()) && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
+            if is_truncated(stop_reason.as_deref())
+                && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
             {
                 truncation_recoveries += 1;
                 ui.note(&format!(

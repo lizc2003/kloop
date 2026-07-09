@@ -460,6 +460,17 @@ name = "kloop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "kloop-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "kloop-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "futures",
  "reqwest",
  "serde",

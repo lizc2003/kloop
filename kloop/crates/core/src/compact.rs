@@ -5,12 +5,12 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Ui;
+use crate::config::Config;
 use crate::history::estimate_message_tokens;
 use crate::history::History;
 use crate::types::ContentBlock;
 use crate::types::Message;
 use crate::types::StreamEvent;
-use crate::Config;
 
 /// Cap on how much of the output limit the growth estimate reserves.
 const OUTPUT_GROWTH_CAP: u64 = 20_000;
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn predicted_overflow_boundary_and_small_window_guard() {
         let growth = max_turn_growth(8_192); // 23_192
-        // At and above the line.
+                                             // At and above the line.
         assert!(predicted_overflow(100_000 - growth, growth, 100_000));
         // One under the line.
         assert!(!predicted_overflow(100_000 - growth - 1, growth, 100_000));
@@ -187,7 +187,9 @@ mod tests {
             Message::user_text("start"),
             tool_use,
             tool_result,
-            Message::assistant(vec![ContentBlock::Text { text: "done".into() }]),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]),
         ];
         let keep_from = keep_from_index(&messages);
         // Small messages all fit the keep budget except we must summarize at
