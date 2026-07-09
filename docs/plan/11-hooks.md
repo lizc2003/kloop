@@ -1,6 +1,8 @@
-# Plan 11 — Hooks
+# Plan 11 — Hooks ✅(0839d61)
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex hooks crate、cc 的 hook 语义(可阻断、可注入上下文)。
+
+**完成记录**:按设计要点全部落地(hooks.rs 归 core、tokio::process、pre_tool 先于权限门、阻断产物、子 agent 继承)。补充定案:阻断理由取 stdout>stderr>exit status;post_* 非 0 只告警;spawn 失败与超时同样放行+告警(fail-open,权限门才是强制层);同事件多 hook 首个阻断短路;matcher 精确匹配;stdout 注入形态 `[{event} hook]\n…`,工具 hook 的经 ToolCtx.hook_context sink 在该轮 tool_results 后记录;`Config` 新增 `session_id` + `hooks: Arc<Hooks>`。测试 143→158。手工验收双轨真 key 过:sonnet-5 与 gpt-5.4-mini 均调 `bash rm`,hook 阻断、模型收到 `blocked by hook: policy: rm is banned…` 后改口,文件未删。
 
 ## 目标
 
