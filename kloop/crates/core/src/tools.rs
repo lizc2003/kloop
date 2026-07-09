@@ -194,7 +194,9 @@ pub async fn dispatch_tools(
     results
 }
 
-fn interrupted(tool_use_id: &str) -> ContentBlock {
+/// Also reused by rollout resume to patch tool_use blocks orphaned by a
+/// killed session.
+pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     ContentBlock::ToolResult {
         tool_use_id: tool_use_id.into(),
         content: "interrupted".into(),

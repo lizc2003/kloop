@@ -1,9 +1,13 @@
 //! kloop CLI: environment-driven configuration, a line-based REPL with
-//! Ctrl+C interruption, and the keyless `--mock` demo.
+//! Ctrl+C interruption, session persistence (`--resume`, `--list-sessions`),
+//! and the keyless `--mock` demo.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -17,10 +21,197 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
+use kloop_core::rollout::load_session;
+use kloop_core::rollout::Rollout;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::Role;
 use kloop_provider::Provider;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionChoice {
+    New,
+    ResumeLatest,
+    Resume(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliArgs {
+    mock: bool,
+    list_sessions: bool,
+    session: SessionChoice,
+}
+
+fn parse_args(args: &[String]) -> Result<CliArgs> {
+    let mut parsed = CliArgs {
+        mock: false,
+        list_sessions: false,
+        session: SessionChoice::New,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mock" => parsed.mock = true,
+            "--list-sessions" => parsed.list_sessions = true,
+            "--resume" => {
+                parsed.session = match args.get(i + 1) {
+                    Some(id) if !id.starts_with('-') => {
+                        i += 1;
+                        SessionChoice::Resume(id.clone())
+                    }
+                    _ => SessionChoice::ResumeLatest,
+                };
+            }
+            other => bail!("unknown argument '{other}' (--mock | --resume [id] | --list-sessions)"),
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+/// Session ids are UTC wall-clock timestamps — readable, sortable, and free
+/// of a rand dependency. A collision within one second gets a numeric suffix.
+fn new_session_id(sessions_dir: &Path) -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let base = timestamp_id(secs);
+    let mut id = base.clone();
+    let mut n = 2;
+    while session_path(sessions_dir, &id).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+fn timestamp_id(unix_secs: u64) -> String {
+    let (y, m, d) = civil_from_days((unix_secs / 86_400) as i64);
+    let rem = unix_secs % 86_400;
+    format!(
+        "{y:04}{m:02}{d:02}-{h:02}{min:02}{s:02}",
+        h = rem / 3600,
+        min = rem % 3600 / 60,
+        s = rem % 60
+    )
+}
+
+/// Days since 1970-01-01 to a UTC civil date (Howard Hinnant's
+/// civil_from_days), so session ids don't need a chrono dependency.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+fn session_path(sessions_dir: &Path, id: &str) -> PathBuf {
+    sessions_dir.join(format!("{id}.jsonl"))
+}
+
+/// All session files, most recently modified first (modified = last active,
+/// which is what `--resume` without an id should pick up).
+fn sessions_by_recency(sessions_dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(sessions_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+fn session_id_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string()
+}
+
+fn list_sessions(sessions_dir: &Path) {
+    let sessions = sessions_by_recency(sessions_dir);
+    if sessions.is_empty() {
+        println!("no saved sessions in {}", sessions_dir.display());
+        return;
+    }
+    for path in sessions {
+        let id = session_id_of(&path);
+        match load_session(&path) {
+            Ok(messages) => println!(
+                "{id}  {} message(s)  {}",
+                messages.len(),
+                first_user_snippet(&messages)
+            ),
+            Err(e) => println!("{id}  (unreadable: {e})"),
+        }
+    }
+}
+
+fn first_user_snippet(messages: &[Message]) -> String {
+    for message in messages {
+        if message.role != Role::User {
+            continue;
+        }
+        for block in &message.content {
+            if let ContentBlock::Text { text } = block {
+                let mut snippet: String = text
+                    .chars()
+                    .take(60)
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
+                if text.chars().count() > 60 {
+                    snippet.push('…');
+                }
+                return snippet;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Build the History for this run: a fresh persisted session by default, or
+/// one replayed from disk for `--resume`.
+fn open_history(
+    cfg: &Config,
+    choice: &SessionChoice,
+    sessions_dir: &Path,
+) -> Result<(History, String)> {
+    let resume_path = match choice {
+        SessionChoice::New => {
+            let id = new_session_id(sessions_dir);
+            let mut history = History::new(cfg.offload_dir.clone());
+            history.attach_rollout(Rollout::new(session_path(sessions_dir, &id)));
+            return Ok((history, id));
+        }
+        SessionChoice::Resume(id) => {
+            let path = session_path(sessions_dir, id);
+            if !path.exists() {
+                bail!("no session '{id}' (try --list-sessions)");
+            }
+            path
+        }
+        SessionChoice::ResumeLatest => sessions_by_recency(sessions_dir)
+            .into_iter()
+            .next()
+            .context("no saved sessions to resume")?,
+    };
+    let id = session_id_of(&resume_path);
+    let messages = load_session(&resume_path)
+        .with_context(|| format!("cannot read session file {}", resume_path.display()))?;
+    println!("[resumed session {id}: {} message(s)]", messages.len());
+    let history = History::resume(cfg.offload_dir.clone(), messages, Rollout::new(resume_path));
+    Ok((history, id))
+}
 
 fn config_from_env(mock: bool) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
@@ -152,12 +343,19 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mock = std::env::args().any(|a| a == "--mock");
-    let cfg = Arc::new(config_from_env(mock)?);
-    let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
-    let mut history = History::new(cfg.offload_dir.clone());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = parse_args(&args)?;
+    let sessions_dir = PathBuf::from(".kloop/sessions");
+    if args.list_sessions {
+        list_sessions(&sessions_dir);
+        return Ok(());
+    }
 
-    if mock {
+    let cfg = Arc::new(config_from_env(args.mock)?);
+    let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
+    let (mut history, session_id) = open_history(&cfg, &args.session, &sessions_dir)?;
+
+    if args.mock {
         history.record(Message::user_text("run the demo"));
         let cancel = CancellationToken::new();
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
@@ -168,7 +366,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("kloop — type a task, 'exit' or Ctrl+D to quit, Ctrl+C to interrupt a running turn");
+    println!(
+        "kloop — session {session_id}; type a task, 'exit' or Ctrl+D to quit, \
+         Ctrl+C to interrupt a running turn"
+    );
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         print!("> ");
@@ -207,4 +408,59 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_covers_all_flags() {
+        assert_eq!(
+            parse_args(&[]).unwrap(),
+            CliArgs {
+                mock: false,
+                list_sessions: false,
+                session: SessionChoice::New,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--mock", "--resume"])).unwrap(),
+            CliArgs {
+                mock: true,
+                list_sessions: false,
+                session: SessionChoice::ResumeLatest,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--resume", "20260709-120000"])).unwrap(),
+            CliArgs {
+                mock: false,
+                list_sessions: false,
+                session: SessionChoice::Resume("20260709-120000".into()),
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--list-sessions"])).unwrap(),
+            CliArgs {
+                mock: false,
+                list_sessions: true,
+                session: SessionChoice::New,
+            }
+        );
+        assert!(parse_args(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn timestamp_ids_match_utc_civil_time() {
+        assert_eq!(timestamp_id(0), "19700101-000000");
+        // date -u -r 1783958400 → 2026-07-13 16:00:00 UTC
+        assert_eq!(timestamp_id(1_783_958_400), "20260713-160000");
+        // leap-year day: 2024-02-29 12:34:56 UTC
+        assert_eq!(timestamp_id(1_709_209_496), "20240229-122456");
+    }
 }

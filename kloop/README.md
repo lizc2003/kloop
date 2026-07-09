@@ -51,9 +51,33 @@ sanctioned rewrite of the append-only history.
 `AGENT_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
 `off` disables compaction).
 
+## Session persistence (Phase 2, second slice)
+
+Every session is persisted to `.kloop/sessions/{id}.jsonl`
+(`crates/core/src/rollout.rs`), one JSON line per recorded message, written
+through as the history records — so a killed process loses at most the line
+being written. Compaction appends a `compacted` marker line carrying the full
+replacement history (the codex rollout pattern): the file stays append-only
+and auditable, and replay just swaps in the replacement and keeps reading.
+
+Resume replays the file, then makes the history legal and consistent again:
+
+- orphaned `tool_use` blocks (session killed before results landed) get the
+  same `is_error` "interrupted" results the live interrupt path uses;
+- a malformed tail line (crash mid-append) truncates to the last intact line
+  instead of failing;
+- the process-global offload counter advances past every `off-NNNN.txt`
+  already on disk, so new spills never clobber files the resumed history
+  points at (usage anchors are not persisted — the estimate re-anchors on
+  the first sampled response).
+
+Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
+dependency); `--resume` picks the most recently modified session, `--resume
+<id>` a specific one, `--list-sessions` shows what's on disk.
+
 ## Deliberately out of scope (Phase 2 remainder)
 
-TUI, MCP, hooks, permission system, multi-session persistence.
+TUI, MCP, hooks, permission system.
 
 ## Running
 
@@ -68,14 +92,20 @@ ANTHROPIC_API_KEY=... cargo run
 OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 # OPENAI_BASE_URL defaults to https://api.openai.com/v1
 # AGENT_PROVIDER=anthropic|openai forces a provider when both keys are set
+
+# sessions
+cargo run -- --list-sessions   # what's on disk, most recent first
+cargo run -- --resume          # continue the most recent session
+cargo run -- --resume <id>     # continue a specific session
 ```
 
 REPL: type a task; Ctrl+C interrupts the running turn (history is patched and
-stays legal); `exit` or Ctrl+D quits.
+stays legal); `exit` or Ctrl+D quits. Every session is saved and resumable —
+see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 54 tests across the workspace:
+`cargo test` runs 65 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -90,7 +120,12 @@ stays legal); `exit` or Ctrl+D quits.
   rebuild/failure-leaves-history-untouched/boundary pairing, and agent-loop
   end-to-end over the Mock provider: tool batching, predictive + reactive
   compaction, truncation continuation, retry/fallback, max-rounds,
-  pre-cancelled abort, sub-agent round-trip.
+  pre-cancelled abort, sub-agent round-trip; rollout round-trip, compacted
+  marker replay, orphan repair on resume, malformed-tail truncation, offload
+  counter sync, and a full persist → restart → resume turn over the Mock
+  provider.
+- **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
+  known dates, leap day).
 
 Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
 exercising all five bets), and with a real key both adapters have been
@@ -124,8 +159,11 @@ crates/core/        kloop-core — the agent, network-free
   src/tools.rs      bash, read/write/edit file, read_offloaded, task;
                     concurrency-safety classification + batched dispatch
   src/compact.rs    predictive threshold math + compaction rewrite
+  src/rollout.rs    session persistence: JSONL append, compacted markers,
+                    replay + orphan repair on resume
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/cli/         kloop — the binary
-  src/main.rs       REPL, env config, StdoutUi, --mock demo
+  src/main.rs       REPL, env config, StdoutUi, --mock demo,
+                    session selection (--resume, --list-sessions)
 ```

@@ -574,6 +574,7 @@ dependencies = [
  "futures",
  "kloop-protocol",
  "kloop-provider",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
