@@ -450,6 +450,7 @@ mod tests {
                 max_rounds: 5,
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
                 context_window: None,
+                fallback_model: None,
             }),
             ui: Arc::new(NullUi),
             cancel,

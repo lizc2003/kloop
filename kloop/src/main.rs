@@ -35,6 +35,8 @@ pub struct Config {
     pub offload_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
     pub context_window: Option<u64>,
+    /// Model to switch to (once per turn) after retries are exhausted.
+    pub fallback_model: Option<String>,
 }
 
 impl Config {
@@ -61,6 +63,7 @@ impl Config {
             max_rounds: 30,
             offload_dir,
             context_window,
+            fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
         };
         if mock {
             return Ok(Config {

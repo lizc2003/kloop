@@ -58,6 +58,10 @@ pub async fn run_turn(
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
+    // The model can be swapped once per turn: after retries are exhausted on
+    // the primary, the rest of the turn runs on the fallback.
+    let mut active_model = cfg.model.clone();
+    let mut truncation_recoveries = 0u32;
     for round in 0..cfg.max_rounds {
         // Predictive: compact BEFORE sampling when this round's estimated
         // growth would overflow the window — don't wait to be rejected.
@@ -81,8 +85,13 @@ pub async fn run_turn(
             }
         }
 
-        let (blocks, usage) = match sample_with_retry(
+        let SampleOk {
+            blocks,
+            usage,
+            stop_reason,
+        } = match sample_with_retry(
             cfg,
+            &active_model,
             history.messages(),
             &tools,
             ui,
@@ -91,7 +100,7 @@ pub async fn run_turn(
         )
         .await
         {
-            Sampled::Blocks(blocks, usage) => (blocks, usage),
+            Sampled::Ok(ok) => ok,
             Sampled::Overflow => {
                 if cfg.context_window.is_none() || overflow_compact_attempted {
                     return TurnOutcome {
@@ -128,11 +137,22 @@ pub async fn run_turn(
                 }
             }
             Sampled::Failed(e) => {
+                // Retries exhausted on the primary model: switch to the
+                // fallback (once) instead of surfacing the error.
+                if let Some(fallback) = &cfg.fallback_model {
+                    if *fallback != active_model {
+                        ui.note(&format!(
+                            "sampling failed on {active_model}; switching to fallback model {fallback}: {e}"
+                        ));
+                        active_model = fallback.clone();
+                        continue;
+                    }
+                }
                 return TurnOutcome {
                     reason: EndReason::Error(e),
                     final_text: String::new(),
                     rounds: round,
-                }
+                };
             }
         };
         history.record(Message::assistant(blocks.clone()));
@@ -152,6 +172,20 @@ pub async fn run_turn(
             })
             .collect();
         if tool_uses.is_empty() {
+            // The turn would end here — but if the response was cut off by
+            // the output limit, ending would strand it mid-thought. Nudge the
+            // model to continue, a bounded number of times per turn. (A
+            // truncated response WITH tool calls needs no special handling:
+            // the loop continues naturally and the model resumes itself.)
+            if is_truncated(stop_reason.as_deref()) && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
+            {
+                truncation_recoveries += 1;
+                ui.note(&format!(
+                    "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
+                ));
+                history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
+                continue;
+            }
             let final_text = blocks
                 .iter()
                 .rev()
@@ -192,8 +226,14 @@ pub async fn run_turn(
     }
 }
 
+struct SampleOk {
+    blocks: Vec<ContentBlock>,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+}
+
 enum Sampled {
-    Blocks(Vec<ContentBlock>, Option<Usage>),
+    Ok(SampleOk),
     Overflow,
     Cancelled,
     Failed(String),
@@ -205,10 +245,23 @@ enum SampleError {
     Retryable(String),
 }
 
+/// The response was cut off by the output token limit ("max_tokens" on the
+/// Anthropic wire, "length" on OpenAI-compat). This is the one legitimate use
+/// of stop_reason: not to decide continuation, but to detect an ungraceful
+/// ending worth recovering from.
+fn is_truncated(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, Some("max_tokens") | Some("length"))
+}
+
+const TRUNCATION_RECOVERY_LIMIT: u32 = 3;
+const TRUNCATION_CONTINUE_MSG: &str = "Your previous response was cut off by the output token \
+limit. Continue exactly where you left off; break the remaining work into smaller pieces.";
+
 const MAX_ATTEMPTS: u32 = 3;
 
 async fn sample_with_retry(
     cfg: &Arc<Config>,
+    model: &str,
     messages: &[Message],
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
@@ -216,8 +269,8 @@ async fn sample_with_retry(
     stream_text: bool,
 ) -> Sampled {
     for attempt in 0..MAX_ATTEMPTS {
-        match sample_once(cfg, messages, tools, ui, cancel, stream_text).await {
-            Ok((blocks, usage)) => return Sampled::Blocks(blocks, usage),
+        match sample_once(cfg, model, messages, tools, ui, cancel, stream_text).await {
+            Ok(ok) => return Sampled::Ok(ok),
             Err(SampleError::Cancelled) => return Sampled::Cancelled,
             // Retrying an oversized request verbatim can never succeed; hand
             // it straight to the reactive compaction path.
@@ -247,15 +300,17 @@ async fn sample_with_retry(
     unreachable!("retry loop always returns")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sample_once(
     cfg: &Arc<Config>,
+    model: &str,
     messages: &[Message],
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
-) -> Result<(Vec<ContentBlock>, Option<Usage>), SampleError> {
-    let mut rx = cfg.provider.stream(&cfg.model, &cfg.system, messages, tools);
+) -> Result<SampleOk, SampleError> {
+    let mut rx = cfg.provider.stream(model, &cfg.system, messages, tools);
     let mut blocks = Vec::new();
     loop {
         tokio::select! {
@@ -274,7 +329,9 @@ async fn sample_once(
                     }
                 }
                 Some(Ok(StreamEvent::BlockDone(b))) => blocks.push(b),
-                Some(Ok(StreamEvent::Done { usage, .. })) => return Ok((blocks, usage)),
+                Some(Ok(StreamEvent::Done { usage, stop_reason })) => {
+                    return Ok(SampleOk { blocks, usage, stop_reason })
+                }
             }
         }
     }
@@ -320,6 +377,7 @@ mod tests {
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
             context_window: None,
+            fallback_model: None,
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -395,6 +453,7 @@ mod tests {
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
             context_window: Some(window),
+            fallback_model: None,
         })
     }
 
@@ -507,6 +566,113 @@ mod tests {
             matches!(outcome.reason, EndReason::Error(_)),
             "second overflow must not loop, got {:?}",
             outcome.reason
+        );
+    }
+
+    fn text(t: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text { text: t.into() }]
+    }
+
+    /// A truncated final response gets a "continue" nudge instead of ending
+    /// the turn mid-thought.
+    #[tokio::test]
+    async fn truncated_response_recovers_with_continuation() {
+        use crate::provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Truncated(text("part one, cut off mid-")),
+            MockTurn::Blocks(text("part two, complete.")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "truncation");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("write something long"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "part two, complete.");
+        assert_eq!(outcome.rounds, 2);
+        // [user, assistant(truncated), user(continue nudge), assistant(rest)]
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(
+            msgs[2],
+            Message::user_text(super::TRUNCATION_CONTINUE_MSG),
+            "the continuation nudge must be recorded so history stays legal"
+        );
+    }
+
+    /// Truncation nudges are bounded: after the limit the turn completes with
+    /// whatever text arrived instead of looping.
+    #[tokio::test]
+    async fn truncation_recovery_is_bounded() {
+        use crate::provider::MockTurn;
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Truncated(text("cut 1")),
+            MockTurn::Truncated(text("cut 2")),
+            MockTurn::Truncated(text("cut 3")),
+            MockTurn::Truncated(text("cut 4")),
+            MockTurn::Truncated(text("cut 5")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "truncation-limit");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("write something very long"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        // 3 nudges (the limit), so the 4th truncated response ends the turn.
+        assert_eq!(outcome.final_text, "cut 4");
+        assert_eq!(outcome.rounds, 4);
+        let nudges = history
+            .messages()
+            .iter()
+            .filter(|m| *m == &Message::user_text(super::TRUNCATION_CONTINUE_MSG))
+            .count();
+        assert_eq!(nudges, 3);
+    }
+
+    /// After the primary model exhausts its retries, the turn continues on
+    /// the fallback model instead of surfacing an error.
+    #[tokio::test]
+    async fn fallback_model_takes_over_after_retries() {
+        use crate::provider::MockTurn;
+        struct NoteUi(std::sync::Mutex<Vec<String>>);
+        impl Ui for NoteUi {
+            fn text_delta(&self, _: &str) {}
+            fn note(&self, s: &str) {
+                self.0.lock().unwrap().push(s.to_string());
+            }
+        }
+
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Error("boom 1".into()),
+            MockTurn::Error("boom 2".into()),
+            MockTurn::Error("boom 3".into()),
+            MockTurn::Blocks(text("answer from fallback")),
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "fallback")).clone();
+        cfg.fallback_model = Some("mock-fallback".into());
+        let cfg = Arc::new(cfg);
+        let note_ui = Arc::new(NoteUi(std::sync::Mutex::new(Vec::new())));
+        let ui: Arc<dyn Ui> = note_ui.clone();
+        let cancel = CancellationToken::new();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("hello"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "answer from fallback");
+        let notes = note_ui.0.lock().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("switching to fallback model mock-fallback")),
+            "expected a fallback-switch note, got {notes:?}"
         );
     }
 }

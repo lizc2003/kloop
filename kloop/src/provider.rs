@@ -21,11 +21,16 @@ use crate::types::ToolDef;
 use crate::types::Usage;
 use crate::types::MAX_OUTPUT_TOKENS;
 
-/// One scripted Mock response: either content blocks or a provider error.
+/// One scripted Mock response: content blocks, a truncated response, or a
+/// provider error.
 pub enum MockTurn {
     Blocks(Vec<ContentBlock>),
+    /// Blocks delivered, but the stream reports the output limit was hit.
+    Truncated(Vec<ContentBlock>),
     /// The request is rejected for exceeding the context window.
     Overflow,
+    /// A transient provider failure (retryable).
+    Error(String),
 }
 
 pub enum Provider {
@@ -81,10 +86,15 @@ impl Provider {
                     }])
                 });
                 tokio::spawn(async move {
-                    let blocks = match turn {
-                        MockTurn::Blocks(blocks) => blocks,
+                    let (blocks, stop_reason) = match turn {
+                        MockTurn::Blocks(blocks) => (blocks, None),
+                        MockTurn::Truncated(blocks) => (blocks, Some("max_tokens".to_string())),
                         MockTurn::Overflow => {
                             let _ = tx.send(Err(anyhow::Error::new(OverflowError))).await;
+                            return;
+                        }
+                        MockTurn::Error(message) => {
+                            let _ = tx.send(Err(anyhow::anyhow!(message))).await;
                             return;
                         }
                     };
@@ -98,7 +108,7 @@ impl Provider {
                     }
                     let _ = tx
                         .send(Ok(StreamEvent::Done {
-                            stop_reason: None,
+                            stop_reason,
                             usage: None,
                         }))
                         .await;
