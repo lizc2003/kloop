@@ -34,6 +34,15 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 
 **其余 cc 常数**(移植时对照):autocompact buffer 按窗口 50k/30k/13k;手动 compact 预留 3k;警告带 20k;单消息工具结果预算 200k 字符、单工具默认 50k;摘要 prompt 九段式(kloop 的 COMPACT_INSTRUCTION 是其精简版);全量压缩后重注入最近读过的 ≤5 个文件现状。
 
+## 会话持久化对比(2026-07-09,plan 7/7b 调研)
+
+三家的落盘语义收敛:JSONL 逐行追加、append-only、延迟建文件、恢复时修补配对。关键分歧与结论:
+
+- **cc 存树不存链**(`src/utils/sessionStorage.ts`):每行是带信封的 Entry(20+ 种类型),消息行带 `uuid`/`parentUuid`/isSidechain/gitBranch;恢复 = 选 leaf 沿 parentUuid 回走再反转(`buildConversationChain`,:2106,带环检测 + 找回被单亲遍历孤儿化的并行 tool_result)。fork/rewind/分支会话全长在这三个字段上。文件在 `~/.claude/projects/<cwd slug>/<uuid>.jsonl`,集中放 home。
+- **压缩持久化两派**:codex 标记行内嵌 `replacement_history`(恢复零重算,拿磁盘换简单);cc 只写 `compact_boundary` 标记 + `isCompactSummary` 普通消息,恢复时对 >5MB 文件做字节级 chunked 前向读、流中截断到最后边界(多 GB transcript 的性能工程,50MB 读上限)。kloop 取 codex 派 + cc 的信封字段(id/parent/ts,plan 7b)。
+- **配对修补 cc 是双向的**(`ensureToolResultPairing`,messages.ts:5580):正向补合成错误块、反向删引用不存在 tool_use 的孤儿 tool_result,且是每次发请求前的防御校验,不只恢复时用。kloop 7b 起同为双向(恢复时)。
+- cc 的性能工程(chunked 读、RSS 优化、200 文件缓存)是规模驱动,不改格式可后补,不属于底子。
+
 ## 预演记录(codex fork,2026-07-09)
 
 kloop 的压缩设计曾先在 codex fork 上完整实现过一轮(分支 `codex/worktree/predictive_reactive_compaction`,提交 57c746ef7,Buildbot 绿,未合入 main):predictive 插在 `run_pre_sampling_compact`、reactive 插在采样错误分支、Feature 双旗标、compact_fork_tests.rs 四个集成测试。价值:验证了设计、抓出小窗口负阈值盲点。教训:kloop 才是项目,参考库不用于开发。
