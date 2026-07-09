@@ -1,6 +1,6 @@
 # Plan 11 — Hooks
 
-> 一个会话完成。开工前先读根目录 CLAUDE.md(会话启动自动加载)。参考:codex hooks crate、cc 的 hook 语义(可阻断、可注入上下文)。
+> 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex hooks crate、cc 的 hook 语义(可阻断、可注入上下文)。
 
 ## 目标
 

@@ -1,6 +1,6 @@
 # Plan 7 — 会话持久化(rollout / resume)
 
-> 一个会话完成。开工前先读根目录 CLAUDE.md(会话启动自动加载)。参考:codex `codex-rs/rollout` crate 的思路(JSONL 逐条追加),但按 kloop 体量做最小版。
+> 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex `codex-rs/rollout` crate 的思路(JSONL 逐条追加),但按 kloop 体量做最小版。
 
 ## 目标
 
@@ -10,7 +10,7 @@
 
 - **格式**:JSONL,一行一个 `Message`(kloop-protocol 已 Serialize/Deserialize,直接用线格式)。文件 `.kloop/sessions/{session_id}.jsonl`,session_id 用时间戳(本项目无 rand 依赖,沿用这一约束)。
 - **写入时机**:History::record 后追加一行(append-only 历史天然适配 append-only 文件);压缩(replace_all)是唯一重写点——策略:压缩后整文件重写,或写入一条压缩标记 + 后续行(倾向后者:保留完整审计,恢复时按标记重放;二选一开工前问用户)。
-- **恢复语义**(CLAUDE.md 教训 5 相关):
+- **恢复语义**(HANDOFF.md 教训 5 相关):
   - usage 锚点不落盘,恢复后从零估算,首次采样自动重新锚定——不需要持久化。
   - offload 指针照常有效(off-NNNN.txt 还在磁盘);但进程级 offload 计数器恢复后从 1 重新数会撞旧文件——恢复时扫 offload 目录取 max+1 初始化计数器。
   - 恢复的历史必须过配对合法性检查(每个 tool_use 有 tool_result;不合法就地补 is_error 结果,复用孤儿修补逻辑)。

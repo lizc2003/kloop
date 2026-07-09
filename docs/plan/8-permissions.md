@@ -1,6 +1,6 @@
 # Plan 8 — 权限系统
 
-> 一个会话完成。开工前先读根目录 CLAUDE.md(会话启动自动加载)。参考:cc 的 canUseTool 回调形态、codex 的 approvals;按 kloop 体量做最小版。
+> 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 canUseTool 回调形态、codex 的 approvals;按 kloop 体量做最小版。
 
 ## 目标
 
