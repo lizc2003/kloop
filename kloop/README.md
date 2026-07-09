@@ -149,14 +149,37 @@ and cache and prompt through the same seam, tagged `[sub-agent]`.
 everything passes *except* deny rules and safety checks). `--mock` disables
 the gate entirely — nobody is at the keyboard.
 
+## TUI (Phase 2, fourth slice)
+
+The default entry point is a ratatui terminal UI (alternate screen): a
+scrolling transcript on top, a one-line status row, and a one-line input at
+the bottom. Tool calls collapse to single status rows (`… bash {...}` while
+running, `✓`/`✗` when done) — their full output lives in history/offload, not
+on screen. Permission prompts appear as a centered y/a/p/n popup; prompts
+from a concurrent tool batch queue and are answered in order.
+
+Structure (`crates/tui`): the agent runs on its own tokio task and owns
+`History`; `ChannelUi` implements both `Ui` and `Approver` by forwarding
+everything as events over an mpsc channel (approval decisions travel back
+over a oneshot; a dropped reply means deny). The UI loop `select!`s crossterm
+key events against agent events, folds both into pure state (`App`), and
+renders via pure cell→line functions — which is what makes the transcript
+logic testable without a terminal. Streaming deltas are drained in batches so
+a burst of tokens redraws once, not per token.
+
+Keys: Enter sends (ignored while a turn runs — no queueing), Ctrl+C
+interrupts the running turn or clears the input when idle, Ctrl+D quits,
+Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom on
+send). `--plain` keeps the old line-based REPL.
+
 ## Deliberately out of scope (Phase 2 remainder)
 
-TUI, MCP, hooks.
+MCP, hooks.
 
 ## Running
 
 ```sh
-# keyless demo: scripted Mock provider exercises all five bets
+# keyless demo: scripted Mock provider exercises all five bets (plain output)
 cargo run -- --mock
 
 # Anthropic (default model claude-sonnet-5; override with AGENT_MODEL)
@@ -166,6 +189,9 @@ ANTHROPIC_API_KEY=... cargo run
 OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 # OPENAI_BASE_URL defaults to https://api.openai.com/v1
 # AGENT_PROVIDER=anthropic|openai forces a provider when both keys are set
+
+# line-based REPL instead of the TUI
+cargo run -- --plain
 
 # sessions
 cargo run -- --list-sessions   # what's on disk, most recent first
@@ -179,13 +205,13 @@ cargo run -- --accept-edits                        # auto-allow cwd file writes
 cargo run -- --yolo                                # bypass (deny/safety still apply)
 ```
 
-REPL: type a task; Ctrl+C interrupts the running turn (history is patched and
-stays legal); `exit` or Ctrl+D quits. Every session is saved and resumable —
-see Session persistence above.
+Both frontends: Ctrl+C interrupts the running turn (history is patched and
+stays legal), Ctrl+D quits (`exit` also works in `--plain`). Every session is
+saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 95 tests across the workspace:
+`cargo test` runs 115 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -212,6 +238,12 @@ see Session persistence above.
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full
   persist → restart → resume turn over the Mock provider.
+- **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
+  decision round-trip, dropped-reply-means-deny), App state folding (delta
+  accumulation and splitting, tool status resolution by id, confirm queueing
+  and keyboard capture, interrupt/quit commands, turn-end cleanup), and pure
+  rendering (CJK-aware wrap/truncate, per-cell-kind lines, tool-row collapse,
+  input window around the cursor).
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
   unrelated-section preservation, malformed rejection).
@@ -227,8 +259,8 @@ every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 
 ## Layout
 
-Cargo workspace, four crates in a strict dependency line
-(protocol ← provider ← core ← cli):
+Cargo workspace, five crates in a strict dependency line
+(protocol ← provider ← core ← tui ← cli):
 
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
@@ -256,8 +288,15 @@ crates/core/        kloop-core — the agent, network-free
                     replay + orphan repair on resume
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
+crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
+  src/events.rs     AgentEvent + ChannelUi (Ui/Approver over channels)
+  src/app.rs        pure state: transcript cells, input, confirm queue
+  src/render.rs     pure cell→line rendering, wrap/truncate, confirm popup
+  src/lib.rs        terminal lifecycle, agent worker task, event loop
+
 crates/cli/         kloop — the binary
-  src/main.rs       REPL, env config, StdoutUi, CliApprover (y/a/p/n prompt),
+  src/main.rs       arg parsing + dispatch (TUI default, --plain REPL),
+                    env config, StdoutUi, CliApprover (y/a/p/n prompt),
                     .kloop/config.toml rule load/persist, --mock demo,
                     session selection (--resume, --list-sessions)
 ```

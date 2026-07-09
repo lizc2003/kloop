@@ -49,6 +49,7 @@ struct CliArgs {
     yolo: bool,
     accept_edits: bool,
     list_sessions: bool,
+    plain: bool,
     session: SessionChoice,
 }
 
@@ -58,6 +59,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
         yolo: false,
         accept_edits: false,
         list_sessions: false,
+        plain: false,
         session: SessionChoice::New,
     };
     let mut i = 0;
@@ -67,6 +69,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--yolo" => parsed.yolo = true,
             "--accept-edits" => parsed.accept_edits = true,
             "--list-sessions" => parsed.list_sessions = true,
+            "--plain" => parsed.plain = true,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
                     Some(id) if !id.starts_with('-') => {
@@ -77,7 +80,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                 };
             }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --resume [id] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --resume [id] | --list-sessions)"
             ),
         }
         i += 1;
@@ -197,14 +200,14 @@ fn first_user_snippet(messages: &[Message]) -> String {
 /// Build the History for this run: a fresh persisted session by default, or
 /// one replayed from disk for `--resume`.
 fn open_history(
-    cfg: &Config,
+    offload_dir: PathBuf,
     choice: &SessionChoice,
     sessions_dir: &Path,
 ) -> Result<(History, String)> {
     let resume_path = match choice {
         SessionChoice::New => {
             let id = new_session_id(sessions_dir);
-            let mut history = History::new(cfg.offload_dir.clone());
+            let mut history = History::new(offload_dir);
             history.attach_rollout(Rollout::new(session_path(sessions_dir, &id)));
             return Ok((history, id));
         }
@@ -224,7 +227,7 @@ fn open_history(
     let (messages, rollout) = resume_session(&resume_path)
         .with_context(|| format!("cannot read session file {}", resume_path.display()))?;
     println!("[resumed session {id}: {} message(s)]", messages.len());
-    let history = History::resume(cfg.offload_dir.clone(), messages, rollout);
+    let history = History::resume(offload_dir, messages, rollout);
     Ok((history, id))
 }
 
@@ -308,7 +311,14 @@ fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn build_permissions(args: &CliArgs) -> Result<Permissions> {
+/// `approver` and `notify` are the UI-facing halves of the permission gate:
+/// the plain REPL passes a blocking stdin prompt + stderr printer, the TUI a
+/// popup + transcript note.
+fn build_permissions(
+    args: &CliArgs,
+    approver: Arc<dyn Approver>,
+    notify: kloop_tui::NoteFn,
+) -> Result<Permissions> {
     // --mock runs a canned turn with nobody at the keyboard: no gating at
     // all. --yolo is bypass mode — deny rules and safety checks still apply.
     if args.mock {
@@ -327,26 +337,24 @@ fn build_permissions(args: &CliArgs) -> Result<Permissions> {
     let persist =
         Box::new(
             move |rules: &[String]| match persist_allow_rules(&config_path, rules) {
-                Ok(()) => eprintln!(
-                    "\x1b[2m[saved to {PERMISSIONS_CONFIG}: {}]\x1b[0m",
+                Ok(()) => notify(&format!(
+                    "saved to {PERMISSIONS_CONFIG}: {}",
                     rules.join(", ")
-                ),
-                Err(e) => eprintln!("\x1b[2m[failed to save allow rule: {e:#}]\x1b[0m"),
+                )),
+                Err(e) => notify(&format!("failed to save allow rule: {e:#}")),
             },
         );
-    Permissions::new(
-        mode,
-        &rules,
-        cwd,
-        Some(Arc::new(CliApprover)),
-        Some(persist),
-    )
-    .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
+    Permissions::new(mode, &rules, cwd, Some(approver), Some(persist))
+        .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
 }
 
-fn config_from_env(args: &CliArgs) -> Result<Config> {
+fn config_from_env(
+    args: &CliArgs,
+    approver: Arc<dyn Approver>,
+    notify: kloop_tui::NoteFn,
+) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
-    let permissions = Arc::new(build_permissions(args)?);
+    let permissions = Arc::new(build_permissions(args, approver, notify)?);
     let system = format!(
         "You are a coding agent working in a CLI. Use the provided tools to inspect and \
              modify files and run commands; keep answers short. Current working directory: {}",
@@ -526,10 +534,29 @@ async fn main() -> Result<()> {
         list_sessions(&sessions_dir);
         return Ok(());
     }
+    let (history, session_id) = open_history(
+        PathBuf::from(".kloop/offload"),
+        &args.session,
+        &sessions_dir,
+    )?;
 
-    let cfg = Arc::new(config_from_env(&args)?);
+    // The TUI is the default entry point; --plain keeps the line-based REPL,
+    // and --mock's scripted demo stays on plain output where it is readable.
+    if args.mock || args.plain {
+        return plain_main(args, history, session_id).await;
+    }
+    kloop_tui::run(
+        move |approver, notify| config_from_env(&args, approver, notify),
+        history,
+        session_id,
+    )
+    .await
+}
+
+async fn plain_main(args: CliArgs, mut history: History, session_id: String) -> Result<()> {
+    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+    let cfg = Arc::new(config_from_env(&args, Arc::new(CliApprover), notify)?);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
-    let (mut history, session_id) = open_history(&cfg, &args.session, &sessions_dir)?;
 
     if args.mock {
         history.record(Message::user_text("run the demo"));
@@ -603,6 +630,7 @@ mod tests {
                 yolo: false,
                 accept_edits: false,
                 list_sessions: false,
+                plain: false,
                 session: SessionChoice::New,
             }
         );
@@ -613,16 +641,18 @@ mod tests {
                 yolo: false,
                 accept_edits: false,
                 list_sessions: false,
+                plain: false,
                 session: SessionChoice::ResumeLatest,
             }
         );
         assert_eq!(
-            parse_args(&strings(&["--resume", "20260709-120000"])).unwrap(),
+            parse_args(&strings(&["--resume", "20260709-120000", "--plain"])).unwrap(),
             CliArgs {
                 mock: false,
                 yolo: false,
                 accept_edits: false,
                 list_sessions: false,
+                plain: true,
                 session: SessionChoice::Resume("20260709-120000".into()),
             }
         );
@@ -633,6 +663,7 @@ mod tests {
                 yolo: true,
                 accept_edits: true,
                 list_sessions: true,
+                plain: false,
                 session: SessionChoice::New,
             }
         );

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/provider", "crates/core", "crates/cli"]
+members = ["crates/protocol", "crates/provider", "crates/core", "crates/cli", "crates/tui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,13 @@ edition = "2021"
 kloop-core = { path = "crates/core" }
 kloop-protocol = { path = "crates/protocol" }
 kloop-provider = { path = "crates/provider" }
+kloop-tui = { path = "crates/tui" }
 
 anyhow = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+ratatui = "0.29"
+unicode-width = "0.2"
 globset = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

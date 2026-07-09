@@ -23,6 +23,16 @@ use kloop_protocol::MAX_OUTPUT_TOKENS;
 pub trait Ui: Send + Sync {
     fn text_delta(&self, s: &str);
     fn note(&self, s: &str);
+    /// Tool-call lifecycle, for UIs that render per-call status rows. The
+    /// defaults collapse to the plain note stream so line-based UIs need not
+    /// care about call ids.
+    fn tool_start(&self, id: &str, name: &str, summary: &str) {
+        let _ = id;
+        self.note(&format!("{name} {summary}"));
+    }
+    fn tool_end(&self, id: &str, ok: bool) {
+        let _ = (id, ok);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

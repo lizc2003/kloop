@@ -187,14 +187,14 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
     let summary: String = input.to_string().chars().take(120).collect();
-    ctx.ui.note(&format!("{name} {summary}"));
+    ctx.ui.tool_start(&id, &name, &summary);
     let gated = async {
         if let Err(reason) = ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
             bail!(reason);
         }
         execute_tool(&name, &input, &ctx).await
     };
-    tokio::select! {
+    let result = tokio::select! {
         _ = ctx.cancel.cancelled() => interrupted(&id),
         r = gated => match r {
             Ok(content) => ContentBlock::ToolResult {
@@ -208,7 +208,17 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 is_error: true,
             },
         },
-    }
+    };
+    let ContentBlock::ToolResult {
+        tool_use_id,
+        is_error,
+        ..
+    } = &result
+    else {
+        unreachable!("run_one always builds a tool_result")
+    };
+    ctx.ui.tool_end(tool_use_id, !is_error);
+    result
 }
 
 /// Returns an explicitly type-erased future: this is the recursion boundary
