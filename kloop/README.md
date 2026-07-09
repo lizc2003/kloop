@@ -243,9 +243,36 @@ client is the `kloop-mcp` crate (depends only on protocol); the CLI glues
 them (config parsing, namespacing, the adapter). Deferred-tools + tool_search
 for oversized tool lists is future work.
 
-## Deliberately out of scope (Phase 2 remainder)
+## Hooks (Phase 2, seventh slice)
 
-Hooks.
+External command hooks fire at four points: before/after a turn
+(`pre_turn` / `post_turn`) and before/after a tool call (`pre_tool` /
+`post_tool`). Declare them in `.kloop/config.toml`:
+
+```toml
+[[hooks]]
+event = "pre_tool"            # pre_turn | post_turn | pre_tool | post_tool
+command = ["./guard.sh"]      # argv, not a shell string
+matcher = "bash"              # tool events only: exact tool-name filter
+timeout_ms = 5000             # optional, default 10000
+```
+
+The event arrives as one line of JSON on the hook's stdin: `event` and
+`session_id` always, plus `tool_name`/`tool_input` on tool events and
+`tool_result`/`is_error` on `post_tool`. Exit code 0 allows; non-zero
+**blocks** on the pre_* events — a blocked `pre_tool` call never runs and the
+model gets an is_error tool_result (`blocked by hook: …`, the hook's
+stdout/stderr as the reason), a blocked `pre_turn` means the turn never
+starts. On post_* events a non-zero exit is just a warning. Whatever an
+allowing hook prints on stdout is injected into history as a
+`[{event} hook]`-prefixed user message the model sees. Hooks fail open:
+spawn failures and timeouts warn and proceed.
+
+Ordering with permissions: `pre_tool` hooks run **before** the permission
+gate — hooks are automation policy, the permission prompt is the human's
+last word; a hook block means there is nothing left to ask about. Hooks run
+in config order; the first block short-circuits the rest. Sub-agents inherit
+the parent's hook set and session id. `--mock` runs without hooks (hermetic).
 
 ## Running
 
@@ -289,7 +316,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 143 tests across the workspace:
+`cargo test` runs 158 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -311,7 +338,12 @@ saved and resumable — see Session persistence above.
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
-  persistence, opaque never cacheable); rollout round-trip, envelope
+  persistence, opaque never cacheable); hook execution (all four points fire
+  in order around a real turn, blocked pre_tool becomes an is_error
+  tool_result and the command never runs, blocked pre_turn prevents sampling,
+  stdout-injection shape, stdin event JSON contract, timeout/spawn-failure
+  fail open with warnings, matcher filtering, block short-circuits later
+  hooks, post-event non-zero exits only warn); rollout round-trip, envelope
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full
@@ -340,8 +372,8 @@ saved and resumable — see Session persistence above.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
   unrelated-section preservation, malformed rejection), `[mcp.servers]`
-  parsing (round-trip, malformed rejection) and rule-safe name
-  sanitization.
+  parsing (round-trip, malformed rejection), rule-safe name sanitization,
+  and `[[hooks]]` parsing (round-trip, defaults, malformed rejection).
 
 Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
 exercising all five bets), and with a real key both adapters have been

@@ -314,8 +314,11 @@ impl Server {
             srv_seq: self.srv_seq.clone(),
         });
         let note_ui = ui.clone();
-        let cfg = (self.factory)(ui.clone(), Arc::new(move |s: &str| note_ui.note(s)))
+        let mut cfg = (self.factory)(ui.clone(), Arc::new(move |s: &str| note_ui.note(s)))
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
+        // The factory cannot know which thread it is building for; the hook
+        // events' session id is stamped here.
+        cfg.session_id = thread_id.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         tokio::spawn(thread_worker(

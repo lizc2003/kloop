@@ -58,6 +58,10 @@ pub struct ToolCtx {
     pub ui: Arc<dyn Ui>,
     pub cancel: CancellationToken,
     pub depth: u8,
+    /// stdout of allowing tool hooks, collected here because run_one has no
+    /// history access; the agent loop drains it into history after the
+    /// round's tool results are recorded.
+    pub hook_context: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Built-ins plus external sources, in registration order. A name collision
@@ -276,10 +280,42 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let summary: String = input.to_string().chars().take(120).collect();
     ctx.ui.tool_start(&id, &name, &summary);
     let gated = async {
+        // pre_tool hooks run BEFORE the permission gate: hooks are automation
+        // policy, permissions are the human's last word — a hook block means
+        // there is nothing left to ask about.
+        let hooks = &ctx.cfg.hooks;
+        let session_id = &ctx.cfg.session_id;
+        match hooks
+            .pre_tool(session_id, &name, &input, ctx.ui.as_ref())
+            .await
+        {
+            crate::hooks::HookDecision::Block { reason } => {
+                bail!("blocked by hook: {reason}")
+            }
+            crate::hooks::HookDecision::Allow { context } => {
+                ctx.hook_context.lock().unwrap().extend(context);
+            }
+        }
         if let Err(reason) = ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
             bail!(reason);
         }
-        execute_tool(&name, &input, &ctx).await
+        let result = execute_tool(&name, &input, &ctx).await;
+        let (content, is_error) = match &result {
+            Ok(content) => (content.clone(), false),
+            Err(e) => (format!("{e:#}"), true),
+        };
+        let context = hooks
+            .post_tool(
+                session_id,
+                &name,
+                &input,
+                &content,
+                is_error,
+                ctx.ui.as_ref(),
+            )
+            .await;
+        ctx.hook_context.lock().unwrap().extend(context);
+        result
     };
     let result = tokio::select! {
         _ = ctx.cancel.cancelled() => interrupted(&id),
@@ -520,10 +556,13 @@ mod tests {
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 tool_sources: sources,
+                session_id: String::new(),
+                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,
+            hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -962,10 +1001,13 @@ mod tests {
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 tool_sources: Vec::new(),
+                session_id: String::new(),
+                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             }),
             ui: Arc::new(NullUi),
             cancel,
             depth: 0,
+            hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let results = dispatch_tools(
             vec![

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use kloop_provider::Provider;
 
+use crate::hooks::Hooks;
 use crate::permissions::Permissions;
 use crate::tools::ToolSource;
 
@@ -25,4 +26,10 @@ pub struct Config {
     /// External tool providers (MCP servers), merged after the built-ins.
     /// Shared into sub-agent configs like everything else.
     pub tool_sources: Vec<Arc<dyn ToolSource>>,
+    /// Session id surfaced in hook events; empty when the session is
+    /// ephemeral (mock, tests). Sub-agents inherit the parent's id.
+    pub session_id: String,
+    /// External command hooks; the shared Arc means sub-agents inherit the
+    /// same hook set.
+    pub hooks: Arc<Hooks>,
 }

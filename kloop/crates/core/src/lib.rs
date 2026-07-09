@@ -13,6 +13,7 @@ pub mod agent;
 pub mod compact;
 pub mod config;
 pub mod history;
+pub mod hooks;
 pub mod permissions;
 pub mod rollout;
 pub mod shell;

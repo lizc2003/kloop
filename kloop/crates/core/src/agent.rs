@@ -52,8 +52,39 @@ pub struct TurnOutcome {
 
 /// The agent loop. One "round" = one sampling request plus the tool calls it
 /// asked for. Continuation is decided ONLY by the presence of tool_use blocks
-/// in the sampled response — never by stop_reason.
+/// in the sampled response — never by stop_reason. Hooks bracket the loop:
+/// a blocking pre_turn hook means the turn never starts; post_turn runs on
+/// every ending of a started turn (sub-agent turns included — they inherit
+/// the parent's hook set and session id).
 pub async fn run_turn(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+) -> TurnOutcome {
+    match cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await {
+        crate::hooks::HookDecision::Block { reason } => {
+            return TurnOutcome {
+                reason: EndReason::Error(format!("turn blocked by pre_turn hook: {reason}")),
+                final_text: String::new(),
+                rounds: 0,
+            }
+        }
+        crate::hooks::HookDecision::Allow { context } => {
+            for text in context {
+                history.record(Message::user_text(text));
+            }
+        }
+    }
+    let outcome = turn_rounds(cfg, history, ui, cancel, depth).await;
+    for text in cfg.hooks.post_turn(&cfg.session_id, ui.as_ref()).await {
+        history.record(Message::user_text(text));
+    }
+    outcome
+}
+
+async fn turn_rounds(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,
@@ -217,11 +248,17 @@ pub async fn run_turn(
             ui: ui.clone(),
             cancel: cancel.clone(),
             depth,
+            hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let results = dispatch_tools(tool_uses, &ctx).await;
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
         history.record(Message::tool_results(results));
+        // Tool-hook stdout follows the results it commented on, as extra
+        // user-message context.
+        for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap()) {
+            history.record(Message::user_text(text));
+        }
         if cancel.is_cancelled() {
             return TurnOutcome {
                 reason: EndReason::Aborted,
@@ -391,6 +428,8 @@ mod tests {
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             tool_sources: Vec::new(),
+            session_id: String::new(),
+            hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -469,6 +508,8 @@ mod tests {
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             tool_sources: Vec::new(),
+            session_id: String::new(),
+            hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         })
     }
 
@@ -840,6 +881,164 @@ mod tests {
         assert!(is_error);
         assert!(content.contains("declined"), "got: {content}");
         assert!(!std::path::Path::new("should-not-exist").exists());
+    }
+
+    fn hooked_cfg(provider: Provider, defs: Vec<crate::hooks::HookDef>, tag: &str) -> Arc<Config> {
+        let mut cfg = (*compaction_cfg(provider, 200_000, tag)).clone();
+        cfg.session_id = format!("session-{tag}");
+        cfg.hooks = Arc::new(crate::hooks::Hooks { defs });
+        Arc::new(cfg)
+    }
+
+    fn hook(event: crate::hooks::HookEvent, script: &str) -> crate::hooks::HookDef {
+        crate::hooks::HookDef {
+            event,
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            matcher: None,
+            timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
+        }
+    }
+
+    /// All four hook points fire, in order, around a one-tool-call turn.
+    #[tokio::test]
+    async fn four_hook_points_fire_in_order() {
+        use crate::hooks::HookEvent;
+        let marker = std::env::temp_dir().join(format!("kloop-hook-order-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mark = |event: &str| format!("echo {event} >> {}", marker.display());
+        let provider = Provider::mock(vec![
+            vec![tool_use("t1", "echo hi")],
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ]);
+        let cfg = hooked_cfg(
+            provider,
+            vec![
+                hook(HookEvent::PreTurn, &mark("pre_turn")),
+                hook(HookEvent::PostTurn, &mark("post_turn")),
+                hook(HookEvent::PreTool, &mark("pre_tool")),
+                hook(HookEvent::PostTool, &mark("post_tool")),
+            ],
+            "order",
+        );
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "pre_turn\npre_tool\npost_tool\npost_turn\n"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A blocking pre_tool hook: the command never runs and the model gets an
+    /// is_error tool_result carrying the hook's reason — the turn continues.
+    #[tokio::test]
+    async fn pre_tool_hook_block_becomes_error_tool_result() {
+        use crate::hooks::HookEvent;
+        let marker = std::env::temp_dir().join(format!("kloop-hook-block-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let provider = Provider::mock(vec![
+            vec![tool_use("t1", &format!("touch {}", marker.display()))],
+            vec![ContentBlock::Text {
+                text: "changing course".into(),
+            }],
+        ]);
+        let cfg = hooked_cfg(
+            provider,
+            vec![hook(
+                HookEvent::PreTool,
+                "echo rm-like commands are banned; exit 1",
+            )],
+            "block",
+        );
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(
+            history.messages()[2].content[0],
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "blocked by hook: rm-like commands are banned".into(),
+                is_error: true,
+            }
+        );
+        assert!(!marker.exists(), "the blocked command must not have run");
+    }
+
+    /// A blocking pre_turn hook: the turn never starts (nothing sampled,
+    /// nothing recorded) and the user sees the reason.
+    #[tokio::test]
+    async fn pre_turn_hook_block_prevents_the_turn() {
+        use crate::hooks::HookEvent;
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "never sampled".into(),
+        }]]);
+        let cfg = hooked_cfg(
+            provider,
+            vec![hook(HookEvent::PreTurn, "echo out of office; exit 1")],
+            "preturn-block",
+        );
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(
+            outcome.reason,
+            EndReason::Error("turn blocked by pre_turn hook: out of office".into())
+        );
+        assert_eq!(outcome.rounds, 0);
+        assert_eq!(history.messages().len(), 1, "nothing recorded");
+    }
+
+    /// Allowing hooks' stdout lands in history as user-message context, in
+    /// its documented shape: pre_turn before sampling, post_tool right after
+    /// the round's tool results.
+    #[tokio::test]
+    async fn hook_stdout_is_injected_as_user_context() {
+        use crate::hooks::HookEvent;
+        use kloop_protocol::Role;
+        let provider = Provider::mock(vec![
+            vec![tool_use("t1", "echo hi")],
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ]);
+        let cfg = hooked_cfg(
+            provider,
+            vec![
+                hook(HookEvent::PreTurn, "echo repo rule: tests first"),
+                hook(HookEvent::PostTool, "echo lint passed"),
+            ],
+            "inject",
+        );
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        let msgs = history.messages();
+        // [user, user(pre_turn ctx), assistant(tool_use), user(tool_result),
+        //  user(post_tool ctx), assistant(text)]
+        assert_eq!(
+            msgs[1],
+            Message::user_text("[pre_turn hook]\nrepo rule: tests first")
+        );
+        assert_eq!(msgs[2].role, Role::Assistant);
+        assert_eq!(msgs[4], Message::user_text("[post_tool hook]\nlint passed"));
     }
 
     /// The task tool spawns a sub-agent that consumes its own turns from the

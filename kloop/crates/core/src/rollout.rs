@@ -671,6 +671,8 @@ mod tests {
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 tool_sources: Vec::new(),
+                session_id: String::new(),
+                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             })
         };
         let path = temp_file("restart");

@@ -141,6 +141,8 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             fallback_model: None,
             permissions: Arc::new(permissions),
             tool_sources: Vec::new(),
+            session_id: String::new(),
+            hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
         })
     })
 }

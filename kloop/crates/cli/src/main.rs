@@ -21,6 +21,9 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
+use kloop_core::hooks::HookDef;
+use kloop_core::hooks::HookEvent;
+use kloop_core::hooks::Hooks;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -192,6 +195,86 @@ fn open_history(
 
 const PERMISSIONS_CONFIG: &str = ".kloop/config.toml";
 
+/// Parse `[[hooks]]` tables from `.kloop/config.toml`. A missing file or
+/// missing section is an empty list; a malformed entry is an error (a
+/// silently dropped hook would look like a policy that never fires).
+fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(Vec::new());
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(entries) = value.get("hooks") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .context("[[hooks]] must be an array of tables")?;
+    let mut defs = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let spec = entry
+            .as_table()
+            .with_context(|| format!("hooks[{i}] must be a table"))?;
+        for key in spec.keys() {
+            if !matches!(key.as_str(), "event" | "command" | "matcher" | "timeout_ms") {
+                bail!(
+                    "hooks[{i}] has unknown key '{key}' (event | command | matcher | timeout_ms)"
+                );
+            }
+        }
+        let event = spec
+            .get("event")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("hooks[{i}] needs an 'event' string"))?;
+        let event = HookEvent::parse(event).with_context(|| {
+            format!("hooks[{i}] has unknown event '{event}' (pre_turn | post_turn | pre_tool | post_tool)")
+        })?;
+        let command: Vec<String> = spec
+            .get("command")
+            .and_then(|v| v.as_array())
+            .and_then(|list| {
+                list.iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .with_context(|| format!("hooks[{i}] needs a 'command' string array"))?;
+        if command.is_empty() {
+            bail!("hooks[{i}].command must not be empty");
+        }
+        let matcher = match spec.get("matcher") {
+            None => None,
+            Some(v) => {
+                let m = v
+                    .as_str()
+                    .with_context(|| format!("hooks[{i}].matcher must be a string"))?;
+                if !event.is_tool_event() {
+                    bail!(
+                        "hooks[{i}]: matcher is only valid for pre_tool/post_tool, not {}",
+                        event.name()
+                    );
+                }
+                Some(m.to_string())
+            }
+        };
+        let timeout_ms = match spec.get("timeout_ms") {
+            None => kloop_core::hooks::DEFAULT_TIMEOUT_MS,
+            Some(v) => v
+                .as_integer()
+                .filter(|&t| t > 0)
+                .with_context(|| format!("hooks[{i}].timeout_ms must be a positive integer"))?
+                as u64,
+        };
+        defs.push(HookDef {
+            event,
+            command,
+            matcher,
+            timeout_ms,
+        });
+    }
+    Ok(defs)
+}
+
 /// Rules from `.kloop/config.toml` `[permissions]` (allow/deny/ask string
 /// arrays), with AGENT_ALLOW / AGENT_DENY / AGENT_ASK (comma-separated)
 /// appended on top.
@@ -315,6 +398,14 @@ fn config_from_env(
 ) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
+    // --mock stays hermetic: no config reads, no hook child processes.
+    let hooks = if args.mock {
+        Hooks::none()
+    } else {
+        Hooks {
+            defs: load_hooks(Path::new(PERMISSIONS_CONFIG))?,
+        }
+    };
     let system = format!(
         "You are a coding agent working in a CLI. Use the provided tools to inspect and \
              modify files and run commands; keep answers short. Current working directory: {}",
@@ -340,6 +431,10 @@ fn config_from_env(
         fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
         permissions,
         tool_sources: tool_sources.to_vec(),
+        // The caller stamps the real session id once it knows it (after
+        // open_history / per server thread).
+        session_id: String::new(),
+        hooks: Arc::new(hooks),
     };
     if args.mock {
         return Ok(Config {
@@ -538,8 +633,13 @@ async fn main() -> Result<()> {
     if args.mock || args.plain {
         return plain_main(args, history, session_id, tool_sources).await;
     }
+    let factory_session_id = session_id.clone();
     kloop_tui::run(
-        move |approver, notify| config_from_env(&args, approver, notify, &tool_sources),
+        move |approver, notify| {
+            let mut cfg = config_from_env(&args, approver, notify, &tool_sources)?;
+            cfg.session_id = factory_session_id.clone();
+            Ok(cfg)
+        },
         history,
         session_id,
     )
@@ -553,12 +653,9 @@ async fn plain_main(
     tool_sources: Vec<Arc<dyn ToolSource>>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
-    let cfg = Arc::new(config_from_env(
-        &args,
-        Arc::new(CliApprover),
-        notify,
-        &tool_sources,
-    )?);
+    let mut cfg = config_from_env(&args, Arc::new(CliApprover), notify, &tool_sources)?;
+    cfg.session_id = session_id.clone();
+    let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
 
     if args.mock {
@@ -741,6 +838,94 @@ mod tests {
         // Malformed arrays are an error, not a silent skip.
         std::fs::write(&path, "[permissions]\nallow = \"not-an-array\"\n").unwrap();
         assert!(load_permission_rules(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_hooks_full_round_trip() {
+        let dir = std::env::temp_dir().join(format!("kloop-hooks-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / missing section: empty, no error.
+        assert_eq!(
+            load_hooks(Path::new("/nonexistent/kloop.toml")).unwrap(),
+            vec![]
+        );
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert_eq!(load_hooks(&path).unwrap(), vec![]);
+
+        std::fs::write(
+            &path,
+            r#"
+[[hooks]]
+event = "pre_tool"
+command = ["./guard.sh", "--strict"]
+matcher = "bash"
+timeout_ms = 5000
+
+[[hooks]]
+event = "post_turn"
+command = ["notify-send"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_hooks(&path).unwrap(),
+            vec![
+                HookDef {
+                    event: HookEvent::PreTool,
+                    command: vec!["./guard.sh".into(), "--strict".into()],
+                    matcher: Some("bash".into()),
+                    timeout_ms: 5000,
+                },
+                HookDef {
+                    event: HookEvent::PostTurn,
+                    command: vec!["notify-send".into()],
+                    matcher: None,
+                    timeout_ms: kloop_core::hooks::DEFAULT_TIMEOUT_MS,
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_hooks_rejects_malformed_entries() {
+        let dir = std::env::temp_dir().join(format!("kloop-hooks-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        for (tag, bad) in [
+            ("noevent", "[[hooks]]\ncommand = [\"x\"]\n"),
+            (
+                "badevent",
+                "[[hooks]]\nevent = \"on_tool\"\ncommand = [\"x\"]\n",
+            ),
+            ("nocmd", "[[hooks]]\nevent = \"pre_tool\"\n"),
+            (
+                "emptycmd",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = []\n",
+            ),
+            (
+                "cmdstr",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = \"x\"\n",
+            ),
+            (
+                "turnmatcher",
+                "[[hooks]]\nevent = \"pre_turn\"\ncommand = [\"x\"]\nmatcher = \"bash\"\n",
+            ),
+            (
+                "badtimeout",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"x\"]\ntimeout_ms = -1\n",
+            ),
+            (
+                "unknownkey",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"x\"]\nwhen = \"always\"\n",
+            ),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_hooks(&path).is_err(), "{tag} should fail");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
