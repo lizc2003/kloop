@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–7 完成)
+## 二、当前状态(plan 1–8 完成)
 
 **结构**:Cargo workspace,四 crate 严格单向依赖链(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← `kloop`(cli)。
@@ -18,11 +18,12 @@
 - 压缩双防线:predictive(采样前预判 当前+增长预留 是否爆窗,增长 = min(输出上限,20k)+15k,**窗口≤预留时跳过**)+ reactive(溢出错误 downcast OverflowError,每 turn 压缩一次重试)。压缩 = 模型写交接摘要 + 保留约 2k token 近期原文,边界绝不切开 tool_use/tool_result 对,失败不动历史。
 - 恢复语义:流式重试 3 次(指数退避 + 纳秒抖动)、fallback 模型(AGENT_FALLBACK_MODEL,每 turn 切一次)、截断续跑(stop_reason=max_tokens/length 且无 tool_use 时注入续跑提示,限 3 次;这是 stop_reason 的唯一合法用途)、中断孤儿修补、EndReason 四态。
 - token 记账:provider 回传 usage(Anthropic message_start/delta;OpenAI include_usage,usage 块在 finish_reason 后到)锚点 + 其后消息 chars/4 估算;压缩后锚点作废。
+- 权限门(`core/src/permissions.rs`,**真实 API 交互验证待补**):每次工具执行前分层判定——只读工具/只读 bash 直接放行(与并发安全分类共用 `bash_segments`/`segment_is_readonly`)→ `AGENT_ALLOW` allowlist(裸工具名 / `bash(前缀 *)`,链式命令每段都须只读或命中)→ 会话批准缓存(按工具名;bash 按每段首 token)→ 独立 `Approver` trait 询问(类型擦除 future,不动同步 Ui;CLI 实现 y/a/n 阻塞读,Ctrl+C 打断询问时孤儿读可能吞掉下一行输入——已接受的边角)。拒绝 = is_error tool_result,turn 继续。`Permissions` 以 Arc 挂在 Config 上,子 agent 天然继承缓存、描述带 `[sub-agent]`。CLI `--yolo` 全放行,`--mock` 隐含之。
 - 会话持久化(`core/src/rollout.rs`):`.kloop/sessions/{id}.jsonl` 逐条写透(History 可挂 Rollout;写失败降级纯内存);每行带信封 id(`{stem}#{seq}`,无 rand)/ parent(上一行 id,跨恢复续链)/ ts,重放线性但链是未来 rewind/fork 的 schema 地基,未知字段读取忽略(前向兼容,测试锁死);压缩追加 compacted 标记内嵌完整替换历史(仿 codex rollout),文件保持 append-only;恢复(`resume_session`)= 重放 + 双向配对修补(正向补 interrupted、反向删孤儿 tool_result)+ 坏尾**物理**截断 + offload 计数器 fetch_max 同步;`load_session` 只读不动文件;usage 锚点不落盘,首次采样重锚定。CLI `--resume [id]` / `--list-sessions`,session id 为 UTC 时间戳(手写 civil_from_days,无 chrono);子 agent 历史不持久化。
 
-**测试**:71 个。protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数与时间戳。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
+**测试**:82 个。protocol 线格式契约 / provider wiremock HTTP 契约(SSE 序列进、StreamEvent 断言出)/ tools 全执行路径 / permissions 分层判定、规则解析、缓存粒度、询问计数、拒绝后续跑 / history 锚点数学 + 写透 / compact 失败不动历史 / agent 恢复路径 / rollout 往返、标记重放、孤儿修补、跨重启 resume / cli 参数与时间戳。纪律:适配器行为变更必须先改契约测试。CI(`.github/workflows/ci.yml`,仓库根)在 push/PR 上强制 fmt --check / clippy -D warnings / test,macOS+Linux;**仓库尚无远端,workflow 只做过本地等价验证,首次推远端后要看它实际跑绿一次**。
 
-**运行**:真 key 用 `ANTHROPIC_API_KEY`+`ANTHROPIC_BASE_URL`(不含 /v1,适配器自己拼 /v1/messages)或 `OPENAI_API_KEY`+`OPENAI_BASE_URL`+`AGENT_MODEL`;可选 `AGENT_CONTEXT_WINDOW`(默认 200000,off 关压缩)、`AGENT_FALLBACK_MODEL`、`AGENT_PROVIDER`。
+**运行**:真 key 用 `ANTHROPIC_API_KEY`+`ANTHROPIC_BASE_URL`(不含 /v1,适配器自己拼 /v1/messages)或 `OPENAI_API_KEY`+`OPENAI_BASE_URL`+`AGENT_MODEL`;可选 `AGENT_CONTEXT_WINDOW`(默认 200000,off 关压缩)、`AGENT_FALLBACK_MODEL`、`AGENT_PROVIDER`、`AGENT_ALLOW`(权限 allowlist)。
 
 ## 三、沉淀的实现教训(新代码沿用)
 
@@ -36,4 +37,4 @@
 
 ## 四、进度
 
-下一个:**plan 8(权限)**,其后 9-TUI、10-MCP、11-hooks(顺序可与用户重新商定)。
+下一个:**plan 9(TUI)**,其后 10-MCP、11-hooks(顺序可与用户重新商定)。挂账:plan 8 的真实 API 交互验证(询问出现、y 放行、n 拒绝后模型调整)待用户给 key 后补做。
