@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/provider", "crates/core", "crates/cli", "crates/tui"]
+members = [
+    "crates/protocol",
+    "crates/provider",
+    "crates/core",
+    "crates/cli",
+    "crates/tui",
+    "crates/server",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +17,7 @@ edition = "2021"
 kloop-core = { path = "crates/core" }
 kloop-protocol = { path = "crates/protocol" }
 kloop-provider = { path = "crates/provider" }
+kloop-server = { path = "crates/server" }
 kloop-tui = { path = "crates/tui" }
 
 anyhow = "1"

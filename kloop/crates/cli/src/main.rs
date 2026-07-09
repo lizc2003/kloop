@@ -6,8 +6,6 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -27,16 +25,20 @@ use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
+use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::load_session;
+use kloop_core::rollout::new_session_id;
 use kloop_core::rollout::resume_session;
+use kloop_core::rollout::session_id_of;
+use kloop_core::rollout::session_path;
+use kloop_core::rollout::sessions_by_recency;
 use kloop_core::rollout::Rollout;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::Role;
 use kloop_provider::Provider;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionChoice {
     New,
     /// `--continue`: the most recently modified session.
@@ -46,13 +48,14 @@ enum SessionChoice {
     Resume(String),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CliArgs {
     mock: bool,
     yolo: bool,
     accept_edits: bool,
     list_sessions: bool,
     plain: bool,
+    serve: bool,
     session: SessionChoice,
 }
 
@@ -63,6 +66,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
         accept_edits: false,
         list_sessions: false,
         plain: false,
+        serve: false,
         session: SessionChoice::New,
     };
     let mut i = 0;
@@ -73,6 +77,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--accept-edits" => parsed.accept_edits = true,
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
+            "--serve" => parsed.serve = true,
             "--continue" => parsed.session = SessionChoice::Continue,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
@@ -84,80 +89,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                 };
             }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --continue | --resume [id] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --continue | --resume [id] | --list-sessions)"
             ),
         }
         i += 1;
     }
     Ok(parsed)
-}
-
-/// Session ids are UTC wall-clock timestamps — readable, sortable, and free
-/// of a rand dependency. A collision within one second gets a numeric suffix.
-fn new_session_id(sessions_dir: &Path) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let base = timestamp_id(secs);
-    let mut id = base.clone();
-    let mut n = 2;
-    while session_path(sessions_dir, &id).exists() {
-        id = format!("{base}-{n}");
-        n += 1;
-    }
-    id
-}
-
-fn timestamp_id(unix_secs: u64) -> String {
-    let (y, m, d) = civil_from_days((unix_secs / 86_400) as i64);
-    let rem = unix_secs % 86_400;
-    format!(
-        "{y:04}{m:02}{d:02}-{h:02}{min:02}{s:02}",
-        h = rem / 3600,
-        min = rem % 3600 / 60,
-        s = rem % 60
-    )
-}
-
-/// Days since 1970-01-01 to a UTC civil date (Howard Hinnant's
-/// civil_from_days), so session ids don't need a chrono dependency.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d)
-}
-
-fn session_path(sessions_dir: &Path, id: &str) -> PathBuf {
-    sessions_dir.join(format!("{id}.jsonl"))
-}
-
-/// All session files, most recently modified first (modified = last active,
-/// which is what `--resume` without an id should pick up).
-fn sessions_by_recency(sessions_dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(sessions_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    files.into_iter().map(|(_, path)| path).collect()
-}
-
-fn session_id_of(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string()
 }
 
 fn session_line(path: &Path) -> String {
@@ -212,28 +149,6 @@ fn pick_index(input: &str, len: usize) -> Result<usize> {
         Ok(n) if (1..=len).contains(&n) => Ok(n - 1),
         _ => bail!("invalid selection '{input}' (expected 1-{len})"),
     }
-}
-
-fn first_user_snippet(messages: &[Message]) -> String {
-    for message in messages {
-        if message.role != Role::User {
-            continue;
-        }
-        for block in &message.content {
-            if let ContentBlock::Text { text } = block {
-                let mut snippet: String = text
-                    .chars()
-                    .take(60)
-                    .map(|c| if c == '\n' { ' ' } else { c })
-                    .collect();
-                if text.chars().count() > 60 {
-                    snippet.push('…');
-                }
-                return snippet;
-            }
-        }
-    }
-    String::new()
 }
 
 /// Build the History for this run: a fresh persisted session by default, or
@@ -574,6 +489,22 @@ async fn main() -> Result<()> {
         list_sessions(&sessions_dir);
         return Ok(());
     }
+    if args.serve {
+        // Multi-session JSON-RPC server on stdio; each thread gets its own
+        // Config (and thus its own permission gate + session cache).
+        let factory: kloop_server::ConfigFactory = {
+            let args = args.clone();
+            Arc::new(move |approver, notify| config_from_env(&args, approver, notify))
+        };
+        return kloop_server::serve_stdio(
+            factory,
+            kloop_server::ServerPaths {
+                sessions_dir,
+                offload_dir: PathBuf::from(".kloop/offload"),
+            },
+        )
+        .await;
+    }
     let (history, session_id) = open_history(
         PathBuf::from(".kloop/offload"),
         &args.session,
@@ -671,6 +602,7 @@ mod tests {
                 accept_edits: false,
                 list_sessions: false,
                 plain: false,
+                serve: false,
                 session: SessionChoice::New,
             }
         );
@@ -682,6 +614,7 @@ mod tests {
                 accept_edits: false,
                 list_sessions: false,
                 plain: false,
+                serve: false,
                 session: SessionChoice::Pick,
             }
         );
@@ -693,7 +626,20 @@ mod tests {
                 accept_edits: false,
                 list_sessions: false,
                 plain: false,
+                serve: false,
                 session: SessionChoice::Continue,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--serve"])).unwrap(),
+            CliArgs {
+                mock: false,
+                yolo: false,
+                accept_edits: false,
+                list_sessions: false,
+                plain: false,
+                serve: true,
+                session: SessionChoice::New,
             }
         );
         assert_eq!(
@@ -704,6 +650,7 @@ mod tests {
                 accept_edits: false,
                 list_sessions: false,
                 plain: true,
+                serve: false,
                 session: SessionChoice::Resume("20260709-120000".into()),
             }
         );
@@ -715,6 +662,7 @@ mod tests {
                 accept_edits: true,
                 list_sessions: true,
                 plain: false,
+                serve: false,
                 session: SessionChoice::New,
             }
         );
@@ -773,14 +721,5 @@ mod tests {
         assert!(pick_index("0", 5).is_err());
         assert!(pick_index("6", 5).is_err());
         assert!(pick_index("abc", 5).is_err());
-    }
-
-    #[test]
-    fn timestamp_ids_match_utc_civil_time() {
-        assert_eq!(timestamp_id(0), "19700101-000000");
-        // date -u -r 1783958400 → 2026-07-13 16:00:00 UTC
-        assert_eq!(timestamp_id(1_783_958_400), "20260713-160000");
-        // leap-year day: 2024-02-29 12:34:56 UTC
-        assert_eq!(timestamp_id(1_709_209_496), "20240229-122456");
     }
 }

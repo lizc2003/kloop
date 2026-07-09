@@ -177,6 +177,36 @@ text plus tool status rows re-derived from the recorded tool_use/tool_result
 pairs), so a resumed session starts with its conversation visible instead of
 a blank screen.
 
+## Server mode (Phase 2, fifth slice)
+
+`kloop --serve` speaks a JSON-RPC-shaped protocol over stdio (after codex's
+app-server: JSON-RPC 2.0 envelopes minus the `"jsonrpc"` field, one object
+per line) so IDEs and automation can drive multiple sessions concurrently.
+
+Methods: `thread/start`, `thread/resume {threadId}`, `thread/list`,
+`turn/start {threadId, input}`, `turn/interrupt {threadId}`. Every thread is
+its own tokio task owning a History (persisted to the same
+`.kloop/sessions/` files the interactive frontends use — sessions are
+interchangeable between the TUI and the server) and its own permission gate,
+so approval session caches never leak across threads.
+
+Notifications stream per thread: `turn/started`, `text/delta`, `note`,
+`tool/started`, `tool/completed`, `turn/completed {reason}`. Approvals are
+server→client requests in an own `srv-{n}` id namespace; the client answers
+`{"decision": "allow" | "allowSession" | "allowAlways" | "deny"}`, and a
+dropped/never-answered reply denies (interrupt the turn to unblock).
+
+```jsonc
+→ {"id":1,"method":"thread/start","params":{}}
+← {"id":1,"result":{"threadId":"20260709-135146"}}
+→ {"id":2,"method":"turn/start","params":{"threadId":"20260709-135146","input":"create s2.txt"}}
+← {"method":"turn/started","params":{"threadId":"20260709-135146"}}
+← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"]}}
+→ {"id":"srv-1","result":{"decision":"allow"}}
+← {"method":"tool/completed","params":{"threadId":"…","callId":"…","ok":true}}
+← {"method":"turn/completed","params":{"threadId":"…","reason":"completed"}}
+```
+
 ## Deliberately out of scope (Phase 2 remainder)
 
 MCP, hooks.
@@ -198,6 +228,10 @@ OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 # line-based REPL instead of the TUI
 cargo run -- --plain
 
+# multi-session JSON-RPC server on stdio (see Server mode)
+cargo run -- --serve
+cargo run -- --mock --serve   # keyless: scripted provider behind the protocol
+
 # sessions
 cargo run -- --list-sessions   # what's on disk, most recent first
 cargo run -- --continue        # continue the most recent session
@@ -217,7 +251,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 116 tests across the workspace:
+`cargo test` runs 126 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -250,6 +284,14 @@ saved and resumable — see Session persistence above.
   and keyboard capture, interrupt/quit commands, turn-end cleanup), and pure
   rendering (CJK-aware wrap/truncate, per-cell-kind lines, tool-row collapse,
   input window around the cursor).
+- **kloop-server** — wire envelope contract (request/response/notification
+  shapes, string-or-int ids, request-vs-approval-response disambiguation),
+  plus duplex-driven protocol tests against the real serve loop with a
+  scripted provider: delta streaming and completion, approval deny/allow
+  round-trips (file provably not/created), parallel threads with no event
+  cross-tagging and no same-second id collisions, busy-thread rejection,
+  interrupt-while-pending-approval, protocol-error resilience, and sessions
+  surviving a server restart (list/resume/re-run over the same files).
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
   unrelated-section preservation, malformed rejection).
@@ -265,8 +307,9 @@ every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 
 ## Layout
 
-Cargo workspace, five crates in a strict dependency line
-(protocol ← provider ← core ← tui ← cli):
+Cargo workspace, six crates; the dependency graph is a strict line up to
+core, then two sibling frontends under the cli
+(protocol ← provider ← core ← {tui, server} ← cli):
 
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
@@ -300,9 +343,14 @@ crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
   src/render.rs     pure cell→line rendering, wrap/truncate, confirm popup
   src/lib.rs        terminal lifecycle, agent worker task, event loop
 
+crates/server/      kloop-server — multi-session JSON-RPC frontend
+  src/wire.rs       envelopes (request/response/notification/server request)
+  src/lib.rs        serve loop, per-thread workers, approval routing
+
 crates/cli/         kloop — the binary
-  src/main.rs       arg parsing + dispatch (TUI default, --plain REPL),
-                    env config, StdoutUi, CliApprover (y/a/p/n prompt),
-                    .kloop/config.toml rule load/persist, --mock demo,
-                    session selection (--resume, --list-sessions)
+  src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
+                    --serve), env config, StdoutUi, CliApprover (y/a/p/n
+                    prompt), .kloop/config.toml rule load/persist, --mock
+                    demo, session selection (--continue, --resume,
+                    --list-sessions)
 ```

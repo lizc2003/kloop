@@ -745,6 +745,7 @@ dependencies = [
  "kloop-core",
  "kloop-protocol",
  "kloop-provider",
+ "kloop-server",
  "kloop-tui",
  "serde_json",
  "tokio",
@@ -788,6 +789,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "wiremock",
+]
+
+[[package]]
+name = "kloop-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kloop-core",
+ "kloop-protocol",
+ "kloop-provider",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
