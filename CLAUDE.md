@@ -2,7 +2,7 @@
 
 从零做一个新的 Rust agent。详细交接(当前状态、能力清单、实现教训、进度)读 `docs/plan/HANDOFF.md`。
 
-- **kloop 是唯一开发对象**。`refs/codex`、`~/work/claude-code`、`refs/claw-code` 仅供参考,绝不在其上开发或推送。开发阶段直接在 main 分支,不开 feature 分支。
+- **kloop 是唯一开发对象**。`refs/codex`、`~/work/claude-code`、`refs/claw-code` 仅供参考,绝不在其上开发或推送;三个参考库的导读与调研结论在 `refs/README.md`。开发阶段直接在 main 分支,不开 feature 分支。
 - **工作方式**:`docs/plan/` 一个编号文件 = 一个会话任务(✅ 为已完成历史)。开工前读 `docs/plan/HANDOFF.md` + 对应 plan 文件,plan 里标"开工时定/问用户"的点先问清。
 - **完成标准**:cargo fmt + clippy + test 全绿,一次 commit(写清验证方式);行为变更同步 README;plan 文件补 ✅ 与提交号;新教训写进 HANDOFF.md。
 - **验证**:`cd kloop && cargo test`(1 秒,无网络无 key);`cargo run -p kloop -- --mock`。真实 API 的代理和 key 问用户要,勿写进任何提交文件。
