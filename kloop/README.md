@@ -97,6 +97,10 @@ exercising all five bets), and with a real key both adapters have been
 exercised live including offload round-trips, mid-session predictive
 compaction, and truncation recovery.
 
+CI (`.github/workflows/ci.yml`, at the repo root) enforces the same gate on
+every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace`, on macOS and Linux.
+
 ## Layout
 
 Cargo workspace, four crates in a strict dependency line
