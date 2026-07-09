@@ -670,6 +670,7 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                tool_sources: Vec::new(),
             })
         };
         let path = temp_file("restart");

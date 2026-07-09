@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/provider",
     "crates/core",
+    "crates/mcp",
     "crates/cli",
     "crates/tui",
     "crates/server",
@@ -15,6 +16,7 @@ edition = "2021"
 
 [workspace.dependencies]
 kloop-core = { path = "crates/core" }
+kloop-mcp = { path = "crates/mcp" }
 kloop-protocol = { path = "crates/protocol" }
 kloop-provider = { path = "crates/provider" }
 kloop-server = { path = "crates/server" }

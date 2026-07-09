@@ -1,0 +1,10 @@
+[package]
+name = "kloop-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kloop-protocol = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

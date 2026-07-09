@@ -23,6 +23,34 @@ use kloop_protocol::ToolDef;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
 
+/// Past this many tools the definitions start crowding the context window;
+/// the CLI warns at startup (deferred tools + tool_search is the real fix,
+/// not in scope yet).
+pub const TOOL_COUNT_WARN_THRESHOLD: usize = 30;
+
+/// An external provider of tools (an MCP server, in practice). Core only
+/// knows this seam; the wire protocol lives in the `kloop-mcp` crate and the
+/// adapter in the CLI. Implementations expose already-namespaced tool names
+/// (`{server}__{tool}`) so cross-source collisions are config mistakes, not
+/// the common case.
+pub trait ToolSource: Send + Sync {
+    /// Tool definitions as advertised by the source (schema passed through).
+    fn defs(&self) -> &[ToolDef];
+    /// Whether this tool was explicitly marked read-only in config, making
+    /// it eligible for concurrent dispatch. External tools default to NOT
+    /// read-only — serial. (The permission gate is independent: external
+    /// tools always ask unless covered by an allow rule or session cache.)
+    fn is_readonly(&self, tool: &str) -> bool;
+    /// Execute one call. Ok(text) / Err(reason) map onto tool_result
+    /// content / is_error. Type-erased future for object safety, same shape
+    /// as `execute_tool`.
+    fn call<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+}
+
 /// Everything a tool execution needs; cheap to clone into spawned futures.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -32,11 +60,64 @@ pub struct ToolCtx {
     pub depth: u8,
 }
 
+/// Built-ins plus external sources, in registration order. A name collision
+/// (with a built-in or an earlier source) drops the later definition; the
+/// CLI surfaces the same collisions as startup warnings via
+/// [`tool_merge_warnings`].
+pub fn all_tool_defs(depth: u8, sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
+    let mut defs = tool_defs(depth);
+    let mut seen: std::collections::HashSet<String> = defs.iter().map(|d| d.name.clone()).collect();
+    for source in sources {
+        for def in source.defs() {
+            if seen.insert(def.name.clone()) {
+                defs.push(def.clone());
+            }
+        }
+    }
+    defs
+}
+
+/// Startup diagnostics for the merged tool set: name collisions (the later
+/// definition is skipped) and an oversized-list warning. Depth 0 is the
+/// authoritative view (it has the most built-ins).
+pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut seen: std::collections::HashSet<String> =
+        tool_defs(0).into_iter().map(|d| d.name).collect();
+    for source in sources {
+        for def in source.defs() {
+            if !seen.insert(def.name.clone()) {
+                warnings.push(format!(
+                    "tool name collision: '{}' is already registered; the later definition is skipped",
+                    def.name
+                ));
+            }
+        }
+    }
+    let total = seen.len();
+    if total > TOOL_COUNT_WARN_THRESHOLD {
+        warnings.push(format!(
+            "{total} tools registered (> {TOOL_COUNT_WARN_THRESHOLD}); large tool lists crowd the context window"
+        ));
+    }
+    warnings
+}
+
+fn find_source<'a>(
+    sources: &'a [Arc<dyn ToolSource>],
+    name: &str,
+) -> Option<&'a Arc<dyn ToolSource>> {
+    // First source claiming the name wins, mirroring the merge order.
+    sources
+        .iter()
+        .find(|s| s.defs().iter().any(|d| d.name == name))
+}
+
 pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
-            name: "bash",
-            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s.",
+            name: "bash".into(),
+            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -47,8 +128,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "read_file",
-            description: "Read a text file, returning numbered lines formatted as `{n}\\t{line}`. Reads up to 2000 lines by default.",
+            name: "read_file".into(),
+            description: "Read a text file, returning numbered lines formatted as `{n}\\t{line}`. Reads up to 2000 lines by default.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -60,8 +141,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "write_file",
-            description: "Write content to a file, creating parent directories as needed. Overwrites if the file exists.",
+            name: "write_file".into(),
+            description: "Write content to a file, creating parent directories as needed. Overwrites if the file exists.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,8 +153,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "edit_file",
-            description: "Replace old_string with new_string in a file. Fails if old_string is not found, or matches more than once without replace_all.",
+            name: "edit_file".into(),
+            description: "Replace old_string with new_string in a file. Fails if old_string is not found, or matches more than once without replace_all.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -86,8 +167,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "read_offloaded",
-            description: "Fetch the full content of an offloaded tool result by its id (e.g. off-0001).",
+            name: "read_offloaded".into(),
+            description: "Fetch the full content of an offloaded tool result by its id (e.g. off-0001).".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -99,8 +180,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     ];
     if depth == 0 {
         defs.push(ToolDef {
-            name: "task",
-            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Sub-agents cannot spawn further sub-agents.",
+            name: "task".into(),
+            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Sub-agents cannot spawn further sub-agents.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -118,8 +199,10 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
 /// bash is safe only when the parsed command sequence is word-only and every
 /// argv is a known read-only command (same analysis the permission gate
 /// uses — safe-to-parallelize and safe-to-run are two verdicts over one
-/// decomposition).
-pub fn is_concurrency_safe(name: &str, input: &Value) -> bool {
+/// decomposition). External tools are safe only when their source marks them
+/// read-only; built-in names shadow sources here exactly as they do in
+/// dispatch.
+pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
     match name {
         "read_file" | "read_offloaded" => true,
         "bash" => {
@@ -132,7 +215,8 @@ pub fn is_concurrency_safe(name: &str, input: &Value) -> bool {
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
-        _ => false,
+        "write_file" | "edit_file" | "task" => false,
+        other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
 }
 
@@ -144,12 +228,15 @@ pub async fn dispatch_tools(
     tool_uses: Vec<(String, String, Value)>,
     ctx: &ToolCtx,
 ) -> Vec<ContentBlock> {
+    let sources = &ctx.cfg.tool_sources;
     let mut results = Vec::with_capacity(tool_uses.len());
     let mut i = 0;
     while i < tool_uses.len() {
-        let safe = is_concurrency_safe(&tool_uses[i].1, &tool_uses[i].2);
+        let safe = is_concurrency_safe(&tool_uses[i].1, &tool_uses[i].2, sources);
         let mut j = i + 1;
-        while j < tool_uses.len() && is_concurrency_safe(&tool_uses[j].1, &tool_uses[j].2) == safe {
+        while j < tool_uses.len()
+            && is_concurrency_safe(&tool_uses[j].1, &tool_uses[j].2, sources) == safe
+        {
             j += 1;
         }
         let batch = &tool_uses[i..j];
@@ -238,7 +325,10 @@ fn execute_tool<'a>(
             "edit_file" => edit_file_tool(input).await,
             "read_offloaded" => read_offloaded_tool(input, ctx).await,
             "task" => task_tool(input, ctx).await,
-            other => Err(anyhow!("unknown tool: {other}")),
+            other => match find_source(&ctx.cfg.tool_sources, other) {
+                Some(source) => source.call(other, input).await,
+                None => Err(anyhow!("unknown tool: {other}")),
+            },
         }
     })
 }
@@ -415,6 +505,10 @@ mod tests {
     }
 
     fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
+        test_ctx_with_sources(depth, tag, Vec::new())
+    }
+
+    fn test_ctx_with_sources(depth: u8, tag: &str, sources: Vec<Arc<dyn ToolSource>>) -> ToolCtx {
         ToolCtx {
             cfg: Arc::new(Config {
                 provider: Arc::new(Provider::mock(vec![])),
@@ -425,10 +519,55 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                tool_sources: sources,
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,
+        }
+    }
+
+    /// External source stub: `{prefix}__echo` (marked read-only) and
+    /// `{prefix}__fail` (always errors).
+    struct StubSource {
+        defs: Vec<ToolDef>,
+        readonly: String,
+    }
+
+    impl StubSource {
+        fn new(prefix: &str) -> Arc<Self> {
+            let def = |tool: &str| ToolDef {
+                name: format!("{prefix}__{tool}"),
+                description: format!("stub {tool}"),
+                schema: json!({"type": "object"}),
+            };
+            Arc::new(StubSource {
+                defs: vec![def("echo"), def("fail")],
+                readonly: format!("{prefix}__echo"),
+            })
+        }
+    }
+
+    impl ToolSource for StubSource {
+        fn defs(&self) -> &[ToolDef] {
+            &self.defs
+        }
+
+        fn is_readonly(&self, tool: &str) -> bool {
+            tool == self.readonly
+        }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                if tool.ends_with("__fail") {
+                    bail!("stub failure");
+                }
+                Ok(format!("echoed {}", input["text"].as_str().unwrap_or("?")))
+            })
         }
     }
 
@@ -600,9 +739,109 @@ mod tests {
 
     #[test]
     fn tool_defs_expose_task_only_at_depth_zero() {
-        let names = |depth| tool_defs(depth).iter().map(|t| t.name).collect::<Vec<_>>();
-        assert!(names(0).contains(&"task"));
-        assert!(!names(1).contains(&"task"));
+        let names = |depth| {
+            tool_defs(depth)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(0).iter().any(|n| n == "task"));
+        assert!(!names(1).iter().any(|n| n == "task"));
+    }
+
+    #[test]
+    fn all_tool_defs_appends_sources_and_skips_collisions() {
+        let sources: Vec<Arc<dyn ToolSource>> =
+            vec![StubSource::new("srv"), StubSource::new("srv")];
+        let names: Vec<String> = all_tool_defs(0, &sources)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        // Built-ins first, then the first source; the duplicate source's
+        // identical names are dropped.
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_offloaded",
+                "task",
+                "srv__echo",
+                "srv__fail",
+            ]
+        );
+
+        // A source colliding with a built-in name is dropped too.
+        let builtin_clash: Vec<Arc<dyn ToolSource>> = vec![Arc::new(StubSource {
+            defs: vec![ToolDef {
+                name: "bash".into(),
+                description: "impostor".into(),
+                schema: json!({"type": "object"}),
+            }],
+            readonly: String::new(),
+        })];
+        let defs = all_tool_defs(0, &builtin_clash);
+        let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
+        assert_eq!(bash.len(), 1);
+        assert_ne!(bash[0].description, "impostor");
+    }
+
+    #[test]
+    fn tool_merge_warnings_flags_collisions_and_oversized_lists() {
+        assert_eq!(tool_merge_warnings(&[]), Vec::<String>::new());
+
+        let colliding: Vec<Arc<dyn ToolSource>> =
+            vec![StubSource::new("srv"), StubSource::new("srv")];
+        let warnings = tool_merge_warnings(&colliding);
+        assert_eq!(warnings.len(), 2, "one per duplicated name: {warnings:?}");
+        assert!(warnings[0].contains("srv__echo"));
+        assert!(warnings[1].contains("srv__fail"));
+
+        let many: Vec<ToolDef> = (0..40)
+            .map(|i| ToolDef {
+                name: format!("srv__tool{i}"),
+                description: String::new(),
+                schema: json!({"type": "object"}),
+            })
+            .collect();
+        let big: Vec<Arc<dyn ToolSource>> = vec![Arc::new(StubSource {
+            defs: many,
+            readonly: String::new(),
+        })];
+        let warnings = tool_merge_warnings(&big);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("46 tools"), "got: {warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_external_tools_and_maps_errors() {
+        let ctx = test_ctx_with_sources(0, "ext", vec![StubSource::new("srv")]);
+
+        let (out, is_error) = run_tool("srv__echo", json!({"text": "hi"}), &ctx).await;
+        assert!(!is_error);
+        assert_eq!(out, "echoed hi");
+
+        let (out, is_error) = run_tool("srv__fail", json!({}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("stub failure"));
+
+        // Unclaimed names still fail as unknown.
+        let (out, is_error) = run_tool("other__tool", json!({}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("unknown tool"));
+    }
+
+    #[test]
+    fn external_tools_are_serial_unless_marked_readonly() {
+        let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
+        assert!(is_concurrency_safe("srv__echo", &json!({}), &sources));
+        assert!(!is_concurrency_safe("srv__fail", &json!({}), &sources));
+        // Unknown to every source: not safe.
+        assert!(!is_concurrency_safe("other__tool", &json!({}), &sources));
+        // Without sources nothing external is safe.
+        assert!(!is_concurrency_safe("srv__echo", &json!({}), &[]));
     }
 
     #[tokio::test]
@@ -644,6 +883,9 @@ mod tests {
 
     #[test]
     fn concurrency_safety_by_name_and_input() {
+        fn is_concurrency_safe(name: &str, input: &Value) -> bool {
+            super::is_concurrency_safe(name, input, &[])
+        }
         assert!(is_concurrency_safe("read_file", &json!({"path": "x"})));
         assert!(is_concurrency_safe(
             "read_offloaded",
@@ -719,6 +961,7 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                tool_sources: Vec::new(),
             }),
             ui: Arc::new(NullUi),
             cancel,

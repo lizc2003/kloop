@@ -140,6 +140,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(permissions),
+            tool_sources: Vec::new(),
         })
     })
 }

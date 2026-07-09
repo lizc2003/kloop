@@ -163,6 +163,7 @@ mod tests {
             context_window: Some(200_000),
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+            tool_sources: Vec::new(),
         })
     }
 

@@ -1,6 +1,8 @@
 //! kloop CLI: environment-driven configuration, a line-based REPL with
 //! Ctrl+C interruption, session persistence (`--resume`, `--list-sessions`),
-//! and the keyless `--mock` demo.
+//! MCP server wiring, and the keyless `--mock` demo.
+
+mod mcp;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -33,6 +35,8 @@ use kloop_core::rollout::session_id_of;
 use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
 use kloop_core::rollout::Rollout;
+use kloop_core::tools::tool_merge_warnings;
+use kloop_core::tools::ToolSource;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -307,6 +311,7 @@ fn config_from_env(
     args: &CliArgs,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
+    tool_sources: &[Arc<dyn ToolSource>],
 ) -> Result<Config> {
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
@@ -334,6 +339,7 @@ fn config_from_env(
         context_window,
         fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
         permissions,
+        tool_sources: tool_sources.to_vec(),
     };
     if args.mock {
         return Ok(Config {
@@ -489,12 +495,28 @@ async fn main() -> Result<()> {
         list_sessions(&sessions_dir);
         return Ok(());
     }
+    // MCP servers connect once per process (before any UI owns the terminal)
+    // and are shared into every Config — including all server-mode threads.
+    // --mock stays hermetic: no child processes, no config reads.
+    let tool_sources = if args.mock {
+        Vec::new()
+    } else {
+        let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+        let servers = mcp::load_mcp_servers(Path::new(PERMISSIONS_CONFIG))?;
+        let sources = mcp::connect_servers(servers, &warn).await;
+        for warning in tool_merge_warnings(&sources) {
+            warn(&warning);
+        }
+        sources
+    };
     if args.serve {
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
         let factory: kloop_server::ConfigFactory = {
             let args = args.clone();
-            Arc::new(move |approver, notify| config_from_env(&args, approver, notify))
+            Arc::new(move |approver, notify| {
+                config_from_env(&args, approver, notify, &tool_sources)
+            })
         };
         return kloop_server::serve_stdio(
             factory,
@@ -514,19 +536,29 @@ async fn main() -> Result<()> {
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        return plain_main(args, history, session_id).await;
+        return plain_main(args, history, session_id, tool_sources).await;
     }
     kloop_tui::run(
-        move |approver, notify| config_from_env(&args, approver, notify),
+        move |approver, notify| config_from_env(&args, approver, notify, &tool_sources),
         history,
         session_id,
     )
     .await
 }
 
-async fn plain_main(args: CliArgs, mut history: History, session_id: String) -> Result<()> {
+async fn plain_main(
+    args: CliArgs,
+    mut history: History,
+    session_id: String,
+    tool_sources: Vec<Arc<dyn ToolSource>>,
+) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
-    let cfg = Arc::new(config_from_env(&args, Arc::new(CliApprover), notify)?);
+    let cfg = Arc::new(config_from_env(
+        &args,
+        Arc::new(CliApprover),
+        notify,
+        &tool_sources,
+    )?);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
 
     if args.mock {

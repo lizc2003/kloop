@@ -743,6 +743,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kloop-core",
+ "kloop-mcp",
  "kloop-protocol",
  "kloop-provider",
  "kloop-server",
@@ -768,6 +769,16 @@ dependencies = [
  "tokio-util",
  "tree-sitter",
  "tree-sitter-bash",
+]
+
+[[package]]
+name = "kloop-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kloop-protocol",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

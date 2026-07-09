@@ -4,6 +4,7 @@ use std::sync::Arc;
 use kloop_provider::Provider;
 
 use crate::permissions::Permissions;
+use crate::tools::ToolSource;
 
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
@@ -21,4 +22,7 @@ pub struct Config {
     /// Tool-execution gate; the Arc is shared into sub-agent configs so the
     /// session approval cache is inherited.
     pub permissions: Arc<Permissions>,
+    /// External tool providers (MCP servers), merged after the built-ins.
+    /// Shared into sub-agent configs like everything else.
+    pub tool_sources: Vec<Arc<dyn ToolSource>>,
 }

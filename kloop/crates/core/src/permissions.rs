@@ -1094,6 +1094,37 @@ mod tests {
             .is_ok());
     }
 
+    /// The contract MCP integration relies on: an unknown (external) tool
+    /// name defaults to asking; "allow for session" caches by whole tool
+    /// name; the suggested persistent rule is the tool name and parses back.
+    #[tokio::test]
+    async fn mcp_style_tools_ask_by_default_and_remember_by_name() {
+        let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&p, "memory__create_entities", json!({"k": "v"})).await);
+        let asked = approver.asked();
+        assert_eq!(
+            asked[0].remember_rules,
+            Some(vec!["memory__create_entities".to_string()])
+        );
+        assert!(parse_rule("memory__create_entities").is_ok());
+
+        // Session-cached now; a different tool on the same server still asks.
+        assert!(ok(&p, "memory__create_entities", json!({})).await);
+        assert!(!ok(&p, "memory__delete_entities", json!({})).await);
+        assert_eq!(approver.ask_count(), 2);
+
+        // An allow rule by qualified name skips the approver entirely.
+        let approver2 = ScriptedApprover::new(vec![]);
+        let p2 = gate(
+            Mode::Default,
+            rules(&["memory__create_entities"], &[], &[]),
+            approver2.clone(),
+        );
+        assert!(ok(&p2, "memory__create_entities", json!({})).await);
+        assert_eq!(approver2.ask_count(), 0);
+    }
+
     #[test]
     fn rule_parsing_accepts_valid_and_rejects_malformed() {
         assert!(parse_rule("write_file").is_ok());

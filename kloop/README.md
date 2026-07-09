@@ -207,9 +207,45 @@ dropped/never-answered reply denies (interrupt the turn to unblock).
 ← {"method":"turn/completed","params":{"threadId":"…","reason":"completed"}}
 ```
 
+## MCP client (Phase 2, sixth slice)
+
+kloop connects to external MCP tool servers over stdio (JSON-RPC 2.0,
+newline-delimited JSON — one object per line). Declare servers in
+`.kloop/config.toml`:
+
+```toml
+[mcp.servers.fs]
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "sandbox"]
+env = { }                                          # merged onto the process env
+readonly = ["read_text_file", "list_directory"]    # eligible for concurrent dispatch
+```
+
+Servers are spawned once at startup (killed on exit); the handshake is
+`initialize` → `notifications/initialized` → `tools/list` (with `nextCursor`
+pagination), and each advertised tool joins the model's tool list as
+`{server}__{tool}` with its inputSchema passed through verbatim. A failing
+server degrades to a startup warning — MCP never blocks kloop. Name
+sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
+allow rules round-trip through the permission-rule grammar); collisions and
+oversized tool lists (> 30) warn at startup, colliding later definitions are
+skipped.
+
+Calls go out with the raw server-side tool name; the result content array is
+flattened to text (binary blocks degrade to `[image: …]`-style tags), and
+`isError: true` surfaces as an is_error tool_result — same shape as a failing
+built-in. MCP tools run serially unless listed in `readonly`, and always ask
+for permission unless covered by an allow rule (`memory__create_entities` in
+`[permissions].allow`) or the session cache — the `a`/`p` answers work on
+whole-tool granularity.
+
+Layering: core only knows the `ToolSource` trait (`tools.rs`); the wire
+client is the `kloop-mcp` crate (depends only on protocol); the CLI glues
+them (config parsing, namespacing, the adapter). Deferred-tools + tool_search
+for oversized tool lists is future work.
+
 ## Deliberately out of scope (Phase 2 remainder)
 
-MCP, hooks.
+Hooks.
 
 ## Running
 
@@ -238,6 +274,8 @@ cargo run -- --continue        # continue the most recent session
 cargo run -- --resume          # pick a session from a numbered list
 cargo run -- --resume <id>     # continue a specific session
 
+# MCP servers come from .kloop/config.toml — see MCP client above
+
 # permissions (rules also live in .kloop/config.toml — see Permissions)
 AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
 AGENT_DENY='bash(git push *)' cargo run            # hard-block rules
@@ -251,7 +289,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 126 tests across the workspace:
+`cargo test` runs 143 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -292,9 +330,18 @@ saved and resumable — see Session persistence above.
   cross-tagging and no same-second id collisions, busy-thread rejection,
   interrupt-while-pending-approval, protocol-error resilience, and sessions
   surviving a server restart (list/resume/re-run over the same files).
+- **kloop-mcp** — wire-contract tests against an in-process mock MCP server
+  on a duplex pipe: exact handshake JSON (initialize params + the id-less
+  initialized notification), tools/list cursor pagination with whole-object
+  schema passthrough, tools/call round-trip with content-block rendering,
+  isError→Err and JSON-RPC-error→Err mapping, EOF fails pending requests,
+  server-initiated requests refused with -32601 amid noise, concurrent
+  calls routed by id.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
-  unrelated-section preservation, malformed rejection).
+  unrelated-section preservation, malformed rejection), `[mcp.servers]`
+  parsing (round-trip, malformed rejection) and rule-safe name
+  sanitization.
 
 Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
 exercising all five bets), and with a real key both adapters have been
@@ -307,9 +354,10 @@ every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 
 ## Layout
 
-Cargo workspace, six crates; the dependency graph is a strict line up to
-core, then two sibling frontends under the cli
-(protocol ← provider ← core ← {tui, server} ← cli):
+Cargo workspace, seven crates; the dependency graph is a strict line up to
+core, then two sibling frontends under the cli, with the MCP wire client as
+a protocol-only sibling glued in by the cli
+(protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli):
 
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
@@ -327,7 +375,8 @@ crates/core/        kloop-core — the agent, network-free
   src/history.rs    append-only history, record-time offloading,
                     usage-anchored token estimation
   src/tools.rs      bash, read/write/edit file, read_offloaded, task;
-                    concurrency-safety classification + batched dispatch
+                    concurrency-safety classification + batched dispatch;
+                    ToolSource seam for external (MCP) tools
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
   src/permissions.rs the layered execution gate: deny/ask/allow rules,
@@ -347,10 +396,17 @@ crates/server/      kloop-server — multi-session JSON-RPC frontend
   src/wire.rs       envelopes (request/response/notification/server request)
   src/lib.rs        serve loop, per-thread workers, approval routing
 
+crates/mcp/         kloop-mcp — MCP stdio wire client (depends on protocol only)
+  src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
+                    tools/list pagination, tools/call, content rendering
+
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
                     --serve), env config, StdoutUi, CliApprover (y/a/p/n
                     prompt), .kloop/config.toml rule load/persist, --mock
                     demo, session selection (--continue, --resume,
                     --list-sessions)
+  src/mcp.rs        [mcp.servers] config, startup connection with
+                    degrade-to-warning, {server}__{tool} namespacing,
+                    the ToolSource adapter
 ```

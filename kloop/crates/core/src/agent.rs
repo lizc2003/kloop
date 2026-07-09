@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::compact;
 use crate::config::Config;
 use crate::history::History;
+use crate::tools::all_tool_defs;
 use crate::tools::dispatch_tools;
-use crate::tools::tool_defs;
 use crate::tools::ToolCtx;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -60,7 +60,7 @@ pub async fn run_turn(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    let tools = tool_defs(depth);
+    let tools = all_tool_defs(depth, &cfg.tool_sources);
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
@@ -390,6 +390,7 @@ mod tests {
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+            tool_sources: Vec::new(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -467,6 +468,7 @@ mod tests {
             context_window: Some(window),
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+            tool_sources: Vec::new(),
         })
     }
 

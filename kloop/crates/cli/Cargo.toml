@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kloop-core = { workspace = true }
+kloop-mcp = { workspace = true }
 kloop-protocol = { workspace = true }
 kloop-provider = { workspace = true }
 kloop-server = { workspace = true }

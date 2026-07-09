@@ -112,11 +112,12 @@ pub enum StreamEvent {
     },
 }
 
-/// JSON-schema spec for one tool, provider-agnostic.
-#[derive(Clone, Debug)]
+/// JSON-schema spec for one tool, provider-agnostic. Owned strings because
+/// tool sets are no longer static: MCP servers contribute defs at runtime.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub schema: serde_json::Value,
 }
 
