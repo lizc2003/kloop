@@ -39,7 +39,10 @@ use kloop_provider::Provider;
 #[derive(Debug, PartialEq, Eq)]
 enum SessionChoice {
     New,
-    ResumeLatest,
+    /// `--continue`: the most recently modified session.
+    Continue,
+    /// `--resume` with no id: pick from a numbered list.
+    Pick,
     Resume(String),
 }
 
@@ -70,17 +73,18 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--accept-edits" => parsed.accept_edits = true,
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
+            "--continue" => parsed.session = SessionChoice::Continue,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
                     Some(id) if !id.starts_with('-') => {
                         i += 1;
                         SessionChoice::Resume(id.clone())
                     }
-                    _ => SessionChoice::ResumeLatest,
+                    _ => SessionChoice::Pick,
                 };
             }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --resume [id] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --continue | --resume [id] | --list-sessions)"
             ),
         }
         i += 1;
@@ -156,6 +160,18 @@ fn session_id_of(path: &Path) -> String {
         .to_string()
 }
 
+fn session_line(path: &Path) -> String {
+    let id = session_id_of(path);
+    match load_session(path) {
+        Ok(messages) => format!(
+            "{id}  {} message(s)  {}",
+            messages.len(),
+            first_user_snippet(&messages)
+        ),
+        Err(e) => format!("{id}  (unreadable: {e})"),
+    }
+}
+
 fn list_sessions(sessions_dir: &Path) {
     let sessions = sessions_by_recency(sessions_dir);
     if sessions.is_empty() {
@@ -163,15 +179,38 @@ fn list_sessions(sessions_dir: &Path) {
         return;
     }
     for path in sessions {
-        let id = session_id_of(&path);
-        match load_session(&path) {
-            Ok(messages) => println!(
-                "{id}  {} message(s)  {}",
-                messages.len(),
-                first_user_snippet(&messages)
-            ),
-            Err(e) => println!("{id}  (unreadable: {e})"),
-        }
+        println!("{}", session_line(&path));
+    }
+}
+
+/// `--resume` with no id: numbered list on stdout, one line of stdin picks.
+/// Runs before any UI starts, so plain blocking stdio is fine.
+fn pick_session(sessions_dir: &Path) -> Result<PathBuf> {
+    let sessions = sessions_by_recency(sessions_dir);
+    if sessions.is_empty() {
+        bail!("no saved sessions to resume");
+    }
+    println!("saved sessions (most recent first):");
+    for (i, path) in sessions.iter().enumerate() {
+        println!("{:>3}. {}", i + 1, session_line(path));
+    }
+    print!("resume which? [1-{}, empty = 1] > ", sessions.len());
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let index = pick_index(&line, sessions.len())?;
+    Ok(sessions[index].clone())
+}
+
+/// 1-based selection, empty input = the first (most recent) entry.
+fn pick_index(input: &str, len: usize) -> Result<usize> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(0);
+    }
+    match input.parse::<usize>() {
+        Ok(n) if (1..=len).contains(&n) => Ok(n - 1),
+        _ => bail!("invalid selection '{input}' (expected 1-{len})"),
     }
 }
 
@@ -218,10 +257,11 @@ fn open_history(
             }
             path
         }
-        SessionChoice::ResumeLatest => sessions_by_recency(sessions_dir)
+        SessionChoice::Continue => sessions_by_recency(sessions_dir)
             .into_iter()
             .next()
-            .context("no saved sessions to resume")?,
+            .context("no saved sessions to continue")?,
+        SessionChoice::Pick => pick_session(sessions_dir)?,
     };
     let id = session_id_of(&resume_path);
     let (messages, rollout) = resume_session(&resume_path)
@@ -642,7 +682,18 @@ mod tests {
                 accept_edits: false,
                 list_sessions: false,
                 plain: false,
-                session: SessionChoice::ResumeLatest,
+                session: SessionChoice::Pick,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--continue"])).unwrap(),
+            CliArgs {
+                mock: false,
+                yolo: false,
+                accept_edits: false,
+                list_sessions: false,
+                plain: false,
+                session: SessionChoice::Continue,
             }
         );
         assert_eq!(
@@ -711,6 +762,17 @@ mod tests {
         std::fs::write(&path, "[permissions]\nallow = \"not-an-array\"\n").unwrap();
         assert!(load_permission_rules(&path).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pick_index_covers_empty_valid_and_garbage() {
+        assert_eq!(pick_index("", 5).unwrap(), 0);
+        assert_eq!(pick_index("  \n", 5).unwrap(), 0);
+        assert_eq!(pick_index("1", 5).unwrap(), 0);
+        assert_eq!(pick_index(" 5 \n", 5).unwrap(), 4);
+        assert!(pick_index("0", 5).is_err());
+        assert!(pick_index("6", 5).is_err());
+        assert!(pick_index("abc", 5).is_err());
     }
 
     #[test]

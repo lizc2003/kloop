@@ -200,7 +200,8 @@ cargo run -- --plain
 
 # sessions
 cargo run -- --list-sessions   # what's on disk, most recent first
-cargo run -- --resume          # continue the most recent session
+cargo run -- --continue        # continue the most recent session
+cargo run -- --resume          # pick a session from a numbered list
 cargo run -- --resume <id>     # continue a specific session
 
 # permissions (rules also live in .kloop/config.toml — see Permissions)
