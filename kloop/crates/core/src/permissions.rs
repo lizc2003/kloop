@@ -1,13 +1,23 @@
 //! permissions — the layered gate run before every tool execution, shaped
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
-//! deny rules → safety checks → ask rules → bypass → read-only self-verdict
-//! → acceptEdits → allow rules → session cache → ask the user.
+//! deny rules → safety checks → ask rules → sandbox auto-allow → bypass →
+//! read-only self-verdict → acceptEdits → allow rules → session cache →
+//! ask the user.
 //!
 //! Two invariants carried over from cc: **deny always beats allow**, and
 //! **safety checks (destructive commands, sensitive paths) are immune to
 //! bypass mode**. A denial becomes an is_error tool_result — the model can
 //! take another approach; the turn does not end.
+//!
+//! The sandbox auto-allow layer (cc's `autoAllowBashIfSandboxed`) is the
+//! sandbox/approval coupling: a bash call the OS sandbox will contain needs
+//! no human sign-off — containment replaces the parse-level vetting of the
+//! layers below it, opaque scripts included. Everything above it still has
+//! its say: deny rules, safety checks, and — deliberately stricter than cc —
+//! explicit ask rules ("always confirm this" is the user's word, no
+//! automation outranks it). Dispatch feeds the verdict in per call, so an
+//! escaped call (`disable_sandbox: true`) faces the gate like any other.
 //!
 //! Bash content decisions run on the tree-sitter analysis in [`crate::shell`]:
 //! a script the parser cannot fully vouch for is *opaque* — it can never be
@@ -239,7 +249,24 @@ impl Permissions {
 
     /// Whether this tool call may run: `Ok(())` to proceed, `Err(reason)`
     /// with the message the model receives as an is_error tool_result.
+    /// The sandbox-blind form (no auto-allow layer); dispatch uses
+    /// [`Permissions::check_call`] with the per-call sandbox verdict.
     pub async fn check(&self, name: &str, input: &Value, depth: u8) -> Result<(), String> {
+        self.check_call(name, input, depth, /*sandbox_auto_allow*/ false)
+            .await
+    }
+
+    /// `sandbox_auto_allow`: this call will execute inside an OS sandbox
+    /// whose policy opts into approval-free contained runs. Only dispatch
+    /// can know that (it is a fact of the call, not of the gate), so it
+    /// arrives as a parameter.
+    pub async fn check_call(
+        &self,
+        name: &str,
+        input: &Value,
+        depth: u8,
+        sandbox_auto_allow: bool,
+    ) -> Result<(), String> {
         if self.allow_everything {
             return Ok(());
         }
@@ -269,17 +296,24 @@ impl Permissions {
             return self.ask_user(name, input, depth, None, None).await;
         }
 
-        // 4. Bypass mode.
+        // 4. Sandbox auto-allow — the OS sandbox will contain this call, so
+        // nothing below (parse-level vetting, rules, the human) needs to be
+        // consulted. Sits under deny/safety/ask: those keep their say.
+        if sandbox_auto_allow {
+            return Ok(());
+        }
+
+        // 5. Bypass mode.
         if self.mode == Mode::Bypass {
             return Ok(());
         }
 
-        // 5. Read-only self-verdict.
+        // 6. Read-only self-verdict.
         if call.is_readonly(name) {
             return Ok(());
         }
 
-        // 6. acceptEdits: file writes inside the working directory.
+        // 7. acceptEdits: file writes inside the working directory.
         if self.mode == Mode::AcceptEdits
             && matches!(name, "write_file" | "edit_file")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
@@ -287,12 +321,12 @@ impl Permissions {
             return Ok(());
         }
 
-        // 7. Allow rules.
+        // 8. Allow rules.
         if self.matches_allow(name, &call) {
             return Ok(());
         }
 
-        // 8. Session cache.
+        // 9. Session cache.
         let remember = remember_payload(name, &call);
         if let Some(remember) = &remember {
             let session = self.session.lock().unwrap();
@@ -301,7 +335,7 @@ impl Permissions {
             }
         }
 
-        // 9. Ask.
+        // 10. Ask.
         self.ask_user(name, input, depth, None, remember).await
     }
 
@@ -1101,6 +1135,79 @@ mod tests {
             "[sub-agent] [destructive] bash: rm -rf x"
         );
         assert_eq!(asked[1].description, "write_file: a.txt");
+    }
+
+    /// The sandbox auto-allow layer: a contained call runs without asking —
+    /// opaque scripts included, containment replaces analysis — while the
+    /// identical un-contained call still asks.
+    #[tokio::test]
+    async fn sandbox_auto_allow_skips_asking_for_contained_calls_only() {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        for cmd in ["echo x > f.txt", "cargo build", "ls $(evil)"] {
+            assert!(
+                p.check_call("bash", &bash(cmd), 0, /*sandbox_auto_allow*/ true)
+                    .await
+                    .is_ok(),
+                "{cmd}"
+            );
+        }
+        assert_eq!(approver.ask_count(), 0);
+
+        // Same non-readonly call, not contained: reaches the ask layer
+        // (empty script = deny).
+        assert!(p
+            .check_call(
+                "bash",
+                &bash("cargo build"),
+                0,
+                /*sandbox_auto_allow*/ false
+            )
+            .await
+            .is_err());
+        assert_eq!(approver.ask_count(), 1);
+    }
+
+    /// Everything above the auto-allow layer keeps its say: deny rules
+    /// reject outright, safety checks and explicit ask rules still go to
+    /// the human (the ask-rule half is deliberately stricter than cc).
+    #[tokio::test]
+    async fn deny_safety_and_ask_rules_outrank_sandbox_auto_allow() {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Default,
+            rules(&[], &["bash(git push *)"], &[]),
+            approver.clone(),
+        );
+        assert!(p
+            .check_call("bash", &bash("git push origin"), 0, true)
+            .await
+            .is_err());
+        assert_eq!(approver.ask_count(), 0, "deny is a verdict, not a question");
+
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        assert!(p
+            .check_call("bash", &bash("rm -rf /tmp/x"), 0, true)
+            .await
+            .is_err());
+        assert!(approver.asked()[0].description.contains("[destructive]"));
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let p = gate(
+            Mode::Default,
+            rules(&[], &[], &["bash(cargo publish *)"]),
+            approver.clone(),
+        );
+        assert!(p
+            .check_call("bash", &bash("cargo publish --dry-run"), 0, true)
+            .await
+            .is_ok());
+        assert_eq!(
+            approver.ask_count(),
+            1,
+            "ask rule asked despite the sandbox"
+        );
     }
 
     #[tokio::test]

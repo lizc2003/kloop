@@ -121,12 +121,17 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-deny rules → safety checks → ask rules → bypass → read-only self-verdict
-→ acceptEdits → allow rules → session cache → ask the user
+deny rules → safety checks → ask rules → sandbox auto-allow → bypass
+→ read-only self-verdict → acceptEdits → allow rules → session cache
+→ ask the user
 ```
 
 Two invariants carried over from claude-code: **deny always beats allow**,
-and **safety checks are immune to bypass mode**.
+and **safety checks are immune to bypass mode**. The sandbox auto-allow
+layer is the sandbox/approval coupling — see OS sandbox below: a bash call
+the OS sandbox will contain skips everything beneath this layer, while deny
+rules, safety checks and explicit ask rules keep their say (the ask-rule
+half is deliberately stricter than cc's autoAllowBashIfSandboxed).
 
 **Bash decisions run on a real parse tree** (`crates/core/src/shell.rs`,
 tree-sitter-bash): a script qualifies only when every node is a plain
@@ -473,9 +478,16 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   run code, `.kloop` holds the permission rules; the rest of `.git` stays
   writable so `git commit` works sandboxed).
 - **Reads** are full-disk; **network** is off unless configured.
-- The sandbox sits *under* the permission gate and changes nothing about
-  asking: an approved command still runs sandboxed, and `--yolo` bypasses
-  approvals but not the sandbox.
+- **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
+  the sandbox will contain skips the asking layers of the permission gate —
+  opaque scripts (redirects, subshells) included, since OS containment
+  replaces parse-level vetting. Deny rules, safety checks (a visible
+  `rm -rf` still confirms) and explicit ask rules stay in force above it.
+  The accepted trade-off: a contained command can still modify the workspace
+  without a prompt — protected `.git` internals aside, git history is the
+  recovery path. `auto_allow = false` reverts to pure containment (approve
+  first, then run sandboxed). `--yolo` bypasses approvals but not the
+  sandbox.
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
@@ -489,6 +501,7 @@ prompt. Escalation is per call — the next command is sandboxed again.
 enabled = true            # default; false turns the sandbox off
 allow_network = false     # default; true appends the network allow rules
 writable_roots = []       # extra writable directories
+auto_allow = true         # default; false = ask first, then run sandboxed
 ```
 
 `AGENT_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
@@ -563,7 +576,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 285 tests across the workspace:
+`cargo test` runs 288 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -603,11 +616,13 @@ saved and resumable — see Session persistence above.
   branches share the offload dir without clobbering); sandbox contracts
   (exact SBPL profile assembly and `-D` param list, workspace-root
   computation with canonical/literal dedup, denial-detection table incl. the
-  network-off DNS extension, `[no sandbox]` approval tag) plus macOS-only
-  integration against the real `sandbox-exec` (write inside/outside a
-  writable root with the denial hint, protected subpath, per-call
-  disable_sandbox escape, network denied where a bare run connects,
-  background shell sandboxed with inherited-fd output).
+  network-off DNS extension, `[no sandbox]` approval tag, auto-allow
+  layering: contained calls skip asking while deny/safety/ask-rules
+  outrank the sandbox) plus macOS-only integration against the real
+  `sandbox-exec` (write inside/outside a writable root with the denial
+  hint, protected subpath, per-call disable_sandbox escape, network denied
+  where a bare run connects, background shell sandboxed with inherited-fd
+  output, contained bash running with no approver present).
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
   accumulation and splitting, tool status resolution by id, confirm queueing

@@ -46,6 +46,13 @@ pub struct WritableRoot {
 pub struct SandboxPolicy {
     pub writable_roots: Vec<WritableRoot>,
     pub allow_network: bool,
+    /// The sandbox/approval coupling knob (cc's autoAllowBashIfSandboxed,
+    /// default on): a bash call this sandbox will contain skips the asking
+    /// layers of the permission gate — deny rules, safety checks and
+    /// explicit ask rules still run first. `[sandbox] auto_allow = false`
+    /// reverts to slice-1 behavior (sandbox as pure containment, asking
+    /// unchanged).
+    pub auto_allow: bool,
 }
 
 impl SandboxPolicy {
@@ -87,6 +94,7 @@ impl SandboxPolicy {
                 })
                 .collect(),
             allow_network,
+            auto_allow: true,
         }
     }
 }
@@ -223,6 +231,7 @@ mod tests {
         SandboxPolicy {
             writable_roots: roots,
             allow_network,
+            auto_allow: true,
         }
     }
 

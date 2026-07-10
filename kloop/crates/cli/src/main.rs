@@ -443,11 +443,13 @@ fn build_permissions(
 
 /// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
 /// `allow_network` (default false), `writable_roots` (extra writable
-/// directories, default none).
+/// directories, default none), `auto_allow` (default true: sandboxed bash
+/// skips the asking layers of the permission gate).
 struct SandboxSettings {
     enabled: bool,
     allow_network: bool,
     writable_roots: Vec<PathBuf>,
+    auto_allow: bool,
 }
 
 fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
@@ -455,6 +457,7 @@ fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
         enabled: true,
         allow_network: false,
         writable_roots: Vec::new(),
+        auto_allow: true,
     };
     let Ok(raw) = std::fs::read_to_string(config_path) else {
         return Ok(settings);
@@ -490,8 +493,13 @@ fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
                     ));
                 }
             }
+            "auto_allow" => {
+                settings.auto_allow = value
+                    .as_bool()
+                    .context("sandbox.auto_allow must be a boolean")?;
+            }
             other => bail!(
-                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots)"
+                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | auto_allow)"
             ),
         }
     }
@@ -520,13 +528,15 @@ fn build_sandbox(
         return Ok(None);
     }
     match kloop_core::sandbox::availability() {
-        Ok(()) => Ok(Some(Arc::new(
-            kloop_core::sandbox::SandboxPolicy::workspace(
+        Ok(()) => {
+            let mut policy = kloop_core::sandbox::SandboxPolicy::workspace(
                 cwd,
                 &settings.writable_roots,
                 settings.allow_network,
-            ),
-        ))),
+            );
+            policy.auto_allow = settings.auto_allow;
+            Ok(Some(Arc::new(policy)))
+        }
         Err(reason) => {
             warn(&format!(
                 "sandbox unavailable ({reason}); bash commands run unsandboxed"
@@ -1080,11 +1090,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
 
-        // Missing file / missing section: sandbox on, network off, no extras.
+        // Missing file / missing section: sandbox on, network off, no
+        // extras, auto-allow on.
         let settings = load_sandbox_settings(&path).unwrap();
         assert!(settings.enabled);
         assert!(!settings.allow_network);
         assert!(settings.writable_roots.is_empty());
+        assert!(settings.auto_allow);
         std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
         assert!(load_sandbox_settings(&path).unwrap().enabled);
 
@@ -1101,11 +1113,15 @@ mod tests {
         std::fs::write(&path, "[sandbox]\nenabled = false\n").unwrap();
         assert!(!load_sandbox_settings(&path).unwrap().enabled);
 
+        std::fs::write(&path, "[sandbox]\nauto_allow = false\n").unwrap();
+        assert!(!load_sandbox_settings(&path).unwrap().auto_allow);
+
         for bad in [
             "[sandbox]\nenabled = \"yes\"\n",
             "[sandbox]\nallow_network = 1\n",
             "[sandbox]\nwritable_roots = \"/opt\"\n",
             "[sandbox]\nwritable_roots = [1]\n",
+            "[sandbox]\nauto_allow = \"on\"\n",
             "[sandbox]\nnetwork = true\n",
             "sandbox = true\n",
         ] {

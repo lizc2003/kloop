@@ -83,6 +83,14 @@ fn call_sandbox<'a>(input: &Value, ctx: &'a ToolCtx) -> Option<&'a SandboxPolicy
     }
 }
 
+/// The per-call verdict dispatch feeds the permission gate's sandbox
+/// auto-allow layer: bash, not escaped, and the active policy opts in.
+/// Foreground and background take the same wrapper, so one verdict covers
+/// both.
+pub(super) fn sandbox_auto_allowed(name: &str, input: &Value, ctx: &ToolCtx) -> bool {
+    name == "bash" && call_sandbox(input, ctx).is_some_and(|p| p.auto_allow)
+}
+
 pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let command = str_arg(input, "command", "bash")?;
     let sandbox = call_sandbox(input, ctx);
@@ -628,6 +636,7 @@ mod tests {
                     read_only_subpaths: vec![root.join(".kloop")],
                 }],
                 allow_network: false,
+                auto_allow: true,
             };
             (with_sandbox(test_ctx(0, tag), policy), root)
         }
@@ -714,6 +723,74 @@ mod tests {
             let (out, is_error) = run_tool("bash", bash_input(&connect), &bare).await;
             assert!(!is_error, "control run must reach the listener: {out}");
             assert!(!out.contains("Operation not permitted"), "{out}");
+        }
+
+        /// End-to-end through the real dispatch gate: with auto_allow, a
+        /// contained bash call (opaque redirect, previously always asked)
+        /// runs with NOBODY available to approve; the escaped form and the
+        /// auto_allow=false policy both still reach the ask layer and fail.
+        #[tokio::test]
+        async fn auto_allow_runs_contained_bash_without_an_approver() {
+            use std::sync::Arc;
+            let (ctx, root) = sandbox_ctx("autoallow");
+            let no_approver = || {
+                Arc::new(
+                    crate::permissions::Permissions::new(
+                        crate::permissions::Mode::Default,
+                        &Default::default(),
+                        root.clone(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let mut cfg = (*ctx.cfg).clone();
+            cfg.permissions = no_approver();
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+
+            let target = root.join("auto.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo hi > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi\n");
+
+            // Escaping the sandbox forfeits the auto-allow.
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({"command": "touch escaped.txt", "disable_sandbox": true}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error);
+            assert!(out.contains("approval required"), "{out}");
+
+            // auto_allow = false reverts to slice-1: contained or not, the
+            // call asks.
+            let mut cfg = (*ctx.cfg).clone();
+            let mut policy = (*cfg.sandbox.take().unwrap()).clone();
+            policy.auto_allow = false;
+            cfg.sandbox = Some(Arc::new(policy));
+            cfg.permissions = no_approver();
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo hi > {}", root.join("b.txt").display())),
+                &ctx,
+            )
+            .await;
+            assert!(is_error);
+            assert!(out.contains("approval required"), "{out}");
         }
 
         /// The bg output file lives outside the writable roots; the child

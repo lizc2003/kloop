@@ -441,7 +441,13 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 ctx.hook_context.lock().unwrap().extend(context);
             }
         }
-        if let Err(reason) = ctx.cfg.permissions.check(&name, &input, ctx.depth).await {
+        let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &ctx);
+        if let Err(reason) = ctx
+            .cfg
+            .permissions
+            .check_call(&name, &input, ctx.depth, sandbox_auto_allow)
+            .await
+        {
             bail!(reason);
         }
         let result = execute_tool(&name, &input, &ctx).await;

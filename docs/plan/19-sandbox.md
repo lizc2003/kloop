@@ -1,4 +1,4 @@
-# Plan 19 — 沙箱基建(第一片)✅(第一片完成,68bcf18)
+# Plan 19 — 沙箱基建 ✅(片 1 完成 68bcf18;片 2 完成,提交号见下)
 
 > 可能不止一个会话,开工时切片。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 权限系统对比"codex 独有、kloop 暂不做"一节——sandbox+approval 双轴、escalation 环、execpolicy、Starlark 规则都**依赖沙箱基建**,这个 plan 就是去补基建;codex codex-rs 的 seatbelt(macOS)/landlock+seccomp(Linux)实现回源精读(教训 11,这是安全层,更不能凭印象)。
 
@@ -35,4 +35,8 @@ fmt/clippy/test 全绿(macOS+Linux CI 过);手工验收:真 key 让模型试写 
 
 **真 key 验收**:anthropic 轨(sonnet-5)全闭环——写 `~/...` 被拦 → hint 回给模型 → 自发 `disable_sandbox: true` 重试成功;curl 断网(DNS 拦截)同样闭环。openai 轨(gpt-5.4-mini)看到 denial 先汇报征求确认(保守但正确),任务声明访问必需后正确带参升级成功。`[no sandbox]` 标签在审批提示中确认可见。验收方法注记:管道 stdin 下 plain REPL 的异步 reader 会吞掉后续审批行(交互终端无此问题),脚本化验收用 `--yolo`(bypass 只影响审批不影响沙箱,恰好也验证了这一点)。
 
-**下一片取舍(escalation 环 / 双轴联动)**:① cc 的 `autoAllowBashIfSandboxed` 语义——能进沙箱的命令跳过 ask 直接跑(deny/显式 ask 仍优先),这才兑现"受限沙箱内少问"的体验;动 plan 8 管线(在 ask 层加沙箱旁路),建议下一片做,默认开、config 关。② codex 代码环(orchestrator 捕获 denial → 自动询问 → 批准后裸跑重试)可以等:模型驱动的最小逃逸口已验证够用,代码环的增量价值是省一轮模型往返,复杂度换速度,有痛感再上。③ Linux 片对着 bwrap+seccomp 设计(landlock 是 legacy),需要 helper 二进制(arg0 dispatch)时把 sandbox.rs 拆成独立 crate。④ 挂账:seatbelt 下 `.git` 文件型(worktree gitdir 指针)未解析真实 gitdir(codex 有,罕见场景);bash 工具描述提沙箱但 system prompt 未提(cc 在 prompt 教升级时机,kloop 靠 denial hint 事发时教学,验收显示对强弱模型都够用)。
+## ✅ 片 2 完成记录(2026-07-10):auto-allow 双轴联动
+
+cc 的 autoAllowBashIfSandboxed 形态落地:plan 8 管线在 ask 规则之后、bypass 之前插入 sandbox auto-allow 层——会被沙箱兜住的 bash 调用跳过其下所有询问层。三个关键取舍:① **opaque(重定向/子 shell)也覆盖**:OS 遏制替代解析级审查,这是主要 UX 收益(`echo > file` 类询问噪音清零);接受的风险 = 藏在 opaque 里的破坏可无询问改工作区(.git/hooks|config、.kloop 仍受 SBPL 保护,git 史兜底),两家参考同款取舍。② **deny/安全检查/显式 ask 规则保持优先**——可解析的 `rm -rf` 仍问;ask 规则这半**比 cc 严**(cc 的 tool 级 ask 规则会被沙箱 auto-allow 跳过,kloop 认为"always confirm"是用户的话,自动化不得盖过)。③ **判定按调用喂入**:`Permissions::check_call` 第 4 参 `sandbox_auto_allow`(gate 不感知 sandbox 模块;旧 `check` = 恒 false 包装,签名零churn),dispatch 由 `bash::sandbox_auto_allowed`(bash + 未逃逸 + policy.auto_allow)计算;`disable_sandbox: true` 调用天然不享受。配置 `[sandbox] auto_allow` 默认开,false 回退片 1 纯遏制形态。测试 +3(=288):分层契约(contained 跳问含 opaque、同调用不 contained 照问、deny+安全+ask 压过沙箱)、macOS 端到端(无 approver 下 contained 跑通/逃逸被拒/auto_allow=false 回退)、cli 解析。真 key 验收:默认模式(非 --yolo)sonnet-5——重定向写 cwd 零询问直接跑,写外拦截 → 自发升级 → `[no sandbox]` 审批弹出(拒后如实汇报);gpt-5.4-mini 零询问路径同过。
+
+**剩余片取舍**:① ~~auto-allow 双轴联动~~(片 2 已完成,见上)。② codex 代码环(orchestrator 捕获 denial → 自动询问 → 批准后裸跑重试)可以等:模型驱动的最小逃逸口已验证够用,代码环的增量价值是省一轮模型往返,复杂度换速度,有痛感再上。③ Linux 片对着 bwrap+seccomp 设计(landlock 是 legacy),需要 helper 二进制(arg0 dispatch)时把 sandbox.rs 拆成独立 crate。④ 挂账:seatbelt 下 `.git` 文件型(worktree gitdir 指针)未解析真实 gitdir(codex 有,罕见场景);bash 工具描述提沙箱但 system prompt 未提(cc 在 prompt 教升级时机,kloop 靠 denial hint 事发时教学,验收显示对强弱模型都够用)。
