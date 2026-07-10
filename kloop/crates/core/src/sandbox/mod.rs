@@ -6,8 +6,13 @@
 //! function (codex's `sandboxing` crate discipline) so tests can assert the
 //! exact profile on any platform; only [`availability`] and the actual spawn
 //! are platform-dependent. Linux (bwrap + seccomp — landlock is legacy
-//! upstream) and Windows are future slices behind the same seam: the CLI
-//! degrades to unsandboxed execution wherever [`availability`] says no.
+//! upstream) and Windows are future slices: the CLI degrades to unsandboxed
+//! execution wherever [`availability`] says no. This is a directory module so
+//! the seatbelt `.sbpl` assets sit next to their only consumer; when the
+//! platform backends land they get sibling files (`linux.rs`, `windows.rs`).
+//! Note the current seam — a `sandbox-exec`/`bwrap` argv prefix — is
+//! macOS/Linux-shaped; Windows (restricted token / AppContainer) has no
+//! wrapper binary and will reshape it into a spawn-owning form.
 
 use std::path::Path;
 use std::path::PathBuf;

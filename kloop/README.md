@@ -494,7 +494,7 @@ agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
 ## OS sandbox (Phase 2, thirteenth slice)
 
 On macOS, bash commands run inside a seatbelt sandbox by default
-(`crates/core/src/sandbox.rs`, executed via `/usr/bin/sandbox-exec` with a
+(`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-exec` with a
 deny-by-default SBPL profile — the shape cc and codex converged on):
 
 - **Writes** are allow-listed: cwd + `/tmp` + `$TMPDIR` + configured extras.
