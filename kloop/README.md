@@ -461,6 +461,44 @@ prompt / tool subset / model override), sub-agent history persistence,
 async dispatch with completion mailbox (codex spawn/wait shape), hook
 events tagged with the agent — see `docs/plan/17-subagents.md`.
 
+## OS sandbox (Phase 2, thirteenth slice)
+
+On macOS, bash commands run inside a seatbelt sandbox by default
+(`crates/core/src/sandbox.rs`, executed via `/usr/bin/sandbox-exec` with a
+deny-by-default SBPL profile — the shape cc and codex converged on):
+
+- **Writes** are allow-listed: cwd + `/tmp` + `$TMPDIR` + configured extras.
+  Inside a writable root, `.git/hooks`, `.git/config` and `.kloop` stay
+  read-only (they are privilege-escalation surfaces — hooks and git config
+  run code, `.kloop` holds the permission rules; the rest of `.git` stays
+  writable so `git commit` works sandboxed).
+- **Reads** are full-disk; **network** is off unless configured.
+- The sandbox sits *under* the permission gate and changes nothing about
+  asking: an approved command still runs sandboxed, and `--yolo` bypasses
+  approvals but not the sandbox.
+
+When a sandboxed command fails and the failure looks like a sandbox denial
+(keyword match ported from codex, plus DNS-failure shapes when the sandbox
+disables network), the tool result is annotated with guidance; the model can
+then retry that one call with `disable_sandbox: true`, which faces the
+permission gate like any call and is tagged `[no sandbox]` in the approval
+prompt. Escalation is per call — the next command is sandboxed again.
+
+```toml
+[sandbox]
+enabled = true            # default; false turns the sandbox off
+allow_network = false     # default; true appends the network allow rules
+writable_roots = []       # extra writable directories
+```
+
+`AGENT_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
+(Linux/Windows for now — planned as future slices behind the same seam; or a
+missing `sandbox-exec`), kloop warns at startup and runs commands bare:
+fail-open, because the permission gate remains the enforcement layer.
+Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
+`KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
+sandboxes.
+
 ## Running
 
 ```sh
@@ -514,6 +552,9 @@ AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
 AGENT_DENY='bash(git push *)' cargo run            # hard-block rules
 cargo run -- --accept-edits                        # auto-allow cwd file writes
 cargo run -- --yolo                                # bypass (deny/safety still apply)
+
+# OS sandbox (macOS seatbelt; see OS sandbox above)
+AGENT_SANDBOX=off cargo run                        # run bash commands bare
 ```
 
 Both frontends: Ctrl+C interrupts the running turn (history is patched and
@@ -522,7 +563,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 272 tests across the workspace:
+`cargo test` runs 285 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -559,7 +600,14 @@ saved and resumable — see Session persistence above.
   (prefix copy with cross-file lineage and preserved timestamps, branches
   append independently, illegal cuts rejected with nearby legal points,
   cuts before/at a compacted marker replay each side, fork-of-a-fork,
-  branches share the offload dir without clobbering).
+  branches share the offload dir without clobbering); sandbox contracts
+  (exact SBPL profile assembly and `-D` param list, workspace-root
+  computation with canonical/literal dedup, denial-detection table incl. the
+  network-off DNS extension, `[no sandbox]` approval tag) plus macOS-only
+  integration against the real `sandbox-exec` (write inside/outside a
+  writable root with the denial hint, protected subpath, per-call
+  disable_sandbox escape, network denied where a bare run connects,
+  background shell sandboxed with inherited-fd output).
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
   accumulation and splitting, tool status resolution by id, confirm queueing

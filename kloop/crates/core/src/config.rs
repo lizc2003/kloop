@@ -46,6 +46,12 @@ pub struct Config {
     /// Sub-agents share the parent's through the Config clone; server mode
     /// builds one per thread.
     pub background_shells: Arc<BackgroundShells>,
+    /// OS sandbox policy for bash execution; None runs commands bare
+    /// (sandbox disabled, platform unsupported, --mock). The permission gate
+    /// is independent — approved commands still run inside this sandbox, and
+    /// the model escapes per call with disable_sandbox (which faces the same
+    /// gate). Sub-agents inherit it with the Config.
+    pub sandbox: Option<Arc<crate::sandbox::SandboxPolicy>>,
     /// Above this many tools (depth-0 view: built-ins + merged sources) the
     /// source tools are deferred: excluded from the request's tool defs and
     /// discoverable via the tool_search tool instead. Built-ins never defer.

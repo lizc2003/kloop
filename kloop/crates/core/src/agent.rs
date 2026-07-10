@@ -500,6 +500,7 @@ mod tests {
             agent_label: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
+            sandbox: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
         });
@@ -587,6 +588,7 @@ mod tests {
             agent_label: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
+            sandbox: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
         })

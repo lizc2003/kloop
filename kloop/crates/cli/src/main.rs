@@ -441,6 +441,101 @@ fn build_permissions(
         .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
 }
 
+/// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
+/// `allow_network` (default false), `writable_roots` (extra writable
+/// directories, default none).
+struct SandboxSettings {
+    enabled: bool,
+    allow_network: bool,
+    writable_roots: Vec<PathBuf>,
+}
+
+fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
+    let mut settings = SandboxSettings {
+        enabled: true,
+        allow_network: false,
+        writable_roots: Vec::new(),
+    };
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(settings);
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(section) = value.get("sandbox") else {
+        return Ok(settings);
+    };
+    let section = section.as_table().context("[sandbox] must be a table")?;
+    for (key, value) in section {
+        match key.as_str() {
+            "enabled" => {
+                settings.enabled = value
+                    .as_bool()
+                    .context("sandbox.enabled must be a boolean")?;
+            }
+            "allow_network" => {
+                settings.allow_network = value
+                    .as_bool()
+                    .context("sandbox.allow_network must be a boolean")?;
+            }
+            "writable_roots" => {
+                let list = value
+                    .as_array()
+                    .context("sandbox.writable_roots must be an array of strings")?;
+                for entry in list {
+                    settings.writable_roots.push(PathBuf::from(
+                        entry
+                            .as_str()
+                            .context("sandbox.writable_roots must be an array of strings")?,
+                    ));
+                }
+            }
+            other => bail!(
+                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots)"
+            ),
+        }
+    }
+    Ok(settings)
+}
+
+/// The session sandbox policy, or None with a warning when unavailable —
+/// fail-open like hooks: the permission gate stays the enforcement layer.
+/// Built once per process and shared into every Config (server threads too).
+fn build_sandbox(
+    args: &CliArgs,
+    cwd: &Path,
+    warn: impl Fn(&str),
+) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
+    // --mock stays hermetic; AGENT_SANDBOX=off is the env escape hatch.
+    if args.mock
+        || matches!(
+            std::env::var("AGENT_SANDBOX").ok().as_deref(),
+            Some("off") | Some("0") | Some("false")
+        )
+    {
+        return Ok(None);
+    }
+    let settings = load_sandbox_settings(Path::new(PERMISSIONS_CONFIG))?;
+    if !settings.enabled {
+        return Ok(None);
+    }
+    match kloop_core::sandbox::availability() {
+        Ok(()) => Ok(Some(Arc::new(
+            kloop_core::sandbox::SandboxPolicy::workspace(
+                cwd,
+                &settings.writable_roots,
+                settings.allow_network,
+            ),
+        ))),
+        Err(reason) => {
+            warn(&format!(
+                "sandbox unavailable ({reason}); bash commands run unsandboxed"
+            ));
+            Ok(None)
+        }
+    }
+}
+
 /// AGENT_DEFER_THRESHOLD: total tool count above which MCP tool definitions
 /// are deferred behind tool_search. Lower it to exercise deferral with a
 /// small server; raise it to effectively disable deferral.
@@ -459,6 +554,7 @@ fn config_from_env(
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
     project: &context::GatheredContext,
+    sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
 ) -> Result<Config> {
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
     // --mock stays hermetic: no config reads, no hook child processes.
@@ -496,6 +592,7 @@ fn config_from_env(
         agent_label: String::new(),
         hooks: Arc::new(hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
+        sandbox,
         defer_threshold: defer_threshold_from_env()?,
         unlocked_tools: Default::default(),
     };
@@ -728,13 +825,23 @@ async fn main() -> Result<()> {
     for warning in &project.warnings {
         eprintln!("\x1b[2m[{warning}]\x1b[0m");
     }
+    // The sandbox policy is process-stable (cwd + config), so it is built
+    // once and shared into every Config — server threads included.
+    let sandbox = build_sandbox(&args, &cwd, |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"))?;
     if args.serve {
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
         let factory: kloop_server::ConfigFactory = {
             let args = args.clone();
             Arc::new(move |approver, notify| {
-                config_from_env(&args, approver, notify, &tool_sources, &project)
+                config_from_env(
+                    &args,
+                    approver,
+                    notify,
+                    &tool_sources,
+                    &project,
+                    sandbox.clone(),
+                )
             })
         };
         return kloop_server::serve_stdio(
@@ -755,12 +862,19 @@ async fn main() -> Result<()> {
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        return plain_main(args, history, session_id, tool_sources, project).await;
+        return plain_main(args, history, session_id, tool_sources, project, sandbox).await;
     }
     let factory_session_id = session_id.clone();
     kloop_tui::run(
         move |approver, notify| {
-            let mut cfg = config_from_env(&args, approver, notify, &tool_sources, &project)?;
+            let mut cfg = config_from_env(
+                &args,
+                approver,
+                notify,
+                &tool_sources,
+                &project,
+                sandbox.clone(),
+            )?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
         },
@@ -776,6 +890,7 @@ async fn plain_main(
     session_id: String,
     tool_sources: Vec<Arc<dyn ToolSource>>,
     project: context::GatheredContext,
+    sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let mut cfg = config_from_env(
@@ -784,6 +899,7 @@ async fn plain_main(
         notify,
         &tool_sources,
         &project,
+        sandbox,
     )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);
@@ -956,6 +1072,46 @@ mod tests {
             "seq must parse"
         );
         assert!(parse_args(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn sandbox_settings_parse_defaults_and_reject_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("kloop-sbxcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / missing section: sandbox on, network off, no extras.
+        let settings = load_sandbox_settings(&path).unwrap();
+        assert!(settings.enabled);
+        assert!(!settings.allow_network);
+        assert!(settings.writable_roots.is_empty());
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert!(load_sandbox_settings(&path).unwrap().enabled);
+
+        std::fs::write(
+            &path,
+            "[sandbox]\nenabled = true\nallow_network = true\nwritable_roots = [\"/opt/data\"]\n",
+        )
+        .unwrap();
+        let settings = load_sandbox_settings(&path).unwrap();
+        assert!(settings.enabled);
+        assert!(settings.allow_network);
+        assert_eq!(settings.writable_roots, vec![PathBuf::from("/opt/data")]);
+
+        std::fs::write(&path, "[sandbox]\nenabled = false\n").unwrap();
+        assert!(!load_sandbox_settings(&path).unwrap().enabled);
+
+        for bad in [
+            "[sandbox]\nenabled = \"yes\"\n",
+            "[sandbox]\nallow_network = 1\n",
+            "[sandbox]\nwritable_roots = \"/opt\"\n",
+            "[sandbox]\nwritable_roots = [1]\n",
+            "[sandbox]\nnetwork = true\n",
+            "sandbox = true\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_sandbox_settings(&path).is_err(), "accepted: {bad}");
+        }
     }
 
     #[test]

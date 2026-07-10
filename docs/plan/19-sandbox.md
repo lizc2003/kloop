@@ -1,4 +1,4 @@
-# Plan 19 — 沙箱基建(第一片)
+# Plan 19 — 沙箱基建(第一片)✅(第一片完成,提交号见下)
 
 > 可能不止一个会话,开工时切片。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 权限系统对比"codex 独有、kloop 暂不做"一节——sandbox+approval 双轴、escalation 环、execpolicy、Starlark 规则都**依赖沙箱基建**,这个 plan 就是去补基建;codex codex-rs 的 seatbelt(macOS)/landlock+seccomp(Linux)实现回源精读(教训 11,这是安全层,更不能凭印象)。
 
@@ -22,3 +22,17 @@ bash 工具可在受限沙箱里执行(文件系统写限 cwd、默认断网),�
 ## 完成标准
 
 fmt/clippy/test 全绿(macOS+Linux CI 过);手工验收:真 key 让模型试写 /tmp 外任意路径与访问网络,观察被沙箱拦下的报错回给模型;README、HANDOFF 更新;下一片(escalation 环)的取舍写进本文件末尾。
+
+## ✅ 第一片完成记录(2026-07-10)
+
+**开工决定**(与用户对齐):平台 = 先 macOS seatbelt,Linux/Windows 留缝优雅降级(用户明确 Windows 也是后期目标);管线关系 = 保守 + 最小逃逸口——沙箱是权限门**之下**的执行层,批准后仍罩沙箱跑,bash 加 `disable_sandbox` 参数(cc 的 dangerouslyDisableSandbox 形态),带参调用走同一权限门(describe 打 `[no sandbox]` 标签),plan 8 管线零改动;粒度 = 写 cwd+/tmp+$TMPDIR+config extras、读全盘、网络默认禁 `[sandbox] allow_network` 开口;归属 = `core/src/sandbox.rs` 模块(策略→argv 纯函数,学 codex sandboxing crate 的解耦;Linux 片要 helper 二进制时再拆 crate)。
+
+**回源调研结论**(两个 Explore agent 精读,细节在会话):两家收敛 = deny-default + 读全盘 + 写白名单(cwd+tmp)+ 网络默认禁 + `sandbox-exec` 外部二进制 + "沙箱内少问/失败升级批准后裸跑"。分歧:escalation cc 是模型驱动(参数 + prompt 教学),codex 是 orchestrator 代码环;denial 判定 codex 纯输出判定(7 关键词 + 2/126/127 快速否决 + Linux 128+SIGSYS),cc 靠 macOS `log stream` 抓内核事件(重,未抄);Linux 两家现役都是 bwrap+seccomp,**codex 的 landlock 已退居 legacy**(下一片对着 bwrap 设计);`.git` 粒度 cc 只锁 hooks+config(git commit 沙箱内可用),codex 锁整个 `.git`(靠 escalation 付账)——kloop 取 cc 粒度,另锁整个 `.kloop`(权限规则所在)。
+
+**实测事实**(plan 要求实测别猜,均已进测试或注释):拦截报错 = `Operation not permitted`(exit 1,命中关键词表);**继承 fd 跨界写可行**(seatbelt 在 open 时检查,不逐 write)——后台输出文件不需要开洞;`sh -lc` 沙箱内正常;**断网沙箱里 DNS 失败报 `Could not resolve host`(curl exit 6),不命中 codex 关键词表**——kloop 扩展:network_disabled 时 DNS 失败形态(could not resolve host / name resolution / nodename nor servname / getaddrinfo)也算 denial 证据。
+
+**落地**:`core/src/sandbox.rs`(SandboxPolicy/WritableRoot、SBPL 纯函数生成——base/network 模板逐字来自 codex 的 .sbpl 文件、路径经 `-D` param 不内联、denial 判定移植+DNS 扩展、availability 探测)+ bash 前台/后台接线(`shell_command` 统一包装点、BgShell 记 sandbox 旗标、denial hint 注入 tool_result)+ `Config.sandbox: Option<Arc<SandboxPolicy>>`(子 agent/server 线程随 clone 继承)+ cli `[sandbox]`(enabled/allow_network/writable_roots,未知键报错)+ `AGENT_SANDBOX=off` + 不可用降级警告(fail-open,权限门仍是强制层)+ `--mock` 恒不沙箱。测试 +13(=285):SBPL 整串断言、workspace roots 规范化去重、denial 表、`[no sandbox]` 标签、cli 解析,macOS-only 真 sandbox-exec 集成 6 个(写内/写外+hint、保护子路径、逃逸、真 listener 判别断网、后台继承 fd + 后台 denial 注释)。
+
+**真 key 验收**:anthropic 轨(sonnet-5)全闭环——写 `~/...` 被拦 → hint 回给模型 → 自发 `disable_sandbox: true` 重试成功;curl 断网(DNS 拦截)同样闭环。openai 轨(gpt-5.4-mini)看到 denial 先汇报征求确认(保守但正确),任务声明访问必需后正确带参升级成功。`[no sandbox]` 标签在审批提示中确认可见。验收方法注记:管道 stdin 下 plain REPL 的异步 reader 会吞掉后续审批行(交互终端无此问题),脚本化验收用 `--yolo`(bypass 只影响审批不影响沙箱,恰好也验证了这一点)。
+
+**下一片取舍(escalation 环 / 双轴联动)**:① cc 的 `autoAllowBashIfSandboxed` 语义——能进沙箱的命令跳过 ask 直接跑(deny/显式 ask 仍优先),这才兑现"受限沙箱内少问"的体验;动 plan 8 管线(在 ask 层加沙箱旁路),建议下一片做,默认开、config 关。② codex 代码环(orchestrator 捕获 denial → 自动询问 → 批准后裸跑重试)可以等:模型驱动的最小逃逸口已验证够用,代码环的增量价值是省一轮模型往返,复杂度换速度,有痛感再上。③ Linux 片对着 bwrap+seccomp 设计(landlock 是 legacy),需要 helper 二进制(arg0 dispatch)时把 sandbox.rs 拆成独立 crate。④ 挂账:seatbelt 下 `.git` 文件型(worktree gitdir 指针)未解析真实 gitdir(codex 有,罕见场景);bash 工具描述提沙箱但 system prompt 未提(cc 在 prompt 教升级时机,kloop 靠 denial hint 事发时教学,验收显示对强弱模型都够用)。

@@ -623,6 +623,13 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
 fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let hazard = hazard_tag.map_or(String::new(), |t| format!("[{t}] "));
+    // The escape hatch from the OS sandbox is worth flagging to the human:
+    // this run gets full filesystem and network access if approved.
+    let no_sandbox = if name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false) {
+        "[no sandbox] "
+    } else {
+        ""
+    };
     let detail: String = match name {
         "bash" => input["command"].as_str().unwrap_or("?").to_string(),
         "write_file" | "edit_file" | "read_file" => {
@@ -633,7 +640,7 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
     .chars()
     .take(200)
     .collect();
-    format!("{agent}{hazard}{name}: {detail}")
+    format!("{agent}{hazard}{no_sandbox}{name}: {detail}")
 }
 
 #[cfg(test)]
@@ -1094,6 +1101,18 @@ mod tests {
             "[sub-agent] [destructive] bash: rm -rf x"
         );
         assert_eq!(asked[1].description, "write_file: a.txt");
+    }
+
+    #[tokio::test]
+    async fn description_flags_sandbox_escape() {
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let input = serde_json::json!({"command": "git push", "disable_sandbox": true});
+        let _ = p.check("bash", &input, 0).await;
+        assert_eq!(
+            approver.asked()[0].description,
+            "[no sandbox] bash: git push"
+        );
     }
 
     #[tokio::test]

@@ -174,13 +174,14 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
-            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set run_in_background instead of appending '&'.".into(),
+            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set run_in_background instead of appending '&'. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to run"},
                     "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when run_in_background is set"},
-                    "run_in_background": {"type": "boolean", "description": "Run in the background: returns immediately with an ID and an output file path. Check on it later with bash_output or by reading the output file; stop it with kill_bash."}
+                    "run_in_background": {"type": "boolean", "description": "Run in the background: returns immediately with an ID and an output file path. Check on it later with bash_output or by reading the output file; stop it with kill_bash."},
+                    "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
                 },
                 "required": ["command"]
             }),
@@ -572,6 +573,7 @@ pub(crate) mod testutil {
                 agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                sandbox: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
             }),
@@ -596,6 +598,15 @@ pub(crate) mod testutil {
     pub(crate) fn with_provider(mut ctx: ToolCtx, provider: Provider) -> ToolCtx {
         let mut cfg = (*ctx.cfg).clone();
         cfg.provider = Arc::new(provider);
+        ctx.cfg = Arc::new(cfg);
+        ctx
+    }
+
+    /// Rebuild the ctx with an OS sandbox policy for bash.
+    #[allow(dead_code)] // used by the macOS-only sandbox integration tests
+    pub(crate) fn with_sandbox(mut ctx: ToolCtx, policy: crate::sandbox::SandboxPolicy) -> ToolCtx {
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.sandbox = Some(Arc::new(policy));
         ctx.cfg = Arc::new(cfg);
         ctx
     }
@@ -957,6 +968,7 @@ mod tests {
                 agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                sandbox: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
             }),

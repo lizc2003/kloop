@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::str_arg;
 use super::ToolCtx;
+use crate::sandbox;
+use crate::sandbox::SandboxPolicy;
 
 /// Tail returned inline by bash_output; the rest stays in the output file
 /// (cc's BASH_MAX_OUTPUT_DEFAULT is 30k chars).
@@ -45,22 +47,57 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// offload counter).
 static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// The process for `sh -lc <command>`, wrapped in the OS sandbox when a
+/// policy applies. The env vars are hints only (codex's CODEX_SANDBOX
+/// shape): scripts get a way to detect the sandbox instead of failing
+/// mysteriously; enforcement is the profile.
+fn shell_command(command: &str, sandbox: Option<&SandboxPolicy>) -> tokio::process::Command {
+    match sandbox {
+        Some(policy) => {
+            let (program, args) = sandbox::seatbelt_command(policy, command);
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            cmd.env("KLOOP_SANDBOX", "seatbelt");
+            if !policy.allow_network {
+                cmd.env("KLOOP_SANDBOX_NETWORK_DISABLED", "1");
+            }
+            cmd
+        }
+        None => {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-lc").arg(command);
+            cmd
+        }
+    }
+}
+
+/// The session sandbox policy for this call: disable_sandbox is the model's
+/// per-call escape hatch (cc's dangerouslyDisableSandbox shape). The call
+/// still went through the permission gate like any other — escaping changes
+/// the execution wrapper, never the asking.
+fn call_sandbox<'a>(input: &Value, ctx: &'a ToolCtx) -> Option<&'a SandboxPolicy> {
+    if input["disable_sandbox"].as_bool().unwrap_or(false) {
+        None
+    } else {
+        ctx.cfg.sandbox.as_deref()
+    }
+}
+
 pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let command = str_arg(input, "command", "bash")?;
+    let sandbox = call_sandbox(input, ctx);
     if input["run_in_background"].as_bool().unwrap_or(false) {
         // No timeout in background mode (cc clears the timer too); the
         // watchdog and kill_bash are the safety net.
         return ctx
             .cfg
             .background_shells
-            .spawn_background(command, &ctx.cfg.offload_dir);
+            .spawn_background(command, &ctx.cfg.offload_dir, sandbox);
     }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
     let output = tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        tokio::process::Command::new("sh")
-            .arg("-lc")
-            .arg(command)
+        shell_command(command, sandbox)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -79,6 +116,12 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             .code()
             .map_or_else(|| "killed by signal".into(), |c| format!("exit status {c}"));
         text.push_str(&format!("\n[{code}]"));
+        if let Some(policy) = sandbox {
+            if sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
+            {
+                text.push_str(sandbox::DENIAL_HINT);
+            }
+        }
     }
     if text.is_empty() {
         text = "(no output)".into();
@@ -95,13 +138,13 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         .min(BLOCK_TIMEOUT_MAX_MS);
     let shells = &ctx.cfg.background_shells;
     let started = std::time::Instant::now();
-    let (status, path) = loop {
-        let Some((status, path)) = shells.snapshot(id) else {
+    let (status, path, sandboxed) = loop {
+        let Some((status, path, sandboxed)) = shells.snapshot(id) else {
             bail!("bash_output: no background command with id {id}");
         };
         let done = !matches!(status, BgStatus::Running);
         if done || !block || started.elapsed() >= Duration::from_millis(timeout_ms) {
-            break (status, path);
+            break (status, path, sandboxed);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
@@ -109,7 +152,13 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         BgStatus::Running if block => format!("{id}: still running after {timeout_ms}ms"),
         _ => format!("{id}: {}", status_text(&status)),
     };
-    let tail = read_tail(&path).await;
+    let mut tail = read_tail(&path).await;
+    if let (BgStatus::Exited(code), Some(sb)) = (&status, sandboxed) {
+        if *code != Some(0) && sandbox::is_likely_sandbox_denied(*code, &tail, sb.network_disabled)
+        {
+            tail.push_str(sandbox::DENIAL_HINT);
+        }
+    }
     Ok(format!(
         "{status_line}\noutput file: {}\n--- output ---\n{tail}",
         path.display()
@@ -127,7 +176,7 @@ pub(super) async fn kill_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<Strin
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
         match shells.snapshot(id) {
-            Some((BgStatus::Running, _)) => tokio::time::sleep(POLL_INTERVAL).await,
+            Some((BgStatus::Running, _, _)) => tokio::time::sleep(POLL_INTERVAL).await,
             _ => break,
         }
     }
@@ -153,12 +202,21 @@ fn status_text(status: &BgStatus) -> String {
     }
 }
 
+/// What bash_output needs to know about the sandbox a background shell ran
+/// in, captured at spawn time for denial annotation.
+#[derive(Clone, Copy)]
+struct BgSandbox {
+    network_disabled: bool,
+}
+
 struct BgShell {
     command: String,
     output_path: PathBuf,
     status: BgStatus,
     kill: CancellationToken,
     pid: Option<u32>,
+    /// Some = ran inside the OS sandbox.
+    sandbox: Option<BgSandbox>,
 }
 
 /// Session-scoped registry of background shells (one per Config; sub-agents
@@ -173,7 +231,15 @@ impl BackgroundShells {
         Arc::default()
     }
 
-    fn spawn_background(self: &Arc<Self>, command: &str, offload_dir: &Path) -> Result<String> {
+    /// The output file lives outside the sandbox's writable roots, but the
+    /// child writes it through an inherited fd — seatbelt checks at open
+    /// time, not per write (verified against the real sandbox-exec).
+    fn spawn_background(
+        self: &Arc<Self>,
+        command: &str,
+        offload_dir: &Path,
+        sandbox: Option<&SandboxPolicy>,
+    ) -> Result<String> {
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
         let id = format!("bg-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
@@ -183,10 +249,8 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-lc")
-            .arg(command)
-            .stdin(Stdio::null())
+        let mut cmd = shell_command(command, sandbox);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
@@ -204,6 +268,9 @@ impl BackgroundShells {
                 status: BgStatus::Running,
                 kill: CancellationToken::new(),
                 pid,
+                sandbox: sandbox.map(|p| BgSandbox {
+                    network_disabled: !p.allow_network,
+                }),
             },
         );
         let kill = self.shells.lock().unwrap()[&id].kill.clone();
@@ -215,10 +282,14 @@ impl BackgroundShells {
         ))
     }
 
-    fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf)> {
+    fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf, Option<BgSandbox>)> {
         let shells = self.shells.lock().unwrap();
         let shell = shells.get(id)?;
-        Some((shell.status.clone(), shell.output_path.clone()))
+        Some((
+            shell.status.clone(),
+            shell.output_path.clone(),
+            shell.sandbox,
+        ))
     }
 
     /// Flags the shell for its monitor task to kill; Err carries the
@@ -534,6 +605,150 @@ mod tests {
             "inline output stays bounded: {}",
             out.len()
         );
+    }
+
+    /// Real seatbelt integration: these run the actual /usr/bin/sandbox-exec,
+    /// so they are macOS-only; Linux CI covers the sandbox-off path (every
+    /// other test in this file) and the pure profile tests in sandbox.rs.
+    #[cfg(target_os = "macos")]
+    mod seatbelt {
+        use super::*;
+        use crate::sandbox::SandboxPolicy;
+        use crate::sandbox::WritableRoot;
+
+        /// A ctx whose bash runs sandboxed with exactly one writable root
+        /// (returned canonicalized, seatbelt matches resolved paths).
+        fn sandbox_ctx(tag: &str) -> (crate::tools::ToolCtx, std::path::PathBuf) {
+            let root = std::env::temp_dir().join(format!("kloop-sbx-{tag}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            let policy = SandboxPolicy {
+                writable_roots: vec![WritableRoot {
+                    root: root.clone(),
+                    read_only_subpaths: vec![root.join(".kloop")],
+                }],
+                allow_network: false,
+            };
+            (with_sandbox(test_ctx(0, tag), policy), root)
+        }
+
+        /// A directory outside every writable root of `sandbox_ctx`.
+        fn outside_dir(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("kloop-sbx-out-{tag}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::canonicalize(&dir).unwrap()
+        }
+
+        #[tokio::test]
+        async fn write_inside_root_succeeds_outside_gets_denial_hint() {
+            let (ctx, root) = sandbox_ctx("inout");
+            let inside = root.join("ok.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo hi > {}", inside.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(std::fs::read_to_string(&inside).unwrap(), "hi\n");
+
+            let blocked = outside_dir("inout").join("no.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo hi > {}", blocked.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "a denied write is content, not a tool error");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(
+                out.contains("disable_sandbox: true"),
+                "hint teaches the escape: {out}"
+            );
+            assert!(!blocked.exists());
+        }
+
+        #[tokio::test]
+        async fn read_only_subpath_stays_protected_inside_writable_root() {
+            let (ctx, root) = sandbox_ctx("rosub");
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!("mkdir -p {}", root.join(".kloop").display())),
+                &ctx,
+            )
+            .await;
+            assert!(out.contains("Operation not permitted"), "{out}");
+        }
+
+        #[tokio::test]
+        async fn disable_sandbox_escapes_per_call() {
+            let (ctx, _) = sandbox_ctx("escape");
+            let target = outside_dir("escape").join("escaped.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({
+                    "command": format!("echo freed > {}", target.display()),
+                    "disable_sandbox": true
+                }),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "freed\n");
+        }
+
+        #[tokio::test]
+        async fn network_is_denied_where_the_bare_run_connects() {
+            // A real local listener makes the pair discriminating: bare
+            // connect succeeds, sandboxed connect is the one that fails.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+
+            let (ctx, _) = sandbox_ctx("net");
+            let (out, _) = run_tool("bash", bash_input(&connect), &ctx).await;
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(out.contains("disable_sandbox: true"), "{out}");
+
+            let bare = test_ctx(0, "net-bare");
+            let (out, is_error) = run_tool("bash", bash_input(&connect), &bare).await;
+            assert!(!is_error, "control run must reach the listener: {out}");
+            assert!(!out.contains("Operation not permitted"), "{out}");
+        }
+
+        /// The bg output file lives outside the writable roots; the child
+        /// writes it through the inherited fd, which seatbelt permits (checks
+        /// happen at open time). This test is the regression lock on that.
+        #[tokio::test]
+        async fn background_shell_runs_sandboxed_and_reports_denials() {
+            let (ctx, _) = sandbox_ctx("bg");
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({"command": "echo bg-sandboxed", "run_in_background": true}),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            let id = bg_id(&out);
+            let (out, _) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+            assert!(out.contains("completed (exit 0)"), "{out}");
+            assert!(out.contains("bg-sandboxed"), "{out}");
+
+            let blocked = outside_dir("bg").join("no.txt");
+            let (out, _) = run_tool(
+                "bash",
+                json!({
+                    "command": format!("echo hi > {}", blocked.display()),
+                    "run_in_background": true
+                }),
+                &ctx,
+            )
+            .await;
+            let id = bg_id(&out);
+            let (out, _) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+            assert!(out.contains("failed"), "{out}");
+            assert!(out.contains("disable_sandbox: true"), "{out}");
+        }
     }
 
     #[tokio::test]
