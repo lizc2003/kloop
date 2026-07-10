@@ -41,6 +41,7 @@ fn responses(server: &MockServer) -> Provider {
     Provider::OpenAiResponses {
         key: "test-key".into(),
         base: server.uri(),
+        effort: None,
     }
 }
 
@@ -122,6 +123,40 @@ async fn request_body_is_stateless_with_reasoning_include() {
             "stream": true,
         })
     );
+}
+
+/// AGENT_EFFORT maps to the reasoning request field (with summary=auto for
+/// displayable text); absent effort sends no reasoning field at all.
+#[tokio::test]
+async fn effort_maps_to_reasoning_field() {
+    for (effort, expected) in [
+        (None, None),
+        (
+            Some("high".to_string()),
+            Some(json!({"effort": "high", "summary": "auto"})),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(
+            &server,
+            sse_body(&[json!({"type": "response.completed", "response": {}})]),
+        )
+        .await;
+        let provider = Arc::new(Provider::OpenAiResponses {
+            key: "test-key".into(),
+            base: server.uri(),
+            effort: effort.clone(),
+        });
+        let mut rx = provider.stream("test-model", "s", &[Message::user_text("hi")], &[]);
+        while rx.recv().await.is_some() {}
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("reasoning").cloned(),
+            expected,
+            "effort {effort:?}"
+        );
+    }
 }
 
 /// Deltas stream for display; complete items arrive whole in

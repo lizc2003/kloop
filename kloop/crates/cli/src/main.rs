@@ -483,6 +483,9 @@ fn config_from_env(
             Provider::OpenAiResponses {
                 key,
                 base: base_url,
+                // Also the reasoning-capture switch: without the field some
+                // backends never emit reasoning items.
+                effort: std::env::var("AGENT_EFFORT").ok(),
             }
         } else {
             Provider::OpenAiCompat {

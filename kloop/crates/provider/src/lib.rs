@@ -81,6 +81,11 @@ pub enum Provider {
     OpenAiResponses {
         key: String,
         base: String,
+        /// `reasoning: {effort, summary: "auto"}` request field; None sends
+        /// no reasoning field. Backends may emit no reasoning items at all
+        /// without it (live-observed), so this is also the switch that turns
+        /// reasoning capture on.
+        effort: Option<String>,
     },
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
     Mock {
@@ -210,10 +215,10 @@ impl Provider {
                     }
                 });
             }
-            Provider::OpenAiResponses { key, base } => {
+            Provider::OpenAiResponses { key, base, effort } => {
                 let url = format!("{base}/responses");
                 let key = key.clone();
-                let body = json!({
+                let mut body = json!({
                     "model": model,
                     "instructions": system,
                     "input": responses::to_input_items(messages),
@@ -231,6 +236,11 @@ impl Provider {
                     "include": ["reasoning.encrypted_content"],
                     "stream": true,
                 });
+                if let Some(effort) = effort {
+                    // summary=auto asks for displayable reasoning summaries
+                    // alongside the encrypted blob.
+                    body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+                }
                 tokio::spawn(async move {
                     if let Err(e) = responses::stream(&url, &key, &body, &tx).await {
                         let _ = tx.send(Err(e)).await;

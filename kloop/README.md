@@ -401,7 +401,9 @@ OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 # AGENT_PROVIDER=anthropic|openai|openai-responses forces a provider when
 # both keys are set; openai-responses speaks the /responses wire (stateless
 # store:false, reasoning replayed via encrypted_content) with the same
-# OPENAI_* variables
+# OPENAI_* variables. AGENT_EFFORT=minimal|low|medium|high sends the
+# reasoning request field (summary=auto) — some backends emit no reasoning
+# items at all without it, so this is also the reasoning-capture switch
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
