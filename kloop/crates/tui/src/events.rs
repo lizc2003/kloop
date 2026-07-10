@@ -20,13 +20,26 @@ pub enum AgentEvent {
     TextDelta(String),
     ThinkingDelta(String),
     Note(String),
+    /// `agent` is "" for the main agent's own calls, "agent-N" for calls a
+    /// sub-agent makes — parallel sub-agents interleave on this stream.
     ToolStart {
+        agent: String,
         id: String,
         name: String,
         summary: String,
     },
     ToolEnd {
+        agent: String,
         id: String,
+        ok: bool,
+    },
+    /// A task call spawned a sub-agent; ends exactly once per start.
+    AgentStart {
+        agent: String,
+        task: String,
+    },
+    AgentEnd {
+        agent: String,
         ok: bool,
     },
     /// A permission prompt. The decision travels back over `reply`; dropping
@@ -68,17 +81,33 @@ impl Ui for ChannelUi {
         self.send(AgentEvent::Note(s.to_string()));
     }
 
-    fn tool_start(&self, id: &str, name: &str, summary: &str) {
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
         self.send(AgentEvent::ToolStart {
+            agent: agent.to_string(),
             id: id.to_string(),
             name: name.to_string(),
             summary: summary.to_string(),
         });
     }
 
-    fn tool_end(&self, id: &str, ok: bool) {
+    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
         self.send(AgentEvent::ToolEnd {
+            agent: agent.to_string(),
             id: id.to_string(),
+            ok,
+        });
+    }
+
+    fn agent_start(&self, agent: &str, task: &str) {
+        self.send(AgentEvent::AgentStart {
+            agent: agent.to_string(),
+            task: task.to_string(),
+        });
+    }
+
+    fn agent_end(&self, agent: &str, ok: bool) {
+        self.send(AgentEvent::AgentEnd {
+            agent: agent.to_string(),
             ok,
         });
     }
@@ -112,9 +141,13 @@ mod tests {
 
         ui.text_delta("hel");
         ui.text_delta("lo");
-        ui.tool_start("t1", "bash", "{\"command\":\"ls\"}");
+        ui.tool_start("", "t1", "bash", "{\"command\":\"ls\"}");
         ui.note("retrying");
-        ui.tool_end("t1", true);
+        ui.tool_end("", "t1", true);
+        ui.agent_start("agent-1", "look things up");
+        ui.tool_start("agent-1", "t2", "grep", "{\"pattern\":\"x\"}");
+        ui.tool_end("agent-1", "t2", true);
+        ui.agent_end("agent-1", true);
 
         let mut got = Vec::new();
         while let Ok(e) = rx.try_recv() {
@@ -125,9 +158,13 @@ mod tests {
             vec![
                 r#"TextDelta("hel")"#,
                 r#"TextDelta("lo")"#,
-                r#"ToolStart { id: "t1", name: "bash", summary: "{\"command\":\"ls\"}" }"#,
+                r#"ToolStart { agent: "", id: "t1", name: "bash", summary: "{\"command\":\"ls\"}" }"#,
                 r#"Note("retrying")"#,
-                r#"ToolEnd { id: "t1", ok: true }"#,
+                r#"ToolEnd { agent: "", id: "t1", ok: true }"#,
+                r#"AgentStart { agent: "agent-1", task: "look things up" }"#,
+                r#"ToolStart { agent: "agent-1", id: "t2", name: "grep", summary: "{\"pattern\":\"x\"}" }"#,
+                r#"ToolEnd { agent: "agent-1", id: "t2", ok: true }"#,
+                r#"AgentEnd { agent: "agent-1", ok: true }"#,
             ]
         );
     }

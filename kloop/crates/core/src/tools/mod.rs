@@ -298,7 +298,7 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "task".into(),
-            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Sub-agents cannot spawn further sub-agents.".into(),
+            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Sub-agents cannot spawn further sub-agents.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -338,7 +338,11 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
-        "write_file" | "edit_file" | "task" => false,
+        // task is always safe to batch (cc shape): consecutive task calls run
+        // as parallel sub-agents. Their own tool calls are gated individually
+        // — a sub-agent's write still faces hooks and the permission gate.
+        "task" => true,
+        "write_file" | "edit_file" => false,
         other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
 }
@@ -407,7 +411,8 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
     let summary: String = input.to_string().chars().take(120).collect();
-    ctx.ui.tool_start(&id, &name, &summary);
+    ctx.ui
+        .tool_start(&ctx.cfg.agent_label, &id, &name, &summary);
     let gated = async {
         // Locked deferred tools bounce before hooks and permissions: the
         // model skipped tool_search, and neither automation policy nor the
@@ -479,7 +484,8 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     else {
         unreachable!("run_one always builds a tool_result")
     };
-    ctx.ui.tool_end(tool_use_id, !is_error);
+    ctx.ui
+        .tool_end(&ctx.cfg.agent_label, tool_use_id, !is_error);
     result
 }
 
@@ -563,6 +569,7 @@ pub(crate) mod testutil {
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 tool_sources: sources,
                 session_id: String::new(),
+                agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 defer_threshold: 30,
@@ -580,6 +587,15 @@ pub(crate) mod testutil {
     pub(crate) fn with_defer_threshold(mut ctx: ToolCtx, threshold: usize) -> ToolCtx {
         let mut cfg = (*ctx.cfg).clone();
         cfg.defer_threshold = threshold;
+        ctx.cfg = Arc::new(cfg);
+        ctx
+    }
+
+    /// Rebuild the ctx with a scripted provider, for tests whose tools spawn
+    /// sub-agents that sample.
+    pub(crate) fn with_provider(mut ctx: ToolCtx, provider: Provider) -> ToolCtx {
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.provider = Arc::new(provider);
         ctx.cfg = Arc::new(cfg);
         ctx
     }
@@ -869,7 +885,8 @@ mod tests {
             &json!({"path": "x", "content": ""})
         ));
         assert!(!is_concurrency_safe("edit_file", &json!({})));
-        assert!(!is_concurrency_safe("task", &json!({"prompt": "x"})));
+        // Consecutive task calls run as parallel sub-agents (cc shape).
+        assert!(is_concurrency_safe("task", &json!({"prompt": "x"})));
 
         // read-only commands, incl. pipes and chains of safe segments
         assert!(is_concurrency_safe("bash", &bash_input("ls -la")));
@@ -937,6 +954,7 @@ mod tests {
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 tool_sources: Vec::new(),
                 session_id: String::new(),
+                agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 defer_threshold: 30,

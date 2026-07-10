@@ -445,6 +445,7 @@ fn config_from_env(
         // The caller stamps the real session id once it knows it (after
         // open_history / per server thread).
         session_id: String::new(),
+        agent_label: String::new(),
         hooks: Arc::new(hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         defer_threshold: defer_threshold_from_env()?,
@@ -540,7 +541,12 @@ fn config_from_env(
 /// is idle while a turn runs, so a direct blocking read is safe; if the turn
 /// is Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
 /// subsequent input line — accepted edge for a line-based REPL.
-struct CliApprover;
+#[derive(Default)]
+struct CliApprover {
+    /// Parallel sub-agents ask concurrently; one prompt owns the terminal at
+    /// a time, the rest wait here (the TUI gets the same via its queue).
+    prompting: tokio::sync::Mutex<()>,
+}
 
 impl Approver for CliApprover {
     fn confirm(
@@ -548,6 +554,7 @@ impl Approver for CliApprover {
         req: ConfirmRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
         Box::pin(async move {
+            let _one_at_a_time = self.prompting.lock().await;
             let options = match &req.remember_rules {
                 Some(rules) => format!(
                     "y = allow once / a = allow for this session / p = allow always (saves {} to {PERMISSIONS_CONFIG}) / n = deny",
@@ -725,7 +732,7 @@ async fn plain_main(
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let mut cfg = config_from_env(
         &args,
-        Arc::new(CliApprover),
+        Arc::new(CliApprover::default()),
         notify,
         &tool_sources,
         &project,

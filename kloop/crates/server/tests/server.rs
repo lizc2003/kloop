@@ -143,6 +143,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             permissions: Arc::new(permissions),
             tool_sources: Vec::new(),
             session_id: String::new(),
+            agent_label: String::new(),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
             defer_threshold: 30,
@@ -200,6 +201,74 @@ async fn turn_streams_deltas_and_completes() {
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
             .unwrap();
     assert_eq!(messages.len(), 2);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A task call surfaces the sub-agent lifecycle on the wire: agent/started
+/// and agent/completed bracket it, and the sub-agent's own tool calls carry
+/// an "agent" field while the main agent's calls stay unchanged.
+#[tokio::test]
+async fn subagent_notifications_carry_the_agent_label() {
+    let dirs = test_dirs("subagent");
+    let script = vec![
+        // main: spawn the sub-agent
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "task".into(),
+            input: json!({"prompt": "sub work"}),
+        }],
+        // consumed by the sub-agent: one tool call, then its answer
+        vec![ContentBlock::ToolUse {
+            id: "s1".into(),
+            name: "bash".into(),
+            input: json!({"command": "echo hi"}),
+        }],
+        vec![text("sub result")],
+        // main wraps up
+        vec![text("done")],
+    ];
+    let mut client = start_server(factory(script, dirs.offload.clone(), false), &dirs);
+
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let thread_id = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": "delegate"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    let started = log
+        .iter()
+        .find(|m| m["method"] == "agent/started")
+        .expect("agent/started notification");
+    let label = started["params"]["agent"].as_str().unwrap().to_string();
+    assert!(label.starts_with("agent-"), "got {label}");
+    assert_eq!(started["params"]["task"], "sub work");
+
+    // The main agent's task row has no agent field; the sub-agent's bash
+    // row (and its completion) carries the label.
+    let task_row = log
+        .iter()
+        .find(|m| m["method"] == "tool/started" && m["params"]["name"] == "task")
+        .unwrap();
+    assert!(task_row["params"]["agent"].is_null());
+    let bash_row = log
+        .iter()
+        .find(|m| m["method"] == "tool/started" && m["params"]["name"] == "bash")
+        .unwrap();
+    assert_eq!(bash_row["params"]["agent"], label.as_str());
+    assert!(log.iter().any(|m| m["method"] == "tool/completed"
+        && m["params"]["agent"] == label.as_str()
+        && m["params"]["ok"] == true));
+    assert!(log.iter().any(|m| m["method"] == "agent/completed"
+        && m["params"]["agent"] == label.as_str()
+        && m["params"]["ok"] == true));
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

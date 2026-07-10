@@ -400,6 +400,39 @@ session approvals apply). Not ported from cc: the `prompt` parameter with
 small-model post-processing, the 15-minute fetch cache, turndown-style
 HTML→Markdown, and the preapproved-domain list.
 
+## Parallel sub-agents (Phase 2, twelfth slice)
+
+The `task` tool dispatches concurrently (cc shape): `is_concurrency_safe`
+marks `task` unconditionally safe, so consecutive task calls in one response
+run as parallel sub-agents inside the ordinary concurrent batch. Results stay
+paired to their `tool_use_id`s in request order; one sub-agent failing (bad
+input, error, panic) becomes its own `is_error` tool_result without sinking
+the batch. Sub-agents' own writes are still gated individually — hooks and
+the shared permission gate see every inner call, and concurrent approval
+prompts serialize (the TUI already queues; the plain REPL takes a mutex so
+one prompt owns the terminal at a time).
+
+Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
+its cloned Config, and the `Ui` trait carries it end to end:
+`tool_start`/`tool_end` take an `agent` parameter ("" = main agent), and
+`agent_start`/`agent_end` bracket the sub-agent's life. Presentation per
+frontend:
+
+- **TUI**: one live row per sub-agent (`… agent-1 <task> — 3 tools · bash
+  {...}`) that folds its tool calls into a counter plus a latest-call
+  preview — parallel agents never interleave rows — and collapses to
+  `✓ agent-1 <task> (3 tool uses)` when it ends. A row still Running when
+  the turn dies (interrupt drops the task future) is patched to failed.
+- **plain**: dim notes, `agent-1 · bash {...}` per call.
+- **server**: `agent/started` / `agent/completed` notifications; sub-agent
+  `tool/started`/`tool/completed` carry an `"agent"` field (main-agent
+  calls keep the old shape exactly).
+
+Not in this slice (deliberate): custom agent types (config-defined system
+prompt / tool subset / model override), sub-agent history persistence,
+async dispatch with completion mailbox (codex spawn/wait shape), hook
+events tagged with the agent — see `docs/plan/17-subagents.md`.
+
 ## Running
 
 ```sh

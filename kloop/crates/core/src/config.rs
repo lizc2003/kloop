@@ -35,6 +35,10 @@ pub struct Config {
     /// Session id surfaced in hook events; empty when the session is
     /// ephemeral (mock, tests). Sub-agents inherit the parent's id.
     pub session_id: String,
+    /// Label identifying whose events these are in the UI: empty for the main
+    /// agent, "agent-N" for a sub-agent (stamped by the task tool on its
+    /// cloned Config).
+    pub agent_label: String,
     /// External command hooks; the shared Arc means sub-agents inherit the
     /// same hook set.
     pub hooks: Arc<Hooks>,

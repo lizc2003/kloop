@@ -29,15 +29,32 @@ pub trait Ui: Send + Sync {
         let _ = s;
     }
     fn note(&self, s: &str);
-    /// Tool-call lifecycle, for UIs that render per-call status rows. The
-    /// defaults collapse to the plain note stream so line-based UIs need not
-    /// care about call ids.
-    fn tool_start(&self, id: &str, name: &str, summary: &str) {
+    /// Tool-call lifecycle, for UIs that render per-call status rows. `agent`
+    /// is "" for the main agent's calls and the sub-agent's label ("agent-N")
+    /// for calls made inside a task — parallel sub-agents interleave on this
+    /// stream and the label is what tells them apart. The defaults collapse
+    /// to the plain note stream so line-based UIs need not care about call ids.
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
         let _ = id;
-        self.note(&format!("{name} {summary}"));
+        if agent.is_empty() {
+            self.note(&format!("{name} {summary}"));
+        } else {
+            self.note(&format!("{agent} · {name} {summary}"));
+        }
     }
-    fn tool_end(&self, id: &str, ok: bool) {
-        let _ = (id, ok);
+    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
+        let _ = (agent, id, ok);
+    }
+    /// Sub-agent lifecycle: a task call spawned `agent` to work on `task`
+    /// (first line of the prompt, truncated). Ends exactly once per start.
+    fn agent_start(&self, agent: &str, task: &str) {
+        self.note(&format!("{agent} started: {task}"));
+    }
+    fn agent_end(&self, agent: &str, ok: bool) {
+        self.note(&format!(
+            "{agent} {}",
+            if ok { "finished" } else { "failed" }
+        ));
     }
 }
 
@@ -480,6 +497,7 @@ mod tests {
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             tool_sources: Vec::new(),
             session_id: String::new(),
+            agent_label: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             defer_threshold: 30,
@@ -566,6 +584,7 @@ mod tests {
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             tool_sources: Vec::new(),
             session_id: String::new(),
+            agent_label: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             defer_threshold: 30,

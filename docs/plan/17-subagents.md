@@ -2,6 +2,34 @@
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 agents 机制(`.claude/agents/*.md` frontmatter:独立 system prompt、工具白名单、模型 override;并行派发)、codex 的 subagent(SubagentStart/Stop 挂点、SubagentHookContext)。回源核对(教训 11)。
 
+## ✅ 完成记录(2026-07-10,切片 1+4)
+
+**选片**:片 1(并行 task,cc 同步形态)+ 片 4(UI 呈现)。开工前对 cc(AgentTool 全链路)与 codex(multi_agents_v2)各做了一轮回源深调,关键事实沉淀在下方"回源调研结论"节。
+
+**实现**:
+- 并行:`is_concurrency_safe` 对 `task` 恒 true(cc 同款硬编码),连续 task 调用进现有并发批(join_all,无上限——与现有 bash 只读批一致;cc 的上限是 10,kloop 暂不设,真实模型很少一次发这么多)。结果按 tool_use_id 配对回请求序;单个失败(坏参数/出错/panic)只是自己的 is_error tool_result。工具描述追加"连续 task 并行"提示。
+- 标签:`Config.agent_label`("" = 主 agent;task 用进程级全局 `AGENT_SEQ` 发 `agent-N`,教训 2 同款),随 sub_cfg 克隆传播。
+- Ui trait:`tool_start`/`tool_end` 加 `agent` 参数;新增 `agent_start(agent, task_preview)`/`agent_end(agent, ok)`(默认实现退化为 note,plain 零改动)。task_tool 保证 start/end 严格配对(panic 分支也 end)。
+- TUI:`Cell::Agent` 每个子 agent 一行活动行(cc AgentProgressLine 形态)——子 agent 的工具调用折叠为计数 + 最近调用预览,不再混入主流;结束折叠成 `✓ agent-1 <task> (N tool uses)`;interrupt 掉的 Running 行在 TurnEnded 补成 ✗(task future 被 drop 时 agent_end 不会来)。
+- server:新增 `agent/started`/`agent/completed` 通知;子 agent 的 `tool/started`/`tool/completed` 带 `"agent"` 字段,主 agent 的形状逐字节不变。
+- plain:`CliApprover` 加 tokio Mutex——并行子 agent 并发询问时一次只有一个提示占终端。
+
+**测试**(266 个,+7):并行契约(文件屏障证真并发——两个子 agent 的 bash 互等对方 touch 的文件,串行必超 3s;每个 start 配对成功 end 且标签互异)、失败隔离 + 请求序配对、task_preview 截断、TUI 事件契约(agent 字段 + AgentStart/End 全序)、App 折叠(两 agent 交错事件各归各行)、TurnEnded 补 ✗、渲染三态、server 子 agent 通知契约(agent 字段有无)。
+
+**真 key 验收**:双轨 `--plain` 各一次"一次响应发两个并行 task"。sonnet-5:两 agent 均 started 后才各自跑 bash、结束,汇总正确。gpt-5.4-mini:同样并行派发(它自发给 task 加了 max_rounds:1),`date` 触发审批弹出干净(mutex 生效),EOF deny 后子 agent 走轮限收尾——恢复语义符合预期。
+
+**提交**:见 git log(fmt/clippy/test 全绿)。
+
+**挂账(未选切片,原样保留在下方候选)**:片 2(自定义 agent 类型——本次调研已备齐 cc frontmatter 字段表/路由/报错形态,见回源结论)、片 3(历史持久化,先做 plan 18)、片 5(hook 事件带 agent 字段 + SubagentStart/Stop)、片 6(异步派发 + mailbox 回灌)。另:并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流——都等有痛感再修。
+
+## 回源调研结论(2026-07-10,两家对齐)
+
+**收敛的"必然解"**(四样):① agentId 贯穿事件流(cc progress data;codex 子线程独立事件 + 父时间线折叠摘要,双通道);② 子会话独立落盘、与父关联(cc `<session>/subagents/agent-<id>.jsonl` isSidechain,resume 父会话不重放子过程;codex 每子线程独立 rollout + agent_graph 父子边);③ agent 类型 = 命名定义 + model/prompt/工具 override(cc frontmatter:name/description/tools/model/effort/maxTurns 等,system prompt **完全替换**不拼接,模型默认 inherit 且裸别名同 tier 沿用父的精确串,未知类型报错并列可用清单,清单进 task 工具 description;codex role = config 分层覆盖);④ SubagentStart/Stop 挂点 + pre/post tool 带 agent_id(两家字段几乎一致,Stop 额外带 transcript_path)。
+
+**并行形态**:cc Task `isConcurrencySafe` 硬编码 true(AgentTool.tsx:1467),连续调用进并发批,上限 10(`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`),失败转 is_error 不拖批(AbortError 例外整批打断);cc 深度控制不是计数器,是把 Agent 工具从子 agent 工具池里删掉。codex 是全异步:spawn 非阻塞返回 canonical task_name(非 thread-id;V1 才返 agent_id)→ wait(min 10s/default 30s/max 1h,可被 steer 打断,只回摘要)→ mailbox 存全文;并发默认 3(max_concurrent_threads 4 - root);V2 无深度门禁。
+
+**turn 中途回灌**(片 6 的分水岭,两家收敛):只在 step 边界注入,绝不插进在途请求。cc:task-notification 入队,工具循环里主线程只 drain 自己的,转 attachment 进本 turn 的 toolResults;turn 之间则作为 user 消息喂下一 turn。codex:mailbox delivery phase 闸门——tool-call 后 accept、final answer 后 defer 到下一 turn;子终态走 `forward_child_completion_to_parent`(V2 是子 session 终态事件回调,不是 V1 的 watcher),`SubagentAutowake` 触发父空闲时起新 turn;Interrupted 不是终态、父收不到通知。失败语义:codex 把子 agent 错误截 900 tokens + "换个任务再派"引导回父。
+
 ## 现状(升级的起点)
 
 task 工具:深度限 1、`is_concurrency_safe` 标死 false(连续 task 调用串行跑)、子 agent 与主 agent 同 system/同模型/全量工具、历史不持久化(resume 后只剩 tool result,过程丢失)、产出只有 final_text。继承已对:permissions/hooks/session_id/tool_sources 都走 Config 克隆。

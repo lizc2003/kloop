@@ -119,6 +119,32 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                     ),
                 ]));
             }
+            Cell::Agent {
+                agent,
+                task,
+                status,
+                tools,
+                last_tool,
+            } => {
+                let (mark, color) = match status {
+                    ToolStatus::Running => ("…", Color::Yellow),
+                    ToolStatus::Ok => ("✓", Color::Green),
+                    ToolStatus::Failed => ("✗", Color::Red),
+                };
+                // Live: show what it is doing right now; done: a one-line
+                // summary (its tool detail was never in the transcript).
+                let body = if *status == ToolStatus::Running && *tools > 0 {
+                    format!("{agent} {task} — {tools} tools · {last_tool}")
+                } else if *status == ToolStatus::Running {
+                    format!("{agent} {task}")
+                } else {
+                    format!("{agent} {task} ({tools} tool uses)")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::new().fg(color)),
+                    Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
+                ]));
+            }
             Cell::Note(text) => {
                 lines.push(Line::from(Span::styled(
                     truncate(&format!("[{text}]"), width),
@@ -293,6 +319,45 @@ mod tests {
                 "[compacting history]",
                 "done.",
                 "all good",
+            ]
+        );
+    }
+
+    /// Agent rows: running shows the live tool preview, finished collapses to
+    /// a one-line summary with the tool count.
+    #[test]
+    fn agent_rows_render_live_preview_and_final_summary() {
+        let cells = vec![
+            Cell::Agent {
+                agent: "agent-1".into(),
+                task: "find the bug".into(),
+                status: ToolStatus::Running,
+                tools: 0,
+                last_tool: String::new(),
+            },
+            Cell::Agent {
+                agent: "agent-1".into(),
+                task: "find the bug".into(),
+                status: ToolStatus::Running,
+                tools: 3,
+                last_tool: "bash {\"command\":\"cargo test\"}".into(),
+            },
+            Cell::Agent {
+                agent: "agent-1".into(),
+                task: "find the bug".into(),
+                status: ToolStatus::Ok,
+                tools: 3,
+                last_tool: "bash {\"command\":\"cargo test\"}".into(),
+            },
+        ];
+        let lines = transcript_lines(&cells, 60);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "… agent-1 find the bug",
+                "… agent-1 find the bug — 3 tools · bash {\"command\":\"cargo t…",
+                "✓ agent-1 find the bug (3 tool uses)",
             ]
         );
     }

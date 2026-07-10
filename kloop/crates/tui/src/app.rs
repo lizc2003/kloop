@@ -39,6 +39,16 @@ pub enum Cell {
         summary: String,
         status: ToolStatus,
     },
+    /// One live row per sub-agent: its tool calls fold into a counter plus a
+    /// preview of the latest call instead of separate rows, so parallel
+    /// sub-agents never interleave in the transcript.
+    Agent {
+        agent: String,
+        task: String,
+        status: ToolStatus,
+        tools: usize,
+        last_tool: String,
+    },
     Note(String),
 }
 
@@ -82,6 +92,8 @@ pub struct App {
     thinking_open: bool,
     /// tool_use id -> cells index, to resolve ToolEnd.
     tool_cells: HashMap<String, usize>,
+    /// agent label -> cells index of its Agent row.
+    agent_cells: HashMap<String, usize>,
 }
 
 impl App {
@@ -98,6 +110,7 @@ impl App {
             assistant_open: false,
             thinking_open: false,
             tool_cells: HashMap::new(),
+            agent_cells: HashMap::new(),
         }
     }
 
@@ -131,7 +144,26 @@ impl App {
                 self.last_note = Some(n.clone());
                 self.cells.push(Cell::Note(n));
             }
-            AgentEvent::ToolStart { id, name, summary } => {
+            AgentEvent::ToolStart {
+                agent,
+                id,
+                name,
+                summary,
+            } => {
+                if !agent.is_empty() {
+                    // A sub-agent's call folds into its Agent row: bump the
+                    // counter, refresh the preview. No per-call cell, so
+                    // parallel agents cannot interleave.
+                    self.last_note = Some(format!("{agent} · {name} {summary}"));
+                    if let Some(Cell::Agent {
+                        tools, last_tool, ..
+                    }) = self.agent_cell(&agent)
+                    {
+                        *tools += 1;
+                        *last_tool = format!("{name} {summary}");
+                    }
+                    return;
+                }
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.last_note = Some(format!("{name} {summary}"));
@@ -142,7 +174,12 @@ impl App {
                     status: ToolStatus::Running,
                 });
             }
-            AgentEvent::ToolEnd { id, ok } => {
+            AgentEvent::ToolEnd { agent, id, ok } => {
+                // Sub-agent calls have no cell of their own; their agent's
+                // row is resolved by AgentEnd.
+                if !agent.is_empty() {
+                    return;
+                }
                 if let Some(&i) = self.tool_cells.get(&id) {
                     if let Some(Cell::Tool { status, .. }) = self.cells.get_mut(i) {
                         *status = if ok {
@@ -151,6 +188,28 @@ impl App {
                             ToolStatus::Failed
                         };
                     }
+                }
+            }
+            AgentEvent::AgentStart { agent, task } => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = Some(format!("{agent} started: {task}"));
+                self.agent_cells.insert(agent.clone(), self.cells.len());
+                self.cells.push(Cell::Agent {
+                    agent,
+                    task,
+                    status: ToolStatus::Running,
+                    tools: 0,
+                    last_tool: String::new(),
+                });
+            }
+            AgentEvent::AgentEnd { agent, ok } => {
+                if let Some(Cell::Agent { status, .. }) = self.agent_cell(&agent) {
+                    *status = if ok {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Failed
+                    };
                 }
             }
             AgentEvent::Confirm { req, reply } => {
@@ -164,6 +223,16 @@ impl App {
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
                 self.confirms.clear();
+                // An interrupted turn drops task futures mid-await, so a
+                // sub-agent's AgentEnd may never arrive: no row may outlive
+                // its turn still spinning.
+                for cell in &mut self.cells {
+                    if let Cell::Agent { status, .. } = cell {
+                        if *status == ToolStatus::Running {
+                            *status = ToolStatus::Failed;
+                        }
+                    }
+                }
                 match reason {
                     EndReason::Completed => {}
                     EndReason::MaxRounds => {
@@ -174,6 +243,11 @@ impl App {
                 }
             }
         }
+    }
+
+    fn agent_cell(&mut self, agent: &str) -> Option<&mut Cell> {
+        let &i = self.agent_cells.get(agent)?;
+        self.cells.get_mut(i)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Command {
@@ -346,12 +420,14 @@ mod tests {
         app.apply(AgentEvent::TextDelta("hel".into()));
         app.apply(AgentEvent::TextDelta("lo".into()));
         app.apply(AgentEvent::ToolStart {
+            agent: String::new(),
             id: "t1".into(),
             name: "bash".into(),
             summary: "{}".into(),
         });
         app.apply(AgentEvent::TextDelta("world".into()));
         app.apply(AgentEvent::ToolEnd {
+            agent: String::new(),
             id: "t1".into(),
             ok: false,
         });
@@ -367,6 +443,97 @@ mod tests {
                 },
                 Cell::Assistant("world".into()),
             ]
+        );
+    }
+
+    /// Sub-agent events fold into one Agent row each: tool calls bump the
+    /// counter and preview instead of adding cells, AgentEnd resolves the
+    /// status — two parallel agents never interleave rows.
+    #[test]
+    fn subagent_events_fold_into_one_row_per_agent() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::AgentStart {
+            agent: "agent-1".into(),
+            task: "find the bug".into(),
+        });
+        app.apply(AgentEvent::AgentStart {
+            agent: "agent-2".into(),
+            task: "write the docs".into(),
+        });
+        // Interleaved tool activity from both agents plus the main agent.
+        app.apply(AgentEvent::ToolStart {
+            agent: "agent-1".into(),
+            id: "t1".into(),
+            name: "grep".into(),
+            summary: "{\"pattern\":\"bug\"}".into(),
+        });
+        app.apply(AgentEvent::ToolStart {
+            agent: "agent-2".into(),
+            id: "t2".into(),
+            name: "read_file".into(),
+            summary: "{\"path\":\"README\"}".into(),
+        });
+        app.apply(AgentEvent::ToolEnd {
+            agent: "agent-1".into(),
+            id: "t1".into(),
+            ok: true,
+        });
+        app.apply(AgentEvent::ToolStart {
+            agent: "agent-1".into(),
+            id: "t3".into(),
+            name: "bash".into(),
+            summary: "{\"command\":\"cargo test\"}".into(),
+        });
+        app.apply(AgentEvent::AgentEnd {
+            agent: "agent-1".into(),
+            ok: true,
+        });
+        app.apply(AgentEvent::AgentEnd {
+            agent: "agent-2".into(),
+            ok: false,
+        });
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Agent {
+                    agent: "agent-1".into(),
+                    task: "find the bug".into(),
+                    status: ToolStatus::Ok,
+                    tools: 2,
+                    last_tool: "bash {\"command\":\"cargo test\"}".into(),
+                },
+                Cell::Agent {
+                    agent: "agent-2".into(),
+                    task: "write the docs".into(),
+                    status: ToolStatus::Failed,
+                    tools: 1,
+                    last_tool: "read_file {\"path\":\"README\"}".into(),
+                },
+            ]
+        );
+    }
+
+    /// A sub-agent still Running when the turn dies (interrupt drops the task
+    /// future before its AgentEnd) is patched to Failed.
+    #[test]
+    fn turn_end_fails_agents_left_running() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        app.apply(AgentEvent::AgentStart {
+            agent: "agent-1".into(),
+            task: "long job".into(),
+        });
+        app.apply(AgentEvent::TurnEnded(EndReason::Aborted));
+        assert_eq!(
+            app.cells[0],
+            Cell::Agent {
+                agent: "agent-1".into(),
+                task: "long job".into(),
+                status: ToolStatus::Failed,
+                tools: 0,
+                last_tool: String::new(),
+            }
         );
     }
 

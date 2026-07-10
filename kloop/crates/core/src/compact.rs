@@ -168,6 +168,7 @@ mod tests {
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             tool_sources: Vec::new(),
             session_id: String::new(),
+            agent_label: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             defer_threshold: 30,

@@ -403,15 +403,30 @@ impl Ui for ThreadUi {
         self.notify("note", json!({"text": s}));
     }
 
-    fn tool_start(&self, id: &str, name: &str, summary: &str) {
-        self.notify(
-            "tool/started",
-            json!({"callId": id, "name": name, "summary": summary}),
-        );
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
+        let mut params = json!({"callId": id, "name": name, "summary": summary});
+        // Only sub-agent calls carry the field; the main agent's stay as
+        // before so existing clients see an unchanged shape.
+        if !agent.is_empty() {
+            params["agent"] = Value::String(agent.to_string());
+        }
+        self.notify("tool/started", params);
     }
 
-    fn tool_end(&self, id: &str, ok: bool) {
-        self.notify("tool/completed", json!({"callId": id, "ok": ok}));
+    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
+        let mut params = json!({"callId": id, "ok": ok});
+        if !agent.is_empty() {
+            params["agent"] = Value::String(agent.to_string());
+        }
+        self.notify("tool/completed", params);
+    }
+
+    fn agent_start(&self, agent: &str, task: &str) {
+        self.notify("agent/started", json!({"agent": agent, "task": task}));
+    }
+
+    fn agent_end(&self, agent: &str, ok: bool) {
+        self.notify("agent/completed", json!({"agent": agent, "ok": ok}));
     }
 }
 
