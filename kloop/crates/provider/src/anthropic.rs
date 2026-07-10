@@ -15,7 +15,31 @@ use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
+use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
+
+/// The `tools` request field, with its own breakpoint on the last tool. Tools
+/// render before system, and the tool set is far more stable than kloop's
+/// system prompt (which embeds the date and a git snapshot): when a restart
+/// changes the system, the tools prefix still reads from cache.
+pub(super) fn tools_value(tools: &[ToolDef], cache: bool) -> Value {
+    let mut items: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.schema,
+            })
+        })
+        .collect();
+    if cache {
+        if let Some(last) = items.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
+    Value::Array(items)
+}
 
 /// The `system` request field: a plain string without caching, or a one-block
 /// array whose cache_control breakpoint caches tools + system together (the

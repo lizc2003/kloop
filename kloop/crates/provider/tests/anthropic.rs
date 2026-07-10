@@ -100,14 +100,27 @@ async fn streams_text_and_tool_use_with_usage() {
     assert_eq!(ok.len(), 5);
 }
 
-/// The caching request contract, asserted whole-object: system becomes a
-/// one-block array with the tools+system breakpoint, and exactly one message
-/// breakpoint sits on the LAST content block of the LAST message.
+/// The caching request contract, asserted whole-object: one breakpoint on
+/// the LAST tool (the tool set outlives the volatile system prompt), one on
+/// the system block, and exactly one message breakpoint on the LAST content
+/// block of the LAST message.
 #[tokio::test]
 async fn request_body_carries_cache_breakpoints() {
     let server = MockServer::start().await;
     mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
     let provider = Arc::new(anthropic(&server));
+    let tools = [
+        kloop_protocol::ToolDef {
+            name: "bash".into(),
+            description: "run a command".into(),
+            schema: json!({"type": "object"}),
+        },
+        kloop_protocol::ToolDef {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            schema: json!({"type": "object"}),
+        },
+    ];
     let messages = vec![
         Message::user_text("hi"),
         Message::assistant(vec![ContentBlock::ToolUse {
@@ -129,7 +142,7 @@ async fn request_body_carries_cache_breakpoints() {
             ],
         },
     ];
-    let mut rx = provider.stream("test-model", "be brief", &messages, &[]);
+    let mut rx = provider.stream("test-model", "be brief", &messages, &tools);
     while rx.recv().await.is_some() {}
 
     let requests = server.received_requests().await.unwrap();
@@ -159,7 +172,13 @@ async fn request_body_carries_cache_breakpoints() {
                     },
                 ]},
             ],
-            "tools": [],
+            "tools": [
+                {"name": "bash", "description": "run a command",
+                 "input_schema": {"type": "object"}},
+                {"name": "read_file", "description": "read a file",
+                 "input_schema": {"type": "object"},
+                 "cache_control": {"type": "ephemeral"}},
+            ],
             "stream": true,
         })
     );

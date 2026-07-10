@@ -385,9 +385,10 @@ cargo run -- --mock
 
 # Anthropic (default model claude-sonnet-5; override with AGENT_MODEL)
 ANTHROPIC_API_KEY=... cargo run
-# prompt caching is on by default (cache_control breakpoints on the system
-# block and the last message block); AGENT_CACHE=off disables it for
-# diagnosing cache behavior
+# prompt caching is on by default (cache_control breakpoints on the last
+# tool, the system block, and the last message block — the tool set outlives
+# the volatile system prompt, so a restart still reads the tools prefix);
+# AGENT_CACHE=off disables it for diagnosing cache behavior
 # thinking blocks stream dim in the UI and are replayed verbatim (signature
 # included). No AGENT_THINKING = no thinking field sent (current models then
 # run adaptive on their own); AGENT_THINKING=off|adaptive|<budget tokens>

@@ -64,9 +64,10 @@ pub enum Provider {
     Anthropic {
         key: String,
         base: String,
-        /// Prompt caching: mark cache_control breakpoints on the system block
-        /// and the last message block. On by default (pure cost saving); the
-        /// escape hatch exists for diagnosing cache behavior.
+        /// Prompt caching: mark cache_control breakpoints on the last tool,
+        /// the system block, and the last message block. On by default (pure
+        /// cost saving); the escape hatch exists for diagnosing cache
+        /// behavior.
         cache: bool,
         thinking: ThinkingMode,
     },
@@ -191,11 +192,7 @@ impl Provider {
                     "max_tokens": MAX_OUTPUT_TOKENS,
                     "system": anthropic::system_value(system, *cache),
                     "messages": anthropic::messages_value(messages, *cache),
-                    "tools": tools.iter().map(|t| json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.schema,
-                    })).collect::<Vec<_>>(),
+                    "tools": anthropic::tools_value(tools, *cache),
                     "stream": true,
                 });
                 match thinking {
