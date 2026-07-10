@@ -17,7 +17,7 @@
 
 **真 key 验收**:双轨 `--plain --yolo`。anthropic:派 researcher 子 agent(model=haiku override 确实进请求——代理无 haiku 返 503 点名,反证 override 生效;换 sonnet-5 完整闭环)自报"只有 grep/glob/read_file/read_offloaded、无 bash",grep 命中目标文件。gpt-5.4-mini:searcher 类型(model 省略继承 gpt)路由 + 工具限制同样生效,只报 grep/glob/read_file。三项 override(system/model/tools)全部端到端证实。
 
-**提交**:见下方提交号。
+**提交**:8a65327(fmt/clippy/test 全绿,298 个测试)。
 
 ## ✅ 完成记录(2026-07-10,切片 1+4)
 
