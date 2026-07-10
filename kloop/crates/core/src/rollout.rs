@@ -310,7 +310,8 @@ pub(crate) fn timestamp_id(unix_secs: u64) -> String {
 
 /// Days since 1970-01-01 to a UTC civil date (Howard Hinnant's
 /// civil_from_days), so session ids don't need a chrono dependency.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+/// Also feeds the environment block's date (context::utc_date).
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -665,6 +666,7 @@ mod tests {
                 provider: Arc::new(provider),
                 model: "mock".into(),
                 system: "test".into(),
+                project_instructions: None,
                 max_rounds: 5,
                 offload_dir: dir.to_path_buf(),
                 context_window: None,

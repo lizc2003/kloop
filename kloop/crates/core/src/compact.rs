@@ -158,6 +158,7 @@ mod tests {
             provider: Arc::new(provider),
             model: "mock".into(),
             system: "test".into(),
+            project_instructions: None,
             max_rounds: 5,
             offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
             context_window: Some(200_000),

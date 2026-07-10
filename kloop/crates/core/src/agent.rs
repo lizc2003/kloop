@@ -96,6 +96,12 @@ async fn turn_rounds(
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
     let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
+    // The injected instructions message is not part of history, so the
+    // overflow prediction must account for it separately.
+    let instructions_tokens = cfg
+        .project_instructions
+        .as_deref()
+        .map_or(0, |s| s.len() as u64 / 4);
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
@@ -108,7 +114,11 @@ async fn turn_rounds(
         // growth would overflow the window — don't wait to be rejected.
         if let Some(window) = cfg.context_window {
             if history.messages().len() >= 2
-                && compact::predicted_overflow(history.estimated_tokens(), growth, window)
+                && compact::predicted_overflow(
+                    history.estimated_tokens() + instructions_tokens,
+                    growth,
+                    window,
+                )
             {
                 ui.note("predicted context overflow; compacting history");
                 if let Err(e) = compact::run_compaction(cfg, history, ui, cancel).await {
@@ -316,6 +326,20 @@ async fn sample_with_retry(
     cancel: &CancellationToken,
     stream_text: bool,
 ) -> Sampled {
+    // Project instructions ride every request as a synthetic first user
+    // message. They are never recorded: resume rereads fresh files, and
+    // compaction cannot swallow them.
+    let injected;
+    let messages = match &cfg.project_instructions {
+        Some(instructions) => {
+            let mut with_context = Vec::with_capacity(messages.len() + 1);
+            with_context.push(Message::user_text(instructions.clone()));
+            with_context.extend_from_slice(messages);
+            injected = with_context;
+            &injected[..]
+        }
+        None => messages,
+    };
     for attempt in 0..MAX_ATTEMPTS {
         match sample_once(cfg, model, messages, tools, ui, cancel, stream_text).await {
             Ok(ok) => return Sampled::Ok(ok),
@@ -422,6 +446,7 @@ mod tests {
             provider: Arc::new(provider),
             model: "mock".into(),
             system: "test".into(),
+            project_instructions: None,
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
             context_window: None,
@@ -502,6 +527,7 @@ mod tests {
             provider: Arc::new(provider),
             model: "mock".into(),
             system: "test".into(),
+            project_instructions: None,
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
             context_window: Some(window),
@@ -1039,6 +1065,85 @@ mod tests {
         );
         assert_eq!(msgs[2].role, Role::Assistant);
         assert_eq!(msgs[4], Message::user_text("[post_tool hook]\nlint passed"));
+    }
+
+    /// Project instructions ride every sampling request as a synthetic first
+    /// user message — and are never recorded to history.
+    #[tokio::test]
+    async fn project_instructions_injected_per_request_not_recorded() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use("t1", "echo hi")]),
+            MockTurn::Blocks(text("done")),
+        ]);
+        let instructions = "<project-instructions>reply in haiku</project-instructions>";
+        let mut cfg = (*compaction_cfg(provider, 200_000, "instructions")).clone();
+        cfg.project_instructions = Some(instructions.into());
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for request in seen.iter() {
+            assert_eq!(
+                request.messages[0],
+                Message::user_text(instructions),
+                "every request must start with the injected instructions"
+            );
+        }
+        // The real history follows the synthetic message untouched…
+        assert_eq!(seen[1].messages[1], Message::user_text("go"));
+        // …and never absorbs it.
+        assert!(history
+            .messages()
+            .iter()
+            .all(|m| *m != Message::user_text(instructions)));
+    }
+
+    /// The injected instructions count toward the overflow prediction even
+    /// though they are not in history — and the compaction request itself
+    /// runs on plain history, without the injected message.
+    #[tokio::test]
+    async fn instructions_count_toward_predictive_compaction() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(text("summary of everything so far")),
+            MockTurn::Blocks(text("final answer")),
+        ]);
+        // window 30_000, growth 23_192 → threshold ≈ 6_808 tokens. History
+        // alone estimates ~6_500; the 8_000-char instructions add ~2_000 and
+        // push it over, so compaction must fire before sampling.
+        let mut cfg = (*compaction_cfg(provider, 30_000, "instr-predict")).clone();
+        cfg.project_instructions = Some("r".repeat(8_000));
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("x".repeat(13_000)));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "y".repeat(13_000),
+        }]));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "final answer");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "compaction request + the real request");
+        // Request 0 is the compaction summary: plain history, no injection.
+        assert!(seen[0]
+            .messages
+            .iter()
+            .all(|m| m.content.iter().all(|b| !matches!(
+                b,
+                ContentBlock::Text { text } if text.starts_with("rrr")
+            ))));
+        // Request 1 is the real one: instructions first, compacted history after.
+        assert_eq!(seen[1].messages[0], Message::user_text("r".repeat(8_000)));
     }
 
     /// The task tool spawns a sub-agent that consumes its own turns from the

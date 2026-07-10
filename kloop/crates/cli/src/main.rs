@@ -2,6 +2,7 @@
 //! Ctrl+C interruption, session persistence (`--resume`, `--list-sessions`),
 //! MCP server wiring, and the keyless `--mock` demo.
 
+mod context;
 mod mcp;
 
 use std::io::Write as _;
@@ -395,8 +396,8 @@ fn config_from_env(
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
+    project: &context::GatheredContext,
 ) -> Result<Config> {
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
     // --mock stays hermetic: no config reads, no hook child processes.
     let hooks = if args.mock {
@@ -406,11 +407,6 @@ fn config_from_env(
             defs: load_hooks(Path::new(PERMISSIONS_CONFIG))?,
         }
     };
-    let system = format!(
-        "You are a coding agent working in a CLI. Use the provided tools to inspect and \
-             modify files and run commands; keep answers short. Current working directory: {}",
-        cwd.display()
-    );
     let offload_dir = PathBuf::from(".kloop/offload");
     // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
     let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
@@ -424,7 +420,8 @@ fn config_from_env(
     let base = Config {
         provider: Arc::new(Provider::mock(vec![])),
         model: "mock".into(),
-        system,
+        system: project.system.clone(),
+        project_instructions: project.instructions.clone(),
         max_rounds: 30,
         offload_dir,
         context_window,
@@ -604,13 +601,24 @@ async fn main() -> Result<()> {
         }
         sources
     };
+    // Project context (instruction files, env block, git snapshot) is
+    // gathered once per process and shared into every Config the same way.
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let project = if args.mock {
+        context::mock(&cwd)
+    } else {
+        context::gather(&cwd)
+    };
+    for warning in &project.warnings {
+        eprintln!("\x1b[2m[{warning}]\x1b[0m");
+    }
     if args.serve {
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
         let factory: kloop_server::ConfigFactory = {
             let args = args.clone();
             Arc::new(move |approver, notify| {
-                config_from_env(&args, approver, notify, &tool_sources)
+                config_from_env(&args, approver, notify, &tool_sources, &project)
             })
         };
         return kloop_server::serve_stdio(
@@ -631,12 +639,12 @@ async fn main() -> Result<()> {
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        return plain_main(args, history, session_id, tool_sources).await;
+        return plain_main(args, history, session_id, tool_sources, project).await;
     }
     let factory_session_id = session_id.clone();
     kloop_tui::run(
         move |approver, notify| {
-            let mut cfg = config_from_env(&args, approver, notify, &tool_sources)?;
+            let mut cfg = config_from_env(&args, approver, notify, &tool_sources, &project)?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
         },
@@ -651,9 +659,16 @@ async fn plain_main(
     mut history: History,
     session_id: String,
     tool_sources: Vec<Arc<dyn ToolSource>>,
+    project: context::GatheredContext,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
-    let mut cfg = config_from_env(&args, Arc::new(CliApprover), notify, &tool_sources)?;
+    let mut cfg = config_from_env(
+        &args,
+        Arc::new(CliApprover),
+        notify,
+        &tool_sources,
+        &project,
+    )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);

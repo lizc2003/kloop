@@ -20,6 +20,14 @@ use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 
+/// What the Mock provider saw in one `stream()` call; lets core tests assert
+/// the request shape (e.g. injected context messages) without a wire.
+#[derive(Clone, Debug)]
+pub struct MockRequest {
+    pub system: String,
+    pub messages: Vec<Message>,
+}
+
 /// One scripted Mock response: content blocks, a truncated response, or a
 /// provider error.
 pub enum MockTurn {
@@ -44,6 +52,8 @@ pub enum Provider {
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
     Mock {
         turns: Mutex<VecDeque<MockTurn>>,
+        /// Requests as seen, shared out by `mock_recording`.
+        seen: Arc<Mutex<Vec<MockRequest>>>,
     },
 }
 
@@ -64,7 +74,18 @@ impl Provider {
     pub fn mock_scripted(turns: Vec<MockTurn>) -> Self {
         Provider::Mock {
             turns: Mutex::new(turns.into()),
+            seen: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Like `mock_scripted`, but also hands back the request log.
+    pub fn mock_recording(turns: Vec<MockTurn>) -> (Self, Arc<Mutex<Vec<MockRequest>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Provider::Mock {
+            turns: Mutex::new(turns.into()),
+            seen: seen.clone(),
+        };
+        (provider, seen)
     }
 
     /// Start one streaming sampling request. The request body is built before
@@ -78,7 +99,11 @@ impl Provider {
     ) -> mpsc::Receiver<Result<StreamEvent>> {
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(64);
         match self.as_ref() {
-            Provider::Mock { turns } => {
+            Provider::Mock { turns, seen } => {
+                seen.lock().unwrap().push(MockRequest {
+                    system: system.to_string(),
+                    messages: messages.to_vec(),
+                });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                     MockTurn::Blocks(vec![ContentBlock::Text {
                         text: "mock exhausted".into(),

@@ -135,6 +135,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             provider: Arc::new(Provider::mock(turns.clone())),
             model: "mock".into(),
             system: "test".into(),
+            project_instructions: None,
             max_rounds: 10,
             offload_dir: offload.clone(),
             context_window: None,

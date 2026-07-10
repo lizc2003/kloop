@@ -276,6 +276,32 @@ last word; a hook block means there is nothing left to ask about. Hooks run
 in config order; the first block short-circuits the rest. Sub-agents inherit
 the parent's hook set and session id. `--mock` runs without hooks (hermetic).
 
+## Project context (Phase 2, eighth slice)
+
+At startup kloop assembles what the model knows about where it is:
+
+- **System prompt** = base instructions + an environment block (working
+  directory, platform, today's UTC date, whether cwd is a git repo) + a git
+  snapshot (current branch, `git status --short` capped at 1000 bytes,
+  last 5 commits) labeled as a start-of-session snapshot.
+- **Instruction files**: per directory `AGENTS.md` wins, `CLAUDE.md` is the
+  compatibility fallback. Layers, in order: `~/.kloop/` (global), then every
+  directory from the git root down to cwd (closest to cwd last). Without a
+  git root only cwd is consulted. Missing files are simply absent. Total
+  budget 32 KiB across all files — over it, the overflowing file is truncated
+  and the rest skipped, with startup warnings.
+- Following cc and codex, instruction files do **not** go into the system
+  prompt: they ride every sampling request as a synthetic first user message
+  (`<project-instructions>…</project-instructions>`) that is never recorded
+  to history — so `--resume` picks up fresh edits and compaction can't
+  swallow the rules. The overflow prediction accounts for it separately.
+
+Assembly is pure functions in `core/src/context.rs` (testable without a
+filesystem); the IO — file discovery, git commands — lives in
+`cli/src/context.rs`. Sub-agents inherit the same context with the Config;
+server threads share one process-wide assembly. `--mock` stays hermetic:
+no file reads, no git commands, the pre-assembly hardcoded prompt.
+
 ## Running
 
 ```sh
@@ -418,6 +444,8 @@ crates/core/        kloop-core — the agent, network-free
   src/permissions.rs the layered execution gate: deny/ask/allow rules,
                     safety checks, modes, session cache, Approver seam
   src/compact.rs    predictive threshold math + compaction rewrite
+  src/context.rs    pure prompt assembly: system + env block + git snapshot,
+                    instruction-file concatenation under a byte budget
   src/rollout.rs    session persistence: JSONL append, compacted markers,
                     replay + orphan repair on resume
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
@@ -445,4 +473,6 @@ crates/cli/         kloop — the binary
   src/mcp.rs        [mcp.servers] config, startup connection with
                     degrade-to-warning, {server}__{tool} namespacing,
                     the ToolSource adapter
+  src/context.rs    project-context IO: AGENTS.md/CLAUDE.md discovery
+                    (global + git root→cwd), env info, git snapshot commands
 ```

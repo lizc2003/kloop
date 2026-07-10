@@ -1,6 +1,20 @@
-# Plan 13 — 项目上下文注入(system prompt 与项目指令文件)
+# Plan 13 — 项目上下文注入(system prompt 与项目指令文件)✅
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 CLAUDE.md 语义(自动加载、分层、@import)、codex 的 AGENTS.md(project_doc 机制)。教训 11:两边的具体语义都回源核对,别凭印象。
+
+## 完成记录(2026-07-10)
+
+**拍板**(问用户两点,其余开工时定):
+- 文件名:AGENTS.md 为主 + 兼容 CLAUDE.md,同目录都在只取 AGENTS.md;不发明 kloop 自己的名字。
+- git 快照:进 system(cc 形:branch + status --short 截 1000 字节 + 最近 5 提交,标注"开场快照不更新");codex 不注入,弃其形。
+- **注入位置改了 plan 原案**:回源发现 cc/codex 都不把项目指令放 system,而是首条 user 消息。跟随两家——指令走每次采样请求的合成首条 user 消息(`<project-instructions>` 包裹),**不进 History/rollout**,resume 自动拿新内容、压缩吃不掉;predictive 记账单独加上这块估算。环境块 + git 快照进 system 尾部(cc 形)。
+- 归属:纯组装 core/src/context.rs(无 IO,整对象断言),文件发现/git 命令 cli/src/context.rs;core 无 IO 边界守住了。
+- 分层:全局 ~/.kloop/ + 项目层(cwd 向上到 git 根,根→cwd 顺序);无 git 根只看 cwd。上限抄 codex:总预算 32KiB,截断+启动告警。
+- 子 agent 走 `(*cfg).clone()` 天然继承,零改动;server 各 thread 共享一次组装;--mock 保持 hermetic(不读文件不跑 git,沿用原硬编码 system)。
+
+**实现**:`Config.project_instructions: Option<String>`;注入缝在 `sample_with_retry`(压缩请求天然不带);provider Mock 加 `mock_recording`(请求记录器)供测试断言请求形态。测试 159→178:core 组装纯函数(有无 git、截断边界含多字节、预算耗尽/恰好)、agent 注入契约(每请求首条 + 不进 History + predictive 记账 + 压缩请求无注入)、cli 发现(AGENTS>CLAUDE、根→cwd 顺序、git 根外忽略、无根只看 cwd、全局层在前、缺文件不报错)。
+
+**验收**:fmt/clippy/test 全绿;--mock 全程无恙;真 key 双轨(anthropic + openai-compat gpt-5.4-mini)在临时项目验证:AGENTS.md 规则(回复以 BANANA 开头)遵守,日期/分支/cwd 不调工具直接答对(环境块与 git 快照生效)。提交号见 git log。
 
 ## 目标
 

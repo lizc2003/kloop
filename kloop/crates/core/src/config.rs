@@ -14,6 +14,11 @@ pub struct Config {
     pub provider: Arc<Provider>,
     pub model: String,
     pub system: String,
+    /// Assembled project-instructions message (context::assemble_instructions).
+    /// Injected as a synthetic first user message into every sampling request
+    /// — never recorded to history, so resume rereads fresh files and
+    /// compaction cannot swallow it. Sub-agents inherit it with the Config.
+    pub project_instructions: Option<String>,
     pub max_rounds: usize,
     pub offload_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
