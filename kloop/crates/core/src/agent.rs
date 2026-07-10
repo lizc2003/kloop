@@ -953,7 +953,7 @@ mod tests {
             provider,
             vec![hook(
                 HookEvent::PreTool,
-                "echo rm-like commands are banned; exit 1",
+                "echo rm-like commands are banned 1>&2; exit 2",
             )],
             "block",
         );
@@ -985,7 +985,7 @@ mod tests {
         }]]);
         let cfg = hooked_cfg(
             provider,
-            vec![hook(HookEvent::PreTurn, "echo out of office; exit 1")],
+            vec![hook(HookEvent::PreTurn, "echo out of office 1>&2; exit 2")],
             "preturn-block",
         );
         let ui: Arc<dyn Ui> = Arc::new(NullUi);

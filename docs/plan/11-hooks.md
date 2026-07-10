@@ -2,7 +2,7 @@
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:codex hooks crate、cc 的 hook 语义(可阻断、可注入上下文)。
 
-**完成记录**:按设计要点全部落地(hooks.rs 归 core、tokio::process、pre_tool 先于权限门、阻断产物、子 agent 继承)。补充定案:阻断理由取 stdout>stderr>exit status;post_* 非 0 只告警;spawn 失败与超时同样放行+告警(fail-open,权限门才是强制层);同事件多 hook 首个阻断短路;matcher 精确匹配;stdout 注入形态 `[{event} hook]\n…`,工具 hook 的经 ToolCtx.hook_context sink 在该轮 tool_results 后记录;`Config` 新增 `session_id` + `hooks: Arc<Hooks>`。测试 143→158。手工验收双轨真 key 过:sonnet-5 与 gpt-5.4-mini 均调 `bash rm`,hook 阻断、模型收到 `blocked by hook: policy: rm is banned…` 后改口,文件未删。
+**完成记录**:按设计要点全部落地(hooks.rs 归 core、tokio::process、pre_tool 先于权限门、阻断产物、子 agent 继承)。补充定案:退出码语义对照 codex hooks crate 后**改为对齐 cc**——初版"非 0 即阻断"是 plan 原文,但它把"hook 自身出错"误读成"策略阻断",与本层其余 fail-open(超时/spawn 失败放行)矛盾;现为 exit 2 才阻断(理由走 stderr,退 stdout 再退 status),其他一切非 0 = malfunction 告警放行。post_* 上任何退出码只告警;同事件多 hook 首个阻断短路;matcher 精确匹配;stdout 注入形态 `[{event} hook]\n…`,工具 hook 的经 ToolCtx.hook_context sink 在该轮 tool_results 后记录;`Config` 新增 `session_id` + `hooks: Arc<Hooks>`。cc 的 stdout JSON 协议/10 事件/并行执行有意不抄(最小集,可后补)。测试 143→159。手工验收双轨真 key 过:sonnet-5 与 gpt-5.4-mini 均调 `bash rm`,hook 阻断、模型收到 `blocked by hook: policy: rm is banned…` 后改口,文件未删;反面路径也真验过——同 hook 改 exit 1,告警放行,权限门接管询问后 rm 执行。
 
 ## 目标
 

@@ -259,14 +259,16 @@ timeout_ms = 5000             # optional, default 10000
 
 The event arrives as one line of JSON on the hook's stdin: `event` and
 `session_id` always, plus `tool_name`/`tool_input` on tool events and
-`tool_result`/`is_error` on `post_tool`. Exit code 0 allows; non-zero
-**blocks** on the pre_* events — a blocked `pre_tool` call never runs and the
-model gets an is_error tool_result (`blocked by hook: …`, the hook's
-stdout/stderr as the reason), a blocked `pre_turn` means the turn never
-starts. On post_* events a non-zero exit is just a warning. Whatever an
-allowing hook prints on stdout is injected into history as a
-`[{event} hook]`-prefixed user message the model sees. Hooks fail open:
-spawn failures and timeouts warn and proceed.
+`tool_result`/`is_error` on `post_tool`. Exit code 0 allows; exit code **2
+blocks** on the pre_* events (cc's convention — a block must be an explicit
+signal): a blocked `pre_tool` call never runs and the model gets an is_error
+tool_result (`blocked by hook: …`, the reason read from stderr — stdout is
+the context channel), a blocked `pre_turn` means the turn never starts.
+Every other outcome fails **open** with a warning: any other exit code, exit
+2 on a post_* event, a spawn failure, a timeout — a broken hook script is a
+malfunction, not a policy decision (the permission gate is the enforcement
+layer). Whatever an allowing hook prints on stdout is injected into history
+as a `[{event} hook]`-prefixed user message the model sees.
 
 Ordering with permissions: `pre_tool` hooks run **before** the permission
 gate — hooks are automation policy, the permission prompt is the human's
@@ -316,7 +318,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 158 tests across the workspace:
+`cargo test` runs 159 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -339,11 +341,13 @@ saved and resumable — see Session persistence above.
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
   persistence, opaque never cacheable); hook execution (all four points fire
-  in order around a real turn, blocked pre_tool becomes an is_error
+  in order around a real turn, exit-2 pre_tool block becomes an is_error
   tool_result and the command never runs, blocked pre_turn prevents sampling,
-  stdout-injection shape, stdin event JSON contract, timeout/spawn-failure
-  fail open with warnings, matcher filtering, block short-circuits later
-  hooks, post-event non-zero exits only warn); rollout round-trip, envelope
+  block reason stderr>stdout>status, non-2 exits fail open even on pre
+  events, stdout-injection shape, stdin event JSON contract,
+  timeout/spawn-failure fail open with warnings, matcher filtering, block
+  short-circuits later hooks, exit 2 on post events only warns); rollout
+  round-trip, envelope
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full

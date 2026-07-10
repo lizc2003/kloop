@@ -1,11 +1,14 @@
 //! External command hooks on four events: before/after a turn, before/after
 //! a tool call. The event is JSON on the hook's stdin; exit code 0 lets the
-//! action proceed while non-zero blocks it (pre_* events only — post_* exit
-//! codes are warnings). Whatever an allowing hook prints on stdout is
-//! injected into history as extra user-message context. Hooks fail open: a
-//! spawn failure or timeout warns and proceeds, because a broken hook script
-//! must not brick the agent (the permission gate is the enforcement layer;
-//! hooks are automation policy on top).
+//! action proceed, exit code 2 blocks it (pre_* events only; the reason is
+//! read from stderr — stdout is the context channel). A block must be an
+//! explicit signal: every other outcome — any other exit code, a spawn
+//! failure, a timeout — is treated as a hook malfunction and fails OPEN with
+//! a warning, because a broken hook script must not brick the agent (the
+//! permission gate is the enforcement layer; hooks are automation policy on
+//! top). Whatever an allowing hook prints on stdout is injected into history
+//! as extra user-message context. Same semantics as cc's hooks, minus the
+//! structured-JSON stdout protocol.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -167,16 +170,23 @@ impl Hooks {
                         context.push(context_message(event, &stdout));
                     }
                 }
-                HookRun::NonZero { code, output } => {
-                    // Blocking is a pre_* semantic; a failing post_* hook is
-                    // only worth a warning.
-                    if matches!(event, HookEvent::PreTurn | HookEvent::PreTool) {
+                HookRun::NonZero {
+                    code,
+                    stdout,
+                    stderr,
+                } => {
+                    // Only the explicit block signal (exit 2 on a pre_*
+                    // event) blocks; any other non-zero exit is a hook
+                    // malfunction and fails open.
+                    if code == BLOCK_EXIT_CODE
+                        && matches!(event, HookEvent::PreTurn | HookEvent::PreTool)
+                    {
                         return HookDecision::Block {
-                            reason: block_reason(code, &output),
+                            reason: block_reason(&stderr, &stdout),
                         };
                     }
                     ui.note(&format!(
-                        "{} hook {:?} exited with {code} (ignored for post events)",
+                        "{} hook {:?} exited with {code}; proceeding (only exit {BLOCK_EXIT_CODE} blocks pre_* events)",
                         event.name(),
                         def.command
                     ));
@@ -194,27 +204,35 @@ impl Hooks {
     }
 }
 
+/// cc's convention: the one exit code that means "deliberately blocked".
+pub const BLOCK_EXIT_CODE: i32 = 2;
+
 enum HookRun {
     Allow {
         stdout: String,
     },
     NonZero {
         code: i32,
-        output: String,
+        stdout: String,
+        stderr: String,
     },
     /// Spawn failure or timeout — fail open.
     Failed(String),
 }
 
-/// The block reason the model (or user) sees: the hook's own words when it
-/// printed any, else the bare exit status.
-fn block_reason(code: i32, output: &str) -> String {
-    let output = output.trim();
-    if output.is_empty() {
-        format!("hook exited with status {code}")
-    } else {
-        output.to_string()
+/// The block reason the model (or user) sees: stderr is the designated
+/// reason channel (stdout is for context injection), but a hook that spoke
+/// only on stdout is still heard, and a silent one gets the bare status.
+fn block_reason(stderr: &str, stdout: &str) -> String {
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
     }
+    let stdout = stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.to_string();
+    }
+    format!("hook exited with status {BLOCK_EXIT_CODE}")
 }
 
 async fn run_hook(def: &HookDef, payload: &Value) -> HookRun {
@@ -248,14 +266,10 @@ async fn run_hook(def: &HookDef, payload: &Value) -> HookRun {
     if output.status.success() {
         return HookRun::Allow { stdout };
     }
-    // Block reason: prefer the hook's stdout, fall back to stderr.
-    let mut combined = stdout;
-    if combined.trim().is_empty() {
-        combined = String::from_utf8_lossy(&output.stderr).into_owned();
-    }
     HookRun::NonZero {
         code: output.status.code().unwrap_or(-1),
-        output: combined,
+        stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
 
@@ -302,13 +316,16 @@ mod tests {
         );
     }
 
+    /// Exit 2 blocks; the reason channel is stderr, with stdout and the bare
+    /// status as fallbacks.
     #[tokio::test]
-    async fn blocking_hook_prefers_stdout_then_stderr_then_status() {
+    async fn exit_two_blocks_with_reason_from_stderr_then_stdout_then_status() {
         let ui = note_ui();
         let cases = [
-            ("echo not now; exit 2", "not now"),
-            ("echo whoops 1>&2; exit 3", "whoops"),
-            ("exit 4", "hook exited with status 4"),
+            ("echo not now 1>&2; exit 2", "not now"),
+            ("echo also-ctx; echo not now 1>&2; exit 2", "not now"),
+            ("echo spoke on stdout; exit 2", "spoke on stdout"),
+            ("exit 2", "hook exited with status 2"),
         ];
         for (script, want) in cases {
             let hooks = Hooks {
@@ -327,6 +344,31 @@ mod tests {
         }
     }
 
+    /// Any non-zero exit other than 2 is a malfunction, not a block: warn
+    /// and proceed, even on pre_* events.
+    #[tokio::test]
+    async fn other_nonzero_exits_fail_open_on_pre_events() {
+        for script in ["echo broken 1>&2; exit 1", "exit 127"] {
+            let hooks = Hooks {
+                defs: vec![sh(HookEvent::PreTool, script)],
+            };
+            let ui = note_ui();
+            let decision = hooks.pre_tool("s-1", "bash", &json!({}), &ui).await;
+            assert_eq!(
+                decision,
+                HookDecision::Allow {
+                    context: Vec::new()
+                },
+                "script: {script}"
+            );
+            let notes = ui.0.lock().unwrap();
+            assert!(
+                notes.iter().any(|n| n.contains("exited with")),
+                "expected a malfunction warning, got {notes:?}"
+            );
+        }
+    }
+
     /// A block short-circuits the chain: the later hook never runs.
     #[tokio::test]
     async fn block_short_circuits_later_hooks() {
@@ -335,7 +377,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let hooks = Hooks {
             defs: vec![
-                sh(HookEvent::PreTool, "exit 1"),
+                sh(HookEvent::PreTool, "exit 2"),
                 sh(HookEvent::PreTool, &format!("touch {}", marker.display())),
             ],
         };
@@ -443,7 +485,7 @@ mod tests {
                 matcher: Some("bash".into()),
                 ..sh(
                     HookEvent::PreTool,
-                    &format!("touch {}; exit 1", marker.display()),
+                    &format!("touch {}; exit 2", marker.display()),
                 )
             }],
         };
@@ -468,10 +510,12 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    /// Even the block exit code only warns on post events — blocking is a
+    /// pre_* semantic.
     #[tokio::test]
     async fn post_event_nonzero_exit_warns_instead_of_blocking() {
         let hooks = Hooks {
-            defs: vec![sh(HookEvent::PostTool, "echo ignored; exit 7")],
+            defs: vec![sh(HookEvent::PostTool, "echo ignored 1>&2; exit 2")],
         };
         let ui = note_ui();
         let context = hooks
@@ -480,7 +524,7 @@ mod tests {
         assert_eq!(context, Vec::<String>::new());
         let notes = ui.0.lock().unwrap();
         assert!(
-            notes.iter().any(|n| n.contains("exited with 7")),
+            notes.iter().any(|n| n.contains("exited with 2")),
             "expected a non-zero warning, got {notes:?}"
         );
     }
