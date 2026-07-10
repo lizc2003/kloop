@@ -68,4 +68,6 @@
 - **plan 18(收尾)** TUI 按键选截点、server `thread/fork`(schema 已兼容,等有真实需求)。
 - **plan 19(后续片)** 片 1(seatbelt 执行原语)+ 片 2(auto-allow 双轴联动)+ 片 3(代码级 escalation 环)已完成。剩余只有平台扩展:Linux 片对 bwrap+seccomp(landlock 是 legacy;`sandbox/` 已是目录模块,平台后端落 sibling 文件 `linux.rs`——**不拆独立 crate**:Linux-only 依赖用 `cfg(target_os)` 门控即可、helper 二进制用 arg0 dispatch 复用主二进制,拆 crate 仅在 unsafe 面/编译成本有痛感时再议;本机无法手工验收,宜等仓库推远端后 Linux CI 能跑再做);Windows 更后,且缝要从 argv-prefix 改成 spawn-owning trait(restricted token/AppContainer 无包装二进制)。macOS 侧沙箱功能已完整。
 
+- **plan 20(备忘,未开工)** code mode / 代码编排(CodeAct):模型写 JS 程序编排工具/子 agent,中间结果留程序变量不回灌上下文——cc dynamic workflows / codex code mode(用 V8)/ Anthropic code-execution-with-MCP 同族。引擎选型(V8 vs QuickJS vs Boa)、op 层过权限门/沙箱的安全模型是命脉,开工必先回源三家(教训 11)。详见 plan 20 文件。
+
 不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、TodoWrite 类计划工具。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
