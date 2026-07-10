@@ -4,11 +4,13 @@
 //! agent loop and the frontends depend on.
 
 mod bash;
+mod discover;
 mod fs;
 mod search;
 mod task;
 
 pub use bash::BackgroundShells;
+pub use discover::deferred_notice;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,10 +28,10 @@ use crate::config::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 
-/// Past this many tools the definitions start crowding the context window;
-/// the CLI warns at startup (deferred tools + tool_search is the real fix,
-/// not in scope yet).
-pub const TOOL_COUNT_WARN_THRESHOLD: usize = 30;
+/// Past this many tools the definitions would crowd the context window, so
+/// source (MCP) tools are deferred behind tool_search instead of being sent.
+/// Default for `Config.defer_threshold` (`AGENT_DEFER_THRESHOLD` overrides).
+pub const TOOL_DEFER_THRESHOLD: usize = 30;
 
 /// An external provider of tools (an MCP server, in practice). Core only
 /// knows this seam; the wire protocol lives in the `kloop-mcp` crate and the
@@ -71,8 +73,22 @@ pub struct ToolCtx {
 /// (with a built-in or an earlier source) drops the later definition; the
 /// CLI surfaces the same collisions as startup warnings via
 /// [`tool_merge_warnings`].
-pub fn all_tool_defs(depth: u8, sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
+///
+/// Past `defer_threshold` total tools the source defs are withheld: the model
+/// gets built-ins + tool_search only, and loads deferred definitions through
+/// search results. The returned array is then stable for the whole session —
+/// unlocking never mutates it (prompt-cache friendliness is the point).
+pub fn all_tool_defs(
+    depth: u8,
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+) -> Vec<ToolDef> {
     let mut defs = tool_defs(depth);
+    if defer_active(sources, defer_threshold) {
+        defs.push(discover::tool_search_def());
+        defs.push(discover::call_tool_def());
+        return defs;
+    }
     let mut seen: std::collections::HashSet<String> = defs.iter().map(|d| d.name.clone()).collect();
     for source in sources {
         for def in source.defs() {
@@ -84,10 +100,44 @@ pub fn all_tool_defs(depth: u8, sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef>
     defs
 }
 
+/// Whether the deferred-tools regime is on. The verdict is computed from the
+/// depth-0 view (the most built-ins) and holds session-wide, so parent and
+/// sub-agents never disagree about which tools are deferred.
+pub fn defer_active(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> bool {
+    tool_defs(0).len() + merged_source_defs(sources).len() > defer_threshold
+}
+
+/// The source tools hidden behind tool_search: every merged source def when
+/// deferral is active, none otherwise. Collision-skipped defs are excluded —
+/// they are not callable, so they must not be discoverable either.
+pub fn deferred_tool_defs(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<ToolDef> {
+    if defer_active(sources, defer_threshold) {
+        merged_source_defs(sources)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Source defs deduplicated against the depth-0 built-ins and earlier
+/// sources — the same merge order [`all_tool_defs`] uses.
+fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
+    let mut seen: std::collections::HashSet<String> =
+        tool_defs(0).into_iter().map(|d| d.name).collect();
+    let mut defs = Vec::new();
+    for source in sources {
+        for def in source.defs() {
+            if seen.insert(def.name.clone()) {
+                defs.push(def.clone());
+            }
+        }
+    }
+    defs
+}
+
 /// Startup diagnostics for the merged tool set: name collisions (the later
-/// definition is skipped) and an oversized-list warning. Depth 0 is the
-/// authoritative view (it has the most built-ins).
-pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>]) -> Vec<String> {
+/// definition is skipped) and a note when the deferred-tools regime kicked
+/// in. Depth 0 is the authoritative view (it has the most built-ins).
+pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut seen: std::collections::HashSet<String> =
         tool_defs(0).into_iter().map(|d| d.name).collect();
@@ -102,9 +152,9 @@ pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>]) -> Vec<String> {
         }
     }
     let total = seen.len();
-    if total > TOOL_COUNT_WARN_THRESHOLD {
+    if total > defer_threshold {
         warnings.push(format!(
-            "{total} tools registered (> {TOOL_COUNT_WARN_THRESHOLD}); large tool lists crowd the context window"
+            "{total} tools registered (> {defer_threshold}); MCP tool definitions are deferred — the model loads them on demand via tool_search"
         ));
     }
     warnings
@@ -275,6 +325,9 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         // bash_output only reads registry state; kill_bash only signals
         // processes this agent itself started (cc marks both concurrency-safe).
         "bash_output" | "kill_bash" => true,
+        // tool_search reads defs and grows the unlock set — monotonic,
+        // order-independent state, safe to batch.
+        "tool_search" => true,
         "bash" => {
             input["command"]
                 .as_str()
@@ -298,6 +351,16 @@ pub async fn dispatch_tools(
     tool_uses: Vec<(String, String, Value)>,
     ctx: &ToolCtx,
 ) -> Vec<ContentBlock> {
+    // call_tool envelopes are unwrapped before anything else looks at the
+    // calls: concurrency batching, hooks, permissions and the UI must all
+    // judge the inner tool, never the wrapper.
+    let tool_uses: Vec<(String, String, Value)> = tool_uses
+        .into_iter()
+        .map(|(id, name, input)| {
+            let (name, input) = discover::unwrap_call_tool(name, input);
+            (id, name, input)
+        })
+        .collect();
     let sources = &ctx.cfg.tool_sources;
     let mut results = Vec::with_capacity(tool_uses.len());
     let mut i = 0;
@@ -346,6 +409,16 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let summary: String = input.to_string().chars().take(120).collect();
     ctx.ui.tool_start(&id, &name, &summary);
     let gated = async {
+        // Locked deferred tools bounce before hooks and permissions: the
+        // model skipped tool_search, and neither automation policy nor the
+        // human should be consulted about a call that cannot run. This is
+        // also the only rejection that does NOT unlock — unlocking flows
+        // exclusively through a tool_search hit.
+        if discover::locked(&name, &ctx.cfg) {
+            bail!(
+                "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
+            );
+        }
         // pre_tool hooks run BEFORE the permission gate: hooks are automation
         // policy, permissions are the human's last word — a hook block means
         // there is nothing left to ask about.
@@ -430,6 +503,12 @@ fn execute_tool<'a>(
             "grep" => search::grep_tool(input).await,
             "glob" => search::glob_tool(input).await,
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
+            "tool_search" => discover::tool_search_tool(input, ctx).await,
+            // Only malformed envelopes reach this arm — well-formed ones were
+            // rewritten to the inner call at dispatch entry.
+            "call_tool" => Err(anyhow!(
+                "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
+            )),
             "task" => task::task_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
                 Some(source) => source.call(other, input).await,
@@ -486,12 +565,23 @@ pub(crate) mod testutil {
                 session_id: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                defer_threshold: 30,
+                unlocked_tools: Default::default(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Rebuild the ctx with a different defer threshold (Config is behind an
+    /// Arc, so tests clone-and-swap instead of mutating).
+    pub(crate) fn with_defer_threshold(mut ctx: ToolCtx, threshold: usize) -> ToolCtx {
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.defer_threshold = threshold;
+        ctx.cfg = Arc::new(cfg);
+        ctx
     }
 
     /// Run a single tool call through the real dispatch path and return
@@ -573,7 +663,7 @@ mod tests {
     fn all_tool_defs_appends_sources_and_skips_collisions() {
         let sources: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let names: Vec<String> = all_tool_defs(0, &sources)
+        let names: Vec<String> = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD)
             .into_iter()
             .map(|d| d.name)
             .collect();
@@ -606,7 +696,7 @@ mod tests {
             }],
             readonly: String::new(),
         })];
-        let defs = all_tool_defs(0, &builtin_clash);
+        let defs = all_tool_defs(0, &builtin_clash, TOOL_DEFER_THRESHOLD);
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
@@ -614,11 +704,14 @@ mod tests {
 
     #[test]
     fn tool_merge_warnings_flags_collisions_and_oversized_lists() {
-        assert_eq!(tool_merge_warnings(&[]), Vec::<String>::new());
+        assert_eq!(
+            tool_merge_warnings(&[], TOOL_DEFER_THRESHOLD),
+            Vec::<String>::new()
+        );
 
         let colliding: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let warnings = tool_merge_warnings(&colliding);
+        let warnings = tool_merge_warnings(&colliding, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 2, "one per duplicated name: {warnings:?}");
         assert!(warnings[0].contains("srv__echo"));
         assert!(warnings[1].contains("srv__fail"));
@@ -634,9 +727,55 @@ mod tests {
             defs: many,
             readonly: String::new(),
         })];
-        let warnings = tool_merge_warnings(&big);
+        let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("50 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
+    }
+
+    /// The defer regime flips on the threshold: at or under, source tools
+    /// are inline exactly as before and tool_search does not exist; past it,
+    /// the defs shrink to built-ins + tool_search and the source tools move
+    /// to the deferred set.
+    #[test]
+    fn defer_kicks_in_past_threshold() {
+        let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
+        let builtin_count = tool_defs(0).len();
+
+        // Exactly at the threshold: everything inline, no tool_search.
+        let inline = all_tool_defs(0, &sources, builtin_count + 2);
+        assert!(inline.iter().any(|d| d.name == "srv__echo"));
+        assert!(inline.iter().all(|d| d.name != "tool_search"));
+        assert!(deferred_tool_defs(&sources, builtin_count + 2).is_empty());
+
+        // One past it: built-ins + tool_search + call_tool only; sources
+        // deferred.
+        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 1);
+        let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"tool_search"));
+        assert!(names.contains(&"call_tool"));
+        assert!(!names.contains(&"srv__echo"));
+        assert_eq!(deferred_regime.len(), builtin_count + 2);
+        let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 1)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(deferred, vec!["srv__echo", "srv__fail"]);
+    }
+
+    /// A source def colliding with a built-in is not callable, so it must
+    /// not become discoverable either.
+    #[test]
+    fn collision_skipped_defs_are_not_deferred() {
+        let clash: Vec<Arc<dyn ToolSource>> = vec![Arc::new(StubSource {
+            defs: vec![ToolDef {
+                name: "bash".into(),
+                description: "impostor".into(),
+                schema: json!({"type": "object"}),
+            }],
+            readonly: String::new(),
+        })];
+        assert!(deferred_tool_defs(&clash, 0).is_empty());
     }
 
     #[tokio::test]
@@ -800,6 +939,8 @@ mod tests {
                 session_id: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                defer_threshold: 30,
+                unlocked_tools: Default::default(),
             }),
             ui: Arc::new(NullUi),
             cancel,

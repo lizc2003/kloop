@@ -97,17 +97,14 @@ async fn turn_rounds(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    let tools = all_tool_defs(depth, &cfg.tool_sources);
+    let tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
     let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
-    // The injected instructions message is not part of history, so the
-    // overflow prediction must account for it separately.
-    let instructions_tokens = cfg
-        .project_instructions
-        .as_deref()
-        .map_or(0, |s| s.len() as u64 / 4);
+    // The injected context message is not part of history, so the overflow
+    // prediction must account for it separately.
+    let instructions_tokens = injected_context(cfg).map_or(0, |s| s.len() as u64 / 4);
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
@@ -324,6 +321,19 @@ limit. Continue exactly where you left off; break the remaining work into smalle
 
 const MAX_ATTEMPTS: u32 = 3;
 
+/// The synthetic first user message: project instructions plus the
+/// deferred-tools notice. Both parts are session-stable, so the composed
+/// message is too — the prompt-cache prefix survives across rounds.
+fn injected_context(cfg: &Config) -> Option<String> {
+    let notice = crate::tools::deferred_notice(cfg);
+    match (&cfg.project_instructions, notice) {
+        (None, None) => None,
+        (Some(instructions), None) => Some(instructions.clone()),
+        (None, Some(notice)) => Some(notice),
+        (Some(instructions), Some(notice)) => Some(format!("{instructions}\n\n{notice}")),
+    }
+}
+
 async fn sample_with_retry(
     cfg: &Arc<Config>,
     model: &str,
@@ -333,14 +343,14 @@ async fn sample_with_retry(
     cancel: &CancellationToken,
     stream_text: bool,
 ) -> Sampled {
-    // Project instructions ride every request as a synthetic first user
-    // message. They are never recorded: resume rereads fresh files, and
-    // compaction cannot swallow them.
+    // Project instructions and the deferred-tools notice ride every request
+    // as a synthetic first user message. Never recorded: resume rereads
+    // fresh files, and compaction cannot swallow it.
     let injected;
-    let messages = match &cfg.project_instructions {
-        Some(instructions) => {
+    let messages = match injected_context(cfg) {
+        Some(context) => {
             let mut with_context = Vec::with_capacity(messages.len() + 1);
-            with_context.push(Message::user_text(instructions.clone()));
+            with_context.push(Message::user_text(context));
             with_context.extend_from_slice(messages);
             injected = with_context;
             &injected[..]
@@ -435,10 +445,14 @@ mod tests {
     }
 
     fn tool_use(id: &str, cmd: &str) -> ContentBlock {
+        tool_use_named(id, "bash", json!({"command": cmd}))
+    }
+
+    fn tool_use_named(id: &str, name: &str, input: Value) -> ContentBlock {
         ContentBlock::ToolUse {
             id: id.into(),
-            name: "bash".into(),
-            input: json!({"command": cmd}),
+            name: name.into(),
+            input,
         }
     }
 
@@ -468,6 +482,8 @@ mod tests {
             session_id: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
+            defer_threshold: 30,
+            unlocked_tools: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -552,6 +568,8 @@ mod tests {
             session_id: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
+            defer_threshold: 30,
+            unlocked_tools: Default::default(),
         })
     }
 
@@ -1119,6 +1137,118 @@ mod tests {
             .messages()
             .iter()
             .all(|m| *m != Message::user_text(instructions)));
+    }
+
+    /// Deferred regime end to end over Mock: the request's tool defs shrink
+    /// to built-ins + tool_search, the notice rides the injected context
+    /// message (after the instructions) without entering history, and a
+    /// searched tool becomes callable while an unsearched one stays locked.
+    #[tokio::test]
+    async fn deferred_tools_shrink_defs_inject_notice_and_gate_dispatch() {
+        use crate::tools::ToolSource;
+        use kloop_provider::MockTurn;
+
+        struct Srv {
+            defs: Vec<kloop_protocol::ToolDef>,
+        }
+        impl ToolSource for Srv {
+            fn defs(&self) -> &[kloop_protocol::ToolDef] {
+                &self.defs
+            }
+            fn is_readonly(&self, _tool: &str) -> bool {
+                false
+            }
+            fn call<'a>(
+                &'a self,
+                tool: &'a str,
+                _input: &'a Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+            > {
+                Box::pin(async move { Ok(format!("ran {tool}")) })
+            }
+        }
+        let source: Arc<dyn ToolSource> = Arc::new(Srv {
+            defs: vec![kloop_protocol::ToolDef {
+                name: "srv__lookup".into(),
+                description: "Look things up".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }],
+        });
+
+        let (provider, seen) = Provider::mock_recording(vec![
+            // Round 1: one locked direct call + one search — both get results.
+            MockTurn::Blocks(vec![
+                tool_use_named("t1", "srv__lookup", serde_json::json!({})),
+                tool_use_named(
+                    "t2",
+                    "tool_search",
+                    serde_json::json!({"query": "select:srv__lookup"}),
+                ),
+            ]),
+            // Round 2: the unlocked tool now runs.
+            MockTurn::Blocks(vec![tool_use_named(
+                "t3",
+                "srv__lookup",
+                serde_json::json!({}),
+            )]),
+            MockTurn::Blocks(text("done")),
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "deferred")).clone();
+        cfg.project_instructions = Some("INSTR".into());
+        cfg.tool_sources = vec![source];
+        cfg.defer_threshold = 0;
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for request in seen.iter() {
+            // Defs: built-ins + tool_search, never the source tool — stable
+            // across rounds even after the unlock.
+            let names: Vec<&str> = request.tools.iter().map(|d| d.name.as_str()).collect();
+            assert!(names.contains(&"tool_search"));
+            assert!(!names.contains(&"srv__lookup"));
+            // The synthetic first message carries instructions + notice.
+            let Some(ContentBlock::Text { text }) = request.messages[0].content.first() else {
+                panic!("expected injected text message");
+            };
+            assert!(text.starts_with("INSTR\n\n<system-reminder>"), "{text}");
+            assert!(text.contains("srv__lookup"), "{text}");
+        }
+        // Round 1 results: locked bounce for t1, definitions for t2.
+        let round1 = &history.messages()[2];
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &round1.content[0]
+        else {
+            panic!("expected tool_result");
+        };
+        assert!(is_error);
+        assert!(content.contains("call tool_search"), "{content}");
+        // Round 2: the same call now reaches the source.
+        let round2 = &history.messages()[4];
+        assert_eq!(
+            round2.content[0],
+            ContentBlock::ToolResult {
+                tool_use_id: "t3".into(),
+                content: "ran srv__lookup".into(),
+                is_error: false,
+            }
+        );
+        // The notice never entered history.
+        assert!(history
+            .messages()
+            .iter()
+            .all(|m| m.content.iter().all(|b| !matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("<system-reminder>")
+            ))));
     }
 
     /// The injected instructions count toward the overflow prediction even

@@ -145,6 +145,8 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             session_id: String::new(),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
+            defer_threshold: 30,
+            unlocked_tools: Default::default(),
         })
     })
 }

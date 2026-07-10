@@ -226,9 +226,8 @@ pagination), and each advertised tool joins the model's tool list as
 `{server}__{tool}` with its inputSchema passed through verbatim. A failing
 server degrades to a startup warning — MCP never blocks kloop. Name
 sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
-allow rules round-trip through the permission-rule grammar); collisions and
-oversized tool lists (> 30) warn at startup, colliding later definitions are
-skipped.
+allow rules round-trip through the permission-rule grammar); collisions warn
+at startup and the colliding later definitions are skipped.
 
 Calls go out with the raw server-side tool name; the result content array is
 flattened to text (binary blocks degrade to `[image: …]`-style tags), and
@@ -240,8 +239,32 @@ whole-tool granularity.
 
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (depends only on protocol); the CLI glues
-them (config parsing, namespacing, the adapter). Deferred-tools + tool_search
-for oversized tool lists is future work.
+them (config parsing, namespacing, the adapter).
+
+### Deferred tools + tool_search
+
+Past 30 total tools (`AGENT_DEFER_THRESHOLD` overrides; built-ins never
+defer), MCP tool definitions stop being sent to the model. Instead the
+request carries the built-ins plus two extra tools, and the synthetic
+context message lists the deferred tool names:
+
+- **tool_search** `{query, max_results=5}` — `select:<name>[,<name>...]`
+  fetches exact tools; anything else is a keyword search over names (ranked
+  first) and descriptions. Matching tools' full definitions (description +
+  JSON schema) come back in the result and those tools unlock for the rest
+  of the session.
+- **call_tool** `{tool_name, params}` — escape hatch for models that refuse
+  to emit tool calls for names absent from their declared tool list (some
+  OpenAI-compat models). Dispatch unwraps the envelope up front, so
+  permissions, hooks, concurrency and the UI all judge the real tool name.
+
+The tool defs array and the injected name list are byte-stable for the whole
+session — unlocking only opens the dispatch gate, it never mutates the
+request prefix, so the prompt cache survives. Calling a deferred tool before
+searching bounces with guidance (and does not unlock); permission rules and
+the approval cache keep whole-tool-name granularity throughout. Sub-agents
+share the parent's unlock set. Under the threshold nothing changes: all
+tools ship inline and neither tool_search nor call_tool exists.
 
 ## Hooks (Phase 2, seventh slice)
 
@@ -419,6 +442,9 @@ cargo run -- --resume          # pick a session from a numbered list
 cargo run -- --resume <id>     # continue a specific session
 
 # MCP servers come from .kloop/config.toml — see MCP client above
+# AGENT_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
+# (default 30 total tools; lower it to exercise deferral with a small server,
+# raise it to effectively disable)
 
 # permissions (rules also live in .kloop/config.toml — see Permissions)
 AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules

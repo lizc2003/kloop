@@ -27,6 +27,7 @@ use kloop_protocol::MAX_OUTPUT_TOKENS;
 pub struct MockRequest {
     pub system: String,
     pub messages: Vec<Message>,
+    pub tools: Vec<ToolDef>,
 }
 
 /// One scripted Mock response: content blocks, a truncated response, or a
@@ -141,6 +142,7 @@ impl Provider {
                 seen.lock().unwrap().push(MockRequest {
                     system: system.to_string(),
                     messages: messages.to_vec(),
+                    tools: tools.to_vec(),
                 });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                     MockTurn::Blocks(vec![ContentBlock::Text {

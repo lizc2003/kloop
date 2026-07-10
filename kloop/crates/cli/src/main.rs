@@ -393,6 +393,18 @@ fn build_permissions(
         .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
 }
 
+/// AGENT_DEFER_THRESHOLD: total tool count above which MCP tool definitions
+/// are deferred behind tool_search. Lower it to exercise deferral with a
+/// small server; raise it to effectively disable deferral.
+fn defer_threshold_from_env() -> Result<usize> {
+    match std::env::var("AGENT_DEFER_THRESHOLD").ok() {
+        Some(raw) => raw
+            .parse::<usize>()
+            .context("AGENT_DEFER_THRESHOLD must be a tool count"),
+        None => Ok(kloop_core::tools::TOOL_DEFER_THRESHOLD),
+    }
+}
+
 fn config_from_env(
     args: &CliArgs,
     approver: Arc<dyn Approver>,
@@ -435,6 +447,8 @@ fn config_from_env(
         session_id: String::new(),
         hooks: Arc::new(hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
+        defer_threshold: defer_threshold_from_env()?,
+        unlocked_tools: Default::default(),
     };
     if args.mock {
         return Ok(Config {
@@ -643,7 +657,7 @@ async fn main() -> Result<()> {
         sources.extend(web::build_web_source(&web_cfg, &warn));
         let servers = mcp::load_mcp_servers(Path::new(PERMISSIONS_CONFIG))?;
         sources.extend(mcp::connect_servers(servers, &warn).await);
-        for warning in tool_merge_warnings(&sources) {
+        for warning in tool_merge_warnings(&sources, defer_threshold_from_env()?) {
             warn(&warning);
         }
         sources
