@@ -444,11 +444,18 @@ fn config_from_env(
 
     let anthropic = || -> Result<Config> {
         let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
+        // Prompt caching is a pure cost saving, so it defaults on; the escape
+        // hatch is for diagnosing cache behavior against a live endpoint.
+        let cache = !matches!(
+            std::env::var("AGENT_CACHE").ok().as_deref(),
+            Some("off") | Some("0") | Some("false")
+        );
         Ok(Config {
             provider: Arc::new(Provider::Anthropic {
                 key,
                 base: std::env::var("ANTHROPIC_BASE_URL")
                     .unwrap_or_else(|_| "https://api.anthropic.com".into()),
+                cache,
             }),
             model: std::env::var("AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into()),
             ..base.clone()

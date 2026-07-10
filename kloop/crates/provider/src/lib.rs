@@ -44,6 +44,10 @@ pub enum Provider {
     Anthropic {
         key: String,
         base: String,
+        /// Prompt caching: mark cache_control breakpoints on the system block
+        /// and the last message block. On by default (pure cost saving); the
+        /// escape hatch exists for diagnosing cache behavior.
+        cache: bool,
     },
     OpenAiCompat {
         key: String,
@@ -138,14 +142,14 @@ impl Provider {
                         .await;
                 });
             }
-            Provider::Anthropic { key, base } => {
+            Provider::Anthropic { key, base, cache } => {
                 let url = format!("{base}/v1/messages");
                 let key = key.clone();
                 let body = json!({
                     "model": model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
-                    "system": system,
-                    "messages": messages,
+                    "system": anthropic::system_value(system, *cache),
+                    "messages": anthropic::messages_value(messages, *cache),
                     "tools": tools.iter().map(|t| json!({
                         "name": t.name,
                         "description": t.description,

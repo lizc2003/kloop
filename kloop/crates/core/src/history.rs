@@ -87,8 +87,9 @@ impl History {
         &self.items
     }
 
-    /// Record the provider-reported total context size (input + output) for
-    /// the request whose response is the most recently recorded item.
+    /// Record the provider-reported total context size (uncached + cached
+    /// input + output — cached tokens still occupy the window) for the
+    /// request whose response is the most recently recorded item.
     pub fn note_usage(&mut self, total_tokens: u64) {
         self.usage_anchor = Some((self.items.len(), total_tokens));
     }

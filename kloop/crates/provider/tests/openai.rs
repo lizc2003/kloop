@@ -105,9 +105,53 @@ async fn accumulates_tool_calls_and_usage_across_chunks() {
     assert!(matches!(
         &ok[5],
         StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
-            if r == "tool_calls" && *u == Usage { input_tokens: 88, output_tokens: 17 }
+            if r == "tool_calls" && *u == Usage { input_tokens: 88, output_tokens: 17, ..Default::default() }
     ));
     assert_eq!(ok.len(), 6);
+}
+
+/// Cached prompt tokens ride INSIDE prompt_tokens on the OpenAI wire; the
+/// adapter subtracts them out so input_tokens is the uncached remainder on
+/// both rails and total() never double-counts.
+#[tokio::test]
+async fn cached_prompt_tokens_are_split_out_of_input() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 900},
+                }}),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    let StreamEvent::Done {
+        usage: Some(usage), ..
+    } = ok.last().unwrap()
+    else {
+        panic!("expected Done with usage, got {:?}", ok.last());
+    };
+    assert_eq!(
+        *usage,
+        Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_input_tokens: 900,
+            cache_creation_input_tokens: 0,
+        }
+    );
 }
 
 /// Unparseable tool arguments degrade to a raw string, never a panic or a

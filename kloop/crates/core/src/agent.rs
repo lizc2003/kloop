@@ -208,8 +208,9 @@ async fn turn_rounds(
         };
         history.record(Message::assistant(blocks.clone()));
         if let Some(usage) = usage {
-            // input + output = full context size at this request; anchors the
-            // char-heuristic estimate for items recorded after this point.
+            // total() = uncached + cached input + output = full context size
+            // at this request; anchors the char-heuristic estimate for items
+            // recorded after this point.
             history.note_usage(usage.total());
         }
 

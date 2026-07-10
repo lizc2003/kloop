@@ -50,6 +50,7 @@ fn anthropic(server: &MockServer) -> Provider {
     Provider::Anthropic {
         key: "test-key".into(),
         base: server.uri(),
+        cache: true,
     }
 }
 
@@ -92,9 +93,141 @@ async fn streams_text_and_tool_use_with_usage() {
     assert!(matches!(
         &ok[4],
         StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
-            if r == "tool_use" && *u == Usage { input_tokens: 120, output_tokens: 30 }
+            if r == "tool_use" && *u == Usage { input_tokens: 120, output_tokens: 30, ..Default::default() }
     ));
     assert_eq!(ok.len(), 5);
+}
+
+/// The caching request contract, asserted whole-object: system becomes a
+/// one-block array with the tools+system breakpoint, and exactly one message
+/// breakpoint sits on the LAST content block of the LAST message.
+#[tokio::test]
+async fn request_body_carries_cache_breakpoints() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+    let provider = Arc::new(anthropic(&server));
+    let messages = vec![
+        Message::user_text("hi"),
+        Message::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({"command": "ls"}),
+        }]),
+        Message {
+            role: kloop_protocol::Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "continue".into(),
+                },
+            ],
+        },
+    ];
+    let mut rx = provider.stream("test-model", "be brief", &messages, &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "model": "test-model",
+            "max_tokens": 8192,
+            "system": [{
+                "type": "text",
+                "text": "be brief",
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "t1", "name": "bash",
+                    "input": {"command": "ls"},
+                }]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                    {
+                        "type": "text", "text": "continue",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ]},
+            ],
+            "tools": [],
+            "stream": true,
+        })
+    );
+}
+
+/// With caching off the request is byte-identical to the pre-caching shape:
+/// plain string system, no cache_control anywhere.
+#[tokio::test]
+async fn cache_off_sends_plain_request() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+    let provider = Arc::new(Provider::Anthropic {
+        key: "test-key".into(),
+        base: server.uri(),
+        cache: false,
+    });
+    let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "model": "test-model",
+            "max_tokens": 8192,
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+            "tools": [],
+            "stream": true,
+        })
+    );
+}
+
+/// Cache usage fields from message_start survive into Done: they are context
+/// the window still holds, reported next to (not inside) input_tokens.
+#[tokio::test]
+async fn cache_usage_fields_are_parsed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 50,
+            }}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(
+        &ok[0],
+        StreamEvent::Done { usage: Some(u), .. }
+            if *u == Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 900,
+                cache_creation_input_tokens: 50,
+            }
+    ));
 }
 
 #[tokio::test]

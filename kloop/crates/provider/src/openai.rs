@@ -140,11 +140,19 @@ pub(super) async fn stream(
                 bail!("openai-compat stream error: {}", v["error"]);
             }
             // With include_usage the final pre-[DONE] chunk carries usage and
-            // empty choices.
+            // empty choices. OpenAI reports cached prompt tokens INSIDE
+            // prompt_tokens (unlike Anthropic), so they are subtracted out to
+            // keep input_tokens = uncached remainder on both rails.
             if v["usage"].is_object() {
+                let prompt = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+                let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
                 usage = Some(Usage {
-                    input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                    input_tokens: prompt.saturating_sub(cached),
                     output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                    cache_read_input_tokens: cached,
+                    cache_creation_input_tokens: 0,
                 });
             }
             let delta = &v["choices"][0]["delta"];

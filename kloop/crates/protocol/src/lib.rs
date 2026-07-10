@@ -68,17 +68,26 @@ impl Message {
 pub const MAX_OUTPUT_TOKENS: u64 = 8192;
 
 /// Real token usage reported by the provider for one sampling call.
-/// input + output = the full context size at that request, which anchors
-/// the char-heuristic estimate for messages recorded afterwards.
+/// `input_tokens` is only the uncached remainder: cached prompt tokens are
+/// reported separately but still occupy the context window, so the full
+/// context size at the request is `total()` — which anchors the
+/// char-heuristic estimate for messages recorded afterwards.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's prefix cache.
+    pub cache_read_input_tokens: u64,
+    /// Prompt tokens written to the provider's prefix cache this request.
+    pub cache_creation_input_tokens: u64,
 }
 
 impl Usage {
     pub fn total(self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_read_input_tokens
+            + self.cache_creation_input_tokens
     }
 }
 
@@ -192,12 +201,16 @@ mod tests {
         assert_eq!(Message::tool_results(vec![]).role, Role::User);
     }
 
+    /// total() is the full context size: cached prompt tokens still occupy
+    /// the window, so they count alongside the uncached remainder and output.
     #[test]
-    fn usage_total_sums_both_directions() {
+    fn usage_total_includes_cache_fields() {
         let usage = Usage {
             input_tokens: 100,
             output_tokens: 42,
+            cache_read_input_tokens: 900,
+            cache_creation_input_tokens: 8,
         };
-        assert_eq!(usage.total(), 142);
+        assert_eq!(usage.total(), 1050);
     }
 }
