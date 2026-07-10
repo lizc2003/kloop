@@ -351,6 +351,31 @@ process-global (`bg-1`, `bg-2`, …) so sub-agents and server threads sharing
 one offload directory never collide. cc's auto-backgrounding, completion
 notifications, stall detection and Monitor tool are not ported.
 
+## Web tools (Phase 2, eleventh slice)
+
+`web_fetch` and `web_search`, implemented in the `kloop-web` crate and glued
+into core's `ToolSource` seam by the CLI (exactly like MCP servers — core
+stays network-free, reqwest lives only in provider and web):
+
+- **web_fetch** `{url}` — HTTP upgraded to HTTPS, embedded credentials and
+  2000-char URLs rejected, SSRF guard (loopback/private/link-local/CGNAT/
+  metadata ranges refused, DNS names resolved and checked), same-host
+  redirects followed (max 5), cross-host redirects reported back for an
+  explicit re-fetch (cc shape — kills open-redirect laundering), 5MB
+  download cap, HTML→text (hand-rolled: scripts/styles/comments dropped,
+  block tags to newlines, entities decoded), 50k-char text cap.
+- **web_search** `{query, max_results}` — pluggable `SearchBackend` trait;
+  Brave Search API is the first backend (`BRAVE_API_KEY`; without the key
+  the tool is not registered and startup warns). `[web] search_provider`
+  in `.kloop/config.toml` selects the backend ("brave" is the default and
+  only one today); adding a provider = one trait impl + one match arm.
+
+Both are read-only for concurrency; the permission gate treats them like
+any external tool (ask by default, `web_fetch`/`web_search` allow rules or
+session approvals apply). Not ported from cc: the `prompt` parameter with
+small-model post-processing, the 15-minute fetch cache, turndown-style
+HTML→Markdown, and the preapproved-domain list.
+
 ## Running
 
 ```sh
@@ -520,10 +545,16 @@ crates/mcp/         kloop-mcp — MCP stdio wire client (depends on protocol onl
   src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
                     tools/list pagination, tools/call, content rendering
 
+crates/web/         kloop-web — web_fetch/web_search (owns reqwest with provider)
+  src/fetch.rs      SSRF guard, redirect policy, caps, body handling
+  src/html.rs       minimal HTML→text (no extra dependencies)
+  src/search.rs     SearchBackend trait + Brave implementation
+
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
                     --serve), env config, StdoutUi, CliApprover (y/a/p/n
                     prompt), .kloop/config.toml rule load/persist, --mock
+  src/web.rs        [web] config + ToolSource adapter over kloop-web
                     demo, session selection (--continue, --resume,
                     --list-sessions)
   src/mcp.rs        [mcp.servers] config, startup connection with

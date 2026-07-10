@@ -1,6 +1,6 @@
 # Plan 14 — 工具面补全
 
-> ✅ 第一片(grep + glob,c795cea)、第三片(后台 bash,38ab3dc)已完成;切片 2(web)/4(图片)挂账,后续会话继续。
+> ✅ 第一片(grep + glob,c795cea)、第三片(后台 bash,38ab3dc)、第二片(web_fetch/web_search)已完成,提交号见各自完成记录;web_search 真实端点验收等 BRAVE_API_KEY。剩切片 4(图片,倾向归 plan 15 协议扩展一起做)。
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 Grep/Glob/WebFetch/后台 Bash 形态、codex 的对应工具;实现细节回源核对(教训 11)。注意 P0 决定 1 仍然有效:编辑保持 Edit 形态,不做 apply_patch/多文件 patch。
 
@@ -11,9 +11,18 @@
 ## 候选切片(开工时和用户定选哪几片、什么顺序)
 
 1. ✅ **grep + glob 专用只读工具**(最高频,建议必选):倾向纯 Rust 库实现(ripgrep 的 `grep-searcher`/`ignore` crate 族,零外部二进制依赖,尊重 .gitignore),不倾向 spawn rg(存在性/版本不可控)——开工时定。天然 readonly:进并发批、权限只读自查直接放行。输出形态(文件:行号:内容、命中数上限、超限截断进 offload)对照 cc 定。要不要顺带 list_dir,开工时定。
-2. **web_fetch / web_search**:架构决定优先于功能——core 无网络是硬边界(reqwest 独占在 provider),所以两条路:做成 cli 注册的内置 ToolSource(复用 MCP 的缝,core 零改动,倾向);或者用 Anthropic 服务端 web_search 工具(provider 层声明即可,但 OpenAI 轨没有对等物、且不解决 fetch)。开工时定,可能两者都要。fetch 的安全面:SSRF(内网地址拒绝)、大小上限、HTML→文本降噪。
+2. ✅ **web_fetch / web_search**:架构决定优先于功能——core 无网络是硬边界(reqwest 独占在 provider),所以两条路:做成 cli 注册的内置 ToolSource(复用 MCP 的缝,core 零改动,倾向);或者用 Anthropic 服务端 web_search 工具(provider 层声明即可,但 OpenAI 轨没有对等物、且不解决 fetch)。开工时定,可能两者都要。fetch 的安全面:SSRF(内网地址拒绝)、大小上限、HTML→文本降噪。
 3. ✅ **bash 后台任务**:`run_in_background` 参数 + 查询输出/终止的配套工具(cc 形态)。进程生命周期归属(退出时回收、interrupt 语义)、输出缓冲落 offload 目录。价值:dev server、长编译。
 4. **图片输入**:read_file 读图片 → 协议要加 image 块(protocol ContentBlock + 双 provider 翻译 + rollout 前向兼容),和 plan 15 的 thinking 是同类协议扩展,开工时定归 15 一起做还是这里做。
+
+## 完成记录(第二片:web_fetch + web_search,2026-07-10)
+
+- **开工拍板**:走 cli 注册的 ToolSource 缝(core 零改动);web_search 也做,默认后端 Brave Search API(agent 生态最常用的中立选项;Bing API 已退役、Google CSE 限额难用、DDG 无官方 API),`SearchBackend` trait 保证可扩展(加 provider = 一个 trait 实现 + cli match 一条臂);Anthropic 服务端 web_search 不用(provider 层的另一条缝,OpenAI 轨无对等物),记为将来可选第二实现。
+- **回源核对 cc**:WebFetch = url+prompt、turndown 转 Markdown、Haiku 加工、15 分钟缓存、跨 host 重定向不跟随(返回 REDIRECT DETECTED 让模型显式重发)、http→https 升级、URL≤2000、拒绝内嵌凭据;SSRF 防护很弱(只查 hostname 段数)。WebSearch = 适配器工厂(api/tavily/bing/brave/exa,这个逆向版默认自建 tavily 代理)。**抄了**:跨 host 重定向不跟随、http→https 升级、凭据拒绝、URL 长度上限。**没抄**:prompt+小模型加工(kloop 无小模型缝)、缓存、turndown(手写 HTML→text,零新依赖)、preapproved 域名白名单;SSRF 用 kloop 自己的 IP 级检查(环回/私网/link-local/CGNAT/元数据段全拒,域名解析后逐地址查,比 cc 强)。
+- **结构**:新 crate `kloop-web`(只依赖 protocol + reqwest;fetch.rs/html.rs/search.rs),cli `web.rs` 胶合(`[web]` 配置解析 + ToolSource 适配,web 源注册在 MCP 之前)。web_fetch 常开(--mock 除外);`BRAVE_API_KEY` 未设或 provider 未知时 web_search 不注册、启动警告降级。两工具 readonly 进并发批;权限门按外部工具处理(默认询问,`web_fetch` allow 规则可放行)。
+- **测试**:+20(223 总):SSRF 拒绝表(loopback/私网/link-local/169.254 元数据/CGNAT/v4-mapped/localhost/file/ftp)、URL 卫生(升级/凭据/超长)、同 host 重定向跟随与循环上限、跨 host 重定向报告不跟随、HTML→text 契约(script/style/注释剥除、实体解码、块级换行、畸形输入)、大小写截断文案、非文本类型拒绝、Brave wiremock 契约(query/header/高亮剥除/429/空结果)、`[web]` 配置解析与降级路径。
+- **验收**:web_fetch 双轨真 key 过(sonnet-5 抓 example.com 摘要;gpt-5.4-mini 给 http URL 自动升级 https 无异常);**web_search 真实端点验收挂起,等 BRAVE_API_KEY**(wiremock 契约已绿,key 到手跑一次即可)。
+- **挂账**:web_search 真实验收;搜索后端第二实现(tavily/searxng 或 Anthropic 服务端);fetch 缓存、`prompt` 参数小模型加工(等有便宜模型缝)。
 
 ## 备选池(未承诺)
 

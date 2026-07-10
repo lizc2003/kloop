@@ -845,6 +845,7 @@ dependencies = [
  "kloop-provider",
  "kloop-server",
  "kloop-tui",
+ "kloop-web",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -930,6 +931,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "kloop-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kloop-protocol",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

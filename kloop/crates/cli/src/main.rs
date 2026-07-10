@@ -4,6 +4,7 @@
 
 mod context;
 mod mcp;
+mod web;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -595,8 +596,13 @@ async fn main() -> Result<()> {
         Vec::new()
     } else {
         let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+        // Web tools ride the same ToolSource seam, registered before MCP so
+        // a colliding MCP tool name loses (and is warned about).
+        let web_cfg = web::load_web_config(Path::new(PERMISSIONS_CONFIG))?;
+        let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+        sources.extend(web::build_web_source(&web_cfg, &warn));
         let servers = mcp::load_mcp_servers(Path::new(PERMISSIONS_CONFIG))?;
-        let sources = mcp::connect_servers(servers, &warn).await;
+        sources.extend(mcp::connect_servers(servers, &warn).await);
         for warning in tool_merge_warnings(&sources) {
             warn(&warning);
         }

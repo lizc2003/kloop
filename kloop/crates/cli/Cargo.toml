@@ -10,6 +10,7 @@ kloop-protocol = { workspace = true }
 kloop-provider = { workspace = true }
 kloop-server = { workspace = true }
 kloop-tui = { workspace = true }
+kloop-web = { workspace = true }
 
 anyhow = { workspace = true }
 serde_json = { workspace = true }
