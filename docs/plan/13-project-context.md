@@ -14,7 +14,7 @@
 
 **实现**:`Config.project_instructions: Option<String>`;注入缝在 `sample_with_retry`(压缩请求天然不带);provider Mock 加 `mock_recording`(请求记录器)供测试断言请求形态。测试 159→178:core 组装纯函数(有无 git、截断边界含多字节、预算耗尽/恰好)、agent 注入契约(每请求首条 + 不进 History + predictive 记账 + 压缩请求无注入)、cli 发现(AGENTS>CLAUDE、根→cwd 顺序、git 根外忽略、无根只看 cwd、全局层在前、缺文件不报错)。
 
-**验收**:fmt/clippy/test 全绿;--mock 全程无恙;真 key 双轨(anthropic + openai-compat gpt-5.4-mini)在临时项目验证:AGENTS.md 规则(回复以 BANANA 开头)遵守,日期/分支/cwd 不调工具直接答对(环境块与 git 快照生效)。提交号见 git log。
+**验收**:fmt/clippy/test 全绿;--mock 全程无恙;真 key 双轨(anthropic + openai-compat gpt-5.4-mini)在临时项目验证:AGENTS.md 规则(回复以 BANANA 开头)遵守,日期/分支/cwd 不调工具直接答对(环境块与 git 快照生效)。提交 eb8a1b4。
 
 ## 目标
 
