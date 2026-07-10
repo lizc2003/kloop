@@ -54,5 +54,6 @@
 - **plan 16** 沙箱基建第一片(之后才轮到 codex 的 escalation/execpolicy;可能拆多片)。
 - **plan 17** provider 打磨:Anthropic prompt caching + thinking 块。
 - **plan 18** 子 agent 升级(并行 task/自定义类型/历史持久化/UI 呈现,开工时选片;现状是全家桶里最原始的一块)。
+- **plan 19** 工具面补全(grep/glob 专用工具、web_fetch/search、后台 bash、图片输入,开工时选片;web 注意 core 无网络边界——倾向走 ToolSource 缝)。
 
-不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):专用 grep/glob 工具、OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
+不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、TodoWrite 类计划工具。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
