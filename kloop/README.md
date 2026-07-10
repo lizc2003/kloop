@@ -388,6 +388,11 @@ ANTHROPIC_API_KEY=... cargo run
 # prompt caching is on by default (cache_control breakpoints on the system
 # block and the last message block); AGENT_CACHE=off disables it for
 # diagnosing cache behavior
+# thinking blocks stream dim in the UI and are replayed verbatim (signature
+# included). No AGENT_THINKING = no thinking field sent (current models then
+# run adaptive on their own); AGENT_THINKING=off|adaptive|<budget tokens>
+# forces a mode (the budget form is for pre-adaptive models and raises
+# max_tokens by the budget)
 
 # any OpenAI-compatible endpoint (AGENT_MODEL required)
 OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run

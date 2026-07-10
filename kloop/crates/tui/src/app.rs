@@ -31,6 +31,9 @@ pub enum ToolStatus {
 pub enum Cell {
     User(String),
     Assistant(String),
+    /// Model reasoning; accumulates like Assistant but renders collapsed to a
+    /// one-line dim preview (full text lives in history, not on screen).
+    Thinking(String),
     Tool {
         name: String,
         summary: String,
@@ -72,9 +75,11 @@ pub struct App {
     pub confirms: VecDeque<PendingConfirm>,
     /// Latest agent note, surfaced in the status line while running.
     pub last_note: Option<String>,
-    /// Whether the last Assistant cell still accepts text deltas. A tool row
-    /// or note in between closes it so ordering is preserved.
+    /// Whether the last Assistant cell still accepts text deltas. A tool row,
+    /// note, or thinking cell in between closes it so ordering is preserved.
     assistant_open: bool,
+    /// Same for the last Thinking cell and thinking deltas.
+    thinking_open: bool,
     /// tool_use id -> cells index, to resolve ToolEnd.
     tool_cells: HashMap<String, usize>,
 }
@@ -91,6 +96,7 @@ impl App {
             confirms: VecDeque::new(),
             last_note: None,
             assistant_open: false,
+            thinking_open: false,
             tool_cells: HashMap::new(),
         }
     }
@@ -98,6 +104,7 @@ impl App {
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(t) => {
+                self.thinking_open = false;
                 if self.assistant_open {
                     if let Some(Cell::Assistant(text)) = self.cells.last_mut() {
                         text.push_str(&t);
@@ -107,13 +114,26 @@ impl App {
                 self.cells.push(Cell::Assistant(t));
                 self.assistant_open = true;
             }
+            AgentEvent::ThinkingDelta(t) => {
+                self.assistant_open = false;
+                if self.thinking_open {
+                    if let Some(Cell::Thinking(text)) = self.cells.last_mut() {
+                        text.push_str(&t);
+                        return;
+                    }
+                }
+                self.cells.push(Cell::Thinking(t));
+                self.thinking_open = true;
+            }
             AgentEvent::Note(n) => {
                 self.assistant_open = false;
+                self.thinking_open = false;
                 self.last_note = Some(n.clone());
                 self.cells.push(Cell::Note(n));
             }
             AgentEvent::ToolStart { id, name, summary } => {
                 self.assistant_open = false;
+                self.thinking_open = false;
                 self.last_note = Some(format!("{name} {summary}"));
                 self.tool_cells.insert(id, self.cells.len());
                 self.cells.push(Cell::Tool {
@@ -139,6 +159,7 @@ impl App {
             AgentEvent::TurnEnded(reason) => {
                 self.running = false;
                 self.assistant_open = false;
+                self.thinking_open = false;
                 self.last_note = None;
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
@@ -263,6 +284,13 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                 (Role::Assistant, ContentBlock::Text { text }) => {
                     cells.push(Cell::Assistant(text.clone()));
                 }
+                // Empty thinking text (display=omitted models) has nothing to
+                // show; redacted thinking never does.
+                (Role::Assistant, ContentBlock::Thinking { thinking, .. })
+                    if !thinking.is_empty() =>
+                {
+                    cells.push(Cell::Thinking(thinking.clone()));
+                }
                 (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
                     cells.push(Cell::Tool {
                         name: name.clone(),
@@ -338,6 +366,28 @@ mod tests {
                     status: ToolStatus::Failed,
                 },
                 Cell::Assistant("world".into()),
+            ]
+        );
+    }
+
+    /// Thinking and answer deltas accumulate into separate cells, in stream
+    /// order — a thinking burst between text closes and reopens the answer.
+    #[test]
+    fn thinking_deltas_get_their_own_cell() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ThinkingDelta("let me".into()));
+        app.apply(AgentEvent::ThinkingDelta(" see".into()));
+        app.apply(AgentEvent::TextDelta("answer".into()));
+        app.apply(AgentEvent::ThinkingDelta("more thought".into()));
+        app.apply(AgentEvent::TextDelta("!".into()));
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Thinking("let me see".into()),
+                Cell::Assistant("answer".into()),
+                Cell::Thinking("more thought".into()),
+                Cell::Assistant("!".into()),
             ]
         );
     }
@@ -441,6 +491,15 @@ mod tests {
         let messages = vec![
             Message::user_text("do two things"),
             Message::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "planning".into(),
+                    signature: "sig".into(),
+                },
+                // display=omitted models: block present, no text to show.
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig2".into(),
+                },
                 ContentBlock::Text {
                     text: "on it".into(),
                 },
@@ -483,6 +542,7 @@ mod tests {
             cells_from_history(&messages),
             vec![
                 Cell::User("do two things".into()),
+                Cell::Thinking("planning".into()),
                 Cell::Assistant("on it".into()),
                 Cell::Tool {
                     name: "bash".into(),

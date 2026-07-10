@@ -92,6 +92,15 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                     lines.push(Line::from(l));
                 }
             }
+            Cell::Thinking(text) => {
+                // Collapsed to a one-line dim preview of the latest reasoning
+                // line; the stream keeps it moving, the transcript stays calm.
+                let last = text.lines().rev().find(|l| !l.trim().is_empty());
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("∴ {}", last.unwrap_or("thinking…")), width.max(2)),
+                    DIM.add_modifier(Modifier::ITALIC),
+                )));
+            }
             Cell::Tool {
                 name,
                 summary,
@@ -286,6 +295,19 @@ mod tests {
                 "all good",
             ]
         );
+    }
+
+    /// Thinking collapses to one dim line previewing the latest non-empty
+    /// reasoning line, however long the accumulated text.
+    #[test]
+    fn thinking_collapses_to_last_line_preview() {
+        let cells = vec![
+            Cell::Thinking("first thought\nsecond thought\n  \n".into()),
+            Cell::Thinking(String::new()),
+        ];
+        let lines = transcript_lines(&cells, 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["∴ second thought", "∴ thinking…"]);
     }
 
     #[test]

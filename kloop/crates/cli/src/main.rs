@@ -46,6 +46,7 @@ use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_provider::Provider;
+use kloop_provider::ThinkingMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionChoice {
@@ -450,12 +451,23 @@ fn config_from_env(
             std::env::var("AGENT_CACHE").ok().as_deref(),
             Some("off") | Some("0") | Some("false")
         );
+        // No AGENT_THINKING = no thinking field: current models then run
+        // adaptive on their own. The blocks they send are replayed either way.
+        let thinking = match std::env::var("AGENT_THINKING").ok().as_deref() {
+            None => ThinkingMode::Unset,
+            Some("off") => ThinkingMode::Off,
+            Some("adaptive") => ThinkingMode::Adaptive,
+            Some(raw) => ThinkingMode::Budget(raw.parse().context(
+                "AGENT_THINKING must be off | adaptive | <budget tokens for pre-adaptive models>",
+            )?),
+        };
         Ok(Config {
             provider: Arc::new(Provider::Anthropic {
                 key,
                 base: std::env::var("ANTHROPIC_BASE_URL")
                     .unwrap_or_else(|_| "https://api.anthropic.com".into()),
                 cache,
+                thinking,
             }),
             model: std::env::var("AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into()),
             ..base.clone()
@@ -543,6 +555,12 @@ struct StdoutUi;
 impl Ui for StdoutUi {
     fn text_delta(&self, s: &str) {
         print!("{s}");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn thinking_delta(&self, s: &str) {
+        // Dim gray, inline with the stream: reasoning is context, not answer.
+        print!("\x1b[2m{s}\x1b[0m");
         let _ = std::io::stdout().flush();
     }
 

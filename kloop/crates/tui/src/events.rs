@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 #[derive(Debug)]
 pub enum AgentEvent {
     TextDelta(String),
+    ThinkingDelta(String),
     Note(String),
     ToolStart {
         id: String,
@@ -57,6 +58,10 @@ impl ChannelUi {
 impl Ui for ChannelUi {
     fn text_delta(&self, s: &str) {
         self.send(AgentEvent::TextDelta(s.to_string()));
+    }
+
+    fn thinking_delta(&self, s: &str) {
+        self.send(AgentEvent::ThinkingDelta(s.to_string()));
     }
 
     fn note(&self, s: &str) {

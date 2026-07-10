@@ -40,6 +40,25 @@ pub enum MockTurn {
     Error(String),
 }
 
+/// The `thinking` request parameter on the Anthropic wire. Whatever the mode,
+/// thinking blocks the model sends are always accumulated and replayed — on
+/// current models thinking is on by default even with no field sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Send no thinking field (current models then run adaptive).
+    #[default]
+    Unset,
+    /// `{"type": "disabled"}`.
+    Off,
+    /// `{"type": "adaptive"}` — explicit, for models where omitting means off.
+    Adaptive,
+    /// `{"type": "enabled", "budget_tokens": n}` for pre-adaptive models
+    /// (rejected by current ones). Thinking spends from max_tokens, so the
+    /// request raises max_tokens by the budget instead of clamping the budget
+    /// (a clamp degenerates at small limits — lesson 4).
+    Budget(u64),
+}
+
 pub enum Provider {
     Anthropic {
         key: String,
@@ -48,6 +67,7 @@ pub enum Provider {
         /// and the last message block. On by default (pure cost saving); the
         /// escape hatch exists for diagnosing cache behavior.
         cache: bool,
+        thinking: ThinkingMode,
     },
     OpenAiCompat {
         key: String,
@@ -127,8 +147,16 @@ impl Provider {
                         }
                     };
                     for block in &blocks {
-                        if let ContentBlock::Text { text } = block {
-                            let _ = tx.send(Ok(StreamEvent::TextDelta(text.clone()))).await;
+                        match block {
+                            ContentBlock::Text { text } => {
+                                let _ = tx.send(Ok(StreamEvent::TextDelta(text.clone()))).await;
+                            }
+                            ContentBlock::Thinking { thinking, .. } => {
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ThinkingDelta(thinking.clone())))
+                                    .await;
+                            }
+                            _ => {}
                         }
                     }
                     for block in blocks {
@@ -142,10 +170,15 @@ impl Provider {
                         .await;
                 });
             }
-            Provider::Anthropic { key, base, cache } => {
+            Provider::Anthropic {
+                key,
+                base,
+                cache,
+                thinking,
+            } => {
                 let url = format!("{base}/v1/messages");
                 let key = key.clone();
-                let body = json!({
+                let mut body = json!({
                     "model": model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
                     "system": anthropic::system_value(system, *cache),
@@ -157,6 +190,15 @@ impl Provider {
                     })).collect::<Vec<_>>(),
                     "stream": true,
                 });
+                match thinking {
+                    ThinkingMode::Unset => {}
+                    ThinkingMode::Off => body["thinking"] = json!({"type": "disabled"}),
+                    ThinkingMode::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
+                    ThinkingMode::Budget(n) => {
+                        body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
+                        body["max_tokens"] = json!(MAX_OUTPUT_TOKENS + n);
+                    }
+                }
                 tokio::spawn(async move {
                     if let Err(e) = anthropic::stream(&url, &key, &body, &tx).await {
                         let _ = tx.send(Err(e)).await;

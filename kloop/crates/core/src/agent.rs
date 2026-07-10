@@ -22,6 +22,12 @@ use kloop_protocol::MAX_OUTPUT_TOKENS;
 
 pub trait Ui: Send + Sync {
     fn text_delta(&self, s: &str);
+    /// Streaming reasoning text. Display-only and often empty on the wire
+    /// (Anthropic display=omitted sends blocks with no text), so the default
+    /// drops it and only UIs that render thinking opt in.
+    fn thinking_delta(&self, s: &str) {
+        let _ = s;
+    }
     fn note(&self, s: &str);
     /// Tool-call lifecycle, for UIs that render per-call status rows. The
     /// defaults collapse to the plain note stream so line-based UIs need not
@@ -401,6 +407,11 @@ async fn sample_once(
                         ui.text_delta(&t);
                     }
                 }
+                Some(Ok(StreamEvent::ThinkingDelta(t))) => {
+                    if stream_text {
+                        ui.thinking_delta(&t);
+                    }
+                }
                 Some(Ok(StreamEvent::BlockDone(b))) => blocks.push(b),
                 Some(Ok(StreamEvent::Done { usage, stop_reason })) => {
                     return Ok(SampleOk { blocks, usage, stop_reason })
@@ -478,6 +489,8 @@ mod tests {
                     .iter()
                     .map(|b| match b {
                         ContentBlock::Text { .. } => "text",
+                        ContentBlock::Thinking { .. } => "thinking",
+                        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
                         ContentBlock::ToolUse { .. } => "tool_use",
                         ContentBlock::ToolResult { .. } => "tool_result",
                     })
@@ -1147,6 +1160,53 @@ mod tests {
             ))));
         // Request 1 is the real one: instructions first, compacted history after.
         assert_eq!(seen[1].messages[0], Message::user_text("r".repeat(8_000)));
+    }
+
+    /// Thinking blocks are recorded to history verbatim (they must replay on
+    /// the next request) and their text streams to the UI's thinking channel,
+    /// never the answer channel.
+    #[tokio::test]
+    async fn thinking_blocks_recorded_and_streamed_separately() {
+        struct SplitUi {
+            thinking: std::sync::Mutex<String>,
+            text: std::sync::Mutex<String>,
+        }
+        impl Ui for SplitUi {
+            fn text_delta(&self, s: &str) {
+                self.text.lock().unwrap().push_str(s);
+            }
+            fn thinking_delta(&self, s: &str) {
+                self.thinking.lock().unwrap().push_str(s);
+            }
+            fn note(&self, _: &str) {}
+        }
+
+        let blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "pondering".into(),
+                signature: "sig".into(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ];
+        let provider = Provider::mock(vec![blocks.clone()]);
+        let cfg = compaction_cfg(provider, 200_000, "thinking");
+        let split = Arc::new(SplitUi {
+            thinking: std::sync::Mutex::new(String::new()),
+            text: std::sync::Mutex::new(String::new()),
+        });
+        let ui: Arc<dyn Ui> = split.clone();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("think about it"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "answer");
+        assert_eq!(history.messages()[1], Message::assistant(blocks));
+        assert_eq!(*split.thinking.lock().unwrap(), "pondering");
+        assert_eq!(*split.text.lock().unwrap(), "answer");
     }
 
     /// The task tool spawns a sub-agent that consumes its own turns from the

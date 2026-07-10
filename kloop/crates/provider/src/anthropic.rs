@@ -40,11 +40,20 @@ pub(super) fn system_value(system: &str, cache: bool) -> Value {
 pub(super) fn messages_value(messages: &[Message], cache: bool) -> Value {
     let mut value = serde_json::to_value(messages).unwrap_or_default();
     if cache {
+        // The API rejects cache_control on thinking blocks, so the marker
+        // goes on the last cacheable block instead.
         if let Some(block) = value
             .as_array_mut()
             .and_then(|msgs| msgs.last_mut())
             .and_then(|msg| msg["content"].as_array_mut())
-            .and_then(|content| content.last_mut())
+            .and_then(|content| {
+                content.iter_mut().rev().find(|block| {
+                    !matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+            })
         {
             block["cache_control"] = json!({"type": "ephemeral"});
         }
@@ -52,13 +61,24 @@ pub(super) fn messages_value(messages: &[Message], cache: bool) -> Value {
     value
 }
 
-#[derive(Default)]
-struct BlockAcc {
-    is_tool_use: bool,
-    id: String,
-    name: String,
-    text: String,
-    json: String,
+/// One in-flight content block, accumulated across its deltas.
+enum BlockAcc {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Arrives complete in content_block_start; no deltas follow.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 pub(super) async fn stream(
@@ -85,8 +105,7 @@ pub(super) async fn stream(
 
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();
-    // Open blocks by stream index; unknown block kinds (thinking, ...) are never
-    // inserted, so their deltas fall through harmlessly.
+    // Open blocks by stream index.
     let mut open: HashMap<u64, BlockAcc> = HashMap::new();
     let mut stop_reason: Option<String> = None;
     let mut input_tokens: Option<u64> = None;
@@ -115,38 +134,51 @@ pub(super) async fn stream(
                 "content_block_start" => {
                     let index = v["index"].as_u64().unwrap_or(0);
                     let cb = &v["content_block"];
-                    match cb["type"].as_str().unwrap_or_default() {
-                        "text" => {
-                            open.insert(index, BlockAcc::default());
-                        }
-                        "tool_use" => {
-                            open.insert(
-                                index,
-                                BlockAcc {
-                                    is_tool_use: true,
-                                    id: cb["id"].as_str().unwrap_or_default().to_string(),
-                                    name: cb["name"].as_str().unwrap_or_default().to_string(),
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        _ => {}
-                    }
+                    let str_field = |name: &str| cb[name].as_str().unwrap_or_default().to_string();
+                    let acc = match cb["type"].as_str().unwrap_or_default() {
+                        "text" => BlockAcc::Text {
+                            text: String::new(),
+                        },
+                        "tool_use" => BlockAcc::ToolUse {
+                            id: str_field("id"),
+                            name: str_field("name"),
+                            json: String::new(),
+                        },
+                        "thinking" => BlockAcc::Thinking {
+                            thinking: str_field("thinking"),
+                            signature: str_field("signature"),
+                        },
+                        "redacted_thinking" => BlockAcc::RedactedThinking {
+                            data: str_field("data"),
+                        },
+                        // Unknown block kinds are never inserted, so their
+                        // deltas fall through harmlessly below.
+                        _ => continue,
+                    };
+                    open.insert(index, acc);
                 }
                 "content_block_delta" => {
                     let index = v["index"].as_u64().unwrap_or(0);
                     let Some(acc) = open.get_mut(&index) else {
                         continue;
                     };
-                    match v["delta"]["type"].as_str().unwrap_or_default() {
-                        "text_delta" => {
-                            let piece = v["delta"]["text"].as_str().unwrap_or_default();
-                            acc.text.push_str(piece);
+                    let delta = &v["delta"];
+                    match (delta["type"].as_str().unwrap_or_default(), acc) {
+                        ("text_delta", BlockAcc::Text { text }) => {
+                            let piece = delta["text"].as_str().unwrap_or_default();
+                            text.push_str(piece);
                             let _ = tx.send(Ok(StreamEvent::TextDelta(piece.into()))).await;
                         }
-                        "input_json_delta" => {
-                            acc.json
-                                .push_str(v["delta"]["partial_json"].as_str().unwrap_or_default());
+                        ("input_json_delta", BlockAcc::ToolUse { json, .. }) => {
+                            json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                        }
+                        ("thinking_delta", BlockAcc::Thinking { thinking, .. }) => {
+                            let piece = delta["thinking"].as_str().unwrap_or_default();
+                            thinking.push_str(piece);
+                            let _ = tx.send(Ok(StreamEvent::ThinkingDelta(piece.into()))).await;
+                        }
+                        ("signature_delta", BlockAcc::Thinking { signature, .. }) => {
+                            signature.push_str(delta["signature"].as_str().unwrap_or_default());
                         }
                         _ => {}
                     }
@@ -156,18 +188,27 @@ pub(super) async fn stream(
                     let Some(acc) = open.remove(&index) else {
                         continue;
                     };
-                    let block = if acc.is_tool_use {
-                        ContentBlock::ToolUse {
-                            id: acc.id,
-                            name: acc.name,
-                            input: if acc.json.trim().is_empty() {
+                    let block = match acc {
+                        BlockAcc::Text { text } => ContentBlock::Text { text },
+                        BlockAcc::ToolUse { id, name, json } => ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input: if json.trim().is_empty() {
                                 json!({})
                             } else {
-                                serde_json::from_str(&acc.json).unwrap_or_else(|_| json!({}))
+                                serde_json::from_str(&json).unwrap_or_else(|_| json!({}))
                             },
+                        },
+                        BlockAcc::Thinking {
+                            thinking,
+                            signature,
+                        } => ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        },
+                        BlockAcc::RedactedThinking { data } => {
+                            ContentBlock::RedactedThinking { data }
                         }
-                    } else {
-                        ContentBlock::Text { text: acc.text }
                     };
                     let _ = tx.send(Ok(StreamEvent::BlockDone(block))).await;
                 }

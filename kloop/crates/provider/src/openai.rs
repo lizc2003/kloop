@@ -37,6 +37,11 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
                             },
                         })),
+                        // Reasoning is stripped on the way out: chat/completions
+                        // has no standard replay field, and providers that
+                        // accept one (deepseek's reasoning_content) tolerate
+                        // its absence.
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::ToolResult { .. } => {}
                     }
                 }
@@ -74,7 +79,9 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                             }));
                         }
                         ContentBlock::Text { text: t } => text.push_str(t),
-                        ContentBlock::ToolUse { .. } => {}
+                        ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ToolUse { .. } => {}
                     }
                 }
                 if !text.is_empty() {
@@ -117,6 +124,7 @@ pub(super) async fn stream(
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut calls: Vec<CallAcc> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<Usage> = None;
@@ -156,6 +164,18 @@ pub(super) async fn stream(
                 });
             }
             let delta = &v["choices"][0]["delta"];
+            // Reasoning models stream their thinking as reasoning_content
+            // (deepseek-style) or reasoning; either becomes a Thinking block
+            // with no signature (chat/completions has no replay blob).
+            let reasoning = delta["reasoning_content"]
+                .as_str()
+                .or_else(|| delta["reasoning"].as_str());
+            if let Some(piece) = reasoning {
+                if !piece.is_empty() {
+                    thinking.push_str(piece);
+                    let _ = tx.send(Ok(StreamEvent::ThinkingDelta(piece.into()))).await;
+                }
+            }
             if let Some(piece) = delta["content"].as_str() {
                 if !piece.is_empty() {
                     text.push_str(piece);
@@ -192,6 +212,15 @@ pub(super) async fn stream(
     if !finished {
         // Connection died mid-stream; closing without Done signals retryable.
         return Err(anyhow!("openai-compat stream ended before finish"));
+    }
+    // Thinking precedes the answer on the wire, so it finalizes first too.
+    if !thinking.is_empty() {
+        let _ = tx
+            .send(Ok(StreamEvent::BlockDone(ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            })))
+            .await;
     }
     if !text.is_empty() {
         let _ = tx
@@ -280,6 +309,33 @@ mod tests {
                 json!({"role": "user", "content": "and hurry"}),
                 json!({"role": "tool", "tool_call_id": "t2", "content": "[error] boom"}),
             ]
+        );
+    }
+
+    /// Thinking never goes back out on the chat wire: no standard field
+    /// exists, and stray reasoning text would corrupt the assistant content.
+    #[test]
+    fn thinking_blocks_are_stripped_from_outbound_history() {
+        let messages = vec![
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "pondering".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text { text: "hi".into() },
+            ]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::RedactedThinking { data: "d".into() }],
+            },
+        ];
+        assert_eq!(
+            to_openai_messages("s", &messages),
+            vec![
+                json!({"role": "system", "content": "s"}),
+                json!({"role": "assistant", "content": "hi"}),
+            ],
+            "thinking stripped; a message left empty by stripping sends nothing"
         );
     }
 

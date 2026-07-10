@@ -110,6 +110,44 @@ async fn accumulates_tool_calls_and_usage_across_chunks() {
     assert_eq!(ok.len(), 6);
 }
 
+/// reasoning_content deltas (deepseek-style; plain `reasoning` also accepted)
+/// stream as ThinkingDelta and finalize into a signature-less Thinking block
+/// ahead of the text block.
+#[tokio::test]
+async fn reasoning_content_becomes_thinking_block() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"delta": {"reasoning_content": "hmm, "}}]}),
+                json!({"choices": [{"delta": {"reasoning": "two"}}]}),
+                json!({"choices": [{"delta": {"content": "4"}}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::ThinkingDelta(t) if t == "hmm, "));
+    assert!(matches!(&ok[1], StreamEvent::ThinkingDelta(t) if t == "two"));
+    assert!(matches!(&ok[2], StreamEvent::TextDelta(t) if t == "4"));
+    assert!(matches!(
+        &ok[3],
+        StreamEvent::BlockDone(ContentBlock::Thinking { thinking, signature })
+            if thinking == "hmm, two" && signature.is_empty()
+    ));
+    assert!(matches!(&ok[4], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "4"));
+    assert!(matches!(&ok[5], StreamEvent::Done { .. }));
+    assert_eq!(ok.len(), 6);
+}
+
 /// Cached prompt tokens ride INSIDE prompt_tokens on the OpenAI wire; the
 /// adapter subtracts them out so input_tokens is the uncached remainder on
 /// both rails and total() never double-counts.

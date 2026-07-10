@@ -28,7 +28,7 @@
 - compact:thinking 当普通块,不进摘要;压缩替换后旧 thinking 自然消失。
 - UI:TUI 灰字折叠行、plain 灰字;子 agent 不外流(教训 3 同款)。
 - rollout:随 Message 自然落盘/重放;老文件前向兼容测试。
-- growth 公式复查:thinking 算进 max_tokens,MAX_OUTPUT_TOKENS 是否上调开工时定(动了要同步 predictive 测试)。
+- growth 公式复查(已定):MAX_OUTPUT_TOKENS 维持 8192 不动(sonnet-5 实测 adaptive 下正常);Budget 模式把 max_tokens 抬高 budget 而非夹紧(夹紧在小上限下退化,教训 4),代价是 predictive growth 在该遗留模式下低估 budget 量——接受并记录。
 - 验收:真 key sonnet-5 多步任务,历史合法(无 400)、rollout 可 resume、TUI 能看到(或确认 display omitted 下无文本)。
 
 ### 片 3 — /v1/responses 适配器

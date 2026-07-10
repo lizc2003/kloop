@@ -21,6 +21,20 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Model reasoning. Replay rule: when the history goes back to the same
+    /// model the block must be echoed exactly as received (empty text
+    /// included) — the signature cryptographically binds it to this context
+    /// and any edit is rejected. Adapters for other wire formats may reuse
+    /// `signature` for their own opaque replay blob (Responses API
+    /// encrypted_content).
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Reasoning the API withheld; an opaque blob replayed verbatim.
+    RedactedThinking {
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -110,6 +124,9 @@ impl std::error::Error for OverflowError {}
 pub enum StreamEvent {
     /// Incremental text for display only; the full text arrives via BlockDone.
     TextDelta(String),
+    /// Incremental reasoning text for display only; the full block (with its
+    /// signature) arrives via BlockDone.
+    ThinkingDelta(String),
     /// A fully accumulated content block.
     BlockDone(ContentBlock),
     /// Stream finished cleanly. stop_reason is informational only: the loop
@@ -152,6 +169,21 @@ mod tests {
             .unwrap(),
             json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}})
         );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Thinking {
+                thinking: "let me see".into(),
+                signature: "sig-abc".into(),
+            })
+            .unwrap(),
+            json!({"type": "thinking", "thinking": "let me see", "signature": "sig-abc"})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::RedactedThinking {
+                data: "blob".into(),
+            })
+            .unwrap(),
+            json!({"type": "redacted_thinking", "data": "blob"})
+        );
         // is_error omitted when false, present when true.
         assert_eq!(
             serde_json::to_value(ContentBlock::ToolResult {
@@ -178,6 +210,13 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             content: vec![
+                ContentBlock::Thinking {
+                    // The empty-text + signature shape is what display=omitted
+                    // models actually send; it must survive the roundtrip.
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::RedactedThinking { data: "d".into() },
                 ContentBlock::Text { text: "a".into() },
                 ContentBlock::ToolUse {
                     id: "t".into(),

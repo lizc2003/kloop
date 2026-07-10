@@ -10,6 +10,7 @@ use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
+use kloop_provider::ThinkingMode;
 use serde_json::json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -51,6 +52,7 @@ fn anthropic(server: &MockServer) -> Provider {
         key: "test-key".into(),
         base: server.uri(),
         cache: true,
+        thinking: ThinkingMode::Unset,
     }
 }
 
@@ -173,6 +175,7 @@ async fn cache_off_sends_plain_request() {
         key: "test-key".into(),
         base: server.uri(),
         cache: false,
+        thinking: ThinkingMode::Unset,
     });
     let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
     while rx.recv().await.is_some() {}
@@ -236,8 +239,8 @@ async fn unknown_block_kinds_are_ignored() {
     mount_sse(
         &server,
         sse_body(&[
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "s1"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
             json!({"type": "content_block_stop", "index": 0}),
             json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}),
             json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ok"}}),
@@ -255,6 +258,129 @@ async fn unknown_block_kinds_are_ignored() {
     // Only the text block survives: delta + done + Done.
     assert_eq!(ok.len(), 3);
     assert!(matches!(&ok[1], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "ok"));
+}
+
+/// The thinking SSE contract: thinking_delta streams as ThinkingDelta events,
+/// signature_delta accumulates silently, and the finished block carries both
+/// — followed by a complete-at-start redacted_thinking block.
+#[tokio::test]
+async fn thinking_blocks_stream_and_finalize_with_signature() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "let me"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " see"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-abc"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "blob"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "answer"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::ThinkingDelta(t) if t == "let me"));
+    assert!(matches!(&ok[1], StreamEvent::ThinkingDelta(t) if t == " see"));
+    assert!(matches!(
+        &ok[2],
+        StreamEvent::BlockDone(ContentBlock::Thinking { thinking, signature })
+            if thinking == "let me see" && signature == "sig-abc"
+    ));
+    assert!(matches!(
+        &ok[3],
+        StreamEvent::BlockDone(ContentBlock::RedactedThinking { data }) if data == "blob"
+    ));
+    assert!(matches!(&ok[4], StreamEvent::TextDelta(t) if t == "answer"));
+    assert!(
+        matches!(&ok[5], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "answer")
+    );
+    assert!(matches!(&ok[6], StreamEvent::Done { .. }));
+    assert_eq!(ok.len(), 7);
+}
+
+/// History thinking blocks replay verbatim (signature included, empty text
+/// included) and the moving cache breakpoint skips them; the thinking request
+/// field follows the configured mode, raising max_tokens by a legacy budget.
+#[tokio::test]
+async fn thinking_replay_and_request_modes() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+    let provider = Arc::new(Provider::Anthropic {
+        key: "test-key".into(),
+        base: server.uri(),
+        cache: true,
+        thinking: ThinkingMode::Budget(2048),
+    });
+    // Contrived: a trailing assistant message ending in thinking, to pin the
+    // breakpoint-skips-thinking rule.
+    let messages = vec![
+        Message::user_text("hi"),
+        Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: "sig".into(),
+            },
+            ContentBlock::Text { text: "so".into() },
+            ContentBlock::RedactedThinking { data: "d".into() },
+        ]),
+    ];
+    let mut rx = provider.stream("test-model", "s", &messages, &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert_eq!(body["max_tokens"], json!(8192 + 2048));
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            {
+                "type": "text", "text": "so",
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "redacted_thinking", "data": "d"},
+        ]),
+        "replay is verbatim; the breakpoint lands on the last cacheable block"
+    );
+}
+
+/// Adaptive and off modes map to their wire shapes; Unset sends no field.
+#[tokio::test]
+async fn thinking_mode_field_shapes() {
+    for (mode, expected) in [
+        (ThinkingMode::Unset, None),
+        (ThinkingMode::Off, Some(json!({"type": "disabled"}))),
+        (ThinkingMode::Adaptive, Some(json!({"type": "adaptive"}))),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+        let provider = Arc::new(Provider::Anthropic {
+            key: "test-key".into(),
+            base: server.uri(),
+            cache: true,
+            thinking: mode,
+        });
+        let mut rx = provider.stream("test-model", "s", &[Message::user_text("hi")], &[]);
+        while rx.recv().await.is_some() {}
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body.get("thinking").cloned(), expected, "mode {mode:?}");
+        assert_eq!(body["max_tokens"], json!(8192), "mode {mode:?}");
+    }
 }
 
 #[tokio::test]

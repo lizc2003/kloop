@@ -428,7 +428,16 @@ mod tests {
         let mut rollout = Rollout::new(path.clone());
         let messages = vec![
             Message::user_text("hello"),
-            Message::assistant(vec![tool_use("t1")]),
+            // Thinking must round-trip byte-exact (the signature is a replay
+            // credential), empty text included.
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::RedactedThinking { data: "d".into() },
+                tool_use("t1"),
+            ]),
             Message::tool_results(vec![tool_result("t1")]),
             Message::assistant(vec![ContentBlock::Text {
                 text: "done".into(),
