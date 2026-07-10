@@ -326,6 +326,31 @@ newest-first sort happens before the cap so truncation drops the stalest
 files, not the freshest. cc has no LS tool anymore; kloop follows (bash `ls`
 is already read-only-whitelisted).
 
+## Background bash (Phase 2, tenth slice)
+
+`bash` takes `run_in_background`: the command starts in its own process
+group, stdout/stderr interleave straight into a file under `.kloop/offload/`
+(`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
+returns immediately with the ID and the output path. Companions:
+
+- **bash_output** `{bash_id, block=true, timeout_ms=30000}` — blocks until
+  the command finishes (or the timeout), or peeks with `block=false`;
+  reports `running` / `completed (exit 0)` / `failed (exit N)` /
+  `killed (reason)` plus the last 30k bytes of output (read the file with
+  `read_file` for more). Read-only: skips the gate, joins concurrent batches.
+- **kill_bash** `{bash_id}` — SIGKILLs the whole process group and waits for
+  the registry to confirm. Auto-allowed: it can only signal processes this
+  agent itself started.
+
+Semantics: permission checks are identical to foreground bash (the command
+string is what's judged, not where it runs); `timeout_ms` is ignored in
+background mode (cc drops the timer too); interrupting a turn never touches
+background shells — only `kill_bash`, a 1 GiB output-file watchdog, and
+session exit (process-group kill on registry drop) reap them. IDs are
+process-global (`bg-1`, `bg-2`, …) so sub-agents and server threads sharing
+one offload directory never collide. cc's auto-backgrounding, completion
+notifications, stall detection and Monitor tool are not ported.
+
 ## Running
 
 ```sh
@@ -464,7 +489,8 @@ crates/core/        kloop-core — the agent, network-free
     mod.rs          tool defs, concurrency-safety classification, batched
                     dispatch with hook+permission gating; ToolSource seam
                     for external (MCP) tools
-    bash.rs         shell execution
+    bash.rs         foreground + background shell execution, the
+                    BackgroundShells registry, bash_output/kill_bash
     fs.rs           read/write/edit file, read_offloaded
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware
                     walking, output modes, paging, clipping)

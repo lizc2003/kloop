@@ -5,6 +5,7 @@ use kloop_provider::Provider;
 
 use crate::hooks::Hooks;
 use crate::permissions::Permissions;
+use crate::tools::BackgroundShells;
 use crate::tools::ToolSource;
 
 /// Everything a turn needs to run. Construction (env parsing, provider
@@ -37,4 +38,8 @@ pub struct Config {
     /// External command hooks; the shared Arc means sub-agents inherit the
     /// same hook set.
     pub hooks: Arc<Hooks>,
+    /// Session-scoped background shell registry (bash run_in_background).
+    /// Sub-agents share the parent's through the Config clone; server mode
+    /// builds one per thread.
+    pub background_shells: Arc<BackgroundShells>,
 }

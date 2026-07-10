@@ -675,6 +675,7 @@ mod tests {
                 tool_sources: Vec::new(),
                 session_id: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+                background_shells: crate::tools::BackgroundShells::new(),
             })
         };
         let path = temp_file("restart");

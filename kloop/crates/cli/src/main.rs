@@ -432,6 +432,7 @@ fn config_from_env(
         // open_history / per server thread).
         session_id: String::new(),
         hooks: Arc::new(hooks),
+        background_shells: kloop_core::tools::BackgroundShells::new(),
     };
     if args.mock {
         return Ok(Config {

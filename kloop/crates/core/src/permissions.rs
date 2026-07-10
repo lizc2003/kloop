@@ -463,6 +463,10 @@ impl CallFacts {
     fn is_readonly(&self, name: &str) -> bool {
         match name {
             "read_file" | "read_offloaded" | "grep" | "glob" => true,
+            // bash_output reads registry state; kill_bash only signals
+            // processes the agent itself started via bash — neither can
+            // touch anything the original bash call wasn't already gated on.
+            "bash_output" | "kill_bash" => true,
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
@@ -709,6 +713,8 @@ mod tests {
         assert!(ok(&p, "read_offloaded", json!({"id": "off-1"})).await);
         assert!(ok(&p, "grep", json!({"pattern": "fn main"})).await);
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
+        assert!(ok(&p, "bash_output", json!({"bash_id": "bg-1"})).await);
+        assert!(ok(&p, "kill_bash", json!({"bash_id": "bg-1"})).await);
         assert!(ok(&p, "task", json!({"prompt": "go"})).await);
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
         assert!(ok(&p, "bash", bash("sed -n 1,20p f.rs")).await);

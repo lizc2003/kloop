@@ -8,6 +8,8 @@ mod fs;
 mod search;
 mod task;
 
+pub use bash::BackgroundShells;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -122,14 +124,39 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
-            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s.".into(),
+            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set run_in_background instead of appending '&'.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to run"},
-                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000)"}
+                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when run_in_background is set"},
+                    "run_in_background": {"type": "boolean", "description": "Run in the background: returns immediately with an ID and an output file path. Check on it later with bash_output or by reading the output file; stop it with kill_bash."}
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolDef {
+            name: "bash_output".into(),
+            description: "Retrieve the status and output of a background bash command. Blocks until it finishes by default (up to timeout_ms); pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "bash_id": {"type": "string", "description": "ID from a run_in_background bash call, e.g. bg-1"},
+                    "block": {"type": "boolean", "description": "Wait for completion (default true)"},
+                    "timeout_ms": {"type": "integer", "description": "Max wait when blocking (default 30000, max 600000)"}
+                },
+                "required": ["bash_id"]
+            }),
+        },
+        ToolDef {
+            name: "kill_bash".into(),
+            description: "Stop a running background bash command by ID; kills its whole process group.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "bash_id": {"type": "string", "description": "ID from a run_in_background bash call, e.g. bg-1"}
+                },
+                "required": ["bash_id"]
             }),
         },
         ToolDef {
@@ -245,6 +272,9 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
     match name {
         "read_file" | "read_offloaded" | "grep" | "glob" => true,
+        // bash_output only reads registry state; kill_bash only signals
+        // processes this agent itself started (cc marks both concurrency-safe).
+        "bash_output" | "kill_bash" => true,
         "bash" => {
             input["command"]
                 .as_str()
@@ -391,7 +421,9 @@ fn execute_tool<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         match name {
-            "bash" => bash::bash_tool(input).await,
+            "bash" => bash::bash_tool(input, ctx).await,
+            "bash_output" => bash::bash_output_tool(input, ctx).await,
+            "kill_bash" => bash::kill_bash_tool(input, ctx).await,
             "read_file" => fs::read_file_tool(input).await,
             "write_file" => fs::write_file_tool(input).await,
             "edit_file" => fs::edit_file_tool(input).await,
@@ -453,6 +485,7 @@ pub(crate) mod testutil {
                 tool_sources: sources,
                 session_id: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+                background_shells: BackgroundShells::new(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -550,6 +583,8 @@ mod tests {
             names,
             vec![
                 "bash",
+                "bash_output",
+                "kill_bash",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -601,7 +636,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("48 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("50 tools"), "got: {warnings:?}");
     }
 
     #[tokio::test]
@@ -682,6 +717,14 @@ mod tests {
         ));
         assert!(is_concurrency_safe("grep", &json!({"pattern": "x"})));
         assert!(is_concurrency_safe("glob", &json!({"pattern": "*.rs"})));
+        assert!(is_concurrency_safe(
+            "bash_output",
+            &json!({"bash_id": "bg-1"})
+        ));
+        assert!(is_concurrency_safe(
+            "kill_bash",
+            &json!({"bash_id": "bg-1"})
+        ));
         assert!(!is_concurrency_safe(
             "write_file",
             &json!({"path": "x", "content": ""})
@@ -756,6 +799,7 @@ mod tests {
                 tool_sources: Vec::new(),
                 session_id: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+                background_shells: BackgroundShells::new(),
             }),
             ui: Arc::new(NullUi),
             cancel,

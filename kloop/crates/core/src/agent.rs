@@ -455,6 +455,7 @@ mod tests {
             tool_sources: Vec::new(),
             session_id: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+            background_shells: crate::tools::BackgroundShells::new(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -536,6 +537,7 @@ mod tests {
             tool_sources: Vec::new(),
             session_id: String::new(),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+            background_shells: crate::tools::BackgroundShells::new(),
         })
     }
 
