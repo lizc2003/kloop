@@ -61,11 +61,25 @@ pub enum Decision {
 /// One confirmation request. `remember_rules` carries the suggested
 /// persistent rules when the call is remember-able; `None` means only
 /// allow-once / deny apply (opaque bash, sensitive paths, explicit ask
-/// rules).
+/// rules, sandbox escalation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmRequest {
     pub description: String,
     pub remember_rules: Option<Vec<String>>,
+}
+
+/// The outcome of [`Permissions::escalate_sandbox`] — the code-level
+/// escalation loop's consent step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalationOutcome {
+    /// Approved (or bypass mode): re-run the command without the sandbox.
+    Approved,
+    /// The user was asked and declined: keep the sandboxed failure and do
+    /// not invite a disable_sandbox retry.
+    Declined,
+    /// Not asked (no approver, or tests/`--mock`): fall back to the
+    /// model-driven denial hint.
+    NotAttempted,
 }
 
 /// The asking seam, separate from `Ui` so the streaming-output trait stays
@@ -404,6 +418,39 @@ impl Permissions {
             )),
         }
     }
+
+    /// The escalation loop's consent step (codex's retry-on-denial): a
+    /// bash command the OS sandbox contained failed in a denial-shaped way;
+    /// ask whether to re-run it without the sandbox. The command already
+    /// cleared this gate — deny rules and safety checks sit above the
+    /// sandbox layers — so this asks only about removing containment, never
+    /// re-litigates whether the command may run.
+    pub async fn escalate_sandbox(&self, command: &str, depth: u8) -> EscalationOutcome {
+        // Tests / `--mock`: nobody is watching (and the sandbox is off in
+        // `--mock` anyway). Don't silently escalate.
+        if self.allow_everything {
+            return EscalationOutcome::NotAttempted;
+        }
+        // Bypass (`--yolo`) means "don't ask" — escalate as the model-driven
+        // disable_sandbox retry already would (it auto-passes the bypass
+        // layer of the gate).
+        if self.mode == Mode::Bypass {
+            return EscalationOutcome::Approved;
+        }
+        let Some(approver) = &self.approver else {
+            return EscalationOutcome::NotAttempted;
+        };
+        let req = ConfirmRequest {
+            description: describe_escalation(command, depth),
+            remember_rules: None,
+        };
+        match approver.confirm(req).await {
+            Decision::Allow | Decision::AllowSession | Decision::AllowAlways => {
+                EscalationOutcome::Approved
+            }
+            Decision::Deny => EscalationOutcome::Declined,
+        }
+    }
 }
 
 /// Deny/ask matching is the aggressive direction: bash argv are matched
@@ -675,6 +722,14 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
     .take(200)
     .collect();
     format!("{agent}{hazard}{no_sandbox}{name}: {detail}")
+}
+
+/// The escalation prompt: single-line (the TUI popup renders one line) with
+/// a tag that says why it is being asked.
+fn describe_escalation(command: &str, depth: u8) -> String {
+    let agent = if depth > 0 { "[sub-agent] " } else { "" };
+    let cmd: String = command.chars().take(200).collect();
+    format!("{agent}[sandbox denied — run without sandbox?] bash: {cmd}")
 }
 
 #[cfg(test)]
@@ -1207,6 +1262,56 @@ mod tests {
             approver.ask_count(),
             1,
             "ask rule asked despite the sandbox"
+        );
+    }
+
+    /// The escalation consent step: approver decisions map to Approved/
+    /// Declined, bypass auto-approves without asking, and no approver (or
+    /// mock) reports NotAttempted so the caller falls back to the hint.
+    #[tokio::test]
+    async fn escalate_sandbox_maps_decision_and_mode() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.escalate_sandbox("npm install", 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(
+            p.escalate_sandbox("git push", 0).await,
+            EscalationOutcome::Declined
+        );
+        assert_eq!(approver.ask_count(), 2);
+        assert!(approver.asked()[0]
+            .description
+            .contains("[sandbox denied — run without sandbox?] bash: npm install"));
+
+        // Bypass (--yolo): escalate without asking.
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.escalate_sandbox("curl x", 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(approver.ask_count(), 0, "bypass does not prompt");
+
+        // allow_all (tests / --mock): never auto-escalate.
+        assert_eq!(
+            Permissions::allow_all().escalate_sandbox("rm x", 0).await,
+            EscalationOutcome::NotAttempted
+        );
+
+        // No approver available: NotAttempted, so the caller keeps the hint.
+        let p = Permissions::new(
+            Mode::Default,
+            &PermissionRules::default(),
+            PathBuf::from("/"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.escalate_sandbox("touch x", 0).await,
+            EscalationOutcome::NotAttempted
         );
     }
 

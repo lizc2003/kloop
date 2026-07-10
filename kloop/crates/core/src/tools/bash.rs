@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::str_arg;
 use super::ToolCtx;
+use crate::permissions::EscalationOutcome;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
 
@@ -103,7 +104,52 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             .spawn_background(command, &ctx.cfg.offload_dir, sandbox);
     }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = tokio::time::timeout(
+    let output = run_foreground(command, sandbox, timeout_ms).await?;
+    let mut text = format_output(&output);
+
+    // Sandbox denial handling applies only to an actually-sandboxed run;
+    // disable_sandbox / no policy leaves `sandbox` None and skips it.
+    if let Some(policy) = sandbox {
+        if !output.status.success()
+            && sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
+        {
+            if policy.escalate {
+                // The code-level escalation loop (codex's retry-on-denial):
+                // ask once, and on approval re-run the command unsandboxed —
+                // one fewer model round-trip than the disable_sandbox hint.
+                match ctx
+                    .cfg
+                    .permissions
+                    .escalate_sandbox(command, ctx.depth)
+                    .await
+                {
+                    EscalationOutcome::Approved => {
+                        let raw = run_foreground(command, None, timeout_ms).await?;
+                        return Ok(format!(
+                            "{}{}",
+                            sandbox::ESCALATED_PREFIX,
+                            format_output(&raw)
+                        ));
+                    }
+                    EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
+                    EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
+                }
+            } else {
+                text.push_str(sandbox::DENIAL_HINT);
+            }
+        }
+    }
+    Ok(text)
+}
+
+/// One foreground run of `sh -lc <command>`, wrapped in the OS sandbox per
+/// `sandbox`. The caller turns the raw output into model-facing text.
+async fn run_foreground(
+    command: &str,
+    sandbox: Option<&SandboxPolicy>,
+    timeout_ms: u64,
+) -> Result<std::process::Output> {
+    tokio::time::timeout(
         Duration::from_millis(timeout_ms),
         shell_command(command, sandbox)
             .stdin(Stdio::null())
@@ -114,8 +160,13 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     )
     .await
     .map_err(|_| anyhow!("bash: command timed out after {timeout_ms}ms"))?
-    .context("bash: failed to spawn sh")?;
+    .context("bash: failed to spawn sh")
+}
 
+/// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
+/// placeholder when empty — the model-facing text for one run (denial
+/// annotation is the caller's job, so an escalated re-run reuses this).
+fn format_output(output: &std::process::Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
@@ -124,17 +175,11 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             .code()
             .map_or_else(|| "killed by signal".into(), |c| format!("exit status {c}"));
         text.push_str(&format!("\n[{code}]"));
-        if let Some(policy) = sandbox {
-            if sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
-            {
-                text.push_str(sandbox::DENIAL_HINT);
-            }
-        }
     }
     if text.is_empty() {
         text = "(no output)".into();
     }
-    Ok(text)
+    text
 }
 
 pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -623,6 +668,9 @@ mod tests {
         use super::*;
         use crate::sandbox::SandboxPolicy;
         use crate::sandbox::WritableRoot;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
 
         /// A ctx whose bash runs sandboxed with exactly one writable root
         /// (returned canonicalized, seatbelt matches resolved paths).
@@ -637,8 +685,76 @@ mod tests {
                 }],
                 allow_network: false,
                 auto_allow: true,
+                // No approver in test_ctx (allow_all), so escalation always
+                // resolves NotAttempted → the model-driven hint; the tests
+                // below that need a real escalation build their own ctx.
+                escalate: true,
             };
             (with_sandbox(test_ctx(0, tag), policy), root)
+        }
+
+        /// An Approver that returns a fixed decision and counts asks — lets
+        /// the escalation tests assert both the outcome and that the prompt
+        /// fired exactly once.
+        struct CountingApprover {
+            decision: crate::permissions::Decision,
+            asked: Arc<AtomicUsize>,
+        }
+
+        impl crate::permissions::Approver for CountingApprover {
+            fn confirm(
+                &self,
+                _req: crate::permissions::ConfirmRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::permissions::Decision> + Send + '_>,
+            > {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                let decision = self.decision;
+                Box::pin(async move { decision })
+            }
+        }
+
+        /// A sandboxed ctx whose permission gate has a real (scripted)
+        /// approver, so the escalation loop actually runs. auto_allow is on,
+        /// so the initial contained call never prompts — only escalation does.
+        fn escalating_ctx(
+            tag: &str,
+            decision: crate::permissions::Decision,
+        ) -> (crate::tools::ToolCtx, Arc<AtomicUsize>) {
+            let root = std::env::temp_dir().join(format!("kloop-sbx-{tag}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let approver: Arc<dyn crate::permissions::Approver> = Arc::new(CountingApprover {
+                decision,
+                asked: asked.clone(),
+            });
+            let perms = crate::permissions::Permissions::new(
+                crate::permissions::Mode::Default,
+                &Default::default(),
+                root.clone(),
+                Some(approver),
+                None,
+            )
+            .unwrap();
+            let policy = SandboxPolicy {
+                writable_roots: vec![WritableRoot {
+                    root,
+                    read_only_subpaths: vec![],
+                }],
+                allow_network: false,
+                auto_allow: true,
+                escalate: true,
+            };
+            let base = test_ctx(0, tag);
+            let mut cfg = (*base.cfg).clone();
+            cfg.permissions = Arc::new(perms);
+            cfg.sandbox = Some(Arc::new(policy));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..base
+            };
+            (ctx, asked)
         }
 
         /// A directory outside every writable root of `sandbox_ctx`.
@@ -725,13 +841,62 @@ mod tests {
             assert!(!out.contains("Operation not permitted"), "{out}");
         }
 
+        /// Escalation loop, approved: a contained write outside the writable
+        /// root is denied by the sandbox, the loop asks once, and on approval
+        /// re-runs the command unsandboxed — the write lands and the result
+        /// is flagged as escalated, with no denial hint left dangling.
+        #[tokio::test]
+        async fn escalation_reruns_unsandboxed_on_approval() {
+            let (ctx, asked) = escalating_ctx("esc-yes", crate::permissions::Decision::Allow);
+            let target = outside_dir("esc-yes").join("climbed.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo climbed > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("Re-ran without the sandbox"), "{out}");
+            assert!(
+                !out.contains("looks like a sandbox"),
+                "no dangling hint: {out}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "asked exactly once: {out}");
+        }
+
+        /// Escalation loop, declined: the sandboxed failure is kept and the
+        /// result steers the model away from a disable_sandbox retry (not the
+        /// hint, which would invite exactly that).
+        #[tokio::test]
+        async fn escalation_declined_keeps_denial_and_warns_off_retry() {
+            let (ctx, asked) = escalating_ctx("esc-no", crate::permissions::Decision::Deny);
+            let target = outside_dir("esc-no").join("nope.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo climbed > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(out.contains("declined to run this outside"), "{out}");
+            assert!(
+                !out.contains("looks like a sandbox"),
+                "declined must not double up with the hint: {out}"
+            );
+            assert!(!target.exists());
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+        }
+
         /// End-to-end through the real dispatch gate: with auto_allow, a
         /// contained bash call (opaque redirect, previously always asked)
         /// runs with NOBODY available to approve; the escaped form and the
         /// auto_allow=false policy both still reach the ask layer and fail.
         #[tokio::test]
         async fn auto_allow_runs_contained_bash_without_an_approver() {
-            use std::sync::Arc;
             let (ctx, root) = sandbox_ctx("autoallow");
             let no_approver = || {
                 Arc::new(

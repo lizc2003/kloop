@@ -491,10 +491,22 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
-disables network), the tool result is annotated with guidance; the model can
-then retry that one call with `disable_sandbox: true`, which faces the
-permission gate like any call and is tagged `[no sandbox]` in the approval
-prompt. Escalation is per call — the next command is sandboxed again.
+disables network), there are two escalation paths:
+
+- **Code-level loop** (`escalate`, default on — codex's retry-on-denial):
+  the tool asks once ("run this without the sandbox?") and, on approval,
+  re-runs the command unsandboxed within the same tool call — one fewer
+  model round-trip. `--yolo` auto-approves it; declining keeps the failure
+  and steers the model to a different approach. This is the default.
+- **Model-driven** (fallback when `escalate = false`, or when there is no
+  approver): the result is annotated with guidance and the model retries
+  that one call with `disable_sandbox: true`, which faces the permission
+  gate like any call and is tagged `[no sandbox]` in the approval prompt.
+
+Either way, escalation is per call — the next command is sandboxed again —
+and the command already cleared the permission gate (deny rules and safety
+checks sit above the sandbox), so escalation asks only about removing
+containment.
 
 ```toml
 [sandbox]
@@ -502,6 +514,7 @@ enabled = true            # default; false turns the sandbox off
 allow_network = false     # default; true appends the network allow rules
 writable_roots = []       # extra writable directories
 auto_allow = true         # default; false = ask first, then run sandboxed
+escalate = true           # default; false = model-driven disable_sandbox instead
 ```
 
 `AGENT_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
@@ -576,7 +589,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 288 tests across the workspace:
+`cargo test` runs 291 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -618,11 +631,14 @@ saved and resumable — see Session persistence above.
   computation with canonical/literal dedup, denial-detection table incl. the
   network-off DNS extension, `[no sandbox]` approval tag, auto-allow
   layering: contained calls skip asking while deny/safety/ask-rules
-  outrank the sandbox) plus macOS-only integration against the real
-  `sandbox-exec` (write inside/outside a writable root with the denial
-  hint, protected subpath, per-call disable_sandbox escape, network denied
-  where a bare run connects, background shell sandboxed with inherited-fd
-  output, contained bash running with no approver present).
+  outrank the sandbox; escalation-consent decision/mode mapping) plus
+  macOS-only integration against the real `sandbox-exec` (write
+  inside/outside a writable root with the denial hint, protected subpath,
+  per-call disable_sandbox escape, network denied where a bare run
+  connects, background shell sandboxed with inherited-fd output, contained
+  bash running with no approver present, the escalation loop re-running a
+  denied command unsandboxed on approval and warning off retry when
+  declined).
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
   accumulation and splitting, tool status resolution by id, confirm queueing

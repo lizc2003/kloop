@@ -29,6 +29,18 @@ pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file 
     denial. If the command legitimately needs the blocked access, retry with disable_sandbox: \
     true — that run requires user approval.]";
 
+/// Prepended to an escalated (re-run without the sandbox) result so the
+/// model sees the earlier sandboxed failure was resolved by escalation, not
+/// left hanging.
+pub const ESCALATED_PREFIX: &str = "[Re-ran without the sandbox after user approval.]\n";
+
+/// Appended when the user was asked to escalate and declined. Unlike
+/// [`DENIAL_HINT`] it must NOT invite a disable_sandbox retry — the user
+/// already said no.
+pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside kloop's sandbox. \
+    Do not retry with disable_sandbox; take a different approach — write within the workspace or a \
+    temp directory, or ask the user how to proceed.]";
+
 /// One directory the sandboxed command may write, minus its protected
 /// subpaths.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +65,12 @@ pub struct SandboxPolicy {
     /// reverts to slice-1 behavior (sandbox as pure containment, asking
     /// unchanged).
     pub auto_allow: bool,
+    /// The code-level escalation loop (codex's retry-on-denial, default
+    /// on): when a contained bash command fails in a denial-shaped way, ask
+    /// once and — on approval — re-run it without the sandbox, one fewer
+    /// model round-trip than the disable_sandbox hint. `[sandbox] escalate =
+    /// false` keeps the model-driven hint instead.
+    pub escalate: bool,
 }
 
 impl SandboxPolicy {
@@ -95,6 +113,7 @@ impl SandboxPolicy {
                 .collect(),
             allow_network,
             auto_allow: true,
+            escalate: true,
         }
     }
 }
@@ -232,6 +251,7 @@ mod tests {
             writable_roots: roots,
             allow_network,
             auto_allow: true,
+            escalate: true,
         }
     }
 

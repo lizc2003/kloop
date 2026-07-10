@@ -1,4 +1,4 @@
-# Plan 19 — 沙箱基建 ✅(片 1 完成 68bcf18;片 2 完成 41b4fd1)
+# Plan 19 — 沙箱基建 ✅(片 1 完成 68bcf18;片 2 完成 41b4fd1;片 3 完成,提交号见下)
 
 > 可能不止一个会话,开工时切片。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 权限系统对比"codex 独有、kloop 暂不做"一节——sandbox+approval 双轴、escalation 环、execpolicy、Starlark 规则都**依赖沙箱基建**,这个 plan 就是去补基建;codex codex-rs 的 seatbelt(macOS)/landlock+seccomp(Linux)实现回源精读(教训 11,这是安全层,更不能凭印象)。
 
@@ -39,4 +39,13 @@ fmt/clippy/test 全绿(macOS+Linux CI 过);手工验收:真 key 让模型试写 
 
 cc 的 autoAllowBashIfSandboxed 形态落地:plan 8 管线在 ask 规则之后、bypass 之前插入 sandbox auto-allow 层——会被沙箱兜住的 bash 调用跳过其下所有询问层。三个关键取舍:① **opaque(重定向/子 shell)也覆盖**:OS 遏制替代解析级审查,这是主要 UX 收益(`echo > file` 类询问噪音清零);接受的风险 = 藏在 opaque 里的破坏可无询问改工作区(.git/hooks|config、.kloop 仍受 SBPL 保护,git 史兜底),两家参考同款取舍。② **deny/安全检查/显式 ask 规则保持优先**——可解析的 `rm -rf` 仍问;ask 规则这半**比 cc 严**(cc 的 tool 级 ask 规则会被沙箱 auto-allow 跳过,kloop 认为"always confirm"是用户的话,自动化不得盖过)。③ **判定按调用喂入**:`Permissions::check_call` 第 4 参 `sandbox_auto_allow`(gate 不感知 sandbox 模块;旧 `check` = 恒 false 包装,签名零churn),dispatch 由 `bash::sandbox_auto_allowed`(bash + 未逃逸 + policy.auto_allow)计算;`disable_sandbox: true` 调用天然不享受。配置 `[sandbox] auto_allow` 默认开,false 回退片 1 纯遏制形态。测试 +3(=288):分层契约(contained 跳问含 opaque、同调用不 contained 照问、deny+安全+ask 压过沙箱)、macOS 端到端(无 approver 下 contained 跑通/逃逸被拒/auto_allow=false 回退)、cli 解析。真 key 验收:默认模式(非 --yolo)sonnet-5——重定向写 cwd 零询问直接跑,写外拦截 → 自发升级 → `[no sandbox]` 审批弹出(拒后如实汇报);gpt-5.4-mini 零询问路径同过。
 
-**剩余片取舍**:① ~~auto-allow 双轴联动~~(片 2 已完成,见上)。② codex 代码环(orchestrator 捕获 denial → 自动询问 → 批准后裸跑重试)可以等:模型驱动的最小逃逸口已验证够用,代码环的增量价值是省一轮模型往返,复杂度换速度,有痛感再上。③ Linux 片对着 bwrap+seccomp 设计(landlock 是 legacy),需要 helper 二进制(arg0 dispatch)时把 sandbox.rs 拆成独立 crate。④ 挂账:seatbelt 下 `.git` 文件型(worktree gitdir 指针)未解析真实 gitdir(codex 有,罕见场景);bash 工具描述提沙箱但 system prompt 未提(cc 在 prompt 教升级时机,kloop 靠 denial hint 事发时教学,验收显示对强弱模型都够用)。
+## ✅ 片 3 完成记录(2026-07-10):代码级 escalation 环
+
+codex orchestrator 的 retry-on-denial 落地为 bash 工具内的循环:沙箱内命令 denial-shaped 失败 → 代码自问一次"去掉沙箱重跑吗" → 批准即**同一次工具调用内**裸跑重试。收益 = 省一轮模型往返(片 1/2 是 denial→模型→disable_sandbox 重试两次工具调用;片 3 一次搞定,验收里 bash 只调一次)。设计:
+
+- **只问"移除遏制",不重查命令**:命令已过权限门(deny 层 1、safety 层 2 在 sandbox auto-allow 层 4 之上),到 bash_tool 执行时已是"可运行",escalation 只问是否去掉 OS 遏制——与 codex 一致(它的 initial approval 也只做 assess_command_safety,escalation 是独立的 containment-removal 同意)。因此不需要对裸跑变体重跑规则管线,没有绕过 deny 的洞(被 deny 的命令根本到不了 bash_tool)。
+- **三态**:`Permissions::escalate_sandbox(command, depth) -> EscalationOutcome`。Approved(用户批准 / Bypass 自动批准,因 --yolo 下 disable_sandbox 本就在 bypass 层自动放行,保持一致)→ 裸跑重试、结果加 `ESCALATED_PREFIX` 前缀;Declined(用户拒绝)→ 保留沙箱失败 + `ESCALATION_DECLINED`(明确别再劝 disable_sandbox,引导换法);NotAttempted(无 approver / allow_all 测试 / mock)→ 回退片 1/2 的 `DENIAL_HINT` 模型驱动。判定纯代码、provider 无关。
+- **前台专属**:后台命令立即返回,denial 在 bash_output 里出 hint(不改);gate 不感知 sandbox 模块——escalation 消费者是 bash_tool,`escalate_sandbox` 只用 approver + mode。`disable_sandbox: true` 的调用 sandbox=None,天然不进 escalation 分支。
+- 配置 `[sandbox] escalate` 默认开,false 回退模型驱动 hint。测试 +3(=291):三态映射(含 bypass 不问、无 approver NotAttempted、描述串)、macOS 端到端(批准后裸跑写入成功且无残留 hint / 拒绝后保留失败且不含 hint 邀请 / 各问一次)。真 key 验收:anthropic --yolo 自动批准路径——bash 单次调用完成"拦截→自动升级→裸跑写入",模型拿到 escalated 结果;非 --yolo 下 `[sandbox denied — run without sandbox?]` 审批提示正确弹出(管道 stdin 吞行是 plain REPL 老限制,交互终端无碍),拒绝路径下模型如实换到工作区内写。gpt 轨倾向预设 disable_sandbox(走逃逸参数路径),escalation 环是 provider 无关代码,anthropic 轨已证实。
+
+**剩余(仅平台扩展)**:① Linux 片对着 bwrap+seccomp 设计(landlock 是 legacy),需要 helper 二进制(arg0 dispatch)时把 sandbox.rs 拆成独立 crate;本机无 Linux,宜等仓库推远端后 Linux CI 能实跑再做。② Windows 更后。③ 小挂账:seatbelt 下 `.git` 文件型(worktree gitdir 指针)未解析真实 gitdir(codex 有,罕见场景);bash 工具描述提沙箱但 system prompt 未提(靠 denial hint / escalation 事发时教学,验收显示够用)。macOS 侧沙箱(执行原语 + auto-allow + escalation 环)已完整。
