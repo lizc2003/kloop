@@ -3,6 +3,7 @@
 
 mod anthropic;
 mod openai;
+mod responses;
 pub mod sse;
 
 use std::collections::VecDeque;
@@ -70,6 +71,13 @@ pub enum Provider {
         thinking: ThinkingMode,
     },
     OpenAiCompat {
+        key: String,
+        base: String,
+    },
+    /// OpenAI Responses API (`/responses`), stateless: `store: false`, with
+    /// reasoning carried across requests via encrypted_content blobs riding
+    /// in `Thinking.signature`.
+    OpenAiResponses {
         key: String,
         base: String,
     },
@@ -201,6 +209,33 @@ impl Provider {
                 }
                 tokio::spawn(async move {
                     if let Err(e) = anthropic::stream(&url, &key, &body, &tx).await {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                });
+            }
+            Provider::OpenAiResponses { key, base } => {
+                let url = format!("{base}/responses");
+                let key = key.clone();
+                let body = json!({
+                    "model": model,
+                    "instructions": system,
+                    "input": responses::to_input_items(messages),
+                    "tools": tools.iter().map(|t| json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.schema,
+                    })).collect::<Vec<_>>(),
+                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                    "parallel_tool_calls": true,
+                    // Stateless: the server keeps nothing, so reasoning must
+                    // come back as encrypted blobs for the next request.
+                    "store": false,
+                    "include": ["reasoning.encrypted_content"],
+                    "stream": true,
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = responses::stream(&url, &key, &body, &tx).await {
                         let _ = tx.send(Err(e)).await;
                     }
                 });

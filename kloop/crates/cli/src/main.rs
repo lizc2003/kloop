@@ -473,16 +473,25 @@ fn config_from_env(
             ..base.clone()
         })
     };
-    let openai = || -> Result<Config> {
+    let openai = |responses: bool| -> Result<Config> {
         let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
         let model = std::env::var("AGENT_MODEL")
-            .context("AGENT_MODEL is required for the openai-compat provider")?;
-        Ok(Config {
-            provider: Arc::new(Provider::OpenAiCompat {
+            .context("AGENT_MODEL is required for the openai providers")?;
+        let base_url =
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let provider = if responses {
+            Provider::OpenAiResponses {
                 key,
-                base: std::env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
-            }),
+                base: base_url,
+            }
+        } else {
+            Provider::OpenAiCompat {
+                key,
+                base: base_url,
+            }
+        };
+        Ok(Config {
+            provider: Arc::new(provider),
             model,
             ..base.clone()
         })
@@ -490,12 +499,15 @@ fn config_from_env(
 
     match std::env::var("AGENT_PROVIDER").ok().as_deref() {
         Some("anthropic") => anthropic(),
-        Some("openai") | Some("openai-compat") => openai(),
-        Some(other) => bail!("unknown AGENT_PROVIDER '{other}' (anthropic | openai)"),
+        Some("openai") | Some("openai-compat") => openai(false),
+        Some("openai-responses") => openai(true),
+        Some(other) => {
+            bail!("unknown AGENT_PROVIDER '{other}' (anthropic | openai | openai-responses)")
+        }
         None => {
             if let Ok(cfg) = anthropic() {
                 Ok(cfg)
-            } else if let Ok(cfg) = openai() {
+            } else if let Ok(cfg) = openai(false) {
                 Ok(cfg)
             } else {
                 bail!(

@@ -397,7 +397,10 @@ ANTHROPIC_API_KEY=... cargo run
 # any OpenAI-compatible endpoint (AGENT_MODEL required)
 OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 # OPENAI_BASE_URL defaults to https://api.openai.com/v1
-# AGENT_PROVIDER=anthropic|openai forces a provider when both keys are set
+# AGENT_PROVIDER=anthropic|openai|openai-responses forces a provider when
+# both keys are set; openai-responses speaks the /responses wire (stateless
+# store:false, reasoning replayed via encrypted_content) with the same
+# OPENAI_* variables
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
