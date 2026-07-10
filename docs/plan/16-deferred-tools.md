@@ -1,4 +1,4 @@
-# Plan 14 — deferred 工具 + tool_search
+# Plan 16 — deferred 工具 + tool_search
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 调研结论 4——这是 cc 和 codex **独立收敛的必然解**,直接抄形态不必发明;具体机制两边源码回源核对(教训 11)。
 

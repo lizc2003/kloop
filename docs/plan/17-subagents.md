@@ -1,4 +1,4 @@
-# Plan 18 — 子 agent 升级
+# Plan 17 — 子 agent 升级
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 agents 机制(`.claude/agents/*.md` frontmatter:独立 system prompt、工具白名单、模型 override;并行派发)、codex 的 subagent(SubagentStart/Stop 挂点、SubagentHookContext)。回源核对(教训 11)。
 
@@ -10,7 +10,7 @@ task 工具:深度限 1、`is_concurrency_safe` 标死 false(连续 task 调用�
 
 1. **并行 task**:连续 task 调用并发跑(cc 形态)。子 agent 本来就是独立 tokio task,缺的是把 task 从"永不并发"改成可并发批。要解决:并发写文件的风险怎么表达(权限门是共享的、会各自询问——询问并发弹出的 UI 排队 TUI 已有,plain 会乱,开工时定);UI 上多个子 agent 的 tool 行混流怎么区分(见片 4)。
 2. **自定义 agent 类型**:config 定义命名 agent(独立 system prompt、工具子集白名单、模型 override),task 工具加 `agent_type` 参数,模型可见的类型清单进 task 的 description。文件形态(`.kloop/agents/*.md` frontmatter 还是 config.toml 表)开工时问用户。便宜模型跑搜索型子任务是主要收益。
-3. **子 agent 历史持久化**:子会话落 `.kloop/sessions/`,信封 parent 指回父会话该 turn 的行(plan 7b/15 的链地基复用);`--list-sessions` 里标出从属关系。价值:审计 + 断点续查子 agent 干了什么。
+3. **子 agent 历史持久化**:子会话落 `.kloop/sessions/`,信封 parent 指回父会话该 turn 的行(plan 7b/18 的链地基复用);`--list-sessions` 里标出从属关系。价值:审计 + 断点续查子 agent 干了什么。
 4. **子 agent 的 UI 呈现**:TUI 里子 agent 的 tool 行折叠成一组(带前缀/缩进),turn 结束折叠为一行摘要;server 通知加 `agentId`。现状是子 agent 的 tool_start/tool_end 直接混在主流里。
 5. **hook 挂点**:pre/post_tool 事件带 depth 或 agent 字段;SubagentStart/Stop 独立挂点(对齐 codex 命名)开工时定要不要。
 

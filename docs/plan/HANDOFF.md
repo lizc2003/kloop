@@ -48,12 +48,12 @@
 
 **plan 1–12 全部完成,无挂账**(plan 11 hooks 双轨真 key 验收已过)。后续 plan 已写好(13–17,顺序是建议、可按用户意愿调换,取舍点都标了"开工时定/问用户"):
 
-- **plan 13** 项目上下文注入(AGENTS.md/CLAUDE.md + 环境块进 system)——小而高价值,建议下一个。
-- **plan 14** deferred 工具 + tool_search(双库独立收敛的必然解,MCP 一多就需要)。
-- **plan 15** rewind/fork(7b 信封 id/parent 地基兑现)。
-- **plan 16** 沙箱基建第一片(之后才轮到 codex 的 escalation/execpolicy;可能拆多片)。
-- **plan 17** provider 打磨:Anthropic prompt caching + thinking 块。
-- **plan 18** 子 agent 升级(并行 task/自定义类型/历史持久化/UI 呈现,开工时选片;现状是全家桶里最原始的一块)。
-- **plan 19** 工具面补全(grep/glob 专用工具、web_fetch/search、后台 bash、图片输入,开工时选片;web 注意 core 无网络边界——倾向走 ToolSource 缝)。
+- **plan 13** 项目上下文注入(AGENTS.md/CLAUDE.md + 环境块进 system)——小而高价值,下一个。
+- **plan 14** 工具面补全(grep/glob 专用工具、web_fetch/search、后台 bash、图片输入,开工时选片;web 注意 core 无网络边界——倾向走 ToolSource 缝)——日常最高频,工具面好用后面每个 plan 的 dogfooding 都受益。
+- **plan 15** provider 打磨:Anthropic prompt caching + thinking 块——caching 省之后每次真 key 的钱,协议扩展按教训 7 趁 rollout 存量少时动。
+- **plan 16** deferred 工具 + tool_search(双库独立收敛的必然解;吃 plan 13 的组装缝,等 MCP 多起来才有痛感)。
+- **plan 17** 子 agent 升级(并行 task/自定义类型/历史持久化/UI 呈现,开工时选片;现状是全家桶里最原始的一块;若选历史持久化片,先做 plan 18 的链)。
+- **plan 18** rewind/fork(7b 信封 id/parent 地基兑现;相对奢侈品)。
+- **plan 19** 沙箱基建第一片(工程最大,且等 14 的后台 bash/web 稳定后再罩更划算;之后才轮到 codex 的 escalation/execpolicy;可能拆多片)。
 
 不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、TodoWrite 类计划工具。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。

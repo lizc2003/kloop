@@ -1,4 +1,4 @@
-# Plan 15 — rewind / fork(会话树)
+# Plan 18 — rewind / fork(会话树)
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:plan 7b 的 rollout 信封(id/parent/ts 就是为这一天埋的地基);codex rollout 的 fork/rewind 机制回源核对(教训 11);cc 的 /rewind 语义作对照。
 

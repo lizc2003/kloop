@@ -1,4 +1,4 @@
-# Plan 17 — provider 打磨:prompt caching + thinking 块
+# Plan 15 — provider 打磨:prompt caching + thinking 块
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:Anthropic 官方文档(prompt caching、extended thinking)——协议细节只认 spec(教训 9/11);codex/cc 的实现只看接线位置。
 
