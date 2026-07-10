@@ -171,6 +171,41 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "grep".into(),
+            description: "Search file contents with a regular expression (ripgrep-style; Rust regex syntax, no backreferences/lookaround). Respects .gitignore, searches hidden files, skips binary files; prefer this over grep/rg in bash. Results cap at head_limit; page with offset.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "path": {"type": "string", "description": "File or directory to search (default: current directory)"},
+                    "glob": {"type": "string", "description": "Filter files with a glob, e.g. \"*.rs\" or \"*.{ts,tsx}\""},
+                    "type": {"type": "string", "description": "Filter by file type, e.g. rust, js, py, go"},
+                    "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"], "description": "files_with_matches: file paths newest-first (default); content: matching lines as path:line:text; count: per-file match counts"},
+                    "-i": {"type": "boolean", "description": "Case-insensitive (default false)"},
+                    "-n": {"type": "boolean", "description": "Show line numbers in content mode (default true)"},
+                    "-A": {"type": "integer", "description": "Lines shown after each match (content mode only)"},
+                    "-B": {"type": "integer", "description": "Lines shown before each match (content mode only)"},
+                    "-C": {"type": "integer", "description": "Lines shown around each match (content mode only; overrides -A/-B)"},
+                    "head_limit": {"type": "integer", "description": "Max results returned (default 250, 0 = unlimited)"},
+                    "offset": {"type": "integer", "description": "Skip this many results before head_limit applies (default 0)"},
+                    "multiline": {"type": "boolean", "description": "Patterns may span lines and . matches newlines (default false)"}
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDef {
+            name: "glob".into(),
+            description: "Find files by glob pattern, e.g. \"**/*.rs\", \"src/*.ts\" or \"*.{js,json}\" (gitignore-style: a bare name matches at any depth). Respects .gitignore. Returns paths sorted by modification time, newest first, capped at 100.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern to match file paths against"},
+                    "path": {"type": "string", "description": "Directory to search in (default: current directory)"}
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDef {
             name: "read_offloaded".into(),
             description: "Fetch the full content of an offloaded tool result by its id (e.g. off-0001).".into(),
             schema: json!({
@@ -208,7 +243,7 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
 /// dispatch.
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
     match name {
-        "read_file" | "read_offloaded" => true,
+        "read_file" | "read_offloaded" | "grep" | "glob" => true,
         "bash" => {
             input["command"]
                 .as_str()
@@ -359,6 +394,8 @@ fn execute_tool<'a>(
             "read_file" => read_file_tool(input).await,
             "write_file" => write_file_tool(input).await,
             "edit_file" => edit_file_tool(input).await,
+            "grep" => crate::search::grep_tool(input).await,
+            "glob" => crate::search::glob_tool(input).await,
             "read_offloaded" => read_offloaded_tool(input, ctx).await,
             "task" => task_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
@@ -369,7 +406,7 @@ fn execute_tool<'a>(
     })
 }
 
-fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
+pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     input[key]
         .as_str()
         .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
@@ -806,6 +843,8 @@ mod tests {
                 "read_file",
                 "write_file",
                 "edit_file",
+                "grep",
+                "glob",
                 "read_offloaded",
                 "task",
                 "srv__echo",
@@ -852,7 +891,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("46 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("48 tools"), "got: {warnings:?}");
     }
 
     #[tokio::test]
@@ -931,6 +970,8 @@ mod tests {
             "read_offloaded",
             &json!({"id": "off-0001"})
         ));
+        assert!(is_concurrency_safe("grep", &json!({"pattern": "x"})));
+        assert!(is_concurrency_safe("glob", &json!({"pattern": "*.rs"})));
         assert!(!is_concurrency_safe(
             "write_file",
             &json!({"path": "x", "content": ""})

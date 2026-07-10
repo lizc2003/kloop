@@ -462,7 +462,7 @@ impl CallFacts {
 
     fn is_readonly(&self, name: &str) -> bool {
         match name {
-            "read_file" | "read_offloaded" => true,
+            "read_file" | "read_offloaded" | "grep" | "glob" => true,
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
@@ -707,6 +707,8 @@ mod tests {
         let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "read_file", json!({"path": "x"})).await);
         assert!(ok(&p, "read_offloaded", json!({"id": "off-1"})).await);
+        assert!(ok(&p, "grep", json!({"pattern": "fn main"})).await);
+        assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "task", json!({"prompt": "go"})).await);
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
         assert!(ok(&p, "bash", bash("sed -n 1,20p f.rs")).await);

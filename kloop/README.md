@@ -302,6 +302,30 @@ filesystem); the IO — file discovery, git commands — lives in
 server threads share one process-wide assembly. `--mock` stays hermetic:
 no file reads, no git commands, the pre-assembly hardcoded prompt.
 
+## Search tools (Phase 2, ninth slice)
+
+Dedicated read-only `grep` and `glob` tools (`core/src/search.rs`), built on
+ripgrep's own crates (`grep-searcher`/`grep-regex`/`ignore`) — no external
+binary, no shell-quoting pain, and both are read-only by verdict: they skip
+the approval gate and join concurrent tool batches. Shapes follow cc's
+Grep/Glob:
+
+- **grep**: `pattern` (Rust regex) plus `path`, `glob`, `type` filters;
+  `output_mode` = `files_with_matches` (default, newest-first) | `content`
+  (`path:line:text`, `-n`/`-A`/`-B`/`-C` supported) | `count`; `-i`,
+  `multiline`, and `head_limit`/`offset` paging (default 250). Honors
+  .gitignore, searches hidden files, never descends into VCS dirs, skips
+  binary files, clips matched lines at 500 chars, stops after a 20s budget
+  with a partial-results note.
+- **glob**: gitignore-style `pattern` under `path`, newest-first, capped
+  at 100 with cc's truncation notice.
+
+Two deliberate deviations from cc (documented in plan 14): `glob` honors
+.gitignore (cc's does not — a Rust tree would drown in `target/`), and the
+newest-first sort happens before the cap so truncation drops the stalest
+files, not the freshest. cc has no LS tool anymore; kloop follows (bash `ls`
+is already read-only-whitelisted).
+
 ## Running
 
 ```sh
@@ -436,9 +460,11 @@ crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
   src/history.rs    append-only history, record-time offloading,
                     usage-anchored token estimation
-  src/tools.rs      bash, read/write/edit file, read_offloaded, task;
-                    concurrency-safety classification + batched dispatch;
-                    ToolSource seam for external (MCP) tools
+  src/tools.rs      bash, read/write/edit file, grep, glob, read_offloaded,
+                    task; concurrency-safety classification + batched
+                    dispatch; ToolSource seam for external (MCP) tools
+  src/search.rs     grep/glob implementations on the ripgrep crate family
+                    (gitignore-aware walking, output modes, paging, clipping)
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
   src/permissions.rs the layered execution gate: deny/ask/allow rules,
