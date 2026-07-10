@@ -238,7 +238,7 @@ for permission unless covered by an allow rule (`memory__create_entities` in
 `[permissions].allow`) or the session cache — the `a`/`p` answers work on
 whole-tool granularity.
 
-Layering: core only knows the `ToolSource` trait (`tools.rs`); the wire
+Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (depends only on protocol); the CLI glues
 them (config parsing, namespacing, the adapter). Deferred-tools + tool_search
 for oversized tool lists is future work.
@@ -304,7 +304,7 @@ no file reads, no git commands, the pre-assembly hardcoded prompt.
 
 ## Search tools (Phase 2, ninth slice)
 
-Dedicated read-only `grep` and `glob` tools (`core/src/search.rs`), built on
+Dedicated read-only `grep` and `glob` tools (`core/src/tools/search.rs`), built on
 ripgrep's own crates (`grep-searcher`/`grep-regex`/`ignore`) — no external
 binary, no shell-quoting pain, and both are read-only by verdict: they skip
 the approval gate and join concurrent tool batches. Shapes follow cc's
@@ -460,11 +460,15 @@ crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
   src/history.rs    append-only history, record-time offloading,
                     usage-anchored token estimation
-  src/tools.rs      bash, read/write/edit file, grep, glob, read_offloaded,
-                    task; concurrency-safety classification + batched
-                    dispatch; ToolSource seam for external (MCP) tools
-  src/search.rs     grep/glob implementations on the ripgrep crate family
-                    (gitignore-aware walking, output modes, paging, clipping)
+  src/tools/        the tool seam and the built-in tools
+    mod.rs          tool defs, concurrency-safety classification, batched
+                    dispatch with hook+permission gating; ToolSource seam
+                    for external (MCP) tools
+    bash.rs         shell execution
+    fs.rs           read/write/edit file, read_offloaded
+    search.rs       grep/glob on the ripgrep crate family (gitignore-aware
+                    walking, output modes, paging, clipping)
+    task.rs         sub-agent spawning
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
   src/permissions.rs the layered execution gate: deny/ask/allow rules,

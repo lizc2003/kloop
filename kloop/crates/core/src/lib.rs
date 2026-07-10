@@ -17,7 +17,6 @@ pub mod history;
 pub mod hooks;
 pub mod permissions;
 pub mod rollout;
-pub mod search;
 pub mod shell;
 pub mod tools;
 

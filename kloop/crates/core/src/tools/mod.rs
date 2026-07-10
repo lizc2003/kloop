@@ -1,27 +1,28 @@
+//! The tool seam: definitions, per-input concurrency classification, and
+//! the gated dispatch loop (hooks → permissions → execution). Individual
+//! tool implementations live in the sibling modules; this file is what the
+//! agent loop and the frontends depend on.
+
+mod bash;
+mod fs;
+mod search;
+mod task;
+
 use std::future::Future;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::run_turn;
-use crate::agent::EndReason;
 use crate::agent::Ui;
 use crate::config::Config;
-use crate::history::History;
 use kloop_protocol::ContentBlock;
-use kloop_protocol::Message;
 use kloop_protocol::ToolDef;
-
-const SUBAGENT_MAX_ROUNDS: usize = 15;
 
 /// Past this many tools the definitions start crowding the context window;
 /// the CLI warns at startup (deferred tools + tool_search is the real fix,
@@ -390,14 +391,14 @@ fn execute_tool<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         match name {
-            "bash" => bash_tool(input).await,
-            "read_file" => read_file_tool(input).await,
-            "write_file" => write_file_tool(input).await,
-            "edit_file" => edit_file_tool(input).await,
-            "grep" => crate::search::grep_tool(input).await,
-            "glob" => crate::search::glob_tool(input).await,
-            "read_offloaded" => read_offloaded_tool(input, ctx).await,
-            "task" => task_tool(input, ctx).await,
+            "bash" => bash::bash_tool(input).await,
+            "read_file" => fs::read_file_tool(input).await,
+            "write_file" => fs::write_file_tool(input).await,
+            "edit_file" => fs::edit_file_tool(input).await,
+            "grep" => search::grep_tool(input).await,
+            "glob" => search::glob_tool(input).await,
+            "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
+            "task" => task::task_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
                 Some(source) => source.call(other, input).await,
                 None => Err(anyhow!("unknown tool: {other}")),
@@ -412,176 +413,32 @@ pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a
         .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
 }
 
-async fn bash_tool(input: &Value) -> Result<String> {
-    let command = str_arg(input, "command", "bash")?;
-    let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        tokio::process::Command::new("sh")
-            .arg("-lc")
-            .arg(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("bash: command timed out after {timeout_ms}ms"))?
-    .context("bash: failed to spawn sh")?;
-
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
-        let code = output
-            .status
-            .code()
-            .map_or_else(|| "killed by signal".into(), |c| format!("exit status {c}"));
-        text.push_str(&format!("\n[{code}]"));
-    }
-    if text.is_empty() {
-        text = "(no output)".into();
-    }
-    Ok(text)
-}
-
-async fn read_file_tool(input: &Value) -> Result<String> {
-    let path = str_arg(input, "path", "read_file")?;
-    let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("read_file: cannot read {path}"))?;
-    let out: Vec<String> = content
-        .lines()
-        .enumerate()
-        .skip(offset - 1)
-        .take(limit)
-        .map(|(i, line)| format!("{}\t{line}", i + 1))
-        .collect();
-    if out.is_empty() {
-        return Ok("(no lines in requested range)".into());
-    }
-    Ok(out.join("\n"))
-}
-
-async fn write_file_tool(input: &Value) -> Result<String> {
-    let path = str_arg(input, "path", "write_file")?;
-    let content = str_arg(input, "content", "write_file")?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("write_file: cannot create {}", parent.display()))?;
-        }
-    }
-    tokio::fs::write(path, content)
-        .await
-        .with_context(|| format!("write_file: cannot write {path}"))?;
-    Ok(format!("wrote {} bytes to {path}", content.len()))
-}
-
-async fn edit_file_tool(input: &Value) -> Result<String> {
-    let path = str_arg(input, "path", "edit_file")?;
-    let old = str_arg(input, "old_string", "edit_file")?;
-    let new = str_arg(input, "new_string", "edit_file")?;
-    let replace_all = input["replace_all"].as_bool().unwrap_or(false);
-    if old.is_empty() {
-        bail!("edit_file: old_string must not be empty");
-    }
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("edit_file: cannot read {path}"))?;
-    let count = content.matches(old).count();
-    if count == 0 {
-        bail!("edit_file: old_string not found in {path}");
-    }
-    if count > 1 && !replace_all {
-        bail!("edit_file: old_string matches {count} times in {path}; add surrounding context to disambiguate or set replace_all");
-    }
-    let updated = if replace_all {
-        content.replace(old, new)
-    } else {
-        content.replacen(old, new, 1)
-    };
-    tokio::fs::write(path, updated)
-        .await
-        .with_context(|| format!("edit_file: cannot write {path}"))?;
-    let n = if replace_all { count } else { 1 };
-    Ok(format!("edited {path} ({n} replacement(s))"))
-}
-
-async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let id = str_arg(input, "id", "read_offloaded")?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        bail!("read_offloaded: invalid id (only [A-Za-z0-9-] allowed)");
-    }
-    let path = ctx.cfg.offload_dir.join(format!("{id}.txt"));
-    tokio::fs::read_to_string(&path)
-        .await
-        .with_context(|| format!("read_offloaded: no offloaded output with id {id}"))
-}
-
-async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    if ctx.depth >= 1 {
-        bail!("task: sub-agents cannot spawn further sub-agents");
-    }
-    let prompt = str_arg(input, "prompt", "task")?.to_string();
-    let max_rounds = input["max_rounds"]
-        .as_u64()
-        .map_or(SUBAGENT_MAX_ROUNDS, |n| {
-            (n as usize).clamp(1, SUBAGENT_MAX_ROUNDS)
-        });
-    let sub_cfg = Arc::new(Config {
-        max_rounds,
-        ..(*ctx.cfg).clone()
-    });
-    let ui = ctx.ui.clone();
-    let cancel = ctx.cancel.clone();
-    let depth = ctx.depth + 1;
-    // The sub-agent runs as its own tokio task. Besides matching the
-    // semantics, this breaks the recursion cycle (execute_tool -> run_turn ->
-    // dispatch_tools -> execute_tool): task_tool only holds a JoinHandle,
-    // which is Send regardless of the recursive future's type.
-    let handle = tokio::spawn(async move {
-        let mut history = History::new(sub_cfg.offload_dir.clone());
-        history.record(Message::user_text(prompt));
-        run_turn(&sub_cfg, &mut history, &ui, &cancel, depth).await
-    });
-    let outcome = handle
-        .await
-        .map_err(|e| anyhow!("task: sub-agent panicked: {e}"))?;
-    match outcome.reason {
-        EndReason::Completed => Ok(outcome.final_text),
-        EndReason::MaxRounds => Ok(format!(
-            "[sub-agent stopped at its round limit]\n{}",
-            outcome.final_text
-        )),
-        EndReason::Aborted => Err(anyhow!("task: sub-agent interrupted")),
-        EndReason::Error(e) => Err(anyhow!("task: sub-agent failed: {e}")),
-    }
-}
-
+/// Shared fixtures for the per-module tool tests: a permissive ToolCtx and
+/// a dispatch-path runner, so every tool test exercises the real gate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testutil {
     use super::*;
     use kloop_provider::Provider;
 
-    fn bash_input(cmd: &str) -> Value {
+    pub(crate) fn bash_input(cmd: &str) -> Value {
         json!({"command": cmd})
     }
 
-    struct SilentUi;
+    pub(crate) struct SilentUi;
     impl Ui for SilentUi {
         fn text_delta(&self, _: &str) {}
         fn note(&self, _: &str) {}
     }
 
-    fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
+    pub(crate) fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
         test_ctx_with_sources(depth, tag, Vec::new())
     }
 
-    fn test_ctx_with_sources(depth: u8, tag: &str, sources: Vec<Arc<dyn ToolSource>>) -> ToolCtx {
+    pub(crate) fn test_ctx_with_sources(
+        depth: u8,
+        tag: &str,
+        sources: Vec<Arc<dyn ToolSource>>,
+    ) -> ToolCtx {
         ToolCtx {
             cfg: Arc::new(Config {
                 provider: Arc::new(Provider::mock(vec![])),
@@ -603,6 +460,25 @@ mod tests {
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
+
+    /// Run a single tool call through the real dispatch path and return
+    /// (content, is_error).
+    pub(crate) async fn run_tool(name: &str, input: Value, ctx: &ToolCtx) -> (String, bool) {
+        let results = dispatch_tools(vec![("t".into(), name.into(), input)], ctx).await;
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = results.into_iter().next().unwrap()
+        else {
+            panic!("expected tool result");
+        };
+        (content, is_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
 
     /// External source stub: `{prefix}__echo` (marked read-only) and
     /// `{prefix}__fail` (always errors).
@@ -646,172 +522,6 @@ mod tests {
                 Ok(format!("echoed {}", input["text"].as_str().unwrap_or("?")))
             })
         }
-    }
-
-    /// Run a single tool call through the real dispatch path and return
-    /// (content, is_error).
-    async fn run_tool(name: &str, input: Value, ctx: &ToolCtx) -> (String, bool) {
-        let results = dispatch_tools(vec![("t".into(), name.into(), input)], ctx).await;
-        let ContentBlock::ToolResult {
-            content, is_error, ..
-        } = results.into_iter().next().unwrap()
-        else {
-            panic!("expected tool result");
-        };
-        (content, is_error)
-    }
-
-    fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("kloop-tool-{}-{tag}", std::process::id()));
-        std::fs::write(&path, content).unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn bash_merges_output_and_reports_exit_status() {
-        let ctx = test_ctx(0, "bash");
-        let (out, is_error) = run_tool(
-            "bash",
-            bash_input("echo to-stdout; echo to-stderr 1>&2; exit 3"),
-            &ctx,
-        )
-        .await;
-        assert!(
-            !is_error,
-            "non-zero exit is reported in content, not as an error result"
-        );
-        assert!(out.contains("to-stdout"));
-        assert!(out.contains("to-stderr"));
-        assert!(out.contains("[exit status 3]"));
-
-        let (out, _) = run_tool("bash", bash_input("true"), &ctx).await;
-        assert_eq!(out, "(no output)");
-    }
-
-    #[tokio::test]
-    async fn bash_times_out_and_kills_the_child() {
-        let ctx = test_ctx(0, "bash-timeout");
-        let started = std::time::Instant::now();
-        let (out, is_error) = run_tool(
-            "bash",
-            json!({"command": "sleep 30", "timeout_ms": 100}),
-            &ctx,
-        )
-        .await;
-        assert!(is_error);
-        assert!(out.contains("timed out"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn read_file_numbers_lines_with_offset_and_limit() {
-        let path = temp_file("read", "alpha\nbeta\ngamma\ndelta\n");
-        let ctx = test_ctx(0, "read");
-        let (out, is_error) = run_tool(
-            "read_file",
-            json!({"path": path.to_str().unwrap(), "offset": 2, "limit": 2}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error);
-        assert_eq!(out, "2\tbeta\n3\tgamma");
-
-        let (out, is_error) =
-            run_tool("read_file", json!({"path": "/nonexistent/kloop"}), &ctx).await;
-        assert!(is_error);
-        assert!(out.contains("cannot read"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn write_file_creates_parent_directories() {
-        let dir = std::env::temp_dir().join(format!("kloop-write-{}", std::process::id()));
-        let path = dir.join("deep/nested/file.txt");
-        let ctx = test_ctx(0, "write");
-        let (out, is_error) = run_tool(
-            "write_file",
-            json!({"path": path.to_str().unwrap(), "content": "created"}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error, "{out}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn edit_file_replaces_errors_and_replace_all() {
-        let path = temp_file("edit", "one two two three");
-        let p = path.to_str().unwrap();
-        let ctx = test_ctx(0, "edit");
-
-        // Ambiguous match without replace_all is an error and changes nothing.
-        let (out, is_error) = run_tool(
-            "edit_file",
-            json!({"path": p, "old_string": "two", "new_string": "2"}),
-            &ctx,
-        )
-        .await;
-        assert!(is_error);
-        assert!(out.contains("2 times"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one two two three");
-
-        // Missing old_string is an error.
-        let (out, is_error) = run_tool(
-            "edit_file",
-            json!({"path": p, "old_string": "zzz", "new_string": "2"}),
-            &ctx,
-        )
-        .await;
-        assert!(is_error);
-        assert!(out.contains("not found"));
-
-        // replace_all rewrites every occurrence.
-        let (_, is_error) = run_tool(
-            "edit_file",
-            json!({"path": p, "old_string": "two", "new_string": "2", "replace_all": true}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one 2 2 three");
-
-        // Unique match replaces exactly once.
-        let (_, is_error) = run_tool(
-            "edit_file",
-            json!({"path": p, "old_string": "one", "new_string": "1"}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1 2 2 three");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn read_offloaded_round_trip_and_id_validation() {
-        let ctx = test_ctx(0, "offloaded");
-        std::fs::create_dir_all(&ctx.cfg.offload_dir).unwrap();
-        std::fs::write(ctx.cfg.offload_dir.join("off-7777.txt"), "full payload").unwrap();
-
-        let (out, is_error) = run_tool("read_offloaded", json!({"id": "off-7777"}), &ctx).await;
-        assert!(!is_error);
-        assert_eq!(out, "full payload");
-
-        // Path traversal shapes are rejected before touching the filesystem.
-        let (out, is_error) =
-            run_tool("read_offloaded", json!({"id": "../../etc/passwd"}), &ctx).await;
-        assert!(is_error);
-        assert!(out.contains("invalid id"));
-        let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
-    }
-
-    #[tokio::test]
-    async fn task_is_refused_at_depth_one() {
-        let ctx = test_ctx(1, "depth");
-        let (out, is_error) = run_tool("task", json!({"prompt": "recurse"}), &ctx).await;
-        assert!(is_error);
-        assert!(out.contains("cannot spawn"));
     }
 
     #[test]
