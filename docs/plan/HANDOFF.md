@@ -46,4 +46,12 @@
 
 ## 四、进度
 
-**编号 plan(1–12)全部完成,无挂账**(plan 11 hooks 双轨真 key 验收已过)。下一步没有既定 plan,由用户定方向;已知的候选未来工作:deferred 工具 + tool_search(工具列表过大时)、rollout 链上的 rewind/fork、沙箱基建(之后才抄 codex 的 escalation/execpolicy)、首次推远端后看 CI 实跑。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
+**plan 1–12 全部完成,无挂账**(plan 11 hooks 双轨真 key 验收已过)。后续 plan 已写好(13–17,顺序是建议、可按用户意愿调换,取舍点都标了"开工时定/问用户"):
+
+- **plan 13** 项目上下文注入(AGENTS.md/CLAUDE.md + 环境块进 system)——小而高价值,建议下一个。
+- **plan 14** deferred 工具 + tool_search(双库独立收敛的必然解,MCP 一多就需要)。
+- **plan 15** rewind/fork(7b 信封 id/parent 地基兑现)。
+- **plan 16** 沙箱基建第一片(之后才轮到 codex 的 escalation/execpolicy;可能拆多片)。
+- **plan 17** provider 打磨:Anthropic prompt caching + thinking 块。
+
+不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):专用 grep/glob 工具、自定义子 agent 类型、OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
