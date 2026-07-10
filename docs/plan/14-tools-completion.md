@@ -1,6 +1,6 @@
 # Plan 14 — 工具面补全
 
-> ✅ 第一片(grep + glob)已完成,提交号见文末完成记录;切片 2/3/4 挂账,后续会话继续。
+> ✅ 第一片(grep + glob)已完成(c795cea);切片 2/3/4 挂账,后续会话继续。
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 Grep/Glob/WebFetch/后台 Bash 形态、codex 的对应工具;实现细节回源核对(教训 11)。注意 P0 决定 1 仍然有效:编辑保持 Edit 形态,不做 apply_patch/多文件 patch。
 
