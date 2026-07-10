@@ -1,4 +1,4 @@
-# Plan 19 — 沙箱基建(第一片)✅(第一片完成,提交号见下)
+# Plan 19 — 沙箱基建(第一片)✅(第一片完成,68bcf18)
 
 > 可能不止一个会话,开工时切片。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 权限系统对比"codex 独有、kloop 暂不做"一节——sandbox+approval 双轴、escalation 环、execpolicy、Starlark 规则都**依赖沙箱基建**,这个 plan 就是去补基建;codex codex-rs 的 seatbelt(macOS)/landlock+seccomp(Linux)实现回源精读(教训 11,这是安全层,更不能凭印象)。
 
