@@ -1,6 +1,6 @@
 # Plan 14 — 工具面补全
 
-> ✅ 第一片(grep + glob,c795cea)、第三片(后台 bash,38ab3dc)、第二片(web_fetch/web_search)已完成,提交号见各自完成记录;web_search 真实端点验收等 BRAVE_API_KEY。剩切片 4(图片,倾向归 plan 15 协议扩展一起做)。
+> ✅ 第一片(grep + glob,c795cea)、第三片(后台 bash,38ab3dc)、第二片(web_fetch/web_search,2fed3af)已完成;web_search 真实端点验收等 BRAVE_API_KEY。剩切片 4(图片,倾向归 plan 15 协议扩展一起做)。
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 Grep/Glob/WebFetch/后台 Bash 形态、codex 的对应工具;实现细节回源核对(教训 11)。注意 P0 决定 1 仍然有效:编辑保持 Edit 形态,不做 apply_patch/多文件 patch。
 
