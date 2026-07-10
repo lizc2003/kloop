@@ -53,5 +53,6 @@
 - **plan 15** rewind/fork(7b 信封 id/parent 地基兑现)。
 - **plan 16** 沙箱基建第一片(之后才轮到 codex 的 escalation/execpolicy;可能拆多片)。
 - **plan 17** provider 打磨:Anthropic prompt caching + thinking 块。
+- **plan 18** 子 agent 升级(并行 task/自定义类型/历史持久化/UI 呈现,开工时选片;现状是全家桶里最原始的一块)。
 
-不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):专用 grep/glob 工具、自定义子 agent 类型、OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
+不占编号的小事:首次推远端后看 CI 实跑一次绿。备选池(未编号未承诺):专用 grep/glob 工具、OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
