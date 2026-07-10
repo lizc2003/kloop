@@ -62,10 +62,9 @@ and auditable, and replay just swaps in the replacement and keeps reading.
 
 Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
-(unix ms). Replay is linear today; the chain is the schema foundation for
-rewind/forking later, laid down now because adding it after files exist would
-mean a format migration. Unknown fields are ignored on read (locked by test),
-so the format grows additively.
+(unix ms). Within one file the chain is purely sequential; a forked file's
+first line carries a cross-file parent (see Fork below). Unknown fields are
+ignored on read (locked by test), so the format grows additively.
 
 Resume replays the file, then makes the history legal and consistent again:
 
@@ -85,6 +84,35 @@ Resume replays the file, then makes the history legal and consistent again:
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
 <id>` a specific one, `--list-sessions` shows what's on disk.
+
+### Fork (and rewind)
+
+`--fork <id>#<seq>` branches a new session off an existing one at line
+`#<seq>` and continues there (`--fork <id>` forks at the end). This also
+covers rewind: fork your own session at an earlier point and take the other
+road — cheaper than an in-place rewind mechanism, and codex upstream is
+deprecating its rollback API in favor of exactly this.
+
+Mechanics (the shape both references converged on — cc's `/branch` and
+codex's `thread/fork` both copy, neither replays across files):
+
+- the kept prefix (`#1..=#<seq>`) is physically copied into a brand-new
+  session file, re-enveloped under the new stem with timestamps preserved;
+  the source file is never touched;
+- the fork's first line carries a cross-file parent — `{source}#{seq}` —
+  as lineage metadata only; replay stays single-file, so `--resume` works
+  on a fork unchanged and forks can be forked again. `--list-sessions`
+  shows the lineage as `[forked from {source}#{seq}]`;
+- a cut is legal only where the kept prefix ends a complete exchange (the
+  next line must start a fresh user turn — cc's `/rewind` whitelist rule),
+  which makes splitting a tool_use/tool_result pair impossible by
+  construction; an illegal cut lists the legal points near it;
+- a compacted marker inside the prefix replays as usual; a cut at a legal
+  point *before* one forks the raw pre-compaction history, which never
+  left the file;
+- offload files are shared across branches (pointers are copied text; the
+  dir-scanning counter already prevents clobbering), and usage anchors are
+  not persisted, so a fork re-anchors on its first sampled response.
 
 ## Permissions (Phase 2, third slice)
 
@@ -473,6 +501,8 @@ cargo run -- --list-sessions   # what's on disk, most recent first
 cargo run -- --continue        # continue the most recent session
 cargo run -- --resume          # pick a session from a numbered list
 cargo run -- --resume <id>     # continue a specific session
+cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
+cargo run -- --fork <id>       # branch off a session at its end
 
 # MCP servers come from .kloop/config.toml — see MCP client above
 # AGENT_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
@@ -492,7 +522,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 159 tests across the workspace:
+`cargo test` runs 272 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -525,7 +555,11 @@ saved and resumable — see Session persistence above.
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
   unknown-field forward compatibility, offload counter sync, and a full
-  persist → restart → resume turn over the Mock provider.
+  persist → restart → resume turn over the Mock provider; fork contracts
+  (prefix copy with cross-file lineage and preserved timestamps, branches
+  append independently, illegal cuts rejected with nearby legal points,
+  cuts before/at a compacted marker replay each side, fork-of-a-fork,
+  branches share the offload dir without clobbering).
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
   accumulation and splitting, tool status resolution by id, confirm queueing

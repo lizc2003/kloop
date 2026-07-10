@@ -4,12 +4,16 @@
 //! the full replacement history, so the file itself stays append-only and
 //! auditable. Replay swaps in the replacement and keeps reading.
 //!
-//! Every line carries an envelope (`id`, `parent`, `ts`): today replay is
-//! linear and the chain is purely sequential, but the fields are the schema
-//! foundation for rewind/forking later — adding them after files exist would
-//! mean a format migration. Ids are `{file stem}#{seq}` — unique within the
-//! file without a rand dependency. Unknown fields in a line are ignored on
-//! read, so the format can grow additively.
+//! Every line carries an envelope (`id`, `parent`, `ts`): replay is linear
+//! and within one file the chain is purely sequential, but the fields make
+//! forking expressible — a forked file's FIRST line carries a cross-file
+//! parent (`{source stem}#{cut seq}`) recording where it branched off. That
+//! pointer is lineage metadata only: a fork physically copies the kept
+//! prefix (what cc's /branch and codex's thread/fork both do — neither
+//! replays across files), so replay never follows it. Ids are
+//! `{file stem}#{seq}` — unique within the file without a rand dependency.
+//! Unknown fields in a line are ignored on read, so the format can grow
+//! additively.
 
 use std::collections::HashSet;
 use std::io;
@@ -136,39 +140,58 @@ struct ParsedSession {
     intact_end: usize,
 }
 
-fn parse_session(raw: &str) -> ParsedSession {
-    let mut parsed = ParsedSession {
-        items: Vec::new(),
-        last_id: None,
-        max_seq: 0,
-        intact_end: 0,
-    };
+/// Every intact line in file order, plus the byte offset just past the last
+/// one; anything after that offset is a malformed or unterminated tail
+/// (crash mid-append).
+fn intact_lines(raw: &str) -> (Vec<RolloutLine>, usize) {
+    let mut lines = Vec::new();
+    let mut intact_end = 0;
     for line in raw.split_inclusive('\n') {
         // An unterminated final line is a torn write, never trustworthy.
         if !line.ends_with('\n') {
             break;
         }
         let content = line.trim();
-        if content.is_empty() {
-            parsed.intact_end += line.len();
-            continue;
+        if !content.is_empty() {
+            match serde_json::from_str(content) {
+                Ok(parsed) => lines.push(parsed),
+                Err(_) => break,
+            }
         }
-        let meta = match serde_json::from_str(content) {
-            Ok(RolloutLine::Message { meta, message }) => {
+        intact_end += line.len();
+    }
+    (lines, intact_end)
+}
+
+fn seq_of(meta: &LineMeta) -> u64 {
+    meta.id
+        .rsplit('#')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_session(raw: &str) -> ParsedSession {
+    let (lines, intact_end) = intact_lines(raw);
+    let mut parsed = ParsedSession {
+        items: Vec::new(),
+        last_id: None,
+        max_seq: 0,
+        intact_end,
+    };
+    for line in lines {
+        let meta = match line {
+            RolloutLine::Message { meta, message } => {
                 parsed.items.push(message);
                 meta
             }
-            Ok(RolloutLine::Compacted { meta, replacement }) => {
+            RolloutLine::Compacted { meta, replacement } => {
                 parsed.items = replacement;
                 meta
             }
-            Err(_) => break,
         };
-        if let Some(seq) = meta.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
-            parsed.max_seq = parsed.max_seq.max(seq);
-        }
+        parsed.max_seq = parsed.max_seq.max(seq_of(&meta));
         parsed.last_id = Some(meta.id);
-        parsed.intact_end += line.len();
     }
     parsed
 }
@@ -201,6 +224,127 @@ pub fn resume_session(path: &Path) -> io::Result<(Vec<Message>, Rollout)> {
         last_id: parsed.last_id,
     };
     Ok((repair_pairing(parsed.items), rollout))
+}
+
+/// Fork a session: copy lines `#1..=#{cut}` of `src` into a brand-new
+/// session file whose first line's `parent` points across files at
+/// `{src stem}#{cut}`. The pointer is lineage metadata only — the prefix is
+/// physically copied (re-enveloped under the new stem, timestamps
+/// preserved), so replay stays single-file and [`resume_session`] works on
+/// a fork unchanged. The source file is never touched.
+///
+/// A cut is legal when the kept prefix ends a complete exchange: the next
+/// line — if any — must open a fresh user turn (a user message with no
+/// tool_result blocks). This whitelist (cc's /rewind rule) makes splitting
+/// a tool_use/tool_result pair impossible by construction. A cut just
+/// before a compacted marker is therefore illegal, but a cut at any legal
+/// point BEFORE one forks the raw pre-compaction history — the lines are
+/// still in the file. `None` forks at the end.
+pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Result<PathBuf> {
+    let illegal = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
+    let raw = std::fs::read_to_string(src)?;
+    let (lines, _) = intact_lines(&raw);
+    let legal = legal_cut_seqs(&lines);
+    let Some(&last) = legal.last() else {
+        return Err(illegal("session has no lines to fork".into()));
+    };
+    let cut = cut.unwrap_or(last);
+    if !legal.contains(&cut) {
+        let mut near = legal;
+        near.sort_by_key(|s| s.abs_diff(cut));
+        near.truncate(8);
+        near.sort_unstable();
+        let near: Vec<String> = near.iter().map(|s| format!("#{s}")).collect();
+        return Err(illegal(format!(
+            "cannot fork at #{cut}: the kept prefix must end a complete exchange \
+             (the next line must start a user turn); legal points near it: {} (end = #{last})",
+            near.join(", ")
+        )));
+    }
+
+    let id = new_session_id(sessions_dir);
+    let path = session_path(sessions_dir, &id);
+    let prefix = id_prefix(&path);
+    let mut parent = Some(format!("{}#{cut}", id_prefix(src)));
+    let mut out = String::new();
+    for (n, line) in lines
+        .into_iter()
+        .take_while(|line| {
+            let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
+            seq_of(meta) <= cut
+        })
+        .enumerate()
+    {
+        let mut remeta = |meta: LineMeta| {
+            let new_id = format!("{prefix}#{}", n as u64 + 1);
+            LineMeta {
+                id: new_id.clone(),
+                parent: parent.replace(new_id),
+                ts: meta.ts,
+            }
+        };
+        let line = match line {
+            RolloutLine::Message { meta, message } => RolloutLine::Message {
+                meta: remeta(meta),
+                message,
+            },
+            RolloutLine::Compacted { meta, replacement } => RolloutLine::Compacted {
+                meta: remeta(meta),
+                replacement,
+            },
+        };
+        out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
+        out.push('\n');
+    }
+    std::fs::create_dir_all(sessions_dir)?;
+    // create_new: new_session_id picked an unused id; clobbering an existing
+    // session here would destroy history, so a collision must be an error.
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(out.as_bytes())?;
+    Ok(path)
+}
+
+/// Seqs after which the file may be cut: every line whose successor starts
+/// a fresh user turn, plus the last line.
+fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
+    let opens_user_turn = |line: &RolloutLine| match line {
+        RolloutLine::Message { message, .. } => {
+            message.role == Role::User
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        }
+        RolloutLine::Compacted { .. } => false,
+    };
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match lines.get(i + 1) {
+            Some(next) => opens_user_turn(next),
+            None => true,
+        })
+        .map(|(_, line)| {
+            let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
+            seq_of(meta)
+        })
+        .collect()
+}
+
+/// Where a session was forked from: the first line's cross-file parent
+/// (`{src stem}#{seq}`), or None for a session started fresh (its first
+/// line has no parent). Reads only the first line.
+pub fn fork_origin(path: &Path) -> Option<String> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) =
+        serde_json::from_str(first.trim()).ok()?;
+    meta.parent
 }
 
 /// Make the replayed history legal to send. Both directions, mirroring what
@@ -726,6 +870,183 @@ mod tests {
         // The file now replays to the full two-run conversation.
         assert_eq!(load_session(&path).unwrap(), history.messages());
         assert_eq!(history.messages().len(), 4);
+        cleanup(&path);
+    }
+
+    /// Six lines with one tool exchange: legal cuts are #4 (next line opens
+    /// a user turn) and #6 (end).
+    fn seed_forkable(path: &Path) -> Vec<Message> {
+        let messages = vec![
+            Message::user_text("one"),
+            Message::assistant(vec![tool_use("t1")]),
+            Message::tool_results(vec![tool_result("t1")]),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]),
+            Message::user_text("two"),
+            Message::assistant(vec![ContentBlock::Text { text: "bye".into() }]),
+        ];
+        let mut rollout = Rollout::new(path.to_path_buf());
+        for m in &messages {
+            rollout.append_message(m).unwrap();
+        }
+        messages
+    }
+
+    #[test]
+    fn fork_copies_prefix_and_branches_diverge_independently() {
+        let path = temp_file("fork");
+        let dir = path.parent().unwrap().to_path_buf();
+        let messages = seed_forkable(&path);
+
+        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        let fork_stem = session_id_of(&fork_path);
+        assert_ne!(fork_stem, "session");
+        assert_eq!(load_session(&fork_path).unwrap(), messages[..4].to_vec());
+        assert_eq!(fork_origin(&fork_path).unwrap(), "session#4");
+        assert_eq!(fork_origin(&path), None, "fresh session has no origin");
+
+        // Re-enveloped chain: new stem, seq from 1, first parent crosses
+        // files, timestamps preserved from the source lines.
+        let src_lines = raw_lines(&path);
+        let lines = raw_lines(&fork_path);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["id"], format!("{fork_stem}#1"));
+        assert_eq!(lines[0]["parent"], "session#4");
+        assert_eq!(lines[1]["id"], format!("{fork_stem}#2"));
+        assert_eq!(lines[1]["parent"], format!("{fork_stem}#1"));
+        for (line, src) in lines.iter().zip(&src_lines) {
+            assert_eq!(line["ts"], src["ts"], "history keeps its original time");
+        }
+
+        // Both branches keep appending without seeing each other.
+        let (_, mut fork_rollout) = resume_session(&fork_path).unwrap();
+        fork_rollout
+            .append_message(&Message::user_text("fork branch"))
+            .unwrap();
+        let (_, mut src_rollout) = resume_session(&path).unwrap();
+        src_rollout
+            .append_message(&Message::user_text("main branch"))
+            .unwrap();
+        let mut fork_expected = messages[..4].to_vec();
+        fork_expected.push(Message::user_text("fork branch"));
+        assert_eq!(load_session(&fork_path).unwrap(), fork_expected);
+        let mut src_expected = messages;
+        src_expected.push(Message::user_text("main branch"));
+        assert_eq!(load_session(&path).unwrap(), src_expected);
+        let appended = raw_lines(&fork_path);
+        assert_eq!(appended[4]["id"], format!("{fork_stem}#5"));
+        assert_eq!(appended[4]["parent"], format!("{fork_stem}#4"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_without_cut_copies_the_whole_session() {
+        let path = temp_file("forkend");
+        let dir = path.parent().unwrap().to_path_buf();
+        let messages = seed_forkable(&path);
+        let fork_path = fork_session(&path, None, &dir).unwrap();
+        assert_eq!(load_session(&fork_path).unwrap(), messages);
+        assert_eq!(fork_origin(&fork_path).unwrap(), "session#6");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn illegal_cuts_are_rejected_with_nearby_legal_points() {
+        let path = temp_file("forkbad");
+        let dir = path.parent().unwrap().to_path_buf();
+        seed_forkable(&path);
+        // #2 would split the t1 tool exchange.
+        let err = fork_session(&path, Some(2), &dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("#4") && msg.contains("end = #6"), "{msg}");
+        // Past the end of the file.
+        assert!(fork_session(&path, Some(99), &dir).is_err());
+        // Nothing to fork at all.
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        assert!(fork_session(&empty, None, &dir).is_err());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_across_a_compacted_marker_replays_each_side() {
+        let path = temp_file("forkcompact");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut rollout = Rollout::new(path.clone());
+        let assistant_text =
+            |t: &str| Message::assistant(vec![ContentBlock::Text { text: t.into() }]);
+        let pre = vec![Message::user_text("a"), assistant_text("b")];
+        for m in &pre {
+            rollout.append_message(m).unwrap();
+        }
+        rollout.append_message(&Message::user_text("c")).unwrap();
+        rollout.append_message(&assistant_text("d")).unwrap();
+        let replacement = vec![Message::user_text("[summary]")];
+        rollout.append_compacted(&replacement).unwrap(); // #5
+        rollout.append_message(&Message::user_text("e")).unwrap();
+
+        // Cutting at the marker keeps it: the fork replays the replacement.
+        let at_marker = fork_session(&path, Some(5), &dir).unwrap();
+        assert_eq!(load_session(&at_marker).unwrap(), replacement);
+        // Cutting before compaction forks the raw history the marker later
+        // superseded — those lines never left the file.
+        let before = fork_session(&path, Some(2), &dir).unwrap();
+        assert_eq!(load_session(&before).unwrap(), pre);
+        // The line just before the marker is not a legal cut (its successor
+        // is the marker, not a user turn).
+        assert!(fork_session(&path, Some(4), &dir).is_err());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_of_a_fork_points_at_the_middle_file() {
+        let path = temp_file("forkfork");
+        let dir = path.parent().unwrap().to_path_buf();
+        seed_forkable(&path);
+        let first = fork_session(&path, Some(4), &dir).unwrap();
+        let second = fork_session(&first, None, &dir).unwrap();
+        let first_stem = session_id_of(&first);
+        assert_eq!(fork_origin(&second).unwrap(), format!("{first_stem}#4"));
+        assert_eq!(
+            load_session(&second).unwrap(),
+            load_session(&first).unwrap()
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn forked_branches_share_the_offload_dir_without_clobbering() {
+        use crate::history::History;
+        let path = temp_file("forkoffload");
+        let dir = path.parent().unwrap().to_path_buf();
+        seed_forkable(&path);
+        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+
+        // Resume both branches against the shared offload dir and spill from
+        // each: the ids must never collide (counter is dir-global).
+        let spill_from = |session: &Path| {
+            let (messages, rollout) = resume_session(session).unwrap();
+            let mut history = History::resume(dir.clone(), messages, rollout);
+            history.record(Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "big".into(),
+                content: "x".repeat(9_000),
+                is_error: false,
+            }]));
+            let ContentBlock::ToolResult { content, .. } =
+                &history.messages().last().unwrap().content[0]
+            else {
+                panic!("expected tool result");
+            };
+            let start = content.find("id=off-").expect("pointer has id") + 3;
+            content[start..start + 8].to_string()
+        };
+        let main_id = spill_from(&path);
+        let fork_id = spill_from(&fork_path);
+        assert_ne!(main_id, fork_id);
+        assert!(dir.join(format!("{main_id}.txt")).exists());
+        assert!(dir.join(format!("{fork_id}.txt")).exists());
         cleanup(&path);
     }
 

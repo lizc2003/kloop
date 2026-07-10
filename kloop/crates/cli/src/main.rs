@@ -1,6 +1,6 @@
 //! kloop CLI: environment-driven configuration, a line-based REPL with
-//! Ctrl+C interruption, session persistence (`--resume`, `--list-sessions`),
-//! MCP server wiring, and the keyless `--mock` demo.
+//! Ctrl+C interruption, session persistence (`--resume`, `--fork`,
+//! `--list-sessions`), MCP server wiring, and the keyless `--mock` demo.
 
 mod context;
 mod mcp;
@@ -33,6 +33,8 @@ use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::first_user_snippet;
+use kloop_core::rollout::fork_origin;
+use kloop_core::rollout::fork_session;
 use kloop_core::rollout::load_session;
 use kloop_core::rollout::new_session_id;
 use kloop_core::rollout::resume_session;
@@ -56,6 +58,14 @@ enum SessionChoice {
     /// `--resume` with no id: pick from a numbered list.
     Pick,
     Resume(String),
+    /// `--fork <id>[#<seq>]`: branch a new session off an existing one at a
+    /// line boundary (no seq = at the end) and continue there. Covers rewind
+    /// too: fork the current session at an earlier point and take the other
+    /// road — the original file is never touched.
+    Fork {
+        id: String,
+        cut: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,8 +108,27 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                     _ => SessionChoice::Pick,
                 };
             }
+            "--fork" => {
+                let arg = match args.get(i + 1) {
+                    Some(arg) if !arg.starts_with('-') => arg,
+                    _ => bail!("--fork needs a session (<id> or <id>#<seq>)"),
+                };
+                i += 1;
+                parsed.session = match arg.split_once('#') {
+                    None => SessionChoice::Fork {
+                        id: arg.clone(),
+                        cut: None,
+                    },
+                    Some((id, seq)) => SessionChoice::Fork {
+                        id: id.to_string(),
+                        cut: Some(seq.parse().with_context(|| {
+                            format!("--fork: '{seq}' is not a line number (<id>#<seq>)")
+                        })?),
+                    },
+                };
+            }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --continue | --resume [id] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
         }
         i += 1;
@@ -109,13 +138,16 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
 
 fn session_line(path: &Path) -> String {
     let id = session_id_of(path);
+    let origin = fork_origin(path)
+        .map(|o| format!("  [forked from {o}]"))
+        .unwrap_or_default();
     match load_session(path) {
         Ok(messages) => format!(
-            "{id}  {} message(s)  {}",
+            "{id}  {} message(s)  {}{origin}",
             messages.len(),
             first_user_snippet(&messages)
         ),
-        Err(e) => format!("{id}  (unreadable: {e})"),
+        Err(e) => format!("{id}  (unreadable: {e}){origin}"),
     }
 }
 
@@ -187,6 +219,22 @@ fn open_history(
             .next()
             .context("no saved sessions to continue")?,
         SessionChoice::Pick => pick_session(sessions_dir)?,
+        SessionChoice::Fork { id, cut } => {
+            let src = session_path(sessions_dir, id);
+            if !src.exists() {
+                bail!("no session '{id}' (try --list-sessions)");
+            }
+            let path = fork_session(&src, *cut, sessions_dir)
+                .with_context(|| format!("cannot fork session '{id}'"))?;
+            println!(
+                "[forked {id}#{cut} → {fork_id}]",
+                cut = fork_origin(&path)
+                    .and_then(|origin| origin.rsplit('#').next().map(str::to_string))
+                    .unwrap_or_default(),
+                fork_id = session_id_of(&path),
+            );
+            path
+        }
     };
     let id = session_id_of(&resume_path);
     let (messages, rollout) = resume_session(&resume_path)
@@ -877,6 +925,35 @@ mod tests {
                 serve: false,
                 session: SessionChoice::New,
             }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--fork", "20260709-120000#4"])).unwrap(),
+            CliArgs {
+                mock: false,
+                yolo: false,
+                accept_edits: false,
+                list_sessions: false,
+                plain: false,
+                serve: false,
+                session: SessionChoice::Fork {
+                    id: "20260709-120000".into(),
+                    cut: Some(4),
+                },
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--fork", "20260709-120000"]))
+                .unwrap()
+                .session,
+            SessionChoice::Fork {
+                id: "20260709-120000".into(),
+                cut: None,
+            }
+        );
+        assert!(parse_args(&strings(&["--fork"])).is_err(), "id required");
+        assert!(
+            parse_args(&strings(&["--fork", "id#notanumber"])).is_err(),
+            "seq must parse"
         );
         assert!(parse_args(&strings(&["--bogus"])).is_err());
     }
