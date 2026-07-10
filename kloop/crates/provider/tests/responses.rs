@@ -135,8 +135,10 @@ async fn streams_reasoning_text_and_function_call() {
             json!({"type": "response.created"}),
             json!({"type": "response.reasoning_summary_text.delta", "delta": "let me"}),
             json!({"type": "response.reasoning_summary_text.delta", "delta": " see"}),
+            // Field set mirrors the real wire (2026-07-10, live capture):
+            // reasoning carries content/id alongside summary/encrypted_content.
             json!({"type": "response.output_item.done", "item": {
-                "type": "reasoning", "id": "rs_1",
+                "type": "reasoning", "id": "rs_1", "content": [],
                 "summary": [{"type": "summary_text", "text": "let me"},
                             {"type": "summary_text", "text": " see"}],
                 "encrypted_content": "enc-blob",
@@ -150,6 +152,7 @@ async fn streams_reasoning_text_and_function_call() {
             json!({"type": "response.output_item.done", "item": {
                 "type": "function_call", "id": "fc_1", "call_id": "call_9",
                 "name": "bash", "arguments": "{\"command\":\"ls\"}",
+                "status": "completed",
             }}),
             json!({"type": "response.completed", "response": {"usage": {
                 "input_tokens": 1000, "output_tokens": 30,

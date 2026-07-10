@@ -1,6 +1,6 @@
 # Plan 15 ✅ — provider 打磨:prompt caching + thinking/reasoning + 三线协议
 
-> 完成(2026-07-10):片 1 = 56efa17(caching + usage 记账,真 key cache_read=14450 全量命中);片 2 = dcefac7(thinking 块,真 key sonnet-5 adaptive 产出空文本+signature 块、回带无 400、resume 正常,openai 轨回归过);片 3 = 6c3adf8(Responses 适配器,代理端点两轮工具任务端到端过;**挂账:加密 reasoning 往返仅 wiremock 锁定——现有代理不回 reasoning item,要真实锻炼需官方 OpenAI key**)。测试 223 → 244。追加 6de37c2(用户提议):tools 末尾第三断点——工具集比含日期/git 快照的 system 稳定,重启换 system 时 tools 前缀仍命中。
+> 完成(2026-07-10):片 1 = 56efa17(caching + usage 记账,真 key cache_read=14450 全量命中);片 2 = dcefac7(thinking 块,真 key sonnet-5 adaptive 产出空文本+signature 块、回带无 400、resume 正常,openai 轨回归过);片 3 = 6c3adf8(Responses 适配器,代理端点两轮工具任务端到端过;**挂账:加密 reasoning 往返仅 wiremock 锁定,销账需官方 api.openai.com key**)。挂账后续核查(2026-07-10,端点事实存 memory `reference-codex-proxy-endpoint`):当时"chat 转码"推测**不成立**——该代理是 ChatGPT Codex 后端,复杂任务 + effort:high 会产真实 Fernet 密文的 reasoning item,但**只在流式 `output_item.done` 里带全字段**(非流式与 `completed` 聚合体剥掉 id/encrypted_content,代理 quirk,kloop 收割点恰是 output_item.done 不受影响);且四组回放对照(原样/不带/篡改密文/剥密文)第二轮**全部 200**——密文根本没被送去解密,"回放接受"与"缺配对 400"两条契约在该端点都验证不了,挂账维持。测试 223 → 244。追加 6de37c2(用户提议):tools 末尾第三断点——工具集比含日期/git 快照的 system 稳定,重启换 system 时 tools 前缀仍命中。
 
 > 原 scope 是 caching + thinking;开工时用户扩大:`/v1/messages`、`/chat/completions`、`/v1/responses` 三个线协议都要支持(参考 cc / codex / claw-code)。调研结论(spec + 三库对照)沉淀在本文件;协议细节只认 spec(教训 9/11)。分三片,每片独立 commit + 验收。
 
