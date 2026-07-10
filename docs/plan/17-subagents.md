@@ -18,7 +18,7 @@
 
 **真 key 验收**:双轨 `--plain` 各一次"一次响应发两个并行 task"。sonnet-5:两 agent 均 started 后才各自跑 bash、结束,汇总正确。gpt-5.4-mini:同样并行派发(它自发给 task 加了 max_rounds:1),`date` 触发审批弹出干净(mutex 生效),EOF deny 后子 agent 走轮限收尾——恢复语义符合预期。
 
-**提交**:见 git log(fmt/clippy/test 全绿)。
+**提交**:f2944c5(fmt/clippy/test 全绿,266 个测试)。
 
 **挂账(未选切片,原样保留在下方候选)**:片 2(自定义 agent 类型——本次调研已备齐 cc frontmatter 字段表/路由/报错形态,见回源结论)、片 3(历史持久化,先做 plan 18)、片 5(hook 事件带 agent 字段 + SubagentStart/Stop)、片 6(异步派发 + mailbox 回灌)。另:并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流——都等有痛感再修。
 
