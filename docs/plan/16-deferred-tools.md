@@ -1,4 +1,4 @@
-# Plan 16 — deferred 工具 + tool_search
+# Plan 16 — deferred 工具 + tool_search ✅(提交 c527f63)
 
 > 一个会话完成。开工前先读 docs/plan/HANDOFF.md。参考:refs/README.md 调研结论 4——这是 cc 和 codex **独立收敛的必然解**,直接抄形态不必发明;具体机制两边源码回源核对(教训 11)。
 
@@ -23,3 +23,15 @@
 ## 完成标准
 
 fmt/clippy/test 全绿;真 key 手工验收:接一个多工具 MCP server(官方 filesystem 即可,人为调低阈值),观察模型搜索→解锁→调用的闭环;README、HANDOFF 更新(>30 警告文案同步改)。
+
+## 完成记录(2026-07-10,提交 c527f63)
+
+开工调研回源核对了两个参考库(教训 11 又一次兑现):plan 预设的"解锁后进 defs"两家现行实现都不是——cc 旧快照走 SearchExtraTools+ExecuteExtraTool 中转(tools 数组永不变,保 prompt cache),codex 靠 Responses API 服务端 `defer_loading`(搬不到 /v1/messages);而 cc 现行 harness 已演化到第三形态:**tools 数组静态,schema 随搜索结果返回,模型直调未声明名字**。用户拍板"必须缓存友好",选第三形态:
+
+- 阈值形态:总工具数(depth-0 视角)> `defer_threshold`(默认 30,`AGENT_DEFER_THRESHOLD` 覆盖)才 defer,内置永不 defer;阈值内行为与之前逐字节相同。
+- 名单注入:复用 plan 13 的首条合成 user 消息缝,列全部 deferred 名字且**不随解锁缩减**(与 defs 数组一样会话内字节稳定)。
+- 解锁 = `Config.unlocked_tools`(`Arc<RwLock<HashSet>>`)insert,只开 `run_one` 顶部的分发门(在 hooks/权限之前,锁定调用不该惊动任何人);未解锁直调报错引导 tool_search,不解锁。子 agent 经 Config clone 共享解锁集。
+- **call_tool 兜底(验收中发现的必要项)**:gpt-5.4-mini 会搜索、解锁,但任何措辞下都拒绝对不在 tools 数组里的名字发 tool_use(明说"can't issue that deferred tool call from this interface");cc 旧版 ExecuteExtraTool 正是为这类模型存在的中间站。kloop 版在 dispatch_tools 入口拆包信封,权限/hooks/并发/UI 全见真名,零层侵入;history 保留模型原始信封,回放保真。
+- pin 口子不做(阈值即主逃生口,配置键以后加向后兼容);per-turn 解锁、per-tool pin 记为可能性。
+
+真 key 验收(filesystem MCP 14 工具 + 阈值 5):sonnet-5 首试 `select:` 多选 → 直调;gpt-5.4-mini 搜索 → `call_tool` 信封,均闭环。测试 259 全绿。
