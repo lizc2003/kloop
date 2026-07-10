@@ -74,6 +74,16 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
   基建,等 kloop 有沙箱再回来抄。cc 独有暂不做:AI 分类器 auto 模式、updatedInput 改写、
   permission modes 全集(kloop 只取 default/acceptEdits/bypass 三档)。
 
+## codex 后台/交互进程与多 agent 调研(2026-07-10,plan 14 第三片后)
+
+背景:kloop 已有后台 bash(run_in_background + bash_output/kill_bash + 进程组 + monitor task)与同步 task 子 agent,评估 codex 还有什么可借。细节可再查:unified_exec 在 `codex-rs/core/src/unified_exec/`(process_manager.rs 编排、head_tail_buffer.rs 截断)+ 工具面 `core/src/tools/handlers/unified_exec/`;多 agent 在 `core/src/tools/handlers/multi_agents_v2/`;并行锁 `core/src/tools/parallel.rs`。
+
+- **unified_exec 的本质差异是交互**(codex 上游机制,codex 只加审批/沙箱面):`exec_command`(cmd/tty/yield_time_ms 默认 10s/max_output_tokens)先等一会,等不完就存进程返回 `session_id`;`write_stdin(session_id, chars)` 续写,**空 chars = 纯轮询**(默认 5s,上限 300s)。可持续写 stdin(REPL/ssh/交互确认)是 kloop 后台 bash 没有的能力;PTY 可选。生命周期:上限 64 个,LRU 淘汰(保护最近 8、优先淘汰已退出),turn 结束全清,无空闲超时。输出 HeadTailBuffer:1MiB,头尾各 50%,中间截断。
+- **codex 没有"完成主动通知模型"的通道**:后台进程靠模型轮询;`notify` 配置是通知用户的外部命令(fire-and-forget,输出丢弃)。三个参考里只有 cc 做了 task-notification 回灌模型。
+- **多 agent 是异步体系**:`spawn` 立即返回 agent_id → `wait`(mailbox 更新摘要,新用户输入可提前打断)→ `send_message`;**子 agent 终态时投递父 agent mailbox(turn 中途回灌,`session/mod.rs` forward_child_completion_to_parent)——"通知通道"的现成先例,且只对子 agent 做、无需全局任务框架**。role 化(config 分层覆盖 model/effort/系统提示)、complexity 分级、CSV 批量 fan-out 均体量巨大,明确不抄。
+- **工具并行 codex 比 kloop 粗**(反向借鉴,保持 kloop 现状):全局单把 RwLock + 每工具静态 supports_parallel 布尔,读锁共享写锁独占;无路径粒度、无 kloop 的"连续只读成批、遇写切断"顺序性。
+- **借鉴清单**:① `write_stdin` 最小切片(挂 plan 14 备选);② 子 agent 异步最小形态 spawn+wait+mailbox 回灌(挂 plan 17);③ 小卫生件:HeadTailBuffer、进程表上限+LRU(有痛感时整段抄)。不抄:ToolOrchestrator 审批沙箱耦合、多 agent 全家桶、notify、SubagentStart/Stop hooks 引擎、parallel.rs 全局锁。
+
 ## 预演记录(codex fork,2026-07-09)
 
 kloop 的压缩设计曾先在 codex fork 上完整实现过一轮(分支 `codex/worktree/predictive_reactive_compaction`,提交 57c746ef7,Buildbot 绿,未合入 main):predictive 插在 `run_pre_sampling_compact`、reactive 插在采样错误分支、Feature 双旗标、compact_fork_tests.rs 四个集成测试。价值:验证了设计、抓出小窗口负阈值盲点。教训:kloop 才是项目,参考库不用于开发。

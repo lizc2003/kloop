@@ -15,6 +15,11 @@
 3. ✅ **bash 后台任务**:`run_in_background` 参数 + 查询输出/终止的配套工具(cc 形态)。进程生命周期归属(退出时回收、interrupt 语义)、输出缓冲落 offload 目录。价值:dev server、长编译。
 4. **图片输入**:read_file 读图片 → 协议要加 image 块(protocol ContentBlock + 双 provider 翻译 + rollout 前向兼容),和 plan 15 的 thinking 是同类协议扩展,开工时定归 15 一起做还是这里做。
 
+## 备选池(未承诺)
+
+- **write_stdin(交互式后台进程)**:codex unified_exec 的核心差异——往活着的后台进程写 stdin(REPL、ssh、交互式确认),空写 = 轮询。最小切法:在现有后台 bash 上加一个 `write_stdin(bash_id, chars)` 工具,连管道即可(需把后台 spawn 的 stdin 从 null 改为 piped),不抄 PTY/审批编排。调研结论见 refs/README.md"codex 后台/交互进程"节(2026-07-10)。
+- 顺手小件(有痛感时抄):HeadTailBuffer(bash_output 头尾各留一半,保住开头报错)、后台进程表上限 + LRU 淘汰。
+
 ## 不做(维持现状)
 
 apply_patch(P0 决定 1);notebook 工具(niche);TodoWrite 类计划工具(价值存疑,备选池观察)。
