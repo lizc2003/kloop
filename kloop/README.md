@@ -461,10 +461,35 @@ frontend:
   `tool/started`/`tool/completed` carry an `"agent"` field (main-agent
   calls keep the old shape exactly).
 
-Not in this slice (deliberate): custom agent types (config-defined system
-prompt / tool subset / model override), sub-agent history persistence,
-async dispatch with completion mailbox (codex spawn/wait shape), hook
-events tagged with the agent — see `docs/plan/17-subagents.md`.
+### Custom agent types
+
+A `task` call can target a named specialized agent via the `agent_type`
+parameter. Types are defined in `.kloop/config.toml`:
+
+```toml
+[agents.researcher]
+description = "Read-only code searcher — locates things in the repo."
+system = "You are a code search sub-agent. Use grep/glob, read files, report concisely."
+model = "claude-haiku-4-5"      # optional; omitted inherits the parent's model
+tools = ["grep", "glob", "read_file"]   # optional; omitted inherits the full set
+```
+
+Each field overrides the sub-agent's Config (cc's `.claude/agents`
+semantics): `system` **replaces** the system prompt (not concatenated),
+`model` swaps the model (the point of a cheap searcher), and `tools` is an
+exact allowlist — the sub-agent's tool defs are filtered to it and a call to
+anything outside is rejected at dispatch (`read_offloaded` always stays
+available, so a restricted agent can still read back a truncated result).
+Only `description` is required; it is shown to the model in the task tool's
+description so it can pick a type, and an unknown `agent_type` is an
+is_error result naming the available ones. Sub-agents still can't spawn
+further sub-agents, and they share the parent's permission gate — the human's
+last word doesn't loosen inside a sub-agent. `--mock` reads no config, so it
+sees no types.
+
+Not yet (deliberate): sub-agent history persistence, async dispatch with a
+completion mailbox (codex spawn/wait shape), hook events tagged with the
+agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
 
 ## OS sandbox (Phase 2, thirteenth slice)
 
@@ -589,7 +614,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 291 tests across the workspace:
+`cargo test` runs 298 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -605,7 +630,12 @@ saved and resumable — see Session persistence above.
   end-to-end over the Mock provider: tool batching, predictive + reactive
   compaction, truncation continuation, retry/fallback, max-rounds,
   pre-cancelled abort, sub-agent round-trip, denied-tool-continues-turn;
-  shell analysis contracts (word-only parsing, quote/concatenation
+  custom agent types (type lookup + unknown-type error listing, tool
+  allowlist gating with the read_offloaded exception, agent_type routing the
+  sub-agent's system/model/filtered tools through the recorded request,
+  dispatch rejecting a tool outside the allowlist, `[agents.<name>]` parsing
+  with malformed-field rejection); shell analysis contracts (word-only
+  parsing, quote/concatenation
   unwrapping, opaque-construct rejection, `bash -c` unwrap, read-only option
   vetting, git option-injection, dangerous-through-wrappers); permission
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune

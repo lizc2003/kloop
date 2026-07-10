@@ -147,6 +147,8 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
             sandbox: None,
+            agent_types: std::sync::Arc::new(Vec::new()),
+            tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
         })

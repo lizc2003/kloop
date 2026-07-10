@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::agents::AgentType;
 use kloop_core::history::History;
 use kloop_core::hooks::HookDef;
 use kloop_core::hooks::HookEvent;
@@ -454,6 +455,79 @@ struct SandboxSettings {
     escalate: bool,
 }
 
+/// Custom agent types from `.kloop/config.toml` `[agents.<name>]`: each is a
+/// table with a required `description` and optional `system` / `model` /
+/// `tools` (string array). Order follows the file so the task description
+/// lists them stably. `--mock` skips this like every other config read.
+fn load_agent_types(config_path: &Path) -> Result<Vec<AgentType>> {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(Vec::new());
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(agents) = value.get("agents") else {
+        return Ok(Vec::new());
+    };
+    let agents = agents
+        .as_table()
+        .context("[agents] must be a table of named agent definitions")?;
+    let mut types = Vec::new();
+    for (name, def) in agents {
+        let def = def
+            .as_table()
+            .with_context(|| format!("[agents.{name}] must be a table"))?;
+        for key in def.keys() {
+            if !matches!(key.as_str(), "description" | "system" | "model" | "tools") {
+                bail!("[agents.{name}] has unknown key '{key}' (description | system | model | tools)");
+            }
+        }
+        let description = def
+            .get("description")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("[agents.{name}] needs a 'description' string"))?
+            .to_string();
+        let str_field = |key: &str| -> Result<Option<String>> {
+            match def.get(key) {
+                None => Ok(None),
+                Some(v) => Ok(Some(
+                    v.as_str()
+                        .with_context(|| format!("[agents.{name}].{key} must be a string"))?
+                        .to_string(),
+                )),
+            }
+        };
+        let tools = match def.get("tools") {
+            None => None,
+            Some(v) => {
+                let list = v.as_array().with_context(|| {
+                    format!("[agents.{name}].tools must be an array of strings")
+                })?;
+                let mut names = Vec::new();
+                for entry in list {
+                    names.push(
+                        entry
+                            .as_str()
+                            .with_context(|| {
+                                format!("[agents.{name}].tools must be an array of strings")
+                            })?
+                            .to_string(),
+                    );
+                }
+                Some(names)
+            }
+        };
+        types.push(AgentType {
+            name: name.clone(),
+            description,
+            system: str_field("system")?,
+            model: str_field("model")?,
+            tools,
+        });
+    }
+    Ok(types)
+}
+
 fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
     let mut settings = SandboxSettings {
         enabled: true,
@@ -574,6 +648,7 @@ fn config_from_env(
     tool_sources: &[Arc<dyn ToolSource>],
     project: &context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
+    agent_types: Arc<Vec<AgentType>>,
 ) -> Result<Config> {
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
     // --mock stays hermetic: no config reads, no hook child processes.
@@ -612,6 +687,8 @@ fn config_from_env(
         hooks: Arc::new(hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         sandbox,
+        agent_types,
+        tool_allowlist: None,
         defer_threshold: defer_threshold_from_env()?,
         unlocked_tools: Default::default(),
     };
@@ -847,6 +924,13 @@ async fn main() -> Result<()> {
     // The sandbox policy is process-stable (cwd + config), so it is built
     // once and shared into every Config — server threads included.
     let sandbox = build_sandbox(&args, &cwd, |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"))?;
+    // Agent types are likewise config-derived and process-stable; --mock stays
+    // hermetic (no config reads).
+    let agent_types = Arc::new(if args.mock {
+        Vec::new()
+    } else {
+        load_agent_types(Path::new(PERMISSIONS_CONFIG))?
+    });
     if args.serve {
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
@@ -860,6 +944,7 @@ async fn main() -> Result<()> {
                     &tool_sources,
                     &project,
                     sandbox.clone(),
+                    agent_types.clone(),
                 )
             })
         };
@@ -881,7 +966,16 @@ async fn main() -> Result<()> {
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        return plain_main(args, history, session_id, tool_sources, project, sandbox).await;
+        return plain_main(
+            args,
+            history,
+            session_id,
+            tool_sources,
+            project,
+            sandbox,
+            agent_types,
+        )
+        .await;
     }
     let factory_session_id = session_id.clone();
     kloop_tui::run(
@@ -893,6 +987,7 @@ async fn main() -> Result<()> {
                 &tool_sources,
                 &project,
                 sandbox.clone(),
+                agent_types.clone(),
             )?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
@@ -910,6 +1005,7 @@ async fn plain_main(
     tool_sources: Vec<Arc<dyn ToolSource>>,
     project: context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
+    agent_types: Arc<Vec<AgentType>>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let mut cfg = config_from_env(
@@ -919,6 +1015,7 @@ async fn plain_main(
         &tool_sources,
         &project,
         sandbox,
+        agent_types,
     )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);
@@ -1091,6 +1188,65 @@ mod tests {
             "seq must parse"
         );
         assert!(parse_args(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn agent_types_parse_fields_and_reject_malformed() {
+        let dir = std::env::temp_dir().join(format!("kloop-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / no [agents]: empty.
+        assert!(load_agent_types(&path).unwrap().is_empty());
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert!(load_agent_types(&path).unwrap().is_empty());
+
+        std::fs::write(
+            &path,
+            "[agents.researcher]\n\
+             description = \"Searches the codebase.\"\n\
+             system = \"You research.\"\n\
+             model = \"claude-haiku-4-5\"\n\
+             tools = [\"grep\", \"read_file\"]\n\
+             \n\
+             [agents.reviewer]\n\
+             description = \"Reviews a diff.\"\n",
+        )
+        .unwrap();
+        let types = load_agent_types(&path).unwrap();
+        assert_eq!(types.len(), 2);
+        let researcher = types.iter().find(|t| t.name == "researcher").unwrap();
+        assert_eq!(
+            (
+                researcher.description.as_str(),
+                researcher.system.as_deref(),
+                researcher.model.as_deref(),
+                researcher.tools.clone(),
+            ),
+            (
+                "Searches the codebase.",
+                Some("You research."),
+                Some("claude-haiku-4-5"),
+                Some(vec!["grep".to_string(), "read_file".to_string()]),
+            )
+        );
+        let reviewer = types.iter().find(|t| t.name == "reviewer").unwrap();
+        assert_eq!(reviewer.system, None);
+        assert_eq!(reviewer.model, None);
+        assert_eq!(reviewer.tools, None);
+
+        for bad in [
+            "[agents.x]\n",                                        // no description
+            "[agents.x]\ndescription = 3\n",                       // wrong type
+            "[agents.x]\ndescription = \"d\"\nmodel = 5\n",        // wrong type
+            "[agents.x]\ndescription = \"d\"\ntools = \"grep\"\n", // tools not an array
+            "[agents.x]\ndescription = \"d\"\ntools = [3]\n",      // tools not strings
+            "[agents.x]\ndescription = \"d\"\nprompt = \"p\"\n",   // unknown key
+            "agents = 3\n",                                        // [agents] not a table
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_agent_types(&path).is_err(), "accepted: {bad}");
+        }
     }
 
     #[test]

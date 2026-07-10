@@ -2,6 +2,23 @@
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 agents 机制(`.claude/agents/*.md` frontmatter:独立 system prompt、工具白名单、模型 override;并行派发)、codex 的 subagent(SubagentStart/Stop 挂点、SubagentHookContext)。回源核对(教训 11)。
 
+## ✅ 完成记录(2026-07-10,切片 2:自定义 agent 类型)
+
+**选片**:片 2。文件形态开工时问用户,用户选 **A(`config.toml` `[agents.<name>]` 表)**——理由:kloop 一贯把配置收在 config.toml,B 的 `.md` frontmatter 要引 YAML 依赖或手写解析(违教训 8/9)。其余按 cc 形态直接定:system **完全替换**不拼接、model 省略继承父、tools 省略继承全集、未知类型报错列可用清单、清单进 task description、仍深度 1。
+
+**实现**:
+- `core/src/agents.rs`:`AgentType { name, description, system, model, tools }`(后三者 Option)+ `lookup`(未知报错列可用)+ `tool_available`(白名单门,`read_offloaded` 恒真——基建例外,否则受限子 agent 读不回自己 offload 的大输出被卡)+ `agent_types_hint`(列表进 task description,config 派生故 session 稳定、缓存友好)。
+- `Config` 加 `agent_types: Arc<Vec<AgentType>>`(注册表,随 clone 继承)+ `tool_allowlist: Option<Arc<HashSet<String>>>`(仅受限子 agent 设,主 agent 恒 None)。
+- task 加 `agent_type` 参数:`lookup` → 命中则 sub_cfg 覆盖 system/model、tools 设 `tool_allowlist`;label 带 `[type]` 前缀。
+- 两处工具门:`turn_rounds`(agent.rs)按 allowlist `retain` 过滤 defs + depth-0 时把 hint 追加进 task def description;`run_one`(tools/mod.rs)入口拒非白名单调用(在 locked/hooks/权限**之前**——capability 先于一切;防模型幻觉出被过滤掉的工具名)。
+- provider `MockRequest` 加 `model` 字段(录制请求模型,测 override;录制器本就该记请求的模型)。
+
+**测试**(298 个,+7):agents 单元(lookup 命中/空/未知列清单、tool_available 白名单 + read_offloaded 例外、hint 列表/空)、task 路由(agent_type 把 system/model/过滤后 tools 送进录制请求、未知类型 is_error 列可用)、dispatch 白名单拒绝(bash 被拒、grep 放行、read_offloaded 恒放行)、cli `[agents.<name>]` 解析(字段往返 + 7 种畸形拒绝:缺 description、类型错、tools 非数组/非串、未知键、[agents] 非表)。
+
+**真 key 验收**:双轨 `--plain --yolo`。anthropic:派 researcher 子 agent(model=haiku override 确实进请求——代理无 haiku 返 503 点名,反证 override 生效;换 sonnet-5 完整闭环)自报"只有 grep/glob/read_file/read_offloaded、无 bash",grep 命中目标文件。gpt-5.4-mini:searcher 类型(model 省略继承 gpt)路由 + 工具限制同样生效,只报 grep/glob/read_file。三项 override(system/model/tools)全部端到端证实。
+
+**提交**:见下方提交号。
+
 ## ✅ 完成记录(2026-07-10,切片 1+4)
 
 **选片**:片 1(并行 task,cc 同步形态)+ 片 4(UI 呈现)。开工前对 cc(AgentTool 全链路)与 codex(multi_agents_v2)各做了一轮回源深调,关键事实沉淀在下方"回源调研结论"节。

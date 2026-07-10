@@ -831,6 +831,8 @@ mod tests {
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: crate::tools::BackgroundShells::new(),
                 sandbox: None,
+                agent_types: Arc::new(Vec::new()),
+                tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
             })

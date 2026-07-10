@@ -299,11 +299,12 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "task".into(),
-            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Sub-agents cannot spawn further sub-agents.".into(),
+            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Sub-agents cannot spawn further sub-agents. Pass agent_type to use a configured specialized agent (see below); omit it for a general-purpose sub-agent.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "Complete standalone task description"},
+                    "agent_type": {"type": "string", "description": "Name of a configured agent type to use (its own system prompt, model, and tools); omit for a general-purpose sub-agent"},
                     "max_rounds": {"type": "integer", "description": "Round cap for the sub-agent (default and max 15)"}
                 },
                 "required": ["prompt"]
@@ -415,6 +416,13 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     ctx.ui
         .tool_start(&ctx.cfg.agent_label, &id, &name, &summary);
     let gated = async {
+        // A custom agent type's tool allowlist is a capability gate: the tool
+        // is filtered out of this sub-agent's defs, so a call to it is a
+        // hallucination — reject before hooks or the human are consulted.
+        // (The main agent has no allowlist, so this never fires for it.)
+        if !crate::agents::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
+            bail!("tool '{name}' is not available to this agent type");
+        }
         // Locked deferred tools bounce before hooks and permissions: the
         // model skipped tool_search, and neither automation policy nor the
         // human should be consulted about a call that cannot run. This is
@@ -580,6 +588,8 @@ pub(crate) mod testutil {
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 sandbox: None,
+                agent_types: Arc::new(Vec::new()),
+                tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
             }),
@@ -829,6 +839,32 @@ mod tests {
         assert!(out.contains("unknown tool"));
     }
 
+    /// A sub-agent with a tool allowlist has calls to tools outside it
+    /// rejected at dispatch (defense in depth — the defs are already
+    /// filtered), while read_offloaded stays available regardless.
+    #[tokio::test]
+    async fn tool_allowlist_rejects_tools_outside_the_set() {
+        let base = test_ctx(1, "allowlist");
+        let mut cfg = (*base.cfg).clone();
+        cfg.tool_allowlist = Some(Arc::new(["grep".to_string()].into_iter().collect()));
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (out, is_error) = run_tool("bash", bash_input("echo hi"), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("not available to this agent type"), "{out}");
+
+        // Whitelisted tool is not blocked by the allowlist.
+        let (out, _) = run_tool("grep", json!({"pattern": "x"}), &ctx).await;
+        assert!(!out.contains("not available to this agent type"), "{out}");
+
+        // read_offloaded is the infra exception: never blocked by the list.
+        let (out, _) = run_tool("read_offloaded", json!({"id": "off-9999"}), &ctx).await;
+        assert!(!out.contains("not available to this agent type"), "{out}");
+    }
+
     #[test]
     fn external_tools_are_serial_unless_marked_readonly() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
@@ -975,6 +1011,8 @@ mod tests {
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 sandbox: None,
+                agent_types: Arc::new(Vec::new()),
+                tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
             }),

@@ -52,6 +52,15 @@ pub struct Config {
     /// the model escapes per call with disable_sandbox (which faces the same
     /// gate). Sub-agents inherit it with the Config.
     pub sandbox: Option<Arc<crate::sandbox::SandboxPolicy>>,
+    /// Named custom agent types the task tool can dispatch to (plan 17
+    /// slice 2). Empty when none are configured. Shared into sub-agent
+    /// configs so a sub-agent could look them up too (though it cannot spawn
+    /// further sub-agents).
+    pub agent_types: Arc<Vec<crate::agents::AgentType>>,
+    /// Exact tool-name allowlist for THIS agent; None = the full tool set.
+    /// Set only on a sub-agent whose agent_type restricts its tools; the
+    /// main agent is always None. `read_offloaded` stays available either way.
+    pub tool_allowlist: Option<Arc<std::collections::HashSet<String>>>,
     /// Above this many tools (depth-0 view: built-ins + merged sources) the
     /// source tools are deferred: excluded from the request's tool defs and
     /// discoverable via the tool_search tool instead. Built-ins never defer.

@@ -114,7 +114,21 @@ async fn turn_rounds(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    let tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
+    let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
+    // A custom agent type may restrict this sub-agent's tools; the main agent
+    // (None) keeps them all. read_offloaded is never filtered out.
+    if cfg.tool_allowlist.is_some() {
+        let allow = cfg.tool_allowlist.as_deref();
+        tools.retain(|t| crate::agents::tool_available(allow, &t.name));
+    }
+    // At depth 0 the task tool exists; list the configured agent types in its
+    // description so the model knows what it can dispatch to.
+    if depth == 0 && !cfg.agent_types.is_empty() {
+        if let Some(task) = tools.iter_mut().find(|t| t.name == "task") {
+            task.description
+                .push_str(&crate::agents::agent_types_hint(&cfg.agent_types));
+        }
+    }
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
@@ -501,6 +515,8 @@ mod tests {
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             sandbox: None,
+            agent_types: Arc::new(Vec::new()),
+            tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
         });
@@ -589,6 +605,8 @@ mod tests {
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             sandbox: None,
+            agent_types: Arc::new(Vec::new()),
+            tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
         })

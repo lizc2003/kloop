@@ -11,6 +11,7 @@ use super::str_arg;
 use super::ToolCtx;
 use crate::agent::run_turn;
 use crate::agent::EndReason;
+use crate::agents::AgentType;
 use crate::config::Config;
 use crate::history::History;
 use kloop_protocol::Message;
@@ -31,16 +32,43 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         .map_or(SUBAGENT_MAX_ROUNDS, |n| {
             (n as usize).clamp(1, SUBAGENT_MAX_ROUNDS)
         });
+    // A custom agent type overrides the sub-agent's system prompt, model and
+    // tool set; an unknown name is an is_error result naming the available
+    // types. Omitting agent_type keeps the general-purpose inherit-everything
+    // sub-agent.
+    let agent_type = match input["agent_type"].as_str() {
+        Some(name) => {
+            Some(AgentType::lookup(&ctx.cfg.agent_types, name).map_err(|e| anyhow!("task: {e}"))?)
+        }
+        None => None,
+    };
     let agent = format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed));
-    let sub_cfg = Arc::new(Config {
+    let mut sub = Config {
         max_rounds,
         agent_label: agent.clone(),
         ..(*ctx.cfg).clone()
-    });
+    };
+    if let Some(at) = agent_type {
+        if let Some(system) = &at.system {
+            sub.system = system.clone();
+        }
+        if let Some(model) = &at.model {
+            sub.model = model.clone();
+        }
+        if let Some(tools) = &at.tools {
+            sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
+        }
+    }
+    let sub_cfg = Arc::new(sub);
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     let depth = ctx.depth + 1;
-    ui.agent_start(&agent, &task_preview(&prompt));
+    // The label shown next to the running agent carries its type, if any.
+    let preview = match agent_type {
+        Some(at) => format!("[{}] {}", at.name, task_preview(&prompt)),
+        None => task_preview(&prompt),
+    };
+    ui.agent_start(&agent, &preview);
     // The sub-agent runs as its own tokio task. Besides matching the
     // semantics, this breaks the recursion cycle (execute_tool -> run_turn ->
     // dispatch_tools -> execute_tool): task_tool only holds a JoinHandle,
@@ -233,6 +261,80 @@ mod tests {
         assert_eq!(tool_use_id, "t2");
         assert!(is_error);
         assert!(content.contains("missing required string argument 'prompt'"));
+    }
+
+    /// agent_type overrides route to the sub-agent's request: its system
+    /// prompt, model, and tool set are all the type's, and the tool set is
+    /// filtered to the allowlist (plus the always-on read_offloaded).
+    #[tokio::test]
+    async fn agent_type_routes_system_model_and_tools() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) =
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "researched".into(),
+            }])]);
+        let types = vec![AgentType {
+            name: "researcher".into(),
+            description: "searches".into(),
+            system: Some("You are a research agent.".into()),
+            model: Some("cheap-model".into()),
+            tools: Some(vec!["grep".into(), "read_file".into()]),
+        }];
+        let base = with_provider(test_ctx(0, "atype"), provider);
+        let mut cfg = (*base.cfg).clone();
+        cfg.agent_types = Arc::new(types);
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "find X", "agent_type": "researcher"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out, "researched");
+
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "only the sub-agent sampled");
+        assert_eq!(reqs[0].model, "cheap-model");
+        assert_eq!(reqs[0].system, "You are a research agent.");
+        let names: Vec<&str> = reqs[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"grep") && names.contains(&"read_file"));
+        assert!(
+            names.contains(&"read_offloaded"),
+            "infra tool kept: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bash"),
+            "non-whitelisted filtered: {names:?}"
+        );
+        assert!(!names.contains(&"write_file"));
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_type_errors_with_available_list() {
+        let types = vec![AgentType {
+            name: "researcher".into(),
+            description: "searches".into(),
+            system: None,
+            model: None,
+            tools: None,
+        }];
+        let base = test_ctx(0, "atype-bad");
+        let mut cfg = (*base.cfg).clone();
+        cfg.agent_types = Arc::new(types);
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+        let (out, is_error) =
+            run_tool("task", json!({"prompt": "x", "agent_type": "ghost"}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("unknown agent_type 'ghost'"), "{out}");
+        assert!(out.contains("researcher"), "lists what's available: {out}");
     }
 
     #[test]

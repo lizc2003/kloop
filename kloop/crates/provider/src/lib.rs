@@ -25,6 +25,7 @@ use kloop_protocol::MAX_OUTPUT_TOKENS;
 /// the request shape (e.g. injected context messages) without a wire.
 #[derive(Clone, Debug)]
 pub struct MockRequest {
+    pub model: String,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
@@ -140,6 +141,7 @@ impl Provider {
         match self.as_ref() {
             Provider::Mock { turns, seen } => {
                 seen.lock().unwrap().push(MockRequest {
+                    model: model.to_string(),
                     system: system.to_string(),
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
