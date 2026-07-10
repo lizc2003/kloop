@@ -119,6 +119,78 @@ impl SearchBackend for Brave {
     }
 }
 
+/// Tavily Search API: one JSON POST with a bearer token. The default
+/// backend — free tier needs no card, and it is the most common choice in
+/// the agent ecosystem. <https://docs.tavily.com/documentation/api-reference/endpoint/search>
+pub struct Tavily {
+    key: String,
+    base: String,
+}
+
+impl Tavily {
+    pub fn new(key: String) -> Self {
+        Tavily {
+            key,
+            base: "https://api.tavily.com".into(),
+        }
+    }
+
+    /// Test seam: point at a mock server.
+    pub fn with_base(key: String, base: String) -> Self {
+        Tavily { key, base }
+    }
+}
+
+impl SearchBackend for Tavily {
+    fn name(&self) -> &'static str {
+        "tavily"
+    }
+
+    fn search<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        query: &'a str,
+        count: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
+        Box::pin(async move {
+            let resp = client
+                .post(format!("{}/search", self.base))
+                .bearer_auth(&self.key)
+                .json(&serde_json::json!({
+                    "query": query,
+                    "max_results": count,
+                    "search_depth": "basic",
+                }))
+                .send()
+                .await
+                .context("web_search: request to tavily failed")?;
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .context("web_search: reading tavily response failed")?;
+            if !status.is_success() {
+                let head: String = body.chars().take(200).collect();
+                bail!("web_search: tavily returned HTTP {status}: {head}");
+            }
+            let json: Value =
+                serde_json::from_str(&body).context("web_search: tavily returned invalid JSON")?;
+            let results = json["results"].as_array().cloned().unwrap_or_default();
+            Ok(results
+                .iter()
+                .take(count)
+                .map(|r| SearchHit {
+                    title: crate::html::strip_inline_tags(
+                        r["title"].as_str().unwrap_or("(untitled)"),
+                    ),
+                    url: r["url"].as_str().unwrap_or("").to_string(),
+                    snippet: crate::html::strip_inline_tags(r["content"].as_str().unwrap_or("")),
+                })
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +238,66 @@ mod tests {
             text.starts_with("1. The Rust Book\n   https://doc.rust-lang.org/book/\n   Learn Rust")
         );
         assert!(text.contains("2. rust-lang/rust"));
+    }
+
+    #[tokio::test]
+    async fn tavily_posts_json_and_parses_results() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(header("Authorization", "Bearer tvly-test"))
+            .and(body_partial_json(json!({"query": "rust agent", "max_results": 2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "query": "rust agent",
+                "results": [
+                    {"title": "The Rust Book", "url": "https://doc.rust-lang.org/book/", "content": "Learn Rust", "score": 0.9},
+                    {"title": "rust-lang/rust", "url": "https://github.com/rust-lang/rust", "content": "The Rust repo", "score": 0.8}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::client();
+        let tavily = Tavily::with_base("tvly-test".into(), server.uri());
+        assert_eq!(tavily.name(), "tavily");
+        let hits = tavily.search(&client, "rust agent", 2).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "The Rust Book");
+        assert_eq!(hits[0].snippet, "Learn Rust");
+        assert!(format_hits(&hits).contains("2. rust-lang/rust"));
+    }
+
+    #[tokio::test]
+    async fn tavily_maps_errors_and_empty_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::client();
+        let err = Tavily::with_base("bad".into(), server.uri())
+            .search(&client, "q", 5)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HTTP 401") && msg.contains("invalid api key"),
+            "{msg}"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+            .mount(&server)
+            .await;
+        let hits = Tavily::with_base("k".into(), server.uri())
+            .search(&client, "nothing", 5)
+            .await
+            .unwrap();
+        assert_eq!(format_hits(&hits), "No results found");
     }
 
     #[tokio::test]

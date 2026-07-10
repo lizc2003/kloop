@@ -364,11 +364,12 @@ stays network-free, reqwest lives only in provider and web):
   explicit re-fetch (cc shape — kills open-redirect laundering), 5MB
   download cap, HTML→text (hand-rolled: scripts/styles/comments dropped,
   block tags to newlines, entities decoded), 50k-char text cap.
-- **web_search** `{query, max_results}` — pluggable `SearchBackend` trait;
-  Brave Search API is the first backend (`BRAVE_API_KEY`; without the key
-  the tool is not registered and startup warns). `[web] search_provider`
-  in `.kloop/config.toml` selects the backend ("brave" is the default and
-  only one today); adding a provider = one trait impl + one match arm.
+- **web_search** `{query, max_results}` — pluggable `SearchBackend` trait
+  with two backends: Tavily (default, `TAVILY_API_KEY`; its free tier needs
+  no card) and Brave (`BRAVE_API_KEY`). Without the selected backend's key
+  the tool is not registered and startup warns. `[web] search_provider`
+  in `.kloop/config.toml` selects the backend; adding a provider = one
+  trait impl + one match arm.
 
 Both are read-only for concurrency; the permission gate treats them like
 any external tool (ask by default, `web_fetch`/`web_search` allow rules or
@@ -548,7 +549,7 @@ crates/mcp/         kloop-mcp — MCP stdio wire client (depends on protocol onl
 crates/web/         kloop-web — web_fetch/web_search (owns reqwest with provider)
   src/fetch.rs      SSRF guard, redirect policy, caps, body handling
   src/html.rs       minimal HTML→text (no extra dependencies)
-  src/search.rs     SearchBackend trait + Brave implementation
+  src/search.rs     SearchBackend trait + Tavily/Brave implementations
 
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,

@@ -21,6 +21,7 @@ use kloop_protocol::ToolDef;
 pub use search::Brave;
 pub use search::SearchBackend;
 pub use search::SearchHit;
+pub use search::Tavily;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SEARCH_RESULTS_DEFAULT: usize = 5;

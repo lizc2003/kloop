@@ -1,8 +1,8 @@
 //! Web tools glue: `[web]` config parsing and the `ToolSource` adapter over
 //! `kloop-web` — the same seam MCP servers ride, so core stays network-free.
-//! web_fetch is always on (except --mock); web_search needs a backend key
-//! (BRAVE_API_KEY for the default provider) and degrades to a warning
-//! without one.
+//! web_fetch is always on (except --mock); web_search needs the selected
+//! backend's key (TAVILY_API_KEY for the default provider) and degrades to
+//! a warning without one.
 
 use std::future::Future;
 use std::path::Path;
@@ -18,18 +18,20 @@ use kloop_core::tools::ToolSource;
 use kloop_protocol::ToolDef;
 use kloop_web::Brave;
 use kloop_web::SearchBackend;
+use kloop_web::Tavily;
 use kloop_web::WebTools;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebConfig {
-    /// Which SearchBackend to construct; "brave" is the only one today.
+    /// Which SearchBackend to construct: "tavily" (default; free tier needs
+    /// no card) or "brave".
     pub search_provider: String,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         WebConfig {
-            search_provider: "brave".into(),
+            search_provider: "tavily".into(),
         }
     }
 }
@@ -67,20 +69,35 @@ pub fn load_web_config(config_path: &Path) -> Result<WebConfig> {
 /// fetch-only with a warning (missing key, unknown provider) — web tools
 /// never block startup.
 pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn ToolSource>> {
-    let search: Option<Box<dyn SearchBackend>> = match cfg.search_provider.as_str() {
-        "brave" => match std::env::var("BRAVE_API_KEY") {
-            Ok(key) if !key.is_empty() => Some(Box::new(Brave::new(key))),
-            _ => {
-                warn("web_search disabled: BRAVE_API_KEY not set (web_fetch still available)");
-                None
-            }
-        },
-        other => {
+    let backend = |key: String| -> Option<Box<dyn SearchBackend>> {
+        match cfg.search_provider.as_str() {
+            "tavily" => Some(Box::new(Tavily::new(key))),
+            "brave" => Some(Box::new(Brave::new(key))),
+            _ => None,
+        }
+    };
+    let key_env = match cfg.search_provider.as_str() {
+        "tavily" => Some("TAVILY_API_KEY"),
+        "brave" => Some("BRAVE_API_KEY"),
+        _ => None,
+    };
+    let search: Option<Box<dyn SearchBackend>> = match key_env {
+        None => {
             warn(&format!(
-                "web_search disabled: unknown [web].search_provider '{other}' (supported: brave)"
+                "web_search disabled: unknown [web].search_provider '{}' (supported: tavily, brave)",
+                cfg.search_provider
             ));
             None
         }
+        Some(env) => match std::env::var(env) {
+            Ok(key) if !key.is_empty() => backend(key),
+            _ => {
+                warn(&format!(
+                    "web_search disabled: {env} not set (web_fetch still available)"
+                ));
+                None
+            }
+        },
     };
     match WebTools::new(search) {
         Ok(tools) => {
@@ -143,11 +160,11 @@ mod tests {
         assert_eq!(load_web_config(&path).unwrap(), WebConfig::default());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
 
-        let path = write_config("override", "[web]\nsearch_provider = \"tavily\"\n");
+        let path = write_config("override", "[web]\nsearch_provider = \"brave\"\n");
         assert_eq!(
             load_web_config(&path).unwrap(),
             WebConfig {
-                search_provider: "tavily".into()
+                search_provider: "brave".into()
             }
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

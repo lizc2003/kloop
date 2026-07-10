@@ -21,8 +21,9 @@
 - **回源核对 cc**:WebFetch = url+prompt、turndown 转 Markdown、Haiku 加工、15 分钟缓存、跨 host 重定向不跟随(返回 REDIRECT DETECTED 让模型显式重发)、http→https 升级、URL≤2000、拒绝内嵌凭据;SSRF 防护很弱(只查 hostname 段数)。WebSearch = 适配器工厂(api/tavily/bing/brave/exa,这个逆向版默认自建 tavily 代理)。**抄了**:跨 host 重定向不跟随、http→https 升级、凭据拒绝、URL 长度上限。**没抄**:prompt+小模型加工(kloop 无小模型缝)、缓存、turndown(手写 HTML→text,零新依赖)、preapproved 域名白名单;SSRF 用 kloop 自己的 IP 级检查(环回/私网/link-local/CGNAT/元数据段全拒,域名解析后逐地址查,比 cc 强)。
 - **结构**:新 crate `kloop-web`(只依赖 protocol + reqwest;fetch.rs/html.rs/search.rs),cli `web.rs` 胶合(`[web]` 配置解析 + ToolSource 适配,web 源注册在 MCP 之前)。web_fetch 常开(--mock 除外);`BRAVE_API_KEY` 未设或 provider 未知时 web_search 不注册、启动警告降级。两工具 readonly 进并发批;权限门按外部工具处理(默认询问,`web_fetch` allow 规则可放行)。
 - **测试**:+20(223 总):SSRF 拒绝表(loopback/私网/link-local/169.254 元数据/CGNAT/v4-mapped/localhost/file/ftp)、URL 卫生(升级/凭据/超长)、同 host 重定向跟随与循环上限、跨 host 重定向报告不跟随、HTML→text 契约(script/style/注释剥除、实体解码、块级换行、畸形输入)、大小写截断文案、非文本类型拒绝、Brave wiremock 契约(query/header/高亮剥除/429/空结果)、`[web]` 配置解析与降级路径。
-- **验收**:web_fetch 双轨真 key 过(sonnet-5 抓 example.com 摘要;gpt-5.4-mini 给 http URL 自动升级 https 无异常);**web_search 真实端点验收挂起,等 BRAVE_API_KEY**(wiremock 契约已绿,key 到手跑一次即可)。
-- **挂账**:web_search 真实验收;搜索后端第二实现(tavily/searxng 或 Anthropic 服务端);fetch 缓存、`prompt` 参数小模型加工(等有便宜模型缝)。
+- **验收**:web_fetch 双轨真 key 过(sonnet-5 抓 example.com 摘要;gpt-5.4-mini 给 http URL 自动升级 https 无异常);web_search 真实端点验收等 key。
+- **拍板变更(同日)**:默认搜索后端 Brave → **Tavily**——Brave 已取消无卡免费套餐,默认值应该开箱能用;Tavily 免费档 1000 次/月无卡,且是 agent 生态最常用后端(cc 逆向版默认适配器就是 tavily)。Brave 实现保留,`[web] search_provider = "brave"` + `BRAVE_API_KEY` 可切换。key 环境变量按 provider:`TAVILY_API_KEY` / `BRAVE_API_KEY`。
+- **挂账**:web_search 真实端点验收(等 TAVILY_API_KEY 到位);搜索后端第三实现(searxng 或 Anthropic 服务端);fetch 缓存、`prompt` 参数小模型加工(等有便宜模型缝)。
 
 ## 备选池(未承诺)
 
