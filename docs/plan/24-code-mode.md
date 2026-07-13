@@ -226,7 +226,7 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
 按所选切片;fmt/clippy/test 全绿;真 key 至少一次"模型写 program 编排多工具/
 子 agent 跑通闭环、权限门在 op 层生效";README、HANDOFF 更新;未选切片记挂账。
 
-## 完成记录(首片,2026-07-13,提交号待补)
+## 完成记录(首片,2026-07-13,提交 ee4b54a)
 
 开工时用户拍板两件事:**引擎 = rquickjs(QuickJS)**(过程中追问了 codex 为何用 V8、
 `v8_enable_sandbox` 的意义、跑完能否完全释放实例——结论均导向 QuickJS:V8 是血统/平台红利
