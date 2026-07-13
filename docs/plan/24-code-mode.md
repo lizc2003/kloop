@@ -250,7 +250,7 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
   生成/程序面排除)+ agent 级 1(exec 经 run_turn,下一请求只带 return 值)。**fmt + clippy
   (-D warnings)+ 全量 354 测试全绿。** `cargo run --mock` 冒烟通过。
 
-### 追加片:进度观察(log 实时化,同会话续做,提交号待补)
+### 追加片:进度观察(log 实时化,同会话续做,提交 065c911)
 
 用户"继续"→选做 UI 观察片。厘清后发现 op 调用本就通过 `run_one` 发 UI 生命周期(plain
 真机验收里 bash/write/agent 都显示了)、TUI/server 消费同样事件——**真缺口只有 `log()`**:原
