@@ -691,6 +691,7 @@ fn config_from_env(
         tool_allowlist: None,
         defer_threshold: defer_threshold_from_env()?,
         unlocked_tools: Default::default(),
+        todos: Default::default(),
     };
     if args.mock {
         return Ok(Config {
@@ -844,13 +845,44 @@ impl Ui for StdoutUi {
     fn note(&self, s: &str) {
         eprintln!("\x1b[2m[{s}]\x1b[0m");
     }
+
+    fn tool_start(&self, agent: &str, _id: &str, name: &str, summary: &str) {
+        // todo_write is rendered as a checklist by todo_update, not a note.
+        if name == "todo_write" {
+            return;
+        }
+        if agent.is_empty() {
+            self.note(&format!("{name} {summary}"));
+        } else {
+            self.note(&format!("{agent} · {name} {summary}"));
+        }
+    }
+
+    fn todo_update(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
+        use kloop_core::tools::TodoStatus;
+        let prefix = if agent.is_empty() {
+            String::new()
+        } else {
+            format!("{agent} · ")
+        };
+        eprintln!("\x1b[2m[{prefix}todos]\x1b[0m");
+        for todo in todos {
+            let (mark, text) = match todo.status {
+                TodoStatus::Completed => ("✓", &todo.content),
+                TodoStatus::InProgress => ("▶", &todo.active_form),
+                TodoStatus::Pending => ("○", &todo.content),
+            };
+            eprintln!("\x1b[2m  {mark} {text}\x1b[0m");
+        }
+    }
 }
 
-/// Scripted turns for `--mock`, exercising all five bets without an API key:
-/// round 1 batches two read-only bash calls concurrently, round 2 runs an
-/// unsafe command whose oversized output triggers offloading, round 3 reads it
-/// back, round 4 spawns a sub-agent (round 5 is the sub-agent's own reply),
-/// round 6 finishes with plain text.
+/// Scripted turns for `--mock`, exercising all five bets (plus the todo list)
+/// without an API key: round 1 lays out a todo list, round 2 batches two
+/// read-only bash calls concurrently, round 3 runs an unsafe command whose
+/// oversized output triggers offloading, round 4 reads it back, round 5 spawns
+/// a sub-agent (round 6 is the sub-agent's own reply), round 7 finishes with
+/// plain text.
 fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
     let tool_use = |id: &str, name: &str, input: serde_json::Value| ContentBlock::ToolUse {
         id: id.into(),
@@ -859,6 +891,18 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
     };
     let text = |t: &str| ContentBlock::Text { text: t.into() };
     vec![
+        vec![
+            text("Planning the demo as a todo list…\n"),
+            tool_use(
+                "t0",
+                "todo_write",
+                json!({"todos": [
+                    {"content": "Look around", "activeForm": "Looking around", "status": "in_progress"},
+                    {"content": "Offload a big output and read it back", "activeForm": "Offloading a big output", "status": "pending"},
+                    {"content": "Delegate to a sub-agent", "activeForm": "Delegating to a sub-agent", "status": "pending"},
+                ]}),
+            ),
+        ],
         vec![
             text("Looking around (these two run as one concurrent batch)…\n"),
             tool_use("t1", "bash", json!({"command": "pwd"})),

@@ -550,6 +550,36 @@ Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
+## Todo list (Phase 2, fourteenth slice)
+
+`todo_write` (`core/src/tools/todo.rs`) is cc's TodoWrite: a single tool the
+model uses to keep a structured task list, so multi-step work stays coherent
+and its progress is visible. It is **full-table replacement** — the model
+sends the entire list every call (each item is `{content, activeForm,
+status}`, `status ∈ pending | in_progress | completed`, no ids), so there is
+no incremental state to drift. Validation is minimal (non-empty list,
+non-empty content/activeForm, valid status); multiple `in_progress` items are
+allowed (cc's one-at-a-time is guidance carried in the tool description, not a
+hard rule).
+
+The list is **session-scoped process state on the `Config`, not history**: it
+survives across turns within a session and starts empty on resume — the model
+rebuilds it from its own `todo_write` calls replayed in history (the TUI
+replays each historical call as its checklist too). Each **sub-agent gets its
+own fresh list** (the `task` tool resets it on the cloned Config), so a
+sub-agent's planning never touches the parent's. It has no external side
+effect, so the permission gate auto-allows it (read-only self-verdict); it
+runs serially (full-table replace has ordering).
+
+Rendering: `todo_write` never shows as a generic tool row — it renders as a
+checklist. The TUI keeps one `Cell::Todo` per turn, updated in place as the
+list evolves (a new user turn starts a fresh block); the plain REPL prints
+the marked list; server mode emits a `todo/updated` notification with the
+full list (a sub-agent's carries an `agent` field, like tool notifications).
+A sub-agent's list stays internal to the TUI transcript (lesson 3), the way
+its text does. Not done (deliberate): dependency graphs, cross-session todo
+stores, rollout persistence of the list.
+
 ## Running
 
 ```sh

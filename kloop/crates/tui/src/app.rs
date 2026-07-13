@@ -11,6 +11,8 @@ use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::tools::TodoItem;
+use kloop_core::tools::TodoStatus;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
@@ -49,6 +51,9 @@ pub enum Cell {
         tools: usize,
         last_tool: String,
     },
+    /// The model's current task list (todo_write). Updated in place within a
+    /// turn; a new user turn starts a fresh block.
+    Todo(Vec<TodoItem>),
     Note(String),
 }
 
@@ -94,6 +99,9 @@ pub struct App {
     tool_cells: HashMap<String, usize>,
     /// agent label -> cells index of its Agent row.
     agent_cells: HashMap<String, usize>,
+    /// Index of the current turn's Todo cell, updated in place as the model
+    /// rewrites its list; reset each new user turn so a fresh block starts.
+    todo_cell: Option<usize>,
 }
 
 impl App {
@@ -111,6 +119,7 @@ impl App {
             thinking_open: false,
             tool_cells: HashMap::new(),
             agent_cells: HashMap::new(),
+            todo_cell: None,
         }
     }
 
@@ -166,6 +175,11 @@ impl App {
                 }
                 self.assistant_open = false;
                 self.thinking_open = false;
+                // todo_write renders as a Todo block via TodoUpdate, not a
+                // generic tool row (cc renders the checklist in its place).
+                if name == "todo_write" {
+                    return;
+                }
                 self.last_note = Some(format!("{name} {summary}"));
                 self.tool_cells.insert(id, self.cells.len());
                 self.cells.push(Cell::Tool {
@@ -210,6 +224,25 @@ impl App {
                     } else {
                         ToolStatus::Failed
                     };
+                }
+            }
+            AgentEvent::TodoUpdate { todos } => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                let done = todos
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::Completed)
+                    .count();
+                self.last_note = Some(format!("todos {done}/{}", todos.len()));
+                // Update this turn's block in place; start one if there is none.
+                match self.todo_cell {
+                    Some(i) if matches!(self.cells.get(i), Some(Cell::Todo(_))) => {
+                        self.cells[i] = Cell::Todo(todos);
+                    }
+                    _ => {
+                        self.todo_cell = Some(self.cells.len());
+                        self.cells.push(Cell::Todo(todos));
+                    }
                 }
             }
             AgentEvent::Confirm { req, reply } => {
@@ -274,6 +307,9 @@ impl App {
                 self.cursor = 0;
                 self.scroll_up = 0;
                 self.cells.push(Cell::User(text.clone()));
+                // A new turn starts a fresh todo block instead of mutating the
+                // previous turn's (which stays in the transcript as history).
+                self.todo_cell = None;
                 self.running = true;
                 return Command::Submit(text);
             }
@@ -364,6 +400,15 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                     if !thinking.is_empty() =>
                 {
                     cells.push(Cell::Thinking(thinking.clone()));
+                }
+                // A historical todo_write replays as its checklist block, the
+                // same shape the live path renders (never a generic tool row).
+                (Role::Assistant, ContentBlock::ToolUse { name, input, .. })
+                    if name == "todo_write" =>
+                {
+                    if let Some(items) = kloop_core::tools::parse_todos(input) {
+                        cells.push(Cell::Todo(items));
+                    }
                 }
                 (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
                     cells.push(Cell::Tool {
@@ -556,6 +601,127 @@ mod tests {
                 Cell::Thinking("more thought".into()),
                 Cell::Assistant("!".into()),
             ]
+        );
+    }
+
+    fn todo(content: &str, active: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            active_form: active.into(),
+            status,
+        }
+    }
+
+    /// A todo_write call renders as a single Todo block, not a generic tool
+    /// row: its ToolStart is suppressed and TodoUpdate owns the cell, updated
+    /// in place as the list evolves within a turn.
+    #[test]
+    fn todo_write_renders_as_a_single_updating_block() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ToolStart {
+            agent: String::new(),
+            id: "t1".into(),
+            name: "todo_write".into(),
+            summary: "{\"todos\":[...]}".into(),
+        });
+        // No tool row appeared for the suppressed call.
+        assert!(app.cells.is_empty());
+
+        let first = vec![
+            todo("Parse", "Parsing", TodoStatus::InProgress),
+            todo("Test", "Testing", TodoStatus::Pending),
+        ];
+        app.apply(AgentEvent::TodoUpdate {
+            todos: first.clone(),
+        });
+        assert_eq!(app.cells, vec![Cell::Todo(first)]);
+
+        // A second update within the turn replaces the same cell in place.
+        let second = vec![
+            todo("Parse", "Parsing", TodoStatus::Completed),
+            todo("Test", "Testing", TodoStatus::InProgress),
+        ];
+        app.apply(AgentEvent::TodoUpdate {
+            todos: second.clone(),
+        });
+        assert_eq!(app.cells, vec![Cell::Todo(second)], "updated in place");
+        assert_eq!(app.last_note.as_deref(), Some("todos 1/2"));
+
+        // The suppressed ToolEnd is a no-op (no tool cell was tracked).
+        app.apply(AgentEvent::ToolEnd {
+            agent: String::new(),
+            id: "t1".into(),
+            ok: true,
+        });
+        assert_eq!(app.cells.len(), 1);
+    }
+
+    /// A new user turn starts a fresh Todo block; the previous turn's stays in
+    /// the transcript as history.
+    #[test]
+    fn new_turn_starts_a_fresh_todo_block() {
+        let mut app = App::new("s".into());
+        let plan = vec![todo("Step", "Doing step", TodoStatus::InProgress)];
+        app.apply(AgentEvent::TodoUpdate {
+            todos: plan.clone(),
+        });
+        app.apply(AgentEvent::TurnEnded(EndReason::Completed));
+
+        // Submit a new turn, then the model writes todos again.
+        for c in "next".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        let plan2 = vec![todo("Other", "Doing other", TodoStatus::Pending)];
+        app.apply(AgentEvent::TodoUpdate {
+            todos: plan2.clone(),
+        });
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Todo(plan),
+                Cell::User("next".into()),
+                Cell::Todo(plan2),
+            ],
+            "the new turn's list is a separate block below the user message"
+        );
+    }
+
+    /// A sub-agent's todo_update never reaches the loop (dropped in ChannelUi),
+    /// so the App only ever sees main-agent TodoUpdate events — but defend the
+    /// invariant here too: an empty-agent update is the only one that renders.
+    #[test]
+    fn resume_replays_todo_write_as_a_checklist_block() {
+        use serde_json::json;
+        let messages = vec![
+            Message::user_text("plan it"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "todo_write".into(),
+                input: json!({"todos": [
+                    {"content": "Parse", "activeForm": "Parsing", "status": "completed"},
+                    {"content": "Test", "activeForm": "Testing", "status": "in_progress"},
+                ]}),
+            }]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "Updated todo list: 2 item(s)".into(),
+                is_error: false,
+            }]),
+        ];
+        let cells = cells_from_history(&messages);
+        assert_eq!(
+            cells,
+            vec![
+                Cell::User("plan it".into()),
+                Cell::Todo(vec![
+                    todo("Parse", "Parsing", TodoStatus::Completed),
+                    todo("Test", "Testing", TodoStatus::InProgress),
+                ]),
+                Cell::Note("resumed session — 3 message(s)".into()),
+            ],
+            "a historical todo_write replays as its checklist, not a tool row"
         );
     }
 

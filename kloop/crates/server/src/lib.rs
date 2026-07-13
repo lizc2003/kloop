@@ -428,6 +428,15 @@ impl Ui for ThreadUi {
     fn agent_end(&self, agent: &str, ok: bool) {
         self.notify("agent/completed", json!({"agent": agent, "ok": ok}));
     }
+
+    fn todo_update(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
+        let mut params = json!({"todos": todos});
+        // A sub-agent's list carries the agent field, like tool notifications.
+        if !agent.is_empty() {
+            params["agent"] = Value::String(agent.to_string());
+        }
+        self.notify("todo/updated", params);
+    }
 }
 
 impl Approver for ThreadUi {

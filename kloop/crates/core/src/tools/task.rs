@@ -46,6 +46,10 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let mut sub = Config {
         max_rounds,
         agent_label: agent.clone(),
+        // A fresh task list: the sub-agent plans independently, and its
+        // todo_write never touches the parent's list (the Config clone would
+        // otherwise share the Arc).
+        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
         ..(*ctx.cfg).clone()
     };
     if let Some(at) = agent_type {
@@ -335,6 +339,56 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("unknown agent_type 'ghost'"), "{out}");
         assert!(out.contains("researcher"), "lists what's available: {out}");
+    }
+
+    /// A sub-agent's todo_write writes to its own fresh list, never the
+    /// parent's — the Config clone would otherwise share the Arc.
+    #[tokio::test]
+    async fn subagent_todos_are_isolated_from_the_parent() {
+        use crate::tools::TodoItem;
+        use crate::tools::TodoStatus;
+
+        let provider = Provider::mock(vec![
+            // sub-agent round 1: rewrite its (empty) todo list
+            vec![ContentBlock::ToolUse {
+                id: "s1".into(),
+                name: "todo_write".into(),
+                input: json!({"todos": [
+                    {"content": "sub task", "activeForm": "doing sub task", "status": "in_progress"}
+                ]}),
+            }],
+            // sub-agent round 2: wrap up
+            vec![ContentBlock::Text {
+                text: "sub done".into(),
+            }],
+        ]);
+        let ctx = with_provider(test_ctx(0, "todo-isolation"), provider);
+        // The parent already has a task list of its own.
+        *ctx.cfg.todos.lock().unwrap() = vec![TodoItem {
+            content: "parent task".into(),
+            active_form: "doing parent task".into(),
+            status: TodoStatus::Pending,
+        }];
+
+        let results = dispatch_tools(
+            vec![("t1".into(), "task".into(), json!({"prompt": "go"}))],
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            results[0],
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "sub done".into(),
+                is_error: false,
+            }
+        );
+
+        // The parent's list is untouched by the sub-agent's todo_write.
+        let parent = ctx.cfg.todos.lock().unwrap();
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].content, "parent task");
+        assert_eq!(parent[0].status, TodoStatus::Pending);
     }
 
     #[test]

@@ -554,6 +554,9 @@ impl CallFacts {
             // tool_search only reads tool definitions and marks them
             // unlocked; the unlocked tool's own calls still pass this gate.
             "tool_search" => true,
+            // todo_write mutates only the in-memory task list — nothing on
+            // the user's system to sign off on (cc never prompts for it).
+            "todo_write" => true,
             "bash" => matches!(&self.bash, Some(BashAnalysis::Commands(cmds))
                 if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c))),
             _ => false,
@@ -816,6 +819,7 @@ mod tests {
         assert!(ok(&p, "kill_bash", json!({"bash_id": "bg-1"})).await);
         assert!(ok(&p, "task", json!({"prompt": "go"})).await);
         assert!(ok(&p, "tool_search", json!({"query": "select:x"})).await);
+        assert!(ok(&p, "todo_write", json!({"todos": []})).await);
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
         assert!(ok(&p, "bash", bash("sed -n 1,20p f.rs")).await);
         assert_eq!(approver.ask_count(), 0);

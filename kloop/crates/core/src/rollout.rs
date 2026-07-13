@@ -835,6 +835,7 @@ mod tests {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
+                todos: Default::default(),
             })
         };
         let path = temp_file("restart");

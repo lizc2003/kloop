@@ -71,4 +71,11 @@ pub struct Config {
     /// works from the schema returned in the tool_search result. Shared into
     /// sub-agent configs so a parent's discoveries carry over.
     pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// The structured task list the model maintains via todo_write (full-table
+    /// replace). Session-scoped process state, not history: it survives across
+    /// turns within a session and starts empty on resume (the model rebuilds
+    /// it from its own todo_write calls replayed in history). Each sub-agent
+    /// gets its OWN fresh list — the task tool resets this on the cloned
+    /// Config so a sub-agent's planning never touches the parent's.
+    pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
 }

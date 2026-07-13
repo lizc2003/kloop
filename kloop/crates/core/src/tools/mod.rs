@@ -8,9 +8,13 @@ mod discover;
 mod fs;
 mod search;
 mod task;
+mod todo;
 
 pub use bash::BackgroundShells;
 pub use discover::deferred_notice;
+pub use todo::parse_todos;
+pub use todo::TodoItem;
+pub use todo::TodoStatus;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -296,6 +300,8 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
     ];
+    // Available at every depth (sub-agents plan too); task is depth-0 only.
+    defs.push(todo::todo_write_def());
     if depth == 0 {
         defs.push(ToolDef {
             name: "task".into(),
@@ -524,6 +530,7 @@ fn execute_tool<'a>(
             "grep" => search::grep_tool(input).await,
             "glob" => search::glob_tool(input).await,
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
+            "todo_write" => todo::todo_write_tool(input, ctx).await,
             "tool_search" => discover::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
@@ -592,6 +599,7 @@ pub(crate) mod testutil {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
+                todos: Default::default(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -724,6 +732,7 @@ mod tests {
                 "grep",
                 "glob",
                 "read_offloaded",
+                "todo_write",
                 "task",
                 "srv__echo",
                 "srv__fail",
@@ -772,7 +781,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("50 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("51 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -1015,6 +1024,7 @@ mod tests {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
+                todos: Default::default(),
             }),
             ui: Arc::new(NullUi),
             cancel,

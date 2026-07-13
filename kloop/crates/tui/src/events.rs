@@ -9,6 +9,7 @@ use kloop_core::agent::Ui;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::tools::TodoItem;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -41,6 +42,12 @@ pub enum AgentEvent {
     AgentEnd {
         agent: String,
         ok: bool,
+    },
+    /// The model rewrote its task list (todo_write, full replacement). Only
+    /// the main agent's updates reach the UI loop; a sub-agent's planning
+    /// stays internal, like its text.
+    TodoUpdate {
+        todos: Vec<TodoItem>,
     },
     /// A permission prompt. The decision travels back over `reply`; dropping
     /// the sender answers Deny (the agent side treats a closed channel as no).
@@ -111,6 +118,16 @@ impl Ui for ChannelUi {
             ok,
         });
     }
+
+    fn todo_update(&self, agent: &str, todos: &[TodoItem]) {
+        // A sub-agent's planning stays internal (lesson 3): only the main
+        // agent's list surfaces as a transcript block.
+        if agent.is_empty() {
+            self.send(AgentEvent::TodoUpdate {
+                todos: todos.to_vec(),
+            });
+        }
+    }
 }
 
 impl Approver for ChannelUi {
@@ -167,6 +184,26 @@ mod tests {
                 r#"AgentEnd { agent: "agent-1", ok: true }"#,
             ]
         );
+    }
+
+    /// The main agent's todo_update becomes a TodoUpdate event; a sub-agent's
+    /// is dropped (its planning stays internal, like its text).
+    #[tokio::test]
+    async fn todo_update_forwards_main_agent_only() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ui = ChannelUi::new(tx);
+        let items = vec![TodoItem {
+            content: "Do it".into(),
+            active_form: "Doing it".into(),
+            status: kloop_core::tools::TodoStatus::InProgress,
+        }];
+
+        ui.todo_update("agent-1", &items); // sub-agent: dropped
+        ui.todo_update("", &items); // main agent: forwarded
+
+        let got: Vec<AgentEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got.len(), 1, "only the main agent's update is forwarded");
+        assert!(matches!(&got[0], AgentEvent::TodoUpdate { todos } if todos == &items));
     }
 
     #[tokio::test]

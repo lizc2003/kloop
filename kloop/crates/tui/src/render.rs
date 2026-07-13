@@ -15,6 +15,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
+use kloop_core::tools::TodoStatus;
+
 use crate::app::App;
 use crate::app::Cell;
 use crate::app::ToolStatus;
@@ -144,6 +146,27 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                     Span::styled(format!("{mark} "), Style::new().fg(color)),
                     Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
                 ]));
+            }
+            Cell::Todo(items) => {
+                lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
+                for item in items {
+                    // in_progress shows its activeForm (what's happening now);
+                    // the others show the plain content.
+                    let (mark, color, text, style) = match item.status {
+                        TodoStatus::Completed => ("✓", Color::Green, &item.content, DIM),
+                        TodoStatus::InProgress => (
+                            "▶",
+                            Color::Yellow,
+                            &item.active_form,
+                            Style::new().add_modifier(Modifier::BOLD),
+                        ),
+                        TodoStatus::Pending => ("○", Color::DarkGray, &item.content, DIM),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {mark} "), Style::new().fg(color)),
+                        Span::styled(truncate(text, width.saturating_sub(4)), style),
+                    ]));
+                }
             }
             Cell::Note(text) => {
                 lines.push(Line::from(Span::styled(
@@ -358,6 +381,34 @@ mod tests {
                 "… agent-1 find the bug",
                 "… agent-1 find the bug — 3 tools · bash {\"command\":\"cargo t…",
                 "✓ agent-1 find the bug (3 tool uses)",
+            ]
+        );
+    }
+
+    /// A Todo cell renders a header plus one marked line per item, showing
+    /// the activeForm for the in_progress item and content for the rest.
+    #[test]
+    fn todo_cell_renders_a_marked_checklist() {
+        use kloop_core::tools::TodoItem;
+        let item = |content: &str, active: &str, status: TodoStatus| TodoItem {
+            content: content.into(),
+            active_form: active.into(),
+            status,
+        };
+        let cells = vec![Cell::Todo(vec![
+            item("Parse input", "Parsing input", TodoStatus::Completed),
+            item("Run tests", "Running tests", TodoStatus::InProgress),
+            item("Write docs", "Writing docs", TodoStatus::Pending),
+        ])];
+        let lines = transcript_lines(&cells, 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "todos",
+                "  ✓ Parse input",
+                "  ▶ Running tests",
+                "  ○ Write docs",
             ]
         );
     }

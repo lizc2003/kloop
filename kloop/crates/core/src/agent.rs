@@ -56,6 +56,30 @@ pub trait Ui: Send + Sync {
             if ok { "finished" } else { "failed" }
         ));
     }
+    /// The model rewrote its task list via todo_write (full replacement).
+    /// `agent` is "" for the main agent, "agent-N" for a sub-agent. The
+    /// default collapses to a one-line note; UIs that render a checklist opt
+    /// in. See [`crate::tools::TodoItem`].
+    fn todo_update(&self, agent: &str, todos: &[crate::tools::TodoItem]) {
+        use crate::tools::TodoStatus;
+        let done = todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
+        let prefix = if agent.is_empty() {
+            String::new()
+        } else {
+            format!("{agent} · ")
+        };
+        match todos.iter().find(|t| t.status == TodoStatus::InProgress) {
+            Some(current) => self.note(&format!(
+                "{prefix}todos {done}/{} · now: {}",
+                todos.len(),
+                current.active_form
+            )),
+            None => self.note(&format!("{prefix}todos {done}/{} done", todos.len())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,6 +543,7 @@ mod tests {
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
+            todos: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -609,6 +634,7 @@ mod tests {
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
+            todos: Default::default(),
         })
     }
 

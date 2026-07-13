@@ -151,6 +151,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
+            todos: Default::default(),
         })
     })
 }
@@ -204,6 +205,57 @@ async fn turn_streams_deltas_and_completes() {
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
             .unwrap();
     assert_eq!(messages.len(), 2);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A todo_write call surfaces as a `todo/updated` notification carrying the
+/// full list; the main agent's carries no "agent" field.
+#[tokio::test]
+async fn todo_write_emits_a_todo_updated_notification() {
+    let dirs = test_dirs("todo");
+    let turns = vec![
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "todo_write".into(),
+            input: json!({"todos": [
+                {"content": "Parse", "activeForm": "Parsing", "status": "in_progress"},
+                {"content": "Test", "activeForm": "Testing", "status": "pending"},
+            ]}),
+        }],
+        vec![text("done")],
+    ];
+    let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
+
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let thread_id = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": "go"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    let todo = log
+        .iter()
+        .find(|m| m["method"] == "todo/updated")
+        .expect("todo/updated notification");
+    assert_eq!(todo["params"]["threadId"], thread_id);
+    assert_eq!(
+        todo["params"]["todos"],
+        json!([
+            {"content": "Parse", "activeForm": "Parsing", "status": "in_progress"},
+            {"content": "Test", "activeForm": "Testing", "status": "pending"},
+        ])
+    );
+    assert!(
+        todo["params"].get("agent").is_none(),
+        "the main agent's list carries no agent field"
+    );
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
