@@ -22,7 +22,7 @@
 
 **真 key 验收**(anthropic 轨,sonnet-5;throwaway example 脚本化 mid-turn steer,验完即删):任务是"分三次单独 bash 跑 `sleep 3 && echo STEP-ONE/TWO/THREE`",后台任务在 t=4s(turn 运行中)把一条 steer push 进 `cfg.inbox`。history 精确印证机制:STEP-ONE 的 tool_result 之后**紧跟一条带 `STEERING_PREFIX` 的独立 user 消息**(排在 tool_result 后、下一次采样前,未插进在途请求、未与 tool_result 交错)→ 模型"Noted the steering message"跑 `echo STEERED-MIDTURN` → 继续 STEP-THREE → 最终答复明确确认"收到你干活时发的消息并处理了"。turn 未被打断,5 rounds Completed。B 方案(脚本 push inbox)验的是核心 drain + 模型响应闭环;TUI enqueue 侧(`Command::Steer`→push)由单测锁定。
 
-**提交**:<!-- 待填 -->
+**提交**:27d0430(fmt/clippy/test 全绿,321 个测试)。
 
 ## 目标
 
