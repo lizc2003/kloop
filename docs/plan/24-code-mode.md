@@ -277,7 +277,8 @@ future 用的 owned guard。
 ② ~~MCP 工具暴露给 program~~ **已完成(plan 27,切片 1+2)**:program 面 + `run_program` TS
 声明并入 source 工具,`run_program_def` 生成点从 `tool_defs` 上移到 `all_tool_defs`;defer 交互
 (命脉)回源纠偏——随 codex 降级紧凑名单、非全量 TS;`ToolCtx.from_program` 跳过 `locked()`
-发现门。切片 3(结构化 `CallToolResult<T>`)与真 key 验收挂账。详见 plan 27 完成记录。
+发现门。真 key anthropic 轨 inline + defer 双侧验收已过。切片 3(结构化 `CallToolResult<T>`)挂账。
+详见 plan 27 完成记录。
 ③ ~~`pipeline()` 原语~~ **已完成**
 (追加片,见下)+ token `budget`(仍挂账)。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
 (追加片,见上);只剩"更富的进度树

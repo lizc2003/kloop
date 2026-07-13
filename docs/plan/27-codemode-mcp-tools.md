@@ -161,11 +161,25 @@ run_program TS 含 source 全量签名(`run_program_def_declares_inline_source_t
 引导(`run_program_def_lists_deferred_source_tools_as_a_manifest`)。既有 `all_tool_defs_appends_sources_and_skips_collisions`
 顺序期望同步(run_program 挪到末尾)。
 
+### 真 key 验收(anthropic/sonnet-5,已过)
+
+用户定"验收"。临时 stub MCP server(scratchpad `stub_mcp.py`,几十行 Python newline JSON-RPC,
+暴露 `echo`/`danger` 两工具)+ 临时 `.kloop/config.toml` `[mcp.servers.stub]`(验完撤,未入库)+
+`AGENT_ALLOW=stub__echo`/`AGENT_DENY=stub__danger`,真 key(`.kloop/env.local`)跑 `--plain`:
+
+- **切片 1(inline,默认阈值)**:模型自发写 `run_program` 调 `tools.stub__echo({text:"plan27"})` +
+  try/catch 调 `tools.stub__danger(...)`,返回 `{"echo":"echo: plan27","danger":"blocked"}`——echo 经
+  MCP 链跑通(结果确从 stub server 回来)、danger 被 deny 规则**在 program 内**拒掉(catch 到),
+  **gate 生效**。
+- **切片 2(defer,`AGENT_DEFER_THRESHOLD=5` 强制)**:启动打印"16 tools registered (> 5) …
+  deferred";模型写 `run_program` **直接**调 `tools.stub__echo({text:"defer27"})`(**没 tool_search**——
+  从 run_program description 的紧凑清单发现),返回 `echo: defer27`——deferred MCP 工具在 program 里
+  跑通(`from_program` 跳过了会弹回顶层直调的 `locked()`)。
+
+完成标准的"真 key 至少一次模型在 program 里调 MCP、gate 生效"两侧(inline + defer)均已过。
+
 ### 挂账
 
-- **真 key 验收**(完成标准要求,未做):需配真/mock MCP server,模型在 program 里编排
-  "内置 + MCP + agent()"跑通闭环、gate 生效。--mock 不连 MCP,验不了;需用户提供 key/代理 +
-  一个 MCP server(真实或临时 stub)。
 - **切片 3**:结构化 `CallToolResult<T>` 结果(codex `description.rs` 有 `CallToolResult<T>` TS +
   `mcp_structured_content_schema`;kloop `ToolSource::call` 现返 String 拍平文本,program 自己
   JSON.parse)。若有真实结构化 MCP 需求再上。
