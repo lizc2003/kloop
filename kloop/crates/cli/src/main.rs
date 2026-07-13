@@ -779,6 +779,20 @@ fn config_from_env(
     }
 }
 
+/// ANSI-color a diff preview for the plain REPL: additions green, deletions
+/// red, everything else (context, hunk gaps, markers) dim.
+fn color_diff(preview: &str) -> String {
+    preview
+        .lines()
+        .map(|line| match line.chars().next() {
+            Some('+') => format!("\x1b[32m{line}\x1b[0m"),
+            Some('-') => format!("\x1b[31m{line}\x1b[0m"),
+            _ => format!("\x1b[2m{line}\x1b[0m"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Interactive y/a/p/n prompt on the terminal. The REPL's own stdin reader
 /// is idle while a turn runs, so a direct blocking read is safe; if the turn
 /// is Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
@@ -804,7 +818,12 @@ impl Approver for CliApprover {
                 ),
                 None => "y = allow once / n = deny".to_string(),
             };
-            print!("\n[approve?] {}\n  {options} > ", req.description);
+            let preview = req
+                .preview
+                .as_deref()
+                .map(|p| format!("\n{}", color_diff(p)))
+                .unwrap_or_default();
+            print!("\n[approve?] {}{preview}\n  {options} > ", req.description);
             let _ = std::io::stdout().flush();
             let line = tokio::task::spawn_blocking(|| {
                 let mut buf = String::new();
@@ -1126,6 +1145,14 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn color_diff_wraps_lines_by_sign() {
+        assert_eq!(
+            color_diff("+add\n-del\n ctx"),
+            "\x1b[32m+add\x1b[0m\n\x1b[31m-del\x1b[0m\n\x1b[2m ctx\x1b[0m"
+        );
     }
 
     #[test]

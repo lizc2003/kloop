@@ -61,11 +61,14 @@ pub enum Decision {
 /// One confirmation request. `remember_rules` carries the suggested
 /// persistent rules when the call is remember-able; `None` means only
 /// allow-once / deny apply (opaque bash, sensitive paths, explicit ask
-/// rules, sandbox escalation).
+/// rules, sandbox escalation). `preview` carries a file-change diff for
+/// `write_file`/`edit_file` so the human sees the change before approving;
+/// `None` for everything else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmRequest {
     pub description: String,
     pub remember_rules: Option<Vec<String>>,
+    pub preview: Option<String>,
 }
 
 /// The outcome of [`Permissions::escalate_sandbox`] — the code-level
@@ -392,6 +395,7 @@ impl Permissions {
         let req = ConfirmRequest {
             description: describe(name, input, depth, hazard_tag),
             remember_rules: remember.as_ref().map(|r| r.rules.clone()),
+            preview: crate::diff::file_change_preview(name, input).await,
         };
         match approver.confirm(req).await {
             Decision::Allow => Ok(()),
@@ -443,6 +447,7 @@ impl Permissions {
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
             remember_rules: None,
+            preview: None,
         };
         match approver.confirm(req).await {
             Decision::Allow | Decision::AllowSession | Decision::AllowAlways => {
@@ -1194,6 +1199,34 @@ mod tests {
             "[sub-agent] [destructive] bash: rm -rf x"
         );
         assert_eq!(asked[1].description, "write_file: a.txt");
+    }
+
+    /// The approval request carries a file-change diff for edit/write so the
+    /// human sees the change; other tools carry none.
+    #[tokio::test]
+    async fn confirm_request_carries_a_change_preview() {
+        let approver = ScriptedApprover::new(vec![Decision::Deny, Decision::Deny, Decision::Deny]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let _ = p
+            .check(
+                "edit_file",
+                &json!({"path": "f.rs", "old_string": "foo", "new_string": "bar"}),
+                0,
+            )
+            .await;
+        // A path that does not exist is previewed as a new file.
+        let _ = p
+            .check(
+                "write_file",
+                &json!({"path": "/work/proj/does-not-exist.txt", "content": "hi\n"}),
+                0,
+            )
+            .await;
+        let _ = p.check("bash", &bash("rm -rf x"), 0).await;
+        let asked = approver.asked();
+        assert_eq!(asked[0].preview.as_deref(), Some("-foo\n+bar"));
+        assert_eq!(asked[1].preview.as_deref(), Some("(new file)\n+hi"));
+        assert_eq!(asked[2].preview, None, "non-file calls carry no preview");
     }
 
     /// The sandbox auto-allow layer: a contained call runs without asking —

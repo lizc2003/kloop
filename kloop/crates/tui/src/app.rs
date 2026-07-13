@@ -779,6 +779,7 @@ mod tests {
             req: ConfirmRequest {
                 description: "bash: git push".into(),
                 remember_rules: Some(vec!["bash(git push *)".into()]),
+                preview: None,
             },
             reply,
         });
@@ -801,6 +802,7 @@ mod tests {
         let req = |d: &str| ConfirmRequest {
             description: d.into(),
             remember_rules: None,
+            preview: None,
         };
         app.apply(AgentEvent::Confirm {
             req: req("first"),
@@ -914,6 +916,7 @@ mod tests {
             req: ConfirmRequest {
                 description: "x".into(),
                 remember_rules: None,
+                preview: None,
             },
             reply,
         });

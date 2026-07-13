@@ -454,6 +454,9 @@ impl Approver for ThreadUi {
         if let Some(rules) = &req.remember_rules {
             params["rememberRules"] = json!(rules);
         }
+        if let Some(preview) = &req.preview {
+            params["preview"] = Value::String(preview.clone());
+        }
         params["threadId"] = Value::String(self.thread_id.clone());
         let sent = self
             .out

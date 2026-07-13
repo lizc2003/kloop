@@ -367,6 +367,8 @@ async fn approval_denied_then_allowed() {
         .unwrap()
         .contains("write_file"));
     assert!(request["params"]["rememberRules"].is_array());
+    // The change preview reaches the client (a fresh path is a new file).
+    assert_eq!(request["params"]["preview"], "(new file)\n+x");
 
     client
         .send(json!({"id": srv_id, "result": {"decision": "deny"}}))

@@ -213,6 +213,7 @@ mod tests {
         let req = ConfirmRequest {
             description: "bash: rm -rf /tmp/x".into(),
             remember_rules: None,
+            preview: None,
         };
 
         let fut = ui.confirm(req.clone());
@@ -232,6 +233,7 @@ mod tests {
         let fut = ui.confirm(ConfirmRequest {
             description: "x".into(),
             remember_rules: None,
+            preview: None,
         });
         let Some(AgentEvent::Confirm { reply, .. }) = rx.recv().await else {
             panic!("expected a Confirm event");
@@ -244,6 +246,7 @@ mod tests {
         let fut = ui.confirm(ConfirmRequest {
             description: "y".into(),
             remember_rules: None,
+            preview: None,
         });
         assert_eq!(fut.await, Decision::Deny);
     }

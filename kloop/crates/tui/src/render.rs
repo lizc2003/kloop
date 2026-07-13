@@ -268,6 +268,10 @@ fn draw_confirm(f: &mut Frame, req: &kloop_core::permissions::ConfirmRequest, ar
         .into_iter()
         .map(Line::from)
         .collect();
+    if let Some(preview) = &req.preview {
+        lines.push(Line::default());
+        lines.extend(diff_preview_lines(preview, inner_w));
+    }
     lines.push(Line::default());
     lines.extend(
         wrap(&options, inner_w)
@@ -286,6 +290,24 @@ fn draw_confirm(f: &mut Frame, req: &kloop_core::permissions::ConfirmRequest, ar
         Paragraph::new(lines).block(Block::bordered().title("approve?")),
         popup,
     );
+}
+
+/// Color a file-change diff preview: additions green, deletions red, context
+/// and markers dim. Each source line keeps its color across width wrapping.
+fn diff_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
+    preview
+        .lines()
+        .flat_map(|line| {
+            let style = match line.chars().next() {
+                Some('+') => Style::new().fg(Color::Green),
+                Some('-') => Style::new().fg(Color::Red),
+                _ => DIM,
+            };
+            wrap(line, width)
+                .into_iter()
+                .map(move |frag| Line::from(Span::styled(frag, style)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -312,6 +334,24 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello!", 5), "hell…");
         assert_eq!(truncate("你好世界", 5), "你好…");
+    }
+
+    #[test]
+    fn diff_preview_colors_lines_by_sign() {
+        let lines = diff_preview_lines(" ctx\n-old\n+new\n⋮", 40);
+        let got: Vec<(String, Style)> = lines
+            .iter()
+            .map(|l| (line_text(l), l.spans[0].style))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (" ctx".to_string(), DIM),
+                ("-old".to_string(), Style::new().fg(Color::Red)),
+                ("+new".to_string(), Style::new().fg(Color::Green)),
+                ("⋮".to_string(), DIM),
+            ]
+        );
     }
 
     #[test]

@@ -177,6 +177,16 @@ denial is not a turn abort: the model receives an `is_error` `tool_result`
 and is told to take another approach. Sub-agents share the parent's rules
 and cache and prompt through the same seam, tagged `[sub-agent]`.
 
+**Change previews**: when a `write_file`/`edit_file` reaches the prompt, the
+request carries a unified-diff preview (`crates/core/src/diff.rs`, `similar`)
+so you approve what you can see, not just a path — approving an invisible edit
+is meaningless. `edit_file` diffs `old_string`→`new_string` directly;
+`write_file` diffs an existing file old→new, or shows a `(new file)` insert
+preview for a fresh path. Hunks carry three lines of context, big diffs are
+capped (`… (N more line(s))`), minified lines clipped. The TUI colors the
+popup (green adds, red deletes), the plain REPL prints the same, the server
+adds a `preview` field to `approval/request`.
+
 **Modes**: default (ask for anything unvouched-for), `--accept-edits`
 (file writes inside the working directory auto-pass), `--yolo` (bypass:
 everything passes *except* deny rules and safety checks). `--mock` disables
@@ -234,7 +244,7 @@ dropped/never-answered reply denies (interrupt the turn to unblock).
 ← {"id":1,"result":{"threadId":"20260709-135146"}}
 → {"id":2,"method":"turn/start","params":{"threadId":"20260709-135146","input":"create s2.txt"}}
 ← {"method":"turn/started","params":{"threadId":"20260709-135146"}}
-← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"]}}
+← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+hello"}}
 → {"id":"srv-1","result":{"decision":"allow"}}
 ← {"method":"tool/completed","params":{"threadId":"…","callId":"…","ok":true}}
 ← {"method":"turn/completed","params":{"threadId":"…","reason":"completed"}}
@@ -671,7 +681,10 @@ saved and resumable — see Session persistence above.
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
-  persistence, opaque never cacheable); hook execution (all four points fire
+  persistence, opaque never cacheable, `ConfirmRequest.preview` carrying an
+  edit/write diff while other calls carry none); change-preview generation
+  (added/deleted/changed lines, distant-hunk splitting, long-line clipping,
+  big-diff capping, write-file existing-vs-new-file previews); hook execution (all four points fire
   in order around a real turn, exit-2 pre_tool block becomes an is_error
   tool_result and the command never runs, blocked pre_turn prevents sampling,
   block reason stderr>stdout>status, non-2 exits fail open even on pre
@@ -704,12 +717,13 @@ saved and resumable — see Session persistence above.
   accumulation and splitting, tool status resolution by id, confirm queueing
   and keyboard capture, interrupt/quit commands, turn-end cleanup), and pure
   rendering (CJK-aware wrap/truncate, per-cell-kind lines, tool-row collapse,
-  input window around the cursor).
+  input window around the cursor, diff-preview coloring by +/- sign).
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
   plus duplex-driven protocol tests against the real serve loop with a
   scripted provider: delta streaming and completion, approval deny/allow
-  round-trips (file provably not/created), parallel threads with no event
+  round-trips (file provably not/created, the change `preview` reaching the
+  client), parallel threads with no event
   cross-tagging and no same-second id collisions, busy-thread rejection,
   interrupt-while-pending-approval, protocol-error resilience, and sessions
   surviving a server restart (list/resume/re-run over the same files).
@@ -771,6 +785,7 @@ crates/core/        kloop-core — the agent, network-free
                     dangerous classifiers, wrapper stripping
   src/permissions.rs the layered execution gate: deny/ask/allow rules,
                     safety checks, modes, session cache, Approver seam
+  src/diff.rs       write/edit change previews for the approval prompt
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,
                     instruction-file concatenation under a byte budget
