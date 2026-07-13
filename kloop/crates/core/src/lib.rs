@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod commands;
 pub mod compact;
 pub mod config;
 pub mod context;

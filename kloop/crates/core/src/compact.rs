@@ -4,7 +4,6 @@ use anyhow::bail;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::estimate_message_tokens;
 use crate::history::History;
@@ -80,14 +79,24 @@ fn starts_with_tool_result(message: &Message) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
+/// Outcome of a successful compaction, for the caller to report — the note
+/// text differs per call site (predictive, reactive, `/compact`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Messages replaced by the summary.
+    pub summarized: usize,
+    /// Recent messages kept verbatim (excludes the summary itself).
+    pub kept: usize,
+}
+
 /// Replace everything before the keep-boundary with a model-written summary.
-/// Fails without touching the history if the summary request fails.
+/// Fails without touching the history if the summary request fails; reporting
+/// the outcome is the caller's job.
 pub async fn run_compaction(
     cfg: &Arc<Config>,
     history: &mut History,
-    ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<CompactionStats> {
     let messages = history.messages();
     if messages.len() < 2 {
         bail!("history too short to compact");
@@ -109,10 +118,7 @@ pub async fn run_compaction(
     let summarized = keep_from;
     let kept = items.len() - 1;
     history.replace_all(items);
-    ui.note(&format!(
-        "history compacted: {summarized} message(s) summarized, {kept} kept verbatim"
-    ));
-    Ok(())
+    Ok(CompactionStats { summarized, kept })
 }
 
 /// One summarization request: no tools, text collected from BlockDone.
@@ -148,12 +154,6 @@ async fn sample_summary(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    struct NullUi;
-    impl Ui for NullUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, _: &str) {}
-    }
 
     fn compact_test_cfg(provider: kloop_provider::Provider, tag: &str) -> Arc<Config> {
         Arc::new(Config {
@@ -198,11 +198,18 @@ mod tests {
         }]]);
         let cfg = compact_test_cfg(provider, "rebuild");
         let mut history = seeded_history(cfg.offload_dir.clone());
-        let ui: Arc<dyn Ui> = Arc::new(NullUi);
 
-        run_compaction(&cfg, &mut history, &ui, &CancellationToken::new())
+        let stats = run_compaction(&cfg, &mut history, &CancellationToken::new())
             .await
             .expect("compaction should succeed");
+        // [user, assistant(fat), user] → summarize the first two, keep the last.
+        assert_eq!(
+            stats,
+            CompactionStats {
+                summarized: 2,
+                kept: 1
+            }
+        );
 
         let msgs = history.messages();
         // [summary, ...kept tail] — the fat prefix is summarized away and the
@@ -224,9 +231,8 @@ mod tests {
         let cfg = compact_test_cfg(provider, "fail");
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
-        let ui: Arc<dyn Ui> = Arc::new(NullUi);
 
-        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..], "history must be untouched");
@@ -239,9 +245,8 @@ mod tests {
         let cfg = compact_test_cfg(provider, "empty");
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
-        let ui: Arc<dyn Ui> = Arc::new(NullUi);
 
-        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..]);
@@ -253,9 +258,8 @@ mod tests {
         let cfg = compact_test_cfg(provider, "short");
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("only message"));
-        let ui: Arc<dyn Ui> = Arc::new(NullUi);
 
-        let result = run_compaction(&cfg, &mut history, &ui, &CancellationToken::new()).await;
+        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages().len(), 1);

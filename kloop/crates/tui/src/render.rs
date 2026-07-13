@@ -174,6 +174,13 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                     DIM,
                 )));
             }
+            Cell::System(text) => {
+                // Slash-command output: dim, but wrapped in full (not collapsed
+                // like a Note) since /help and /cost are multi-line.
+                for l in wrap(text, width) {
+                    lines.push(Line::from(Span::styled(l, DIM)));
+                }
+            }
         }
     }
     lines
@@ -217,7 +224,7 @@ pub fn status_line(app: &App) -> String {
         return format!("working… {note}  (Ctrl+C to interrupt)");
     }
     format!(
-        "session {} — Enter to send · Ctrl+D to quit",
+        "session {} — Enter to send · /help for commands · Ctrl+D to quit",
         app.session_id
     )
 }
@@ -382,6 +389,27 @@ mod tests {
                 "[compacting history]",
                 "done.",
                 "all good",
+            ]
+        );
+    }
+
+    /// A System cell (slash-command output) renders every line dim and wrapped,
+    /// unlike a Note which collapses to one truncated line.
+    #[test]
+    fn system_cell_wraps_all_lines_dim() {
+        let cells = vec![Cell::System(
+            "model: test\ncontext: ~20000 / 200000 tokens (10%)".into(),
+        )];
+        let lines = transcript_lines(&cells, 40);
+        let rendered: Vec<(String, Style)> = lines
+            .iter()
+            .map(|l| (line_text(l), l.spans[0].style))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("model: test".to_string(), DIM),
+                ("context: ~20000 / 200000 tokens (10%)".to_string(), DIM),
             ]
         );
     }

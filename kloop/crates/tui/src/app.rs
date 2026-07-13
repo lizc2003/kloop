@@ -55,6 +55,9 @@ pub enum Cell {
     /// turn; a new user turn starts a fresh block.
     Todo(Vec<TodoItem>),
     Note(String),
+    /// Output of a slash command — a wrapped, dim multi-line block (unlike a
+    /// Note, which collapses to one truncated line).
+    System(String),
 }
 
 /// A permission prompt currently waiting for a keypress. Prompts queue:
@@ -72,6 +75,10 @@ pub enum Command {
     None,
     /// Send this user text to the agent task (a turn is now running).
     Submit(String),
+    /// Run this slash-command line (`/help`, `/compact`, …) on the worker,
+    /// which owns History. Only produced when idle; the worker replies with a
+    /// System block and a TurnEnded that clears the busy state.
+    Slash(String),
     /// Enqueue this text into the running turn's steering queue (plan 22): it
     /// is delivered as a user message at the next round boundary, without
     /// interrupting the turn. Only produced while a turn is running.
@@ -249,6 +256,22 @@ impl App {
                     }
                 }
             }
+            AgentEvent::System(text) => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.cells.push(Cell::System(text));
+            }
+            AgentEvent::ClearTranscript => {
+                // /clear emptied History on the worker; drop the matching view
+                // state so the screen agrees with the model's blank context.
+                self.cells.clear();
+                self.tool_cells.clear();
+                self.agent_cells.clear();
+                self.todo_cell = None;
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = None;
+            }
             AgentEvent::Confirm { req, reply } => {
                 self.confirms.push_back(PendingConfirm { req, reply });
             }
@@ -310,6 +333,13 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
                 self.scroll_up = 0;
+                // A slash command runs only when idle; it is not a message, so
+                // no User cell and no new todo block. While a turn runs, a
+                // '/'-line is just steering text (Ctrl+C stays the hard stop).
+                if !self.running && kloop_core::commands::is_command(&text) {
+                    self.running = true;
+                    return Command::Slash(text);
+                }
                 self.cells.push(Cell::User(text.clone()));
                 if self.running {
                     // Steering: the running turn absorbs this at its next round
@@ -779,6 +809,53 @@ mod tests {
         assert_eq!(app.input, "");
         assert_eq!(app.todo_cell, Some(0), "a steer keeps the live todo block");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
+    }
+
+    /// An idle slash line routes to the worker as Command::Slash and marks the
+    /// app busy, without pushing a User cell or starting a todo block. While a
+    /// turn runs, the same text is steering — Ctrl+C is the only hard stop.
+    #[test]
+    fn slash_command_routes_only_when_idle() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "/help");
+        let cmd = app.on_key(key(KeyCode::Enter));
+        assert_eq!(cmd, Command::Slash("/help".into()));
+        assert!(app.running, "the app shows busy until the worker replies");
+        assert_eq!(app.input, "");
+        assert!(app.cells.is_empty(), "a command is not a User message");
+
+        // While running, a '/'-line is just steering text, not a command.
+        type_str(&mut app, "/cost");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Command::Steer("/cost".into())
+        );
+        assert_eq!(app.cells, vec![Cell::User("/cost".into())]);
+    }
+
+    /// A command's System output renders as its own cell; ClearTranscript wipes
+    /// the transcript view to match History being emptied on the worker.
+    #[test]
+    fn system_output_and_clear_transcript() {
+        let mut app = App::new("s".into());
+        app.cells.push(Cell::User("earlier".into()));
+        app.tool_cells.insert("t1".into(), 0);
+        app.todo_cell = Some(3);
+
+        app.apply(AgentEvent::System(
+            "model: x\ncontext: ~0 / 100 tokens (0%)".into(),
+        ));
+        assert_eq!(
+            app.cells.last(),
+            Some(&Cell::System(
+                "model: x\ncontext: ~0 / 100 tokens (0%)".into()
+            ))
+        );
+
+        app.apply(AgentEvent::ClearTranscript);
+        assert!(app.cells.is_empty());
+        assert!(app.tool_cells.is_empty());
+        assert_eq!(app.todo_cell, None);
     }
 
     #[test]

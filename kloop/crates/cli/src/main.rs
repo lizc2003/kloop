@@ -1062,6 +1062,16 @@ async fn main() -> Result<()> {
     .await
 }
 
+/// A task that cancels `cancel` on the first Ctrl+C; the caller aborts it once
+/// the turn or command finishes. The REPL's own stdin reader is idle meanwhile.
+fn spawn_ctrl_c(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel.cancel();
+        }
+    })
+}
+
 async fn plain_main(
     args: CliArgs,
     mut history: History,
@@ -1097,8 +1107,8 @@ async fn plain_main(
     }
 
     println!(
-        "kloop — session {session_id}; type a task, 'exit' or Ctrl+D to quit, \
-         Ctrl+C to interrupt a running turn"
+        "kloop — session {session_id}; type a task, /help for commands, \
+         'exit' or Ctrl+D to quit, Ctrl+C to interrupt a running turn"
     );
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
@@ -1114,17 +1124,23 @@ async fn plain_main(
         if line == "exit" {
             break;
         }
+        // Slash commands run inline: the REPL owns History directly, so no
+        // routing is needed (unlike the TUI). Ctrl+C interrupts a slow one
+        // (e.g. /compact) the same way it interrupts a turn.
+        if kloop_core::commands::is_command(&line) {
+            let cancel = CancellationToken::new();
+            let watcher = spawn_ctrl_c(cancel.clone());
+            let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
+            watcher.abort();
+            if !result.output.is_empty() {
+                println!("{}", result.output);
+            }
+            continue;
+        }
 
         history.record(Message::user_text(line));
         let cancel = CancellationToken::new();
-        let watcher = {
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    cancel.cancel();
-                }
-            })
-        };
+        let watcher = spawn_ctrl_c(cancel.clone());
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
         watcher.abort();
         println!();

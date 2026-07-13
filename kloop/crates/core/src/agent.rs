@@ -184,17 +184,23 @@ async fn turn_rounds(
                 )
             {
                 ui.note("predicted context overflow; compacting history");
-                if let Err(e) = compact::run_compaction(cfg, history, ui, cancel).await {
-                    if cancel.is_cancelled() {
-                        return TurnOutcome {
-                            reason: EndReason::Aborted,
-                            final_text: String::new(),
-                            rounds: round,
-                        };
+                match compact::run_compaction(cfg, history, cancel).await {
+                    Ok(stats) => ui.note(&format!(
+                        "history compacted: {} summarized, {} kept verbatim",
+                        stats.summarized, stats.kept
+                    )),
+                    Err(e) => {
+                        if cancel.is_cancelled() {
+                            return TurnOutcome {
+                                reason: EndReason::Aborted,
+                                final_text: String::new(),
+                                rounds: round,
+                            };
+                        }
+                        // Predictive failure is not fatal: fall through and let
+                        // the request itself succeed or overflow reactively.
+                        ui.note(&format!("predictive compaction failed: {e:#}"));
                     }
-                    // Predictive failure is not fatal: fall through and let
-                    // the request itself succeed or overflow reactively.
-                    ui.note(&format!("predictive compaction failed: {e:#}"));
                 }
             }
         }
@@ -228,8 +234,14 @@ async fn turn_rounds(
                 }
                 overflow_compact_attempted = true;
                 ui.note("context window exceeded; compacting and retrying");
-                match compact::run_compaction(cfg, history, ui, cancel).await {
-                    Ok(()) => continue,
+                match compact::run_compaction(cfg, history, cancel).await {
+                    Ok(stats) => {
+                        ui.note(&format!(
+                            "history compacted: {} summarized, {} kept verbatim",
+                            stats.summarized, stats.kept
+                        ));
+                        continue;
+                    }
                     Err(e) => {
                         return TurnOutcome {
                             reason: if cancel.is_cancelled() {

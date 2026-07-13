@@ -21,6 +21,12 @@ pub enum AgentEvent {
     TextDelta(String),
     ThinkingDelta(String),
     Note(String),
+    /// Output of a slash command (`/help`, `/cost`, …). Rendered as a wrapped
+    /// system block, not a one-line note — emitted by the worker directly, not
+    /// through the `Ui` seam.
+    System(String),
+    /// `/clear` emptied History; the loop resets its transcript view to match.
+    ClearTranscript,
     /// `agent` is "" for the main agent's own calls, "agent-N" for calls a
     /// sub-agent makes — parallel sub-agents interleave on this stream.
     ToolStart {

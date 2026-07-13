@@ -630,6 +630,36 @@ enqueue yet — the drain path is live for all three, only the enqueue side is
 TUI-only for now. This is the cc/codex convergence: steering is
 enqueue-not-interrupt, delivered only between steps (see `refs/README.md`).
 
+## Slash commands (Phase 2, sixteenth slice)
+
+An input line starting with `/` is a **built-in command**, not a message to
+the model. The set is small and lives one-file-per-command under
+`core/src/commands/` (the directory listing *is* the catalog):
+
+- `/help` — list the commands.
+- `/cost` — the current model and context-window usage (`~used / window
+  tokens (pct%)`, from the same usage anchor + char/4 estimate compaction
+  uses; a cumulative token/dollar total would need per-response accounting the
+  history does not yet keep).
+- `/compact` — summarize and shrink the conversation now, instead of waiting
+  for the predictive/reactive triggers.
+- `/clear` — empty the conversation and start fresh (cc/claw semantics: an
+  append-only compacted-to-nothing marker that resume replays to empty; it
+  does **not** fork a new session file). Process-state (todos, steering queue)
+  resets too.
+
+An unknown `/name` lists the available commands (the same discoverable shape
+as an unknown `agent_type`). Commands run **only when idle** — they read or
+rewrite History, which a running turn is otherwise using; while a turn runs, a
+`/`-line is just steering text. The plain REPL runs them inline (it owns
+History); the TUI routes them to its worker (which owns History) so a slow
+`/compact` shows as busy and Ctrl+C interrupts it like a turn. Only cc has
+this feature among the three references (claw has built-in slash but no user
+templates; the codex checkout has neither) — the shape follows cc.
+**Not done** (deferred to their own plan): user-defined `.kloop/commands/*.md`
+prompt templates with `$ARGUMENTS`/`$N` substitution — they plug into this same
+seam (a `custom.rs` sibling); server-mode slash; `!bash`/`@file` injection.
+
 ## Running
 
 ```sh

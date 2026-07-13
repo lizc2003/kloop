@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use kloop_core::agent::run_turn;
+use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
@@ -42,6 +43,17 @@ pub type NoteFn = Arc<dyn Fn(&str) + Send + Sync>;
 struct Turn {
     text: String,
     cancel: CancellationToken,
+}
+
+/// What the UI loop hands the worker (which owns History). A slash command is
+/// routed here rather than run in the loop precisely because it reads or
+/// rewrites History, exactly like a turn does.
+enum WorkerMsg {
+    Turn(Turn),
+    Command {
+        line: String,
+        cancel: CancellationToken,
+    },
 }
 
 /// Run the TUI until the user quits. `make_config` is called once with the
@@ -67,12 +79,12 @@ pub async fn run(
     // into the transcript instead of starting on a blank screen.
     let resumed_cells = app::cells_from_history(history.messages());
 
-    let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let worker = tokio::spawn(agent_worker(
         cfg,
         history,
         channel_ui as Arc<dyn Ui>,
-        turn_rx,
+        msg_rx,
         event_tx,
     ));
 
@@ -80,7 +92,7 @@ pub async fn run(
     let result = ui_loop(
         &mut terminal,
         event_rx,
-        turn_tx,
+        msg_tx,
         inbox,
         session_id,
         resumed_cells,
@@ -99,14 +111,38 @@ async fn agent_worker(
     cfg: Arc<Config>,
     mut history: History,
     ui: Arc<dyn Ui>,
-    mut turns: mpsc::UnboundedReceiver<Turn>,
+    mut msgs: mpsc::UnboundedReceiver<WorkerMsg>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    while let Some(turn) = turns.recv().await {
-        history.record(Message::user_text(turn.text));
-        let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
-        if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
-            return;
+    while let Some(msg) = msgs.recv().await {
+        match msg {
+            WorkerMsg::Turn(turn) => {
+                history.record(Message::user_text(turn.text));
+                let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
+                if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                    return;
+                }
+            }
+            WorkerMsg::Command { line, cancel } => {
+                let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
+                // Clear first (drops the old cells), then show the result on
+                // the now-blank transcript.
+                if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
+                    return;
+                }
+                if !result.output.is_empty()
+                    && events.send(AgentEvent::System(result.output)).is_err()
+                {
+                    return;
+                }
+                // TurnEnded clears the busy state the key handler set on submit.
+                if events
+                    .send(AgentEvent::TurnEnded(EndReason::Completed))
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
     }
 }
@@ -137,7 +173,7 @@ fn restore_terminal() {
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
-    turns: mpsc::UnboundedSender<Turn>,
+    msgs: mpsc::UnboundedSender<WorkerMsg>,
     inbox: Arc<std::sync::Mutex<Vec<String>>>,
     session_id: String,
     resumed_cells: Vec<app::Cell>,
@@ -155,7 +191,14 @@ async fn ui_loop(
                         Command::Submit(text) => {
                             let cancel = CancellationToken::new();
                             current_cancel = Some(cancel.clone());
-                            let _ = turns.send(Turn { text, cancel });
+                            let _ = msgs.send(WorkerMsg::Turn(Turn { text, cancel }));
+                        }
+                        Command::Slash(line) => {
+                            // Runs on the worker (owns History); its cancel lets
+                            // Ctrl+C interrupt a slow /compact like a turn.
+                            let cancel = CancellationToken::new();
+                            current_cancel = Some(cancel.clone());
+                            let _ = msgs.send(WorkerMsg::Command { line, cancel });
                         }
                         Command::Steer(text) => {
                             // Enqueue for the running turn; the agent loop
