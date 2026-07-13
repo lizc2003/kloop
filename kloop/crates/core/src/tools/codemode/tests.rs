@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde_json::json;
 
+use crate::agent::Ui;
 use crate::permissions::Mode;
 use crate::permissions::PermissionRules;
 use crate::permissions::Permissions;
@@ -15,6 +17,33 @@ use super::*;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("kloop-codemode-{}-{}", std::process::id(), name))
+}
+
+/// Records the UI signals a running program emits, so tests can assert what the
+/// user actually sees while the program executes.
+#[derive(Default)]
+struct RecordUi(Mutex<Vec<String>>);
+impl RecordUi {
+    fn events(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+impl Ui for RecordUi {
+    fn text_delta(&self, _: &str) {}
+    fn note(&self, s: &str) {
+        self.0.lock().unwrap().push(format!("note: {s}"));
+    }
+    fn tool_start(&self, _agent: &str, _id: &str, name: &str, _summary: &str) {
+        self.0.lock().unwrap().push(format!("tool_start: {name}"));
+    }
+    fn tool_end(&self, _agent: &str, _id: &str, ok: bool) {
+        self.0.lock().unwrap().push(format!("tool_end: {ok}"));
+    }
+}
+
+fn with_ui(mut ctx: ToolCtx, ui: Arc<RecordUi>) -> ToolCtx {
+    ctx.ui = ui;
+    ctx
 }
 
 fn with_permissions(mut ctx: ToolCtx, perms: Permissions) -> ToolCtx {
@@ -122,12 +151,56 @@ async fn intermediate_results_stay_off_the_result() {
 }
 
 #[tokio::test]
-async fn program_error_is_reported_with_logs() {
+async fn program_error_surfaces_the_exception_without_logs() {
     let ctx = test_ctx(0, "err");
     let (out, is_error) = exec(r#"log("before"); throw new Error("kaboom");"#, &ctx).await;
     assert!(is_error);
-    assert!(out.contains("before"), "logs so far should survive: {out}");
     assert!(out.contains("kaboom"), "{out}");
+    // log() is a live user-facing channel, not part of the model's result.
+    assert!(
+        !out.contains("before"),
+        "logs must not leak into the result: {out}"
+    );
+}
+
+/// A running program is observable: its `log()` output streams live to the UI
+/// (not buried in the final result) and each `tools.<name>()` op shows as a
+/// tool line — so the program is not a black box while it runs.
+#[tokio::test]
+async fn program_logs_and_ops_stream_to_the_ui() {
+    let file = tmp("observe");
+    std::fs::write(&file, "data").unwrap();
+    let rec = Arc::new(RecordUi::default());
+    let ctx = with_ui(test_ctx(0, "observe"), rec.clone());
+    let (out, is_error) = exec(
+        &format!(
+            r#"log("phase 1");
+               await tools.read_file({{ path: {file:?} }});
+               log("phase 2");
+               return "ok";"#,
+        ),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, "ok", "only the return value comes back, no logs");
+
+    let events = rec.events();
+    // Both logs surfaced live, in order, with the inner op's tool line between
+    // them.
+    let pos = |needle: &str| {
+        events
+            .iter()
+            .position(|e| e == needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in {events:?}"))
+    };
+    assert!(
+        pos("note: phase 1") < pos("tool_start: read_file")
+            && pos("tool_start: read_file") < pos("note: phase 2"),
+        "expected phase 1 → read_file → phase 2 in {events:?}"
+    );
+    assert!(events.iter().any(|e| e == "tool_end: true"), "{events:?}");
+    let _ = std::fs::remove_file(&file);
 }
 
 #[test]

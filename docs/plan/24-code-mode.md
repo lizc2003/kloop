@@ -246,9 +246,23 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
   生成(`exec_def`/`ts_type`/`ts_object`)。接线:`tools/mod.rs`(`mod codemode` + execute_tool
   arm + tool_defs depth-0 push exec)、`permissions.rs`(`exec`→readonly 自动放行)。
 - **测试**:引擎 13(sandbox/并发 barrier/parallel/agent/log/结果强制/资源三杀/import 拒)+
-  core 8(gate 重入命脉/agent 派子/中间态不泄/TS 生成/程序面排除)+ agent 级 1(exec 经
-  run_turn,下一请求只带 return 值)。**fmt + clippy(-D warnings)+ 全量 353 测试全绿。**
-  `cargo run --mock` 冒烟通过。
+  core 9(gate 重入命脉/agent 派子/中间态不泄/异常不带 log/观测性 log 实时+op 行按序/TS
+  生成/程序面排除)+ agent 级 1(exec 经 run_turn,下一请求只带 return 值)。**fmt + clippy
+  (-D warnings)+ 全量 354 测试全绿。** `cargo run --mock` 冒烟通过。
+
+### 追加片:进度观察(log 实时化,同会话续做,提交号待补)
+
+用户"继续"→选做 UI 观察片。厘清后发现 op 调用本就通过 `run_one` 发 UI 生命周期(plain
+真机验收里 bash/write/agent 都显示了)、TUI/server 消费同样事件——**真缺口只有 `log()`**:原
+实现把 log 收集进 Vec、跑完随结果回来(既不实时、又污染上下文)。改为 **`CoreBridge.log`→
+`ctx.ui.note` 实时露出、且不再进 tool_result**(结果只回 `return` 值;对齐 cc narrator 模型 +
+code-mode 省 token 初衷),`exec_tool`/`format_output` 随之简化(去掉 logs 收集)。三前端零改动
+(复用既有 note 通道)。加观测性测试(RecordUi 断言 log 实时成 note、op 的 tool_start 行按序
+夹在两条 log 中间、结果只 return 值),error 测试改断言"异常上浮但 log 不进结果"。真 key 验收:
+plain 下 `log('scanning')` → `[bash …]` → `log('counted 5')` → `entry_count=5` 完整实时 trace,
+模型只拿到 return 值。**踩坑**:改完只跑了 `cargo test`(重建 lib)没重建 binary,首次真机跑用了
+旧二进制(log 仍收集不 note)看着像没生效——`cargo build -p kloop` 后即对。挂账收窄:UI 观察
+只剩"更富的进度树(cc `/workflows`)",kloop 现为扁平实时 trace,够用。
 
 **教训沉淀**:HANDOFF 教训 17(参考实现的复杂度先归因"功能本质 vs 底座连带",换底座能砍掉
 后者)。实现踩坑:同步死循环在 `eval` 阶段被 interrupt(非 await 阶段),故 stop_reason→错误
@@ -257,11 +271,13 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
 `ctx.async_with(async |ctx| …)`(非 deprecated 宏);`gate.read_owned/write_owned()` 给 'static
 future 用的 owned guard。
 
-**挂账(留后续 plan)**:① 真 key 验收——需用户提供 key/代理,做一次"模型写 program 编排多
-工具/子 agent 跑通闭环、gate 在 op 层生效"(同 plan 15 Responses、plan 23 `/compact` 的真 key
-挂账先例)。② MCP 工具暴露给 program(现只内置)+ deferred 集成。③ `pipeline()` 原语 + token
-`budget`。④ UI 进度观察(cc `/workflows` 等价;现 log 只进结果、program 跑时 UI 只见一行
-`exec` 工具行)。⑤ 后台 program + `yield`/`wait`(codex observation frontier;现同步跑完返回)。
+**挂账(留后续 plan)**:① ~~真 key 验收~~ **已完成**(anthropic/sonnet-5:模型写 program 用
+`Promise.all` 并发跑两个 bash + 一个被 `AGENT_DENY` 在 op 层拒掉的 write(writeBlocked=true、
+文件未创建)+ 一个 `agent()` 子 agent(返回 DELEGATED),闭环返回 JSON;gate 在 op 层生效)。
+② MCP 工具暴露给 program(现只内置)+ deferred 集成。③ `pipeline()` 原语 + token
+`budget`。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**(追加片,见上);只剩"更富的进度树
+(cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
+observation frontier;现同步跑完返回)。
 ⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ `Limits` 走配置/env(现
 硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `exec`
 本身只在 depth-0(同 task);受限 agent 类型不给 exec。

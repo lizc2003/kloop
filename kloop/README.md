@@ -666,8 +666,10 @@ The `exec` tool (`core/src/tools/codemode.rs`) is CodeAct: instead of one
 `tool_use` per step, the model writes **a JavaScript program** that orchestrates
 tools and sub-agents — loops, fan-out, pipelines and filters expressed in code.
 Intermediate results stay in program variables; only what the program `return`s
-(plus any `log(...)`) comes back, so a 100-item loop is one tool_result instead
-of 100. This is the industry's "code mode" pattern (Cloudflare coined it; codex
+comes back to the model, so a 100-item loop is one tool_result instead of 100.
+`log(...)` streams live to the user as the program runs — progress narration for
+the human, deliberately kept out of the model's context. This is the industry's
+"code mode" pattern (Cloudflare coined it; codex
 uses in-process V8; cc's dynamic workflows use Node; Anthropic's
 code-execution-with-MCP is the token argument).
 
@@ -707,10 +709,15 @@ an exclusive lock). Resource limits: per-program QuickJS heap cap and stack cap,
 and an interrupt handler that kills a runaway synchronous loop (a CPU-burst
 deadline that ignores await-suspended time) or a user Ctrl+C.
 
+A running program is observable, not a black box: each `tools.<name>(...)` and
+`agent(...)` shows as its own tool line (the ops go through `run_one`, which
+emits the same UI lifecycle a direct call does) and `log(...)` prints live.
+
 **Not done** (deferred): exposing MCP tools to programs (built-ins only for
-now); a `pipeline()` primitive and token `budget`; UI progress observation (a
-`/workflows` equivalent); background programs with `yield`/`wait`; saving a
-program for reuse with journal-based resume. See `docs/plan/24-code-mode.md`.
+now); a `pipeline()` primitive and token `budget`; a richer progress view (cc's
+`/workflows` tree — kloop shows a flat live trace); background programs with
+`yield`/`wait`; saving a program for reuse with journal-based resume. See
+`docs/plan/24-code-mode.md`.
 
 ## Running
 
@@ -776,7 +783,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 353 tests across the workspace:
+`cargo test` runs 354 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -867,10 +874,12 @@ saved and resumable — see Session persistence above.
   cancellation, memory cap). Its core wiring (`tools::codemode`) tests the
   op layer re-entering the real permission gate (a denied tool refused
   inside the program while a read-only one passes), `agent()` spawning a
-  real sub-agent, intermediate results staying off the result, and the
-  TypeScript-API generation; an agent-level test drives one `exec` tool_use
-  over Mock and asserts the next request carries only the program's return
-  value, never the content it read internally.
+  real sub-agent, intermediate results staying off the result, `log()`
+  streaming live to the UI (with the op's tool line ordered between two logs)
+  while staying out of the result, and the TypeScript-API generation; an
+  agent-level test drives one `exec` tool_use over Mock and asserts the next
+  request carries only the program's return value, never the content it read
+  internally.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
   unrelated-section preservation, malformed rejection), `[mcp.servers]`

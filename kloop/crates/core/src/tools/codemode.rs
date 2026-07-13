@@ -13,9 +13,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use anyhow::anyhow;
 use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
@@ -46,43 +44,22 @@ pub(super) async fn exec_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let source = super::str_arg(input, "source", "exec")?;
     let names = program_tool_names();
     let bridge = Arc::new(CoreBridge::new(ctx.clone()));
-    let result = kloop_codemode::run_program(
+    // `log()` output already streamed live to the UI as it ran; only the
+    // program's return value comes back to the model — keeping a program's
+    // progress narration out of the context is the whole point of code-mode.
+    let out = kloop_codemode::run_program(
         source,
         &names,
-        bridge.clone(),
+        bridge,
         ctx.cancel.clone(),
         kloop_codemode::Limits::default(),
     )
-    .await;
-    let logs = bridge.logs.lock().unwrap().clone();
-    match result {
-        Ok(out) => Ok(format_output(&logs, &out)),
-        // Surface logs even on failure — they show how far the program got
-        // before the exception, which is exactly what the model needs to fix it.
-        Err(e) => {
-            let msg = format!("{e:#}");
-            if logs.is_empty() {
-                Err(anyhow!("{msg}"))
-            } else {
-                Err(anyhow!("{}\n\nprogram error: {msg}", logs.join("\n")))
-            }
-        }
-    }
-}
-
-fn format_output(logs: &[String], result: &str) -> String {
-    let mut sections = Vec::new();
-    if !logs.is_empty() {
-        sections.push(logs.join("\n"));
-    }
-    if !result.is_empty() {
-        sections.push(result.to_string());
-    }
-    if sections.is_empty() {
+    .await?;
+    Ok(if out.is_empty() {
         "(program completed with no output)".into()
     } else {
-        sections.join("\n")
-    }
+        out
+    })
 }
 
 /// The bridge core hands the engine: it owns a [`ToolCtx`] clone and turns each
@@ -96,7 +73,6 @@ struct CoreBridge {
     // writes take the write lock (serialized) so a program can't race two
     // edits to the same file past the ordering a normal round would enforce.
     gate: Arc<tokio::sync::RwLock<()>>,
-    logs: Mutex<Vec<String>>,
 }
 
 impl CoreBridge {
@@ -105,7 +81,6 @@ impl CoreBridge {
             ctx,
             seq: AtomicU64::new(0),
             gate: Arc::new(tokio::sync::RwLock::new(())),
-            logs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -153,7 +128,9 @@ impl HostBridge for CoreBridge {
     }
 
     fn log(&self, message: String) {
-        self.logs.lock().unwrap().push(message);
+        // Live progress to the user, through the same note channel every
+        // frontend already renders (plain line / TUI cell / server note).
+        self.ctx.ui.note(&message);
     }
 }
 
