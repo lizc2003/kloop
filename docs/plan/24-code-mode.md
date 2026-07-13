@@ -316,7 +316,7 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 "何时 run_program 胜过 bash/直调"。**"能写对 JS"(给了意图就能,已验)≠"会自发选 run_program"(不会、也不该,
 除非任务真需要)。** 见 HANDOFF 教训 18。
 
-### 追加片:命名打磨(同会话续做,提交号待补)
+### 追加片:命名打磨(同会话续做,提交 310b830)
 
 用户指出两个名字可优化:
 - **`spawn_agent` → `call_agent`**(`HostBridge` trait 方法,内部):`spawn_` 隐含 fire-and-forget,
