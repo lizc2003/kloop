@@ -51,6 +51,8 @@ fmt/clippy/test 绿;真 key 一次多步任务里模型自发用 todo 跟踪进�
 
 **结构**:新 `core/src/tools/todo.rs`(TodoItem/TodoStatus/todo_write_def/todo_write_tool/parse_todos + 校验)。接线:`tools/mod.rs`(mod + pub use + tool_defs 全 depth push + dispatch 分发)、`config.rs`(todos 字段)、`agent.rs`(Ui::todo_update 默认)、`permissions.rs`(readonly)、`tools/task.rs`(子 agent 重置)。前端:tui `events.rs`(AgentEvent::TodoUpdate + ChannelUi override)、`app.rs`(Cell::Todo + todo_cell 就地更新 + 抑制工具行 + 新 turn 重置 + resume 重放)、`render.rs`(checklist 渲染);cli `main.rs` StdoutUi(抑制工具行 + 打印清单);server `lib.rs` ThreadUi(todo/updated 通知)。
 
-**验证**:`cargo test`(308,+10)、clippy -D warnings 0、fmt 绿。**挂账**:真 key 双轨"多步任务里模型自发用 todo"验收待做(需代理+key,问用户)——契约层已全覆盖(工具语义/校验/隔离/权限/三前端呈现/server wire)。
+**验证**:`cargo test`(308,+10)、clippy -D warnings 0、fmt 绿。**真 key 双轨验收已过**(`--plain` 非交互喂只读多步探索任务):
+- **Anthropic sonnet-5**:自发用 todo_write 建 3 项清单,逐项 in_progress→completed 推进,共 5 次 todo_write,checklist 逐轮就地演进到全 ✓;in_progress 显 activeForm("Finding built-in tool count")、完成显 content;todo_write 工具行抑制(只出 `[todos]` 块);只读任务零审批摩擦,结论正确(11 内置工具、sandbox/mod.rs)。
+- **OpenAI-compat gpt-5.4-mini(弱模型)**:同样自发用 todo_write 建清单并逐项推进(3 次更新),checklist 正常渲染、工具行抑制、无 hang——赌注(弱模型也会自发用 todo)成立。模型把工具数数成 12(实为 11)是它自身推理误差,与 todo 功能无关。
 
 **有意偏离/未做**:不抄 claw 的"all-completed 自动清空 list"(纯 UI 细节,且我们的 todo 不回灌模型上下文,清空只影响面板;不清空=完成后仍显示全✓,更好的 UX,更简单);不抄 claw 的落盘 store(改 Config 内存态);不做依赖图 blocks/blockedBy、跨会话 todo 库、list 落 rollout(plan 明确不做)。
