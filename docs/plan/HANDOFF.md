@@ -72,12 +72,13 @@
 - **plan 18(收尾)** TUI 按键选截点、server `thread/fork`(schema 已兼容,等有真实需求)。
 - **plan 19(后续片)** 片 1(seatbelt 执行原语)+ 片 2(auto-allow 双轴联动)+ 片 3(代码级 escalation 环)已完成。剩余只有平台扩展:Linux 片对 bwrap+seccomp(landlock 是 legacy;`sandbox/` 已是目录模块,平台后端落 sibling 文件 `linux.rs`——**不拆独立 crate**:Linux-only 依赖用 `cfg(target_os)` 门控即可、helper 二进制用 arg0 dispatch 复用主二进制,拆 crate 仅在 unsafe 面/编译成本有痛感时再议;本机无法手工验收,宜等仓库推远端后 Linux CI 能跑再做);Windows 更后,且缝要从 argv-prefix 改成 spawn-owning trait(restricted token/AppContainer 无包装二进制)。macOS 侧沙箱功能已完整。
 
-编号 = 建议做序(低编号先做,21→24);均备忘、未开工、可按用户意愿调换:
+编号 = 建议做序(低编号先做);均备忘、未开工、可按用户意愿调换:
 - **plan 20(已完成)** TodoWrite / 计划工具:`todo_write` 整表替换,存 Config 过程态、子 agent 隔离、readonly 自动放行、TUI/plain/server 三前端 checklist 呈现。真 key 双轨验收已过。详见 plan 20 完成记录。
 - **plan 21(已完成)** Edit/Write 的 diff 呈现:`ConfirmRequest.preview` 带 unified diff(`similar` crate、`core/src/diff.rs`),权限门生成、三前端渲染(TUI/plain 彩色、server `preview` 字段)。真 key anthropic 轨验收已过。详见 plan 21 完成记录 + 上文能力条目。
 - **plan 22(已完成机制 + 用户 steering)** 中途注入:step 边界注入队列(`Config.inbox`,round 边界 drain + 收尾兜底,成 user 消息带 cc 式 framing),首客户用户 steering(TUI Enter-while-running 软注入,不断当前工具)。真 key anthropic 轨验收已过(sonnet-5 mid-turn steer 边界注入 + 模型响应闭环)。**子 agent 回灌挂账**——回源(三家真读,file:line 沉淀 refs/README steering 一节)确认它整套依赖异步派发,kloop 现为同步 task,故异步派发 + 回灌留独立 plan(建议 plan 26)。plain/server 的 enqueue 侧(steering 输入)也挂账。详见 plan 22 完成记录。
 - **plan 23(备忘,未开工)** 自定义 slash 命令:`.kloop/commands/` 可复用带参 prompt 模板(`$ARGUMENTS`/`$1`),`[agents.<name>]` 的姊妹。QoL,灵活。文件形态(md vs config.toml)开工问用户。详见 plan 23。
 - **plan 24(备忘,未开工)** code mode / 代码编排(CodeAct):模型写 JS 程序编排工具/子 agent,中间结果留程序变量不回灌上下文——cc dynamic workflows / codex code mode(用 V8)/ Anthropic code-execution-with-MCP 同族。最大杠杆、最重、开工必先回源三家(教训 11)。引擎选型(V8 vs QuickJS vs Boa)、op 层过权限门/沙箱的安全模型是命脉。压轴。详见 plan 24。
 - **plan 25(备忘,未开工)** TUI 审批弹层可滚动:plan 21 的 diff 预览为不可滚动弹层做了硬截断(单行 >200、总行 >40),过渡妥协;真正解法是弹层可滚动(cc/codex 靠可滚动 overlay 容纳完整 diff),届时放宽 core 侧截断。缘起 plan 21 回源。详见 plan 25。
+- **plan 26(备忘,未开工)** 异步派发 + 子 agent 回灌:把 task 从同步 `handle.await` 变成 fire-and-forget(spawn 立即返 `agent-N` id + 完成侦测),子终态把摘要 push 进父 `Config.inbox`(plan 22 的 drain 侧零改动)、可选 autowake。承接 plan 22 deferred 的第二个消费者 + plan 17 片 6"统一任务注册表"。注入侧 plan 22 已建好,本 plan 只补派发侧。派发/生命周期侧需再回源(steering 回源只覆盖了交付侧)。也是 plan 24 code-mode 异步 `agent()` 的地基。详见 plan 26。
 
 不占编号的小事:首次推远端后看 CI 实跑一次绿(用户已暂缓)。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、usage/cost 呈现(记账数据已有,一个 `/cost` 或状态行即可,可与 plan 23 内置 slash 合并)、图片输入(已在 plan 14 挂账)。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
