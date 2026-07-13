@@ -4,6 +4,7 @@
 //! agent loop and the frontends depend on.
 
 mod bash;
+mod codemode;
 mod discover;
 mod fs;
 mod search;
@@ -316,6 +317,10 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
                 "required": ["prompt"]
             }),
         });
+        // exec generates its TypeScript API from the tools built so far, so it
+        // must come last; it exposes everything except itself and task.
+        let exec = codemode::exec_def(&defs);
+        defs.push(exec);
     }
     defs
 }
@@ -538,6 +543,7 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
+            "exec" => codemode::exec_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
                 Some(source) => source.call(other, input).await,
                 None => Err(anyhow!("unknown tool: {other}")),
@@ -735,6 +741,7 @@ mod tests {
                 "read_offloaded",
                 "todo_write",
                 "task",
+                "exec",
                 "srv__echo",
                 "srv__fail",
             ]
@@ -782,7 +789,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("51 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("52 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 

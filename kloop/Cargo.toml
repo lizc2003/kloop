@@ -6,6 +6,7 @@ members = [
     "crates/core",
     "crates/mcp",
     "crates/web",
+    "crates/codemode",
     "crates/cli",
     "crates/tui",
     "crates/server",
@@ -19,6 +20,7 @@ edition = "2021"
 kloop-core = { path = "crates/core" }
 kloop-mcp = { path = "crates/mcp" }
 kloop-protocol = { path = "crates/protocol" }
+kloop-codemode = { path = "crates/codemode" }
 kloop-provider = { path = "crates/provider" }
 kloop-server = { path = "crates/server" }
 kloop-tui = { path = "crates/tui" }
@@ -34,6 +36,10 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# QuickJS engine for code-mode. `futures` = AsyncRuntime/AsyncContext, `parallel` =
+# Send+Sync handles for the multi-thread tokio runtime, `macro` = the binding macros.
+# `bindgen` is deliberately OFF: rquickjs-sys ships pregenerated bindings, so no libclang.
+rquickjs = { version = "0.12", default-features = false, features = ["futures", "parallel", "macro"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"

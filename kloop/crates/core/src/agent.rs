@@ -1255,6 +1255,52 @@ mod tests {
             .all(|m| *m != Message::user_text(instructions)));
     }
 
+    /// Code-mode end to end over Mock: the model emits one `exec` tool_use whose
+    /// program reads a file twice internally, then returns a summary. The next
+    /// request to the model carries exactly one exec tool_result — the summary —
+    /// and the file content the program handled never reaches the context.
+    #[tokio::test]
+    async fn exec_returns_only_final_output_to_the_model() {
+        use kloop_provider::MockTurn;
+        let file = std::env::temp_dir().join(format!("kloop-exec-e2e-{}", std::process::id()));
+        std::fs::write(&file, "PAYLOAD_LINE_XYZ").unwrap();
+        let path = file.to_string_lossy().replace('\\', "\\\\");
+        let source = format!(
+            "const a = await tools.read_file({{ path: \"{path}\" }});\n\
+             const b = await tools.read_file({{ path: \"{path}\" }});\n\
+             return \"read \" + (a.length + b.length) + \" chars total\";"
+        );
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use_named(
+                "e1",
+                "exec",
+                json!({ "source": source }),
+            )]),
+            MockTurn::Blocks(text("done")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "exec-e2e");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        // Second request = the one sent after exec ran. It must show the
+        // program's return value and never the file content read inside it.
+        let seen = seen.lock().unwrap();
+        let dump = format!("{:?}", seen[1].messages);
+        assert!(
+            dump.contains("read ") && dump.contains("chars total"),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("PAYLOAD_LINE_XYZ"),
+            "an intermediate tool result leaked into the context: {dump}"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
     /// Deferred regime end to end over Mock: the request's tool defs shrink
     /// to built-ins + tool_search, the notice rides the injected context
     /// message (after the instructions) without entering history, and a

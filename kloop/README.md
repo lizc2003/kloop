@@ -660,6 +660,58 @@ templates; the codex checkout has neither) — the shape follows cc.
 prompt templates with `$ARGUMENTS`/`$N` substitution — they plug into this same
 seam (a `custom.rs` sibling); server-mode slash; `!bash`/`@file` injection.
 
+## Code mode (Phase 2, seventeenth slice)
+
+The `exec` tool (`core/src/tools/codemode.rs`) is CodeAct: instead of one
+`tool_use` per step, the model writes **a JavaScript program** that orchestrates
+tools and sub-agents — loops, fan-out, pipelines and filters expressed in code.
+Intermediate results stay in program variables; only what the program `return`s
+(plus any `log(...)`) comes back, so a 100-item loop is one tool_result instead
+of 100. This is the industry's "code mode" pattern (Cloudflare coined it; codex
+uses in-process V8; cc's dynamic workflows use Node; Anthropic's
+code-execution-with-MCP is the token argument).
+
+The engine is **QuickJS** via `rquickjs`, in the `kloop-codemode` crate. QuickJS
+over V8 is deliberate: V8 is ~40MB linked plus a sidecar to move it out of the
+binary (codex's shape), against kloop's minimalism; QuickJS is a few hundred KB,
+gives real isolation (no fs/network/console/module import — a program's only
+reach outside is the tools), and — unlike V8, which keeps process-global engine
+state — a fresh runtime is built and fully dropped per program. rquickjs's async
+runtime maps Rust futures to JS promises natively, so `await tools.x()` and
+`Promise.all` work without the manual promise-resolver plumbing bare V8 forces.
+
+The program calls:
+
+```ts
+declare const tools: { read_file(args: { path: string; … }): Promise<string>; … };
+declare function agent(prompt: string, opts?: { agent_type?; max_rounds? }): Promise<string>;
+declare function log(msg: unknown): void;
+declare function parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>;
+```
+
+The `tools` API and its TypeScript declarations are generated from the built-in
+tool schemas and carried in `exec`'s description (typed declarations markedly
+improve how reliably models call tools — the references converge on this).
+
+**The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
+the exact same gated dispatch a direct call takes** — `run_one` (allowlist →
+deferred lock → hooks → permission gate → sandbox → execute) and `task_tool`. A
+denied tool is refused *inside* the program (the model catches the exception); a
+sandboxed command is still sandboxed. The `kloop-codemode` crate is engine-only
+and knows nothing of permissions; it calls back through a `HostBridge` trait,
+which `core/src/tools/codemode.rs` implements over the gate — that inversion is
+why `core` can depend on the engine crate without a cycle. `exec` itself is
+auto-allowed (like `task`): it touches nothing directly. `Promise.all` maps to
+the same concurrency rule as a normal round (read-only calls batch, writes take
+an exclusive lock). Resource limits: per-program QuickJS heap cap and stack cap,
+and an interrupt handler that kills a runaway synchronous loop (a CPU-burst
+deadline that ignores await-suspended time) or a user Ctrl+C.
+
+**Not done** (deferred): exposing MCP tools to programs (built-ins only for
+now); a `pipeline()` primitive and token `budget`; UI progress observation (a
+`/workflows` equivalent); background programs with `yield`/`wait`; saving a
+program for reuse with journal-based resume. See `docs/plan/24-code-mode.md`.
+
 ## Running
 
 ```sh
@@ -724,7 +776,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 298 tests across the workspace:
+`cargo test` runs 353 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -806,6 +858,19 @@ saved and resumable — see Session persistence above.
   isError→Err and JSON-RPC-error→Err mapping, EOF fails pending requests,
   server-initiated requests refused with -32601 amid noise, concurrent
   calls routed by id.
+- **kloop-codemode** — the QuickJS engine in isolation: the async op bridge
+  (a tool call returns a JS promise resolved from a Rust future), real
+  concurrency proven with a 2-party barrier that a serial engine would
+  deadlock, the `parallel` helper turning failures into null, sandboxing
+  (no fetch/require/process/console, import rejected), result coercion,
+  program-error surfacing, and each resource limit (runaway-loop kill,
+  cancellation, memory cap). Its core wiring (`tools::codemode`) tests the
+  op layer re-entering the real permission gate (a denied tool refused
+  inside the program while a read-only one passes), `agent()` spawning a
+  real sub-agent, intermediate results staying off the result, and the
+  TypeScript-API generation; an agent-level test drives one `exec` tool_use
+  over Mock and asserts the next request carries only the program's return
+  value, never the content it read internally.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
   known dates, leap day), permission-config round-trip (load/persist/merge,
   unrelated-section preservation, malformed rejection), `[mcp.servers]`
@@ -823,10 +888,12 @@ every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 
 ## Layout
 
-Cargo workspace, seven crates; the dependency graph is a strict line up to
+Cargo workspace, eight crates; the dependency graph is a strict line up to
 core, then two sibling frontends under the cli, with the MCP wire client as
-a protocol-only sibling glued in by the cli
-(protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli):
+a protocol-only sibling glued in by the cli and the QuickJS code-mode engine
+as a leaf core depends on
+(protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli;
+codemode ← core):
 
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
@@ -853,6 +920,8 @@ crates/core/        kloop-core — the agent, network-free
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware
                     walking, output modes, paging, clipping)
     task.rs         sub-agent spawning
+    codemode.rs     the exec tool: CoreBridge (re-enters the gate per op),
+                    TypeScript API generation; engine is the codemode crate
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
   src/permissions.rs the layered execution gate: deny/ask/allow rules,
@@ -883,6 +952,10 @@ crates/web/         kloop-web — web_fetch/web_search (owns reqwest with provid
   src/fetch.rs      SSRF guard, redirect policy, caps, body handling
   src/html.rs       minimal HTML→text (no extra dependencies)
   src/search.rs     SearchBackend trait + Tavily/Brave implementations
+
+crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rquickjs)
+  src/lib.rs        run_program: isolated async runtime, HostBridge seam,
+                    the tools/agent/log/parallel prelude, resource limits
 
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,

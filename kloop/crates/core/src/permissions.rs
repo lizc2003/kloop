@@ -556,6 +556,9 @@ impl CallFacts {
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
+            // exec (code-mode) itself touches nothing; every tools.<name>()
+            // and agent() call the program makes re-enters this same gate.
+            "exec" => true,
             // tool_search only reads tool definitions and marks them
             // unlocked; the unlocked tool's own calls still pass this gate.
             "tool_search" => true,
