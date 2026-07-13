@@ -1,6 +1,7 @@
-# Plan 27 — code mode:MCP 工具暴露给 program(备忘)
+# Plan 27 — code mode:MCP 工具暴露给 program(✅ 切片 1+2 完成)
 
-> **备忘,未开工**。开工前读 HANDOFF + `docs/plan/24-code-mode.md`(首片 + 三个追加片
+> **✅ 切片 1+2 完成**(提交见文末完成记录;真 key 挂账、切片 3 挂账)。以下为原备忘;
+> 完成记录在文末。开工前读 HANDOFF + `docs/plan/24-code-mode.md`(首片 + 三个追加片
 > 完成记录 + 回源结论)+ `refs/README.md` 的 code-mode 一节。plan 24 已把 code-mode 的
 > 引擎/`exec`/op 层 gate/`agent()`/观测/`parallel`+`pipeline` 都做完并真机验收;本 plan
 > 只补一件事:**让 program 能调 MCP(外部 ToolSource)工具**——"code execution **with MCP**"
@@ -97,3 +98,81 @@ stub source 端到端:program 调 `srv__x(args)` 经 gate 跑通、被 deny 的 
 
 按所选切片;fmt/clippy/test 全绿;真 key 至少一次"模型在 program 里调 MCP 工具、gate 生效";
 README、HANDOFF、plan 24 挂账(②)与本 plan 更新;未选切片记挂账。
+
+## 完成记录(切片 1+2,2026-07-13,提交号 <待填>)
+
+开工时用户定"都做"(切片 1+2 一起;切片 3 结构化结果挂账)。
+
+### 回源结论(三家真读,教训 11+14)
+
+- **codex(唯一有真 Rust code-mode 实现,决定性)**——两个面**解耦**:
+  - 运行期 `tools` 对象(`code-mode/src/runtime/globals.rs` `build_tools_object`)= 从
+    `enabled_tools` 建,**所有启用工具(含 MCP)永远可调**;另有 `ALL_TOOLS` 全局 =
+    `{name, description}[]` 紧凑清单,也永远在。
+  - `exec` 工具的 **description**(`code-mode-protocol/src/description.rs`
+    `build_exec_tool_description`)才受 defer 影响:非 defer → 每工具**完整 TS 声明** +
+    `CallToolResult<T>` 前言;**defer 开 → 不放任何 MCP 的 TS**,只加一句
+    `DEFERRED_NESTED_TOOLS_GUIDANCE`("部分工具从描述省略,但仍在 `tools`/`ALL_TOOLS`,
+    按 name/description 过滤 `ALL_TOOLS` 去找")。分流在 `core/src/mcp_tool_exposure.rs`
+    `build_mcp_tool_exposure`:`search_tool_enabled` 时**全部** MCP 进 `deferred_tools`、
+    `direct_tools` 清空(全或全无)。
+  - **命脉裁定(决定 2)**:plan 原倾向"defer 开仍塞全量 TS"被**回源纠偏**——codex
+    做法相反,defer 开降级紧凑 name+desc。理由见教训 19(a):defer 触发就意味工具多到
+    不发全 schema,code-mode 不该破例把 bloat 换个地方灌回。
+- **Anthropic「code execution with MCP」**(公开设计):MCP 呈现成文件树
+  `./servers/<srv>/<tool>.ts`,渐进 import,中间态留代码。三目标(工具→代码 API、
+  渐进披露、中间态不进上下文)与 kloop 一致,底座不同,不改形态。
+- **cc dynamic workflows**:是**编排 agent**(不是编排 tool_call),脚本里子 agent 各自
+  `ToolSearch` 按需加载 MCP,不把工具烤进脚本全局面。形态不搬,只印证"deferred→按需发现"。
+
+### 落地(切片 1+2)
+
+- **结构改动**(决定 1):`run_program` 的 def 生成从 `tool_defs`(纯函数、无 sources)
+  上移到 `all_tool_defs`(持 sources)。`tools/mod.rs` 拆出私有 `builtin_defs(depth)`(内置 +
+  depth-0 的 task,**不产 run_program**);`tool_defs` 仍产**内置版** run_program(仅供
+  `defer_active`/`tool_merge_warnings` 计数 + `program_tool_names` 过滤,**从不发给模型**);
+  `all_tool_defs` 在 depth-0 产**含 source 的** run_program。counts/collision/阈值语义**逐字节
+  不变**(builtin_defs 少的 1 个 run_program 由 all_tool_defs 补回),唯一改的是 `all_tool_defs`
+  里 run_program **从 source 之前挪到之后**(TS 依赖 sources,故最后生成)——既有测试
+  `all_tool_defs_appends_sources_and_skips_collisions` 期望数组同步。
+- **program 面**(决定 5):`program_tool_names(sources)` 并入 `merged_source_defs`——**运行期
+  `tools` 永远含所有 source 方法**,defer 与否都可调(否则 `tools.srv__x` TypeError);减
+  {run_program, task}(tool_search/call_tool 天然不在,因它们不在 builtin_defs 也不在 source)。
+- **run_program def**(`tools/codemode.rs`):签名 `run_program_def(callable, deferred)`。
+  `callable` 得全量 TS 声明(内置 + inline source);`deferred` 非空时追加 `- tools.<name>: <desc>`
+  紧凑清单 + 引导("cannot call tool_search from inside a program;要精确 schema 先普通轮
+  tool_search 再写 program")。命名(决定 4)沿用 plan 10 消毒后的 `{server}__{tool}`,`__` 是
+  合法 JS 标识符字符,直接作方法名。
+- **结果形状**(决定 3):沿用 `Promise<string>`(内置一致、最小);结构化 `CallToolResult<T>`
+  挂账(切片 3)。
+- **locked 门交互**(实现踩坑,回源未覆盖):defer 开时顶层直调 deferred 工具被 `run_one` 的
+  `locked()` 弹回(必须先 tool_search);但 program 调它经 `CoreBridge` 也走 `run_one`,会被同一门
+  弹回。解法:`ToolCtx` 加 `from_program: bool`,`CoreBridge::new` 置 true,`run_one` 仅在
+  `!from_program` 时查 `locked()`。**纯发现门绕过,非安全门**(教训 19b):deny/权限/沙箱/hooks
+  照常;保住 plan-16"仅 tool_search 解锁"不变量(program 不写 `unlocked_tools`,顶层直调仍弹回)。
+
+### 测试(+6,共 364)
+
+`tools/codemode/tests.rs`:非 defer 时 program 调 `srv__echo` 经 gate 跑通(`program_calls_an_mcp_source_tool`)、
+deny 的 source 工具在 program 里被拒(`denied_mcp_source_tool_is_refused_in_a_program`)、defer 时顶层直调
+弹回但 program 调它跳过 locked 跑通(`program_calls_a_deferred_mcp_tool_that_top_level_cannot`)、
+`program_tool_names` 含 source 名(`program_surface_includes_source_tools`)。`tools/mod.rs`:inline 时
+run_program TS 含 source 全量签名(`run_program_def_declares_inline_source_tools`)、defer 时降级紧凑名单 +
+引导(`run_program_def_lists_deferred_source_tools_as_a_manifest`)。既有 `all_tool_defs_appends_sources_and_skips_collisions`
+顺序期望同步(run_program 挪到末尾)。
+
+### 挂账
+
+- **真 key 验收**(完成标准要求,未做):需配真/mock MCP server,模型在 program 里编排
+  "内置 + MCP + agent()"跑通闭环、gate 生效。--mock 不连 MCP,验不了;需用户提供 key/代理 +
+  一个 MCP server(真实或临时 stub)。
+- **切片 3**:结构化 `CallToolResult<T>` 结果(codex `description.rs` 有 `CallToolResult<T>` TS +
+  `mcp_structured_content_schema`;kloop `ToolSource::call` 现返 String 拍平文本,program 自己
+  JSON.parse)。若有真实结构化 MCP 需求再上。
+
+### 教训
+
+写进 HANDOFF 教训 19:(a)同预算的两套机制(defer 渐进披露 + code-mode 工具→TS API)要
+**组合**而非叠加后互相拆台——defer 也压 code-mode 面,别让新 surface 把省下的预算吐回;
+(b)门分**发现门**(`locked`,可按"来源已具备能力"豁免)与**安全门**(deny/权限/沙箱,绝不豁免),
+`from_program` 只关发现门。

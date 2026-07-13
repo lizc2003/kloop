@@ -697,9 +697,19 @@ through every stage as its own chain with **no barrier between stages** — a fa
 item reaches stage 3 while a slow one is still in stage 1 — matching cc's two
 core orchestration primitives.
 
-The `tools` API and its TypeScript declarations are generated from the built-in
-tool schemas and carried in `run_program`'s description (typed declarations markedly
+The `tools` API and its TypeScript declarations are generated from the tool
+schemas and carried in `run_program`'s description (typed declarations markedly
 improve how reliably models call tools — the references converge on this).
+**External source (MCP) tools are exposed too**, not just built-ins: below the
+defer threshold they get full typed declarations alongside the built-ins; past
+it (too many to type in full) they degrade to a compact name + description
+manifest but stay callable — `tools.<server>__<tool>(args)` routes through the
+same gate. A program call bypasses only the *deferred-tool lock* (the tool is
+already exposed on `tools`, so it is "loaded" for the program's purposes); the
+top-level model still `tool_search`es to direct-call, and every other gate
+(deny, permission, sandbox, hooks) applies unchanged. This is "code execution
+with MCP" — orchestrate several MCP tools + built-ins + `agent()` in one program
+with intermediate results off the context window.
 
 **The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
 the exact same gated dispatch a direct call takes** — `run_one` (allowlist →
@@ -719,11 +729,12 @@ A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
-**Not done** (deferred): exposing MCP tools to programs (built-ins only for
-now); a token `budget` primitive; a richer progress view (cc's
-`/workflows` tree — kloop shows a flat live trace); background programs with
-`yield`/`wait`; saving a program for reuse with journal-based resume. See
-`docs/plan/24-code-mode.md`.
+**Not done** (deferred): structured `CallToolResult<T>` results (a program gets
+the MCP tool's flattened text via `Promise<string>` and `JSON.parse`s it if
+needed); a token `budget` primitive; a richer progress view (cc's `/workflows`
+tree — kloop shows a flat live trace); background programs with `yield`/`wait`;
+saving a program for reuse with journal-based resume. See
+`docs/plan/24-code-mode.md` and `docs/plan/27-codemode-mcp-tools.md`.
 
 ## Running
 

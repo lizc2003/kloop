@@ -72,6 +72,13 @@ pub struct ToolCtx {
     /// history access; the agent loop drains it into history after the
     /// round's tool results are recorded.
     pub hook_context: Arc<std::sync::Mutex<Vec<String>>>,
+    /// True for calls a `run_program` program fires through the code-mode
+    /// bridge. Such a call skips the deferred-tool lock gate: the tool is
+    /// already exposed on the program's `tools` object, so it is "loaded" for
+    /// the program's purposes. Every other gate (deny rules, permission,
+    /// sandbox, hooks) still applies — this is a discovery bypass, not a
+    /// security one.
+    pub from_program: bool,
 }
 
 /// Built-ins plus external sources, in registration order. A name collision
@@ -88,19 +95,35 @@ pub fn all_tool_defs(
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
 ) -> Vec<ToolDef> {
-    let mut defs = tool_defs(depth);
-    if defer_active(sources, defer_threshold) {
+    let mut defs = builtin_defs(depth);
+    let deferred_regime = defer_active(sources, defer_threshold);
+    // Source tools the program's TypeScript API declares in full (inline
+    // regime) — empty when deferred, where they degrade to a compact name +
+    // description list instead (see `run_program_def`).
+    let inline_sources = if deferred_regime {
         defs.push(discover::tool_search_def());
         defs.push(discover::call_tool_def());
-        return defs;
-    }
-    let mut seen: std::collections::HashSet<String> = defs.iter().map(|d| d.name.clone()).collect();
-    for source in sources {
-        for def in source.defs() {
-            if seen.insert(def.name.clone()) {
-                defs.push(def.clone());
-            }
-        }
+        Vec::new()
+    } else {
+        let merged = merged_source_defs(sources);
+        defs.extend(merged.iter().cloned());
+        merged
+    };
+    // run_program is depth-0 only (like task). Now that sources are visible, its
+    // TypeScript API can list them: full declarations for inline source tools,
+    // or a compact manifest for deferred ones — both callable at runtime.
+    if depth == 0 {
+        let (callable, deferred) = if deferred_regime {
+            (
+                builtin_defs(0),
+                deferred_tool_defs(sources, defer_threshold),
+            )
+        } else {
+            let mut callable = builtin_defs(0);
+            callable.extend(inline_sources);
+            (callable, Vec::new())
+        };
+        defs.push(codemode::run_program_def(&callable, &deferred));
     }
     defs
 }
@@ -175,7 +198,11 @@ fn find_source<'a>(
         .find(|s| s.defs().iter().any(|d| d.name == name))
 }
 
-pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
+/// The built-in tool defs (bash, file, search, todo, and — at depth 0 —
+/// `task`). This is the set `run_program` derives its TypeScript API from, so
+/// it deliberately excludes `run_program` itself: no self-reference, and no
+/// throwaway description regeneration when only counting is needed.
+fn builtin_defs(depth: u8) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
@@ -317,10 +344,19 @@ pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
                 "required": ["prompt"]
             }),
         });
-        // run_program generates its TypeScript API from the tools built so far,
-        // so it must come last; it exposes everything except itself and task.
-        let run_program = codemode::run_program_def(&defs);
-        defs.push(run_program);
+    }
+    defs
+}
+
+/// The built-ins plus a built-ins-only `run_program`. This is what tool-counting
+/// (`defer_active`, `tool_merge_warnings`) sees, so `run_program` counts toward
+/// the defer threshold like any other built-in. The definition actually sent to
+/// the model — whose TypeScript API also lists the external source tools — is
+/// built in [`all_tool_defs`], which can see the sources.
+pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
+    let mut defs = builtin_defs(depth);
+    if depth == 0 {
+        defs.push(codemode::run_program_def(&defs, &[]));
     }
     defs
 }
@@ -438,8 +474,10 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // model skipped tool_search, and neither automation policy nor the
         // human should be consulted about a call that cannot run. This is
         // also the only rejection that does NOT unlock — unlocking flows
-        // exclusively through a tool_search hit.
-        if discover::locked(&name, &ctx.cfg) {
+        // exclusively through a tool_search hit. A program bypasses this gate:
+        // its `tools` object already exposes the tool, so it is loaded for the
+        // program (the top-level model still must tool_search to direct-call).
+        if !ctx.from_program && discover::locked(&name, &ctx.cfg) {
             bail!(
                 "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
             );
@@ -612,6 +650,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
+            from_program: false,
         }
     }
 
@@ -726,7 +765,9 @@ mod tests {
             .map(|d| d.name)
             .collect();
         // Built-ins first, then the first source; the duplicate source's
-        // identical names are dropped.
+        // identical names are dropped. run_program comes last: its TypeScript
+        // API is generated from the built-ins AND the source tools, so it is
+        // appended only after the sources are merged.
         assert_eq!(
             names,
             vec![
@@ -741,9 +782,9 @@ mod tests {
                 "read_offloaded",
                 "todo_write",
                 "task",
-                "run_program",
                 "srv__echo",
                 "srv__fail",
+                "run_program",
             ]
         );
 
@@ -821,6 +862,52 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(deferred, vec!["srv__echo", "srv__fail"]);
+    }
+
+    /// Slice 1: inline (below threshold) source tools get a full typed
+    /// declaration in run_program's TypeScript API.
+    #[test]
+    fn run_program_def_declares_inline_source_tools() {
+        let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
+        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD);
+        let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
+        assert!(
+            rp.description.contains("srv__echo(args:"),
+            "expected a typed declaration: {}",
+            rp.description
+        );
+        assert!(
+            !rp.description.contains("- tools.srv__echo:"),
+            "inline tools must not fall back to the manifest: {}",
+            rp.description
+        );
+    }
+
+    /// Slice 2: past the threshold source tools degrade to a compact name +
+    /// description manifest in run_program's description — no full signatures —
+    /// with guidance that they stay callable from a program.
+    #[test]
+    fn run_program_def_lists_deferred_source_tools_as_a_manifest() {
+        let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
+        // One source (2 tools) past the built-in count forces the defer regime.
+        let defs = all_tool_defs(0, &sources, tool_defs(0).len());
+        let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
+        assert!(
+            rp.description.contains("- tools.srv__echo:"),
+            "expected a manifest line: {}",
+            rp.description
+        );
+        assert!(
+            !rp.description.contains("srv__echo(args:"),
+            "deferred tools must not be typed in full: {}",
+            rp.description
+        );
+        assert!(
+            rp.description
+                .contains("cannot call tool_search from inside a program"),
+            "expected the program-path guidance: {}",
+            rp.description
+        );
     }
 
     /// A source def colliding with a built-in is not callable, so it must
@@ -1039,6 +1126,7 @@ mod tests {
             cancel,
             depth: 0,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
+            from_program: false,
         };
         let results = dispatch_tools(
             vec![

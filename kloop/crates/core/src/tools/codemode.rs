@@ -30,19 +30,28 @@ fn is_program_callable(name: &str) -> bool {
     !matches!(name, "run_program" | "task")
 }
 
-/// The tool names a program may call, taken from the depth-0 built-in set.
-/// MCP tools are not exposed to programs yet (deferred).
-fn program_tool_names() -> Vec<String> {
-    super::tool_defs(0)
+/// The tool names a program may call: the depth-0 built-ins plus every external
+/// source (MCP) tool, deduplicated. Source tools are always included — deferred
+/// or not — so a `tools.<name>()` call never lands on a missing method; deferral
+/// only trims what the `run_program` *description* declares in full, never what
+/// the runtime exposes (a program call bypasses the deferred-tool lock gate).
+fn program_tool_names(sources: &[Arc<dyn super::ToolSource>]) -> Vec<String> {
+    let mut names: Vec<String> = super::builtin_defs(0)
         .into_iter()
         .filter(|d| is_program_callable(&d.name))
         .map(|d| d.name)
-        .collect()
+        .collect();
+    names.extend(
+        super::merged_source_defs(sources)
+            .into_iter()
+            .map(|d| d.name),
+    );
+    names
 }
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let source = super::str_arg(input, "source", "run_program")?;
-    let names = program_tool_names();
+    let names = program_tool_names(&ctx.cfg.tool_sources);
     let bridge = Arc::new(CoreBridge::new(ctx.clone()));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
@@ -77,6 +86,13 @@ struct CoreBridge {
 
 impl CoreBridge {
     fn new(ctx: ToolCtx) -> Self {
+        // Calls a program fires are "from a program": they skip the deferred-tool
+        // lock gate, since the tool is already exposed on the program's `tools`
+        // object. All other gates (deny, permission, sandbox, hooks) still apply.
+        let ctx = ToolCtx {
+            from_program: true,
+            ..ctx
+        };
         Self {
             ctx,
             seq: AtomicU64::new(0),
@@ -138,7 +154,14 @@ impl HostBridge for CoreBridge {
 /// program can call, generated from `callable`'s schemas — the same trick the
 /// references converge on (typed API declarations markedly improve how reliably
 /// the model calls tools). Depth-0 only, like `task`.
-pub(super) fn run_program_def(callable: &[ToolDef]) -> ToolDef {
+///
+/// `callable` is the set declared with a full typed signature (built-ins, plus
+/// external source tools when they are inline). `deferred` is the source tools
+/// held behind the defer threshold: too many to type in full, so they get a
+/// compact name + description manifest instead — still callable at runtime, just
+/// without a declared signature (the model can `tool_search` one in a normal
+/// turn to see its schema before writing the program).
+pub(super) fn run_program_def(callable: &[ToolDef], deferred: &[ToolDef]) -> ToolDef {
     let mut decls = String::from("declare const tools: {\n");
     for def in callable.iter().filter(|d| is_program_callable(&d.name)) {
         decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
@@ -160,7 +183,7 @@ pub(super) fn run_program_def(callable: &[ToolDef]) -> ToolDef {
         "declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number) => any>): Promise<any[]>;\n",
     );
 
-    let description = format!(
+    let mut description = format!(
         "Run a JavaScript program that orchestrates tools instead of calling them one at a time. \
 Use this when a task is a loop, a fan-out, a pipeline, or a filter over many items — writing it \
 as one program keeps intermediate results in program variables instead of flooding the context \
@@ -173,6 +196,22 @@ and sandbox checks as a direct tool call. Run independent calls concurrently wit
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
 Available API (TypeScript):\n```ts\n{decls}```"
     );
+
+    if !deferred.is_empty() {
+        description.push_str(
+            "\n\nThese additional tools are also callable on `tools` by name but are not typed \
+above (there are too many to declare in full). Call them directly as `tools.<name>(args)` — you \
+cannot call tool_search from inside a program. If you need a tool's exact argument schema, call \
+tool_search for it in a normal turn first, then write the program:\n",
+        );
+        for def in deferred {
+            description.push_str(&format!(
+                "- tools.{}: {}\n",
+                def.name,
+                one_line(&def.description)
+            ));
+        }
+    }
 
     ToolDef {
         name: "run_program".into(),

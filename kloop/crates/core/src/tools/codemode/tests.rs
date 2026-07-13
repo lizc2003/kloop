@@ -9,8 +9,11 @@ use crate::permissions::PermissionRules;
 use crate::permissions::Permissions;
 use crate::tools::testutil::run_tool;
 use crate::tools::testutil::test_ctx;
+use crate::tools::testutil::test_ctx_with_sources;
+use crate::tools::testutil::with_defer_threshold;
 use crate::tools::testutil::with_provider;
 use crate::tools::ToolCtx;
+use crate::tools::ToolSource;
 use kloop_protocol::ToolDef;
 
 use super::*;
@@ -236,7 +239,7 @@ fn run_program_def_renders_a_typescript_api() {
             schema: json!({"type": "object"}),
         },
     ];
-    let def = run_program_def(&defs);
+    let def = run_program_def(&defs, &[]);
     let d = &def.description;
     assert_eq!(def.name, "run_program");
     assert!(d.contains("read_file(args: {"), "{d}");
@@ -282,9 +285,116 @@ fn ts_type_covers_common_shapes() {
 
 #[test]
 fn program_surface_excludes_run_program_and_task() {
-    let names = program_tool_names();
+    let names = program_tool_names(&[]);
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
     assert!(!names.iter().any(|n| n == "task"));
+}
+
+// ---- External source (MCP) tools exposed to programs (plan 27) ----
+
+/// A minimal external tool source: `srv__echo` (read-only, echoes its `text`
+/// arg) and `srv__danger` (a mutating tool). Mirrors the shape an MCP tool
+/// reaches the code-mode bridge with.
+struct Srv {
+    defs: Vec<ToolDef>,
+}
+
+fn srv() -> std::sync::Arc<dyn ToolSource> {
+    let def = |name: &str, desc: &str| ToolDef {
+        name: name.into(),
+        description: desc.into(),
+        schema: json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"]
+        }),
+    };
+    std::sync::Arc::new(Srv {
+        defs: vec![
+            def("srv__echo", "Echo the text argument back"),
+            def("srv__danger", "A mutating tool"),
+        ],
+    })
+}
+
+impl ToolSource for Srv {
+    fn defs(&self) -> &[ToolDef] {
+        &self.defs
+    }
+    fn is_readonly(&self, tool: &str) -> bool {
+        tool == "srv__echo"
+    }
+    fn call<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("?");
+            Ok(format!("{tool} echoes {text}"))
+        })
+    }
+}
+
+/// Slice 1: below the defer threshold, an external source tool is callable from
+/// a program by its name, routed through the real gate to the source.
+#[tokio::test]
+async fn program_calls_an_mcp_source_tool() {
+    let ctx = test_ctx_with_sources(0, "mcp-inline", vec![srv()]);
+    let (out, is_error) = run(r#"return await tools.srv__echo({ text: "hi" });"#, &ctx).await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, "srv__echo echoes hi");
+}
+
+/// Slice 1: the permission gate still applies inside a program — a denied
+/// source tool is refused exactly like a denied built-in.
+#[tokio::test]
+async fn denied_mcp_source_tool_is_refused_in_a_program() {
+    let rules = PermissionRules {
+        allow: vec![],
+        deny: vec!["srv__echo".into()],
+        ask: vec![],
+    };
+    let perms = Permissions::new(Mode::Default, &rules, std::env::temp_dir(), None, None).unwrap();
+    let ctx = with_permissions(test_ctx_with_sources(0, "mcp-deny", vec![srv()]), perms);
+    let (out, is_error) = run(
+        r#"try { await tools.srv__echo({ text: "x" }); return "RAN"; }
+           catch (e) { return "BLOCKED"; }"#,
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, "BLOCKED");
+}
+
+/// Slice 2: past the defer threshold the source tool is deferred — a top-level
+/// direct call bounces on the lock gate — yet it stays callable from inside a
+/// program, which bypasses that gate (the tool is exposed on `tools`). Every
+/// other gate still runs; here the permission gate allows.
+#[tokio::test]
+async fn program_calls_a_deferred_mcp_tool_that_top_level_cannot() {
+    let ctx = with_defer_threshold(test_ctx_with_sources(0, "mcp-deferred", vec![srv()]), 0);
+
+    // Top-level direct call bounces: the model would have to tool_search first.
+    let (out, is_error) = run_tool("srv__echo", json!({ "text": "x" }), &ctx).await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("deferred and not loaded"), "{out}");
+
+    // The same tool, called from inside a program, runs.
+    let (out, is_error) = run(r#"return await tools.srv__echo({ text: "hi" });"#, &ctx).await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, "srv__echo echoes hi");
+}
+
+/// The program's callable surface always includes source tools, deferred or not.
+#[test]
+fn program_surface_includes_source_tools() {
+    let names = program_tool_names(&[srv()]);
+    assert!(names.iter().any(|n| n == "srv__echo"));
+    assert!(names.iter().any(|n| n == "srv__danger"));
+    assert!(names.iter().any(|n| n == "bash"));
+    assert!(!names.iter().any(|n| n == "run_program"));
 }

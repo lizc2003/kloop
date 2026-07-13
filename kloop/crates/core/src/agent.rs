@@ -342,6 +342,7 @@ async fn turn_rounds(
             cancel: cancel.clone(),
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
+            from_program: false,
         };
         let results = dispatch_tools(tool_uses, &ctx).await;
         // Record results BEFORE checking cancellation so every tool_use has a
