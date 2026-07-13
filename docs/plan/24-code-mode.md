@@ -296,3 +296,22 @@ stage 1),某 stage 抛错该项落 `null` 并跳过其余 stage(与 `parallel` �
 的 stage 1 等一个只在 item 0 的 stage 2 才打开的 gate——按 stage barrier 必死锁,逐项独立链则
 流通)。真 key:`pipeline([2,3,4], n=>n*n, sq=>bash('echo '+sq))` → `["4","9","16"]`。fmt +
 clippy + 全量 358 测试全绿。挂账收窄:③ 只剩 token `budget`。
+
+### 发现:何时模型会自发选 exec(真机观察,重要)
+
+问题:模型会不会**自发**(未被显式要求)写 program?真机验(不提 exec,给一个 fan-out 任务
+"数 docs/plan 下每个文件行数、报最长 5 个"):sonnet-5 **没用 exec**,而是一条 bash 一行流
+(`find … | xargs wc -l | sort -rn | head`)——**且这是对的**,shell 管道本就是文件 fan-out 的
+最顺手解。
+
+结论:**exec 不是在真空里跟"逐轮直调"竞争,它同时在跟 bash 和 直接 `task()` 抢活**。shell 能
+表达的 fan-out → 模型(对的)选 bash;agent 扇出 → 直接并发 `task()` 也够。**exec 唯一别人干不了
+的生态位 = 用代码逻辑编排 bash 干不了的工具(MCP / web_fetch / 带条件转换的 agent 串联),且中间
+结果多到不该进上下文。而这个生态位现在恰恰还没打开**——program 只暴露了内置工具(bash/read/
+grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
+
+**推论(直接印证 plan 27 的必要性)**:code-mode 的"自发被选中"价值被**工具生态位**闸住——单有引擎
+不够,得有 bash/直调干不了的工具可编排(= plan 27 MCP 暴露)。要驱动自发使用,三条路:①补生态位
+(plan 27);②加显式引导(cc 用 skill 注手册 / codex 用 mode);③在 `exec` description 里点明
+"何时 exec 胜过 bash/直调"。**"能写对 JS"(给了意图就能,已验)≠"会自发选 exec"(不会、也不该,
+除非任务真需要)。** 见 HANDOFF 教训 18。
