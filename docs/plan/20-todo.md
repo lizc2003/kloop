@@ -37,7 +37,7 @@ todo 隔离。
 
 fmt/clippy/test 绿;真 key 一次多步任务里模型自发用 todo 跟踪进度;README、HANDOFF。
 
-## ✅ 完成记录(提交 0ab90aa)
+## ✅ 完成记录(提交 48d0a49)
 
 **拍板(开工时定,plan lean + cc/claw 回源核对)**:
 - **形态**:整表替换(cc/claw 形态)。单 `todo_write`,模型每次发全量。
