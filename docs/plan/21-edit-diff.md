@@ -91,4 +91,4 @@ diff 两串"分级也照抄为兜底。**可不抄的分歧**(核对确认):intr
 **未做**(记为可能性):②转录工具行内联/可展开 diff;审批弹层滚动(plan 25);intraline
 词级高亮 / 语法高亮;逐 hunk 批准(cc 也不做);二进制文件 diff。
 
-commit: c86882a(feat 初版)+ 回源修正提交(见 git log,行号 + edit 读文件)。
+commit: c86882a(feat 初版)+ 903b870(回源修正:行号 + edit 读文件整文件 diff)。
