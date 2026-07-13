@@ -1,4 +1,4 @@
-# Plan 21 — Edit/Write 的 diff 呈现 ✅(commit 见末尾)
+# Plan 21 — Edit/Write 的 diff 呈现 ✅(commit c86882a)
 
 > ✅ 已完成。开工前读 HANDOFF。参考:cc 的编辑审批带 diff 显示。
 
@@ -73,4 +73,4 @@ fmt/clippy/test 绿;真 key 一次编辑任务审批时看到 diff;README、HAND
 **未做**(记为可能性):②转录工具行内联/可展开 diff;交互式逐 hunk 批准(cc 也不做);
 语法高亮;二进制文件 diff。
 
-commit: (见 git log,与本记录同一提交)
+commit: c86882a(feat)。
