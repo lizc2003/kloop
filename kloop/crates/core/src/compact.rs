@@ -177,6 +177,7 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
+            inbox: Default::default(),
         })
     }
 

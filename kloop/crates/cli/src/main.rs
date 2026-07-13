@@ -692,6 +692,7 @@ fn config_from_env(
         defer_threshold: defer_threshold_from_env()?,
         unlocked_tools: Default::default(),
         todos: Default::default(),
+        inbox: Default::default(),
     };
     if args.mock {
         return Ok(Config {

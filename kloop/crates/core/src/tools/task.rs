@@ -50,6 +50,11 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         // todo_write never touches the parent's list (the Config clone would
         // otherwise share the Arc).
         todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+        // A fresh steering queue: the user steers the main agent, and a
+        // running sub-agent must never drain the parent's pending steering
+        // (the Config clone would otherwise share the Arc). No front-end pushes
+        // to a sub-agent's queue today, so it simply stays empty.
+        inbox: Arc::new(std::sync::Mutex::new(Vec::new())),
         ..(*ctx.cfg).clone()
     };
     if let Some(at) = agent_type {

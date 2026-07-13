@@ -168,6 +168,11 @@ async fn turn_rounds(
     let mut active_model = cfg.model.clone();
     let mut truncation_recoveries = 0u32;
     for round in 0..cfg.max_rounds {
+        // Step-boundary steering: deliver anything the user typed during the
+        // previous round (tool execution / sampling) as a user message before
+        // this round's request. At round 0 the queue is empty (the turn just
+        // started) so this is a no-op. Never touches an in-flight request.
+        drain_inbox(&cfg.inbox, history);
         // Predictive: compact BEFORE sampling when this round's estimated
         // growth would overflow the window — don't wait to be rejected.
         if let Some(window) = cfg.context_window {
@@ -282,11 +287,18 @@ async fn turn_rounds(
             })
             .collect();
         if tool_uses.is_empty() {
-            // The turn would end here — but if the response was cut off by
-            // the output limit, ending would strand it mid-thought. Nudge the
-            // model to continue, a bounded number of times per turn. (A
-            // truncated response WITH tool calls needs no special handling:
-            // the loop continues naturally and the model resumes itself.)
+            // The turn would end here — but a steer that landed during this
+            // final sampling must not be lost. Absorb it and keep going, so a
+            // late "wait, also do X" is answered instead of dropped. (Steers
+            // during tool execution are already delivered at the loop top.)
+            if drain_inbox(&cfg.inbox, history) {
+                continue;
+            }
+            // If the response was cut off by the output limit, ending would
+            // strand it mid-thought. Nudge the model to continue, a bounded
+            // number of times per turn. (A truncated response WITH tool calls
+            // needs no special handling: the loop continues naturally and the
+            // model resumes itself.)
             if is_truncated(stop_reason.as_deref())
                 && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
             {
@@ -373,6 +385,31 @@ fn is_truncated(stop_reason: Option<&str>) -> bool {
 const TRUNCATION_RECOVERY_LIMIT: u32 = 3;
 const TRUNCATION_CONTINUE_MSG: &str = "Your previous response was cut off by the output token \
 limit. Continue exactly where you left off; break the remaining work into smaller pieces.";
+
+/// Framing for a steering message (typed while the turn was running). Recorded
+/// as a user message at the next round boundary so the model treats it as a
+/// mid-work interjection to fold in, not a brand-new task. cc frames steers the
+/// same way ("The user sent a new message while you were working…"); codex
+/// records them as plain user prompts — framing is the cheap side that helps
+/// weaker models, so kloop adopts it.
+const STEERING_PREFIX: &str = "The user sent this message while you were working. Address it \
+as part of the current task — finish any step already in progress, then act on it:";
+
+/// Drain the step-boundary injection queue into history as user messages,
+/// framed as steering. Returns true if anything was injected. Called only at
+/// round boundaries (top of the loop, and just before the turn would end) —
+/// never mid-request, so an in-flight sampling never sees a partial write and
+/// tool_result blocks are never interleaved with the injected user message.
+fn drain_inbox(inbox: &std::sync::Mutex<Vec<String>>, history: &mut History) -> bool {
+    let pending: Vec<String> = std::mem::take(&mut *inbox.lock().unwrap());
+    if pending.is_empty() {
+        return false;
+    }
+    for text in pending {
+        history.record(Message::user_text(format!("{STEERING_PREFIX}\n{text}")));
+    }
+    true
+}
 
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -544,6 +581,7 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
+            inbox: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -635,6 +673,7 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
+            inbox: Default::default(),
         })
     }
 
@@ -1441,6 +1480,199 @@ mod tests {
                 is_error: false,
             }]),
             "the sub-agent's final text is the tool result"
+        );
+    }
+
+    /// Steering typed during a round's tool execution is delivered as a framed
+    /// user message at the NEXT round boundary — present in the next request,
+    /// absent from the one already in flight, and never interleaved with the
+    /// tool_result blocks.
+    #[tokio::test]
+    async fn steering_delivered_at_next_boundary_not_mid_request() {
+        use kloop_provider::MockTurn;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        // Pushes one steer the first time any tool starts — i.e. during round
+        // 0's dispatch, after round 0's request already went out.
+        struct SteerOnToolUi {
+            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            fired: AtomicBool,
+        }
+        impl Ui for SteerOnToolUi {
+            fn text_delta(&self, _: &str) {}
+            fn note(&self, _: &str) {}
+            fn tool_start(&self, _: &str, _: &str, _: &str, _: &str) {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    self.inbox
+                        .lock()
+                        .unwrap()
+                        .push("also check the logs".into());
+                }
+            }
+        }
+
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use("t1", "echo hi")]),
+            MockTurn::Blocks(text("done")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "steer-boundary");
+        let ui: Arc<dyn Ui> = Arc::new(SteerOnToolUi {
+            inbox: cfg.inbox.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.rounds, 2);
+        let steer = Message::user_text(format!("{STEERING_PREFIX}\nalso check the logs"));
+        // [user go, assistant tool_use, user tool_results, user steer, assistant done]
+        assert_eq!(
+            history.messages()[3],
+            steer,
+            "the steer is a framed user message after the round's tool_results"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !seen[0].messages.contains(&steer),
+            "round 0's in-flight request predates the steer"
+        );
+        assert!(
+            seen[1].messages.contains(&steer),
+            "round 1's request carries the steer"
+        );
+    }
+
+    /// A steer that lands during the FINAL sampling (a response with no tool
+    /// calls) is absorbed by the end guard: the turn continues to address it
+    /// instead of dropping it.
+    #[tokio::test]
+    async fn late_steering_keeps_the_turn_going() {
+        use kloop_provider::MockTurn;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        struct SteerOnTextUi {
+            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            fired: AtomicBool,
+        }
+        impl Ui for SteerOnTextUi {
+            fn text_delta(&self, _: &str) {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    self.inbox.lock().unwrap().push("wait, also do Y".into());
+                }
+            }
+            fn note(&self, _: &str) {}
+        }
+
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Blocks(text("first attempt")),
+            MockTurn::Blocks(text("addressed the steer")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "steer-late");
+        let ui: Arc<dyn Ui> = Arc::new(SteerOnTextUi {
+            inbox: cfg.inbox.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("start"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        assert_eq!(outcome.final_text, "addressed the steer");
+        assert_eq!(
+            outcome.rounds, 2,
+            "the late steer prevented ending at round 1"
+        );
+        let steer = Message::user_text(format!("{STEERING_PREFIX}\nwait, also do Y"));
+        assert!(history.messages().contains(&steer));
+        assert!(
+            cfg.inbox.lock().unwrap().is_empty(),
+            "the queue was drained"
+        );
+    }
+
+    /// A running sub-agent must not drain the PARENT's steering queue: each
+    /// agent gets its own inbox (the task tool resets it on the cloned Config).
+    /// A steer pushed to the parent while the sub-agent works is invisible to
+    /// the sub-agent and delivered to the parent at its own next boundary.
+    #[tokio::test]
+    async fn subagent_does_not_drain_parent_steering() {
+        use kloop_provider::MockRequest;
+        use kloop_provider::MockTurn;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        // Pushes a parent steer the first time a SUB-agent (agent != "") starts
+        // a tool — i.e. while the sub-agent is mid-turn.
+        struct SteerParentUi {
+            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            fired: AtomicBool,
+        }
+        impl Ui for SteerParentUi {
+            fn text_delta(&self, _: &str) {}
+            fn note(&self, _: &str) {}
+            fn tool_start(&self, agent: &str, _: &str, _: &str, _: &str) {
+                if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
+                    self.inbox.lock().unwrap().push("parent steer".into());
+                }
+            }
+        }
+
+        let (provider, seen) = Provider::mock_recording(vec![
+            // parent round 0: spawn a sub-agent
+            MockTurn::Blocks(vec![tool_use_named(
+                "t1",
+                "task",
+                json!({"prompt": "sub work"}),
+            )]),
+            // sub round 0: run a tool (fires the parent steer mid-sub-turn)
+            MockTurn::Blocks(vec![tool_use("s1", "echo hi")]),
+            // sub round 1: finish
+            MockTurn::Blocks(text("sub done")),
+            // parent round 1: finish
+            MockTurn::Blocks(text("done")),
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, "steer-isolation");
+        let ui: Arc<dyn Ui> = Arc::new(SteerParentUi {
+            inbox: cfg.inbox.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        let has_steer = |req: &MockRequest| {
+            req.messages.iter().any(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.starts_with(STEERING_PREFIX)),
+                )
+            })
+        };
+        let first_text = |req: &MockRequest| match req.messages[0].content.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            _ => String::new(),
+        };
+        let seen = seen.lock().unwrap();
+        for req in seen.iter() {
+            if first_text(req) == "sub work" {
+                assert!(
+                    !has_steer(req),
+                    "the sub-agent must never see the parent's steer"
+                );
+            }
+        }
+        assert!(
+            seen.iter()
+                .any(|req| first_text(req) == "go" && has_steer(req)),
+            "the parent delivers its own steer at its next boundary"
         );
     }
 }

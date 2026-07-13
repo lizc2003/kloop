@@ -152,6 +152,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
+            inbox: Default::default(),
         })
     })
 }

@@ -59,6 +59,9 @@ pub async fn run(
         channel_ui.clone(),
         Arc::new(move |s: &str| note_ui.note(s)),
     )?);
+    // Shared with the worker's Config: the UI loop enqueues steering here while
+    // a turn runs, the agent loop drains it at round boundaries (plan 22).
+    let inbox = cfg.inbox.clone();
 
     // Snapshot before the worker takes History: a resumed session replays
     // into the transcript instead of starting on a blank screen.
@@ -74,7 +77,15 @@ pub async fn run(
     ));
 
     let mut terminal = setup_terminal()?;
-    let result = ui_loop(&mut terminal, event_rx, turn_tx, session_id, resumed_cells).await;
+    let result = ui_loop(
+        &mut terminal,
+        event_rx,
+        turn_tx,
+        inbox,
+        session_id,
+        resumed_cells,
+    )
+    .await;
     restore_terminal();
     // The worker holds the session rollout; aborting mid-write is equivalent
     // to a killed session, which resume already repairs.
@@ -127,6 +138,7 @@ async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     turns: mpsc::UnboundedSender<Turn>,
+    inbox: Arc<std::sync::Mutex<Vec<String>>>,
     session_id: String,
     resumed_cells: Vec<app::Cell>,
 ) -> Result<()> {
@@ -144,6 +156,12 @@ async fn ui_loop(
                             let cancel = CancellationToken::new();
                             current_cancel = Some(cancel.clone());
                             let _ = turns.send(Turn { text, cancel });
+                        }
+                        Command::Steer(text) => {
+                            // Enqueue for the running turn; the agent loop
+                            // drains it at the next round boundary. The user's
+                            // raw text already showed as a User cell.
+                            inbox.lock().unwrap().push(text);
                         }
                         Command::Interrupt => {
                             if let Some(cancel) = &current_cancel {

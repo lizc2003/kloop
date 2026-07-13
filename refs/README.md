@@ -84,6 +84,37 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 - **工具并行 codex 比 kloop 粗**(反向借鉴,保持 kloop 现状):全局单把 RwLock + 每工具静态 supports_parallel 布尔,读锁共享写锁独占;无路径粒度、无 kloop 的"连续只读成批、遇写切断"顺序性。
 - **借鉴清单**:① `write_stdin` 最小切片(挂 plan 14 备选);② 子 agent 异步最小形态 spawn+wait+mailbox 回灌(挂 plan 17);③ 小卫生件:HeadTailBuffer、进程表上限+LRU(有痛感时整段抄)。不抄:ToolOrchestrator 审批沙箱耦合、多 agent 全家桶、notify、SubagentStart/Stop hooks 引擎、parallel.rs 全局锁。
 
+## steering / 中途注入对比(2026-07-13,plan 22 回源;kloop 已按此实现机制 + 用户 steering)
+
+三家真读代码交叉核对(细节可再查:cc `src/utils/messageQueueManager.ts` + `src/query.ts:1829-1904`
+drain + `src/utils/messages.ts:5988` framing;codex `core/src/session/input_queue.rs` +
+`session/turn.rs:229` drain + `session/mod.rs:3903` `steer_input` / `:1881`
+`forward_child_completion_to_parent`;claw `rust/crates/runtime/src/conversation.rs:325`):
+
+- **收敛点(cc 与 codex 用完全不同架构独立都做,kloop 已抄)**:① **steering = 入队,绝不 abort
+  turn**——干活时打字进队列;硬断(Ctrl+C/Esc / `Op::Interrupt`)是**另一条结构上独立的路径**
+  (cancellation token / AbortController)。② **绝不插进在途请求**——只在 step/round 边界、下一次
+  采样**之前** drain;cc 注释点破原因"interleave tool_result 与 regular user 消息会 API 报错",
+  所以排到该轮 tool_results 之后再作 user 消息。③ 一个 per-turn(cc 优先级队列 / codex `TurnInput`
+  队列)队列,循环边界 drain。④ **子 agent 回灌 = 把子终态投进父队列、step 边界交付**,带
+  delivery-phase 闸门(工具后折进后续请求 / 终答后推迟下一 turn)+ autowake 唤醒空闲父;**Interrupted
+  子不回灌**(codex `is_final=false`)。
+- **分歧(judgment,不必都抄)**:注入 framing——cc 包"The user sent a new message while you were
+  working…IMPORTANT: 完成当前任务后必须处理",codex 记为**裸 user prompt** 不 framing;kloop 取
+  **cc 式轻 framing**(便宜、对弱模型有用,`STEERING_PREFIX`)。回灌摘要截断——codex completion
+  上限 1000 token、**仅 error 分支截 900**、成功摘要原样透传(**订正**:本 README 上文"截 900
+  token"是旧记,只对 error 成立)。
+- **claw-code 是反面教材**:无 steering,纯阻塞 REPL(`conversation.rs:325` 同步 `run_turn`,
+  读一行→整轮跑完→再读);Ctrl+C 只设 `AtomicBool` 且仅 hook 子进程查(`hooks.rs:327/804`),
+  连模型流/工具都断不了。kloop 早有 turn 级 cancel,远高于它。
+- **kloop 取舍**:机制 = step 边界注入队列(`Config.inbox`,`agent.rs` round 顶 drain + 收尾兜底),
+  首客户用户 steering(TUI Enter-while-running 入队);**子 agent 回灌整套依赖异步派发**(收敛点 ④),
+  kloop 现为同步 task,故回灌 + 异步派发留独立 plan(建议 plan 26,机制留接口:push framing 摘要进
+  inbox 即可,drain 侧零改)。plain/server 的 enqueue 侧挂账(plain 阻塞读、server `turn/steer`)。
+- **教训**:验收覆盖最弱目标模型这条(教训 13)对 steering 尤其成立——framing 是给 gpt-5.4-mini 这类
+  只认声明工具/需要显式上下文的模型留的显式通道;裸 user 消息 sonnet-5 能懂,弱模型未必分得清"这是
+  中途插话还是新任务"。
+
 ## 编辑审批 diff 呈现对比(2026-07-13,plan 21 回源;kloop 已按此实现)
 
 三家的编辑审批 diff 交叉核对(细节可再查:cc `src/utils/diff.ts` `structuredPatch` +

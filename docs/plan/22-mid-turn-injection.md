@@ -1,7 +1,28 @@
-# Plan 22 — 中途注入:steering + 子 agent 回灌(备忘)
+# Plan 22 — 中途注入:steering + 子 agent 回灌
 
-> 备忘,未开工。**本 plan 吸收 plan 17 片 6 的机制部分**(异步派发 + mailbox 回灌)。
-> 开工前读 HANDOFF + plan 17 的"回源调研结论"节(两家在此已收敛)。
+> **机制 + TUI steering 已完成(2026-07-13,提交见文末)。** 子 agent 回灌挂账——
+> 它离不开异步派发,回源加固见完成记录。开工前读 HANDOFF + plan 17 的"回源调研结论"节。
+
+## ✅ 完成记录(2026-07-13,机制 + TUI steering)
+
+**回源(教训 11/14,三家真读代码,file:line 落地,沉淀在 `refs/README.md` steering 一节)**:
+- **claw-code**:无 steering,纯阻塞 REPL(`conversation.rs:325` 同步 `run_turn`,读一行→整轮→再读);Ctrl+C 只杀 hook 子进程,连 turn 都断不了。反面。
+- **cc(TS 真源码)**:单一优先级队列(`messageQueueManager.ts:53`,`now>next>later`),干活时提交=入队不打断(`handlePromptSubmit.ts:346`);**绝不插在途请求**,严格在工具结果收齐后、下一次 `callModel` 前 drain(`query.ts:1864`,注释点破"interleave tool_result 与 user 消息会 API 报错");注入带 framing(`messages.ts:5988` "The user sent a new message while you were working…");interrupt(`user-cancel`)vs steer(`interrupt`)靠 AbortController reason 区分。
+- **codex(codex-rs)**:`TurnInput` 队列(`input_queue.rs:12`),`Op::UserInput` 遇活跃 turn→`steer_input` 入队不 abort(`session/mod.rs:3903`,Review/Compact 拒 steer);**在 run_turn 循环顶部 drain**(`turn.rs:229`,`can_drain_pending_input` 初 false 让本轮首请求先跑);子回灌 `forward_child_completion_to_parent`(`mod.rs:1881`)投父 mailbox + delivery-phase 闸门(工具后 CurrentTurn / 终答后 NextTurn)+ autowake,**Interrupted 子 `is_final=false` 不回灌**;成功摘要**原样透传**(仅 error 截 900 token——refs/README 旧记"截 900"已订正)。
+- **收敛(两家独立)**:① steering=入队绝不 abort turn,硬断是另一条独立路径(cancellation token);② 绝不插在途请求,只在 step 边界、下一次采样前 drain;③ **子 agent 回灌整套依赖异步派发**(codex spawn→wait→mailbox→autowake / cc `later` 优先级 + Sleep-flush + agentId 分域)。
+
+**scope 决定(开工时与用户定,回源加固)**:kloop 现有 task 是**同步 await**(`task_tool` 直接 `handle.await` 拿 final_text 当 tool_result),parent 阻塞等着——回灌没有独立价值;要它有意义得先建异步派发,那是 plan 17 片 6 明说"别提前抽象、等真实需求"的整套子系统。故本会话只做**机制 + 用户 steering**;子 agent 回灌 + 异步派发留独立 plan(建议 plan 26),机制留好接口(inbox 是中性字符串队列,回灌到时 push 自己 framing 的摘要即可)。
+
+**实现**:
+- `Config.inbox: Arc<Mutex<Vec<String>>>`(step 边界注入队列,照 `todos` 那套过程态;子 agent 各自 fresh,`task` 在克隆 Config 上重置——running 子 agent 绝不 drain 父的 steering)。
+- `core/src/agent.rs`:`drain_inbox` helper + 两个 drain 点——**round 循环顶部**(交付上一轮工具执行期间打的字,在本轮采样前)+ **收尾兜底**(`tool_uses` 空、准备结束前再 drain,late steer 命中则 `continue` 不结束,turn 继续处理而非丢弃)。注入成 user 消息、带 cc 式 framing(`STEERING_PREFIX`),记进 history/rollout(过压缩、resume 重放);因排在该轮 `tool_results` 之后作独立 user 消息,天然不交错(合规两家收敛)。
+- TUI:`Command::Steer(String)`,`App::on_key` 的 Enter 在 running 时返 Steer(推 `Cell::User` 显示、不新起 turn、不重置 todo 块);`ui_loop` 持 `cfg.inbox.clone()`,Steer 命令 push 入队;agent 每 round 边界 drain。plain/server 的 enqueue 侧挂账(plain 阻塞读、server `turn/steer`),但**drain 路径三前端都活**(inbox 在 Config 上,run_turn 天然 drain,空队列 no-op)。
+
+**测试**(321 个,+4):core 三本——边界注入(steer 在 round 0 工具执行期打入 → 进 round 1 请求、不进 round 0 在途请求、成 `tool_results` 后的 framed user 消息)、收尾兜底(final 采样期 late steer → 不结束、turn 续跑、最终答案是处理 steer 后的、队列已清)、子 agent 隔离(running 子 agent 的请求永不含父 steer、父在自己下一边界交付);tui 一本(running 时 Enter 返 `Command::Steer` + User cell、不结束/不重置 todo)+ 更新旧断言(running 时 Enter 从"忽略"改"steer")。
+
+**真 key 验收**(anthropic 轨,sonnet-5;throwaway example 脚本化 mid-turn steer,验完即删):任务是"分三次单独 bash 跑 `sleep 3 && echo STEP-ONE/TWO/THREE`",后台任务在 t=4s(turn 运行中)把一条 steer push 进 `cfg.inbox`。history 精确印证机制:STEP-ONE 的 tool_result 之后**紧跟一条带 `STEERING_PREFIX` 的独立 user 消息**(排在 tool_result 后、下一次采样前,未插进在途请求、未与 tool_result 交错)→ 模型"Noted the steering message"跑 `echo STEERED-MIDTURN` → 继续 STEP-THREE → 最终答复明确确认"收到你干活时发的消息并处理了"。turn 未被打断,5 rounds Completed。B 方案(脚本 push inbox)验的是核心 drain + 模型响应闭环;TUI enqueue 侧(`Command::Steer`→push)由单测锁定。
+
+**提交**:<!-- 待填 -->
 
 ## 目标
 

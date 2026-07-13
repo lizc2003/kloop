@@ -217,10 +217,10 @@ renders via pure cell→line functions — which is what makes the transcript
 logic testable without a terminal. Streaming deltas are drained in batches so
 a burst of tokens redraws once, not per token.
 
-Keys: Enter sends (ignored while a turn runs — no queueing), Ctrl+C
-interrupts the running turn or clears the input when idle, Ctrl+D quits,
-Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom on
-send). `--plain` keeps the old line-based REPL.
+Keys: Enter sends when idle, or **steers** while a turn runs (see below);
+Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+D
+quits, Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom
+on send). `--plain` keeps the old line-based REPL.
 
 `--resume` replays the saved session into the transcript (user/assistant
 text plus tool status rows re-derived from the recorded tool_use/tool_result
@@ -596,6 +596,39 @@ full list (a sub-agent's carries an `agent` field, like tool notifications).
 A sub-agent's list stays internal to the TUI transcript (lesson 3), the way
 its text does. Not done (deliberate): dependency graphs, cross-session todo
 stores, rollout persistence of the list.
+
+## Steering — mid-turn injection (Phase 2, fifteenth slice)
+
+Type a message while a turn is running and it **steers** instead of being
+dropped: it queues, and is delivered to the model as a user message at the
+next round boundary — never spliced into an in-flight request. It does not
+interrupt the current tools (Ctrl+C stays the hard stop). This is a general
+**step-boundary injection queue** (`Config.inbox`, a `Vec<String>` behind a
+mutex); the current consumer is user steering, and sub-agent completion
+delivery (the mailbox path) plugs into the same queue once async dispatch
+exists.
+
+The mechanism is a straight drain of `Config.inbox` at round boundaries in the
+agent loop (`core/src/agent.rs`): at the **top of each round** (delivering
+steers typed during the previous round's tool execution before the next
+sampling), and again in an **end guard** — when the model returns no tool
+calls, a steer that landed during that final sampling is absorbed and the turn
+continues instead of ending, so a late "wait, also do X" is answered rather
+than lost. Each injected message is framed (`The user sent this message while
+you were working…`) so the model treats it as a mid-work interjection to fold
+in, not a brand-new task. It is recorded to history (and rollout) as a normal
+user message, so it survives compaction and replays on resume; because it is
+recorded right after the round's `tool_result` blocks (a separate user
+message), it never interleaves tool results with regular text — the ordering
+constraint both cc and codex call out.
+
+Each **sub-agent gets its own fresh queue** (the `task` tool resets it on the
+cloned Config, like the todo list), so a running sub-agent never drains the
+parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
+a User cell); the plain REPL (blocking stdin) and server (`turn/steer`) do not
+enqueue yet — the drain path is live for all three, only the enqueue side is
+TUI-only for now. This is the cc/codex convergence: steering is
+enqueue-not-interrupt, delivered only between steps (see `refs/README.md`).
 
 ## Running
 

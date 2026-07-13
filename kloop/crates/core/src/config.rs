@@ -78,4 +78,13 @@ pub struct Config {
     /// gets its OWN fresh list — the task tool resets this on the cloned
     /// Config so a sub-agent's planning never touches the parent's.
     pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
+    /// Step-boundary injection queue (plan 22). Strings pushed here — user
+    /// steering typed while the turn runs — are drained at round boundaries
+    /// (never mid-request) and recorded as user messages before the next
+    /// sampling. cc and codex independently converge on this: steering is
+    /// enqueue-not-interrupt, delivered only between steps. Each sub-agent gets
+    /// its OWN fresh queue (the task tool resets it on the cloned Config, like
+    /// `todos`) so a parent's steering is never drained by a running sub-agent.
+    /// The front-end holds a clone of this Arc to enqueue while a turn runs.
+    pub inbox: Arc<std::sync::Mutex<Vec<String>>>,
 }

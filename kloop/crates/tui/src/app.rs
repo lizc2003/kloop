@@ -72,6 +72,10 @@ pub enum Command {
     None,
     /// Send this user text to the agent task (a turn is now running).
     Submit(String),
+    /// Enqueue this text into the running turn's steering queue (plan 22): it
+    /// is delivered as a user message at the next round boundary, without
+    /// interrupting the turn. Only produced while a turn is running.
+    Steer(String),
     /// Cancel the in-flight turn's CancellationToken.
     Interrupt,
     Quit,
@@ -300,13 +304,19 @@ impl App {
             }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
-                if text.is_empty() || self.running {
+                if text.is_empty() {
                     return Command::None;
                 }
                 self.input.clear();
                 self.cursor = 0;
                 self.scroll_up = 0;
                 self.cells.push(Cell::User(text.clone()));
+                if self.running {
+                    // Steering: the running turn absorbs this at its next round
+                    // boundary. It does not start a new turn, reset the todo
+                    // block, or interrupt tools (Ctrl+C stays the hard stop).
+                    return Command::Steer(text);
+                }
                 // A new turn starts a fresh todo block instead of mutating the
                 // previous turn's (which stays in the transcript as history).
                 self.todo_cell = None;
@@ -742,10 +752,33 @@ mod tests {
         assert_eq!(app.input, "");
         assert_eq!(app.cells, vec![Cell::User("你x好b".into())]);
 
-        // While running, Enter with new text is ignored (no queueing).
+        // While running, Enter steers instead of starting a new turn.
         type_str(&mut app, "next");
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
-        assert_eq!(app.cells.len(), 1);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Command::Steer("next".into())
+        );
+        assert_eq!(
+            app.cells,
+            vec![Cell::User("你x好b".into()), Cell::User("next".into())]
+        );
+    }
+
+    /// Steering (Enter while a turn runs) queues the text as Command::Steer and
+    /// shows it as a User cell, but does not end/restart the turn or reset the
+    /// live todo block.
+    #[test]
+    fn steering_while_running_queues_without_a_new_turn() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        app.todo_cell = Some(0);
+        type_str(&mut app, "also do X");
+        let cmd = app.on_key(key(KeyCode::Enter));
+        assert_eq!(cmd, Command::Steer("also do X".into()));
+        assert!(app.running, "steering does not end or restart the turn");
+        assert_eq!(app.input, "");
+        assert_eq!(app.todo_cell, Some(0), "a steer keeps the live todo block");
+        assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
     }
 
     #[test]

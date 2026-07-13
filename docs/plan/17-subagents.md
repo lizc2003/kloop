@@ -61,6 +61,7 @@ task 工具:深度限 1、`is_concurrency_safe` 标死 false(连续 task 调用�
 4. **子 agent 的 UI 呈现**:TUI 里子 agent 的 tool 行折叠成一组(带前缀/缩进),turn 结束折叠为一行摘要;server 通知加 `agentId`。现状是子 agent 的 tool_start/tool_end 直接混在主流里。
 5. **hook 挂点**:pre/post_tool 事件带 depth 或 agent 字段;SubagentStart/Stop 独立挂点(对齐 codex 命名)开工时定要不要。
 6. **统一任务注册表(方向,开工时定做不做)**:cc 已把后台 shell/异步 agent/远程会话收敛成一套 Task 框架(统一 id、status、output 文件、TaskOutput/TaskStop、`<task-notification>`)。kloop 的对应路径:若选片 1 且做成异步派发(fire-and-forget + 查询),把 `BackgroundShells` 泛化成 `Tasks` 注册表(id 前缀 `bg-`/`agent-`,bash_output/kill_bash 泛化或加别名),那是第二个客户出现、有真实需求驱动的时刻——不要提前抽象(2026-07-10 拍板:不单开 plan)。真正的分水岭是 **turn 中途通知通道**(任务完成时主动喂给模型,免轮询):要动主循环采样时机,是独立架构决定,开工时问用户;没有它,统一注册表的收益只剩命名整齐。codex 的最小先例(2026-07-10 调研,见 refs/README.md):异步 spawn 返回 agent_id + `wait` 工具(mailbox 更新摘要,可被新用户输入打断)+ 子 agent 终态投递父 mailbox 的 turn 中途回灌——只对子 agent 做通知、不建全局框架,是介于"纯轮询"和"cc 全量 task-notification"之间的中间形态;它的 role/complexity/CSV fan-out 全家桶不抄。
+   - **进展(2026-07-13,plan 22)**:这个"turn 中途通知通道"的**注入侧机制已由 plan 22 交付**——step 边界注入队列(`Config.inbox`,round 边界 drain + 收尾兜底,成 user 消息),首个客户是用户 steering。子 agent 回灌复用同一队列,但**它的前置(异步派发引擎:spawn 立即返回 + 完成侦测 + autowake + 注册表泛化)仍挂账**;plan 22 回源确认了两家的收敛"子 agent 回灌整套依赖异步派发",故留独立 plan(建议 plan 26)。届时:子终态回调 push 一条 framing 过的摘要进父的 `inbox` 即可,drain 侧零改动。
 
 ## 不做(维持现状)
 
