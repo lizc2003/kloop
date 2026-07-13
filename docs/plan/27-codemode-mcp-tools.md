@@ -99,7 +99,7 @@ stub source 端到端:program 调 `srv__x(args)` 经 gate 跑通、被 deny 的 
 按所选切片;fmt/clippy/test 全绿;真 key 至少一次"模型在 program 里调 MCP 工具、gate 生效";
 README、HANDOFF、plan 24 挂账(②)与本 plan 更新;未选切片记挂账。
 
-## 完成记录(切片 1+2,2026-07-13,提交号 <待填>)
+## 完成记录(切片 1+2,2026-07-13,提交号 5ffb01f)
 
 开工时用户定"都做"(切片 1+2 一起;切片 3 结构化结果挂账)。
 
