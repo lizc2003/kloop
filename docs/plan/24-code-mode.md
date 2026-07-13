@@ -283,7 +283,7 @@ observation frontier;现同步跑完返回)。
 硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `exec`
 本身只在 depth-0(同 task);受限 agent 类型不给 exec。
 
-### 追加片:`pipeline()` 原语(同会话续做,提交号待补)
+### 追加片:`pipeline()` 原语(同会话续做,提交 8ce4cd6)
 
 补齐 cc 两个核心编排原语的另一半(首片只做了 `parallel`)。`pipeline(items, ...stages)`——
 **每项作独立 async 链穿过所有 stage、stage 间无 barrier**(快的项可到 stage 3 而慢的项还在
