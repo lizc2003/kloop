@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn diff_preview_colors_lines_by_sign() {
-        let lines = diff_preview_lines(" ctx\n-old\n+new\n⋮", 40);
+        let lines = diff_preview_lines(" 1  ctx\n-2  old\n+2  new\n⋮", 40);
         let got: Vec<(String, Style)> = lines
             .iter()
             .map(|l| (line_text(l), l.spans[0].style))
@@ -346,9 +346,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (" ctx".to_string(), DIM),
-                ("-old".to_string(), Style::new().fg(Color::Red)),
-                ("+new".to_string(), Style::new().fg(Color::Green)),
+                (" 1  ctx".to_string(), DIM),
+                ("-2  old".to_string(), Style::new().fg(Color::Red)),
+                ("+2  new".to_string(), Style::new().fg(Color::Green)),
                 ("⋮".to_string(), DIM),
             ]
         );

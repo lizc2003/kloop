@@ -84,6 +84,31 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 - **工具并行 codex 比 kloop 粗**(反向借鉴,保持 kloop 现状):全局单把 RwLock + 每工具静态 supports_parallel 布尔,读锁共享写锁独占;无路径粒度、无 kloop 的"连续只读成批、遇写切断"顺序性。
 - **借鉴清单**:① `write_stdin` 最小切片(挂 plan 14 备选);② 子 agent 异步最小形态 spawn+wait+mailbox 回灌(挂 plan 17);③ 小卫生件:HeadTailBuffer、进程表上限+LRU(有痛感时整段抄)。不抄:ToolOrchestrator 审批沙箱耦合、多 agent 全家桶、notify、SubagentStart/Stop hooks 引擎、parallel.rs 全局锁。
 
+## 编辑审批 diff 呈现对比(2026-07-13,plan 21 回源;kloop 已按此实现)
+
+三家的编辑审批 diff 交叉核对(细节可再查:cc `src/utils/diff.ts` `structuredPatch` +
+`src/components/FileEditToolDiff.tsx` `getPatchForDisplay`,`packages/color-diff-napi`
+渲染;codex `tui/src/diff_render.rs` `create_diff_summary`(`diffy` crate)+ `git-utils/
+src/turn_diff.rs`(`similar`);claw `refs/claw-code/rust/crates/runtime/src/file_ops.rs`
+`make_patch`):
+
+- **收敛点(两个正经实现独立都做,kloop 已抄)**:① **读文件、应用编辑、整文件 diff 带
+  真实行号**——不是直 diff old_string/new_string 两串;改动显示在文件里的真实周围上下文 +
+  真实行号。cc 甚至有"文件读不到/超大(old_string 是整文件)就退化成直 diff 两串"的分级,
+  kloop 照抄为兜底。② 3 行上下文;③ 省 `@@` 头改用逐行行号;④ 审批处内联渲染 diff;
+  ⑤ 着色 add 绿 / del 红 / context 暗。
+- **分歧(不必抄)**:hunk 分隔符 cc 用 `...`、codex 用 `⋮`(kloop 取 `⋮` 与 codex 一致);
+  intraline 词级高亮只有 cc 做(`color-diff` 对相邻 -/+ 对做 wordDiff,>40% 变化率放弃);
+  语法高亮 cc/codex 有、nice-to-have;new-file 呈现 cc 语法高亮整段无 `+`、codex 全 `+`
+  (kloop 取全 `+` 与 codex 一致);长行 cc/codex 都**换行**、kloop **截断**(因弹层不可滚动,
+  见 plan 25);行数硬截断 kloop 独有(两家审批处靠可滚动 overlay 不截,plan 25 补滚动后放宽)。
+- **claw-code 是反面教材**:`make_patch` 全 `-`+全 `+` 朴素拼接(无 LCS、无上下文、无对齐),
+  行号 old_start/new_start 恒为 1 无意义,且 headless CLI 审批处根本不渲染 diff(只把
+  `structuredPatch` 塞进 tool_result JSON 对齐 cc 输出契约)。kloop 质量远高于它。
+- **教训**:plan 21 初版按 plan 备忘"edit 直接成 diff"跳过回源(教训 11 复发),漏了行号 +
+  读文件这对收敛点;用户追问后回源补齐。收敛信号(教训 14)在这里很干净:cc 与 codex 用
+  完全不同的库(structuredPatch vs diffy/similar)得出同一"读文件+整文件 diff+行号"取舍。
+
 ## 预演记录(codex fork,2026-07-09)
 
 kloop 的压缩设计曾先在 codex fork 上完整实现过一轮(分支 `codex/worktree/predictive_reactive_compaction`,提交 57c746ef7,Buildbot 绿,未合入 main):predictive 插在 `run_pre_sampling_compact`、reactive 插在采样错误分支、Feature 双旗标、compact_fork_tests.rs 四个集成测试。价值:验证了设计、抓出小窗口负阈值盲点。教训:kloop 才是项目,参考库不用于开发。

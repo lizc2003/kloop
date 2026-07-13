@@ -1224,8 +1224,9 @@ mod tests {
             .await;
         let _ = p.check("bash", &bash("rm -rf x"), 0).await;
         let asked = approver.asked();
-        assert_eq!(asked[0].preview.as_deref(), Some("-foo\n+bar"));
-        assert_eq!(asked[1].preview.as_deref(), Some("(new file)\n+hi"));
+        // f.rs cannot be read here, so the edit degrades to a two-string diff.
+        assert_eq!(asked[0].preview.as_deref(), Some("-1  foo\n+1  bar"));
+        assert_eq!(asked[1].preview.as_deref(), Some("(new file)\n+1  hi"));
         assert_eq!(asked[2].preview, None, "non-file calls carry no preview");
     }
 

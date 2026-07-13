@@ -1150,8 +1150,8 @@ mod tests {
     #[test]
     fn color_diff_wraps_lines_by_sign() {
         assert_eq!(
-            color_diff("+add\n-del\n ctx"),
-            "\x1b[32m+add\x1b[0m\n\x1b[31m-del\x1b[0m\n\x1b[2m ctx\x1b[0m"
+            color_diff("+1  add\n-2  del\n 3  ctx"),
+            "\x1b[32m+1  add\x1b[0m\n\x1b[31m-2  del\x1b[0m\n\x1b[2m 3  ctx\x1b[0m"
         );
     }
 

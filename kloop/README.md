@@ -178,14 +178,21 @@ and is told to take another approach. Sub-agents share the parent's rules
 and cache and prompt through the same seam, tagged `[sub-agent]`.
 
 **Change previews**: when a `write_file`/`edit_file` reaches the prompt, the
-request carries a unified-diff preview (`crates/core/src/diff.rs`, `similar`)
-so you approve what you can see, not just a path — approving an invisible edit
-is meaningless. `edit_file` diffs `old_string`→`new_string` directly;
-`write_file` diffs an existing file old→new, or shows a `(new file)` insert
-preview for a fresh path. Hunks carry three lines of context, big diffs are
-capped (`… (N more line(s))`), minified lines clipped. The TUI colors the
-popup (green adds, red deletes), the plain REPL prints the same, the server
-adds a `preview` field to `approval/request`.
+request carries a line-numbered diff (`crates/core/src/diff.rs`, `similar`) so
+you approve what you can see, not just a path — approving an invisible edit is
+meaningless. Following claude-code and codex (which independently converge on
+it), `edit_file` **reads the target, applies the edit, and diffs the whole
+file** — the change shown in its real surrounding lines with real line numbers,
+not the edit strings in isolation. `write_file` diffs an existing file old→new,
+or shows a `(new file)` insert preview for a fresh path. When the file can't be
+read, is over 1 MiB, or the `old_string` doesn't uniquely match, it falls back
+to diffing the two edit strings (numbered from 1) — claude-code's same
+degradation. Each line is `{+/-/space}{line-number}  {content}`; hunks carry
+three lines of context separated by `⋮`, big diffs are capped
+(`… (N more line(s))`), minified lines clipped. The TUI colors the popup (green
+adds, red deletes, dim context), the plain REPL prints the same ANSI, the
+server adds a `preview` field to `approval/request`. The popup is not yet
+scrollable, hence the caps.
 
 **Modes**: default (ask for anything unvouched-for), `--accept-edits`
 (file writes inside the working directory auto-pass), `--yolo` (bypass:
@@ -244,7 +251,7 @@ dropped/never-answered reply denies (interrupt the turn to unblock).
 ← {"id":1,"result":{"threadId":"20260709-135146"}}
 → {"id":2,"method":"turn/start","params":{"threadId":"20260709-135146","input":"create s2.txt"}}
 ← {"method":"turn/started","params":{"threadId":"20260709-135146"}}
-← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+hello"}}
+← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+1  hello"}}
 → {"id":"srv-1","result":{"decision":"allow"}}
 ← {"method":"tool/completed","params":{"threadId":"…","callId":"…","ok":true}}
 ← {"method":"turn/completed","params":{"threadId":"…","reason":"completed"}}
@@ -683,8 +690,10 @@ saved and resumable — see Session persistence above.
   acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
   persistence, opaque never cacheable, `ConfirmRequest.preview` carrying an
   edit/write diff while other calls carry none); change-preview generation
-  (added/deleted/changed lines, distant-hunk splitting, long-line clipping,
-  big-diff capping, write-file existing-vs-new-file previews); hook execution (all four points fire
+  (line-numbered added/deleted/changed lines, distant-hunk splitting,
+  long-line clipping, big-diff capping, write-file existing-vs-new-file
+  previews, edit_file reading the file and applying the edit vs the
+  two-string fallback); hook execution (all four points fire
   in order around a real turn, exit-2 pre_tool block becomes an is_error
   tool_result and the command never runs, blocked pre_turn prevents sampling,
   block reason stderr>stdout>status, non-2 exits fail open even on pre
