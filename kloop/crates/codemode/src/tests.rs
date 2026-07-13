@@ -147,6 +147,71 @@ async fn parallel_helper_turns_failures_into_null() {
 }
 
 #[tokio::test]
+async fn pipeline_flows_each_item_through_all_stages() {
+    let out = run(
+        r#"const r = await pipeline([1, 2, 3],
+               (v) => v * 10,
+               (v) => v + 1);
+           return JSON.stringify(r);"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "[11,21,31]");
+}
+
+#[tokio::test]
+async fn pipeline_stage_failure_nulls_only_that_item() {
+    let out = run(
+        r#"const r = await pipeline([1, 2, 3],
+               (v) => { if (v === 2) throw new Error("bad"); return v; },
+               (v) => v * 100);
+           return JSON.stringify(r);"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "[100,null,300]");
+}
+
+#[tokio::test]
+async fn pipeline_stage_receives_prev_item_and_index() {
+    // item "a", index 0: stage1 → "a!", stage2 → "a" + 0 + "a!" = "a0a!"
+    // item "b", index 1: stage1 → "b!", stage2 → "b" + 1 + "b!" = "b1b!"
+    let out = run(
+        r#"const r = await pipeline(["a", "b"],
+               (prev, item, index) => prev + "!",
+               (prev, item, index) => item + index + prev);
+           return JSON.stringify(r);"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, r#"["a0a!","b1b!"]"#);
+}
+
+#[tokio::test]
+async fn pipeline_has_no_barrier_between_stages() {
+    // Item 1's stage 1 blocks on a gate that only item 0's stage 2 opens. A
+    // per-stage barrier would deadlock (stage 2 never starts until every item
+    // clears stage 1); independent per-item chains flow through.
+    let fut = run(
+        r#"let release;
+           const gate = new Promise((r) => { release = r; });
+           const out = await pipeline([0, 1],
+               async (v, item, i) => { if (i === 1) await gate; return item; },
+               async (v) => { if (v === 0) release(); return "done" + v; });
+           return JSON.stringify(out);"#,
+        TestBridge::echo(),
+    );
+    let out = tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("pipeline must not barrier between stages (would deadlock)")
+        .unwrap();
+    assert_eq!(out, r#"["done0","done1"]"#);
+}
+
+#[tokio::test]
 async fn agent_bridges_through_host() {
     let out = run(
         r#"return await agent("find X", { agent_type: "researcher" });"#,

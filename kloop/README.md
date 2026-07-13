@@ -689,7 +689,13 @@ declare const tools: { read_file(args: { path: string; … }): Promise<string>; 
 declare function agent(prompt: string, opts?: { agent_type?; max_rounds? }): Promise<string>;
 declare function log(msg: unknown): void;
 declare function parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>;
+declare function pipeline(items: any[], ...stages): Promise<any[]>;
 ```
+
+`parallel` is a barrier (all thunks, failures→null); `pipeline` runs each item
+through every stage as its own chain with **no barrier between stages** — a fast
+item reaches stage 3 while a slow one is still in stage 1 — matching cc's two
+core orchestration primitives.
 
 The `tools` API and its TypeScript declarations are generated from the built-in
 tool schemas and carried in `exec`'s description (typed declarations markedly
@@ -714,7 +720,7 @@ A running program is observable, not a black box: each `tools.<name>(...)` and
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
 **Not done** (deferred): exposing MCP tools to programs (built-ins only for
-now); a `pipeline()` primitive and token `budget`; a richer progress view (cc's
+now); a token `budget` primitive; a richer progress view (cc's
 `/workflows` tree — kloop shows a flat live trace); background programs with
 `yield`/`wait`; saving a program for reuse with journal-based resume. See
 `docs/plan/24-code-mode.md`.
@@ -783,7 +789,7 @@ saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 354 tests across the workspace:
+`cargo test` runs 358 tests across the workspace:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
@@ -868,7 +874,9 @@ saved and resumable — see Session persistence above.
 - **kloop-codemode** — the QuickJS engine in isolation: the async op bridge
   (a tool call returns a JS promise resolved from a Rust future), real
   concurrency proven with a 2-party barrier that a serial engine would
-  deadlock, the `parallel` helper turning failures into null, sandboxing
+  deadlock, the `parallel` helper turning failures into null, `pipeline`'s
+  per-item no-barrier flow (proven with a gate that would deadlock a
+  per-stage barrier) plus its failure→null and stage-args contract, sandboxing
   (no fetch/require/process/console, import rejected), result coercion,
   program-error surfacing, and each resource limit (runaway-loop kill,
   cancellation, memory cap). Its core wiring (`tools::codemode`) tests the

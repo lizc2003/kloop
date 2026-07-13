@@ -229,8 +229,8 @@ fn envelope(result: Result<String, String>) -> String {
 }
 
 /// The JS prelude: builds the `tools` object (one method per tool name),
-/// `agent`, `log` and `parallel` on top of the raw `__call_tool`/`__agent`/
-/// `__log` host functions. Kept tiny and dependency-free.
+/// `agent`, `log`, `parallel` and `pipeline` on top of the raw `__call_tool`/
+/// `__agent`/`__log` host functions. Kept tiny and dependency-free.
 fn build_prelude(tool_names: &[String]) -> String {
     let names = serde_json::to_string(tool_names).unwrap_or_else(|_| "[]".into());
     format!(
@@ -251,6 +251,19 @@ fn build_prelude(tool_names: &[String]) -> String {
         globalThis.log = (msg) => __log(typeof msg === 'string' ? msg : JSON.stringify(msg));
         globalThis.parallel = (thunks) =>
             Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));
+        // Each item flows through every stage as its own independent async
+        // chain — NO barrier between stages, so a fast item can reach stage 3
+        // while a slow one is still in stage 1. A stage that throws drops that
+        // item to null and skips its remaining stages, mirroring `parallel`.
+        globalThis.pipeline = (items, ...stages) =>
+            Promise.all((items ?? []).map(async (item, index) => {{
+                let value = item;
+                for (const stage of stages) {{
+                    try {{ value = await stage(value, item, index); }}
+                    catch {{ return null; }}
+                }}
+                return value;
+            }}));
         "#
     )
 }

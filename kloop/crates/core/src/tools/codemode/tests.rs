@@ -248,6 +248,7 @@ fn exec_def_renders_a_typescript_api() {
     assert!(d.contains(r#"output_mode?: "content" | "count""#), "{d}");
     assert!(d.contains("declare function agent("), "{d}");
     assert!(d.contains("declare function parallel<T>"), "{d}");
+    assert!(d.contains("declare function pipeline("), "{d}");
     // task is not callable from a program (agent() replaces it); exec isn't either.
     assert!(!d.contains("task(args"), "{d}");
     assert!(!d.contains("exec(args"), "{d}");

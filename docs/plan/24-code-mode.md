@@ -274,10 +274,23 @@ future 用的 owned guard。
 **挂账(留后续 plan)**:① ~~真 key 验收~~ **已完成**(anthropic/sonnet-5:模型写 program 用
 `Promise.all` 并发跑两个 bash + 一个被 `AGENT_DENY` 在 op 层拒掉的 write(writeBlocked=true、
 文件未创建)+ 一个 `agent()` 子 agent(返回 DELEGATED),闭环返回 JSON;gate 在 op 层生效)。
-② MCP 工具暴露给 program(现只内置)+ deferred 集成。③ `pipeline()` 原语 + token
-`budget`。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**(追加片,见上);只剩"更富的进度树
+② MCP 工具暴露给 program(现只内置)+ deferred 集成。③ ~~`pipeline()` 原语~~ **已完成**
+(追加片,见下)+ token `budget`(仍挂账)。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
+(追加片,见上);只剩"更富的进度树
 (cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
 observation frontier;现同步跑完返回)。
 ⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ `Limits` 走配置/env(现
 硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `exec`
 本身只在 depth-0(同 task);受限 agent 类型不给 exec。
+
+### 追加片:`pipeline()` 原语(同会话续做,提交号待补)
+
+补齐 cc 两个核心编排原语的另一半(首片只做了 `parallel`)。`pipeline(items, ...stages)`——
+**每项作独立 async 链穿过所有 stage、stage 间无 barrier**(快的项可到 stage 3 而慢的项还在
+stage 1),某 stage 抛错该项落 `null` 并跳过其余 stage(与 `parallel` 一致),stage 回调收
+`(prev, item, index)`。纯 JS prelude helper(`build_prelude` 里 `Promise.all(items.map(async
+… for stage of stages …))`),零引擎改动;`exec` 的 TS 声明加一行 `declare function pipeline`。
+测试 4 个(引擎层):逐项穿两 stage、失败只 null 该项、stage 三参、**无-barrier 证明**(item 1
+的 stage 1 等一个只在 item 0 的 stage 2 才打开的 gate——按 stage barrier 必死锁,逐项独立链则
+流通)。真 key:`pipeline([2,3,4], n=>n*n, sq=>bash('echo '+sq))` → `["4","9","16"]`。fmt +
+clippy + 全量 358 测试全绿。挂账收窄:③ 只剩 token `budget`。

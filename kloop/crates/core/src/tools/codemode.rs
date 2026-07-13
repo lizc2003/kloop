@@ -156,6 +156,9 @@ pub(super) fn exec_def(callable: &[ToolDef]) -> ToolDef {
     decls.push_str(
         "declare function parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>;\n",
     );
+    decls.push_str(
+        "declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number) => any>): Promise<any[]>;\n",
+    );
 
     let description = format!(
         "Run a JavaScript program that orchestrates tools instead of calling them one at a time. \
