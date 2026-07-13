@@ -274,7 +274,9 @@ future 用的 owned guard。
 **挂账(留后续 plan)**:① ~~真 key 验收~~ **已完成**(anthropic/sonnet-5:模型写 program 用
 `Promise.all` 并发跑两个 bash + 一个被 `AGENT_DENY` 在 op 层拒掉的 write(writeBlocked=true、
 文件未创建)+ 一个 `agent()` 子 agent(返回 DELEGATED),闭环返回 JSON;gate 在 op 层生效)。
-② MCP 工具暴露给 program(现只内置)+ deferred 集成。③ ~~`pipeline()` 原语~~ **已完成**
+② MCP 工具暴露给 program(现只内置)+ deferred 集成 → **独立立项 plan 27**(最有价值、
+最需回源的一片:defer 交互是命脉,`exec_def` 生成点要从 `tool_defs` 上移到 `all_tool_defs`)。
+③ ~~`pipeline()` 原语~~ **已完成**
 (追加片,见下)+ token `budget`(仍挂账)。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
 (追加片,见上);只剩"更富的进度树
 (cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
