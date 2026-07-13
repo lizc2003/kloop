@@ -187,9 +187,9 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
   `dispatch_tools`**——这与 kloop-web 那种"core 零改动 ToolSource"不同(ToolSource 是叶子,
   code-mode 要反向回调 core 的门)。故 seam 形态待定:要么把 op 需要的"过门执行一个工具调用"
   能力抽成 core 上的一个 trait 对象注入引擎,要么 code-mode 工具直接实现在 core 里、只把
-  JS 引擎薄封装在 kloop-codemode。**开工时定**(倾向后者:引擎在独立 crate,`exec` 工具的
+  JS 引擎薄封装在 kloop-codemode。**开工时定**(倾向后者:引擎在独立 crate,`run_program` 工具的
   op 层留在 core 以直接够到 `run_one`)。
-- 触发:一个内置 Freeform/普通工具(codex 叫 `exec`,cc 叫 `Workflow`)——模型显式调用、
+- 触发:一个内置 Freeform/普通工具(codex 叫 `run_program`,cc 叫 `Workflow`)——模型显式调用、
   裸 JS 源码。倾向最小面先做一个工具(名字开工定,如 `code`/`run_program`)。
 - 递归:`execute_tool` 已是类型擦除 future(`tools/mod.rs:517`),code-mode 工具作为一个 arm、
   内部 op 回调 `run_one`,结构上与 `task→run_turn→dispatch_tools` 完全同构,递归 Send 已解。
@@ -241,13 +241,13 @@ Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索�
   JS prelude 在其上建 `tools`/`agent`/`log`/`parallel`;源码包成 `(async()=>{…})()` 令顶层
   `await`/`return` 合法且结果恒串化。`HostBridge` trait = engine↔host 缝(`call_tool`/
   `spawn_agent`/`log`)。
-- **`core/src/tools/codemode.rs`**:`exec` 工具 + `CoreBridge`(实现 `HostBridge`,回灌
+- **`core/src/tools/codemode.rs`**:`run_program` 工具 + `CoreBridge`(实现 `HostBridge`,回灌
   `super::run_one` 全链 gate 与 `task::task_tool`;`RwLock` 复刻并发规则)+ JSON Schema→TS
   生成(`exec_def`/`ts_type`/`ts_object`)。接线:`tools/mod.rs`(`mod codemode` + execute_tool
-  arm + tool_defs depth-0 push exec)、`permissions.rs`(`exec`→readonly 自动放行)。
+  arm + tool_defs depth-0 push run_program)、`permissions.rs`(`run_program`→readonly 自动放行)。
 - **测试**:引擎 13(sandbox/并发 barrier/parallel/agent/log/结果强制/资源三杀/import 拒)+
   core 9(gate 重入命脉/agent 派子/中间态不泄/异常不带 log/观测性 log 实时+op 行按序/TS
-  生成/程序面排除)+ agent 级 1(exec 经 run_turn,下一请求只带 return 值)。**fmt + clippy
+  生成/程序面排除)+ agent 级 1(run_program 经 run_turn,下一请求只带 return 值)。**fmt + clippy
   (-D warnings)+ 全量 354 测试全绿。** `cargo run --mock` 冒烟通过。
 
 ### 追加片:进度观察(log 实时化,同会话续做,提交 065c911)
@@ -282,8 +282,8 @@ future 用的 owned guard。
 (cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
 observation frontier;现同步跑完返回)。
 ⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ `Limits` 走配置/env(现
-硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `exec`
-本身只在 depth-0(同 task);受限 agent 类型不给 exec。
+硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `run_program`
+本身只在 depth-0(同 task);受限 agent 类型不给 run_program。
 
 ### 追加片:`pipeline()` 原语(同会话续做,提交 8ce4cd6)
 
@@ -291,27 +291,41 @@ observation frontier;现同步跑完返回)。
 **每项作独立 async 链穿过所有 stage、stage 间无 barrier**(快的项可到 stage 3 而慢的项还在
 stage 1),某 stage 抛错该项落 `null` 并跳过其余 stage(与 `parallel` 一致),stage 回调收
 `(prev, item, index)`。纯 JS prelude helper(`build_prelude` 里 `Promise.all(items.map(async
-… for stage of stages …))`),零引擎改动;`exec` 的 TS 声明加一行 `declare function pipeline`。
+… for stage of stages …))`),零引擎改动;`run_program` 的 TS 声明加一行 `declare function pipeline`。
 测试 4 个(引擎层):逐项穿两 stage、失败只 null 该项、stage 三参、**无-barrier 证明**(item 1
 的 stage 1 等一个只在 item 0 的 stage 2 才打开的 gate——按 stage barrier 必死锁,逐项独立链则
 流通)。真 key:`pipeline([2,3,4], n=>n*n, sq=>bash('echo '+sq))` → `["4","9","16"]`。fmt +
 clippy + 全量 358 测试全绿。挂账收窄:③ 只剩 token `budget`。
 
-### 发现:何时模型会自发选 exec(真机观察,重要)
+### 发现:何时模型会自发选 run_program(真机观察,重要)
 
-问题:模型会不会**自发**(未被显式要求)写 program?真机验(不提 exec,给一个 fan-out 任务
-"数 docs/plan 下每个文件行数、报最长 5 个"):sonnet-5 **没用 exec**,而是一条 bash 一行流
+问题:模型会不会**自发**(未被显式要求)写 program?真机验(不提 run_program,给一个 fan-out 任务
+"数 docs/plan 下每个文件行数、报最长 5 个"):sonnet-5 **没用 run_program**,而是一条 bash 一行流
 (`find … | xargs wc -l | sort -rn | head`)——**且这是对的**,shell 管道本就是文件 fan-out 的
 最顺手解。
 
-结论:**exec 不是在真空里跟"逐轮直调"竞争,它同时在跟 bash 和 直接 `task()` 抢活**。shell 能
-表达的 fan-out → 模型(对的)选 bash;agent 扇出 → 直接并发 `task()` 也够。**exec 唯一别人干不了
+结论:**run_program 不是在真空里跟"逐轮直调"竞争,它同时在跟 bash 和 直接 `task()` 抢活**。shell 能
+表达的 fan-out → 模型(对的)选 bash;agent 扇出 → 直接并发 `task()` 也够。**run_program 唯一别人干不了
 的生态位 = 用代码逻辑编排 bash 干不了的工具(MCP / web_fetch / 带条件转换的 agent 串联),且中间
 结果多到不该进上下文。而这个生态位现在恰恰还没打开**——program 只暴露了内置工具(bash/read/
 grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 
 **推论(直接印证 plan 27 的必要性)**:code-mode 的"自发被选中"价值被**工具生态位**闸住——单有引擎
 不够,得有 bash/直调干不了的工具可编排(= plan 27 MCP 暴露)。要驱动自发使用,三条路:①补生态位
-(plan 27);②加显式引导(cc 用 skill 注手册 / codex 用 mode);③在 `exec` description 里点明
-"何时 exec 胜过 bash/直调"。**"能写对 JS"(给了意图就能,已验)≠"会自发选 exec"(不会、也不该,
+(plan 27);②加显式引导(cc 用 skill 注手册 / codex 用 mode);③在 `run_program` description 里点明
+"何时 run_program 胜过 bash/直调"。**"能写对 JS"(给了意图就能,已验)≠"会自发选 run_program"(不会、也不该,
 除非任务真需要)。** 见 HANDOFF 教训 18。
+
+### 追加片:命名打磨(同会话续做,提交号待补)
+
+用户指出两个名字可优化:
+- **`spawn_agent` → `call_agent`**(`HostBridge` trait 方法,内部):`spawn_` 隐含 fire-and-forget,
+  但它是**同步** invoke-and-return(和 `call_tool` 一样),`call_agent` 对仗更整齐、语义更准。JS 侧
+  面向模型的 `agent()` 名字**不动**(对齐 cc workflow API;且现同步,若改 `spawn_` 反而误导——等
+  plan 26 真异步后再谈)。
+- **`exec` → `run_program`**(面向模型的工具名):`exec` 紧挨 `bash`,易被读成"另一种执行命令",不含
+  "写段程序"的信号;结合"发现"节(模型不自发选它),更清楚的名字是便宜的杠杆。同步改了内部
+  `exec_tool`/`exec_def`→`run_program_tool`/`run_program_def`、synthetic id 前缀 `exec-`→`run_program-`、
+  测试/文档全量。**注:首片~pipeline 的旧提交/记录里的 `exec` = 现 `run_program`。**
+
+零行为变更(纯改名),全量 358 测试全绿 + fmt + clippy;真 key 冒烟确认模型按新名 `run_program` 调用。

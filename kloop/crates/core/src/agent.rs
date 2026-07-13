@@ -1255,14 +1255,16 @@ mod tests {
             .all(|m| *m != Message::user_text(instructions)));
     }
 
-    /// Code-mode end to end over Mock: the model emits one `exec` tool_use whose
-    /// program reads a file twice internally, then returns a summary. The next
-    /// request to the model carries exactly one exec tool_result — the summary —
-    /// and the file content the program handled never reaches the context.
+    /// Code-mode end to end over Mock: the model emits one `run_program`
+    /// tool_use whose program reads a file twice internally, then returns a
+    /// summary. The next request to the model carries exactly one run_program
+    /// tool_result — the summary — and the file content the program handled
+    /// never reaches the context.
     #[tokio::test]
-    async fn exec_returns_only_final_output_to_the_model() {
+    async fn run_program_returns_only_final_output_to_the_model() {
         use kloop_provider::MockTurn;
-        let file = std::env::temp_dir().join(format!("kloop-exec-e2e-{}", std::process::id()));
+        let file =
+            std::env::temp_dir().join(format!("kloop-run-program-e2e-{}", std::process::id()));
         std::fs::write(&file, "PAYLOAD_LINE_XYZ").unwrap();
         let path = file.to_string_lossy().replace('\\', "\\\\");
         let source = format!(
@@ -1273,12 +1275,12 @@ mod tests {
         let (provider, seen) = Provider::mock_recording(vec![
             MockTurn::Blocks(vec![tool_use_named(
                 "e1",
-                "exec",
+                "run_program",
                 json!({ "source": source }),
             )]),
             MockTurn::Blocks(text("done")),
         ]);
-        let cfg = compaction_cfg(provider, 200_000, "exec-e2e");
+        let cfg = compaction_cfg(provider, 200_000, "run-program-e2e");
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("go"));
@@ -1286,7 +1288,7 @@ mod tests {
         let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
         assert_eq!(outcome.reason, EndReason::Completed);
 
-        // Second request = the one sent after exec ran. It must show the
+        // Second request = the one sent after run_program ran. It must show the
         // program's return value and never the file content read inside it.
         let seen = seen.lock().unwrap();
         let dump = format!("{:?}", seen[1].messages);

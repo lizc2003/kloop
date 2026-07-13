@@ -511,7 +511,7 @@ agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
 ## OS sandbox (Phase 2, thirteenth slice)
 
 On macOS, bash commands run inside a seatbelt sandbox by default
-(`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-exec` with a
+(`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-run_program` with a
 deny-by-default SBPL profile — the shape cc and codex converged on):
 
 - **Writes** are allow-listed: cwd + `/tmp` + `$TMPDIR` + configured extras.
@@ -561,7 +561,7 @@ escalate = true           # default; false = model-driven disable_sandbox instea
 
 `AGENT_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
 (Linux/Windows for now — planned as future slices behind the same seam; or a
-missing `sandbox-exec`), kloop warns at startup and runs commands bare:
+missing `sandbox-run_program`), kloop warns at startup and runs commands bare:
 fail-open, because the permission gate remains the enforcement layer.
 Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
@@ -662,7 +662,7 @@ seam (a `custom.rs` sibling); server-mode slash; `!bash`/`@file` injection.
 
 ## Code mode (Phase 2, seventeenth slice)
 
-The `exec` tool (`core/src/tools/codemode.rs`) is CodeAct: instead of one
+The `run_program` tool (`core/src/tools/codemode.rs`) is CodeAct: instead of one
 `tool_use` per step, the model writes **a JavaScript program** that orchestrates
 tools and sub-agents — loops, fan-out, pipelines and filters expressed in code.
 Intermediate results stay in program variables; only what the program `return`s
@@ -698,7 +698,7 @@ item reaches stage 3 while a slow one is still in stage 1 — matching cc's two
 core orchestration primitives.
 
 The `tools` API and its TypeScript declarations are generated from the built-in
-tool schemas and carried in `exec`'s description (typed declarations markedly
+tool schemas and carried in `run_program`'s description (typed declarations markedly
 improve how reliably models call tools — the references converge on this).
 
 **The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
@@ -708,7 +708,7 @@ denied tool is refused *inside* the program (the model catches the exception); a
 sandboxed command is still sandboxed. The `kloop-codemode` crate is engine-only
 and knows nothing of permissions; it calls back through a `HostBridge` trait,
 which `core/src/tools/codemode.rs` implements over the gate — that inversion is
-why `core` can depend on the engine crate without a cycle. `exec` itself is
+why `core` can depend on the engine crate without a cycle. `run_program` itself is
 auto-allowed (like `task`): it touches nothing directly. `Promise.all` maps to
 the same concurrency rule as a normal round (read-only calls batch, writes take
 an exclusive lock). Resource limits: per-program QuickJS heap cap and stack cap,
@@ -842,7 +842,7 @@ saved and resumable — see Session persistence above.
   network-off DNS extension, `[no sandbox]` approval tag, auto-allow
   layering: contained calls skip asking while deny/safety/ask-rules
   outrank the sandbox; escalation-consent decision/mode mapping) plus
-  macOS-only integration against the real `sandbox-exec` (write
+  macOS-only integration against the real `sandbox-run_program` (write
   inside/outside a writable root with the denial hint, protected subpath,
   per-call disable_sandbox escape, network denied where a bare run
   connects, background shell sandboxed with inherited-fd output, contained
@@ -885,7 +885,7 @@ saved and resumable — see Session persistence above.
   real sub-agent, intermediate results staying off the result, `log()`
   streaming live to the UI (with the op's tool line ordered between two logs)
   while staying out of the result, and the TypeScript-API generation; an
-  agent-level test drives one `exec` tool_use over Mock and asserts the next
+  agent-level test drives one `run_program` tool_use over Mock and asserts the next
   request carries only the program's return value, never the content it read
   internally.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
@@ -937,7 +937,7 @@ crates/core/        kloop-core — the agent, network-free
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware
                     walking, output modes, paging, clipping)
     task.rs         sub-agent spawning
-    codemode.rs     the exec tool: CoreBridge (re-enters the gate per op),
+    codemode.rs     the run_program tool: CoreBridge (re-enters the gate per op),
                     TypeScript API generation; engine is the codemode crate
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping

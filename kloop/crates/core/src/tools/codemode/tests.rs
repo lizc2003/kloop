@@ -53,8 +53,8 @@ fn with_permissions(mut ctx: ToolCtx, perms: Permissions) -> ToolCtx {
     ctx
 }
 
-async fn exec(source: &str, ctx: &ToolCtx) -> (String, bool) {
-    run_tool("exec", json!({ "source": source }), ctx).await
+async fn run(source: &str, ctx: &ToolCtx) -> (String, bool) {
+    run_tool("run_program", json!({ "source": source }), ctx).await
 }
 
 #[tokio::test]
@@ -62,7 +62,7 @@ async fn program_reads_a_file_through_the_real_dispatch() {
     let file = tmp("read");
     std::fs::write(&file, "hello codemode").unwrap();
     let ctx = test_ctx(0, "read");
-    let (out, is_error) = exec(
+    let (out, is_error) = run(
         &format!(r#"return await tools.read_file({{ path: {:?} }});"#, file),
         &ctx,
     )
@@ -90,7 +90,7 @@ async fn tool_calls_pass_the_permission_gate() {
     let perms = Permissions::new(Mode::Default, &rules, std::env::temp_dir(), None, None).unwrap();
     let ctx = with_permissions(test_ctx(0, "gate"), perms);
 
-    let (out, is_error) = exec(
+    let (out, is_error) = run(
         &format!(
             r#"let w;
                try {{ await tools.write_file({{ path: {forbidden:?}, content: "x" }}); w = "WROTE"; }}
@@ -119,7 +119,7 @@ async fn agent_call_spawns_a_subagent() {
         text: "sub-agent result".into(),
     }]]);
     let ctx = with_provider(test_ctx(0, "agent"), provider);
-    let (out, is_error) = exec(r#"return await agent("do the thing");"#, &ctx).await;
+    let (out, is_error) = run(r#"return await agent("do the thing");"#, &ctx).await;
     assert!(!is_error, "{out}");
     assert_eq!(out, "sub-agent result");
 }
@@ -132,7 +132,7 @@ async fn intermediate_results_stay_off_the_result() {
     let file = tmp("intermediate");
     std::fs::write(&file, "SECRET_PAYLOAD").unwrap();
     let ctx = test_ctx(0, "intermediate");
-    let (out, is_error) = exec(
+    let (out, is_error) = run(
         &format!(
             r#"const a = await tools.read_file({{ path: {file:?} }});
                const b = await tools.read_file({{ path: {file:?} }});
@@ -153,7 +153,7 @@ async fn intermediate_results_stay_off_the_result() {
 #[tokio::test]
 async fn program_error_surfaces_the_exception_without_logs() {
     let ctx = test_ctx(0, "err");
-    let (out, is_error) = exec(r#"log("before"); throw new Error("kaboom");"#, &ctx).await;
+    let (out, is_error) = run(r#"log("before"); throw new Error("kaboom");"#, &ctx).await;
     assert!(is_error);
     assert!(out.contains("kaboom"), "{out}");
     // log() is a live user-facing channel, not part of the model's result.
@@ -172,7 +172,7 @@ async fn program_logs_and_ops_stream_to_the_ui() {
     std::fs::write(&file, "data").unwrap();
     let rec = Arc::new(RecordUi::default());
     let ctx = with_ui(test_ctx(0, "observe"), rec.clone());
-    let (out, is_error) = exec(
+    let (out, is_error) = run(
         &format!(
             r#"log("phase 1");
                await tools.read_file({{ path: {file:?} }});
@@ -204,7 +204,7 @@ async fn program_logs_and_ops_stream_to_the_ui() {
 }
 
 #[test]
-fn exec_def_renders_a_typescript_api() {
+fn run_program_def_renders_a_typescript_api() {
     let defs = vec![
         ToolDef {
             name: "read_file".into(),
@@ -236,9 +236,9 @@ fn exec_def_renders_a_typescript_api() {
             schema: json!({"type": "object"}),
         },
     ];
-    let def = exec_def(&defs);
+    let def = run_program_def(&defs);
     let d = &def.description;
-    assert_eq!(def.name, "exec");
+    assert_eq!(def.name, "run_program");
     assert!(d.contains("read_file(args: {"), "{d}");
     assert!(d.contains("path: string"), "{d}");
     assert!(d.contains("limit?: number"), "{d}");
@@ -249,9 +249,10 @@ fn exec_def_renders_a_typescript_api() {
     assert!(d.contains("declare function agent("), "{d}");
     assert!(d.contains("declare function parallel<T>"), "{d}");
     assert!(d.contains("declare function pipeline("), "{d}");
-    // task is not callable from a program (agent() replaces it); exec isn't either.
+    // task is not callable from a program (agent() replaces it); run_program
+    // (the tool itself) isn't either.
     assert!(!d.contains("task(args"), "{d}");
-    assert!(!d.contains("exec(args"), "{d}");
+    assert!(!d.contains("run_program(args"), "{d}");
 }
 
 #[test]
@@ -280,10 +281,10 @@ fn ts_type_covers_common_shapes() {
 }
 
 #[test]
-fn program_surface_excludes_exec_and_task() {
+fn program_surface_excludes_run_program_and_task() {
     let names = program_tool_names();
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
-    assert!(!names.iter().any(|n| n == "exec"));
+    assert!(!names.iter().any(|n| n == "run_program"));
     assert!(!names.iter().any(|n| n == "task"));
 }

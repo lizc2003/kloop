@@ -45,7 +45,7 @@ pub trait HostBridge: Send + Sync + 'static {
     /// Ok(text) is the tool_result content; Err(reason) becomes a JS exception.
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<String, String>>;
     /// `agent(prompt, opts)` — spawn a sub-agent (reuses core's task seam).
-    fn spawn_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>>;
+    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>>;
     /// `log(msg)` — progress output surfaced to the user and appended to the
     /// program's result. Fire-and-forget, never blocks the program.
     fn log(&self, message: String);
@@ -200,7 +200,7 @@ fn install_host_functions(ctx: &rquickjs::Ctx<'_>, bridge: Arc<dyn HostBridge>) 
             let bridge = agent_bridge.clone();
             async move {
                 let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-                envelope(bridge.spawn_agent(prompt, opts).await)
+                envelope(bridge.call_agent(prompt, opts).await)
             }
         }),
     )

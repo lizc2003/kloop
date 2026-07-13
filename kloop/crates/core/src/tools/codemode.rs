@@ -1,4 +1,4 @@
-//! The `exec` tool: code-mode / CodeAct. The model writes a JavaScript program
+//! The `run_program` tool: code-mode / CodeAct. The model writes a JavaScript program
 //! that orchestrates the built-in tools and sub-agents; it runs in an isolated
 //! QuickJS runtime (the `kloop-codemode` crate) and every `tools.<name>(...)`
 //! or `agent(...)` call routes back here through [`CoreBridge`], which re-enters
@@ -24,10 +24,10 @@ use kloop_codemode::HostBridge;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 
-/// Tools NOT exposed to a program: `exec` itself (no program-in-program) and
-/// `task` (replaced by the `agent()` orchestration primitive).
+/// Tools NOT exposed to a program: `run_program` itself (no program-in-program)
+/// and `task` (replaced by the `agent()` orchestration primitive).
 fn is_program_callable(name: &str) -> bool {
-    !matches!(name, "exec" | "task")
+    !matches!(name, "run_program" | "task")
 }
 
 /// The tool names a program may call, taken from the depth-0 built-in set.
@@ -40,8 +40,8 @@ fn program_tool_names() -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn exec_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let source = super::str_arg(input, "source", "exec")?;
+pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    let source = super::str_arg(input, "source", "run_program")?;
     let names = program_tool_names();
     let bridge = Arc::new(CoreBridge::new(ctx.clone()));
     // `log()` output already streamed live to the UI as it ran; only the
@@ -88,7 +88,7 @@ impl CoreBridge {
 impl HostBridge for CoreBridge {
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<String, String>> {
         let safe = super::is_concurrency_safe(&name, &args, &self.ctx.cfg.tool_sources);
-        let id = format!("exec-{}", self.seq.fetch_add(1, Ordering::Relaxed));
+        let id = format!("run_program-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         let ctx = self.ctx.clone();
         let gate = self.gate.clone();
         Box::pin(async move {
@@ -112,7 +112,7 @@ impl HostBridge for CoreBridge {
         })
     }
 
-    fn spawn_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
+    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
         let ctx = self.ctx.clone();
         Box::pin(async move {
             let mut task_input = json!({ "prompt": prompt });
@@ -134,11 +134,11 @@ impl HostBridge for CoreBridge {
     }
 }
 
-/// The `exec` tool definition. Its description carries the TypeScript API the
+/// The `run_program` tool definition. Its description carries the TypeScript API the
 /// program can call, generated from `callable`'s schemas — the same trick the
 /// references converge on (typed API declarations markedly improve how reliably
 /// the model calls tools). Depth-0 only, like `task`.
-pub(super) fn exec_def(callable: &[ToolDef]) -> ToolDef {
+pub(super) fn run_program_def(callable: &[ToolDef]) -> ToolDef {
     let mut decls = String::from("declare const tools: {\n");
     for def in callable.iter().filter(|d| is_program_callable(&d.name)) {
         decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
@@ -175,7 +175,7 @@ Available API (TypeScript):\n```ts\n{decls}```"
     );
 
     ToolDef {
-        name: "exec".into(),
+        name: "run_program".into(),
         description,
         schema: json!({
             "type": "object",

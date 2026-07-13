@@ -47,7 +47,7 @@ impl HostBridge for TestBridge {
         })
     }
 
-    fn spawn_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
+    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
         Box::pin(async move { Ok(format!("agent[{opts}]: {prompt}")) })
     }
 
