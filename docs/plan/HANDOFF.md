@@ -64,14 +64,15 @@
 
 **plan 1–13、15、16、18 全部完成;plan 14 完成切片 1(grep+glob)、3(后台 bash)、2(web 工具);plan 17 完成切片 1(并行 task)+ 4(UI 呈现)+ 2(自定义 agent 类型);plan 19 完成片 1(macOS seatbelt 执行原语 + 最小逃逸口)+ 片 2(auto-allow 双轴联动)+ 片 3(代码级 escalation 环);tools 已拆目录(缝在 `tools/mod.rs`,实现按领域一文件)**。plan 15 开工时用户扩了 scope(三线协议:/v1/messages、/chat/completions、/v1/responses 全支持),唯一挂账:Responses 加密 reasoning 往返仅 wiremock 锁定,真实锻炼需官方 OpenAI key。后续 plan(顺序是建议、可按用户意愿调换,取舍点都标了"开工时定/问用户"):
 - **plan 14(收尾)** 图片输入;grep/glob 路径级权限规则、write_stdin 等挂账见 plan 文件。切片 1/2/3 双轨验收全过。
-- **plan 17(收尾)** 剩余切片:历史持久化(plan 18 的跨文件血缘链已落地可用)、hook agent 字段;异步派发 + mailbox 回灌的**机制部分已移交 plan 24**(step 边界注入,与用户 steering 合并)。切片 1/4/2 已完成。
+- **plan 17(收尾)** 剩余切片:历史持久化(plan 18 的跨文件血缘链已落地可用)、hook agent 字段;异步派发 + mailbox 回灌的**机制部分已移交 plan 22**(step 边界注入,与用户 steering 合并)。切片 1/4/2 已完成。
 - **plan 18(收尾)** TUI 按键选截点、server `thread/fork`(schema 已兼容,等有真实需求)。
 - **plan 19(后续片)** 片 1(seatbelt 执行原语)+ 片 2(auto-allow 双轴联动)+ 片 3(代码级 escalation 环)已完成。剩余只有平台扩展:Linux 片对 bwrap+seccomp(landlock 是 legacy;`sandbox/` 已是目录模块,平台后端落 sibling 文件 `linux.rs`——**不拆独立 crate**:Linux-only 依赖用 `cfg(target_os)` 门控即可、helper 二进制用 arg0 dispatch 复用主二进制,拆 crate 仅在 unsafe 面/编译成本有痛感时再议;本机无法手工验收,宜等仓库推远端后 Linux CI 能跑再做);Windows 更后,且缝要从 argv-prefix 改成 spawn-owning trait(restricted token/AppContainer 无包装二进制)。macOS 侧沙箱功能已完整。
 
-- **plan 20(备忘,未开工)** code mode / 代码编排(CodeAct):模型写 JS 程序编排工具/子 agent,中间结果留程序变量不回灌上下文——cc dynamic workflows / codex code mode(用 V8)/ Anthropic code-execution-with-MCP 同族。引擎选型(V8 vs QuickJS vs Boa)、op 层过权限门/沙箱的安全模型是命脉,开工必先回源三家(教训 11)。详见 plan 20 文件。
-- **plan 21(备忘,未开工)** TodoWrite / 计划工具:模型自维护结构化任务清单(整表替换,cc 形态),多步任务连贯 + 进度可见。高性价比。详见 plan 21。
-- **plan 22(备忘,未开工)** Edit/Write 的 diff 呈现:审批/转录里看得见改了什么(unified diff,`similar` crate),接口是 `ConfirmRequest` 加 `preview` 字段。编码 agent 信任核心。详见 plan 22。
-- **plan 23(备忘,未开工)** 自定义 slash 命令:`.kloop/commands/` 可复用带参 prompt 模板(`$ARGUMENTS`/`$1`),`[agents.<name>]` 的姊妹。文件形态(md vs config.toml)开工问用户。详见 plan 23。
-- **plan 24(备忘,未开工)** 中途注入:step 边界注入机制,两客户——用户 steering(干活时插话)+ 子 agent 回灌(**吸收 plan 17 片 6**)。两家收敛"只在 step 边界注入"。详见 plan 24。
+编号 = 建议做序(低编号先做,20→24);均备忘、未开工、可按用户意愿调换:
+- **plan 20(备忘,未开工)** TodoWrite / 计划工具:模型自维护结构化任务清单(整表替换,cc 形态),多步任务连贯 + 进度可见。最便宜的高价值快赢。详见 plan 20。
+- **plan 21(备忘,未开工)** Edit/Write 的 diff 呈现:审批/转录里看得见改了什么(unified diff,`similar` crate),接口是 `ConfirmRequest` 加 `preview` 字段。编码 agent 信任核心。详见 plan 21。
+- **plan 22(备忘,未开工)** 中途注入:step 边界注入机制,两客户——用户 steering(干活时插话)+ 子 agent 回灌(**吸收 plan 17 片 6**)。基础机制,一次建好三处受益(17 片 6 / steering / plan 24 后台观察)。详见 plan 22。
+- **plan 23(备忘,未开工)** 自定义 slash 命令:`.kloop/commands/` 可复用带参 prompt 模板(`$ARGUMENTS`/`$1`),`[agents.<name>]` 的姊妹。QoL,灵活。文件形态(md vs config.toml)开工问用户。详见 plan 23。
+- **plan 24(备忘,未开工)** code mode / 代码编排(CodeAct):模型写 JS 程序编排工具/子 agent,中间结果留程序变量不回灌上下文——cc dynamic workflows / codex code mode(用 V8)/ Anthropic code-execution-with-MCP 同族。最大杠杆、最重、开工必先回源三家(教训 11)。引擎选型(V8 vs QuickJS vs Boa)、op 层过权限门/沙箱的安全模型是命脉。压轴。详见 plan 24。
 
 不占编号的小事:首次推远端后看 CI 实跑一次绿(用户已暂缓)。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、usage/cost 呈现(记账数据已有,一个 `/cost` 或状态行即可,可与 plan 23 内置 slash 合并)、图片输入(已在 plan 14 挂账)。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。

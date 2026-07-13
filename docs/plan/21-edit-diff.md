@@ -1,4 +1,4 @@
-# Plan 22 — Edit/Write 的 diff 呈现(备忘)
+# Plan 21 — Edit/Write 的 diff 呈现(备忘)
 
 > 备忘,未开工。开工前读 HANDOFF。参考:cc 的编辑审批带 diff 显示。
 

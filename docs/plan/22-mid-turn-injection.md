@@ -1,4 +1,4 @@
-# Plan 24 — 中途注入:steering + 子 agent 回灌(备忘)
+# Plan 22 — 中途注入:steering + 子 agent 回灌(备忘)
 
 > 备忘,未开工。**本 plan 吸收 plan 17 片 6 的机制部分**(异步派发 + mailbox 回灌)。
 > 开工前读 HANDOFF + plan 17 的"回源调研结论"节(两家在此已收敛)。

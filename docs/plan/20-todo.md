@@ -1,4 +1,4 @@
-# Plan 21 — TodoWrite / 计划工具(备忘)
+# Plan 20 — TodoWrite / 计划工具(备忘)
 
 > 备忘,未开工。开工前读 HANDOFF。参考:cc TodoWrite(模型维护结构化任务清单,
 > 整表替换、单 in_progress 软约束、UI 呈现进度)。回源核对 cc 字段与语义(教训 11)。
