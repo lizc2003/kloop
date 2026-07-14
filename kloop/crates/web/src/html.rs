@@ -130,7 +130,15 @@ fn is_block_tag(tag: &str) -> bool {
 /// Decode one entity at the start of `rest` (which begins with '&').
 /// Returns (decoded text, byte length consumed).
 fn decode_entity(rest: &str) -> Option<(String, usize)> {
-    let semi = rest[..rest.len().min(12)].find(';')?;
+    // Entities are short and ASCII; scan only the first dozen bytes for the
+    // ';' terminator (a bare '&' in prose must not reach for a distant ';').
+    // Walk by chars, not a raw byte slice: `rest` can hold multibyte text
+    // right after the '&', and `rest[..12]` would panic on a non-char boundary.
+    let semi = rest
+        .char_indices()
+        .take_while(|(byte, _)| *byte < 12)
+        .find(|(_, c)| *c == ';')
+        .map(|(byte, _)| byte)?;
     let body = &rest[1..semi];
     let decoded = match body {
         "amp" => "&".to_string(),
@@ -208,6 +216,17 @@ mod tests {
         );
         // Unknown / malformed entities pass through literally.
         assert_eq!(html_to_text("R&D &unknown; &#zzz;"), "R&D &unknown; &#zzz;");
+    }
+
+    #[test]
+    fn bare_amp_before_multibyte_char_does_not_panic() {
+        // A bare '&' followed by ~10 ASCII then a multibyte char once put the
+        // 12-byte cutoff mid-character and panicked on untrusted web content.
+        assert_eq!(html_to_text("&aaaaaaaaaa中文"), "&aaaaaaaaaa中文");
+        // The multibyte char landing exactly on the byte-12 boundary.
+        assert_eq!(html_to_text("x &bbbbbbbbbb好 y"), "x &bbbbbbbbbb好 y");
+        // A real entity right before multibyte text still decodes.
+        assert_eq!(html_to_text("&amp;中文"), "&中文");
     }
 
     #[test]

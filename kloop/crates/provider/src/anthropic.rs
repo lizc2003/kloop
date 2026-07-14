@@ -139,7 +139,7 @@ pub(super) async fn stream(
 
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk?;
-        for frame in parser.feed(&String::from_utf8_lossy(&chunk)) {
+        for frame in parser.feed(&chunk) {
             let v: Value = match serde_json::from_str(&frame.data) {
                 Ok(v) => v,
                 Err(_) => continue,

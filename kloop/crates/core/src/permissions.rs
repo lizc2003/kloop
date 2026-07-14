@@ -36,7 +36,6 @@ use std::sync::Mutex;
 use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
-use globset::Glob;
 use globset::GlobMatcher;
 use serde_json::Value;
 
@@ -185,7 +184,11 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                 Ok(Rule::BashPrefix { tokens, wildcard })
             }
             "write_file" | "edit_file" | "read_file" => {
-                let glob = Glob::new(inner.trim())
+                // Match case-insensitively on case-folding filesystems so a
+                // deny like `write_file(secrets/**)` is not slipped by `Secrets/`.
+                let glob = globset::GlobBuilder::new(inner.trim())
+                    .case_insensitive(FS_FOLDS_CASE)
+                    .build()
                     .with_context(|| format!("rule '{entry}': invalid glob"))?
                     .compile_matcher();
                 Ok(Rule::PathGlob {
@@ -612,6 +615,20 @@ fn lexical_normalize(cwd: &Path, path: &Path) -> PathBuf {
     out
 }
 
+/// Case-folding filesystems (macOS/Windows default): `.GIT` and `.git` are
+/// the same inode, so a cased alias would slip a write past a case-sensitive
+/// sensitive-path or deny check and land on the real `.git/hooks`. Fold case
+/// there; compare verbatim where distinct names are distinct files.
+const FS_FOLDS_CASE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+fn fs_fold(name: &str) -> std::borrow::Cow<'_, str> {
+    if FS_FOLDS_CASE {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
 /// Paths where a write is privilege escalation, not editing: VCS internals
 /// (hooks run code), kloop's own state, key material, shell/git rc files
 /// (cc's `checkPathSafetyForAutoEdit` list, trimmed to this project's
@@ -636,6 +653,8 @@ fn path_is_sensitive(normalized: &Path) -> bool {
         let Some(name) = name.to_str() else {
             return true; // non-UTF8 path: refuse to vouch
         };
+        let folded = fs_fold(name);
+        let name = folded.as_ref();
         let is_last = components.peek().is_none();
         if SENSITIVE_DIRS.contains(&name) && !is_last {
             return true;
@@ -1440,5 +1459,17 @@ mod tests {
         assert!(!s("/w/proj/src/main.rs"));
         assert!(!s("/w/proj/git/readme.md"), "git dir ≠ .git dir");
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
+    }
+
+    #[test]
+    fn sensitive_path_folds_case_on_case_insensitive_fs() {
+        let s = |p: &str| path_is_sensitive(Path::new(p));
+        // A cased alias resolves to the real `.git`/`.ssh`/`.env*` on a
+        // case-folding FS, so it must be caught there; on a case-sensitive FS
+        // those are genuinely distinct paths and stay non-sensitive.
+        assert_eq!(s("/w/proj/.GIT/hooks/pre-commit"), FS_FOLDS_CASE);
+        assert_eq!(s("/w/proj/.SSH/id_rsa"), FS_FOLDS_CASE);
+        assert_eq!(s("/w/proj/.Env.production"), FS_FOLDS_CASE);
+        assert_eq!(s("/home/u/.Bashrc"), FS_FOLDS_CASE);
     }
 }

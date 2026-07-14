@@ -132,7 +132,7 @@ pub(super) async fn stream(
 
     'outer: while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk?;
-        for frame in parser.feed(&String::from_utf8_lossy(&chunk)) {
+        for frame in parser.feed(&chunk) {
             if frame.data.trim() == "[DONE]" {
                 finished = true;
                 break 'outer;
