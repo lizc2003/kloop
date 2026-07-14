@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::commands;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
@@ -422,6 +423,22 @@ async fn thread_worker(
 ) {
     while let Some(turn) = turns.recv().await {
         ui.notify("turn/started", json!({}));
+        // A slash command reads/rewrites History like a turn (hence the
+        // single-flight running flag and the turn/started..turn/completed
+        // bracket the client already waits on) but is not a model turn: no
+        // user message is recorded and nothing is sampled. Its output comes
+        // back as a `system` notification instead of `text/delta`; `/clear`
+        // also emits `thread/cleared` so the client resets its transcript.
+        if commands::is_command(&turn.input) {
+            let result = commands::run(&turn.input, &mut history, &cfg, &turn.cancel).await;
+            ui.notify("system", json!({"text": result.output}));
+            if result.cleared {
+                ui.notify("thread/cleared", json!({}));
+            }
+            running.store(false, Ordering::SeqCst);
+            ui.notify("turn/completed", json!({"reason": "completed"}));
+            continue;
+        }
         history.record(Message::user_text(turn.input));
         let dyn_ui: Arc<dyn Ui> = ui.clone();
         let outcome = run_turn(&cfg, &mut history, &dyn_ui, &turn.cancel, 0).await;

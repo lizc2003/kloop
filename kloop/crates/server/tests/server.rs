@@ -844,3 +844,114 @@ async fn thread_fork_rejects_an_illegal_cut() {
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
+
+/// A slash-command `turn/start` input runs the command (not the model): its
+/// output comes back as a `system` notification bracketed by turn/started and
+/// turn/completed, no `text/delta`, and no user message is recorded.
+#[tokio::test]
+async fn slash_commands_surface_as_system_notifications() {
+    let dirs = test_dirs("slash");
+    // The script is never consumed — slash commands don't sample the model.
+    let mut client = start_server(
+        factory(vec![vec![text("unused")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let tid = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // /help lists the builtins as a system note; the stream carries no delta.
+    client
+        .send(
+            json!({"id": 2, "method": "turn/start", "params": {"threadId": tid, "input": "/help"}}),
+        )
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(
+        methods_for_thread(&log, &tid),
+        vec!["turn/started", "system", "turn/completed"]
+    );
+    let help_text = log.iter().find(|m| m["method"] == "system").unwrap()["params"]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        help_text.contains("/help") && help_text.contains("/compact"),
+        "help must list the builtins: {help_text}"
+    );
+    assert_eq!(log.last().unwrap()["params"]["reason"], "completed");
+
+    // An unknown command lists the available ones, still as a system note.
+    client
+        .send(json!({"id": 3, "method": "turn/start", "params": {"threadId": tid, "input": "/frobnicate"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert!(
+        log.iter().find(|m| m["method"] == "system").unwrap()["params"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown command")
+    );
+
+    client.shutdown().await;
+    // Commands record no user turns: the session stayed empty.
+    let messages =
+        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{tid}.jsonl"))).unwrap();
+    assert!(
+        messages.is_empty(),
+        "slash commands must not record user turns: {messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// `/clear` reports via `system`, emits `thread/cleared` so the client resets
+/// its view, and the cleared History persists (the session replays to empty).
+#[tokio::test]
+async fn clear_command_empties_history_and_notifies() {
+    let dirs = test_dirs("slash-clear");
+    let mut client = start_server(
+        factory(vec![vec![text("an answer")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let tid = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A real turn populates history first.
+    client
+        .send(
+            json!({"id": 2, "method": "turn/start", "params": {"threadId": tid, "input": "hello"}}),
+        )
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    client
+        .send(json!({"id": 3, "method": "turn/start", "params": {"threadId": tid, "input": "/clear"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(
+        methods_for_thread(&log, &tid),
+        vec!["turn/started", "system", "thread/cleared", "turn/completed"]
+    );
+    assert_eq!(
+        log.iter().find(|m| m["method"] == "system").unwrap()["params"]["text"],
+        "conversation cleared"
+    );
+
+    client.shutdown().await;
+    let messages =
+        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{tid}.jsonl"))).unwrap();
+    assert!(
+        messages.is_empty(),
+        "after /clear the session must replay to empty: {messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}

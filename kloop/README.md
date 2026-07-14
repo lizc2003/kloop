@@ -280,7 +280,12 @@ interchangeable between the TUI and the server) and its own permission gate,
 so approval session caches never leak across threads.
 
 Notifications stream per thread: `turn/started`, `text/delta`, `note`,
-`tool/started`, `tool/completed`, `turn/completed {reason}`. Approvals are
+`tool/started`, `tool/completed`, `turn/completed {reason}`. A `turn/start`
+whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`) runs
+the command instead of the model: its output comes back as a `system`
+notification (not `text/delta`), `/clear` also emits `thread/cleared` so the
+client resets its transcript, and the turn/started..turn/completed bracket is
+unchanged. Approvals are
 server→client requests in an own `srv-{n}` id namespace; the client answers
 `{"decision": "allow" | "allowSession" | "allowAlways" | "deny"}`, and a
 dropped/never-answered reply denies (interrupt the turn to unblock).
@@ -710,9 +715,12 @@ History); the TUI routes them to its worker (which owns History) so a slow
 `/compact` shows as busy and Ctrl+C interrupts it like a turn. Only cc has
 this feature among the three references (claw has built-in slash but no user
 templates; the codex checkout has neither) — the shape follows cc.
-**Not done** (deferred to their own plan): user-defined `.kloop/commands/*.md`
-prompt templates with `$ARGUMENTS`/`$N` substitution — they plug into this same
-seam (a `custom.rs` sibling); server-mode slash; `!bash`/`@file` injection.
+Server mode runs the same commands: a `turn/start` with a `/`-prefixed input is
+dispatched to the command layer in the thread worker (see the server section
+above). **Not done** (deferred to their own plan): user-defined
+`.kloop/commands/*.md` prompt templates with `$ARGUMENTS`/`$N` substitution —
+they plug into this same seam (a `custom.rs` sibling); `!bash`/`@file`
+injection.
 
 ## Code mode (Phase 2, seventeenth slice)
 

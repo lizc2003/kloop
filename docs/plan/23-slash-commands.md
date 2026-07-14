@@ -39,7 +39,18 @@
 
 **挂账/不做**:用户自定义 `.kloop/commands/*.md` 模板(`$ARGUMENTS`/`$N` 替换,回源见
 下——只有 cc 有、0 索引、frontmatter;kloop 落地时接 `commands/custom.rs` 姊妹 + `run`
-match 前加 lookup)、server-mode slash、`!bash`/`@file` 注入、命名空间/子目录。
+match 前加 lookup)、~~server-mode slash~~(✅ 见下)、`!bash`/`@file` 注入、命名空间/子目录。
+
+### ✅ 追加(2026-07-14,server slash,plan A 会话·提交号 PENDING-23)
+
+server-mode slash 挂账收尾:thread worker 收到 turn 后先判 `commands::is_command`,
+是命令则走 `commands::run`(worker 持 History+cfg+cancel)**而非** run_turn——**不
+record user 消息、不采样**;output 走新 `system` 通知(非 text/delta),`/clear` 额外发
+`thread/cleared` 让 client 清转录,`turn/started..turn/completed` 包裹不变(client 状态机
+统一)。触发点在 worker 而非 turn_start(命令要 History,只在 worker 里)。测试 +2
+(server duplex):`/help`+未知命令成 `system` 通知且无 text/delta、不 record user(会话
+留空);`/clear` 发 `system{conversation cleared}`+`thread/cleared` 且会话回放到空
+(compacted-empty 标记)。plain/TUI 侧 plan 23 本体已做,本片补 server 前端。
 
 ---
 
