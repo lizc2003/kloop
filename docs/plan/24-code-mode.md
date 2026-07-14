@@ -287,7 +287,9 @@ inline/defer/结构化/glob 四侧验收全过。**plan 27 彻底收尾,无 code
 (追加片,见上);只剩"更富的进度树
 (cc `/workflows`)",kloop 现为扁平实时 trace。⑤ ~~后台 program~~ **已完成(2026-07-14,`run_program{background:true}`
 复用 plan 26 异步基建;不做 codex observation frontier——见下节完成记录)**。
-⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ ~~`Limits` 走配置/env~~ **已完成
+⑥ ~~journal resume~~ **已完成(2026-07-14,`resume_from_run_id`
++ per-run agent() journal;见下节完成记录)**;**保存复用归 plan 23**(cc 就是 Write 文件进
+`.claude/workflows/` auto-register 成 slash 命令 = 用户自定义命令族,不在 code-mode)。⑦ ~~`Limits` 走配置/env~~ **已完成
 (2026-07-14,`[codemode]` config + `AGENT_PROGRAM_*` env,见下节)**。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `run_program`
 本身只在 depth-0(同 task);受限 agent 类型不给 run_program。
 
@@ -375,3 +377,23 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 - **真 key**(anthropic sonnet-5,`--plain --yolo`):模型 `run_program{background:true}`(源码 `return await tools.bash({command:"sleep 3 && echo DEEPFIELD99"})`)→ 立即返 `program-1 started` → 父自跑 `echo PARENT_HERE_OK` → `wait` 阻塞 → `program-1 finished` → 回灌 → 终答 **"Program output: DEEPFIELD99 | My own echo output: PARENT_HERE_OK"**。后台派发→continue→wait→回灌→合并全链闭环。
 
 **至此 plan 24 挂账只剩 ⑥ 保存复用 + journal resume**(独立大件,有真实需求再上;plan 24 自评"同步跑 resume 优先级低",现后台化后可议)。
+
+### 追加片:journal resume(挂账⑥,2026-07-14,提交见 HANDOFF)
+
+用户"继续 plan 24"→ 定做 ⑥ 的 journal resume。**回源(一个 Explore 真读 cc workflow-engine journal.ts/hooks.ts/WorkflowTool.ts,file:line)纠正了我的怀疑**:我原以为 journal resume 缺"持久 program 身份/resume 入口",但回源坐实——cc 的 resume 就是**一次 tool call 带 `resumeFromRunId`**(WorkflowTool.ts:116,154,164),持久 id = runId(tool_result 里给模型),journal 落 `<projectRoot>/.claude/workflow-runs/<runId>/journal.jsonl`,**天然套 kloop 一次性 run_program tool_use**;且它**真接通、有测试、默认开**(runWorkflow.test.ts:118-169),**不像 budget 是 null 占位**。`agentCallKey=sha256(prompt+规范化params)`,replay 同 key 同位置返缓存跳过 spawn/budget/semaphore(hooks.ts:73-90),只对 `agent()` 生效。**保存复用(A)** cc 就是 Write 文件进 `.claude/workflows/` auto-register 成 `/<name>`(namedWorkflowCommands.ts)= 用户自定义命令族 → **归 plan 23**。
+
+**kloop 取舍(比 cc 更简、并发更稳)**:
+- **并发正确性**:cc replay 靠 JS 单线程 `journalIndex` 同步递增;kloop `call_agent` 同步部分在 future poll 时执行(顺序不定),故**让 JS prelude 的 `agent()` 分配单调 `__seq` 传给 Rust**(JS 单线程确定)——journal 按 `(seq,key)` 索引,与子 agent future 解析顺序无关。
+- **memoize 语义比 cc 更简**:cc 前缀 replay(首个 divergence 后全作废);kloop **每个 `(seq,key)` 独立 memoize**——key 仍匹配就复用(即使前面某调用变了)。安全,因为 key = 完整 (prompt+params):依赖上游改动的调用其 prompt 会变→key 变→自然 miss;独立 fan-out 则复用更多。
+- **key 不用 sha256**:直接用规范化字符串 `prompt=…\0agent_type=…\0max_rounds=…`(journal 是本地文件,无需短 key/密码学,零依赖)。
+- **落盘**:`.kloop/program-runs/<run_id>/journal.jsonl`(offload_dir 兄弟推导,免 Config 字段);每次 hit/record 覆盖写(seq 排序,崩溃安全);lazy(无 agent() 的 program 不落文件)。
+- run_id 生成 `run-{unix_secs}-{PROGRAM_RUN_SEQ}`(无 rand/Date)。**只在失败时**把 run_id + resume 引导告诉模型(成功不 resume);后台 program 的失败 reinject 同带。
+
+**落地**:
+- `tools/codemode/journal.rs`(新):`Journal{old:HashMap<seq,Entry> load, written:Mutex<Vec> 覆盖写, path}` + `claim(seq,key)→Hit(复制进 written+persist)/Miss` + `record` + `is_active` + `agent_call_key`。
+- `codemode/lib.rs`:`HostBridge::call_agent` 加 `seq:u32`;`__agent` host 加 seq 参;prelude `agent()` 闭包内 `__seq++` 传入。
+- `tools/codemode.rs`:`CoreBridge` 持 `Option<Arc<Journal>>`;`call_agent` seq+key claim/record(hit 不占 agent-cap 槽);`run_program_tool` run_id/journal/`resume_from_run_id`/失败 `resume_hint`;`spawn_background_program`+`classify_program` 带 run_id/journal;`run_program_def` schema+desc 加 resume_from_run_id。
+- **测试**(+8):journal 单元 5(key 稳定/区分、fresh miss、resume hit+divergence miss、同 key 不同 seq 独立、乱序 record seq 排序)、引擎 seq 单调 1、core resume e2e 2(两轮不同 provider turn 证 hit 返缓存非 re-spawn、失败后报 resumable run_id)。
+- **真 key**(anthropic sonnet-5,`--plain --yolo`):run 1 `agent(ZEBRA); throw` → agent-1 派发 journaled → 失败报 `run-…-1`;run 2 `resume_from_run_id` + 去 throw → **无 agent 派发日志**(对比 run 1)→ agent() 从 journal 重放未再派子 agent → `resumed-with:ZEBRA`;journal.jsonl 落 `seq=0,key=prompt=reply…,result=ZEBRA`。**"run 2 无 agent 派发"= resume 跳过已完成 agent() 省 token 的铁证。**
+
+**至此 plan 24 code-mode 全部完成**(引擎 + gate + agent() + pipeline/parallel + UI 观察 + MCP 暴露[plan 27] + 资源治理 caps/Limits 配置化 + 后台 program + journal resume)。**无 plan 24 挂账**;保存复用归 plan 23;token budget/并发 pacing/富进度树记"不做"附依据。

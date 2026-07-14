@@ -47,7 +47,16 @@ pub trait HostBridge: Send + Sync + 'static {
     /// Err(reason) becomes a JS exception.
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>>;
     /// `agent(prompt, opts)` — spawn a sub-agent (reuses core's task seam).
-    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>>;
+    /// `seq` is the call's monotonic index, assigned by the JS `agent()` wrapper
+    /// (JS is single-threaded, so it is deterministic regardless of the order
+    /// sub-agent futures resolve in) — the host uses it to journal/replay the
+    /// call for resume.
+    fn call_agent(
+        &self,
+        seq: u32,
+        prompt: String,
+        opts: Value,
+    ) -> BoxFuture<Result<String, String>>;
     /// `log(msg)` — progress output surfaced to the user and appended to the
     /// program's result. Fire-and-forget, never blocks the program.
     fn log(&self, message: String);
@@ -217,12 +226,17 @@ fn install_host_functions(ctx: &rquickjs::Ctx<'_>, bridge: Arc<dyn HostBridge>) 
     let agent_bridge = bridge.clone();
     let agent = Function::new(
         ctx.clone(),
-        Async(move |prompt: String, opts_json: String| {
+        Async(move |prompt: String, opts_json: String, seq: u32| {
             let bridge = agent_bridge.clone();
             async move {
                 let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
                 // agent() yields text; wrap it in the same value envelope as a tool.
-                envelope(bridge.call_agent(prompt, opts).await.map(Value::String))
+                envelope(
+                    bridge
+                        .call_agent(seq, prompt, opts)
+                        .await
+                        .map(Value::String),
+                )
             }
         }),
     )
@@ -268,11 +282,16 @@ fn build_prelude(tool_names: &[String], max_items: usize) -> String {
                 return r.value;
             }};
         }}
-        globalThis.agent = async (prompt, opts) => {{
-            const r = JSON.parse(await __agent(String(prompt), JSON.stringify(opts ?? {{}})));
-            if (!r.ok) throw new Error(r.error);
-            return r.value;
-        }};
+        globalThis.agent = (() => {{
+            let __seq = 0;
+            return async (prompt, opts) => {{
+                // Assign the call index here, in JS (single-threaded → a
+                // deterministic order), so the host can journal/replay by it.
+                const r = JSON.parse(await __agent(String(prompt), JSON.stringify(opts ?? {{}}), __seq++));
+                if (!r.ok) throw new Error(r.error);
+                return r.value;
+            }};
+        }})();
         globalThis.log = (msg) => __log(typeof msg === 'string' ? msg : JSON.stringify(msg));
         const __MAX_ITEMS = {max_items};
         const __checkItems = (n, who) => {{

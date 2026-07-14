@@ -38,6 +38,11 @@ const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 /// reasoning as the offload/agent counters.
 static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
 
+mod journal;
+use journal::agent_call_key;
+use journal::Claim;
+use journal::Journal;
+
 /// Tools NOT exposed to a program: `run_program` itself (no program-in-program),
 /// `task` (replaced by the `agent()` orchestration primitive), and the
 /// background-dispatch tools `wait`/`stop_agent` (a program orchestrates
@@ -70,18 +75,70 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     let source = super::str_arg(input, "source", "run_program")?.to_string();
     let names = program_tool_names(&ctx.cfg.tool_sources);
     let limits = ctx.cfg.program_limits;
+    // Each run has a run_id and an agent()-call journal. A resume passes the old
+    // run_id back, reusing the journal dir so completed agent() calls are
+    // skipped instead of re-spawned (and re-charged) — plan 24 journal resume.
+    let run_id = input["resume_from_run_id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(new_run_id);
+    let journal = Arc::new(Journal::open(journal_path(&ctx.cfg.offload_dir, &run_id)));
+
     // Fire-and-forget: spawn detached, return a program id now, reinject the
     // return value at the next round boundary (reuses the plan-26 async path).
     if input["background"].as_bool().unwrap_or(false) {
-        return spawn_background_program(ctx, source, names, limits);
+        return spawn_background_program(ctx, source, names, limits, run_id, journal);
     }
-    let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits));
+    let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits, Some(journal.clone())));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
     // progress narration out of the context is the whole point of code-mode.
-    let out =
-        kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await?;
-    Ok(program_output(out))
+    match kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await {
+        Ok(out) => Ok(program_output(out)),
+        Err(e) => Err(resume_hint(e, &journal, &run_id)),
+    }
+}
+
+/// Process-global run counter; combined with a wall-clock second it makes a
+/// run_id unique within a process and (near-certainly) across processes. No
+/// rand/Date dependency.
+static PROGRAM_RUN_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+fn new_run_id() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "run-{secs}-{}",
+        PROGRAM_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// `.kloop/program-runs/<run_id>/journal.jsonl` — a sibling of the offload dir
+/// (so it lives under `.kloop/` without a new Config field). Created lazily on
+/// the first journaled agent() call.
+fn journal_path(offload_dir: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+    offload_dir
+        .parent()
+        .unwrap_or(offload_dir)
+        .join("program-runs")
+        .join(run_id)
+        .join("journal.jsonl")
+}
+
+/// Append resume guidance to a program failure, but only if at least one
+/// agent() call was journaled — otherwise there is nothing to skip on resume.
+fn resume_hint(e: anyhow::Error, journal: &Journal, run_id: &str) -> anyhow::Error {
+    if journal.is_active() {
+        anyhow!(
+            "{e:#}\n[This program journaled its completed agent() calls. To resume without \
+             re-running them, call run_program again with the same source and \
+             resume_from_run_id: \"{run_id}\".]"
+        )
+    } else {
+        e
+    }
 }
 
 fn program_output(out: String) -> String {
@@ -114,6 +171,8 @@ fn spawn_background_program(
     source: String,
     names: Vec<String>,
     limits: kloop_codemode::Limits,
+    run_id: String,
+    journal: Arc<Journal>,
 ) -> Result<String> {
     let label = format!("program-{}", PROGRAM_SEQ.fetch_add(1, Ordering::Relaxed));
     let own_cancel = CancellationToken::new();
@@ -129,7 +188,7 @@ fn spawn_background_program(
     // turn's — the parent may end while the program is still going.
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
-    let bridge = Arc::new(CoreBridge::new(bg_ctx, limits));
+    let bridge = Arc::new(CoreBridge::new(bg_ctx, limits, Some(journal.clone())));
     ui.agent_start(&label, &preview);
     tokio::spawn({
         let label = label.clone();
@@ -138,7 +197,7 @@ fn spawn_background_program(
             let outcome =
                 kloop_codemode::run_program(&source, &names, bridge, own_cancel.clone(), limits)
                     .await;
-            let (status, reinject) = classify_program(outcome, &own_cancel);
+            let (status, reinject) = classify_program(outcome, &own_cancel, &journal, &run_id);
             async_agents.set_status(&label, status);
             match reinject {
                 Some(summary) => parent_inbox.push(InboxItem::ProgramResult {
@@ -167,17 +226,28 @@ fn spawn_background_program(
 fn classify_program(
     outcome: Result<String>,
     own_cancel: &CancellationToken,
+    journal: &Journal,
+    run_id: &str,
 ) -> (AgentStatus, Option<String>) {
     match outcome {
         Ok(out) => (AgentStatus::Completed, Some(program_output(out))),
         Err(_) if own_cancel.is_cancelled() => (AgentStatus::Aborted, None),
-        Err(e) => (
-            AgentStatus::Failed,
-            Some(format!(
-                "[background program failed] {}\nYou may re-run it or try another approach.",
+        Err(e) => {
+            let mut msg = format!(
+                "[background program failed] {}",
                 truncate_program_error(&format!("{e:#}"))
-            )),
-        ),
+            );
+            // Resumable iff it journaled completed agent() calls.
+            if journal.is_active() {
+                msg.push_str(&format!(
+                    "\nTo resume without re-running completed agent() calls, run_program again \
+                     with the same source and resume_from_run_id: \"{run_id}\"."
+                ));
+            } else {
+                msg.push_str("\nYou may re-run it or try another approach.");
+            }
+            (AgentStatus::Failed, Some(msg))
+        }
     }
 }
 
@@ -208,10 +278,13 @@ struct CoreBridge {
     // that precedent. The hard total ceiling is the guard that matters.
     agent_count: AtomicU64,
     max_agents: u64,
+    // agent() call journal for resume (plan 24): a hit returns the cached result
+    // and skips the spawn (and the cap charge). None when resume is off.
+    journal: Option<Arc<Journal>>,
 }
 
 impl CoreBridge {
-    fn new(ctx: ToolCtx, limits: kloop_codemode::Limits) -> Self {
+    fn new(ctx: ToolCtx, limits: kloop_codemode::Limits, journal: Option<Arc<Journal>>) -> Self {
         // Calls a program fires are "from a program": they skip the deferred-tool
         // lock gate, since the tool is already exposed on the program's `tools`
         // object. All other gates (deny, permission, sandbox, hooks) still apply.
@@ -225,6 +298,7 @@ impl CoreBridge {
             gate: Arc::new(tokio::sync::RwLock::new(())),
             agent_count: AtomicU64::new(0),
             max_agents: limits.max_agents,
+            journal,
         }
     }
 }
@@ -267,13 +341,32 @@ impl HostBridge for CoreBridge {
         })
     }
 
-    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
+    fn call_agent(
+        &self,
+        seq: u32,
+        prompt: String,
+        opts: Value,
+    ) -> BoxFuture<Result<String, String>> {
         let ctx = self.ctx.clone();
-        // Claim a slot synchronously so concurrent calls get distinct counts;
-        // the (max_agents+1)th is refused before it can spawn.
-        let n = self.agent_count.fetch_add(1, Ordering::Relaxed);
+        // Journal replay is a synchronous, deterministic decision (seq comes
+        // from JS): a hit reuses a prior run's result and skips the spawn — and
+        // the cap charge, since a replayed call already ran last time.
+        let key = agent_call_key(&prompt, &opts);
+        let journal = self.journal.clone();
+        let claim = journal.as_ref().map(|j| j.claim(seq, &key));
+        let hit = matches!(claim, Some(Claim::Hit(_)));
+        // Only a live (missed) call claims a cap slot; concurrent misses get
+        // distinct counts from the sync fetch_add.
+        let n = if hit {
+            0
+        } else {
+            self.agent_count.fetch_add(1, Ordering::Relaxed)
+        };
         let max = self.max_agents;
         Box::pin(async move {
+            if let Some(Claim::Hit(cached)) = claim {
+                return Ok(cached);
+            }
             if n >= max {
                 return Err(format!(
                     "program exceeds the agent cap ({max} agent() calls); it likely fans out \
@@ -281,14 +374,19 @@ impl HostBridge for CoreBridge {
                 ));
             }
             let mut task_input = json!({ "prompt": prompt });
-            for key in ["agent_type", "max_rounds"] {
-                if let Some(v) = opts.get(key) {
-                    task_input[key] = v.clone();
+            for k in ["agent_type", "max_rounds"] {
+                if let Some(v) = opts.get(k) {
+                    task_input[k] = v.clone();
                 }
             }
-            super::task::task_tool(&task_input, &ctx)
+            let result = super::task::task_tool(&task_input, &ctx)
                 .await
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|e| format!("{e:#}"));
+            // Record only a successful live call so a resume can skip it.
+            if let (Ok(out), Some(j)) = (&result, &journal) {
+                j.record(seq, key, out.clone());
+            }
+            result
         })
     }
 
@@ -371,6 +469,10 @@ immediately and its return value is delivered to you as a message when it \
 finishes (block for it with the `wait` tool, or cancel it with `stop_agent`). \
 Use this for long fan-outs/migrations so they don't hold up the turn; omit it \
 for a normal synchronous run.\n\n\
+If a program fails partway through a long agent() fan-out, it reports a \
+run_id; call run_program again with the SAME source and `resume_from_run_id` \
+set to it to skip the agent() calls that already completed (their results are \
+replayed from a journal) and only re-run the rest.\n\n\
 Available API (TypeScript):\n```ts\n{decls}```"
     );
 
@@ -398,7 +500,8 @@ the program:\n",
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "The JavaScript program to run"},
-                "background": {"type": "boolean", "description": "Run detached: returns a program id immediately and delivers the return value as a message when it finishes (block with wait, cancel with stop_agent). Omit for a synchronous run."}
+                "background": {"type": "boolean", "description": "Run detached: returns a program id immediately and delivers the return value as a message when it finishes (block with wait, cancel with stop_agent). Omit for a synchronous run."},
+                "resume_from_run_id": {"type": "string", "description": "Resume a failed run: pass the run_id it reported (with the same source) to skip agent() calls that already completed."}
             },
             "required": ["source"]
         }),

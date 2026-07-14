@@ -47,8 +47,13 @@ impl HostBridge for TestBridge {
         })
     }
 
-    fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
-        Box::pin(async move { Ok(format!("agent[{opts}]: {prompt}")) })
+    fn call_agent(
+        &self,
+        seq: u32,
+        prompt: String,
+        opts: Value,
+    ) -> BoxFuture<Result<String, String>> {
+        Box::pin(async move { Ok(format!("agent#{seq}[{opts}]: {prompt}")) })
     }
 
     fn log(&self, message: String) {
@@ -272,7 +277,21 @@ async fn agent_bridges_through_host() {
     )
     .await
     .unwrap();
-    assert_eq!(out, r#"agent[{"agent_type":"researcher"}]: find X"#);
+    assert_eq!(out, r#"agent#0[{"agent_type":"researcher"}]: find X"#);
+}
+
+/// The JS `agent()` wrapper assigns a monotonic seq per call (single-threaded,
+/// so deterministic) and passes it to the host — the host journals/replays by
+/// it. Two calls get 0 then 1, regardless of resolution order.
+#[tokio::test]
+async fn agent_calls_carry_a_monotonic_seq() {
+    let out = run(
+        r#"const a = await agent("one", {}); const b = await agent("two", {}); return a + "|" + b;"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "agent#0[{}]: one|agent#1[{}]: two");
 }
 
 #[tokio::test]

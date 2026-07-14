@@ -245,6 +245,65 @@ async fn stopped_background_program_does_not_reinject() {
     );
 }
 
+/// Journal resume: a completed agent() call is replayed from the journal on a
+/// resume run instead of being re-spawned. Two different provider turns — a
+/// re-spawn would return the second; a journal hit returns the first (cached).
+#[tokio::test]
+async fn resume_replays_completed_agent_calls_from_the_journal() {
+    let run_id = format!("ktr-{}", std::process::id());
+    let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&jdir);
+
+    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let provider = kloop_provider::Provider::mock(vec![text("FIRST"), text("SECOND")]);
+    let ctx = with_provider(test_ctx(0, "resume"), provider);
+    let src = r#"return await agent("do the work");"#;
+    let args = json!({ "source": src, "resume_from_run_id": run_id });
+
+    // Run 1: spawns the sub-agent, samples "FIRST", journals it.
+    let (out1, e1) = run_tool("run_program", args.clone(), &ctx).await;
+    assert!(!e1, "{out1}");
+    assert_eq!(out1, "FIRST");
+
+    // Run 2 (same run_id + source): the agent() call hits the journal — no
+    // re-spawn, so the second provider turn is never consumed.
+    let (out2, e2) = run_tool("run_program", args, &ctx).await;
+    assert!(!e2, "{out2}");
+    assert_eq!(
+        out2, "FIRST",
+        "resume replays the cached result, not a re-spawn"
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+}
+
+/// A program that fails after completing an agent() call reports its run_id and
+/// how to resume — so the model can skip the completed work on retry.
+#[tokio::test]
+async fn failure_after_agent_reports_a_resumable_run_id() {
+    let run_id = format!("ktrf-{}", std::process::id());
+    let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&jdir);
+
+    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let provider = kloop_provider::Provider::mock(vec![text("STEP_ONE_DONE")]);
+    let ctx = with_provider(test_ctx(0, "resumefail"), provider);
+    let src = r#"await agent("step one"); throw new Error("boom after step one");"#;
+
+    let (out, is_error) = run_tool(
+        "run_program",
+        json!({ "source": src, "resume_from_run_id": run_id }),
+        &ctx,
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("boom after step one"), "{out}");
+    assert!(
+        out.contains(&run_id) && out.contains("resume_from_run_id"),
+        "reports how to resume: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+}
+
 /// Intermediate tool results live in program variables; only the return value
 /// comes back. Two full file reads happen, but their content never appears in
 /// the tool_result — exactly the context-window saving code-mode exists for.

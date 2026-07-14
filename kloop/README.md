@@ -812,12 +812,29 @@ the model between `yield`s) — that is pull-based observation coupled to V8's
 synchronous-pause model, whereas kloop is push-based (result reinjected on
 completion) and `log()` already streams progress to the user live.
 
+**Journal resume**: a long program that fails partway through an `agent()`
+fan-out doesn't have to re-burn the sub-agents that already finished. Every run
+has a `run_id` and journals each completed `agent()` call (keyed by its
+JS-assigned sequence number + a canonical string of its prompt+params) to
+`.kloop/program-runs/<run_id>/journal.jsonl`. On failure the run_id is reported;
+calling `run_program` again with the same source and `resume_from_run_id` set
+replays each matching `(seq, key)` from the journal — returning the cached
+result and skipping the spawn (and the agent-cap charge) — so only the calls
+that hadn't finished re-run. Only `agent()` is journaled (it is the expensive
+call). The JS-assigned seq makes replay independent of the order sub-agent
+futures resolve in; unlike cc's prefix-replay this memoizes each `(seq, key)`
+independently, which is safe because a call whose inputs changed has a changed
+prompt (so its key changes and it re-runs). A one-shot `run_program` tool_use
+maps cleanly onto this — exactly cc's `resumeFromRunId` shape.
+
 **Not done** (deferred, with reason): a token `budget` primitive — cc's
 `budget.total` ships as a hardcoded `null` placeholder (its hard cap never
 fires), and kloop has no turn-level budget source, so a budget object would be a
 no-op until there's a real source to feed it; a richer progress view (cc's
-`/workflows` tree — kloop shows a flat live trace); saving a program for reuse
-with journal-based resume. See `docs/plan/24-code-mode.md` and
+`/workflows` tree — kloop shows a flat live trace); saving a program as a named,
+reusable command (cc does this by writing a file into `.claude/workflows/` — for
+kloop that's the same seam as user-defined slash commands, which is plan 23's
+deferred piece, not a code-mode one). See `docs/plan/24-code-mode.md` and
 `docs/plan/27-codemode-mcp-tools.md`.
 
 ## Async sub-agents (Phase 2, eighteenth slice)
