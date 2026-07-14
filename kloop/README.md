@@ -713,11 +713,15 @@ with intermediate results off the context window.
 
 An MCP tool resolves to its structured `CallToolResult` object
 (`Promise<CallToolResult>` — `.content[]`, `.structuredContent`), not flat text,
-so a program reads typed fields without parsing (built-ins stay
-`Promise<string>`). The structured value rides a per-call sink on `ToolCtx`:
-`execute_tool` drops it there on a source hit and the bridge returns it to the
-program, while the model-facing tool_result still gets the flattened text. An
-`isError` result throws (the program `try/catch`es it), same as a built-in.
+so a program reads typed fields without parsing. Built-ins stay `Promise<string>`
+— except `glob`, whose result is naturally a list, so a program gets a
+`string[]` of paths. Both ride a per-call sink on `ToolCtx`: `execute_tool` drops
+the structured value there and the bridge returns it to the program, while the
+model-facing tool_result still gets the flattened text. An `isError` MCP result
+throws (the program `try/catch`es it), same as a built-in. (This follows
+codex, whose built-ins are strings by default and objects only where the data
+is inherently structured; `grep` stays a string — its shape is output-mode
+dependent, so a program splits its lines per mode.)
 
 **The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
 the exact same gated dispatch a direct call takes** — `run_one` (allowlist →

@@ -472,3 +472,45 @@ fn run_program_def_types_source_tools_as_calltoolresult() {
         "{d}"
     );
 }
+
+/// `glob` is the one built-in whose result is naturally a list: a program gets a
+/// `string[]` of paths (not the newline-joined text the model sees), and the
+/// declaration says so.
+#[tokio::test]
+async fn program_receives_glob_paths_as_an_array() {
+    let dir = tmp("glob-array");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    std::fs::write(dir.join("b.txt"), "y").unwrap();
+    let ctx = test_ctx(0, "glob-array");
+    let (out, is_error) = run(
+        &format!(
+            r#"const files = await tools.glob({{ pattern: "*.txt", path: {dir:?} }});
+               return JSON.stringify({{ isArray: Array.isArray(files), count: files.length }});"#,
+        ),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, r#"{"isArray":true,"count":2}"#);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_program_def_declares_glob_as_string_array() {
+    let def = run_program_def(
+        &[ToolDef {
+            name: "glob".into(),
+            description: "Find files".into(),
+            schema: json!({"type": "object"}),
+        }],
+        &[],
+        &[],
+    );
+    assert!(
+        def.description
+            .contains("glob(args: Record<string, unknown>): Promise<string[]>;"),
+        "{}",
+        def.description
+    );
+}

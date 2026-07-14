@@ -225,6 +225,26 @@ CallToolResult 只在成功时到手、不带 isError:true(TS 类型省略 isErr
 → `{"vowels":3,"length":10,"firstText":"elderberry: 3 vowels"}`,**直接读结构化字段、免解析**,全链
 (wire structuredContent → SourceOutput → 旁路 → Value → JS 对象)跑通。
 
+### 内置 glob 结构化(切片 3 尾附,同提交)
+
+用户追问"codex 内置工具返回啥"→回源(教训 11,纠正我一句凭印象的话):codex 内置**不统一**,
+由每个工具的 `ToolOutput::code_mode_result()` 定(`tools/src/tool_output.rs`)——**默认(产文本的
+exec/shell 等)= 字符串**(`response_input_to_code_mode_result`:`Text→JsonValue::String`),只有**数据
+天生结构化**的工具才 override 回对象(`current_time→{current_time}`、`update_plan→{}`、`view_image→图片
+对象`、多 agent 系列、`tool_search→数组`);MCP→完整 CallToolResult。所以 kloop 内置回 string 与 codex
+默认一致,不需全面改。
+
+据此只补一个内置:**glob → `string[]`**(找文件的工具返回文件列表、天生是数组,对得上 codex
+`tool_search→数组` 的哲学)。实现:`run_glob` 返 `(text, Vec<String>)`;`glob_tool(input, sink)` 命中程序
+旁路时投 `Value::Array`;`ToolCtx.program_result` 提为 `pub type ProgramResultSink`;`run_program_def` 加
+`builtin_output_type(name)` 按名覆盖(glob→`string[]`,其余`string`),使 TS 声明与运行期一致(否则模型对
+数组写 `.split()` 会崩)。真 key 已过(program `Array.isArray(files)`/`.length`/`[0]`)。
+
+**grep 有意不做**:3 个 output_mode 会让返回类型随入参变(`string[]`/`{path,line,text}[]`/count),TS 只能
+写丑联合、模型还得 narrow,比"回 string、program 按模式 split"更糟。**tool_search 无关**:kloop 里 program
+调不到它(不在 program 面,plan 27 决定 5),codex 那条 `tool_search→数组` 是因它让 program 能 tool_search,
+kloop 走 description 清单发现的另一条路。
+
 ### 挂账(切片 3 后)
 
 - 无 code-mode-MCP 侧挂账。code-mode 其余挂账见 plan 24(budget / 后台 yield-wait / 保存复用),不在本 plan。

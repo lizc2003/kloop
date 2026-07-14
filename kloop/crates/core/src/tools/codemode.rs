@@ -191,9 +191,10 @@ pub(super) fn run_program_def(
     for def in builtins.iter().filter(|d| is_program_callable(&d.name)) {
         decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
         decls.push_str(&format!(
-            "  {}(args: {}): Promise<string>;\n",
+            "  {}(args: {}): Promise<{}>;\n",
             def.name,
-            ts_type(&def.schema)
+            ts_type(&def.schema),
+            builtin_output_type(&def.name)
         ));
     }
     for def in sources {
@@ -262,6 +263,17 @@ the program:\n",
 
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A built-in's TypeScript return type in a program. Almost all resolve to their
+/// text as a string; `glob` hands back its path list as an array (the one
+/// built-in whose result is naturally a list — it stashes a `string[]` into the
+/// program-result sink, so the declaration must match).
+fn builtin_output_type(name: &str) -> &'static str {
+    match name {
+        "glob" => "string[]",
+        _ => "string",
+    }
 }
 
 /// Minimal JSON-Schema → TypeScript type. Covers the shapes the built-in tool

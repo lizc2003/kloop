@@ -81,6 +81,12 @@ pub trait ToolSource: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>>;
 }
 
+/// Per-call sink a code-mode program call carries: a tool drops a structured
+/// value here (an MCP `CallToolResult`, or a built-in's natural array like
+/// glob's path list) so the program receives it instead of the flattened text
+/// `run_one` returns. One slot per call, so concurrent program calls never race.
+pub type ProgramResultSink = Arc<std::sync::Mutex<Option<Value>>>;
+
 /// Everything a tool execution needs; cheap to clone into spawned futures.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -99,12 +105,11 @@ pub struct ToolCtx {
     /// sandbox, hooks) still applies — this is a discovery bypass, not a
     /// security one.
     pub from_program: bool,
-    /// Per-call sink the code-mode bridge sets so a source tool's structured
-    /// result (its `CallToolResult`) reaches the program instead of the
-    /// flattened text `run_one` returns. `execute_tool` fills it on a source
-    /// hit; the bridge reads it after `run_one`. One slot per call (each bridge
-    /// call clones the ctx), so concurrent program calls never collide.
-    pub program_result: Option<Arc<std::sync::Mutex<Option<Value>>>>,
+    /// Per-call sink the code-mode bridge sets so a tool's structured result
+    /// (an MCP `CallToolResult`, or a built-in's natural array) reaches the
+    /// program instead of the flattened text `run_one` returns. `execute_tool`
+    /// fills it on the relevant tools; the bridge reads it after `run_one`.
+    pub program_result: Option<ProgramResultSink>,
 }
 
 /// Built-ins plus external sources, in registration order. A name collision
@@ -597,7 +602,9 @@ fn execute_tool<'a>(
             "write_file" => fs::write_file_tool(input).await,
             "edit_file" => fs::edit_file_tool(input).await,
             "grep" => search::grep_tool(input).await,
-            "glob" => search::glob_tool(input).await,
+            // glob hands a program its path list as a string[] (built-ins are
+            // otherwise strings); the model-facing text is unchanged.
+            "glob" => search::glob_tool(input, ctx.program_result.as_ref()).await,
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
             "tool_search" => discover::tool_search_tool(input, ctx).await,

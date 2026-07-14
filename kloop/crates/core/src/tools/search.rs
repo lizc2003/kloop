@@ -100,12 +100,20 @@ pub async fn grep_tool(input: &Value) -> Result<String> {
         .map_err(|e| anyhow!("grep: worker panicked: {e}"))?
 }
 
-pub async fn glob_tool(input: &Value) -> Result<String> {
+pub async fn glob_tool(
+    input: &Value,
+    program_result: Option<&crate::tools::ProgramResultSink>,
+) -> Result<String> {
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
     let root = PathBuf::from(input["path"].as_str().unwrap_or("."));
-    tokio::task::spawn_blocking(move || run_glob(&pattern, &root))
+    let (text, paths) = tokio::task::spawn_blocking(move || run_glob(&pattern, &root))
         .await
-        .map_err(|e| anyhow!("glob: worker panicked: {e}"))?
+        .map_err(|e| anyhow!("glob: worker panicked: {e}"))??;
+    // A program gets the path list as an array; the model gets the text.
+    if let Some(slot) = program_result {
+        *slot.lock().unwrap() = Some(Value::Array(paths.into_iter().map(Value::String).collect()));
+    }
+    Ok(text)
 }
 
 fn run_grep(args: &GrepArgs) -> Result<String> {
@@ -236,7 +244,10 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
     Ok(out)
 }
 
-fn run_glob(pattern: &str, root: &Path) -> Result<String> {
+/// Returns the model-facing text and the capped list of matched paths (the
+/// array a code-mode program receives). The two share the same paths — the text
+/// is just those paths joined, with truncation/timeout notices appended.
+fn run_glob(pattern: &str, root: &Path) -> Result<(String, Vec<String>)> {
     if !root.is_dir() {
         bail!("glob: not a directory: {}", root.display());
     }
@@ -256,15 +267,11 @@ fn run_glob(pattern: &str, root: &Path) -> Result<String> {
     // Newest first: the cap must keep the most recently touched files.
     files.sort_by_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
     let total = files.len();
-    let mut out = if total == 0 {
+    let paths: Vec<String> = files.into_iter().take(GLOB_LIMIT).map(|(_, d)| d).collect();
+    let mut out = if paths.is_empty() {
         "No files found".to_string()
     } else {
-        files
-            .into_iter()
-            .take(GLOB_LIMIT)
-            .map(|(_, d)| d)
-            .collect::<Vec<_>>()
-            .join("\n")
+        paths.join("\n")
     };
     if total > GLOB_LIMIT {
         out.push_str("\n(Results are truncated. Consider using a more specific path or pattern.)");
@@ -274,7 +281,7 @@ fn run_glob(pattern: &str, root: &Path) -> Result<String> {
             "\n[search stopped after 20s; results are partial — narrow the path or pattern]",
         );
     }
-    Ok(out)
+    Ok((out, paths))
 }
 
 fn build_matcher(args: &GrepArgs) -> Result<RegexMatcher> {
@@ -511,7 +518,7 @@ mod tests {
     }
 
     async fn glob(input: Value) -> Result<String> {
-        glob_tool(&input).await
+        glob_tool(&input, None).await
     }
 
     /// Strip the tree root prefix so assertions read relative.
