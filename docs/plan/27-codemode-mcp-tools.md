@@ -245,6 +245,30 @@ exec/shell 等)= 字符串**(`response_input_to_code_mode_result`:`Text→JsonVa
 调不到它(不在 program 面,plan 27 决定 5),codex 那条 `tool_search→数组` 是因它让 program 能 tool_search,
 kloop 走 description 清单发现的另一条路。
 
+### 结构化返回:模型未提示识别验证(教训 18,已过)
+
+前面的真 key 验收都**点名告诉了模型**"返回结构化 / 返回数组",验的是**能力**(给意图会用对);
+用户追问"大模型能自己认出这些结构化返回吗"——这是教训 18 的分野(能力 ≠ 采用),得**不提示返回
+形态**、光靠 `run_program` description 里的 TS 声明(`Promise<CallToolResult>` / `Promise<string[]>`)
+看模型认不认。信号干净:数组当字符串 `.split` 会 TypeError 崩、对象当字符串也崩。三例(anthropic/
+sonnet-5,均过):
+
+- **glob → `string[]`**(中性 prompt "docs/plan 下有几个 .md、最新的是哪个"):模型写
+  `const files = await tools.glob(...); return { count: files.length, ... }`——**当数组用**
+  (`files.length` + `files[0]`),答 "29 / HANDOFF.md" 正确。若当字符串 `files.length` 会是字符数、
+  `.split` 会崩。
+- **MCP CallToolResult 单次**(中性 prompt,问只在 `structuredContent` 里的 `length`):模型
+  `const r = await tools.stub__analyze(...); return r;`——**返回整个对象**,下一轮读出 `length=10`
+  (只在结构化里),证明认得是对象、没当字符串;但没在程序内抽字段。
+- **MCP 扇出(决定性)**:把 stub 的**文本抽成 `"analyzed <word>"`(无数字)**,元音数只在
+  `structuredContent`;模型扇出 5 词、比较、答 "banana 3 个元音" 正确——**文本无数字,必然是在程序
+  循环里读了 `r.structuredContent.vowels`** 才比得出来。
+
+结论:sonnet-5 **能光凭 TS 声明正确认出并使用结构化返回**,无需提示。**一个诚实的 nuance**:单次
+调用时它倾向**回传整个对象**(小对象无所谓,大结果会浪费 code-mode 省上下文的意义,本可
+`return r.structuredContent`);到扇出/回传一堆对象不划算时,才自觉在程序内抽字段——**上下文自适应**,
+非机制 bug。这把 plan 24 收敛点"类型化声明显著提升模型正确率"**从入参类型延伸证到了返回类型**。
+
 ### 挂账(切片 3 后)
 
 - 无 code-mode-MCP 侧挂账。code-mode 其余挂账见 plan 24(budget / 后台 yield-wait / 保存复用),不在本 plan。
