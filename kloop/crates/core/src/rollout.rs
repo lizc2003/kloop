@@ -837,6 +837,7 @@ mod tests {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
+                async_agents: Default::default(),
             })
         };
         let path = temp_file("restart");

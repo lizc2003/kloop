@@ -607,10 +607,9 @@ Type a message while a turn is running and it **steers** instead of being
 dropped: it queues, and is delivered to the model as a user message at the
 next round boundary — never spliced into an in-flight request. It does not
 interrupt the current tools (Ctrl+C stays the hard stop). This is a general
-**step-boundary injection queue** (`Config.inbox`, a `Vec<String>` behind a
-mutex); the current consumer is user steering, and sub-agent completion
-delivery (the mailbox path) plugs into the same queue once async dispatch
-exists.
+**step-boundary injection queue** (`Config.inbox`, a signalling `Inbox` of
+typed `InboxItem`s); its two consumers are user steering and background
+sub-agent results (see *Async sub-agents* below), each with its own framing.
 
 The mechanism is a straight drain of `Config.inbox` at round boundaries in the
 agent loop (`core/src/agent.rs`): at the **top of each round** (delivering
@@ -749,6 +748,47 @@ emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 (cc's `/workflows` tree — kloop shows a flat live trace); background programs
 with `yield`/`wait`; saving a program for reuse with journal-based resume. See
 `docs/plan/24-code-mode.md` and `docs/plan/27-codemode-mcp-tools.md`.
+
+## Async sub-agents (Phase 2, eighteenth slice)
+
+`task` takes `background: true`: instead of blocking and returning the
+sub-agent's final text, it **fires and forgets** — returns an `agent-N` id
+immediately and the sub-agent's result is delivered to the parent as a message
+when it finishes. So the parent can dispatch a long subtask, keep working, and
+collect the result later. Two companion tools manage the in-flight agents:
+
+- `wait` — block until a background sub-agent finishes (or new input arrives, or
+  a timeout: default 30s, 10s–1h). It returns a short status line; the finished
+  agent's result arrives separately at the next round boundary. Like codex's
+  `wait`, it **signals but does not carry** — it never drains the queue itself.
+- `stop_agent` — cancel a runaway background sub-agent by id.
+
+Mechanism: the detached sub-agent (its own tokio task, on its **own** cancel
+token so a finished parent turn never kills it) reinjects its result into the
+parent's `Config.inbox` — the same step-boundary queue as steering — as a framed
+`InboxItem::SubAgentResult`, drained into history at the next round boundary
+(the drain side was already built for steering; this is the queue's second
+consumer). A **success passes through verbatim**; a failure is truncated (~900
+tokens, codex's cap) with re-dispatch guidance; an **interrupted sub-agent
+reinjects nothing** (codex's `is_final` — its partial output is noise, and cc
+diverges here by delivering a `killed` partial). A separate `AsyncAgents`
+registry (`core/src/tools/async_agents.rs`) tracks the in-flight agents,
+enforces a concurrency cap (8), and reaps on session end — kept **separate** from
+the background-shell registry, because codex keeps its shell tasks and
+sub-agents in distinct mechanisms and cc only unifies the *state* model, not
+spawn (a shared `Tasks` abstraction would be pre-abstracting against that).
+
+**Autowake** closes the loop when the parent turn has already ended: in the TUI,
+a background sub-agent finishing while the agent sits idle starts a delivery turn
+automatically (the idle UI loop notices the non-empty inbox and dispatches a
+`Wake` — a turn with no new user text that just drains and responds), so the
+result reaches the model without the user having to type. A *running* turn drains
+at its own round boundary, so autowake only fires when idle (codex's guard:
+idle + pending work). The plain REPL (blocking stdin, no event loop) and the
+server (client-driven turns) don't autowake — their reinjection is delivered at
+the next user / `turn/start`; only the TUI has the event loop to be woken.
+Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
+See `docs/plan/26-async-dispatch.md`.
 
 ## Running
 

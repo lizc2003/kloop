@@ -556,6 +556,10 @@ impl CallFacts {
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
+            // wait only blocks; stop_agent only signals a sub-agent this agent
+            // itself spawned — neither touches anything the sub-agent's own
+            // calls weren't already gated on (same reasoning as kill_bash).
+            "wait" | "stop_agent" => true,
             // run_program (code-mode) itself touches nothing; every tools.<name>()
             // and agent() call the program makes re-enters this same gate.
             "run_program" => true,

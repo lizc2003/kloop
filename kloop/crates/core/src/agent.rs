@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::compact;
 use crate::config::Config;
 use crate::history::History;
+use crate::inbox::Inbox;
 use crate::tools::all_tool_defs;
 use crate::tools::dispatch_tools;
 use crate::tools::ToolCtx;
@@ -400,27 +401,19 @@ const TRUNCATION_RECOVERY_LIMIT: u32 = 3;
 const TRUNCATION_CONTINUE_MSG: &str = "Your previous response was cut off by the output token \
 limit. Continue exactly where you left off; break the remaining work into smaller pieces.";
 
-/// Framing for a steering message (typed while the turn was running). Recorded
-/// as a user message at the next round boundary so the model treats it as a
-/// mid-work interjection to fold in, not a brand-new task. cc frames steers the
-/// same way ("The user sent a new message while you were working…"); codex
-/// records them as plain user prompts — framing is the cheap side that helps
-/// weaker models, so kloop adopts it.
-const STEERING_PREFIX: &str = "The user sent this message while you were working. Address it \
-as part of the current task — finish any step already in progress, then act on it:";
-
-/// Drain the step-boundary injection queue into history as user messages,
-/// framed as steering. Returns true if anything was injected. Called only at
+/// Drain the step-boundary injection queue into history as user messages, each
+/// framed by its own kind ([`InboxItem::into_message`]: steering vs a background
+/// sub-agent's result). Returns true if anything was injected. Called only at
 /// round boundaries (top of the loop, and just before the turn would end) —
 /// never mid-request, so an in-flight sampling never sees a partial write and
 /// tool_result blocks are never interleaved with the injected user message.
-fn drain_inbox(inbox: &std::sync::Mutex<Vec<String>>, history: &mut History) -> bool {
-    let pending: Vec<String> = std::mem::take(&mut *inbox.lock().unwrap());
+fn drain_inbox(inbox: &Inbox, history: &mut History) -> bool {
+    let pending = inbox.drain();
     if pending.is_empty() {
         return false;
     }
-    for text in pending {
-        history.record(Message::user_text(format!("{STEERING_PREFIX}\n{text}")));
+    for item in pending {
+        history.record(Message::user_text(item.into_message()));
     }
     true
 }
@@ -540,6 +533,8 @@ async fn sample_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inbox::InboxItem;
+    use crate::inbox::STEERING_PREFIX;
     use kloop_protocol::Role;
     use kloop_provider::Provider;
     use serde_json::json;
@@ -596,6 +591,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
+            async_agents: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -688,6 +684,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
+            async_agents: Default::default(),
         })
     }
 
@@ -1562,7 +1559,7 @@ mod tests {
         // Pushes one steer the first time any tool starts — i.e. during round
         // 0's dispatch, after round 0's request already went out.
         struct SteerOnToolUi {
-            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            inbox: Arc<Inbox>,
             fired: AtomicBool,
         }
         impl Ui for SteerOnToolUi {
@@ -1571,9 +1568,7 @@ mod tests {
             fn tool_start(&self, _: &str, _: &str, _: &str, _: &str) {
                 if !self.fired.swap(true, Ordering::SeqCst) {
                     self.inbox
-                        .lock()
-                        .unwrap()
-                        .push("also check the logs".into());
+                        .push(InboxItem::Steer("also check the logs".into()));
                 }
             }
         }
@@ -1623,13 +1618,13 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         struct SteerOnTextUi {
-            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            inbox: Arc<Inbox>,
             fired: AtomicBool,
         }
         impl Ui for SteerOnTextUi {
             fn text_delta(&self, _: &str) {
                 if !self.fired.swap(true, Ordering::SeqCst) {
-                    self.inbox.lock().unwrap().push("wait, also do Y".into());
+                    self.inbox.push(InboxItem::Steer("wait, also do Y".into()));
                 }
             }
             fn note(&self, _: &str) {}
@@ -1657,10 +1652,7 @@ mod tests {
         );
         let steer = Message::user_text(format!("{STEERING_PREFIX}\nwait, also do Y"));
         assert!(history.messages().contains(&steer));
-        assert!(
-            cfg.inbox.lock().unwrap().is_empty(),
-            "the queue was drained"
-        );
+        assert!(cfg.inbox.is_empty(), "the queue was drained");
     }
 
     /// A running sub-agent must not drain the PARENT's steering queue: each
@@ -1677,7 +1669,7 @@ mod tests {
         // Pushes a parent steer the first time a SUB-agent (agent != "") starts
         // a tool — i.e. while the sub-agent is mid-turn.
         struct SteerParentUi {
-            inbox: Arc<std::sync::Mutex<Vec<String>>>,
+            inbox: Arc<Inbox>,
             fired: AtomicBool,
         }
         impl Ui for SteerParentUi {
@@ -1685,7 +1677,7 @@ mod tests {
             fn note(&self, _: &str) {}
             fn tool_start(&self, agent: &str, _: &str, _: &str, _: &str) {
                 if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
-                    self.inbox.lock().unwrap().push("parent steer".into());
+                    self.inbox.push(InboxItem::Steer("parent steer".into()));
                 }
             }
         }

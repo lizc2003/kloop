@@ -24,10 +24,13 @@ use kloop_codemode::HostBridge;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 
-/// Tools NOT exposed to a program: `run_program` itself (no program-in-program)
-/// and `task` (replaced by the `agent()` orchestration primitive).
+/// Tools NOT exposed to a program: `run_program` itself (no program-in-program),
+/// `task` (replaced by the `agent()` orchestration primitive), and the
+/// background-dispatch tools `wait`/`stop_agent` (a program orchestrates
+/// synchronously via `agent()`/`parallel()`; fire-and-forget is a model-loop
+/// concept with no meaning inside one program run).
 fn is_program_callable(name: &str) -> bool {
-    !matches!(name, "run_program" | "task")
+    !matches!(name, "run_program" | "task" | "wait" | "stop_agent")
 }
 
 /// The tool names a program may call: the depth-0 built-ins plus every external

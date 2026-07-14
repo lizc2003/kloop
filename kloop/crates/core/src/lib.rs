@@ -18,6 +18,7 @@ pub mod context;
 pub mod diff;
 pub mod history;
 pub mod hooks;
+pub mod inbox;
 pub mod permissions;
 pub mod rollout;
 pub mod sandbox;

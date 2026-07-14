@@ -17,7 +17,7 @@ pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
     // Process-state that lives outside History resets too, matching what a
     // brand-new session would look like (both start empty on resume).
     cfg.todos.lock().unwrap().clear();
-    cfg.inbox.lock().unwrap().clear();
+    cfg.inbox.drain();
     SlashResult {
         output: "conversation cleared".into(),
         cleared: true,

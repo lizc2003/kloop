@@ -26,6 +26,8 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
+use kloop_core::inbox::Inbox;
+use kloop_core::inbox::InboxItem;
 use kloop_core::permissions::Approver;
 use kloop_core::Config;
 use kloop_protocol::Message;
@@ -52,6 +54,14 @@ enum WorkerMsg {
     Turn(Turn),
     Command {
         line: String,
+        cancel: CancellationToken,
+    },
+    /// Autowake (plan 26): a background sub-agent finished while the agent was
+    /// idle. Run a turn with NO new user text — `run_turn` drains the reinjected
+    /// result at its round-0 boundary and responds — so the result reaches the
+    /// model without the user having to type. The worker no-ops if the inbox
+    /// was already drained by a race.
+    Wake {
         cancel: CancellationToken,
     },
 }
@@ -123,6 +133,24 @@ async fn agent_worker(
                     return;
                 }
             }
+            WorkerMsg::Wake { cancel } => {
+                // Raced: a still-running turn already drained the reinjection,
+                // or stop_agent left nothing. Nothing to sample — just clear the
+                // busy state the UI loop set when it dispatched the wake.
+                if cfg.inbox.is_empty() {
+                    if events
+                        .send(AgentEvent::TurnEnded(EndReason::Completed))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+                if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                    return;
+                }
+            }
             WorkerMsg::Command { line, cancel } => {
                 let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
                 // Clear first (drops the old cells), then show the result on
@@ -170,11 +198,20 @@ fn restore_terminal() {
     let _ = std::io::stdout().flush();
 }
 
+/// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
+/// waiting: a running turn drains the inbox at its own round boundary (firing
+/// then would double-deliver), and an empty inbox means there is nothing to wake
+/// for. Kept as a pure function so the delivery invariant is unit-tested rather
+/// than only exercised through the live terminal loop.
+fn autowake_ready(running: bool, inbox: &Inbox) -> bool {
+    !running && !inbox.is_empty()
+}
+
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     msgs: mpsc::UnboundedSender<WorkerMsg>,
-    inbox: Arc<std::sync::Mutex<Vec<String>>>,
+    inbox: Arc<Inbox>,
     session_id: String,
     resumed_cells: Vec<app::Cell>,
 ) -> Result<()> {
@@ -204,7 +241,7 @@ async fn ui_loop(
                             // Enqueue for the running turn; the agent loop
                             // drains it at the next round boundary. The user's
                             // raw text already showed as a User cell.
-                            inbox.lock().unwrap().push(text);
+                            inbox.push(InboxItem::Steer(text));
                         }
                         Command::Interrupt => {
                             if let Some(cancel) = &current_cancel {
@@ -229,7 +266,39 @@ async fn ui_loop(
                 while let Ok(event) = events.try_recv() {
                     app.apply(event);
                 }
+                // Autowake (plan 26): a background sub-agent finished (its
+                // agent_end woke this select) and left a result in the inbox
+                // while the agent sits idle. Start a turn to deliver it without
+                // waiting for the user. The guard also catches the race where a
+                // reinjection lands just after a turn ends.
+                if autowake_ready(app.running, &inbox) {
+                    let cancel = CancellationToken::new();
+                    current_cancel = Some(cancel.clone());
+                    app.running = true;
+                    let _ = msgs.send(WorkerMsg::Wake { cancel });
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kloop_core::inbox::InboxItem;
+
+    #[test]
+    fn autowake_only_when_idle_with_pending() {
+        let inbox = Inbox::default();
+        // Idle but nothing pending: don't wake.
+        assert!(!autowake_ready(false, &inbox));
+        inbox.push(InboxItem::SubAgentResult {
+            label: "agent-1".into(),
+            summary: "done".into(),
+        });
+        // Idle + a reinjection waiting: wake to deliver it.
+        assert!(autowake_ready(false, &inbox));
+        // A turn is running: don't wake — it drains at its own round boundary.
+        assert!(!autowake_ready(true, &inbox));
     }
 }

@@ -3,6 +3,7 @@
 //! tool implementations live in the sibling modules; this file is what the
 //! agent loop and the frontends depend on.
 
+mod async_agents;
 mod bash;
 mod codemode;
 mod discover;
@@ -11,6 +12,8 @@ mod search;
 mod task;
 mod todo;
 
+pub use async_agents::AgentStatus;
+pub use async_agents::AsyncAgents;
 pub use bash::BackgroundShells;
 pub use discover::deferred_notice;
 pub use todo::parse_todos;
@@ -364,15 +367,37 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "task".into(),
-            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt; returns its final text. Consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Sub-agents cannot spawn further sub-agents. Pass agent_type to use a configured specialized agent (see below); omit it for a general-purpose sub-agent.".into(),
+            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt. By default this blocks and returns the sub-agent's final text; consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Pass background=true to fire-and-forget instead: it returns immediately with an agent id (agent-N) and the sub-agent's result is delivered to you as a message when it finishes — use this to keep working while a long subtask runs, then block for it with the wait tool. Sub-agents cannot spawn further sub-agents. Pass agent_type to use a configured specialized agent (see below); omit it for a general-purpose sub-agent.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "Complete standalone task description"},
                     "agent_type": {"type": "string", "description": "Name of a configured agent type to use (its own system prompt, model, and tools); omit for a general-purpose sub-agent"},
+                    "background": {"type": "boolean", "description": "Fire-and-forget: return an agent id immediately and deliver the result as a message when it finishes, instead of blocking (default false)"},
                     "max_rounds": {"type": "integer", "description": "Round cap for the sub-agent (default and max 15)"}
                 },
                 "required": ["prompt"]
+            }),
+        });
+        defs.push(ToolDef {
+            name: "wait".into(),
+            description: "Block until a background sub-agent (dispatched with task background=true) finishes, or new input arrives, or the timeout passes. Returns a short status; the finished sub-agent's result is delivered separately as a message. Only useful when background sub-agents are running.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "timeout_ms": {"type": "integer", "description": "Max wait (default 30000, min 10000, max 3600000)"}
+                }
+            }),
+        });
+        defs.push(ToolDef {
+            name: "stop_agent".into(),
+            description: "Stop a running background sub-agent by id (agent-N). It ends without reporting a result.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "The agent id from a background task call, e.g. agent-2"}
+                },
+                "required": ["agent_id"]
             }),
         });
     }
@@ -422,6 +447,11 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         // as parallel sub-agents. Their own tool calls are gated individually
         // — a sub-agent's write still faces hooks and the permission gate.
         "task" => true,
+        // stop_agent only signals a sub-agent's own cancel token — like
+        // kill_bash, nothing the batch could race on. wait BLOCKS, so it must
+        // run alone (batching it would stall its siblings behind the deadline).
+        "stop_agent" => true,
+        "wait" => false,
         "write_file" | "edit_file" => false,
         other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
@@ -614,6 +644,8 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
+            "wait" => async_agents::wait_tool(input, ctx).await,
+            "stop_agent" => async_agents::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
                 Some(source) => {
@@ -686,6 +718,7 @@ pub(crate) mod testutil {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
+                async_agents: Default::default(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -827,6 +860,8 @@ mod tests {
                 "read_offloaded",
                 "todo_write",
                 "task",
+                "wait",
+                "stop_agent",
                 "srv__echo",
                 "srv__fail",
                 "run_program",
@@ -875,7 +910,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("52 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("54 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -1166,6 +1201,7 @@ mod tests {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
+                async_agents: Default::default(),
             }),
             ui: Arc::new(NullUi),
             cancel,

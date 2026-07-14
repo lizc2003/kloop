@@ -4,7 +4,9 @@ use std::sync::Arc;
 use kloop_provider::Provider;
 
 use crate::hooks::Hooks;
+use crate::inbox::Inbox;
 use crate::permissions::Permissions;
+use crate::tools::AsyncAgents;
 use crate::tools::BackgroundShells;
 use crate::tools::ToolSource;
 
@@ -78,13 +80,21 @@ pub struct Config {
     /// gets its OWN fresh list — the task tool resets this on the cloned
     /// Config so a sub-agent's planning never touches the parent's.
     pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
-    /// Step-boundary injection queue (plan 22). Strings pushed here — user
-    /// steering typed while the turn runs — are drained at round boundaries
-    /// (never mid-request) and recorded as user messages before the next
-    /// sampling. cc and codex independently converge on this: steering is
-    /// enqueue-not-interrupt, delivered only between steps. Each sub-agent gets
-    /// its OWN fresh queue (the task tool resets it on the cloned Config, like
-    /// `todos`) so a parent's steering is never drained by a running sub-agent.
+    /// Step-boundary injection queue (plan 22 + 26). Items pushed here — user
+    /// steering typed while the turn runs, or a background sub-agent's result —
+    /// are drained at round boundaries (never mid-request) and recorded as user
+    /// messages before the next sampling, each with its own framing. cc and
+    /// codex independently converge on this: enqueue-not-interrupt, delivered
+    /// only between steps. Each sub-agent gets its OWN fresh queue (the task
+    /// tool resets it on the cloned Config, like `todos`) so a parent's steering
+    /// is never drained by a running sub-agent; a *background* sub-agent instead
+    /// reinjects into a clone of the PARENT's queue captured before the reset.
     /// The front-end holds a clone of this Arc to enqueue while a turn runs.
-    pub inbox: Arc<std::sync::Mutex<Vec<String>>>,
+    pub inbox: Arc<Inbox>,
+    /// Registry of background sub-agents dispatched with task {"background":
+    /// true} (plan 26): tracks in-flight agents for `wait`/`stop_agent` and
+    /// enforces a concurrency cap. Shared into sub-agent configs like
+    /// everything else, though only the depth-0 agent spawns into it. Kept
+    /// separate from `background_shells` on purpose (see [`AsyncAgents`]).
+    pub async_agents: Arc<AsyncAgents>,
 }

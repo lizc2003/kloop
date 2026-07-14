@@ -6,17 +6,27 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Result;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
+use super::async_agents::AgentStatus;
 use super::str_arg;
 use super::ToolCtx;
 use crate::agent::run_turn;
 use crate::agent::EndReason;
+use crate::agent::TurnOutcome;
 use crate::agents::AgentType;
 use crate::config::Config;
 use crate::history::History;
+use crate::inbox::Inbox;
+use crate::inbox::InboxItem;
 use kloop_protocol::Message;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
+
+/// Cap on a background sub-agent's reinjected error text (~900 tokens, codex's
+/// error-branch limit). A successful result is passed through verbatim; only a
+/// failure is truncated, since its noise shouldn't crowd the parent's context.
+const MAX_REINJECT_ERROR_CHARS: usize = 3600;
 
 /// Process-global so parallel task calls (and any future spawner) never hand
 /// out the same label — same reasoning as the offload counter (lesson 2).
@@ -32,6 +42,7 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         .map_or(SUBAGENT_MAX_ROUNDS, |n| {
             (n as usize).clamp(1, SUBAGENT_MAX_ROUNDS)
         });
+    let background = input["background"].as_bool().unwrap_or(false);
     // A custom agent type overrides the sub-agent's system prompt, model and
     // tool set; an unknown name is an is_error result naming the available
     // types. Omitting agent_type keeps the general-purpose inherit-everything
@@ -43,40 +54,20 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         None => None,
     };
     let agent = format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut sub = Config {
-        max_rounds,
-        agent_label: agent.clone(),
-        // A fresh task list: the sub-agent plans independently, and its
-        // todo_write never touches the parent's list (the Config clone would
-        // otherwise share the Arc).
-        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-        // A fresh steering queue: the user steers the main agent, and a
-        // running sub-agent must never drain the parent's pending steering
-        // (the Config clone would otherwise share the Arc). No front-end pushes
-        // to a sub-agent's queue today, so it simply stays empty.
-        inbox: Arc::new(std::sync::Mutex::new(Vec::new())),
-        ..(*ctx.cfg).clone()
-    };
-    if let Some(at) = agent_type {
-        if let Some(system) = &at.system {
-            sub.system = system.clone();
-        }
-        if let Some(model) = &at.model {
-            sub.model = model.clone();
-        }
-        if let Some(tools) = &at.tools {
-            sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
-        }
-    }
-    let sub_cfg = Arc::new(sub);
+    let sub_cfg = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
-    let cancel = ctx.cancel.clone();
     let depth = ctx.depth + 1;
     // The label shown next to the running agent carries its type, if any.
     let preview = match agent_type {
         Some(at) => format!("[{}] {}", at.name, task_preview(&prompt)),
         None => task_preview(&prompt),
     };
+
+    if background {
+        return spawn_background(ctx, sub_cfg, agent, &preview, prompt, depth, ui);
+    }
+
+    let cancel = ctx.cancel.clone();
     ui.agent_start(&agent, &preview);
     // The sub-agent runs as its own tokio task. Besides matching the
     // semantics, this breaks the recursion cycle (execute_tool -> run_turn ->
@@ -108,6 +99,125 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     };
     ui.agent_end(&agent, result.is_ok());
     result
+}
+
+/// Fire-and-forget spawn (plan 26): register the agent, launch a DETACHED tokio
+/// task, and return immediately. Unlike the synchronous path the sub-agent runs
+/// on its OWN cancel token (registered for `stop_agent`) — a finished parent
+/// turn must never kill a still-running background agent. When it ends, it
+/// reinjects its result into the PARENT's inbox (captured before `build_sub_config`
+/// reset the sub-agent's own inbox to fresh).
+fn spawn_background(
+    ctx: &ToolCtx,
+    sub_cfg: Arc<Config>,
+    agent: String,
+    preview: &str,
+    prompt: String,
+    depth: u8,
+    ui: Arc<dyn crate::agent::Ui>,
+) -> Result<String> {
+    let own_cancel = CancellationToken::new();
+    ctx.cfg
+        .async_agents
+        .register(&agent, preview, own_cancel.clone())
+        .map_err(|msg| anyhow!("task: {msg}"))?;
+    let parent_inbox = ctx.cfg.inbox.clone();
+    let async_agents = ctx.cfg.async_agents.clone();
+    ui.agent_start(&agent, preview);
+    tokio::spawn({
+        let ui = ui.clone();
+        let label = agent.clone();
+        async move {
+            let mut history = History::new(sub_cfg.offload_dir.clone());
+            history.record(Message::user_text(prompt));
+            let outcome = run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await;
+            let (status, reinject) = classify_background(outcome);
+            async_agents.set_status(&label, status);
+            match reinject {
+                Some(summary) => parent_inbox.push(InboxItem::SubAgentResult {
+                    label: label.clone(),
+                    summary,
+                }),
+                // Terminal with no reinjection (interrupted): still wake a
+                // blocked `wait` so it re-evaluates instead of blocking out its
+                // full deadline.
+                None => parent_inbox.notify_activity(),
+            }
+            ui.agent_end(
+                &label,
+                matches!(status, AgentStatus::Completed | AgentStatus::MaxRounds),
+            );
+        }
+    });
+    Ok(format!(
+        "Sub-agent {agent} started in the background. Keep working; its result will be delivered \
+         to you as a message when it finishes. Block for it with the wait tool, or stop it with \
+         stop_agent."
+    ))
+}
+
+/// Map a background sub-agent's terminal outcome to (registry status, optional
+/// reinjection). Success/round-limit pass through verbatim (codex); a failure
+/// is truncated; an interrupted agent reinjects nothing (codex's is_final —
+/// its partial output is noise, and the model that stopped it already knows).
+fn classify_background(outcome: TurnOutcome) -> (AgentStatus, Option<String>) {
+    match outcome.reason {
+        EndReason::Completed => (AgentStatus::Completed, Some(outcome.final_text)),
+        EndReason::MaxRounds => (
+            AgentStatus::MaxRounds,
+            Some(format!(
+                "[sub-agent stopped at its round limit]\n{}",
+                outcome.final_text
+            )),
+        ),
+        EndReason::Error(e) => (
+            AgentStatus::Failed,
+            Some(format!(
+                "[sub-agent failed] {}\nYou may re-dispatch it or try another approach.",
+                truncate_error(&e)
+            )),
+        ),
+        EndReason::Aborted => (AgentStatus::Aborted, None),
+    }
+}
+
+fn truncate_error(e: &str) -> String {
+    if e.chars().count() <= MAX_REINJECT_ERROR_CHARS {
+        return e.to_string();
+    }
+    let truncated: String = e.chars().take(MAX_REINJECT_ERROR_CHARS).collect();
+    format!("{truncated}… (error truncated)")
+}
+
+/// Build the sub-agent's Config: a fresh todo list and a fresh inbox (a running
+/// sub-agent must never drain the parent's steering, and its own todo_write must
+/// not touch the parent's list — the Config clone would otherwise share both
+/// Arcs), plus any agent_type overrides.
+fn build_sub_config(
+    ctx: &ToolCtx,
+    max_rounds: usize,
+    agent: String,
+    agent_type: Option<&AgentType>,
+) -> Arc<Config> {
+    let mut sub = Config {
+        max_rounds,
+        agent_label: agent,
+        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+        inbox: Arc::new(Inbox::default()),
+        ..(*ctx.cfg).clone()
+    };
+    if let Some(at) = agent_type {
+        if let Some(system) = &at.system {
+            sub.system = system.clone();
+        }
+        if let Some(model) = &at.model {
+            sub.model = model.clone();
+        }
+        if let Some(tools) = &at.tools {
+            sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
+        }
+    }
+    Arc::new(sub)
 }
 
 /// First line of the prompt, truncated — the label a UI shows next to the
@@ -394,6 +504,127 @@ mod tests {
         assert_eq!(parent.len(), 1);
         assert_eq!(parent[0].content, "parent task");
         assert_eq!(parent[0].status, TodoStatus::Pending);
+    }
+
+    /// Fire-and-forget: task {background:true} returns a "started" message
+    /// immediately (NOT the result), and the detached sub-agent reinjects its
+    /// final text into the PARENT's inbox as a framed SubAgentResult when done.
+    #[tokio::test]
+    async fn background_task_returns_immediately_and_reinjects() {
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "sub result".into(),
+        }]]);
+        let ctx = with_provider(test_ctx(0, "bg-reinject"), provider);
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "go do it", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("started in the background"), "{out}");
+        assert!(
+            !out.contains("sub result"),
+            "the result is NOT returned inline: {out}"
+        );
+
+        // The detached sub-agent finishes and reinjects into the parent inbox.
+        for _ in 0..300 {
+            if !ctx.cfg.inbox.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let items = ctx.cfg.inbox.drain();
+        assert_eq!(items.len(), 1, "one reinjected result");
+        match &items[0] {
+            InboxItem::SubAgentResult { label, summary } => {
+                assert!(label.starts_with("agent-"), "{label}");
+                assert_eq!(summary, "sub result");
+            }
+            other => panic!("expected SubAgentResult, got {other:?}"),
+        }
+        assert_eq!(ctx.cfg.async_agents.running_count(), 0, "slot freed");
+    }
+
+    /// A background sub-agent cancelled via stop_agent ends Aborted and
+    /// reinjects NOTHING (codex's is_final) — only a wake so a blocked wait
+    /// re-evaluates.
+    #[tokio::test]
+    async fn stopped_background_task_does_not_reinject() {
+        // Sub-agent blocks on a long bash so stop_agent can catch it running.
+        let provider = Provider::mock(vec![vec![ContentBlock::ToolUse {
+            id: "s1".into(),
+            name: "bash".into(),
+            input: json!({"command": "sleep 30"}),
+        }]]);
+        let ctx = with_provider(test_ctx(0, "bg-stopped"), provider);
+
+        let (out, _) = run_tool("task", json!({"prompt": "long", "background": true}), &ctx).await;
+        let agent = out
+            .split_whitespace()
+            .find(|w| w.starts_with("agent-"))
+            .unwrap()
+            .to_string();
+        // Let the sub-agent get into its bash before stopping it.
+        for _ in 0..100 {
+            if ctx.cfg.async_agents.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (stop_out, is_error) = run_tool("stop_agent", json!({"agent_id": agent}), &ctx).await;
+        assert!(!is_error, "{stop_out}");
+        assert!(stop_out.contains("Stopping"), "{stop_out}");
+
+        // Wait for it to actually wind down, then assert nothing was reinjected.
+        for _ in 0..300 {
+            if ctx.cfg.async_agents.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ctx.cfg.inbox.is_empty(),
+            "an interrupted sub-agent reinjects nothing"
+        );
+    }
+
+    #[test]
+    fn classify_background_maps_outcomes() {
+        let outcome = |reason| TurnOutcome {
+            reason,
+            final_text: "the answer".into(),
+            rounds: 1,
+        };
+        // Success passes through verbatim.
+        assert_eq!(
+            classify_background(outcome(EndReason::Completed)),
+            (AgentStatus::Completed, Some("the answer".into()))
+        );
+        // Round limit is framed but still carries the text.
+        let (status, msg) = classify_background(outcome(EndReason::MaxRounds));
+        assert_eq!(status, AgentStatus::MaxRounds);
+        assert!(msg.unwrap().contains("the answer"));
+        // A failure is framed with re-dispatch guidance.
+        let (status, msg) = classify_background(outcome(EndReason::Error("boom".into())));
+        assert_eq!(status, AgentStatus::Failed);
+        assert!(msg.unwrap().contains("boom"));
+        // Interrupted reinjects nothing.
+        assert_eq!(
+            classify_background(outcome(EndReason::Aborted)),
+            (AgentStatus::Aborted, None)
+        );
+    }
+
+    #[test]
+    fn truncate_error_caps_only_long_failures() {
+        assert_eq!(truncate_error("short"), "short");
+        let long = "x".repeat(MAX_REINJECT_ERROR_CHARS + 500);
+        let out = truncate_error(&long);
+        assert!(out.ends_with("… (error truncated)"));
+        assert!(out.chars().count() < long.chars().count());
     }
 
     #[test]

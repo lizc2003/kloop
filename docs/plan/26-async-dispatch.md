@@ -1,6 +1,7 @@
-# Plan 26 — 异步派发 + 子 agent 回灌(备忘)
+# Plan 26 — 异步派发 + 子 agent 回灌(✅ 完成,见文末完成记录)
 
-> **备忘,未开工**。开工前读 HANDOFF + plan 22 完成记录 + plan 17 片 6(候选切片 6
+> **✅ 切片 1+2+3 + 轻量 interrupt 完成**(注册表大泛化与切片 5 落盘挂账,有依据)。以下为原备忘,
+> 开工回源结论已回填到文末"完成记录"。开工前读 HANDOFF + plan 22 完成记录 + plan 17 片 6(候选切片 6
 > "统一任务注册表")+ `refs/README.md` 的 **steering / 中途注入对比** 一节(plan 22
 > 回源已把交付侧收敛点落到 file:line)。**注入侧机制已由 plan 22 建好**(`Config.inbox`
 > step 边界注入队列),本 plan 只补**派发侧**:让 task 从"同步 await"变成"fire-and-forget
@@ -124,3 +125,105 @@ Interrupted 子不回灌;摘要截断契约;`wait` 被 steer 提前打断 / 超�
 
 按所选切片;fmt/clippy/test 全绿;真 key 至少一次"父异步派子 agent、继续干活、子完成回灌进父
 下一轮闭环";README、HANDOFF(标 plan 17 片 6 / plan 22 子 agent 回灌由本 plan 承接)、未选切片挂账。
+
+---
+
+## ✅ 完成记录(切片 1+2+3 + 轻量 interrupt;提交 4b9fad4)
+
+开工时用户定"不要考虑复杂度,要最合理的方案",故不为省事砍——按最合理的完整异步派发面做,
+只砍有证据/本质依据的。**做了切片 1(异步 spawn + 完成侦测 + 回灌)+ 2(`wait`)+ 3(autowake,
+TUI)+ 轻量 interrupt(`stop_agent`)**;**不做**注册表大泛化(`BackgroundShells→Tasks`)与切片 5
+(异步子 agent 落盘)——都是有依据的取舍,见下。
+
+### 回源回填(派发/生命周期侧,steering 那次只覆盖交付侧;本会话真读 codex + cc,file:line)
+
+**收敛(两家独立一致,照抄)**:
+- **spawn 非阻塞**:codex `spawn` 立即返 canonical task_name(`spawn.rs:193-294`),不把结果返给模型;
+  cc `void runAsyncAgentLifecycle`、立即返 `async_launched`+output-file 指针(`AgentTool.tsx:873,902`)。
+- **回灌投父队列**:codex → `Op::InterAgentCommunication` → 父会话级 mailbox VecDeque(`session/mod.rs:1889`
+  `forward_child_completion_to_parent`,过 Op 通道在父事件循环串行处理);cc → 全局单例队列
+  `enqueuePendingNotification(mode:'task-notification')`、优先级 `later`(`messageQueueManager.ts:142`)。
+- **摘要截断**:两家都**成功原样透传、失败才截**。codex 常量坐实 `session_prefix.rs:10-13,33-36`:
+  `COMPLETION_MESSAGE_MAX_TOKENS=1000`、`ENVELOPE_RESERVE=100`、error 截 `900`,成功分支不截;cc `<result>`
+  内联最终答案全文、`<summary>` 短状态、`<output-file>` 指针三层(`LocalAgentTask.tsx:302-315`)。
+- **autowake 守卫**:codex `maybe_start_turn_for_pending_work`(`tasks/mod.rs:474`)——仅"有 trigger_turn 邮件
+  且空闲(抢 active_turn 锁失败即 return)"才起合成 turn 喂空 input(turn 内 drain 邮箱);`SubagentAutowake`
+  feature 默认开。cc 靠 turn 末 drain / `Sleep`(proactive)后 mid-turn drain `later`(`query.ts:1860-1865`)。
+
+**两个分歧(plan 备忘估错,已按回源纠偏)**:
+1. **Interrupted 是否回灌**——plan 备忘写"两家都不回灌(抄 codex is_final)",**回源发现只有 codex 这样**
+   (`status.rs:26` is_final 视 Interrupted 非终态 + `session_prefix.rs:41` 返 None 双重过滤);**cc 反而回灌**
+   `killed`+`extractPartialResult`(`agentToolUtils.ts:652-680`,注释"must fire unconditionally",只靠 `notified`
+   幂等去重)。→ kloop **随 codex:不回灌**(教训 14:参考库里"存在"不等于"收敛";一家的选择别当收敛照抄)。
+2. **注册表是否统一**——plan 想"泛化 `BackgroundShells`→`Tasks`",但 **codex 后台/用户 shell 走
+   `UserShellCommandTask`、不进 `AgentRegistry`**(两套独立机制);cc `Task.spawn/render` 已在 #22546 删、
+   只剩 `kill` 多态,**只统一状态模型不统一 spawn**。→ kloop **新开平行的 `AsyncAgents` 注册表、不强行合并**
+   (教训 16/17:不预抽象、别为整齐照搬;第三个消费者出现再议)。
+
+**方向导数**:codex V2 已**离开 detached completion watcher**(`control.rs:460` `maybe_start_completion_watcher`
+被 `!= V2` 门控关掉)、转向**终态事件内联 forward**。kloop 无事件总线,取最自然的形态——给子 agent 的
+JoinHandle 挂完成逻辑(在 spawned task 尾部),完成时 push 摘要进父 inbox(近 cc 的 lifecycle-driver-then-enqueue)。
+
+### 落地(文件)
+
+- **`core/src/inbox.rs`(新)**:`Config.inbox` 从 `Arc<Mutex<Vec<String>>>` 升级成 `Arc<Inbox>`——带
+  `tokio::Notify` 的信号队列 + 类型化 `InboxItem { Steer(String), SubAgentResult{label,summary} }`,`into_message`
+  按类型 framing(steering 的 `STEERING_PREFIX` 从 agent.rs 移来 + 新 `SUBAGENT_PREFIX`)。**修正 plan 备忘的
+  "中性字符串队列各自 framing"**——实际旧 `drain_inbox` 把所有项硬套 `STEERING_PREFIX`,类型化后才真正各自 framing
+  (教训 16 具体落点:plan 对现码的描述也是二手)。`push` 用 `notify_one`(留 permit 防 race),`notify_activity`
+  唤醒不入队(中断子唤醒 `wait`),`drain`/`is_empty`/`notified`。
+- **`core/src/tools/async_agents.rs`(新)**:`AsyncAgents` 注册表(id→{task,status,own-cancel},并发上限 8、
+  Drop 补刀 cancel)+ `AgentStatus` + `wait_tool`(clamp 10s/30s/1h;有 pending 立即返不 drain;无运行且空立即返;
+  否则 select notified/timeout/turn-cancel;**信号不搬运**)+ `stop_agent_tool`。
+- **`core/src/tools/task.rs`**:`task` 加 `background` 参数。`background:true` 走 `spawn_background`——注册进
+  `AsyncAgents`(超并发拒)、用**独立 cancel**(非父 turn cancel,父结束不杀它)detached spawn、立即返"已派发"引导;
+  子终态 `classify_background`(Completed/MaxRounds 透传、Error 截 `MAX_REINJECT_ERROR_CHARS=3600`、Aborted→None)
+  push 进**父 inbox**(reinject)或 `notify_activity`(中断)。抽出 `build_sub_config`(fresh todos+fresh inbox 共用)。
+- **`core/src/agent.rs`**:`drain_inbox(&Inbox, ...)` 按 `InboxItem::into_message` 各自 framing;删除本地
+  `STEERING_PREFIX`(移进 inbox.rs)。
+- **`core/src/tools/mod.rs`**:depth-0 加 `wait`/`stop_agent` def + 分发;`wait` 非并发安全(阻塞,单飞)、
+  `stop_agent` 并发安全(仅信号);`task` 描述补 background 说明。**`codemode.rs`**:program 面排除
+  `wait`/`stop_agent`(fire-and-forget 是模型循环概念、program 内同步 `agent()` 无此义)。
+- **`core/src/permissions.rs`**:`wait`/`stop_agent` 进只读自判(自动放行,同 `task`/`kill_bash` 理由)。
+- **TUI(`crates/tui/src/lib.rs`)**:`WorkerMsg::Wake`(无用户文本、只 drain+采样,inbox 空则 no-op)+
+  `autowake_ready(running, &inbox)` 守卫(空闲 且 inbox 非空)+ ui_loop 每批事件后检查触发。**关键简化**:
+  autowake 不需要新的 Ui 控制通道——异步子完成的 `agent_end` 本就是个 AgentEvent、会唤醒 ui_loop 的 select,
+  于是只要"每批事件后 空闲+inbox 非空 → 派 Wake"就够,race(子在父末次 drain 后完成)天然覆盖(教训 21)。
+- Config 各构造点 + `/clear`(清 inbox 改 `drain()`)+ 各 steering 测试(inbox 类型/push)随改。
+
+### 前端矩阵
+
+| | 异步 spawn + 回灌 | wait / stop_agent | autowake |
+|---|---|---|---|
+| TUI | ✓ | ✓ | ✓(空闲起 Wake turn) |
+| plain | ✓(下一 round 边界 / 下一 user turn drain) | ✓ | ✗(阻塞读无事件循环,下一 user turn 交付) |
+| server | ✓(子终态 `agent/completed` 已有;reinject 落 thread inbox,下一 `turn/start` drain) | ✓ | ✗(client-driven turn,协议契约不变) |
+
+plain/server 无 autowake 是**平台事实**(无事件循环 / 客户端驱动),同 plan 22 plain 的 steering 入队挂账同因,
+文档标注即可,不是砍功能。
+
+### 测试(核心 238,+6;TUI 38,+1)
+
+- `inbox.rs`:steer/subagent 各自 framing、push/drain 往返、`notified` 唤醒、race 下 permit 存活。
+- `async_agents.rs`:并发上限、完成腾槽、stop 取消+拒非运行/未知、Drop 补刀;`wait` 无运行立即返 / 有 pending
+  立即返且**不 drain**(经 `run_tool` 全分发路径,含权限门只读放行)。
+- `task.rs`:**背景 spawn 立即返"已派发"(非结果)且 detached 子完成后 reinject 成 `SubAgentResult` 进父 inbox、
+  腾槽**;**`stop_agent` 的子 Aborted 不回灌**(端到端:派长 bash 子→stop→轮询 running_count→断言 inbox 空);
+  `classify_background` 四态映射;`truncate_error` 只截长失败。
+- `tui/lib.rs`:`autowake_ready` 空闲+pending 才触发、运行中不重入。
+- 既有工具计数/名单契约(`all_tool_defs`、`tool_merge_warnings` 52→54)随 +2 内置更新。
+
+### 真 key 验收(anthropic 轨 sonnet-5,plain --yolo)
+
+`task {background:true}` 派子 agent(回"OCEANWAVE42")→ 立即返"agent-1 started" → 父自己跑 `echo PARENT_ECHO_OK`
+→ `wait {}` 阻塞 → "agent-1 finished" → 回灌下一轮边界交付 → 终答一行 **"Sub-agent word received: OCEANWAVE42;
+my echo output: PARENT_ECHO_OK."**。**即完成标准的"父异步派子 agent、继续干活、子完成回灌进父下一轮闭环"**。
+(autowake 的 TUI 空闲自动起 turn 是真键手感项,plain 覆盖不到,建议用户在真 TUI 快速过一次,同 plan 25。)
+
+### 挂账(有依据,非因难)
+
+- **注册表大泛化 `BackgroundShells→Tasks`**:回源坐实两家不强合并,`AsyncAgents` 平行即可(见分歧 2)。
+- **切片 5 异步子 agent 落盘**(plan 17 片 3):持久化子系统(rollout 父链、`--list-sessions` 标记、resume 语义),
+  另一根设计轴,不做进本 plan 更正确。
+- plain/server 的 autowake(平台事实)、cc 式 output-file 指针(kloop 子 agent 不落盘,无指针可给)、
+  `list_agents` 独立工具(wait 返回已带 running 计数,够了)。

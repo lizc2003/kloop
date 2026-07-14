@@ -128,6 +128,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
+            async_agents: Default::default(),
         })
     }
 
@@ -217,7 +218,8 @@ mod tests {
             active_form: "doing".into(),
             status: crate::tools::TodoStatus::InProgress,
         });
-        cfg.inbox.lock().unwrap().push("stale steer".into());
+        cfg.inbox
+            .push(crate::inbox::InboxItem::Steer("stale steer".into()));
 
         let result = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
         assert_eq!(
@@ -229,7 +231,7 @@ mod tests {
         );
         assert!(history.messages().is_empty());
         assert!(cfg.todos.lock().unwrap().is_empty());
-        assert!(cfg.inbox.lock().unwrap().is_empty());
+        assert!(cfg.inbox.is_empty());
     }
 
     #[tokio::test]
