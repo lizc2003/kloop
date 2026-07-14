@@ -218,7 +218,8 @@ plain/server 无 autowake 是**平台事实**(无事件循环 / 客户端驱动)
 `task {background:true}` 派子 agent(回"OCEANWAVE42")→ 立即返"agent-1 started" → 父自己跑 `echo PARENT_ECHO_OK`
 → `wait {}` 阻塞 → "agent-1 finished" → 回灌下一轮边界交付 → 终答一行 **"Sub-agent word received: OCEANWAVE42;
 my echo output: PARENT_ECHO_OK."**。**即完成标准的"父异步派子 agent、继续干活、子完成回灌进父下一轮闭环"**。
-(autowake 的 TUI 空闲自动起 turn 是真键手感项,plain 覆盖不到,建议用户在真 TUI 快速过一次,同 plan 25。)
+
+**autowake 真键手感也已过**(真 TUI):父派后台子(子 `sleep 6 && echo ok` 后回 BANANA77)、**不 wait 直接结束这一轮**说"已派发";约 6s 后 `✓ agent-1 (1 tool uses)` 子完成,**用户未打字、TUI 自动冒出新一轮回复报 BANANA77**——空闲期子完成触发 `WorkerMsg::Wake` 交付 turn 的闭环坐实。plain 覆盖不到的这条(阻塞读无事件循环)由真 TUI 补上。
 
 ### 挂账(有依据,非因难)
 
