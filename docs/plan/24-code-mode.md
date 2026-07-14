@@ -336,7 +336,7 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 
 零行为变更(纯改名),全量 358 测试全绿 + fmt + clippy;真 key 冒烟确认模型按新名 `run_program` 调用。
 
-### 追加片:资源治理 caps + Limits 配置化(挂账③⑦,2026-07-14,提交见 HANDOFF)
+### 追加片:资源治理 caps + Limits 配置化(挂账③⑦,2026-07-14,提交 f37fd7b)
 
 开工时用户在"token budget vs caps + Limits 配置化"间**定后者**(附回源依据)。**回源颠覆性发现(教训 11,一个 Explore 真读 cc workflow-engine,file:line)**:cc 的 `budget.total` 是**硬编码 `null` 占位**(`src/workflow/ports.ts:61`、`service.ts:137`,注释"未来从 settings 读"),"+500k" 解析器(`tokenBudget.ts`)存在但**没接进 workflow budget**——所以 cc 生产里 `remaining()` 恒 `Infinity`、`assertCanSpend()` 永不触发,budget 是 no-op 预留。**真正生效的失控保护是 caps**:`MAX_TOTAL_AGENTS=1000`(agent() 超限抛)、`MAX_ITEMS_PER_CALL=4096`(parallel/pipeline 超限抛,不截断)、并发默认 3/上限 16。
 
