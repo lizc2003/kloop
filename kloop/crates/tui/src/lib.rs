@@ -29,6 +29,10 @@ use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
 use kloop_core::permissions::Approver;
+use kloop_core::rollout::fork_points;
+use kloop_core::rollout::fork_session;
+use kloop_core::rollout::resume_session;
+use kloop_core::rollout::session_id_of;
 use kloop_core::Config;
 use kloop_protocol::Message;
 
@@ -63,6 +67,16 @@ enum WorkerMsg {
     /// was already drained by a race.
     Wake {
         cancel: CancellationToken,
+    },
+    /// Read the session's rewind targets off disk (plan 18) and reply with a
+    /// `ForkPoints` event. Runs on the worker because it owns the rollout path;
+    /// idle-only, so no turn is in flight racing the read.
+    ListForkPoints,
+    /// Rewind History onto the fork cut at `seq`: fork the session file, swap
+    /// History to the branch, and reply with a `Forked` event carrying its
+    /// messages and id.
+    Fork {
+        seq: u64,
     },
 }
 
@@ -171,8 +185,54 @@ async fn agent_worker(
                     return;
                 }
             }
+            WorkerMsg::ListForkPoints => {
+                // An in-memory-only history (no rollout) can't be rewound.
+                let points = match history.rollout_path() {
+                    Some(path) => fork_points(path).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if events.send(AgentEvent::ForkPoints(points)).is_err() {
+                    return;
+                }
+            }
+            WorkerMsg::Fork { seq } => {
+                let event = match fork_here(&history, seq) {
+                    Ok((session_id, messages, rollout)) => {
+                        history.rebase(messages.clone(), rollout);
+                        AgentEvent::Forked {
+                            session_id,
+                            messages,
+                        }
+                    }
+                    // A failed rewind leaves History untouched; report and carry
+                    // on the original branch.
+                    Err(e) => AgentEvent::System(format!("rewind failed: {e}")),
+                };
+                if events.send(event).is_err() {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// Fork the live session at `seq` and load the branch: the new id, its messages,
+/// and a rollout writer pointed at the fork file. The session's own directory is
+/// the sessions dir (branches are siblings). Errors if the history isn't backed
+/// by a file or the fork/reload fails.
+fn fork_here(
+    history: &History,
+    seq: u64,
+) -> std::io::Result<(String, Vec<Message>, kloop_core::rollout::Rollout)> {
+    let src = history.rollout_path().ok_or_else(|| {
+        std::io::Error::other("this session is not being saved, so it cannot be rewound")
+    })?;
+    let sessions_dir = src
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session file has no parent directory"))?;
+    let fork_path = fork_session(src, Some(seq), sessions_dir)?;
+    let (messages, rollout) = resume_session(&fork_path)?;
+    Ok((session_id_of(&fork_path), messages, rollout))
 }
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
@@ -243,6 +303,14 @@ async fn ui_loop(
                             // raw text already showed as a User cell.
                             inbox.push(InboxItem::Steer(text));
                         }
+                        Command::RequestForkPoints => {
+                            // The worker owns the rollout path; it reads the
+                            // fork targets and replies with a ForkPoints event.
+                            let _ = msgs.send(WorkerMsg::ListForkPoints);
+                        }
+                        Command::Fork(seq) => {
+                            let _ = msgs.send(WorkerMsg::Fork { seq });
+                        }
                         Command::Interrupt => {
                             if let Some(cancel) = &current_cancel {
                                 cancel.cancel();
@@ -286,6 +354,43 @@ async fn ui_loop(
 mod tests {
     use super::*;
     use kloop_core::inbox::InboxItem;
+    use kloop_core::rollout::Rollout;
+    use kloop_protocol::ContentBlock;
+
+    /// The worker's rewind primitive: fork the live session's file at a cut,
+    /// derive the sessions dir from the rollout path, and hand back the branch's
+    /// id and truncated messages (which `rebase` then installs).
+    #[test]
+    fn fork_here_branches_the_live_session_at_a_cut() {
+        let dir = std::env::temp_dir().join(format!("kloop-tui-forkhere-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        let mut history = History::new(dir.clone());
+        history.attach_rollout(Rollout::new(session.clone()));
+        history.record(Message::user_text("one"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "done".into(),
+        }]));
+        history.record(Message::user_text("two"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "bye".into(),
+        }]));
+
+        // Cut at #2 keeps the first turn only; the branch gets a fresh id.
+        let (id, messages, _rollout) = fork_here(&history, 2).unwrap();
+        assert_ne!(id, "session");
+        assert_eq!(
+            messages,
+            vec![
+                Message::user_text("one"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn autowake_only_when_idle_with_pending() {

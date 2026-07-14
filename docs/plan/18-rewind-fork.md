@@ -16,6 +16,34 @@ thread**(同 `thread/resume`)→ 返 `{threadId, messageCount}`,client 可立即
 测试 +2(server duplex):fork 建活 thread + 血缘 `fork_origin` 指回源 `#cut` + 源文件
 不动 + fork 可独立 turn;非法 cut 列合法点 + 缺源报错。**TUI 按键选点仍挂账**。
 
+### ✅ 追加(2026-07-14,TUI 按键选点收尾——原地 rewind,提交号 PENDING)
+
+最后一处挂账("TUI 按键选点")补上,做成**原地 rewind**(cc `/rewind` 语义)而非
+CLI `--fork` 那种"分叉后退出再 `--resume`":TUI 里 **Ctrl+R**(仅空闲)开选点弹层
+→ Enter 在选中的截点 fork + **把 live History 换到该分支** + 转录区重建到更早状态 →
+下一条消息续在新分支,旧分支照样落盘(可再 fork/resume)。开工前先查 `reload`:确认
+TUI **无** reload 机制,但 worker 独占 History 可直接重赋值,所以进程内热切换很便宜——
+真正成本在选点 picker,A(fork 后 relaunch)/B(原地)共用,故选价值更高的 B。
+
+- **seq 权威留 core**:`rollout::fork_points(path) -> Vec<ForkPoint{seq,preview}>`,复用
+  `legal_cut_seqs` 同款 `opens_user_turn` 判定(提取为模块级 fn 两处共用),排除 tip
+  (末尾 rewind 是 no-op)和首轮(其前无截点);预览取该轮开头 user 消息、剥
+  `STEERING_PREFIX` 框、collapse 空白。picker 列的点 = `fork_session` 会接受的点,选中
+  永不被拒。
+- **History::rebase(items, rollout)**:原地换历史 + 换写入文件,复用已持有的 offload_dir
+  (分支共享,同 resume),usage_anchor 清空重锚,旧 rollout drop(它写的分支已在自己文件)。
+- **接线**:App 加 `ForkPicker{points,cursor}` 模态(confirm 之外第二个夺键者),
+  `Command::{RequestForkPoints,Fork(seq)}`;worker 加 `WorkerMsg::{ListForkPoints,Fork{seq}}`
+  → `fork_here`(从 `rollout_path().parent()` 推 sessions_dir)→ `AgentEvent::{ForkPoints,
+  Forked{session_id,messages}}`;`Forked` 用 `cells_from_history` 重建转录、把末尾"resumed
+  session"note 改标"rewound — N kept"、换 session_id。空列表 → System note"nothing to
+  rewind to yet"。
+- 测试 +10:core(fork_points 列边界带预览/剥 steering 框/单轮空、rebase 换历史+重定向写入
+  +原分支不动)、tui app(Ctrl+R 仅空闲请求、picker 导航+选中 Fork(seq)+吞按键、Esc 取消、
+  空列表出 System note、Forked 重建转录+换 id)、tui lib(`fork_here` 在截点分叉、推 sessions
+  dir、返新 id+截断消息)。全绿 427,fmt/clippy 净。TUI 交互无法管道验,靠单测锁定(同
+  server slash 惯例)。
+
 **回源调研结论**(两个 Explore agent,cc + codex 全文见会话记录,要点):
 - 两家都是"物理复制前缀进新文件",都**刻意回避跨文件行级 parent 链**:cc 怕悬空引用(`/branch` 整份拷贝 + `forkedFrom` 仅元数据),codex 明说"复制换简单"(`fork_thread` 复制截断前缀 + SessionMeta `forked_from_id` 文件级标签)。
 - 截点合法性两家都靠**白名单**而非事后配对校验:cc 只允许真实 user 消息(tool_result 型 user、合成消息全排除),codex 只在 turn 边界切(TurnStarted 三重校验,半截 turn 合成 TurnAborted 收尾)。

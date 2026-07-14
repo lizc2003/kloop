@@ -59,6 +59,17 @@ impl History {
         }
     }
 
+    /// Rewind the live conversation onto a forked branch: install the fork's
+    /// items and redirect persistence to its rollout, keeping the same offload
+    /// store (branches share it, like resume). The usage anchor resets so the
+    /// next sampled response re-anchors the estimate. The old rollout is dropped
+    /// unwritten — the branch it wrote already lives in its own file on disk.
+    pub fn rebase(&mut self, items: Vec<Message>, rollout: Rollout) {
+        self.items = items;
+        self.rollout = Some(rollout);
+        self.usage_anchor = None;
+    }
+
     pub fn record(&mut self, mut msg: Message) {
         for block in &mut msg.content {
             if let ContentBlock::ToolResult { content, .. } = block {
@@ -309,6 +320,51 @@ mod tests {
         assert_eq!(
             crate::rollout::load_session(&session).unwrap(),
             h.messages()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_rewinds_onto_a_fork_and_redirects_writes() {
+        use crate::rollout::fork_session;
+        let dir = temp_dir("rebase");
+        let session = dir.join("session.jsonl");
+        let mut h = History::new(dir.clone());
+        h.attach_rollout(Rollout::new(session.clone()));
+        h.record(Message::user_text("one"));
+        h.record(Message::assistant(vec![ContentBlock::Text {
+            text: "done".into(),
+        }]));
+        h.record(Message::user_text("two"));
+        h.record(Message::assistant(vec![ContentBlock::Text {
+            text: "bye".into(),
+        }]));
+
+        // Fork before the "two" turn (cut at #2) and rewind the live history
+        // onto that branch.
+        let fork_path = fork_session(&session, Some(2), &dir).unwrap();
+        let (items, rollout) = crate::rollout::resume_session(&fork_path).unwrap();
+        h.rebase(items, rollout);
+        assert_eq!(
+            h.messages(),
+            &[
+                Message::user_text("one"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+            ]
+        );
+
+        // New records land in the fork file; the original branch is untouched.
+        h.record(Message::user_text("three"));
+        assert_eq!(
+            crate::rollout::load_session(&fork_path).unwrap(),
+            h.messages()
+        );
+        assert_eq!(
+            crate::rollout::load_session(&session).unwrap().len(),
+            4,
+            "the original branch keeps its full history"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

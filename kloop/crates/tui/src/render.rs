@@ -216,6 +216,9 @@ pub fn input_view(input: &str, cursor: usize, width: usize) -> (String, u16) {
 }
 
 pub fn status_line(app: &App) -> String {
+    if app.fork_picker.is_some() {
+        return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
+    }
     if !app.confirms.is_empty() {
         return "awaiting approval".into();
     }
@@ -224,7 +227,7 @@ pub fn status_line(app: &App) -> String {
         return format!("working… {note}  (Ctrl+C to interrupt)");
     }
     format!(
-        "session {} — Enter to send · /help for commands · Ctrl+D to quit",
+        "session {} — Enter to send · /help for commands · Ctrl+R to rewind · Ctrl+D to quit",
         app.session_id
     )
 }
@@ -254,11 +257,58 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (visible, x) = input_view(&app.input, app.cursor, input_width.max(2));
     f.render_widget(Paragraph::new(format!("> {visible}")), input_area);
 
-    if app.confirms.is_empty() {
-        f.set_cursor_position((input_area.x + 2 + x, input_area.y));
-    } else {
+    if !app.confirms.is_empty() {
         draw_confirm(f, app, f.area());
+    } else if app.fork_picker.is_some() {
+        draw_fork_picker(f, app, f.area());
+    } else {
+        f.set_cursor_position((input_area.x + 2 + x, input_area.y));
     }
+}
+
+/// The rewind picker popup (plan 18): one row per fork point, the cursor row
+/// reversed, windowed so the cursor stays visible in a tall list. The bottom
+/// border shows the cursor's position in the list.
+fn draw_fork_picker(f: &mut Frame, app: &App, area: Rect) {
+    let picker = app.fork_picker.as_ref().expect("checked some");
+    let popup_w = area.width.saturating_sub(4).clamp(20, 76);
+    let inner_w = usize::from(popup_w - 2);
+    let rows: Vec<Line> = picker
+        .points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let text = truncate(&format!("#{}  {}", p.seq, p.preview), inner_w);
+            let style = if i == picker.cursor {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    // border(2) is the only overhead; window the rows so the cursor is visible.
+    let avail = usize::from(area.height);
+    let popup_h = (rows.len() + 2).min(avail).max(3);
+    let content_h = popup_h - 2;
+    let scroll = picker.cursor.saturating_sub(content_h - 1);
+    let end = (scroll + content_h).min(rows.len());
+    let visible = rows[scroll..end].to_vec();
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
+        width: popup_w,
+        height: popup_h as u16,
+    };
+    let block = Block::bordered()
+        .title("rewind — ↑↓ enter esc")
+        .title_bottom(
+            Line::from(format!("{}/{}", picker.cursor + 1, picker.points.len())).right_aligned(),
+        );
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(visible).block(block), popup);
 }
 
 fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {

@@ -26,6 +26,7 @@ use std::time::UNIX_EPOCH;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::inbox::STEERING_PREFIX;
 use crate::tools::interrupted;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -355,10 +356,12 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
     Ok(path)
 }
 
-/// Seqs after which the file may be cut: every line whose successor starts
-/// a fresh user turn, plus the last line.
-fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
-    let opens_user_turn = |line: &RolloutLine| match line {
+/// A line that begins a fresh user turn: a plain user message (a tool_result
+/// carrier is the tail of the previous turn, not a new one). This is the cut
+/// boundary both `legal_cut_seqs` and `fork_points` key off, so a fork point
+/// the picker offers is always one `fork_session` will accept.
+fn opens_user_turn(line: &RolloutLine) -> bool {
+    match line {
         RolloutLine::Message { message, .. } => {
             message.role == Role::User
                 && !message
@@ -367,7 +370,12 @@ fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         }
         RolloutLine::Compacted { .. } => false,
-    };
+    }
+}
+
+/// Seqs after which the file may be cut: every line whose successor starts
+/// a fresh user turn, plus the last line.
+fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
     lines
         .iter()
         .enumerate()
@@ -380,6 +388,64 @@ fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
             seq_of(meta)
         })
         .collect()
+}
+
+/// A turn boundary a live session can rewind to: the cut `seq` plus a preview
+/// of the user message that opens the turn dropped by cutting there — what the
+/// TUI shows as "rewind to before this".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPoint {
+    pub seq: u64,
+    pub preview: String,
+}
+
+/// The rewind targets of a live session, oldest first. Each is a legal cut whose
+/// next line starts a user turn, paired with that turn's opening message — so the
+/// caller picks by content, never by raw seq. Excludes the tip (rewinding to the
+/// current end is a no-op) and the first turn (nothing precedes it). The seqs are
+/// exactly the non-tip entries of `legal_cut_seqs`, so `fork_session` accepts any
+/// of them. Reads the whole file.
+pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
+    let raw = std::fs::read_to_string(path)?;
+    let (lines, _) = intact_lines(&raw);
+    let mut points = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        // The tip has no successor: skip it (a no-op rewind).
+        let Some(next) = lines.get(i + 1) else {
+            continue;
+        };
+        if !opens_user_turn(next) {
+            continue;
+        }
+        let RolloutLine::Message { message, .. } = next else {
+            continue;
+        };
+        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
+        points.push(ForkPoint {
+            seq: seq_of(meta),
+            preview: user_turn_preview(message),
+        });
+    }
+    Ok(points)
+}
+
+/// A one-line gist of a user turn's opening message for the rewind picker: the
+/// first text block, with steering framing stripped (a steer is `PREFIX\ntext`)
+/// and whitespace collapsed. Empty if the message carries no text.
+fn user_turn_preview(message: &Message) -> String {
+    let text = message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("");
+    let text = text
+        .strip_prefix(STEERING_PREFIX)
+        .map(str::trim_start)
+        .unwrap_or(text);
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Where a session was forked from: the first line's cross-file parent
@@ -1104,6 +1170,66 @@ mod tests {
             load_session(&second).unwrap(),
             load_session(&first).unwrap()
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_points_list_turn_boundaries_with_previews() {
+        let path = temp_file("forkpoints");
+        seed_forkable(&path);
+        // seed_forkable's legal cuts are {4, 6}; #6 is the tip (a no-op rewind)
+        // so only #4 remains, previewed by the turn it drops (user "two").
+        assert_eq!(
+            fork_points(&path).unwrap(),
+            vec![ForkPoint {
+                seq: 4,
+                preview: "two".into(),
+            }]
+        );
+        // Every offered seq is one fork_session accepts.
+        for point in fork_points(&path).unwrap() {
+            let dir = path.parent().unwrap();
+            assert!(fork_session(&path, Some(point.seq), dir).is_ok());
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_points_strip_steering_framing_and_skip_the_tip() {
+        let path = temp_file("forkpointsteer");
+        let mut rollout = Rollout::new(path.clone());
+        for m in [
+            Message::user_text("start"),
+            Message::assistant(vec![tool_use("t1")]),
+            Message::tool_results(vec![tool_result("t1")]),
+            // A mid-turn steer is a user message with no tool_result block, so
+            // it opens a turn the picker can rewind to — shown by its own words.
+            Message::user_text(format!("{STEERING_PREFIX}\nmid-turn nudge")),
+            Message::assistant(vec![ContentBlock::Text { text: "ok".into() }]),
+        ] {
+            rollout.append_message(&m).unwrap();
+        }
+        assert_eq!(
+            fork_points(&path).unwrap(),
+            vec![ForkPoint {
+                seq: 3,
+                preview: "mid-turn nudge".into(),
+            }]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_points_of_a_single_turn_session_is_empty() {
+        let path = temp_file("forkpointsone");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("only")).unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "hi".into(),
+            }]))
+            .unwrap();
+        assert!(fork_points(&path).unwrap().is_empty());
         cleanup(&path);
     }
 

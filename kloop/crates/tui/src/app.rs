@@ -11,6 +11,7 @@ use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
 use kloop_core::tools::TodoStatus;
 use kloop_protocol::ContentBlock;
@@ -68,6 +69,14 @@ pub struct PendingConfirm {
     reply: oneshot::Sender<Decision>,
 }
 
+/// The open rewind picker (plan 18): the fork targets the worker read off the
+/// session file, and which one the cursor sits on. Only present while the user
+/// is choosing; selecting or cancelling clears it.
+pub struct ForkPicker {
+    pub points: Vec<ForkPoint>,
+    pub cursor: usize,
+}
+
 /// What the event loop must do after a key was handled; the side-effectful
 /// counterpart to the pure state change already applied.
 #[derive(Debug, PartialEq, Eq)]
@@ -75,6 +84,12 @@ pub enum Command {
     None,
     /// Send this user text to the agent task (a turn is now running).
     Submit(String),
+    /// Ask the worker for this session's rewind targets (Ctrl+R, idle only).
+    /// The worker replies with a `ForkPoints` event that opens the picker.
+    RequestForkPoints,
+    /// Rewind History onto the fork cut at this seq (the picker's selection).
+    /// The worker forks, swaps History, and replies with a `Forked` event.
+    Fork(u64),
     /// Run this slash-command line (`/help`, `/compact`, …) on the worker,
     /// which owns History. Only produced when idle; the worker replies with a
     /// System block and a TurnEnded that clears the busy state.
@@ -117,6 +132,9 @@ pub struct App {
     /// Index of the current turn's Todo cell, updated in place as the model
     /// rewrites its list; reset each new user turn so a fresh block starts.
     todo_cell: Option<usize>,
+    /// The rewind picker while it is open (Ctrl+R when idle); None otherwise.
+    /// While open it captures the keyboard, like a confirm prompt.
+    pub fork_picker: Option<ForkPicker>,
 }
 
 impl App {
@@ -136,6 +154,7 @@ impl App {
             tool_cells: HashMap::new(),
             agent_cells: HashMap::new(),
             todo_cell: None,
+            fork_picker: None,
         }
     }
 
@@ -277,6 +296,43 @@ impl App {
                 self.thinking_open = false;
                 self.last_note = None;
             }
+            AgentEvent::ForkPoints(points) => {
+                if points.is_empty() {
+                    self.cells
+                        .push(Cell::System("nothing to rewind to yet".into()));
+                } else {
+                    // Points are oldest-first; the newest turn (bottom of the
+                    // list) is the usual rewind target, so start the cursor there.
+                    let cursor = points.len() - 1;
+                    self.fork_picker = Some(ForkPicker { points, cursor });
+                }
+            }
+            AgentEvent::Forked {
+                session_id,
+                messages,
+            } => {
+                // History was swapped to the fork; rebuild the view to match its
+                // truncated content, exactly like resuming into a session.
+                self.session_id = session_id;
+                self.cells = cells_from_history(&messages);
+                // cells_from_history tags the tail "resumed session"; relabel it
+                // so the transcript says a rewind happened, not a resume.
+                if matches!(self.cells.last(), Some(Cell::Note(_))) {
+                    self.cells.pop();
+                    self.cells.push(Cell::Note(format!(
+                        "rewound — {} message(s) kept",
+                        messages.len()
+                    )));
+                }
+                self.tool_cells.clear();
+                self.agent_cells.clear();
+                self.todo_cell = None;
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = None;
+                self.scroll_up = 0;
+                self.fork_picker = None;
+            }
             AgentEvent::Confirm { req, reply } => {
                 self.confirms.push_back(PendingConfirm { req, reply });
             }
@@ -321,6 +377,10 @@ impl App {
         if !self.confirms.is_empty() {
             return self.on_confirm_key(key);
         }
+        // So does an open rewind picker.
+        if self.fork_picker.is_some() {
+            return self.on_fork_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
             (KeyCode::Char('d'), true) => return Command::Quit,
@@ -330,6 +390,13 @@ impl App {
                 }
                 self.input.clear();
                 self.cursor = 0;
+            }
+            (KeyCode::Char('r'), true) => {
+                // Rewind (plan 18) is idle-only: a running turn owns History, so
+                // Ctrl+R is ignored mid-turn. The worker answers with ForkPoints.
+                if !self.running {
+                    return Command::RequestForkPoints;
+                }
             }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
@@ -430,6 +497,38 @@ impl App {
         // a/p degrade to allow-once in the gate when the call isn't
         // remember-able, same as the plain REPL.
         let _ = pending.reply.send(decision);
+        Command::None
+    }
+
+    /// Keys while the rewind picker is open. ↑↓/kj move the cursor, Enter forks
+    /// at the selected point, Esc/Ctrl+C back out without touching History.
+    fn on_fork_key(&mut self, key: KeyEvent) -> Command {
+        let picker = self.fork_picker.as_mut().expect("checked some");
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => return Command::Quit,
+                KeyCode::Char('c') => self.fork_picker = None,
+                _ => {}
+            }
+            return Command::None;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.cursor = (picker.cursor + 1).min(picker.points.len() - 1);
+            }
+            KeyCode::Enter => {
+                // The picker is only opened with a non-empty list, so the cursor
+                // always indexes a real point.
+                let seq = picker.points[picker.cursor].seq;
+                self.fork_picker = None;
+                return Command::Fork(seq);
+            }
+            KeyCode::Esc => self.fork_picker = None,
+            _ => {}
+        }
         Command::None
     }
 }
@@ -885,6 +984,90 @@ mod tests {
         assert!(app.cells.is_empty());
         assert!(app.tool_cells.is_empty());
         assert_eq!(app.todo_cell, None);
+    }
+
+    fn fp(seq: u64, preview: &str) -> ForkPoint {
+        ForkPoint {
+            seq,
+            preview: preview.into(),
+        }
+    }
+
+    /// Ctrl+R asks for rewind targets only when idle; a running turn owns
+    /// History, so it is ignored mid-turn.
+    #[test]
+    fn ctrl_r_requests_fork_points_only_when_idle() {
+        let mut app = App::new("s".into());
+        assert_eq!(app.on_key(ctrl('r')), Command::RequestForkPoints);
+        app.running = true;
+        assert_eq!(app.on_key(ctrl('r')), Command::None);
+    }
+
+    /// The picker opens on ForkPoints with the cursor on the newest turn; ↑
+    /// moves it, other keys are swallowed (not typed into the input), and Enter
+    /// forks at the selected seq and closes the picker.
+    #[test]
+    fn fork_picker_navigates_and_selects() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "two"), fp(6, "three")]));
+        assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 1, "starts newest");
+
+        // A stray character is captured by the picker, not inserted as input.
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.input, "");
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 0);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::Fork(4));
+        assert!(app.fork_picker.is_none(), "selecting closes the picker");
+    }
+
+    /// Esc backs out of the picker without forking.
+    #[test]
+    fn fork_picker_esc_cancels() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "two")]));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert!(app.fork_picker.is_none());
+    }
+
+    /// Nothing to rewind to surfaces as a System note, not an empty picker.
+    #[test]
+    fn empty_fork_points_note_instead_of_picker() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![]));
+        assert!(app.fork_picker.is_none());
+        assert_eq!(
+            app.cells.last(),
+            Some(&Cell::System("nothing to rewind to yet".into()))
+        );
+    }
+
+    /// A completed rewind rebuilds the transcript from the fork's history and
+    /// adopts its session id.
+    #[test]
+    fn forked_rebuilds_transcript_and_adopts_session_id() {
+        let mut app = App::new("old".into());
+        app.cells.push(Cell::User("stale".into()));
+        app.apply(AgentEvent::Forked {
+            session_id: "new".into(),
+            messages: vec![
+                Message::user_text("one"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+            ],
+        });
+        assert_eq!(app.session_id, "new");
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::User("one".into()),
+                Cell::Assistant("done".into()),
+                Cell::Note("rewound — 2 message(s) kept".into()),
+            ]
+        );
+        assert!(app.fork_picker.is_none());
     }
 
     #[test]

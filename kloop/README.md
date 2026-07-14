@@ -119,7 +119,15 @@ Server mode exposes the same mechanism as `thread/fork {threadId, cut?}`
 live thread (like `thread/resume`), and returns `{threadId, messageCount}` so
 the client can `turn/start` on it right away. The source need not be an active
 thread — forking reads the file directly, so a dormant history can be branched.
-TUI key-driven cut selection is still deferred.
+
+In the TUI, **Ctrl+R** (when idle) opens a rewind picker: it lists the turn
+boundaries the session can rewind to — each previewed by the user message it
+would drop — and Enter forks at the chosen point *in place*. Unlike `--fork`,
+you don't leave the session: History swaps onto the branch, the transcript
+rebuilds to the earlier state, and the next message continues the new branch
+(the old one stays on disk, forkable/resumable). Esc cancels. The picker's
+points are exactly the cuts `fork_session` accepts, so a selection can never be
+rejected. Rewind is idle-only — a running turn owns History (Ctrl+C first).
 
 ### Sub-agent sessions
 
@@ -254,10 +262,12 @@ logic testable without a terminal. Streaming deltas are drained in batches so
 a burst of tokens redraws once, not per token.
 
 Keys: Enter sends when idle, or **steers** while a turn runs (see below);
-Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+D
-quits, Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom
-on send). While an approval popup is up it captures the keyboard: the same
-scroll keys (plus j/k) page through a tall diff, y/a/p/n answer. `--plain`
+Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+R (idle)
+opens the rewind picker (see [Fork](#fork-and-rewind)), Ctrl+D quits,
+Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom on
+send). While an approval popup or the rewind picker is up it captures the
+keyboard: for approvals the scroll keys (plus j/k) page through a tall diff and
+y/a/p/n answer; for rewind ↑↓/kj move and Enter/Esc select or cancel. `--plain`
 keeps the old line-based REPL.
 
 `--resume` replays the saved session into the transcript (user/assistant

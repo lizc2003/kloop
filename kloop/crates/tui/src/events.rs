@@ -9,7 +9,9 @@ use kloop_core::agent::Ui;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
+use kloop_protocol::Message;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -27,6 +29,16 @@ pub enum AgentEvent {
     System(String),
     /// `/clear` emptied History; the loop resets its transcript view to match.
     ClearTranscript,
+    /// The rewind targets the worker read off the session file (plan 18): the
+    /// UI loop opens the fork picker with them. Empty means nothing to rewind
+    /// to, surfaced as a System note instead.
+    ForkPoints(Vec<ForkPoint>),
+    /// A rewind completed: History now holds this forked branch, so the loop
+    /// rebuilds the transcript from `messages` and adopts the new `session_id`.
+    Forked {
+        session_id: String,
+        messages: Vec<Message>,
+    },
     /// `agent` is "" for the main agent's own calls, "agent-N" for calls a
     /// sub-agent makes — parallel sub-agents interleave on this stream.
     ToolStart {
