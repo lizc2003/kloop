@@ -231,8 +231,8 @@ mod tests {
             &'a self,
             tool: &'a str,
             _input: &'a Value,
-        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-            Box::pin(async move { Ok(format!("ran {tool}")) })
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move { Ok(crate::tools::SourceOutput::text(format!("ran {tool}"))) })
         }
     }
 

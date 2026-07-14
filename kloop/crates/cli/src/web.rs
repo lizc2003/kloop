@@ -14,6 +14,7 @@ use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
 
+use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ToolDef;
 use kloop_web::Brave;
@@ -132,8 +133,8 @@ impl ToolSource for WebToolSource {
         &'a self,
         tool: &'a str,
         input: &'a Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(self.tools.call(tool, input))
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+        Box::pin(async move { Ok(SourceOutput::text(self.tools.call(tool, input).await?)) })
     }
 }
 

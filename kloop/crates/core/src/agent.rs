@@ -343,6 +343,7 @@ async fn turn_rounds(
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_result: None,
         };
         let results = dispatch_tools(tool_uses, &ctx).await;
         // Record results BEFORE checking cancellation so every tool_use has a
@@ -1328,9 +1329,13 @@ mod tests {
                 tool: &'a str,
                 _input: &'a Value,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<crate::tools::SourceOutput>>
+                        + Send
+                        + 'a,
+                >,
             > {
-                Box::pin(async move { Ok(format!("ran {tool}")) })
+                Box::pin(async move { Ok(crate::tools::SourceOutput::text(format!("ran {tool}"))) })
             }
         }
         let source: Arc<dyn ToolSource> = Arc::new(Srv {

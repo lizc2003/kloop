@@ -711,6 +711,14 @@ top-level model still `tool_search`es to direct-call, and every other gate
 with MCP" — orchestrate several MCP tools + built-ins + `agent()` in one program
 with intermediate results off the context window.
 
+An MCP tool resolves to its structured `CallToolResult` object
+(`Promise<CallToolResult>` — `.content[]`, `.structuredContent`), not flat text,
+so a program reads typed fields without parsing (built-ins stay
+`Promise<string>`). The structured value rides a per-call sink on `ToolCtx`:
+`execute_tool` drops it there on a source hit and the bridge returns it to the
+program, while the model-facing tool_result still gets the flattened text. An
+`isError` result throws (the program `try/catch`es it), same as a built-in.
+
 **The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
 the exact same gated dispatch a direct call takes** — `run_one` (allowlist →
 deferred lock → hooks → permission gate → sandbox → execute) and `task_tool`. A
@@ -729,11 +737,9 @@ A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
-**Not done** (deferred): structured `CallToolResult<T>` results (a program gets
-the MCP tool's flattened text via `Promise<string>` and `JSON.parse`s it if
-needed); a token `budget` primitive; a richer progress view (cc's `/workflows`
-tree — kloop shows a flat live trace); background programs with `yield`/`wait`;
-saving a program for reuse with journal-based resume. See
+**Not done** (deferred): a token `budget` primitive; a richer progress view
+(cc's `/workflows` tree — kloop shows a flat live trace); background programs
+with `yield`/`wait`; saving a program for reuse with journal-based resume. See
 `docs/plan/24-code-mode.md` and `docs/plan/27-codemode-mcp-tools.md`.
 
 ## Running

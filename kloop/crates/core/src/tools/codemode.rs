@@ -102,10 +102,15 @@ impl CoreBridge {
 }
 
 impl HostBridge for CoreBridge {
-    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<String, String>> {
+    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>> {
         let safe = super::is_concurrency_safe(&name, &args, &self.ctx.cfg.tool_sources);
         let id = format!("run_program-{}", self.seq.fetch_add(1, Ordering::Relaxed));
-        let ctx = self.ctx.clone();
+        // Fresh per-call sink: execute_tool drops a source tool's structured
+        // CallToolResult here, so the program receives the object rather than
+        // the flattened text. One slot per call → concurrent calls never race.
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx = self.ctx.clone();
+        ctx.program_result = Some(slot.clone());
         let gate = self.gate.clone();
         Box::pin(async move {
             let _guard: Box<dyn std::any::Any + Send> = if safe {
@@ -123,7 +128,13 @@ impl HostBridge for CoreBridge {
             if is_error {
                 Err(content)
             } else {
-                Ok(content)
+                // Source (MCP) tools resolve to their structured CallToolResult;
+                // built-ins keep the string contract (text as a JSON string).
+                Ok(slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(Value::String(content)))
             }
         })
     }
@@ -155,18 +166,40 @@ impl HostBridge for CoreBridge {
 /// references converge on (typed API declarations markedly improve how reliably
 /// the model calls tools). Depth-0 only, like `task`.
 ///
-/// `callable` is the set declared with a full typed signature (built-ins, plus
-/// external source tools when they are inline). `deferred` is the source tools
-/// held behind the defer threshold: too many to type in full, so they get a
-/// compact name + description manifest instead — still callable at runtime, just
-/// without a declared signature (the model can `tool_search` one in a normal
-/// turn to see its schema before writing the program).
-pub(super) fn run_program_def(callable: &[ToolDef], deferred: &[ToolDef]) -> ToolDef {
-    let mut decls = String::from("declare const tools: {\n");
-    for def in callable.iter().filter(|d| is_program_callable(&d.name)) {
+/// `builtins` are declared returning `Promise<string>`. `sources` are inline
+/// external (MCP) tools, declared returning `Promise<CallToolResult>` (a program
+/// gets the structured result object, not flat text). `deferred` are source
+/// tools held behind the defer threshold: too many to type in full, so they get
+/// a compact name + description manifest instead — still callable at runtime and
+/// still returning a `CallToolResult`, just without a declared signature (the
+/// model can `tool_search` one in a normal turn to see its schema first).
+pub(super) fn run_program_def(
+    builtins: &[ToolDef],
+    sources: &[ToolDef],
+    deferred: &[ToolDef],
+) -> ToolDef {
+    let has_source_tools = !sources.is_empty() || !deferred.is_empty();
+    let mut decls = String::new();
+    if has_source_tools {
+        // Structured result an MCP tool resolves to (a subset of the MCP spec's
+        // CallToolResult; isError surfaces as a thrown exception, not here).
+        decls.push_str(
+            "type CallToolResult<T = unknown> = { content: Array<{ type: string; text?: string; [k: string]: unknown }>; structuredContent?: T; [k: string]: unknown };\n",
+        );
+    }
+    decls.push_str("declare const tools: {\n");
+    for def in builtins.iter().filter(|d| is_program_callable(&d.name)) {
         decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
         decls.push_str(&format!(
             "  {}(args: {}): Promise<string>;\n",
+            def.name,
+            ts_type(&def.schema)
+        ));
+    }
+    for def in sources {
+        decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
+        decls.push_str(&format!(
+            "  {}(args: {}): Promise<CallToolResult>;\n",
             def.name,
             ts_type(&def.schema)
         ));
@@ -200,9 +233,10 @@ Available API (TypeScript):\n```ts\n{decls}```"
     if !deferred.is_empty() {
         description.push_str(
             "\n\nThese additional tools are also callable on `tools` by name but are not typed \
-above (there are too many to declare in full). Call them directly as `tools.<name>(args)` — you \
-cannot call tool_search from inside a program. If you need a tool's exact argument schema, call \
-tool_search for it in a normal turn first, then write the program:\n",
+above (there are too many to declare in full). Call them directly as `tools.<name>(args)`; each \
+returns a `Promise<CallToolResult>`. You cannot call tool_search from inside a program — if you \
+need a tool's exact argument schema, call tool_search for it in a normal turn first, then write \
+the program:\n",
         );
         for def in deferred {
             description.push_str(&format!(

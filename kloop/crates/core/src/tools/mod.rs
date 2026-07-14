@@ -43,6 +43,26 @@ pub const TOOL_DEFER_THRESHOLD: usize = 30;
 /// adapter in the CLI. Implementations expose already-namespaced tool names
 /// (`{server}__{tool}`) so cross-source collisions are config mistakes, not
 /// the common case.
+/// What a [`ToolSource`] call yields: the flattened `text` a tool_result carries
+/// (the model-facing path) plus an optional `structured` value a code-mode
+/// program receives instead — an MCP tool's raw `CallToolResult` object, so a
+/// program can read `.structuredContent` / `.content` without parsing text.
+/// `structured: None` → a program gets `text` as a JS string, like a built-in.
+pub struct SourceOutput {
+    pub text: String,
+    pub structured: Option<Value>,
+}
+
+impl SourceOutput {
+    /// A text-only result (web tools, stubs): no structured form to hand a program.
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            structured: None,
+        }
+    }
+}
+
 pub trait ToolSource: Send + Sync {
     /// Tool definitions as advertised by the source (schema passed through).
     fn defs(&self) -> &[ToolDef];
@@ -51,14 +71,14 @@ pub trait ToolSource: Send + Sync {
     /// read-only — serial. (The permission gate is independent: external
     /// tools always ask unless covered by an allow rule or session cache.)
     fn is_readonly(&self, tool: &str) -> bool;
-    /// Execute one call. Ok(text) / Err(reason) map onto tool_result
-    /// content / is_error. Type-erased future for object safety, same shape
-    /// as `execute_tool`.
+    /// Execute one call. `Ok(SourceOutput)` carries the tool_result text (and an
+    /// optional structured form for programs); `Err(reason)` becomes is_error.
+    /// Type-erased future for object safety, same shape as `execute_tool`.
     fn call<'a>(
         &'a self,
         tool: &'a str,
         input: &'a Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>>;
 }
 
 /// Everything a tool execution needs; cheap to clone into spawned futures.
@@ -79,6 +99,12 @@ pub struct ToolCtx {
     /// sandbox, hooks) still applies — this is a discovery bypass, not a
     /// security one.
     pub from_program: bool,
+    /// Per-call sink the code-mode bridge sets so a source tool's structured
+    /// result (its `CallToolResult`) reaches the program instead of the
+    /// flattened text `run_one` returns. `execute_tool` fills it on a source
+    /// hit; the bridge reads it after `run_one`. One slot per call (each bridge
+    /// call clones the ctx), so concurrent program calls never collide.
+    pub program_result: Option<Arc<std::sync::Mutex<Option<Value>>>>,
 }
 
 /// Built-ins plus external sources, in registration order. A name collision
@@ -110,20 +136,20 @@ pub fn all_tool_defs(
         merged
     };
     // run_program is depth-0 only (like task). Now that sources are visible, its
-    // TypeScript API can list them: full declarations for inline source tools,
-    // or a compact manifest for deferred ones — both callable at runtime.
+    // TypeScript API can list them: full declarations for inline source tools
+    // (typed `Promise<CallToolResult>`), or a compact manifest for deferred
+    // ones — both callable at runtime.
     if depth == 0 {
-        let (callable, deferred) = if deferred_regime {
-            (
-                builtin_defs(0),
-                deferred_tool_defs(sources, defer_threshold),
-            )
+        let deferred = if deferred_regime {
+            deferred_tool_defs(sources, defer_threshold)
         } else {
-            let mut callable = builtin_defs(0);
-            callable.extend(inline_sources);
-            (callable, Vec::new())
+            Vec::new()
         };
-        defs.push(codemode::run_program_def(&callable, &deferred));
+        defs.push(codemode::run_program_def(
+            &builtin_defs(0),
+            &inline_sources,
+            &deferred,
+        ));
     }
     defs
 }
@@ -356,7 +382,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
 pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth);
     if depth == 0 {
-        defs.push(codemode::run_program_def(&defs, &[]));
+        defs.push(codemode::run_program_def(&defs, &[], &[]));
     }
     defs
 }
@@ -583,7 +609,15 @@ fn execute_tool<'a>(
             "task" => task::task_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
-                Some(source) => source.call(other, input).await,
+                Some(source) => {
+                    let out = source.call(other, input).await?;
+                    // A program call gets the structured form; the model-facing
+                    // path (and the tool_result) always gets the text.
+                    if let Some(slot) = &ctx.program_result {
+                        *slot.lock().unwrap() = out.structured;
+                    }
+                    Ok(out.text)
+                }
                 None => Err(anyhow!("unknown tool: {other}")),
             },
         }
@@ -651,6 +685,7 @@ pub(crate) mod testutil {
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_result: None,
         }
     }
 
@@ -734,12 +769,15 @@ mod tests {
             &'a self,
             tool: &'a str,
             input: &'a Value,
-        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
             Box::pin(async move {
                 if tool.ends_with("__fail") {
                     bail!("stub failure");
                 }
-                Ok(format!("echoed {}", input["text"].as_str().unwrap_or("?")))
+                Ok(SourceOutput::text(format!(
+                    "echoed {}",
+                    input["text"].as_str().unwrap_or("?")
+                )))
             })
         }
     }
@@ -1127,6 +1165,7 @@ mod tests {
             depth: 0,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_result: None,
         };
         let results = dispatch_tools(
             vec![

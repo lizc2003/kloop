@@ -172,10 +172,11 @@ impl McpClient {
         Ok(tools)
     }
 
-    /// One tools/call with the RAW tool name. `isError: true` (a successful
-    /// JSON-RPC response marking a failed tool run) surfaces as Err with the
-    /// rendered content as the message, exactly like a failing built-in.
-    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {
+    /// One tools/call with the RAW tool name, returning the full structured
+    /// `CallToolResult` (content blocks, `structuredContent`, `_meta`, …).
+    /// `isError: true` (a successful JSON-RPC response marking a failed tool
+    /// run) surfaces as Err with the rendered content, like a failing built-in.
+    pub async fn call_tool_structured(&self, name: &str, arguments: &Value) -> Result<Value> {
         let result = self
             .request(
                 "tools/call",
@@ -183,11 +184,18 @@ impl McpClient {
                 CALL_TIMEOUT,
             )
             .await?;
-        let text = render_content(&result["content"]);
         if result["isError"].as_bool().unwrap_or(false) {
-            bail!("{text}");
+            bail!("{}", render_result(&result));
         }
-        Ok(text)
+        Ok(result)
+    }
+
+    /// The same call flattened to the plain text a tool_result carries — the
+    /// model-facing path. A program instead gets the structured result above.
+    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {
+        Ok(render_result(
+            &self.call_tool_structured(name, arguments).await?,
+        ))
     }
 
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -281,6 +289,13 @@ async fn read_loop(
     for (_, tx) in stranded {
         let _ = tx.send(Err(anyhow!("mcp server closed the connection")));
     }
+}
+
+/// Flatten a `CallToolResult`'s content array into the plain text a tool_result
+/// carries — the model-facing rendering. Exposed so the CLI can render the text
+/// side of a structured result without a second wire call.
+pub fn render_result(result: &Value) -> String {
+    render_content(&result["content"])
 }
 
 /// Flatten an MCP content array into the plain text a tool_result carries.

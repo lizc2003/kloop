@@ -239,7 +239,7 @@ fn run_program_def_renders_a_typescript_api() {
             schema: json!({"type": "object"}),
         },
     ];
-    let def = run_program_def(&defs, &[]);
+    let def = run_program_def(&defs, &[], &[]);
     let d = &def.description;
     assert_eq!(def.name, "run_program");
     assert!(d.contains("read_file(args: {"), "{d}");
@@ -295,8 +295,8 @@ fn program_surface_excludes_run_program_and_task() {
 // ---- External source (MCP) tools exposed to programs (plan 27) ----
 
 /// A minimal external tool source: `srv__echo` (read-only, echoes its `text`
-/// arg) and `srv__danger` (a mutating tool). Mirrors the shape an MCP tool
-/// reaches the code-mode bridge with.
+/// arg), `srv__danger` (a mutating tool), and `srv__data` (returns a structured
+/// CallToolResult). Mirrors the shape an MCP tool reaches the bridge with.
 struct Srv {
     defs: Vec<ToolDef>,
 }
@@ -315,6 +315,7 @@ fn srv() -> std::sync::Arc<dyn ToolSource> {
         defs: vec![
             def("srv__echo", "Echo the text argument back"),
             def("srv__danger", "A mutating tool"),
+            def("srv__data", "Return a structured result"),
         ],
     })
 }
@@ -324,17 +325,34 @@ impl ToolSource for Srv {
         &self.defs
     }
     fn is_readonly(&self, tool: &str) -> bool {
-        tool == "srv__echo"
+        tool == "srv__echo" || tool == "srv__data"
     }
     fn call<'a>(
         &'a self,
         tool: &'a str,
         input: &'a serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<crate::tools::SourceOutput>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("?");
-            Ok(format!("{tool} echoes {text}"))
+            if tool == "srv__data" {
+                // A real MCP CallToolResult: flat text plus structuredContent.
+                return Ok(crate::tools::SourceOutput {
+                    text: format!("count={}", text.len()),
+                    structured: Some(json!({
+                        "content": [{"type": "text", "text": format!("count={}", text.len())}],
+                        "structuredContent": {"len": text.len(), "echo": text}
+                    })),
+                });
+            }
+            Ok(crate::tools::SourceOutput::text(format!(
+                "{tool} echoes {text}"
+            )))
         })
     }
 }
@@ -397,4 +415,60 @@ fn program_surface_includes_source_tools() {
     assert!(names.iter().any(|n| n == "srv__danger"));
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
+}
+
+/// Slice 3: an MCP tool with a structured result reaches the program as the
+/// `CallToolResult` object (content blocks + structuredContent), not flat text,
+/// so the program reads typed fields directly. A built-in in the same program
+/// still returns a plain string.
+#[tokio::test]
+async fn program_receives_structured_calltoolresult_from_mcp() {
+    let ctx = test_ctx_with_sources(0, "mcp-structured", vec![srv()]);
+    let (out, is_error) = run(
+        r#"const r = await tools.srv__data({ text: "hello" });
+           const b = typeof (await tools.grep({ pattern: "zzz_nomatch_zzz" }));
+           return JSON.stringify({
+               structured: r.structuredContent.len,
+               echo: r.structuredContent.echo,
+               firstBlock: r.content[0].text,
+               builtinType: b,
+           });"#,
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    // structuredContent.len = "hello".len() = 5; content[0].text is the flat
+    // text; a built-in tool still resolves to a string.
+    assert_eq!(
+        out,
+        r#"{"structured":5,"echo":"hello","firstBlock":"count=5","builtinType":"string"}"#
+    );
+}
+
+/// Slice 3: inline source tools are declared returning `Promise<CallToolResult>`
+/// (built-ins keep `Promise<string>`), and the `CallToolResult` type is defined.
+#[test]
+fn run_program_def_types_source_tools_as_calltoolresult() {
+    let builtins = vec![ToolDef {
+        name: "read_file".into(),
+        description: "Read".into(),
+        schema: json!({"type": "object"}),
+    }];
+    let sources = vec![ToolDef {
+        name: "srv__data".into(),
+        description: "Structured".into(),
+        schema: json!({"type": "object"}),
+    }];
+    let def = run_program_def(&builtins, &sources, &[]);
+    let d = &def.description;
+    assert!(d.contains("type CallToolResult"), "{d}");
+    assert!(
+        d.contains("srv__data(args: Record<string, unknown>): Promise<CallToolResult>;"),
+        "{d}"
+    );
+    // Built-ins keep the string contract.
+    assert!(
+        d.contains("read_file(args: Record<string, unknown>): Promise<string>;"),
+        "{d}"
+    );
 }

@@ -42,8 +42,10 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub trait HostBridge: Send + Sync + 'static {
     /// `tools.<name>(args)` — run one tool call through core's full gate
     /// (allowlist → deferred lock → hooks → permission → sandbox → execute).
-    /// Ok(text) is the tool_result content; Err(reason) becomes a JS exception.
-    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<String, String>>;
+    /// Ok(value) resolves the JS promise as-is: a built-in tool yields a JSON
+    /// string, an MCP source tool its structured `CallToolResult` object.
+    /// Err(reason) becomes a JS exception.
+    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>>;
     /// `agent(prompt, opts)` — spawn a sub-agent (reuses core's task seam).
     fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>>;
     /// `log(msg)` — progress output surfaced to the user and appended to the
@@ -200,7 +202,8 @@ fn install_host_functions(ctx: &rquickjs::Ctx<'_>, bridge: Arc<dyn HostBridge>) 
             let bridge = agent_bridge.clone();
             async move {
                 let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-                envelope(bridge.call_agent(prompt, opts).await)
+                // agent() yields text; wrap it in the same value envelope as a tool.
+                envelope(bridge.call_agent(prompt, opts).await.map(Value::String))
             }
         }),
     )
@@ -220,8 +223,11 @@ fn install_host_functions(ctx: &rquickjs::Ctx<'_>, bridge: Arc<dyn HostBridge>) 
 
 /// Host-function results cross to JS as a JSON envelope so the prelude wrappers
 /// can turn an `Err` into a thrown exception without the engine needing to
-/// build a JS exception across an await boundary.
-fn envelope(result: Result<String, String>) -> String {
+/// build a JS exception across an await boundary. `value` is any JSON value —
+/// a string for built-ins/agent, an object for an MCP tool's CallToolResult —
+/// and the prelude returns it to the program after JSON.parse, so objects
+/// arrive as objects.
+fn envelope(result: Result<Value, String>) -> String {
     match result {
         Ok(value) => json!({ "ok": true, "value": value }).to_string(),
         Err(error) => json!({ "ok": false, "error": error }).to_string(),

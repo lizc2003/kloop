@@ -16,6 +16,7 @@ use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
 
+use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
 use kloop_mcp::McpClient;
 use kloop_protocol::ToolDef;
@@ -140,13 +141,20 @@ impl ToolSource for McpToolSource {
         &'a self,
         tool: &'a str,
         input: &'a Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
         Box::pin(async move {
             let raw = self
                 .raw_names
                 .get(tool)
                 .with_context(|| format!("unknown mcp tool: {tool}"))?;
-            self.client.call_tool(raw, input).await
+            // One wire call: the structured CallToolResult for a program, and
+            // its flattened text for the model-facing tool_result.
+            let structured = self.client.call_tool_structured(raw, input).await?;
+            let text = kloop_mcp::render_result(&structured);
+            Ok(SourceOutput {
+                text,
+                structured: Some(structured),
+            })
         })
     }
 }

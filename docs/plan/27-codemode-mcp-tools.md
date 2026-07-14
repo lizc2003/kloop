@@ -1,6 +1,6 @@
-# Plan 27 — code mode:MCP 工具暴露给 program(✅ 切片 1+2 完成)
+# Plan 27 — code mode:MCP 工具暴露给 program(✅ 切片 1+2+3 全部完成)
 
-> **✅ 切片 1+2 完成**(提交见文末完成记录;真 key 挂账、切片 3 挂账)。以下为原备忘;
+> **✅ 切片 1+2+3 全部完成**(提交见文末完成记录;三侧真 key 验收均过)。以下为原备忘;
 > 完成记录在文末。开工前读 HANDOFF + `docs/plan/24-code-mode.md`(首片 + 三个追加片
 > 完成记录 + 回源结论)+ `refs/README.md` 的 code-mode 一节。plan 24 已把 code-mode 的
 > 引擎/`exec`/op 层 gate/`agent()`/观测/`parallel`+`pipeline` 都做完并真机验收;本 plan
@@ -190,11 +190,44 @@ prompt = "这 10 个单词用 stub__analyze 拿统计,告诉我元音最多的 3
 **这正面印证 plan 27 论点**:补上"别人干不了的活"(MCP 扇出)后,聪明模型不再回退到逐次直调,
 而是自发用 code-mode 编排。教训 18 的闸门(独有生态位)是对的、且 plan 27 把它打开了。
 
-### 挂账
+### 切片 3(结构化 `CallToolResult`,已完成,2026-07-14,提交号 <待填>)
 
-- **切片 3**:结构化 `CallToolResult<T>` 结果(codex `description.rs` 有 `CallToolResult<T>` TS +
-  `mcp_structured_content_schema`;kloop `ToolSource::call` 现返 String 拍平文本,program 自己
-  JSON.parse)。若有真实结构化 MCP 需求再上。
+用户定"完整版"(不走精简"只补 structuredContent 到文本"路)。回源:codex 把工具结果作
+**结构化 JSON 对象**送进 JS(`code-mode/src/runtime/module_loader.rs` `resolve_tool_response`
+→ `json_to_v8`;`RuntimeCommand::ToolResponse{id,result}` 的 result 是原始 CallToolResult),
+program 拿 `Promise<CallToolResult<T>>`。kloop 原本一路字符串契约(wire `render_content` 拍平丢
+`structuredContent` → `ToolSource::call → String` → `HostBridge::call_tool → Result<String>` → JS 串)。
+
+3-crate 落地:
+- **kloop-mcp**:`call_tool_structured(name,args) -> Result<Value>` 保留原始 CallToolResult(isError
+  仍 → Err 带渲染文本);`call_tool -> Result<String>` 变薄壳 = `render_result(call_tool_structured?)`;
+  `render_result(&Value)` 提为 pub(CLI 渲染文本免二次 wire 调)。wire 契约测试零改(`call_tool`
+  语义不变)。
+- **core**:`ToolSource::call` 返回 `SourceOutput{text, structured: Option<Value>}`(6 impl 改,
+  非 MCP 用 `SourceOutput::text(..)`);`ToolCtx` 加**按调用旁路** `program_result:
+  Option<Arc<Mutex<Option<Value>>>>`;`execute_tool` source 臂命中时把 `out.structured` 投进旁路、
+  仍回 `out.text`(model 路径/tool_result 不变——protocol content 是文本)。**关键**:旁路是
+  per-call 的(CoreBridge 每次调用新建槽、设在 clone 的 ctx 上),故 `Promise.all` 并发调用互不串。
+- **codemode.rs**:`CoreBridge.call_tool -> Result<Value,String>`,run_one 回 String 后从旁路 `take()`
+  出结构化(有则回对象、无则 `Value::String(text)`——内置保持字符串契约);`run_program_def(builtins,
+  sources, deferred)` 三参,source 声明 `Promise<CallToolResult>` + 注入紧凑 `type CallToolResult` 定义,
+  内置仍 `Promise<string>`。
+- **engine(kloop-codemode)**:`HostBridge::call_tool -> Result<Value,String>`;`envelope` 收 Value——
+  prelude 本就 `JSON.parse` envelope,故对象天然作对象到达 JS,**prelude 零改**;`call_agent` 仍回
+  String,包成 `Value::String` 过同一 envelope。program 最终 `return` 值仍串化(`wrap_source` 不变)。
+
+isError 语义:结构化路径同字符串路径——isError → 抛异常(program `try/catch`),故解析出的
+CallToolResult 只在成功时到手、不带 isError:true(TS 类型省略 isError)。
+
+**真 key 验收(anthropic 轨,已过)**:stub `analyze(word)` 返回带 `structuredContent{word,vowels,length}`
+的 CallToolResult;模型写 program `const r = await tools.stub__analyze({word:"elderberry"}); return
+{vowels: r.structuredContent.vowels, length: r.structuredContent.length, firstText: r.content[0].text}`
+→ `{"vowels":3,"length":10,"firstText":"elderberry: 3 vowels"}`,**直接读结构化字段、免解析**,全链
+(wire structuredContent → SourceOutput → 旁路 → Value → JS 对象)跑通。
+
+### 挂账(切片 3 后)
+
+- 无 code-mode-MCP 侧挂账。code-mode 其余挂账见 plan 24(budget / 后台 yield-wait / 保存复用),不在本 plan。
 
 ### 教训
 

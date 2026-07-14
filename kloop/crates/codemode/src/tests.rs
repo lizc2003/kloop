@@ -33,7 +33,7 @@ impl TestBridge {
 }
 
 impl HostBridge for TestBridge {
-    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<String, String>> {
+    fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>> {
         let behavior = self.behavior;
         let barrier = self.barrier.clone();
         Box::pin(async move {
@@ -41,7 +41,7 @@ impl HostBridge for TestBridge {
                 b.wait().await;
             }
             match behavior {
-                Behavior::Echo => Ok(format!("{name}({args})")),
+                Behavior::Echo => Ok(Value::String(format!("{name}({args})"))),
                 Behavior::Fail => Err(format!("tool {name} refused")),
             }
         })
