@@ -296,7 +296,7 @@ fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
             .and_then(|v| v.as_str())
             .with_context(|| format!("hooks[{i}] needs an 'event' string"))?;
         let event = HookEvent::parse(event).with_context(|| {
-            format!("hooks[{i}] has unknown event '{event}' (pre_turn | post_turn | pre_tool | post_tool)")
+            format!("hooks[{i}] has unknown event '{event}' (pre_turn | post_turn | pre_tool | post_tool | subagent_start | subagent_stop)")
         })?;
         let command: Vec<String> = spec
             .get("command")

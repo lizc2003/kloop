@@ -10,6 +10,7 @@
 //! as extra user-message context. Same semantics as cc's hooks, minus the
 //! structured-JSON stdout protocol.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -27,6 +28,14 @@ pub enum HookEvent {
     PostTurn,
     PreTool,
     PostTool,
+    /// A sub-agent's turn start/end. A sub-agent fires these INSTEAD of
+    /// pre_turn/post_turn (its main-agent counterparts) — the shape both cc
+    /// (Stop→SubagentStop) and codex ("child turns run SubagentStop") agree
+    /// on. subagent_stop carries the sub-agent's own transcript path (plan 17
+    /// slice 3) and its final message, so an audit/notification hook gets "this
+    /// sub-agent finished, here is its record and result".
+    SubagentStart,
+    SubagentStop,
 }
 
 impl HookEvent {
@@ -36,6 +45,8 @@ impl HookEvent {
             HookEvent::PostTurn => "post_turn",
             HookEvent::PreTool => "pre_tool",
             HookEvent::PostTool => "post_tool",
+            HookEvent::SubagentStart => "subagent_start",
+            HookEvent::SubagentStop => "subagent_stop",
         }
     }
 
@@ -45,12 +56,23 @@ impl HookEvent {
             "post_turn" => Some(HookEvent::PostTurn),
             "pre_tool" => Some(HookEvent::PreTool),
             "post_tool" => Some(HookEvent::PostTool),
+            "subagent_start" => Some(HookEvent::SubagentStart),
+            "subagent_stop" => Some(HookEvent::SubagentStop),
             _ => None,
         }
     }
 
     pub fn is_tool_event(self) -> bool {
         matches!(self, HookEvent::PreTool | HookEvent::PostTool)
+    }
+
+    /// Events on which exit code 2 is an explicit block (the rest fail open).
+    /// The "start"/"pre" events, where blocking still means something.
+    fn can_block(self) -> bool {
+        matches!(
+            self,
+            HookEvent::PreTurn | HookEvent::PreTool | HookEvent::SubagentStart
+        )
     }
 }
 
@@ -86,6 +108,16 @@ pub fn context_message(event: HookEvent, stdout: &str) -> String {
     format!("[{} hook]\n{}", event.name(), stdout.trim_end())
 }
 
+/// Add the `agent` field to a tool-event payload only when it names a
+/// sub-agent, so main-agent payloads stay byte-identical (cc/codex both omit
+/// the sub-agent id on main-thread tool events).
+fn with_agent(mut event: Value, agent: &str) -> Value {
+    if !agent.is_empty() {
+        event["agent"] = Value::String(agent.to_string());
+    }
+    event
+}
+
 impl Hooks {
     pub fn none() -> Self {
         Hooks::default()
@@ -104,46 +136,107 @@ impl Hooks {
         }
     }
 
+    /// `agent` is the sub-agent label ("agent-N") when a sub-agent's tool call
+    /// triggered this, or "" for the main agent. Both cc and codex carry an
+    /// `agent_id` present only on sub-agent tool events; kloop mirrors that by
+    /// adding the `agent` field only when non-empty, so main-agent payloads
+    /// stay byte-identical.
     pub async fn pre_tool(
         &self,
         session_id: &str,
+        agent: &str,
         tool_name: &str,
         tool_input: &Value,
         ui: &dyn Ui,
     ) -> HookDecision {
-        let event = json!({
-            "event": "pre_tool",
-            "session_id": session_id,
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-        });
+        let event = with_agent(
+            json!({
+                "event": "pre_tool",
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            }),
+            agent,
+        );
         self.run_event(HookEvent::PreTool, Some(tool_name), &event, ui)
             .await
     }
 
+    // The event fields plus the agent label and ui sink add up past the lint's
+    // threshold; they are all distinct primitives, so a params struct would
+    // only add ceremony.
+    #[allow(clippy::too_many_arguments)]
     pub async fn post_tool(
         &self,
         session_id: &str,
+        agent: &str,
         tool_name: &str,
         tool_input: &Value,
         tool_result: &str,
         is_error: bool,
         ui: &dyn Ui,
     ) -> Vec<String> {
-        let event = json!({
-            "event": "post_tool",
-            "session_id": session_id,
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-            "tool_result": tool_result,
-            "is_error": is_error,
-        });
+        let event = with_agent(
+            json!({
+                "event": "post_tool",
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "tool_result": tool_result,
+                "is_error": is_error,
+            }),
+            agent,
+        );
         match self
             .run_event(HookEvent::PostTool, Some(tool_name), &event, ui)
             .await
         {
             HookDecision::Allow { context } => context,
             HookDecision::Block { .. } => unreachable!("post events never block"),
+        }
+    }
+
+    /// A sub-agent's turn is starting (its counterpart to pre_turn). Fires only
+    /// for sub-agents; `agent` is the label ("agent-N"). Can block like
+    /// pre_turn — a policy hook may refuse to let a sub-agent run.
+    pub async fn subagent_start(&self, session_id: &str, agent: &str, ui: &dyn Ui) -> HookDecision {
+        let event = json!({
+            "event": "subagent_start",
+            "session_id": session_id,
+            "agent": agent,
+        });
+        self.run_event(HookEvent::SubagentStart, None, &event, ui)
+            .await
+    }
+
+    /// A sub-agent's turn has ended (its counterpart to post_turn). Carries the
+    /// sub-agent's own transcript path (its session file, plan 17 slice 3; None
+    /// when the sub-agent ran in-memory) and its final assistant message, so an
+    /// audit/notification hook gets the record and the result. Context-only,
+    /// never blocks.
+    pub async fn subagent_stop(
+        &self,
+        session_id: &str,
+        agent: &str,
+        agent_transcript_path: Option<&Path>,
+        last_assistant_message: &str,
+        ui: &dyn Ui,
+    ) -> Vec<String> {
+        let mut event = json!({
+            "event": "subagent_stop",
+            "session_id": session_id,
+            "agent": agent,
+            "last_assistant_message": last_assistant_message,
+        });
+        if let Some(path) = agent_transcript_path {
+            event["agent_transcript_path"] = json!(path.to_string_lossy());
+        }
+        match self
+            .run_event(HookEvent::SubagentStop, None, &event, ui)
+            .await
+        {
+            HookDecision::Allow { context } => context,
+            HookDecision::Block { .. } => unreachable!("subagent_stop never blocks"),
         }
     }
 
@@ -175,18 +268,16 @@ impl Hooks {
                     stdout,
                     stderr,
                 } => {
-                    // Only the explicit block signal (exit 2 on a pre_*
+                    // Only the explicit block signal (exit 2 on a blocking
                     // event) blocks; any other non-zero exit is a hook
                     // malfunction and fails open.
-                    if code == BLOCK_EXIT_CODE
-                        && matches!(event, HookEvent::PreTurn | HookEvent::PreTool)
-                    {
+                    if code == BLOCK_EXIT_CODE && event.can_block() {
                         return HookDecision::Block {
                             reason: block_reason(&stderr, &stdout),
                         };
                     }
                     ui.note(&format!(
-                        "{} hook {:?} exited with {code}; proceeding (only exit {BLOCK_EXIT_CODE} blocks pre_* events)",
+                        "{} hook {:?} exited with {code}; proceeding (only exit {BLOCK_EXIT_CODE} blocks pre_*/subagent_start events)",
                         event.name(),
                         def.command
                     ));
@@ -332,7 +423,7 @@ mod tests {
                 defs: vec![sh(HookEvent::PreTool, script)],
             };
             let decision = hooks
-                .pre_tool("s-1", "bash", &json!({"command": "rm -rf /"}), &ui)
+                .pre_tool("s-1", "", "bash", &json!({"command": "rm -rf /"}), &ui)
                 .await;
             assert_eq!(
                 decision,
@@ -353,7 +444,7 @@ mod tests {
                 defs: vec![sh(HookEvent::PreTool, script)],
             };
             let ui = note_ui();
-            let decision = hooks.pre_tool("s-1", "bash", &json!({}), &ui).await;
+            let decision = hooks.pre_tool("s-1", "", "bash", &json!({}), &ui).await;
             assert_eq!(
                 decision,
                 HookDecision::Allow {
@@ -382,7 +473,7 @@ mod tests {
             ],
         };
         let ui = note_ui();
-        let decision = hooks.pre_tool("s-1", "bash", &json!({}), &ui).await;
+        let decision = hooks.pre_tool("s-1", "", "bash", &json!({}), &ui).await;
         assert!(matches!(decision, HookDecision::Block { .. }));
         assert!(!marker.exists(), "second hook must not have run");
     }
@@ -402,6 +493,7 @@ mod tests {
         hooks
             .post_tool(
                 "s-9",
+                "",
                 "bash",
                 &json!({"command": "ls"}),
                 "file-a\nfile-b",
@@ -435,7 +527,7 @@ mod tests {
         };
         let ui = note_ui();
         let started = std::time::Instant::now();
-        let decision = hooks.pre_tool("s-1", "bash", &json!({}), &ui).await;
+        let decision = hooks.pre_tool("s-1", "", "bash", &json!({}), &ui).await;
         assert_eq!(
             decision,
             HookDecision::Allow {
@@ -493,7 +585,7 @@ mod tests {
 
         // Non-matching tool: the hook does not even run.
         let decision = hooks
-            .pre_tool("s-1", "read_file", &json!({"path": "x"}), &ui)
+            .pre_tool("s-1", "", "read_file", &json!({"path": "x"}), &ui)
             .await;
         assert_eq!(
             decision,
@@ -504,7 +596,7 @@ mod tests {
         assert!(!marker.exists(), "hook must not run for read_file");
 
         // Matching tool: it runs and blocks.
-        let decision = hooks.pre_tool("s-1", "bash", &json!({}), &ui).await;
+        let decision = hooks.pre_tool("s-1", "", "bash", &json!({}), &ui).await;
         assert!(matches!(decision, HookDecision::Block { .. }));
         assert!(marker.exists());
         let _ = std::fs::remove_file(&marker);
@@ -519,7 +611,7 @@ mod tests {
         };
         let ui = note_ui();
         let context = hooks
-            .post_tool("s-1", "bash", &json!({}), "out", false, &ui)
+            .post_tool("s-1", "", "bash", &json!({}), "out", false, &ui)
             .await;
         assert_eq!(context, Vec::<String>::new());
         let notes = ui.0.lock().unwrap();
@@ -536,9 +628,126 @@ mod tests {
             HookEvent::PostTurn,
             HookEvent::PreTool,
             HookEvent::PostTool,
+            HookEvent::SubagentStart,
+            HookEvent::SubagentStop,
         ] {
             assert_eq!(HookEvent::parse(event.name()), Some(event));
         }
         assert_eq!(HookEvent::parse("on_tool"), None);
+    }
+
+    /// A sub-agent's tool call carries the `agent` field; the main agent's does
+    /// not (byte-identical to before).
+    #[tokio::test]
+    async fn tool_event_carries_agent_only_for_subagents() {
+        let capture = std::env::temp_dir().join(format!("kloop-hook-agent-{}", std::process::id()));
+        let read_event = |path: &Path| -> Value {
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap()
+        };
+        let ui = note_ui();
+
+        // Sub-agent: `agent` present.
+        let _ = std::fs::remove_file(&capture);
+        let hooks = Hooks {
+            defs: vec![sh(
+                HookEvent::PreTool,
+                &format!("cat > {}", capture.display()),
+            )],
+        };
+        hooks
+            .pre_tool("s-1", "agent-2", "bash", &json!({"command": "ls"}), &ui)
+            .await;
+        assert_eq!(read_event(&capture)["agent"], "agent-2");
+
+        // Main agent: no `agent` key at all.
+        let _ = std::fs::remove_file(&capture);
+        hooks
+            .pre_tool("s-1", "", "bash", &json!({"command": "ls"}), &ui)
+            .await;
+        assert_eq!(read_event(&capture).get("agent"), None);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// subagent_start can block (exit 2), just like pre_turn — a policy hook
+    /// may refuse to let a sub-agent run.
+    #[tokio::test]
+    async fn subagent_start_can_block() {
+        let hooks = Hooks {
+            defs: vec![sh(
+                HookEvent::SubagentStart,
+                "echo no subagents 1>&2; exit 2",
+            )],
+        };
+        let ui = note_ui();
+        let decision = hooks.subagent_start("s-1", "agent-1", &ui).await;
+        assert_eq!(
+            decision,
+            HookDecision::Block {
+                reason: "no subagents".into()
+            }
+        );
+    }
+
+    /// subagent_stop delivers the agent label, its own transcript path, and the
+    /// final assistant message; it never blocks (exit 2 only warns).
+    #[tokio::test]
+    async fn subagent_stop_payload_and_never_blocks() {
+        let capture =
+            std::env::temp_dir().join(format!("kloop-hook-substop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let hooks = Hooks {
+            defs: vec![sh(
+                HookEvent::SubagentStop,
+                &format!("cat > {}; exit 2", capture.display()),
+            )],
+        };
+        let ui = note_ui();
+        let transcript = std::path::PathBuf::from("/tmp/sessions/parent-agent-1.jsonl");
+        let context = hooks
+            .subagent_stop(
+                "parent",
+                "agent-1",
+                Some(&transcript),
+                "the sub-agent's answer",
+                &ui,
+            )
+            .await;
+        // exit 2 on a stop event is a malfunction, not a block: context is empty.
+        assert_eq!(context, Vec::<String>::new());
+        let event: Value =
+            serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        assert_eq!(
+            event,
+            json!({
+                "event": "subagent_stop",
+                "session_id": "parent",
+                "agent": "agent-1",
+                "agent_transcript_path": "/tmp/sessions/parent-agent-1.jsonl",
+                "last_assistant_message": "the sub-agent's answer",
+            })
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// An in-memory sub-agent (no session file) omits the transcript path.
+    #[tokio::test]
+    async fn subagent_stop_omits_transcript_when_in_memory() {
+        let capture =
+            std::env::temp_dir().join(format!("kloop-hook-substop-mem-{}", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let hooks = Hooks {
+            defs: vec![sh(
+                HookEvent::SubagentStop,
+                &format!("cat > {}", capture.display()),
+            )],
+        };
+        let ui = note_ui();
+        hooks
+            .subagent_stop("parent", "agent-1", None, "answer", &ui)
+            .await;
+        let event: Value =
+            serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
+        assert_eq!(event.get("agent_transcript_path"), None);
+        let _ = std::fs::remove_file(&capture);
     }
 }

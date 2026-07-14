@@ -349,13 +349,14 @@ tools ship inline and neither tool_search nor call_tool exists.
 
 ## Hooks (Phase 2, seventh slice)
 
-External command hooks fire at four points: before/after a turn
-(`pre_turn` / `post_turn`) and before/after a tool call (`pre_tool` /
-`post_tool`). Declare them in `.kloop/config.toml`:
+External command hooks fire at six points: before/after a turn
+(`pre_turn` / `post_turn`), before/after a tool call (`pre_tool` /
+`post_tool`), and around a sub-agent's turn (`subagent_start` /
+`subagent_stop`). Declare them in `.kloop/config.toml`:
 
 ```toml
 [[hooks]]
-event = "pre_tool"            # pre_turn | post_turn | pre_tool | post_tool
+event = "pre_tool"            # pre_turn|post_turn|pre_tool|post_tool|subagent_start|subagent_stop
 command = ["./guard.sh"]      # argv, not a shell string
 matcher = "bash"              # tool events only: exact tool-name filter
 timeout_ms = 5000             # optional, default 10000
@@ -364,15 +365,27 @@ timeout_ms = 5000             # optional, default 10000
 The event arrives as one line of JSON on the hook's stdin: `event` and
 `session_id` always, plus `tool_name`/`tool_input` on tool events and
 `tool_result`/`is_error` on `post_tool`. Exit code 0 allows; exit code **2
-blocks** on the pre_* events (cc's convention — a block must be an explicit
-signal): a blocked `pre_tool` call never runs and the model gets an is_error
-tool_result (`blocked by hook: …`, the reason read from stderr — stdout is
-the context channel), a blocked `pre_turn` means the turn never starts.
-Every other outcome fails **open** with a warning: any other exit code, exit
-2 on a post_* event, a spawn failure, a timeout — a broken hook script is a
-malfunction, not a policy decision (the permission gate is the enforcement
-layer). Whatever an allowing hook prints on stdout is injected into history
-as a `[{event} hook]`-prefixed user message the model sees.
+blocks** on the "start"/pre events — `pre_turn`, `pre_tool`, `subagent_start`
+(cc's convention — a block must be an explicit signal): a blocked `pre_tool`
+call never runs and the model gets an is_error tool_result (`blocked by hook:
+…`, the reason read from stderr — stdout is the context channel), a blocked
+`pre_turn`/`subagent_start` means the turn never starts. Every other outcome
+fails **open** with a warning: any other exit code, exit 2 on a stop/post
+event, a spawn failure, a timeout — a broken hook script is a malfunction,
+not a policy decision (the permission gate is the enforcement layer).
+Whatever an allowing hook prints on stdout is injected into history as a
+`[{event} hook]`-prefixed user message the model sees.
+
+**Sub-agents** (dispatched by the `task` tool) fire `subagent_start` /
+`subagent_stop` **instead of** `pre_turn` / `post_turn` — the split both cc
+(`Stop`→`SubagentStop`) and codex ("child turns run SubagentStop")
+converge on, so a "when the main agent finishes" hook and a "when a
+sub-agent finishes" hook are cleanly separable. `subagent_stop` carries the
+sub-agent's own `agent` label, its `agent_transcript_path` (the child session
+file, omitted for an in-memory sub-agent) and its `last_assistant_message`
+(the result) — enough for an audit or notification hook. A sub-agent's
+`pre_tool` / `post_tool` additionally carry an `agent` field (`agent-N`);
+main-agent tool events omit it, so their payload is byte-identical to before.
 
 Ordering with permissions: `pre_tool` hooks run **before** the permission
 gate — hooks are automation policy, the permission prompt is the human's

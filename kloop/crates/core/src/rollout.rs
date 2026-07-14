@@ -108,6 +108,12 @@ impl Rollout {
         self.last_id.as_deref()
     }
 
+    /// The session file this rollout writes to — surfaced in the subagent_stop
+    /// hook so an audit hook can point at the sub-agent's transcript.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         self.append_line(RolloutLine::Message {
             meta: self.next_meta(),

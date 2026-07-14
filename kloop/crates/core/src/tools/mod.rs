@@ -553,8 +553,9 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // there is nothing left to ask about.
         let hooks = &ctx.cfg.hooks;
         let session_id = &ctx.cfg.session_id;
+        let agent = &ctx.cfg.agent_label;
         match hooks
-            .pre_tool(session_id, &name, &input, ctx.ui.as_ref())
+            .pre_tool(session_id, agent, &name, &input, ctx.ui.as_ref())
             .await
         {
             crate::hooks::HookDecision::Block { reason } => {
@@ -581,6 +582,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         let context = hooks
             .post_tool(
                 session_id,
+                agent,
                 &name,
                 &input,
                 &content,

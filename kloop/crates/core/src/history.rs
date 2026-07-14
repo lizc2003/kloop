@@ -95,6 +95,12 @@ impl History {
         self.rollout.as_ref().and_then(Rollout::last_id)
     }
 
+    /// Path to this session's file, or None for an in-memory-only history.
+    /// The subagent_stop hook surfaces it as the sub-agent's transcript.
+    pub fn rollout_path(&self) -> Option<&Path> {
+        self.rollout.as_ref().map(Rollout::path)
+    }
+
     /// Record the provider-reported total context size (uncached + cached
     /// input + output — cached tokens still occupy the window) for the
     /// request whose response is the most recently recorded item.

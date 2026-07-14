@@ -2,6 +2,30 @@
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 agents 机制(`.claude/agents/*.md` frontmatter:独立 system prompt、工具白名单、模型 override;并行派发)、codex 的 subagent(SubagentStart/Stop 挂点、SubagentHookContext)。回源核对(教训 11)。
 
+## ✅ 完成记录(2026-07-14,切片 5:hook agent 字段 + SubagentStart/Stop)—— plan 17 全部切片完成
+
+**选片**:片 5(最后一片)。开工时用户定 **Option B(对齐两家)**,而非只加 agent 字段的最小 Option A——依据:两家独立收敛(教训 14)+ 片 3 刚落的子会话 transcript 让富 payload 可交付 + 用户"最合理不为省事砍"基调。
+
+**回源(两个 Explore 真读 cc + codex,file:line,坐实 plan 17 回源节的④)**:
+- **两家都成对有 SubagentStart + SubagentStop**,且都是"SessionStart/Stop 的子 agent 变体"——子 agent 触发 Subagent\* **而非**普通 Stop(cc `hooks.ts:3805` `subagentId ? 'SubagentStop' : 'Stop'`、frontmatter Stop 转 SubagentStop;codex `hook_runtime.rs:304-305` "Root turns run Stop; child turns run SubagentStop")。
+- **两家 SubagentStop 都带子会话 transcript + 结果摘要**:cc `agent_transcript_path` + `last_assistant_message`(`coreTypes.generated.ts:158-165`);codex `agent_transcript_path`(子)+ `transcript_path`(父)+ `last_assistant_message`(`schema.rs:579-595`,集成测试 `subagent_notifications.rs:750-766` 锁定)。SubagentStart 都极简(agent_id/type)。
+- **pre/post tool 都带可选 `agent_id`+`agent_type`**(仅 thread-spawn 子 agent 有,主 agent 省略,`skip_serializing_if`),都**无 depth**(cc depth 只在 analytics 埋点、不进 payload)。
+
+**kloop 取舍(照抄两家的分裂形状,字段名对齐,粒度按地基)**:
+- **两半**:① pre_tool/post_tool 加 `agent` 字段(`with_agent` 仅非空插入,主 payload 逐字节不变——对齐两家"主 agent 省略 agent_id");② 独立 `subagent_start`/`subagent_stop` 事件,子 agent(`agent_label` 非空)在 `run_turn` 里走这两个**而非** pre_turn/post_turn。
+- **subagent_stop payload**:`agent` + `agent_transcript_path`(子会话文件,`History::rollout_path`,in-memory 省略)+ `last_assistant_message`(`outcome.final_text`)。字段名照抄两家。**不抄**:父 transcript_path(kloop `session_id` 已是父 id,可派生)、depth(两家都无)、`agent_type`(kloop 未在子 Config 存类型名,记可能性)、stop_hook_active(kloop 无递归 stop 概念)。
+- **subagent_start** 可 block(同 pre_turn,`can_block` 含它),subagent_stop 只 context/不 block(同 post_turn)。
+- **kloop 一个子 agent = 一次 run_turn**,所以 post_turn 本可统一表达(见下方"为何仍分裂"),但分裂能带 transcript+result 富 payload,值得——照两家形状。
+- `HookEvent` 加两枚举 + name/parse;`run_event` 的 block 判定抽成 `event.can_block()`;`Rollout::path`/`History::rollout_path` getter;cli `load_hooks` 错误串列全 6 事件;matcher 仍只对 tool 事件(subagent 事件的 agent_type matcher 记可能性)。
+
+**为何仍分裂而非用 post_turn+agent 统一**(教训点):kloop `post_turn` 本是两家 Stop/SubagentStop 的统一版(一个子 agent = 一次 run_turn,post_turn 恰好每子触发一次)。但分裂成独立事件能让 subagent_stop 带**子 agent 专属的富 payload**(transcript 路径 + 结果),这是通用 post_turn 塞不进去的(会污染主 agent 的 post_turn 形状);且"主 agent 结束"与"某子 agent 结束"是 hook 脚本想分别挂的两件事。所以此处**照两家的分裂**,而非 kloop 地基更省的统一——与片 3"粒度按地基做更细"是一体两面(见教训 23)。
+
+**测试**(399,+5):hooks 单元(tool 事件 agent 仅子有主无、subagent_start 可 block、subagent_stop payload 全字段 + 不 block、in-memory 省略 transcript、6 事件名往返)+ agent.rs 路由集成(子 agent turn 触发 subagent_start/stop 而非 pre/post_turn、stop 带 agent/transcript/result)。
+
+**真 key 验收**(anthropic sonnet-5,`--plain --yolo`,配 pre_tool/subagent_stop/post_turn 三 hook):模型派子 agent 跑 `echo HOOKTEST_OK`——`pre_tool` 主 agent 的 `task` 调用无 agent 字段、子 agent 的 `bash` 调用带 `agent=agent-1`;`subagent_stop` 一次带 `agent=agent-1` + `agent_transcript_path=.kloop/sessions/…-agent-1.jsonl` + `last_assistant_message`(结果)+ `session_id`(父);`post_turn` 只主 agent 触发(keys 仅 event/session_id,子 agent 未触发)。**路由 + agent 字段 + 富 payload 全链闭环。**
+
+**提交**:见 HANDOFF 对应条目(fmt/clippy/test 全绿,399 测试)。**至此 plan 17 全部切片(1/2/3/4/5 + 片 6 由 plan 26 承接)完成,无挂账。**
+
 ## ✅ 完成记录(2026-07-14,切片 3:子 agent 历史持久化)
 
 **选片**:片 3(= plan 26 挂账的切片 5)。开工时用户定**统一落所有子 agent**(同步并行 task + 异步 background 一视同仁),依据是回源发现 cc/codex 都无差别对所有子 agent 落盘,且独立子文件能看到子 agent 的**完整工具调用过程**(父 tool_result 只有 final_text)。用户基调延续 plan 26:"要最合理的方案"。
@@ -58,7 +82,7 @@
 
 **提交**:f2944c5(fmt/clippy/test 全绿,266 个测试)。
 
-**挂账(未选切片,原样保留在下方候选)**:片 2(自定义 agent 类型——本次调研已备齐 cc frontmatter 字段表/路由/报错形态,见回源结论)、~~片 3(历史持久化,先做 plan 18)~~ **已完成(2026-07-14,统一落所有子 agent,见顶部完成记录)**、片 5(hook 事件带 agent 字段 + SubagentStart/Stop)、~~片 6(异步派发 + mailbox 回灌)~~ **已由 plan 26 承接完成**。另:并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流——都等有痛感再修。
+**挂账(全部已清)**:~~片 2(自定义 agent 类型)~~ **✅**、~~片 3(历史持久化)~~ **✅ 2026-07-14**、~~片 5(hook agent 字段 + SubagentStart/Stop)~~ **✅ 2026-07-14(Option B,见顶部完成记录)**、~~片 6(异步派发 + mailbox 回灌)~~ **✅ plan 26 承接**。**plan 17 五片全清**。残留小账(非切片,等痛感):并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流、subagent 事件的 agent_type matcher。
 
 ## 回源调研结论(2026-07-10,两家对齐)
 

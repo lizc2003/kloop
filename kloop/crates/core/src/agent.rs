@@ -111,13 +111,30 @@ pub async fn run_turn(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    match cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await {
+    // A sub-agent (agent_label set) fires subagent_start/subagent_stop instead
+    // of pre_turn/post_turn — the split both cc and codex converge on (a
+    // sub-agent's turn boundary is its own event, carrying its transcript and
+    // result). The main agent keeps the plain turn hooks.
+    let agent = &cfg.agent_label;
+    let start = if agent.is_empty() {
+        cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await
+    } else {
+        cfg.hooks
+            .subagent_start(&cfg.session_id, agent, ui.as_ref())
+            .await
+    };
+    match start {
         crate::hooks::HookDecision::Block { reason } => {
+            let which = if agent.is_empty() {
+                "pre_turn"
+            } else {
+                "subagent_start"
+            };
             return TurnOutcome {
-                reason: EndReason::Error(format!("turn blocked by pre_turn hook: {reason}")),
+                reason: EndReason::Error(format!("turn blocked by {which} hook: {reason}")),
                 final_text: String::new(),
                 rounds: 0,
-            }
+            };
         }
         crate::hooks::HookDecision::Allow { context } => {
             for text in context {
@@ -126,7 +143,22 @@ pub async fn run_turn(
         }
     }
     let outcome = turn_rounds(cfg, history, ui, cancel, depth).await;
-    for text in cfg.hooks.post_turn(&cfg.session_id, ui.as_ref()).await {
+    let stop_context = if agent.is_empty() {
+        cfg.hooks.post_turn(&cfg.session_id, ui.as_ref()).await
+    } else {
+        // Copy the transcript path out before the mutable record() borrow.
+        let transcript = history.rollout_path().map(|p| p.to_path_buf());
+        cfg.hooks
+            .subagent_stop(
+                &cfg.session_id,
+                agent,
+                transcript.as_deref(),
+                &outcome.final_text,
+                ui.as_ref(),
+            )
+            .await
+    };
+    for text in stop_context {
         history.record(Message::user_text(text));
     }
     outcome
@@ -664,6 +696,80 @@ mod tests {
                 is_error: false,
             }
         );
+    }
+
+    /// Slice 5 routing: a sub-agent's turn fires subagent_start/subagent_stop,
+    /// NOT pre_turn/post_turn (the split both references converge on), and
+    /// subagent_stop carries the agent label, the sub-agent's own transcript
+    /// path, and its final message.
+    #[tokio::test]
+    async fn subagent_turn_routes_to_subagent_hooks() {
+        use crate::hooks::{HookDef, HookEvent, Hooks, DEFAULT_TIMEOUT_MS};
+        let dir = std::env::temp_dir().join(format!("kloop-subhook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = |event, script: String| HookDef {
+            event,
+            command: vec!["sh".into(), "-c".into(), script],
+            matcher: None,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        };
+        let d = dir.display();
+        let hooks = Hooks {
+            defs: vec![
+                hook(HookEvent::PreTurn, format!("touch {d}/pre_turn")),
+                hook(HookEvent::PostTurn, format!("touch {d}/post_turn")),
+                hook(
+                    HookEvent::SubagentStart,
+                    format!("touch {d}/subagent_start"),
+                ),
+                hook(HookEvent::SubagentStop, format!("cat > {d}/subagent_stop")),
+            ],
+        };
+
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "sub answer".into(),
+        }]]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "subhook")).clone();
+        cfg.agent_label = "agent-7".into();
+        cfg.session_id = "parent-sess".into();
+        cfg.hooks = Arc::new(hooks);
+        let cfg = Arc::new(cfg);
+
+        // Give the sub-agent a session file so the stop payload has a transcript.
+        let session = dir.join("agent-7.jsonl");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+        history.record(Message::user_text("do sub work"));
+
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        assert!(dir.join("subagent_start").exists(), "subagent_start fired");
+        assert!(dir.join("subagent_stop").exists(), "subagent_stop fired");
+        assert!(
+            !dir.join("pre_turn").exists(),
+            "pre_turn must NOT fire for a sub-agent"
+        );
+        assert!(
+            !dir.join("post_turn").exists(),
+            "post_turn must NOT fire for a sub-agent"
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.join("subagent_stop"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(payload["agent"], "agent-7");
+        assert_eq!(
+            payload["agent_transcript_path"],
+            session.to_string_lossy().as_ref()
+        );
+        assert_eq!(payload["last_assistant_message"], "sub answer");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
