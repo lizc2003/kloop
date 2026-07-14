@@ -114,6 +114,13 @@ codex's `thread/fork` both copy, neither replays across files):
   dir-scanning counter already prevents clobbering), and usage anchors are
   not persisted, so a fork re-anchors on its first sampled response.
 
+Server mode exposes the same mechanism as `thread/fork {threadId, cut?}`
+(omit `cut` to fork at the end): it copies the prefix, spawns the fork as a
+live thread (like `thread/resume`), and returns `{threadId, messageCount}` so
+the client can `turn/start` on it right away. The source need not be an active
+thread — forking reads the file directly, so a dormant history can be branched.
+TUI key-driven cut selection is still deferred.
+
 ### Sub-agent sessions
 
 A sub-agent the `task` tool spawns (synchronous batch or `background: true`)
@@ -264,9 +271,9 @@ a blank screen.
 app-server: JSON-RPC 2.0 envelopes minus the `"jsonrpc"` field, one object
 per line) so IDEs and automation can drive multiple sessions concurrently.
 
-Methods: `thread/start`, `thread/resume {threadId}`, `thread/list`,
-`turn/start {threadId, input}`, `turn/steer {threadId, input}`,
-`turn/interrupt {threadId}`. Every thread is
+Methods: `thread/start`, `thread/resume {threadId}`,
+`thread/fork {threadId, cut?}`, `thread/list`, `turn/start {threadId, input}`,
+`turn/steer {threadId, input}`, `turn/interrupt {threadId}`. Every thread is
 its own tokio task owning a History (persisted to the same
 `.kloop/sessions/` files the interactive frontends use — sessions are
 interchangeable between the TUI and the server) and its own permission gate,

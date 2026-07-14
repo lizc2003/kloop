@@ -183,6 +183,7 @@ impl Server {
         let result = match method {
             "thread/start" => self.thread_start(),
             "thread/resume" => self.thread_resume(&params),
+            "thread/fork" => self.thread_fork(&params),
             "thread/list" => self.thread_list(),
             "turn/start" => self.turn_start(&params),
             "turn/steer" => self.turn_steer(&params),
@@ -252,6 +253,36 @@ impl Server {
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
         self.spawn_thread(thread_id.to_string(), history)?;
         Ok(json!({"threadId": thread_id, "messageCount": count}))
+    }
+
+    /// Fork a session at a cut point into a fresh thread, then spawn it live
+    /// (like `thread/resume`) so the client can `turn/start` on it immediately.
+    /// `cut` is optional — omit it to fork at the end. The source need not be an
+    /// active thread; forking reads the file directly, so a client can branch a
+    /// dormant history. `fork_session` copies the prefix and records cross-file
+    /// lineage; an illegal cut comes back as an error listing the legal points.
+    fn thread_fork(&mut self, params: &Value) -> MethodResult {
+        let src_id = str_param(params, "threadId")?;
+        let cut = match params.get("cut") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or((
+                wire::INVALID_PARAMS,
+                "'cut' must be a non-negative integer".to_string(),
+            ))?),
+        };
+        let src = rollout::session_path(&self.paths.sessions_dir, src_id);
+        if !src.exists() {
+            return Err((wire::SERVER_ERROR, format!("no session '{src_id}'")));
+        }
+        let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
+        let new_id = rollout::session_id_of(&new_path);
+        let (messages, rollout) = rollout::resume_session(&new_path)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume fork: {e}")))?;
+        let count = messages.len();
+        let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
+        self.spawn_thread(new_id.clone(), history)?;
+        Ok(json!({"threadId": new_id, "messageCount": count}))
     }
 
     fn thread_list(&self) -> MethodResult {

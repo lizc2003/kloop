@@ -735,3 +735,112 @@ async fn sessions_survive_a_server_restart() {
     assert_eq!(messages.len(), 4, "both turns persisted across the restart");
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
+
+/// `thread/fork` copies a session prefix into a fresh thread and spawns it
+/// live: the client can turn/start on the fork immediately, the fork's lineage
+/// points back into the source at the cut, and the source file is untouched.
+#[tokio::test]
+async fn thread_fork_branches_a_session_into_a_live_thread() {
+    let dirs = test_dirs("fork");
+    let script = vec![vec![text("first answer")], vec![text("second answer")]];
+    let mut client = start_server(factory(script, dirs.offload.clone(), false), &dirs);
+
+    // Source thread with one complete user/assistant exchange.
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let src = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": src, "input": "q1"}}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    // Fork at the end (no cut) into a new live thread.
+    client
+        .send(json!({"id": 3, "method": "thread/fork", "params": {"threadId": src}}))
+        .await;
+    let log = client.recv_until(|m| m["id"] == 3).await;
+    let resp = log.last().unwrap();
+    let fork_id = resp["result"]["threadId"].as_str().unwrap().to_string();
+    assert_ne!(fork_id, src, "the fork gets its own thread id");
+    assert_eq!(resp["result"]["messageCount"], 2);
+
+    // Lineage: the fork's first line carries a cross-file parent at the cut.
+    let fork_path = dirs.sessions.join(format!("{fork_id}.jsonl"));
+    assert_eq!(
+        kloop_core::rollout::fork_origin(&fork_path),
+        Some(format!("{src}#2"))
+    );
+
+    // The fork is live: a turn runs on it and completes.
+    client
+        .send(json!({"id": 4, "method": "turn/start", "params": {"threadId": fork_id, "input": "q2"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(log.last().unwrap()["params"]["reason"], "completed");
+
+    client.shutdown().await;
+    // Source untouched (2 lines); fork grew (2 copied + q2 + its answer).
+    let src_msgs =
+        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{src}.jsonl"))).unwrap();
+    assert_eq!(
+        src_msgs.len(),
+        2,
+        "the source must be untouched by the fork"
+    );
+    let fork_msgs = kloop_core::rollout::load_session(&fork_path).unwrap();
+    assert_eq!(fork_msgs.len(), 4);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// An illegal cut (splitting a user/assistant pair) and a missing source both
+/// come back as clean errors; the illegal-cut error lists the legal points.
+#[tokio::test]
+async fn thread_fork_rejects_an_illegal_cut() {
+    let dirs = test_dirs("fork-illegal");
+    let mut client = start_server(
+        factory(vec![vec![text("answer")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let src = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": src, "input": "q"}}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    // Cut #1 lands between the user message and its assistant reply — illegal.
+    client
+        .send(json!({"id": 3, "method": "thread/fork", "params": {"threadId": src, "cut": 1}}))
+        .await;
+    let log = client.recv_until(|m| m["id"] == 3).await;
+    let msg = log.last().unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg.contains("cannot fork") && msg.contains("#2"),
+        "illegal-cut error must list the legal points: {msg}"
+    );
+
+    // Forking a session that does not exist is a clean error too.
+    client
+        .send(json!({"id": 4, "method": "thread/fork", "params": {"threadId": "ghost"}}))
+        .await;
+    let err = client.recv().await;
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no session"));
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}

@@ -6,6 +6,16 @@
 
 **入口形态(用户拍板)**:只做 CLI `--fork <id>#<seq>`(`--fork <id>` = 末尾 fork);TUI 按键选点、server `thread/fork` 留到以后,schema 已兼容。**rewind 不做独立机制**:就是对当前会话在更早截点 `--fork`——依据是 codex 上游已把 `thread/rollback` 标 DEPRECATED、正收敛到 fork-by-turn-id,而 cc 的同文件树形 rewind 需要 leaf 计算 + 单亲回走 + 孤儿 tool_result 回收整套读侧,对 kloop 线性重放改动量远超收益。
 
+### ✅ 追加(2026-07-14,server 入口,plan A 会话·提交号 PENDING-18)
+
+`thread/fork` 挂账现补上:新 RPC `thread/fork {threadId, cut?}`(缺 `cut` = 末尾
+fork)复用现成 `rollout::fork_session`——复制前缀 → `resume_session` → **spawn 成活
+thread**(同 `thread/resume`)→ 返 `{threadId, messageCount}`,client 可立即
+`turn/start`。源无需是 active thread(直接读文件,可 branch 休眠历史)。非法 cut →
+`fork_session` 报错带合法点提示,映射 SERVER_ERROR;`cut` 非整数 → INVALID_PARAMS。
+测试 +2(server duplex):fork 建活 thread + 血缘 `fork_origin` 指回源 `#cut` + 源文件
+不动 + fork 可独立 turn;非法 cut 列合法点 + 缺源报错。**TUI 按键选点仍挂账**。
+
 **回源调研结论**(两个 Explore agent,cc + codex 全文见会话记录,要点):
 - 两家都是"物理复制前缀进新文件",都**刻意回避跨文件行级 parent 链**:cc 怕悬空引用(`/branch` 整份拷贝 + `forkedFrom` 仅元数据),codex 明说"复制换简单"(`fork_thread` 复制截断前缀 + SessionMeta `forked_from_id` 文件级标签)。
 - 截点合法性两家都靠**白名单**而非事后配对校验:cc 只允许真实 user 消息(tool_result 型 user、合成消息全排除),codex 只在 turn 边界切(TurnStarted 三重校验,半截 turn 合成 TurnAborted 收尾)。
