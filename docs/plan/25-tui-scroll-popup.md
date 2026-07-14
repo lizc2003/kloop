@@ -84,8 +84,10 @@ fmt/clippy/test 全绿(373 测试,+5)。落地按"关键决定"逐条:
 - **端到端 headless 集成**(`draw_confirm_windows_a_tall_diff_and_pins_the_options`):用 ratatui
   `TestBackend`(无 TTY)把 60 行 diff 渲染进 40×16 真实 Frame,断言:顶部窗口显示 `+1` 不显示 `+60` +
   选项 pin + `↓ more`;`confirm_scroll=999` 后 over-scroll 自纠、显示 `+60` 不显示 `+1` + 选项仍 pin +
-  hint 翻成 `↑ more`。这是对交互滚动最强的可自动化验证(交互 TUI 无法在无 TTY 环境手工驱动,
-  剩"真键手感"由用户在真 TUI 里过目即可)。
+  hint 翻成 `↑ more`。这是对交互滚动最强的可自动化验证(交互 TUI 无法在无 TTY 环境手工驱动)。
+- **真键手感已过**(用户在真 TUI,anthropic 轨):prompt 让模型 write_file 一个 120 行新文件,
+  审批弹层带超高 `(new file)` diff——用户确认滚动顺、黄色选项行全程钉在底部、`↓/↑ more`
+  hint 方向正确。至此 plan 25 无挂账。
 
 **教训**:一个"不可容纳"的过渡妥协(plan 21 的行数硬截断)在容器能滚后要**退到最松**,但别退到"不设限"——
 可滚动 ≠ 无边界,minified 整文件覆盖仍能产出十万行巨串,拖慢 wrap/滚动。放宽是把"必然会截到正常内容的紧上界"
