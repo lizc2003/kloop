@@ -21,7 +21,7 @@
 
 **真 key 验收**(anthropic sonnet-5,`--plain --yolo`):模型派 agent-1 跑 `echo SUBAGENT_RAN_OK`;落盘坐实——`20260714-080150-agent-1.jsonl` 首行 `subagent_of=20260714-080150#2`(父 assistant tool_use 行)、`parent=None`、完整 4 消息转录(user→tool_use→tool_result→text);`--list-sessions` 两个都显示、子标 `[sub-agent of 20260714-080150#2]`;`--resume` picker 只给父。**即 plan 17 片 3 "子会话落盘 + parent 链 + `--list-sessions` 标从属" 的完整闭环。**
 
-**提交**:见 HANDOFF 对应条目(fmt/clippy/test 全绿,394 测试)。
+**提交**:a2bd470(fmt/clippy/test 全绿,394 测试)。
 
 ## ✅ 完成记录(2026-07-10,切片 2:自定义 agent 类型)
 
