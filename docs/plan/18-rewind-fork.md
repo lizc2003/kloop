@@ -6,7 +6,7 @@
 
 **入口形态(用户拍板)**:只做 CLI `--fork <id>#<seq>`(`--fork <id>` = 末尾 fork);TUI 按键选点、server `thread/fork` 留到以后,schema 已兼容。**rewind 不做独立机制**:就是对当前会话在更早截点 `--fork`——依据是 codex 上游已把 `thread/rollback` 标 DEPRECATED、正收敛到 fork-by-turn-id,而 cc 的同文件树形 rewind 需要 leaf 计算 + 单亲回走 + 孤儿 tool_result 回收整套读侧,对 kloop 线性重放改动量远超收益。
 
-### ✅ 追加(2026-07-14,server 入口,plan A 会话·提交号 PENDING-18)
+### ✅ 追加(2026-07-14,server 入口,plan A 会话·提交号 61c40ce)
 
 `thread/fork` 挂账现补上:新 RPC `thread/fork {threadId, cut?}`(缺 `cut` = 末尾
 fork)复用现成 `rollout::fork_session`——复制前缀 → `resume_session` → **spawn 成活

@@ -41,7 +41,7 @@
 下——只有 cc 有、0 索引、frontmatter;kloop 落地时接 `commands/custom.rs` 姊妹 + `run`
 match 前加 lookup)、~~server-mode slash~~(✅ 见下)、`!bash`/`@file` 注入、命名空间/子目录。
 
-### ✅ 追加(2026-07-14,server slash,plan A 会话·提交号 PENDING-23)
+### ✅ 追加(2026-07-14,server slash,plan A 会话·提交号 946891e)
 
 server-mode slash 挂账收尾:thread worker 收到 turn 后先判 `commands::is_command`,
 是命令则走 `commands::run`(worker 持 History+cfg+cancel)**而非** run_turn——**不

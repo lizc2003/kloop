@@ -24,7 +24,7 @@
 
 **提交**:27d0430(fmt/clippy/test 全绿,321 个测试)。
 
-### ✅ 追加(2026-07-14,server 入队侧,plan A 会话·提交号 PENDING-22)
+### ✅ 追加(2026-07-14,server 入队侧,plan A 会话·提交号 bf555d5)
 
 steering 的 enqueue 侧原为 TUI-only,现补上 **server**:新 RPC `turn/steer
 {threadId, input}` push `InboxItem::Steer` 进该 thread 的 `cfg.inbox`(clone 存进
