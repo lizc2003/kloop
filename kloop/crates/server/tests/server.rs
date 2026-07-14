@@ -908,8 +908,9 @@ async fn slash_commands_surface_as_system_notifications() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// `/clear` reports via `system`, emits `thread/cleared` so the client resets
-/// its view, and the cleared History persists (the session replays to empty).
+/// `/clear` emits `thread/cleared` so the client resets its view, then reports
+/// via `system` on the now-blank transcript (order matches the TUI), and the
+/// cleared History persists (the session replays to empty).
 #[tokio::test]
 async fn clear_command_empties_history_and_notifies() {
     let dirs = test_dirs("slash-clear");
@@ -939,7 +940,7 @@ async fn clear_command_empties_history_and_notifies() {
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(
         methods_for_thread(&log, &tid),
-        vec!["turn/started", "system", "thread/cleared", "turn/completed"]
+        vec!["turn/started", "thread/cleared", "system", "turn/completed"]
     );
     assert_eq!(
         log.iter().find(|m| m["method"] == "system").unwrap()["params"]["text"],

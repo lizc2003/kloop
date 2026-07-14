@@ -431,9 +431,15 @@ async fn thread_worker(
         // also emits `thread/cleared` so the client resets its transcript.
         if commands::is_command(&turn.input) {
             let result = commands::run(&turn.input, &mut history, &cfg, &turn.cancel).await;
-            ui.notify("system", json!({"text": result.output}));
+            // Clear first, then show the output on the now-blank transcript —
+            // matching the TUI order (crates/tui/src/lib.rs). Reversed, a
+            // client that resets its transcript on `thread/cleared` would wipe
+            // the command output it just received.
             if result.cleared {
                 ui.notify("thread/cleared", json!({}));
+            }
+            if !result.output.is_empty() {
+                ui.notify("system", json!({"text": result.output}));
             }
             running.store(false, Ordering::SeqCst);
             ui.notify("turn/completed", json!({"reason": "completed"}));

@@ -200,6 +200,9 @@ async fn turn_rounds(
     // the primary, the rest of the turn runs on the fallback.
     let mut active_model = cfg.model.clone();
     let mut truncation_recoveries = 0u32;
+    // Cut-off text from truncated rounds, prepended to the final answer so a
+    // truncated-then-continued turn returns the whole deliverable.
+    let mut truncated_prefix = String::new();
     for round in 0..cfg.max_rounds {
         // Step-boundary steering: deliver anything the user typed during the
         // previous round (tool execution / sampling) as a user message before
@@ -344,24 +347,27 @@ async fn turn_rounds(
             // number of times per turn. (A truncated response WITH tool calls
             // needs no special handling: the loop continues naturally and the
             // model resumes itself.)
+            let round_text = last_text(&blocks);
             if is_truncated(stop_reason.as_deref())
                 && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
             {
                 truncation_recoveries += 1;
+                // Keep the cut-off segment. A sub-agent (stream_text=false)
+                // delivers ONLY through final_text, so without this a long
+                // answer that overran the output limit would reach the parent
+                // as just its tail — the front would be lost.
+                truncated_prefix.push_str(&round_text);
                 ui.note(&format!(
                     "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
                 ));
                 history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
                 continue;
             }
-            let final_text = blocks
-                .iter()
-                .rev()
-                .find_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let final_text = if truncated_prefix.is_empty() {
+                round_text
+            } else {
+                format!("{truncated_prefix}{round_text}")
+            };
             return TurnOutcome {
                 reason: EndReason::Completed,
                 final_text,
@@ -431,6 +437,20 @@ enum SampleError {
 /// ending worth recovering from.
 fn is_truncated(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("max_tokens") | Some("length"))
+}
+
+/// The last text block of a sampled response — the assistant's answer for the
+/// round. Used both to end a turn and to preserve the cut-off segment of a
+/// truncated round before the continuation nudge.
+fn last_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .rev()
+        .find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 const TRUNCATION_RECOVERY_LIMIT: u32 = 3;
@@ -936,7 +956,12 @@ mod tests {
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
 
         assert_eq!(outcome.reason, EndReason::Completed);
-        assert_eq!(outcome.final_text, "part two, complete.");
+        // The cut-off segment is preserved and prepended to the continuation,
+        // so the deliverable is the whole answer — not just its tail.
+        assert_eq!(
+            outcome.final_text,
+            "part one, cut off mid-part two, complete."
+        );
         assert_eq!(outcome.rounds, 2);
         // [user, assistant(truncated), user(continue nudge), assistant(rest)]
         let msgs = history.messages();
@@ -970,7 +995,8 @@ mod tests {
 
         assert_eq!(outcome.reason, EndReason::Completed);
         // 3 nudges (the limit), so the 4th truncated response ends the turn.
-        assert_eq!(outcome.final_text, "cut 4");
+        // Every cut-off segment is accumulated into the final deliverable.
+        assert_eq!(outcome.final_text, "cut 1cut 2cut 3cut 4");
         assert_eq!(outcome.rounds, 4);
         let nudges = history
             .messages()

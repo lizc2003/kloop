@@ -46,7 +46,13 @@ fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
                 BashAnalysis::Commands(inner_cmds) => flattened.extend(inner_cmds),
                 BashAnalysis::Opaque => return BashAnalysis::Opaque,
             },
-            _ => flattened.push(argv),
+            // A `bash -c` wrapper past the unwrap limit must NOT be kept as a
+            // trusted plain command: its inner script stays unvetted, so
+            // `argv_is_dangerous(["bash", …])` and deny prefixes never see the
+            // `rm -rf` inside it, and bypass mode would auto-run it. Opaque
+            // keeps it out of every auto-allow path (falls through to ask).
+            Some(_) => return BashAnalysis::Opaque,
+            None => flattened.push(argv),
         }
     }
     BashAnalysis::Commands(flattened)
@@ -485,6 +491,14 @@ mod tests {
         assert_eq!(
             commands("bash script.sh").unwrap(),
             vec![argv(&["bash", "script.sh"])]
+        );
+        // Nesting past the unwrap limit stays a `bash -c` wrapper: it must be
+        // Opaque, not a trusted plain command. `whoami` stands in for the real
+        // payload (`rm -rf /`); if this returned Commands, the inner command
+        // would escape the danger/deny checks and bypass mode would auto-run it.
+        assert_eq!(
+            analyze_bash("bash -c \"bash -c 'bash -c whoami'\""),
+            BashAnalysis::Opaque
         );
     }
 

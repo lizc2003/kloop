@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -149,18 +150,48 @@ async fn run_foreground(
     sandbox: Option<&SandboxPolicy>,
     timeout_ms: u64,
 ) -> Result<std::process::Output> {
-    tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        shell_command(command, sandbox)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("bash: command timed out after {timeout_ms}ms"))?
-    .context("bash: failed to spawn sh")
+    let mut cmd = shell_command(command, sandbox);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Its own process group so a timeout or a cancelled turn can SIGKILL the
+    // whole tree, not just the `sh` leader: kill_on_drop reaps only the direct
+    // child, leaving `make`/`npm` grandchildren orphaned and still running.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().context("bash: failed to spawn sh")?;
+    // Group-kills the tree if this future is dropped mid-run (turn cancel) or
+    // times out; disarmed once the child has exited cleanly on its own.
+    let mut guard = GroupKillGuard { pid: child.id() };
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
+        Ok(result) => {
+            guard.disarm();
+            result.context("bash: failed to run sh")
+        }
+        Err(_) => bail!("bash: command timed out after {timeout_ms}ms"),
+    }
+}
+
+/// Group-kills a foreground shell's process tree if dropped before its child
+/// exits on its own (timeout, or the owning turn being cancelled). Disarmed on
+/// a clean exit so a reused group id is never signalled.
+struct GroupKillGuard {
+    pid: Option<u32>,
+}
+
+impl GroupKillGuard {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_group(pid);
+        }
+    }
 }
 
 /// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
@@ -327,7 +358,18 @@ impl BackgroundShells {
             },
         );
         let kill = self.shells.lock().unwrap()[&id].kill.clone();
-        tokio::spawn(monitor(self.clone(), id.clone(), child, kill, path.clone()));
+        // A Weak, not an Arc: an owning ref would keep the registry alive as
+        // long as any shell runs, so `Drop for BackgroundShells` (the session
+        // teardown that group-kills leftover shells) could never fire while it
+        // still had work to reap. The monitor only needs the registry to write
+        // back a final status, which it skips if the session is already gone.
+        tokio::spawn(monitor(
+            Arc::downgrade(self),
+            id.clone(),
+            child,
+            kill,
+            path.clone(),
+        ));
         Ok(format!(
             "Command running in background with ID: {id}. Output is being written to: {}. \
              Check on it with bash_output; stop it with kill_bash.",
@@ -402,7 +444,7 @@ fn kill_group(pid: u32) {
 /// output-file cap. Deliberately not tied to any turn's cancel token — that
 /// is what makes the shell "background".
 async fn monitor(
-    shells: Arc<BackgroundShells>,
+    shells: Weak<BackgroundShells>,
     id: String,
     mut child: tokio::process::Child,
     kill: CancellationToken,
@@ -438,7 +480,11 @@ async fn monitor(
         Some(reason) => BgStatus::Killed(reason),
         None => BgStatus::Exited(exit.and_then(|s| s.code())),
     };
-    shells.set_status(&id, status);
+    // The session may have ended while this shell ran; if so there is no
+    // registry left to update (Drop already group-killed it).
+    if let Some(shells) = shells.upgrade() {
+        shells.set_status(&id, status);
+    }
 }
 
 /// Last `OUTPUT_TAIL_BYTES` of the output file; the model reads further back
@@ -516,6 +562,40 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("timed out"));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A foreground timeout must reap the whole process group, not just the
+    /// `sh` leader: a backgrounded grandchild is orphaned and keeps running
+    /// unless the group is killed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn foreground_timeout_reaps_the_whole_group() {
+        let ctx = test_ctx(0, "bash-group-kill");
+        let pidfile = std::env::temp_dir().join(format!("kloop-grp-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // Background a long sleeper (the grandchild), record its pid, then
+        // block on `wait`; the timeout has to take the sleeper down with sh.
+        let cmd = format!("sleep 60 & echo $! > {}; wait", pidfile.display());
+        let (out, is_error) =
+            run_tool("bash", json!({"command": cmd, "timeout_ms": 500}), &ctx).await;
+        assert!(is_error && out.contains("timed out"), "{out}");
+
+        // Let the group kill land, then check the sleeper is gone (`kill -0`
+        // fails once the process no longer exists).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written before the timeout")
+            .trim()
+            .to_string();
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(&pid)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "grandchild {pid} outlived the group kill");
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     #[tokio::test]
