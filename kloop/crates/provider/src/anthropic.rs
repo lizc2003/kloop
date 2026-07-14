@@ -111,21 +111,12 @@ pub(super) async fn stream(
     body: &Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<()> {
-    let resp = crate::http_client()
+    let req = crate::http_client()
         .post(url)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
-        .json(body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if is_overflow_message(&text) {
-            return Err(anyhow::Error::new(OverflowError));
-        }
-        bail!("anthropic http {status}: {text}");
-    }
+        .json(body);
+    let resp = crate::send_checked(req, "anthropic").await?;
 
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();

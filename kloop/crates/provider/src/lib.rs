@@ -116,6 +116,26 @@ fn is_overflow_message(text: &str) -> bool {
         || lower.contains("maximum context length")
 }
 
+/// Send an already-authed request and validate the status, shared by every
+/// adapter: a non-2xx overflow surfaces as `OverflowError` (so the agent loop
+/// can compact and retry), anything else as a labelled error. `label` names
+/// the rail for the error text (e.g. "anthropic", "openai-compat").
+pub(crate) async fn send_checked(
+    req: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<reqwest::Response> {
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if is_overflow_message(&text) {
+            return Err(anyhow::Error::new(OverflowError));
+        }
+        anyhow::bail!("{label} http {status}: {text}");
+    }
+    Ok(resp)
+}
+
 impl Provider {
     pub fn mock(turns: Vec<Vec<ContentBlock>>) -> Self {
         Self::mock_scripted(turns.into_iter().map(MockTurn::Blocks).collect())

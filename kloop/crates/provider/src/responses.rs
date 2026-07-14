@@ -178,20 +178,8 @@ pub(super) async fn stream(
     body: &Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<()> {
-    let resp = crate::http_client()
-        .post(url)
-        .bearer_auth(key)
-        .json(body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if is_overflow_message(&text) {
-            return Err(anyhow::Error::new(OverflowError));
-        }
-        bail!("openai-responses http {status}: {text}");
-    }
+    let req = crate::http_client().post(url).bearer_auth(key).json(body);
+    let resp = crate::send_checked(req, "openai-responses").await?;
 
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();

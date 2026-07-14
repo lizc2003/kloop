@@ -71,6 +71,15 @@ pub fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// The status glyph and colour shared by tool rows and sub-agent rows.
+fn status_mark(status: &ToolStatus) -> (&'static str, Color) {
+    match status {
+        ToolStatus::Running => ("…", Color::Yellow),
+        ToolStatus::Ok => ("✓", Color::Green),
+        ToolStatus::Failed => ("✗", Color::Red),
+    }
+}
+
 /// The transcript as display lines: the pure core of the UI. Tool calls
 /// collapse to one status row; user/assistant text wraps to the width.
 pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
@@ -108,11 +117,7 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                 summary,
                 status,
             } => {
-                let (mark, color) = match status {
-                    ToolStatus::Running => ("…", Color::Yellow),
-                    ToolStatus::Ok => ("✓", Color::Green),
-                    ToolStatus::Failed => ("✗", Color::Red),
-                };
+                let (mark, color) = status_mark(status);
                 lines.push(Line::from(vec![
                     Span::styled(format!("{mark} "), Style::new().fg(color)),
                     Span::styled(
@@ -128,11 +133,7 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                 tools,
                 last_tool,
             } => {
-                let (mark, color) = match status {
-                    ToolStatus::Running => ("…", Color::Yellow),
-                    ToolStatus::Ok => ("✓", Color::Green),
-                    ToolStatus::Failed => ("✗", Color::Red),
-                };
+                let (mark, color) = status_mark(status);
                 // Live: show what it is doing right now; done: a one-line
                 // summary (its tool detail was never in the transcript).
                 let body = if *status == ToolStatus::Running && *tools > 0 {

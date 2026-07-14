@@ -191,7 +191,7 @@ async fn guard(url: &Url, allow_private: bool) -> Result<()> {
 
 fn ip_is_public(ip: IpAddr) -> bool {
     fn v4_public(ip: Ipv4Addr) -> bool {
-        let [a, b, _, _] = ip.octets();
+        let [a, b, c, _] = ip.octets();
         !(ip.is_loopback()
             || ip.is_private()
             || ip.is_link_local()
@@ -199,24 +199,47 @@ fn ip_is_public(ip: IpAddr) -> bool {
             || ip.is_broadcast()
             || ip.is_multicast()
             || ip.is_documentation()
+            // 0.0.0.0/8 "this host on this network".
+            || a == 0
+            // 240.0.0.0/4 reserved (class E); 255.255.255.255 is broadcast above.
+            || a >= 240
             // 100.64.0.0/10 (CGNAT) — covers most cloud metadata detours.
             || (a == 100 && (64..128).contains(&b))
             // 192.0.0.0/24 (protocol assignments).
-            || (a == 192 && b == 0 && ip.octets()[2] == 0))
+            || (a == 192 && b == 0 && c == 0))
     }
     match ip {
         IpAddr::V4(v4) => v4_public(v4),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // v6-native non-public ranges FIRST: `::1`/`::` are IPv4-compatible,
+            // so `to_ipv4()` would map them to a public-looking `0.0.0.x` and
+            // wave them through if checked before these.
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let seg = v6.segments();
+            // fc00::/7 unique-local, fe80::/10 link-local.
+            if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // Embedded IPv4 — both ::ffff:a.b.c.d (mapped) and ::a.b.c.d
+            // (compatible): judge the inner address, catching a loopback/
+            // private/CGNAT hidden in v6 form.
+            if let Some(v4) = v6.to_ipv4() {
                 return v4_public(v4);
             }
-            let seg0 = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7 unique-local, fe80::/10 link-local.
-                || (seg0 & 0xfe00) == 0xfc00
-                || (seg0 & 0xffc0) == 0xfe80)
+            // NAT64 well-known prefix 64:ff9b::/96 embeds a v4 the gateway
+            // routes to; judge the embedded address the same way.
+            if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return v4_public(v4);
+            }
+            true
         }
     }
 }
@@ -250,6 +273,12 @@ mod tests {
             "fc00::1",
             "::ffff:127.0.0.1", // v4-mapped loopback
             "::ffff:10.0.0.1",
+            "::127.0.0.1",     // v4-compatible loopback
+            "::a00:1",         // v4-compatible 10.0.0.1
+            "64:ff9b::7f00:1", // NAT64-embedded 127.0.0.1
+            "64:ff9b::a00:1",  // NAT64-embedded 10.0.0.1
+            "240.0.0.1",       // class E reserved
+            "0.1.2.3",         // 0.0.0.0/8
         ];
         for ip in private {
             assert!(!ip_is_public(ip.parse().unwrap()), "{ip} should be private");

@@ -65,6 +65,20 @@ enum RolloutLine {
     },
 }
 
+impl RolloutLine {
+    /// The line's metadata, common to both variants.
+    fn meta(&self) -> &LineMeta {
+        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = self;
+        meta
+    }
+
+    /// Consume the line for its metadata, dropping the payload.
+    fn into_meta(self) -> LineMeta {
+        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = self;
+        meta
+    }
+}
+
 /// Append-only writer for one session file. The file (and its directory) is
 /// created lazily on first append, so a session that never records anything
 /// leaves nothing behind. Tracks the id chain: each line's `parent` is the
@@ -157,8 +171,7 @@ impl Rollout {
             .open(&self.path)?;
         writeln!(file, "{json}")?;
         // Only advance the chain once the line is durably in the file.
-        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
-        self.last_id = Some(meta.id);
+        self.last_id = Some(line.into_meta().id);
         self.next_seq += 1;
         Ok(())
     }
@@ -314,10 +327,7 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
     let mut out = String::new();
     for (n, line) in lines
         .into_iter()
-        .take_while(|line| {
-            let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
-            seq_of(meta) <= cut
-        })
+        .take_while(|line| seq_of(line.meta()) <= cut)
         .enumerate()
     {
         let mut remeta = |meta: LineMeta| {
@@ -383,10 +393,7 @@ fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
             Some(next) => opens_user_turn(next),
             None => true,
         })
-        .map(|(_, line)| {
-            let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
-            seq_of(meta)
-        })
+        .map(|(_, line)| seq_of(line.meta()))
         .collect()
 }
 
@@ -420,9 +427,8 @@ pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
         let RolloutLine::Message { message, .. } = next else {
             continue;
         };
-        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = line;
         points.push(ForkPoint {
-            seq: seq_of(meta),
+            seq: seq_of(line.meta()),
             preview: user_turn_preview(message),
         });
     }
@@ -491,9 +497,8 @@ fn read_first_meta(path: &Path) -> Option<LineMeta> {
     let file = std::fs::File::open(path).ok()?;
     let mut first = String::new();
     std::io::BufReader::new(file).read_line(&mut first).ok()?;
-    let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) =
-        serde_json::from_str(first.trim()).ok()?;
-    Some(meta)
+    let line: RolloutLine = serde_json::from_str(first.trim()).ok()?;
+    Some(line.into_meta())
 }
 
 /// Make the replayed history legal to send. Both directions, mirroring what
