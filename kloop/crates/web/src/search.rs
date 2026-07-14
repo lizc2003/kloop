@@ -46,6 +46,39 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
         .join("\n")
 }
 
+/// Send a backend's built request, validate the status, and parse the body —
+/// the skeleton every backend shares. `name` labels the errors.
+async fn send_and_parse(req: reqwest::RequestBuilder, name: &str) -> Result<Value> {
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("web_search: request to {name} failed"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("web_search: reading {name} response failed"))?;
+    if !status.is_success() {
+        let head: String = body.chars().take(200).collect();
+        bail!("web_search: {name} returned HTTP {status}: {head}");
+    }
+    serde_json::from_str(&body).with_context(|| format!("web_search: {name} returned invalid JSON"))
+}
+
+/// Map a backend's result array to hits. `snippet_field` is the per-backend
+/// key holding the summary ("description" for Brave, "content" for Tavily).
+fn hits_from(results: &[Value], count: usize, snippet_field: &str) -> Vec<SearchHit> {
+    results
+        .iter()
+        .take(count)
+        .map(|r| SearchHit {
+            title: crate::html::strip_inline_tags(r["title"].as_str().unwrap_or("(untitled)")),
+            url: r["url"].as_str().unwrap_or("").to_string(),
+            snippet: crate::html::strip_inline_tags(r[snippet_field].as_str().unwrap_or("")),
+        })
+        .collect()
+}
+
 /// Brave Search API: one GET with a subscription-token header.
 /// <https://api-dashboard.search.brave.com/app/documentation>
 pub struct Brave {
@@ -79,42 +112,14 @@ impl SearchBackend for Brave {
         count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
         Box::pin(async move {
-            let resp = client
+            let req = client
                 .get(format!("{}/res/v1/web/search", self.base))
                 .query(&[("q", query), ("count", &count.to_string())])
                 .header("X-Subscription-Token", &self.key)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .context("web_search: request to brave failed")?;
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .context("web_search: reading brave response failed")?;
-            if !status.is_success() {
-                let head: String = body.chars().take(200).collect();
-                bail!("web_search: brave returned HTTP {status}: {head}");
-            }
-            let json: Value =
-                serde_json::from_str(&body).context("web_search: brave returned invalid JSON")?;
-            let results = json["web"]["results"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            Ok(results
-                .iter()
-                .take(count)
-                .map(|r| SearchHit {
-                    title: crate::html::strip_inline_tags(
-                        r["title"].as_str().unwrap_or("(untitled)"),
-                    ),
-                    url: r["url"].as_str().unwrap_or("").to_string(),
-                    snippet: crate::html::strip_inline_tags(
-                        r["description"].as_str().unwrap_or(""),
-                    ),
-                })
-                .collect())
+                .header("Accept", "application/json");
+            let json = send_and_parse(req, "brave").await?;
+            let results = json["web"]["results"].as_array().map(Vec::as_slice);
+            Ok(hits_from(results.unwrap_or_default(), count, "description"))
         })
     }
 }
@@ -153,40 +158,17 @@ impl SearchBackend for Tavily {
         count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
         Box::pin(async move {
-            let resp = client
+            let req = client
                 .post(format!("{}/search", self.base))
                 .bearer_auth(&self.key)
                 .json(&serde_json::json!({
                     "query": query,
                     "max_results": count,
                     "search_depth": "basic",
-                }))
-                .send()
-                .await
-                .context("web_search: request to tavily failed")?;
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .context("web_search: reading tavily response failed")?;
-            if !status.is_success() {
-                let head: String = body.chars().take(200).collect();
-                bail!("web_search: tavily returned HTTP {status}: {head}");
-            }
-            let json: Value =
-                serde_json::from_str(&body).context("web_search: tavily returned invalid JSON")?;
-            let results = json["results"].as_array().cloned().unwrap_or_default();
-            Ok(results
-                .iter()
-                .take(count)
-                .map(|r| SearchHit {
-                    title: crate::html::strip_inline_tags(
-                        r["title"].as_str().unwrap_or("(untitled)"),
-                    ),
-                    url: r["url"].as_str().unwrap_or("").to_string(),
-                    snippet: crate::html::strip_inline_tags(r["content"].as_str().unwrap_or("")),
-                })
-                .collect())
+                }));
+            let json = send_and_parse(req, "tavily").await?;
+            let results = json["results"].as_array().map(Vec::as_slice);
+            Ok(hits_from(results.unwrap_or_default(), count, "content"))
         })
     }
 }
