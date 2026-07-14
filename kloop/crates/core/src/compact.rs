@@ -92,8 +92,12 @@ pub struct CompactionStats {
 /// Replace everything before the keep-boundary with a model-written summary.
 /// Fails without touching the history if the summary request fails; reporting
 /// the outcome is the caller's job.
+/// `model` is the caller's currently-active model, which may be the fallback
+/// if the primary already failed this turn — summarizing on the known-broken
+/// primary would just fail the compaction.
 pub async fn run_compaction(
     cfg: &Arc<Config>,
+    model: &str,
     history: &mut History,
     cancel: &CancellationToken,
 ) -> Result<CompactionStats> {
@@ -108,7 +112,7 @@ pub async fn run_compaction(
 
     let mut request = messages[..keep_from].to_vec();
     request.push(Message::user_text(COMPACT_INSTRUCTION));
-    let summary = sample_summary(cfg, &request, cancel).await?;
+    let summary = sample_summary(cfg, model, &request, cancel).await?;
     if summary.trim().is_empty() {
         bail!("compaction model returned an empty summary");
     }
@@ -124,12 +128,11 @@ pub async fn run_compaction(
 /// One summarization request: no tools, text collected from BlockDone.
 async fn sample_summary(
     cfg: &Arc<Config>,
+    model: &str,
     request: &[Message],
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let mut rx = cfg
-        .provider
-        .stream(&cfg.model, COMPACT_SYSTEM, request, &[]);
+    let mut rx = cfg.provider.stream(model, COMPACT_SYSTEM, request, &[]);
     let mut summary = String::new();
     loop {
         tokio::select! {
@@ -202,7 +205,7 @@ mod tests {
         let cfg = compact_test_cfg(provider, "rebuild");
         let mut history = seeded_history(cfg.offload_dir.clone());
 
-        let stats = run_compaction(&cfg, &mut history, &CancellationToken::new())
+        let stats = run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
             .await
             .expect("compaction should succeed");
         // [user, assistant(fat), user] → summarize the first two, keep the last.
@@ -225,6 +228,36 @@ mod tests {
         assert!(msgs.len() < 4);
     }
 
+    /// Compaction samples on the model it is handed, not `cfg.model` — so a
+    /// turn that already fell back off a broken primary compacts on the
+    /// fallback instead of failing on the dead primary.
+    #[tokio::test]
+    async fn compaction_samples_on_the_given_model() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "summary".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "model-arg");
+        assert_eq!(cfg.model, "mock");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        run_compaction(
+            &cfg,
+            "fallback-model",
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].model, "fallback-model",
+            "compaction must use the passed model, not cfg.model"
+        );
+    }
+
     #[tokio::test]
     async fn failed_compaction_leaves_history_untouched() {
         let provider =
@@ -235,7 +268,8 @@ mod tests {
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
 
-        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
+        let result =
+            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..], "history must be untouched");
@@ -249,7 +283,8 @@ mod tests {
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
 
-        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
+        let result =
+            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..]);
@@ -262,7 +297,8 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("only message"));
 
-        let result = run_compaction(&cfg, &mut history, &CancellationToken::new()).await;
+        let result =
+            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
 
         assert!(result.is_err());
         assert_eq!(history.messages().len(), 1);

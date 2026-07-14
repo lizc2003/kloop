@@ -220,7 +220,7 @@ async fn turn_rounds(
                 )
             {
                 ui.note("predicted context overflow; compacting history");
-                match compact::run_compaction(cfg, history, cancel).await {
+                match compact::run_compaction(cfg, &active_model, history, cancel).await {
                     Ok(stats) => ui.note(&format!(
                         "history compacted: {} summarized, {} kept verbatim",
                         stats.summarized, stats.kept
@@ -270,7 +270,7 @@ async fn turn_rounds(
                 }
                 overflow_compact_attempted = true;
                 ui.note("context window exceeded; compacting and retrying");
-                match compact::run_compaction(cfg, history, cancel).await {
+                match compact::run_compaction(cfg, &active_model, history, cancel).await {
                     Ok(stats) => {
                         ui.note(&format!(
                             "history compacted: {} summarized, {} kept verbatim",
@@ -394,7 +394,8 @@ async fn turn_rounds(
         history.record(Message::tool_results(results));
         // Tool-hook stdout follows the results it commented on, as extra
         // user-message context.
-        for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap()) {
+        for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap_or_else(|e| e.into_inner()))
+        {
             history.record(Message::user_text(text));
         }
         if cancel.is_cancelled() {

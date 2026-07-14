@@ -17,7 +17,7 @@ pub async fn run(
     cfg: &Arc<Config>,
     cancel: &CancellationToken,
 ) -> SlashResult {
-    let output = match run_compaction(cfg, history, cancel).await {
+    let output = match run_compaction(cfg, &cfg.model, history, cancel).await {
         Ok(stats) => format!(
             "history compacted: {} summarized, {} kept verbatim",
             stats.summarized, stats.kept

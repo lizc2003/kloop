@@ -429,12 +429,15 @@ impl Drop for BackgroundShells {
 fn kill_group(pid: u32) {
     #[cfg(unix)]
     {
+        // `status()` (not `spawn()`) so the short-lived `kill` helper is
+        // reaped instead of piling up as a zombie across a long session; it
+        // exits the instant the signal is delivered, so the wait is trivial.
         let _ = std::process::Command::new("kill")
             .arg("-9")
             .arg(format!("-{pid}"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
     }
     #[cfg(not(unix))]
     let _ = pid;
