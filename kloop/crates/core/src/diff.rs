@@ -17,9 +17,10 @@
 //!
 //! Each line is `{sign}{line-number}  {content}`: `+`/`-`/space in column one
 //! (so a frontend colors by first char), then a right-aligned gutter number.
-//! Hunks carry three lines of context, separated by `⋮`; large diffs are
-//! capped and long lines clipped so a minified file can't blow up the popup
-//! (the TUI popup is not yet scrollable — see the scroll plan).
+//! Hunks carry three lines of context, separated by `⋮`; the total is capped
+//! and long lines clipped. The TUI popup scrolls (plan 25), so the line cap is
+//! a generous ceiling — ordinary edits never hit it; it only stops a minified
+//! whole-file overwrite from turning into a pathologically huge preview string.
 //!
 //! The preview is a plain string on [`crate::permissions::ConfirmRequest`];
 //! frontends render it (the TUI/plain color +/- lines, the server forwards it).
@@ -28,8 +29,10 @@ use serde_json::Value;
 use similar::ChangeTag;
 use similar::TextDiff;
 
-/// Cap on preview body lines before a `… (N more line(s))` marker.
-const MAX_PREVIEW_LINES: usize = 40;
+/// Cap on preview body lines before a `… (N more line(s))` marker. Generous:
+/// the popup scrolls now (plan 25), so this only bounds a runaway minified
+/// whole-file overwrite, not ordinary edits.
+const MAX_PREVIEW_LINES: usize = 500;
 /// Cap on a single line's content characters before an ellipsis.
 const MAX_LINE_LEN: usize = 200;
 /// Files larger than this are diffed via the two-string fallback (or, for
@@ -224,11 +227,18 @@ mod tests {
 
     #[test]
     fn big_diffs_are_capped_with_a_remainder_marker() {
-        let new: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let diff = numbered_diff("", &new);
+        // Ordinary-sized diffs (well under the generous cap) are never cut.
+        let modest: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(numbered_diff("", &modest).lines().count(), 100);
+
+        // Only a runaway preview (over the cap) gets the remainder marker.
+        let huge: String = (0..MAX_PREVIEW_LINES + 100)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let diff = numbered_diff("", &huge);
         let lines: Vec<&str> = diff.lines().collect();
         assert_eq!(lines.len(), MAX_PREVIEW_LINES + 1);
-        assert_eq!(lines[MAX_PREVIEW_LINES], "… (60 more line(s))");
+        assert_eq!(lines[MAX_PREVIEW_LINES], "… (100 more line(s))");
     }
 
     #[tokio::test]

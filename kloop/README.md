@@ -188,11 +188,13 @@ or shows a `(new file)` insert preview for a fresh path. When the file can't be
 read, is over 1 MiB, or the `old_string` doesn't uniquely match, it falls back
 to diffing the two edit strings (numbered from 1) — claude-code's same
 degradation. Each line is `{+/-/space}{line-number}  {content}`; hunks carry
-three lines of context separated by `⋮`, big diffs are capped
-(`… (N more line(s))`), minified lines clipped. The TUI colors the popup (green
-adds, red deletes, dim context), the plain REPL prints the same ANSI, the
-server adds a `preview` field to `approval/request`. The popup is not yet
-scrollable, hence the caps.
+three lines of context separated by `⋮`, minified lines are clipped, and the
+whole preview is capped only by a generous 500-line ceiling (a runaway
+minified whole-file overwrite can't blow up) — ordinary edits are never cut.
+The TUI colors the popup (green adds, red deletes, dim context) and **scrolls
+it** (↑/↓/j/k/PageUp/PageDown, with a `↑↓ more` hint in the border and the
+y/a/p/n options pinned below the scroll region), the plain REPL prints the
+same ANSI, the server adds a `preview` field to `approval/request`.
 
 **Modes**: default (ask for anything unvouched-for), `--accept-edits`
 (file writes inside the working directory auto-pass), `--yolo` (bypass:
@@ -220,7 +222,9 @@ a burst of tokens redraws once, not per token.
 Keys: Enter sends when idle, or **steers** while a turn runs (see below);
 Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+D
 quits, Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom
-on send). `--plain` keeps the old line-based REPL.
+on send). While an approval popup is up it captures the keyboard: the same
+scroll keys (plus j/k) page through a tall diff, y/a/p/n answer. `--plain`
+keeps the old line-based REPL.
 
 `--resume` replays the saved session into the transcript (user/assistant
 text plus tool status rows re-derived from the recorded tool_use/tool_result
@@ -840,7 +844,8 @@ saved and resumable — see Session persistence above.
   persistence, opaque never cacheable, `ConfirmRequest.preview` carrying an
   edit/write diff while other calls carry none); change-preview generation
   (line-numbered added/deleted/changed lines, distant-hunk splitting,
-  long-line clipping, big-diff capping, write-file existing-vs-new-file
+  long-line clipping, modest diffs uncut vs the 500-line ceiling marker,
+  write-file existing-vs-new-file
   previews, edit_file reading the file and applying the edit vs the
   two-string fallback); hook execution (all four points fire
   in order around a real turn, exit-2 pre_tool block becomes an is_error
@@ -873,9 +878,12 @@ saved and resumable — see Session persistence above.
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
   accumulation and splitting, tool status resolution by id, confirm queueing
-  and keyboard capture, interrupt/quit commands, turn-end cleanup), and pure
+  and keyboard capture, popup scroll keys with offset reset on advance,
+  interrupt/quit commands, turn-end cleanup), and pure
   rendering (CJK-aware wrap/truncate, per-cell-kind lines, tool-row collapse,
-  input window around the cursor, diff-preview coloring by +/- sign).
+  input window around the cursor, diff-preview coloring by +/- sign, confirm
+  popup windowing a tall diff with pinned options and a scroll hint — verified
+  end-to-end through a TestBackend frame).
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
   plus duplex-driven protocol tests against the real serve loop with a

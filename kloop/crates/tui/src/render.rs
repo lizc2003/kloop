@@ -254,23 +254,52 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (visible, x) = input_view(&app.input, app.cursor, input_width.max(2));
     f.render_widget(Paragraph::new(format!("> {visible}")), input_area);
 
-    if let Some(pending) = app.confirms.front() {
-        draw_confirm(f, &pending.req, f.area());
-    } else {
+    if app.confirms.is_empty() {
         f.set_cursor_position((input_area.x + 2 + x, input_area.y));
+    } else {
+        draw_confirm(f, app, f.area());
     }
 }
 
-fn draw_confirm(f: &mut Frame, req: &kloop_core::permissions::ConfirmRequest, area: Rect) {
-    let options = match &req.remember_rules {
-        Some(rules) => format!(
-            "y allow once · a allow this session · p always ({}) · n deny",
-            rules.join(", ")
-        ),
-        None => "y allow once · n deny".to_string(),
-    };
+fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
     let popup_w = area.width.saturating_sub(4).clamp(20, 76);
     let inner_w = usize::from(popup_w - 2);
+    let req = &app.confirms.front().expect("checked non-empty").req;
+    let body = confirm_body_lines(req, inner_w);
+    // The y/a/p/n options are pinned below the scroll region — the point of the
+    // popup is those keys, so they must stay visible however far the diff runs.
+    let options = confirm_option_lines(req, inner_w);
+    // border(2) + one blank separator + the pinned options.
+    let overhead = 3 + options.len();
+    let avail = usize::from(area.height);
+    let popup_h = (body.len() + overhead).min(avail);
+    let content_h = popup_h.saturating_sub(overhead).max(1);
+    let (scroll, mut lines, more_above, more_below) =
+        window_lines(&body, app.confirm_scroll, content_h);
+    app.confirm_scroll = scroll;
+    lines.push(Line::default());
+    lines.extend(options);
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
+        width: popup_w,
+        height: popup_h as u16,
+    };
+    let mut block = Block::bordered().title("approve?");
+    if let Some(hint) = scroll_hint(more_above, more_below) {
+        block = block.title_bottom(Line::from(hint).right_aligned());
+    }
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// The scrollable part of a confirm popup: the wrapped description, then (if
+/// present) a blank line and the colored diff preview. Pure and testable.
+fn confirm_body_lines(
+    req: &kloop_core::permissions::ConfirmRequest,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = wrap(&req.description, inner_w)
         .into_iter()
         .map(Line::from)
@@ -279,24 +308,55 @@ fn draw_confirm(f: &mut Frame, req: &kloop_core::permissions::ConfirmRequest, ar
         lines.push(Line::default());
         lines.extend(diff_preview_lines(preview, inner_w));
     }
-    lines.push(Line::default());
-    lines.extend(
-        wrap(&options, inner_w)
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow)))),
-    );
-    let popup_h = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
-        width: popup_w,
-        height: popup_h,
+    lines
+}
+
+/// The pinned action line(s): the yellow y/a/p/n key hints.
+fn confirm_option_lines(
+    req: &kloop_core::permissions::ConfirmRequest,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let options = match &req.remember_rules {
+        Some(rules) => format!(
+            "y allow once · a allow this session · p always ({}) · n deny",
+            rules.join(", ")
+        ),
+        None => "y allow once · n deny".to_string(),
     };
-    f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("approve?")),
-        popup,
-    );
+    wrap(&options, inner_w)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
+        .collect()
+}
+
+/// Window `lines` to `height` rows at offset `scroll`, clamped to a valid
+/// range. Returns the clamped offset (written back so it self-corrects after
+/// over-scrolling), the visible slice, and whether more lies above/below (for
+/// the scroll hint). The caller pins its own footer after the visible slice.
+fn window_lines(
+    lines: &[Line<'static>],
+    scroll: usize,
+    height: usize,
+) -> (usize, Vec<Line<'static>>, bool, bool) {
+    let height = height.max(1);
+    let scroll = scroll.min(lines.len().saturating_sub(height));
+    let end = (scroll + height).min(lines.len());
+    (
+        scroll,
+        lines[scroll..end].to_vec(),
+        scroll > 0,
+        end < lines.len(),
+    )
+}
+
+/// The bottom-border hint telling the user the popup scrolls and which way.
+fn scroll_hint(more_above: bool, more_below: bool) -> Option<String> {
+    match (more_above, more_below) {
+        (false, false) => None,
+        (true, false) => Some(" ↑ more ".into()),
+        (false, true) => Some(" ↓ more ".into()),
+        (true, true) => Some(" ↑↓ more ".into()),
+    }
 }
 
 /// Color a file-change diff preview: additions green, deletions red, context
@@ -341,6 +401,147 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello!", 5), "hell…");
         assert_eq!(truncate("你好世界", 5), "你好…");
+    }
+
+    #[test]
+    fn window_lines_slices_by_offset_and_flags_overflow() {
+        let lines: Vec<Line<'static>> = (0..10).map(|i| Line::from(i.to_string())).collect();
+        let texts = |ls: &[Line]| -> Vec<String> { ls.iter().map(line_text).collect() };
+
+        // Everything fits: no clamp, no scroll needed, no hints.
+        let (scroll, vis, up, down) = window_lines(&lines, 0, 10);
+        assert_eq!((scroll, up, down), (0, false, false));
+        assert_eq!(texts(&vis).len(), 10);
+
+        // A window in the middle: both directions have more.
+        let (scroll, vis, up, down) = window_lines(&lines, 3, 4);
+        assert_eq!((scroll, up, down), (3, true, true));
+        assert_eq!(texts(&vis), vec!["3", "4", "5", "6"]);
+
+        // Scrolled to the very top: only more below.
+        let (_, _, up, down) = window_lines(&lines, 0, 4);
+        assert_eq!((up, down), (false, true));
+
+        // Over-scrolled: the offset self-corrects to the last full window and
+        // the "more below" hint clears.
+        let (scroll, vis, up, down) = window_lines(&lines, 999, 4);
+        assert_eq!((scroll, up, down), (6, true, false));
+        assert_eq!(texts(&vis), vec!["6", "7", "8", "9"]);
+    }
+
+    #[test]
+    fn scroll_hint_reflects_available_directions() {
+        assert_eq!(scroll_hint(false, false), None);
+        assert_eq!(scroll_hint(false, true).as_deref(), Some(" ↓ more "));
+        assert_eq!(scroll_hint(true, false).as_deref(), Some(" ↑ more "));
+        assert_eq!(scroll_hint(true, true).as_deref(), Some(" ↑↓ more "));
+    }
+
+    /// The body carries the description and (when present) a blank line plus the
+    /// colored diff; the pinned options are a separate, yellow footer.
+    #[test]
+    fn confirm_body_and_options_split_scrollable_from_pinned() {
+        use kloop_core::permissions::ConfirmRequest;
+        let req = ConfirmRequest {
+            description: "write_file: notes.txt".into(),
+            remember_rules: None,
+            preview: Some("+1  hello\n+2  world".into()),
+        };
+        let body: Vec<String> = confirm_body_lines(&req, 40).iter().map(line_text).collect();
+        assert_eq!(
+            body,
+            vec!["write_file: notes.txt", "", "+1  hello", "+2  world"]
+        );
+
+        let opts = confirm_option_lines(&req, 40);
+        assert_eq!(
+            opts.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["y allow once · n deny"]
+        );
+        // Options are yellow so they read as the action bar.
+        assert_eq!(opts[0].spans[0].style, Style::new().fg(Color::Yellow));
+    }
+
+    /// End-to-end through a real ratatui frame (TestBackend, no TTY): a diff
+    /// taller than the popup renders a windowed slice with the options pinned at
+    /// the bottom and a `↓ more` hint; scrolling to the end swaps the visible
+    /// slice and flips the hint to `↑ more`, options still pinned.
+    #[test]
+    fn draw_confirm_windows_a_tall_diff_and_pins_the_options() {
+        use crate::events::AgentEvent;
+        use kloop_core::permissions::ConfirmRequest;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use tokio::sync::oneshot;
+
+        let rows = |term: &Terminal<TestBackend>| -> Vec<String> {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let preview = (1..=60)
+            .map(|i| format!("+{i}  line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::new("s".into());
+        let (reply, _rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "write_file: big.txt".into(),
+                remember_rules: None,
+                preview: Some(preview),
+            },
+            reply,
+        });
+
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+
+        // Pinned to the top: early diff lines show, the tail does not, and the
+        // options plus a `↓ more` hint are on screen.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = rows(&term).join("\n");
+        assert!(
+            screen.contains("+1  line 1"),
+            "top of diff visible:\n{screen}"
+        );
+        assert!(
+            !screen.contains("+60  line 60"),
+            "tail not yet visible:\n{screen}"
+        );
+        assert!(
+            screen.contains("y allow once · n deny"),
+            "options pinned:\n{screen}"
+        );
+        assert!(screen.contains("↓ more"), "down hint shown:\n{screen}");
+        assert!(!screen.contains("↑ more"), "no up hint at top:\n{screen}");
+
+        // Over-scroll: the offset self-corrects to the last window, the tail
+        // shows, the top scrolls off, and the hint flips — options stay pinned.
+        app.confirm_scroll = 999;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = rows(&term).join("\n");
+        assert!(app.confirm_scroll < 999, "offset clamped to a valid range");
+        assert!(
+            screen.contains("+60  line 60"),
+            "tail visible after scroll:\n{screen}"
+        );
+        assert!(
+            !screen.contains("+1  line 1"),
+            "top scrolled off:\n{screen}"
+        );
+        assert!(
+            screen.contains("y allow once · n deny"),
+            "options still pinned:\n{screen}"
+        );
+        assert!(screen.contains("↑ more"), "up hint shown:\n{screen}");
+        assert!(!screen.contains("↓ more"), "no down hint at end:\n{screen}");
     }
 
     #[test]

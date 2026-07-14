@@ -99,6 +99,10 @@ pub struct App {
     pub scroll_up: usize,
     pub running: bool,
     pub confirms: VecDeque<PendingConfirm>,
+    /// Scroll offset (in display lines) into the active confirm popup's body,
+    /// so a diff taller than the popup can be read in full. Reset to 0 when the
+    /// front prompt changes; clamped to a valid range at render time.
+    pub confirm_scroll: usize,
     /// Latest agent note, surfaced in the status line while running.
     pub last_note: Option<String>,
     /// Whether the last Assistant cell still accepts text deltas. A tool row,
@@ -125,6 +129,7 @@ impl App {
             scroll_up: 0,
             running: false,
             confirms: VecDeque::new(),
+            confirm_scroll: 0,
             last_note: None,
             assistant_open: false,
             thinking_open: false,
@@ -283,6 +288,7 @@ impl App {
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
                 self.confirms.clear();
+                self.confirm_scroll = 0;
                 // An interrupted turn drops task futures mid-await, so a
                 // sub-agent's AgentEnd may never arrive: no row may outlive
                 // its turn still spinning.
@@ -390,6 +396,27 @@ impl App {
                 _ => return Command::None,
             }
         }
+        // Scroll the popup body (a tall diff) instead of answering. j/k mirror
+        // Up/Down for keyboard-home users; the render clamps the offset.
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
+                return Command::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.confirm_scroll += 1;
+                return Command::None;
+            }
+            KeyCode::PageUp => {
+                self.confirm_scroll = self.confirm_scroll.saturating_sub(10);
+                return Command::None;
+            }
+            KeyCode::PageDown => {
+                self.confirm_scroll += 10;
+                return Command::None;
+            }
+            _ => {}
+        }
         let decision = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Decision::Allow,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Decision::Deny,
@@ -398,6 +425,8 @@ impl App {
             _ => return Command::None,
         };
         let pending = self.confirms.pop_front().expect("checked non-empty");
+        // The next queued prompt (if any) starts unscrolled.
+        self.confirm_scroll = 0;
         // a/p degrade to allow-once in the gate when the call isn't
         // remember-able, same as the plain REPL.
         let _ = pending.reply.send(decision);
@@ -902,6 +931,53 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(rx.try_recv().unwrap(), Decision::AllowSession);
         assert!(app.confirms.is_empty());
+    }
+
+    /// While a prompt is up, arrow/j/k/PageUp/PageDown scroll the popup instead
+    /// of leaking to the input line, and the offset never goes below zero.
+    /// Answering advances to the next queued prompt with the offset reset.
+    #[tokio::test]
+    async fn confirm_scroll_keys_move_the_popup_and_reset_on_advance() {
+        let mut app = App::new("s".into());
+        let (r1, _rx1) = oneshot::channel();
+        let (r2, _rx2) = oneshot::channel();
+        let req = |d: &str| ConfirmRequest {
+            description: d.into(),
+            remember_rules: None,
+            preview: None,
+        };
+        app.apply(AgentEvent::Confirm {
+            req: req("first"),
+            reply: r1,
+        });
+        app.apply(AgentEvent::Confirm {
+            req: req("second"),
+            reply: r2,
+        });
+
+        // Scrolling keys adjust the offset and are captured by the prompt.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.confirm_scroll, 2);
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.confirm_scroll, 12);
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_scroll, 10);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.confirm_scroll, 0);
+        // None of that reached the input line.
+        assert_eq!(app.input, "");
+        // Below-zero is saturated, not wrapped.
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.confirm_scroll, 0);
+
+        // Scroll into the first diff, then answer: the next prompt starts fresh.
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.confirm_scroll, 10);
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.confirms.front().unwrap().req.description, "second");
+        assert_eq!(app.confirm_scroll, 0, "the next prompt is unscrolled");
     }
 
     #[tokio::test]
