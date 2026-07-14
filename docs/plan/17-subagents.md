@@ -24,7 +24,7 @@
 
 **真 key 验收**(anthropic sonnet-5,`--plain --yolo`,配 pre_tool/subagent_stop/post_turn 三 hook):模型派子 agent 跑 `echo HOOKTEST_OK`——`pre_tool` 主 agent 的 `task` 调用无 agent 字段、子 agent 的 `bash` 调用带 `agent=agent-1`;`subagent_stop` 一次带 `agent=agent-1` + `agent_transcript_path=.kloop/sessions/…-agent-1.jsonl` + `last_assistant_message`(结果)+ `session_id`(父);`post_turn` 只主 agent 触发(keys 仅 event/session_id,子 agent 未触发)。**路由 + agent 字段 + 富 payload 全链闭环。**
 
-**提交**:见 HANDOFF 对应条目(fmt/clippy/test 全绿,399 测试)。**至此 plan 17 全部切片(1/2/3/4/5 + 片 6 由 plan 26 承接)完成,无挂账。**
+**提交**:6c585cc(fmt/clippy/test 全绿,399 测试)。**至此 plan 17 全部切片(1/2/3/4/5 + 片 6 由 plan 26 承接)完成,无挂账。**
 
 ## ✅ 完成记录(2026-07-14,切片 3:子 agent 历史持久化)
 
