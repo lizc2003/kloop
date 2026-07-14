@@ -408,6 +408,96 @@ async fn approval_denied_then_allowed() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// `turn/steer` pushed while a turn is hung at an approval gate is delivered
+/// into that same turn: the worker drains the inbox at the next round boundary,
+/// after the tool executes. Proves the server wires steering into a *running*
+/// turn (not just queued for the next one).
+#[tokio::test]
+async fn steer_folds_into_a_running_turn() {
+    let dirs = test_dirs("steer");
+    let target = dirs.root.join("steer.txt");
+    let script = vec![
+        // Round 0: a write_file that hangs at the approval gate.
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "write_file".into(),
+            input: json!({"path": target.to_str().unwrap(), "content": "x"}),
+        }],
+        // Round 1 (after the tool runs and the steer drains): wrap up.
+        vec![text("done")],
+    ];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let thread_id = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": "go"}}))
+        .await;
+    let log = client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+    let srv_id = log.last().unwrap()["id"].as_str().unwrap().to_string();
+
+    // Steer while the turn is parked at the gate; the server pushes it to the
+    // thread's inbox (a bare ack, no turn started).
+    client
+        .send(json!({"id": 3, "method": "turn/steer", "params": {"threadId": thread_id, "input": "also check the logs"}}))
+        .await;
+    let log = client.recv_until(|m| m["id"] == 3).await;
+    assert!(
+        log.iter().any(|m| m["id"] == 3 && m["result"] == json!({})),
+        "turn/steer acks with an empty result: {log:?}"
+    );
+
+    // Release the tool; the turn resumes, drains the steer, and completes.
+    client
+        .send(json!({"id": srv_id, "result": {"decision": "allow"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(log.last().unwrap()["params"]["reason"], "completed");
+
+    client.shutdown().await;
+    let messages =
+        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
+            .unwrap();
+    let steered = messages.iter().any(|m| {
+        m.content.iter().any(|b| {
+            matches!(b, ContentBlock::Text { text }
+                if text.contains(kloop_core::inbox::STEERING_PREFIX)
+                    && text.contains("also check the logs"))
+        })
+    });
+    assert!(
+        steered,
+        "the steer must be delivered as a framed user message in the turn: {messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// `turn/steer` to a nonexistent thread is a clean error, not a panic.
+#[tokio::test]
+async fn steer_to_a_missing_thread_errors() {
+    let dirs = test_dirs("steer-missing");
+    let mut client = start_server(
+        factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client
+        .send(json!({"id": 1, "method": "turn/steer", "params": {"threadId": "ghost", "input": "hi"}}))
+        .await;
+    let err = client.recv().await;
+    assert_eq!(err["id"], 1);
+    assert_eq!(err["error"]["code"], -32000);
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 #[tokio::test]
 async fn parallel_threads_do_not_cross_streams() {
     let dirs = test_dirs("parallel");

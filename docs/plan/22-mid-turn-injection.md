@@ -24,6 +24,17 @@
 
 **提交**:27d0430(fmt/clippy/test 全绿,321 个测试)。
 
+### ✅ 追加(2026-07-14,server 入队侧,plan A 会话·提交号 PENDING-22)
+
+steering 的 enqueue 侧原为 TUI-only,现补上 **server**:新 RPC `turn/steer
+{threadId, input}` push `InboxItem::Steer` 进该 thread 的 `cfg.inbox`(clone 存进
+`ThreadHandle`)。**无条件 push、不检查 running、不启动 turn**——运行中 push 由 worker
+下一 round 边界 drain 折进当前 turn;空闲 push 由下一次 `turn/start` 顶部 drain 交付
+(client-driven server 无 autowake,同 plan 22 平台事实)。测试 +2(server duplex):
+运行中 steer 端到端(approval 挂住 turn→push→放行→drain,断言 history 出现带
+`STEERING_PREFIX` 的 framed user 消息)、steer 到不存在 thread 干净报错。**plain REPL
+(阻塞读)入队侧仍挂账**(平台事实,drain 三前端都活)。
+
 ## 目标
 
 一个"**step 边界注入**"机制,两个消费者:

@@ -265,7 +265,8 @@ app-server: JSON-RPC 2.0 envelopes minus the `"jsonrpc"` field, one object
 per line) so IDEs and automation can drive multiple sessions concurrently.
 
 Methods: `thread/start`, `thread/resume {threadId}`, `thread/list`,
-`turn/start {threadId, input}`, `turn/interrupt {threadId}`. Every thread is
+`turn/start {threadId, input}`, `turn/steer {threadId, input}`,
+`turn/interrupt {threadId}`. Every thread is
 its own tokio task owning a History (persisted to the same
 `.kloop/sessions/` files the interactive frontends use — sessions are
 interchangeable between the TUI and the server) and its own permission gate,
@@ -668,10 +669,13 @@ constraint both cc and codex call out.
 Each **sub-agent gets its own fresh queue** (the `task` tool resets it on the
 cloned Config, like the todo list), so a running sub-agent never drains the
 parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
-a User cell); the plain REPL (blocking stdin) and server (`turn/steer`) do not
-enqueue yet — the drain path is live for all three, only the enqueue side is
-TUI-only for now. This is the cc/codex convergence: steering is
-enqueue-not-interrupt, delivered only between steps (see `refs/README.md`).
+a User cell); server mode enqueues via `turn/steer {threadId, input}` (pushed
+during a running turn it folds in at the next round boundary, pushed while idle
+it is delivered at the top of the next `turn/start` — there is no autowake in
+client-driven server mode). The plain REPL (blocking stdin) does not enqueue
+yet — the drain path is live for all three, so the gap is only the enqueue
+side. This is the cc/codex convergence: steering is enqueue-not-interrupt,
+delivered only between steps (see `refs/README.md`).
 
 ## Slash commands (Phase 2, sixteenth slice)
 

@@ -37,6 +37,8 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
+use kloop_core::inbox::Inbox;
+use kloop_core::inbox::InboxItem;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -129,6 +131,11 @@ struct ThreadHandle {
     turn_tx: mpsc::UnboundedSender<Turn>,
     running: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// The thread's step-boundary injection queue (a clone of `Config.inbox`,
+    /// which the worker's turns drain). `turn/steer` pushes here; the text is
+    /// delivered as a user message at the next round boundary — during a
+    /// running turn, or at the start of the next `turn/start` if idle.
+    inbox: Arc<Inbox>,
 }
 
 type PendingApprovals = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Decision>>>>;
@@ -178,6 +185,7 @@ impl Server {
             "thread/resume" => self.thread_resume(&params),
             "thread/list" => self.thread_list(),
             "turn/start" => self.turn_start(&params),
+            "turn/steer" => self.turn_steer(&params),
             "turn/interrupt" => self.turn_interrupt(&params),
             _ => Err((wire::METHOD_NOT_FOUND, format!("unknown method '{method}'"))),
         };
@@ -296,6 +304,25 @@ impl Server {
         Ok(json!({}))
     }
 
+    /// Enqueue steering text typed while a turn runs (or between turns). Unlike
+    /// `turn/start` this never starts a turn and never checks the running flag:
+    /// the worker's turn loop drains the inbox at round boundaries, so a steer
+    /// pushed during a running turn folds into it, and one pushed while idle is
+    /// delivered at the top of the next `turn/start`. There is no autowake in
+    /// client-driven server mode, so an idle steer waits for that next turn.
+    fn turn_steer(&mut self, params: &Value) -> MethodResult {
+        let thread_id = str_param(params, "threadId")?;
+        let input = str_param(params, "input")?;
+        let handle = self.threads.get(thread_id).ok_or_else(|| {
+            (
+                wire::SERVER_ERROR,
+                format!("no active thread '{thread_id}'"),
+            )
+        })?;
+        handle.inbox.push(InboxItem::Steer(input.to_string()));
+        Ok(json!({}))
+    }
+
     fn turn_interrupt(&mut self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "threadId")?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
@@ -325,19 +352,17 @@ impl Server {
         cfg.session_id = thread_id.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
-        tokio::spawn(thread_worker(
-            Arc::new(cfg),
-            history,
-            ui,
-            turn_rx,
-            running.clone(),
-        ));
+        let cfg = Arc::new(cfg);
+        // The steering queue the worker's turns drain; `turn/steer` pushes here.
+        let inbox = cfg.inbox.clone();
+        tokio::spawn(thread_worker(cfg, history, ui, turn_rx, running.clone()));
         self.threads.insert(
             thread_id,
             ThreadHandle {
                 turn_tx,
                 running,
                 current_cancel: Arc::new(Mutex::new(None)),
+                inbox,
             },
         );
         Ok(())
