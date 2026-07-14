@@ -35,6 +35,15 @@ steering 的 enqueue 侧原为 TUI-only,现补上 **server**:新 RPC `turn/steer
 `STEERING_PREFIX` 的 framed user 消息)、steer 到不存在 thread 干净报错。**plain REPL
 (阻塞读)入队侧仍挂账**(平台事实,drain 三前端都活)。
 
+**为何 plain 不做(2026-07-14 侦查后判定跳过,非仅"以后补")**:plain 只有一个
+stdin,审批弹窗 `CliApprover`(`cli/src/main.rs`)在 turn 运行时用**阻塞**
+`stdin().read_line()` 读 y/a/p/n,现有设计明确靠注释"turn 运行时 REPL 自己的读取器空
+闲"这一前提。要 steering 就得在 turn 期间再起一个并发 stdin 读取器,一旦撞审批门,
+审批器与 steering 读取器会同抢 fd 0——用户敲的一行落到哪边不确定,是**正确性 bug**。
+做**对**得把 plain 输入统一成单读取器 + 按状态派发(steering 队列 / 审批回答 / 新
+turn),即把 plain 重构成 TUI 那样的事件循环 + channel 路由审批——对遗留前端
+(`--plain`/`--mock`)投机收益不划算,故跳过。真要做,当独立"plain 事件循环化"任务。
+
 ## 目标
 
 一个"**step 边界注入**"机制,两个消费者:

@@ -16,7 +16,7 @@ thread**(同 `thread/resume`)→ 返 `{threadId, messageCount}`,client 可立即
 测试 +2(server duplex):fork 建活 thread + 血缘 `fork_origin` 指回源 `#cut` + 源文件
 不动 + fork 可独立 turn;非法 cut 列合法点 + 缺源报错。**TUI 按键选点仍挂账**。
 
-### ✅ 追加(2026-07-14,TUI 按键选点收尾——原地 rewind,提交号 PENDING)
+### ✅ 追加(2026-07-14,TUI 按键选点收尾——原地 rewind,提交号 8808306)
 
 最后一处挂账("TUI 按键选点")补上,做成**原地 rewind**(cc `/rewind` 语义)而非
 CLI `--fork` 那种"分叉后退出再 `--resume`":TUI 里 **Ctrl+R**(仅空闲)开选点弹层
