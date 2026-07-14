@@ -33,6 +33,12 @@ as part of the current task — finish any step already in progress, then act on
 const SUBAGENT_PREFIX: &str = "A background sub-agent you dispatched has finished. Its result is \
 below — fold it into your work, and if you were waiting on it, continue from here:";
 
+/// Framing for a background program's result reinjected into its parent
+/// (plan 24: `run_program {"background": true}`). Like a sub-agent result but
+/// from a program the parent launched, not a sub-agent.
+const PROGRAM_PREFIX: &str = "A background program you launched has finished. Its return value is \
+below — fold it into your work, and if you were waiting on it, continue from here:";
+
 /// One pending injection. Neutral text alone would force a single framing on
 /// every producer (the drain used to hard-wrap everything as steering); a typed
 /// item lets each producer frame its own message.
@@ -43,6 +49,9 @@ pub enum InboxItem {
     /// A background sub-agent's terminal summary, reinjected to its parent
     /// (plan 26). `label` is the "agent-N" id; `summary` is the framed body.
     SubAgentResult { label: String, summary: String },
+    /// A background program's return value, reinjected to its parent
+    /// (plan 24). `label` is the "program-N" id; `summary` is the return value.
+    ProgramResult { label: String, summary: String },
 }
 
 impl InboxItem {
@@ -52,6 +61,9 @@ impl InboxItem {
             InboxItem::Steer(text) => format!("{STEERING_PREFIX}\n{text}"),
             InboxItem::SubAgentResult { label, summary } => {
                 format!("{SUBAGENT_PREFIX}\n[{label}]\n{summary}")
+            }
+            InboxItem::ProgramResult { label, summary } => {
+                format!("{PROGRAM_PREFIX}\n[{label}]\n{summary}")
             }
         }
     }
@@ -121,6 +133,14 @@ mod tests {
             }
             .into_message(),
             format!("{SUBAGENT_PREFIX}\n[agent-2]\nfound 3 matches")
+        );
+        assert_eq!(
+            InboxItem::ProgramResult {
+                label: "program-1".into(),
+                summary: "42".into(),
+            }
+            .into_message(),
+            format!("{PROGRAM_PREFIX}\n[program-1]\n42")
         );
     }
 

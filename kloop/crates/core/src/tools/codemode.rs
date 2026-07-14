@@ -11,18 +11,32 @@
 //! gate lives here because the gate is what makes code-mode safe.
 
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
+use super::async_agents::AgentStatus;
 use super::ToolCtx;
+use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
 use kloop_codemode::HostBridge;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
+
+/// Cap on a background program's reinjected error text, matching the sub-agent
+/// error cap (~900 tokens). A successful return value is passed through; only a
+/// failure is truncated so its noise can't crowd the parent's context.
+const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
+
+/// Process-global so parallel background spawns never collide on a label — same
+/// reasoning as the offload/agent counters.
+static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
 
 /// Tools NOT exposed to a program: `run_program` itself (no program-in-program),
 /// `task` (replaced by the `agent()` orchestration primitive), and the
@@ -53,20 +67,126 @@ fn program_tool_names(sources: &[Arc<dyn super::ToolSource>]) -> Vec<String> {
 }
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let source = super::str_arg(input, "source", "run_program")?;
+    let source = super::str_arg(input, "source", "run_program")?.to_string();
     let names = program_tool_names(&ctx.cfg.tool_sources);
     let limits = ctx.cfg.program_limits;
+    // Fire-and-forget: spawn detached, return a program id now, reinject the
+    // return value at the next round boundary (reuses the plan-26 async path).
+    if input["background"].as_bool().unwrap_or(false) {
+        return spawn_background_program(ctx, source, names, limits);
+    }
     let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
     // progress narration out of the context is the whole point of code-mode.
     let out =
-        kloop_codemode::run_program(source, &names, bridge, ctx.cancel.clone(), limits).await?;
-    Ok(if out.is_empty() {
+        kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await?;
+    Ok(program_output(out))
+}
+
+fn program_output(out: String) -> String {
+    if out.is_empty() {
         "(program completed with no output)".into()
     } else {
         out
-    })
+    }
+}
+
+/// First line of the source, truncated — the label a UI/registry shows for a
+/// background program while it runs.
+fn program_preview(source: &str) -> String {
+    let line = source.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mut preview: String = line.trim().chars().take(80).collect();
+    if preview.len() < line.trim().len() {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Fire-and-forget program spawn (plan 24, `run_program {"background": true}`):
+/// register in the shared async-task registry, launch a DETACHED tokio task on
+/// its OWN cancel token (a finished parent turn must not kill a still-running
+/// program), and return immediately. When the program ends it reinjects its
+/// return value into the parent's inbox. Mirrors the sub-agent background path
+/// (plan 26) and reuses the same registry, `wait`, `stop_agent` and autowake.
+fn spawn_background_program(
+    ctx: &ToolCtx,
+    source: String,
+    names: Vec<String>,
+    limits: kloop_codemode::Limits,
+) -> Result<String> {
+    let label = format!("program-{}", PROGRAM_SEQ.fetch_add(1, Ordering::Relaxed));
+    let own_cancel = CancellationToken::new();
+    let preview = program_preview(&source);
+    ctx.cfg
+        .async_agents
+        .register(&label, &preview, own_cancel.clone())
+        .map_err(|msg| anyhow!("run_program: {msg}"))?;
+    let parent_inbox = ctx.cfg.inbox.clone();
+    let async_agents = ctx.cfg.async_agents.clone();
+    let ui = ctx.ui.clone();
+    // The program's tool calls run on the program's own cancel, not the parent
+    // turn's — the parent may end while the program is still going.
+    let mut bg_ctx = ctx.clone();
+    bg_ctx.cancel = own_cancel.clone();
+    let bridge = Arc::new(CoreBridge::new(bg_ctx, limits));
+    ui.agent_start(&label, &preview);
+    tokio::spawn({
+        let label = label.clone();
+        let ui = ui.clone();
+        async move {
+            let outcome =
+                kloop_codemode::run_program(&source, &names, bridge, own_cancel.clone(), limits)
+                    .await;
+            let (status, reinject) = classify_program(outcome, &own_cancel);
+            async_agents.set_status(&label, status);
+            match reinject {
+                Some(summary) => parent_inbox.push(InboxItem::ProgramResult {
+                    label: label.clone(),
+                    summary,
+                }),
+                // Stopped/aborted: no reinjection, but still wake a blocked
+                // `wait` so it re-evaluates instead of blocking its full deadline.
+                None => parent_inbox.notify_activity(),
+            }
+            ui.agent_end(&label, matches!(status, AgentStatus::Completed));
+        }
+    });
+    Ok(format!(
+        "Program {label} started in the background. Keep working; its return value will be \
+         delivered to you as a message when it finishes. Block for it with the wait tool, or \
+         stop it with stop_agent."
+    ))
+}
+
+/// Map a background program's terminal outcome to (registry status, optional
+/// reinjection). Success reinjects the return value; a failure reinjects a
+/// framed, truncated error; a program stopped via `stop_agent` (its own cancel
+/// fired) reinjects nothing — the model that stopped it already knows (codex's
+/// is_final).
+fn classify_program(
+    outcome: Result<String>,
+    own_cancel: &CancellationToken,
+) -> (AgentStatus, Option<String>) {
+    match outcome {
+        Ok(out) => (AgentStatus::Completed, Some(program_output(out))),
+        Err(_) if own_cancel.is_cancelled() => (AgentStatus::Aborted, None),
+        Err(e) => (
+            AgentStatus::Failed,
+            Some(format!(
+                "[background program failed] {}\nYou may re-run it or try another approach.",
+                truncate_program_error(&format!("{e:#}"))
+            )),
+        ),
+    }
+}
+
+fn truncate_program_error(e: &str) -> String {
+    if e.chars().count() <= MAX_PROGRAM_ERROR_CHARS {
+        return e.to_string();
+    }
+    let truncated: String = e.chars().take(MAX_PROGRAM_ERROR_CHARS).collect();
+    format!("{truncated}… (error truncated)")
 }
 
 /// The bridge core hands the engine: it owns a [`ToolCtx`] clone and turns each
@@ -246,6 +366,11 @@ and sandbox checks as a direct tool call. Run independent calls concurrently wit
 `parallel([...])`. There is no filesystem, network, module import, or console — the tools and \
 `agent()` are the only way to reach outside.\n\n\
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
+Set `background: true` to run the program detached: you get a program id back \
+immediately and its return value is delivered to you as a message when it \
+finishes (block for it with the `wait` tool, or cancel it with `stop_agent`). \
+Use this for long fan-outs/migrations so they don't hold up the turn; omit it \
+for a normal synchronous run.\n\n\
 Available API (TypeScript):\n```ts\n{decls}```"
     );
 
@@ -272,7 +397,8 @@ the program:\n",
         schema: json!({
             "type": "object",
             "properties": {
-                "source": {"type": "string", "description": "The JavaScript program to run"}
+                "source": {"type": "string", "description": "The JavaScript program to run"},
+                "background": {"type": "boolean", "description": "Run detached: returns a program id immediately and delivers the return value as a message when it finishes (block with wait, cancel with stop_agent). Omit for a synchronous run."}
             },
             "required": ["source"]
         }),

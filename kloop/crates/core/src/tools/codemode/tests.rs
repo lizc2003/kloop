@@ -168,6 +168,83 @@ async fn agent_cap_refuses_runaway_fanout() {
     assert!(out.contains("agent cap (2"), "the third hit the cap: {out}");
 }
 
+/// Fire-and-forget: run_program {"background": true} returns a "started" message
+/// (NOT the result), and the detached program reinjects its return value into
+/// the PARENT's inbox as a framed ProgramResult when it finishes.
+#[tokio::test]
+async fn background_program_returns_immediately_and_reinjects() {
+    use crate::inbox::InboxItem;
+    let ctx = test_ctx(0, "bg-program");
+    let (out, is_error) = run_tool(
+        "run_program",
+        json!({ "source": "return 'PROG_DONE';", "background": true }),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert!(out.contains("started in the background"), "{out}");
+    assert!(
+        !out.contains("PROG_DONE"),
+        "the result is NOT returned inline: {out}"
+    );
+
+    for _ in 0..300 {
+        if !ctx.cfg.inbox.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let items = ctx.cfg.inbox.drain();
+    assert_eq!(items.len(), 1, "one reinjected result");
+    match &items[0] {
+        InboxItem::ProgramResult { label, summary } => {
+            assert!(label.starts_with("program-"), "{label}");
+            assert_eq!(summary, "PROG_DONE");
+        }
+        other => panic!("expected ProgramResult, got {other:?}"),
+    }
+    assert_eq!(ctx.cfg.async_agents.running_count(), 0, "slot freed");
+}
+
+/// A background program cancelled via stop_agent ends Aborted and reinjects
+/// NOTHING (codex's is_final) — only a wake so a blocked wait re-evaluates.
+#[tokio::test]
+async fn stopped_background_program_does_not_reinject() {
+    let ctx = test_ctx(0, "bg-prog-stop");
+    // The program blocks on a long bash so stop_agent can catch it running.
+    let (out, _) = run_tool(
+        "run_program",
+        json!({ "source": "return await tools.bash({ command: 'sleep 30' });", "background": true }),
+        &ctx,
+    )
+    .await;
+    let id = out
+        .split_whitespace()
+        .find(|w| w.starts_with("program-"))
+        .unwrap()
+        .to_string();
+    for _ in 0..100 {
+        if ctx.cfg.async_agents.running_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (stop_out, is_error) = run_tool("stop_agent", json!({ "agent_id": id }), &ctx).await;
+    assert!(!is_error, "{stop_out}");
+    assert!(stop_out.contains("Stopping"), "{stop_out}");
+
+    for _ in 0..300 {
+        if ctx.cfg.async_agents.running_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        ctx.cfg.inbox.is_empty(),
+        "an interrupted program reinjects nothing"
+    );
+}
+
 /// Intermediate tool results live in program variables; only the return value
 /// comes back. Two full file reads happen, but their content never appears in
 /// the tool_result — exactly the context-window saving code-mode exists for.

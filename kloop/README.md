@@ -798,13 +798,27 @@ A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
+**Background programs**: `run_program {"background": true}` fires and forgets —
+it returns a `program-N` id immediately and the program's return value is
+delivered to the parent as a message when it finishes, so a long fan-out /
+migration doesn't hold up the turn. It reuses the async sub-agent machinery
+wholesale (see "Async sub-agents" below): the same registry, the same `wait` /
+`stop_agent` tools, the same inbox reinjection and TUI autowake — a background
+program and a background sub-agent are the same kind of detached task, so they
+share one registry (the shell registry stays separate: a shell has an output
+file, not a reinjected result). Deliberately **not** copied from codex: its
+cell/observation-frontier machinery (incremental pull-based output streamed to
+the model between `yield`s) — that is pull-based observation coupled to V8's
+synchronous-pause model, whereas kloop is push-based (result reinjected on
+completion) and `log()` already streams progress to the user live.
+
 **Not done** (deferred, with reason): a token `budget` primitive — cc's
 `budget.total` ships as a hardcoded `null` placeholder (its hard cap never
 fires), and kloop has no turn-level budget source, so a budget object would be a
 no-op until there's a real source to feed it; a richer progress view (cc's
-`/workflows` tree — kloop shows a flat live trace); background programs with
-`yield`/`wait`; saving a program for reuse with journal-based resume. See
-`docs/plan/24-code-mode.md` and `docs/plan/27-codemode-mcp-tools.md`.
+`/workflows` tree — kloop shows a flat live trace); saving a program for reuse
+with journal-based resume. See `docs/plan/24-code-mode.md` and
+`docs/plan/27-codemode-mcp-tools.md`.
 
 ## Async sub-agents (Phase 2, eighteenth slice)
 

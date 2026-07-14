@@ -1,15 +1,19 @@
-//! Background sub-agent registry + the `wait`/`stop_agent` tools (plan 26).
+//! Background async-task registry + the `wait`/`stop_agent` tools (plan 26).
 //!
-//! A `task {"background": true}` call spawns a detached sub-agent and returns
-//! immediately; the sub-agent reinjects its result into the parent's inbox when
-//! it finishes (see [`crate::tools::task`]). This registry tracks those
-//! in-flight agents so the parent can block on them (`wait`) or cancel a runaway
-//! (`stop_agent`), and so a concurrency cap catches fork bombs.
+//! Two producers register here, both with the identical fire-and-forget
+//! lifecycle (detached run on an own cancel token, reinject a result into the
+//! parent's inbox when done): a `task {"background": true}` sub-agent (plan 26)
+//! and a `run_program {"background": true}` program (plan 24). This registry
+//! tracks those in-flight tasks so the parent can block on any of them (`wait`)
+//! or cancel a runaway (`stop_agent`), and so a concurrency cap catches fork
+//! bombs. The label prefix (`agent-N` / `program-N`) tells them apart.
 //!
-//! Deliberately SEPARATE from [`crate::tools::BackgroundShells`]: codex keeps
-//! its shell tasks and sub-agents in distinct mechanisms, and cc only unifies
-//! the *state* model, not spawn. A shared `Tasks` abstraction would be
-//! pre-abstracting against that evidence — revisit if a third consumer appears.
+//! Still deliberately SEPARATE from [`crate::tools::BackgroundShells`]: a shell
+//! has an output file and no reinjection — a different lifecycle. codex keeps
+//! shells and agents in distinct mechanisms and cc only unifies the *state*
+//! model, not spawn, so shells stay out. Programs, by contrast, share this
+//! registry precisely because their lifecycle is identical to a sub-agent's
+//! (the "third consumer" that made generalizing worth it, plan 26).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,7 +88,7 @@ impl AsyncAgents {
             .count();
         if running >= MAX_BACKGROUND_AGENTS {
             return Err(format!(
-                "too many background sub-agents already running ({running}); wait for some to \
+                "too many background tasks already running ({running}); wait for some to \
                  finish (use the wait tool) before dispatching more"
             ));
         }
@@ -121,7 +125,7 @@ impl AsyncAgents {
     fn request_stop(&self, id: &str) -> Result<String, String> {
         let agents = self.agents.lock().unwrap();
         let Some(e) = agents.get(id) else {
-            return Err(format!("no background sub-agent with id {id}"));
+            return Err(format!("no background task with id {id}"));
         };
         if e.status != AgentStatus::Running {
             return Err(format!(
@@ -161,8 +165,9 @@ pub(super) async fn wait_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
     if agents.running_count() == 0 && inbox.is_empty() {
         return Ok(
-            "No background sub-agents are running and nothing is pending. Dispatch work \
-                   with task {\"background\": true}, or just continue."
+            "No background tasks are running and nothing is pending. Dispatch work with \
+                   task {\"background\": true} or run_program {\"background\": true}, or just \
+                   continue."
                 .into(),
         );
     }
@@ -180,7 +185,7 @@ pub(super) async fn wait_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     tokio::pin!(notified);
     tokio::select! {
         _ = &mut notified => Ok(status_report(
-            "A background sub-agent finished or new input arrived; it will be delivered on the next step.",
+            "A background task finished or new input arrived; it will be delivered on the next step.",
             agents.running_count(),
         )),
         _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => Ok(status_report(
@@ -193,19 +198,19 @@ pub(super) async fn wait_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 fn status_report(head: &str, running: usize) -> String {
     match running {
-        0 => format!("{head} No sub-agents are still running."),
-        1 => format!("{head} 1 sub-agent is still running."),
-        n => format!("{head} {n} sub-agents are still running."),
+        0 => format!("{head} No background tasks are still running."),
+        1 => format!("{head} 1 background task is still running."),
+        n => format!("{head} {n} background tasks are still running."),
     }
 }
 
-/// `stop_agent`: cancel a running background sub-agent by id. It ends Aborted
-/// and reports no result.
+/// `stop_agent`: cancel a running background task (sub-agent or program) by id.
+/// It ends Aborted and reports no result.
 pub(super) async fn stop_agent_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "agent_id", "stop_agent")?;
     match ctx.cfg.async_agents.request_stop(id) {
         Ok(task) => Ok(format!(
-            "Stopping background sub-agent {id} ({task}). It will not report a result."
+            "Stopping background task {id} ({task}). It will not report a result."
         )),
         Err(e) => bail!(e),
     }
@@ -223,10 +228,7 @@ mod tests {
         let ctx = test_ctx(0, "wait-idle");
         let (out, is_error) = run_tool("wait", json!({}), &ctx).await;
         assert!(!is_error, "{out}");
-        assert!(
-            out.contains("No background sub-agents are running"),
-            "{out}"
-        );
+        assert!(out.contains("No background tasks are running"), "{out}");
     }
 
     #[tokio::test]
@@ -254,7 +256,7 @@ mod tests {
         let err = reg
             .register("agent-over", "t", CancellationToken::new())
             .unwrap_err();
-        assert!(err.contains("too many background sub-agents"), "{err}");
+        assert!(err.contains("too many background tasks"), "{err}");
     }
 
     #[test]

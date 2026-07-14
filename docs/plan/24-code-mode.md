@@ -285,8 +285,8 @@ inline/defer/结构化/glob 四侧验收全过。**plan 27 彻底收尾,无 code
 `null` 占位、硬顶从不触发,kloop 无 turn-level 预算来源,做了是 no-op;改做 caps,见下节完成记录)**。
 ④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
 (追加片,见上);只剩"更富的进度树
-(cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
-observation frontier;现同步跑完返回)。
+(cc `/workflows`)",kloop 现为扁平实时 trace。⑤ ~~后台 program~~ **已完成(2026-07-14,`run_program{background:true}`
+复用 plan 26 异步基建;不做 codex observation frontier——见下节完成记录)**。
 ⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ ~~`Limits` 走配置/env~~ **已完成
 (2026-07-14,`[codemode]` config + `AGENT_PROGRAM_*` env,见下节)**。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `run_program`
 本身只在 depth-0(同 task);受限 agent 类型不给 run_program。
@@ -352,3 +352,26 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 - **真 key**(anthropic sonnet-5,`--plain --yolo`):`.kloop/config.toml` `[codemode] max_items=3` → 模型写 `parallel(5 items)` → 抛 **`parallel: 5 items exceeds the cap of 3 per call`** → 模型报告并建议分批。config→Config.program_limits→prelude cap→抛→模型可见全链闭环。
 
 **至此 plan 24 code-mode 挂账收窄到:⑤ 后台 program + yield/wait、⑥ 保存复用 + journal resume(都是独立大件,有真实需求再上)。** token budget/UI 富进度树/并发 pacing 均记"不做/deferred 附依据"。
+
+### 追加片:后台 program(挂账⑤,2026-07-14,提交见 HANDOFF)
+
+用户"继续 plan 24"→ 在 ⑤ vs ⑥ 间**定 ⑤**(理由:⑤ 才兑现 code-mode 的"规模"收益、plan 26 异步基建可复用、是 ⑥ 前提)。
+
+**回源(一个 Explore 真读 codex cell_actor + cc workflow-engine,file:line)**:
+- **必然解骨架两家一致**:spawn 非阻塞 + 立即返 id + 完成回灌 + 有界观察。
+- **回灌方式是核心分野,kloop 天然属 cc 路线**:cc = **推送式**(完成 → `<task-notification>` → 优先级队列 `later`(`WorkflowTool.ts:110-172`、`notifications.ts:36-88`、`query.ts:1864`)→ 空闲 drain 进 turn);codex = **拉取式**(terminal `Buffered` 在 `CellPhase::Completed` 等模型主动 `wait` 来取,`cell_actor/types.rs:220-262`,**无注入队列/自动唤醒**)。**kloop 现有 inbox 注入队列 + autowake = cc 推送式**,故 `run_program{background}` 照 cc:spawn→返 id→完成回灌 inbox;kloop 又已有 `wait`/`stop_agent`(codex 风格),两者兼得。
+- **codex cell_actor 四类 V8 连带复杂度可整体删**(教训 17 再验):`v8::IsolateHandle` 强杀、独立 `thread::spawn`+`std_mpsc` 线程桥+`catch_unwind`、`RuntimeControlCommand` pause-until-resumed 握手、`PendingFrontier` 簿记——rquickjs+tokio 下 program 是普通 future,`.await` 自然挂起、drop 自然取消,全不需要。
+- **cc 模型侧无 wait 工具**(纯 notification 推 + 人用 `/workflows` 面板看 `ProgressEvent` 流);codex 有 `wait(cell_id, 10s 默认)`。
+
+**取舍**:
+- **不做 codex 增量观察 frontier / `yield_control` / `notify`**(拉取式增量观察是 codex 拉取模型 + V8 同步暂停的配套;kloop 推送式回灌不需要,且 `log()` 已实时流给用户看进度)。
+- **注册表:复用 `AsyncAgents`**(program 是 inbox-reinject 类的第三个后台执行单元,与异步子 agent 生命周期**完全相同**;`AsyncAgents` 本就通用 `id→{desc,status,cancel}`)。**不碰 `BackgroundShells`**(shell 有输出文件、无回灌,是另一种生命周期——plan 26"shells⊥agents 不合并"不受影响)。这正是 plan 26 挂账里说的"第三个消费者出现再议"——出现了、且与第二个消费者机制全同,故泛化(轻:改面向模型措辞 sub-agent→background task,不重命名类型)。
+
+**落地**:
+- `inbox.rs`:`InboxItem::ProgramResult{label,summary}` + `PROGRAM_PREFIX` framing。
+- `tools/codemode.rs`:`run_program` 加 `background` 参数;`background:true` 走 `spawn_background_program`(仿 `task::spawn_background`)——`PROGRAM_SEQ`→`program-N`、`async_agents.register`、**独立 own_cancel**(父 turn 结束不杀;program 的工具调用也用 own_cancel:`bg_ctx.cancel=own_cancel`)detached spawn、完成 `classify_program` 三态(Completed push `ProgramResult`、Failed 截断 push、Aborted[own_cancel 触发]不回灌只 `notify_activity`)、立即返"已派发"引导;`run_program_def` schema+desc 加 background。
+- `tools/async_agents.rs`:面向模型措辞泛化(background task);模块 doc 更新(第三个消费者到位,programs 与 agents 共表、shells 仍分开)。wait/stop_agent/autowake/三前端 drain **全零改动复用**(只认 inbox 活动)。
+- **测试**(+3):inbox `ProgramResult` framing、codemode `background_program` 立即返非结果 + detached 完成 push `ProgramResult` 进父 inbox + 腾槽、`stopped_background_program` 的 Aborted 不回灌(派长 bash→stop→轮询→断言 inbox 空)。
+- **真 key**(anthropic sonnet-5,`--plain --yolo`):模型 `run_program{background:true}`(源码 `return await tools.bash({command:"sleep 3 && echo DEEPFIELD99"})`)→ 立即返 `program-1 started` → 父自跑 `echo PARENT_HERE_OK` → `wait` 阻塞 → `program-1 finished` → 回灌 → 终答 **"Program output: DEEPFIELD99 | My own echo output: PARENT_HERE_OK"**。后台派发→continue→wait→回灌→合并全链闭环。
+
+**至此 plan 24 挂账只剩 ⑥ 保存复用 + journal resume**(独立大件,有真实需求再上;plan 24 自评"同步跑 resume 优先级低",现后台化后可议)。
