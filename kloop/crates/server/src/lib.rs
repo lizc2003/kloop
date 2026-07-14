@@ -249,6 +249,10 @@ impl Server {
     fn thread_list(&self) -> MethodResult {
         let threads: Vec<Value> = rollout::sessions_by_recency(&self.paths.sessions_dir)
             .iter()
+            // Sub-agent transcripts share the sessions dir but are internal;
+            // like cc's sidechains and codex's source filter, keep them out
+            // of the thread list (still resumable by explicit id).
+            .filter(|path| !rollout::is_subagent_session(path))
             .filter_map(|path| {
                 let messages = rollout::load_session(path).ok()?;
                 Some(json!({

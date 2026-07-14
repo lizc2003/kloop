@@ -24,6 +24,13 @@ pub struct Config {
     pub project_instructions: Option<String>,
     pub max_rounds: usize,
     pub offload_dir: PathBuf,
+    /// Directory holding session rollout files (`.kloop/sessions`). A sub-agent
+    /// the task tool spawns writes its own session file here, named
+    /// `{parent session_id}-{agent-N}`, so its transcript is auditable and
+    /// separately resumable. Sub-agents inherit the parent's dir with the
+    /// Config clone. Empty for ephemeral sessions (mock, tests) — a sub-agent
+    /// then stays in-memory like before.
+    pub sessions_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
     pub context_window: Option<u64>,
     /// Model to switch to (once per turn) after retries are exhausted.

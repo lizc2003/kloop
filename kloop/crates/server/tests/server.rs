@@ -138,6 +138,9 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             project_instructions: None,
             max_rounds: 10,
             offload_dir: offload.clone(),
+            // Siblings under the same test root (test_dirs), matching the
+            // ServerPaths the server lists/creates threads from.
+            sessions_dir: offload.with_file_name("sessions"),
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(permissions),

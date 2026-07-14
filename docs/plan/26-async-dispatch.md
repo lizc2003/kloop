@@ -224,7 +224,6 @@ my echo output: PARENT_ECHO_OK."**。**即完成标准的"父异步派子 agent�
 ### 挂账(有依据,非因难)
 
 - **注册表大泛化 `BackgroundShells→Tasks`**:回源坐实两家不强合并,`AsyncAgents` 平行即可(见分歧 2)。
-- **切片 5 异步子 agent 落盘**(plan 17 片 3):持久化子系统(rollout 父链、`--list-sessions` 标记、resume 语义),
-  另一根设计轴,不做进本 plan 更正确。
+- ~~**切片 5 异步子 agent 落盘**(plan 17 片 3)~~ **已完成(2026-07-14,归 plan 17 片 3;开工时用户定统一落所有子 agent 而非只异步,依据回源两家无差别落盘)**。当时判"另一根设计轴不做进本 plan"正确——它确实是独立的持久化子系统(rollout 首行 `subagent_of` 行级父链、`--list-sessions` 标 `[sub-agent of …]`、默认 resume 过滤子会话)。
 - plain/server 的 autowake(平台事实)、cc 式 output-file 指针(kloop 子 agent 不落盘,无指针可给)、
   `list_agents` 独立工具(wait 返回已带 running 计数,够了)。

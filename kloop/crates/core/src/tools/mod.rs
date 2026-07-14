@@ -108,6 +108,11 @@ pub struct ToolCtx {
     /// sandbox, hooks) still applies — this is a discovery bypass, not a
     /// security one.
     pub from_program: bool,
+    /// Id of the parent session's line that this round's assistant message was
+    /// recorded as (`{stem}#{seq}`), or None for an in-memory-only session. The
+    /// task tool stamps it as the spawned sub-agent's `subagent_of`
+    /// back-pointer. Constant across a round's concurrent tool calls.
+    pub parent_rollout_id: Option<String>,
     /// Per-call sink the code-mode bridge sets so a tool's structured result
     /// (an MCP `CallToolResult`, or a built-in's natural array) reaches the
     /// program instead of the flattened text `run_one` returns. `execute_tool`
@@ -703,6 +708,7 @@ pub(crate) mod testutil {
                 project_instructions: None,
                 max_rounds: 5,
                 offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
+                sessions_dir: std::env::temp_dir().join(format!("kloop-tools-sessions-{tag}")),
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
@@ -725,6 +731,7 @@ pub(crate) mod testutil {
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            parent_rollout_id: None,
             program_result: None,
         }
     }
@@ -1186,6 +1193,7 @@ mod tests {
                 project_instructions: None,
                 max_rounds: 5,
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
+                sessions_dir: std::env::temp_dir().join("kloop-test-cancel-sessions"),
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
@@ -1208,6 +1216,7 @@ mod tests {
             depth: 0,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            parent_rollout_id: None,
             program_result: None,
         };
         let results = dispatch_tools(

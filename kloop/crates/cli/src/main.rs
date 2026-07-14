@@ -36,13 +36,16 @@ use kloop_core::permissions::Permissions;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
+use kloop_core::rollout::is_subagent_session;
 use kloop_core::rollout::load_session;
 use kloop_core::rollout::new_session_id;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::session_id_of;
+use kloop_core::rollout::session_origin;
 use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
 use kloop_core::rollout::Rollout;
+use kloop_core::rollout::SessionOrigin;
 use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
 use kloop_core::Config;
@@ -139,9 +142,11 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
 
 fn session_line(path: &Path) -> String {
     let id = session_id_of(path);
-    let origin = fork_origin(path)
-        .map(|o| format!("  [forked from {o}]"))
-        .unwrap_or_default();
+    let origin = match session_origin(path) {
+        Some(SessionOrigin::Fork(o)) => format!("  [forked from {o}]"),
+        Some(SessionOrigin::SubAgent(o)) => format!("  [sub-agent of {o}]"),
+        None => String::new(),
+    };
     match load_session(path) {
         Ok(messages) => format!(
             "{id}  {} message(s)  {}{origin}",
@@ -163,10 +168,21 @@ fn list_sessions(sessions_dir: &Path) {
     }
 }
 
+/// Top-level sessions the resume picker offers, most recent first: every
+/// session except sub-agent transcripts, which are reachable only by explicit
+/// id (they still show in `--list-sessions`). Mirrors cc hiding sidechains and
+/// codex filtering by source.
+fn resumable_sessions(sessions_dir: &Path) -> Vec<PathBuf> {
+    sessions_by_recency(sessions_dir)
+        .into_iter()
+        .filter(|path| !is_subagent_session(path))
+        .collect()
+}
+
 /// `--resume` with no id: numbered list on stdout, one line of stdin picks.
 /// Runs before any UI starts, so plain blocking stdio is fine.
 fn pick_session(sessions_dir: &Path) -> Result<PathBuf> {
-    let sessions = sessions_by_recency(sessions_dir);
+    let sessions = resumable_sessions(sessions_dir);
     if sessions.is_empty() {
         bail!("no saved sessions to resume");
     }
@@ -215,7 +231,7 @@ fn open_history(
             }
             path
         }
-        SessionChoice::Continue => sessions_by_recency(sessions_dir)
+        SessionChoice::Continue => resumable_sessions(sessions_dir)
             .into_iter()
             .next()
             .context("no saved sessions to continue")?,
@@ -660,6 +676,7 @@ fn config_from_env(
         }
     };
     let offload_dir = PathBuf::from(".kloop/offload");
+    let sessions_dir = PathBuf::from(".kloop/sessions");
     // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
     let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
         Some("off") | Some("0") => None,
@@ -676,6 +693,7 @@ fn config_from_env(
         project_instructions: project.instructions.clone(),
         max_rounds: 30,
         offload_dir,
+        sessions_dir,
         context_window,
         fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
         permissions,

@@ -36,6 +36,14 @@ struct LineMeta {
     id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent: Option<String>,
+    /// Set only on a sub-agent session's FIRST line: `{parent stem}#{seq}` of
+    /// the parent turn's assistant line that carried the spawning task
+    /// tool_use. Lineage metadata only — unlike a fork, a sub-agent history is
+    /// wholly independent (no prefix copied), so replay ignores it. It drives
+    /// the `[sub-agent of …]` label and keeps sub-agent files out of the
+    /// default resume picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_of: Option<String>,
     /// Unix milliseconds at append time.
     ts: u64,
 }
@@ -65,18 +73,39 @@ pub struct Rollout {
     prefix: String,
     next_seq: u64,
     last_id: Option<String>,
+    /// Set only for a sub-agent's rollout: stamped onto the FIRST appended
+    /// line's envelope (`subagent_of`) and ignored thereafter.
+    subagent_of: Option<String>,
 }
 
 impl Rollout {
     /// A fresh session: the id chain starts at `#1` with no parent.
     pub fn new(path: PathBuf) -> Self {
+        Self::with_origin(path, None)
+    }
+
+    /// A sub-agent's rollout: like [`Rollout::new`], but the first appended
+    /// line records the parent turn (`{parent stem}#{seq}`) that spawned it.
+    pub fn new_subagent(path: PathBuf, subagent_of: String) -> Self {
+        Self::with_origin(path, Some(subagent_of))
+    }
+
+    fn with_origin(path: PathBuf, subagent_of: Option<String>) -> Self {
         let prefix = id_prefix(&path);
         Self {
             path,
             prefix,
             next_seq: 1,
             last_id: None,
+            subagent_of,
         }
+    }
+
+    /// The id of the most recently appended line (`{stem}#{seq}`), or None if
+    /// nothing has been written yet. A spawning parent uses this as the
+    /// `subagent_of` back-pointer for the sub-agent it launches.
+    pub fn last_id(&self) -> Option<&str> {
+        self.last_id.as_deref()
     }
 
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
@@ -97,6 +126,12 @@ impl Rollout {
         LineMeta {
             id: format!("{}#{}", self.prefix, self.next_seq),
             parent: self.last_id.clone(),
+            // Only the first line carries the sub-agent back-pointer.
+            subagent_of: if self.next_seq == 1 {
+                self.subagent_of.clone()
+            } else {
+                None
+            },
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -222,6 +257,9 @@ pub fn resume_session(path: &Path) -> io::Result<(Vec<Message>, Rollout)> {
         prefix: id_prefix(path),
         next_seq: parsed.max_seq + 1,
         last_id: parsed.last_id,
+        // The first line (with any subagent_of) is already on disk; resumed
+        // appends never sit at seq 1, so this is never consulted.
+        subagent_of: None,
     };
     Ok((repair_pairing(parsed.items), rollout))
 }
@@ -280,6 +318,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
             LineMeta {
                 id: new_id.clone(),
                 parent: parent.replace(new_id),
+                // A fork's lineage is its cross-file `parent`; it is an
+                // independent branch, never a sub-agent, so drop any
+                // subagent_of the copied source line may have carried.
+                subagent_of: None,
                 ts: meta.ts,
             }
         };
@@ -338,13 +380,48 @@ fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
 /// (`{src stem}#{seq}`), or None for a session started fresh (its first
 /// line has no parent). Reads only the first line.
 pub fn fork_origin(path: &Path) -> Option<String> {
+    read_first_meta(path).and_then(|meta| meta.parent)
+}
+
+/// How a session file relates to another, read from its first line: forked
+/// from a cut point of another session, or spawned as a sub-agent of a parent
+/// turn. None for a session started fresh at the top level.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// A fork's cross-file `parent` (`{src stem}#{cut}`).
+    Fork(String),
+    /// A sub-agent's `subagent_of` (`{parent stem}#{spawning line seq}`).
+    SubAgent(String),
+}
+
+/// The first line's lineage. `subagent_of` wins over `parent`: a sub-agent's
+/// first line never has a cross-file `parent` (its chain starts fresh), so the
+/// two are mutually exclusive in practice, but the precedence keeps the label
+/// unambiguous. Reads only the first line.
+pub fn session_origin(path: &Path) -> Option<SessionOrigin> {
+    let meta = read_first_meta(path)?;
+    match (meta.subagent_of, meta.parent) {
+        (Some(sa), _) => Some(SessionOrigin::SubAgent(sa)),
+        (None, Some(parent)) => Some(SessionOrigin::Fork(parent)),
+        (None, None) => None,
+    }
+}
+
+/// A sub-agent's session is kept out of the default resume picker (like cc's
+/// sidechain files and codex's subagent-source filter) — it is reachable
+/// only by explicit id. `--list-sessions` still shows it, labelled.
+pub fn is_subagent_session(path: &Path) -> bool {
+    matches!(session_origin(path), Some(SessionOrigin::SubAgent(_)))
+}
+
+fn read_first_meta(path: &Path) -> Option<LineMeta> {
     use std::io::BufRead as _;
     let file = std::fs::File::open(path).ok()?;
     let mut first = String::new();
     std::io::BufReader::new(file).read_line(&mut first).ok()?;
     let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) =
         serde_json::from_str(first.trim()).ok()?;
-    meta.parent
+    Some(meta)
 }
 
 /// Make the replayed history legal to send. Both directions, mirroring what
@@ -822,6 +899,7 @@ mod tests {
                 project_instructions: None,
                 max_rounds: 5,
                 offload_dir: dir.to_path_buf(),
+                sessions_dir: dir.to_path_buf(),
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
@@ -1053,6 +1131,92 @@ mod tests {
         assert_ne!(main_id, fork_id);
         assert!(dir.join(format!("{main_id}.txt")).exists());
         assert!(dir.join(format!("{fork_id}.txt")).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn subagent_rollout_stamps_origin_on_the_first_line_only() {
+        let path = temp_file("subagent");
+        let mut rollout = Rollout::new_subagent(path.clone(), "parent#5".into());
+        rollout
+            .append_message(&Message::user_text("do the sub task"))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]))
+            .unwrap();
+
+        let lines = raw_lines(&path);
+        assert_eq!(
+            lines[0]["subagent_of"], "parent#5",
+            "first line records the spawning turn"
+        );
+        assert_eq!(
+            lines[0].get("parent"),
+            None,
+            "a sub-agent history starts a fresh chain, no cross-file parent"
+        );
+        assert_eq!(
+            lines[1].get("subagent_of"),
+            None,
+            "only the first line carries the back-pointer"
+        );
+        assert_eq!(lines[1]["parent"], "session#1", "chain is sequential after");
+
+        assert_eq!(
+            session_origin(&path),
+            Some(SessionOrigin::SubAgent("parent#5".into()))
+        );
+        assert!(is_subagent_session(&path));
+
+        // Lineage metadata is inert on replay: the history is just the two messages.
+        assert_eq!(load_session(&path).unwrap().len(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn session_origin_distinguishes_fork_subagent_and_fresh() {
+        let path = temp_file("origin");
+        let dir = path.parent().unwrap().to_path_buf();
+        seed_forkable(&path);
+
+        // A fresh top-level session has no origin and is not a sub-agent.
+        assert_eq!(session_origin(&path), None);
+        assert!(!is_subagent_session(&path));
+
+        // A fork: cross-file parent, no subagent_of → Fork.
+        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        assert_eq!(
+            session_origin(&fork_path),
+            Some(SessionOrigin::Fork("session#4".into()))
+        );
+        assert!(!is_subagent_session(&fork_path));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn forking_a_subagent_session_becomes_a_fork_not_a_subagent() {
+        let path = temp_file("subfork");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut rollout = Rollout::new_subagent(path.clone(), "parent#5".into());
+        rollout
+            .append_message(&Message::user_text("sub work"))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]))
+            .unwrap();
+
+        // Forking it yields an independent branch: the copied subagent_of is
+        // dropped and the new first line is a fork pointer.
+        let fork = fork_session(&path, None, &dir).unwrap();
+        assert!(matches!(
+            session_origin(&fork),
+            Some(SessionOrigin::Fork(_))
+        ));
+        assert!(!is_subagent_session(&fork));
         cleanup(&path);
     }
 

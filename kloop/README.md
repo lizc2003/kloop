@@ -114,6 +114,33 @@ codex's `thread/fork` both copy, neither replays across files):
   dir-scanning counter already prevents clobbering), and usage anchors are
   not persisted, so a fork re-anchors on its first sampled response.
 
+### Sub-agent sessions
+
+A sub-agent the `task` tool spawns (synchronous batch or `background: true`)
+writes its own session file next to the parent's, so its full transcript is
+auditable — the parent's tool_result keeps only the sub-agent's final text,
+while the file records every tool call it made. Both references converged on
+this (cc's `subagents/agent-<id>.jsonl` sidechains, codex's one rollout per
+child thread); kloop keeps its flat, single-file layout rather than cc's
+nested dirs or codex's SQLite `thread_spawn_edges`:
+
+- the child file is `{parent id}-{agent-N}.jsonl` — the name itself shows the
+  lineage and stays unique (parent id is unique, the label is process-global);
+- its first line carries `subagent_of` = `{parent id}#{seq}` of the parent
+  turn's assistant line that made the spawning `task` call — a *line-level*
+  back-pointer (finer than either reference's session-level link), independent
+  of the fork `parent` field since a sub-agent history is wholly its own (no
+  prefix copied);
+- lines are written through live as the sub-agent records them, so even a
+  `stop_agent`-cancelled child leaves its partial transcript on disk;
+- `--list-sessions` shows sub-agent sessions labelled `[sub-agent of …]`, but
+  the default `--resume`/`--continue` picker skips them (they are reachable
+  only by explicit id) — matching cc hiding sidechains and codex's source
+  filter, while still keeping them visible for audit;
+- the parent's `task {background:true}` reply names the child's session log so
+  a human reading the parent transcript can jump to it. A parent with no
+  session (`--mock`, tests) leaves the sub-agent in memory, as before.
+
 ## Permissions (Phase 2, third slice)
 
 Every tool call passes a layered gate before executing

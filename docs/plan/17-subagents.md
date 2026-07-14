@@ -2,6 +2,27 @@
 
 > 体量偏大,开工时选片,可能不止一个会话。开工前先读 docs/plan/HANDOFF.md。参考:cc 的 agents 机制(`.claude/agents/*.md` frontmatter:独立 system prompt、工具白名单、模型 override;并行派发)、codex 的 subagent(SubagentStart/Stop 挂点、SubagentHookContext)。回源核对(教训 11)。
 
+## ✅ 完成记录(2026-07-14,切片 3:子 agent 历史持久化)
+
+**选片**:片 3(= plan 26 挂账的切片 5)。开工时用户定**统一落所有子 agent**(同步并行 task + 异步 background 一视同仁),依据是回源发现 cc/codex 都无差别对所有子 agent 落盘,且独立子文件能看到子 agent 的**完整工具调用过程**(父 tool_result 只有 final_text)。用户基调延续 plan 26:"要最合理的方案"。
+
+**回源回填**(两个 Explore agent 真读 cc + codex,file:line;修正 HANDOFF/refs 的二手冲突):
+- **收敛的必然解**(照抄):① 每个子 agent 独立 rollout 文件,不塞进父文件线性流(cc `subagents/agent-<id>.jsonl`、codex `rollout-{ts}-{child_id}.jsonl`);② 父子关联记在**会话文件里的元数据**(cc 每消息 `sessionId/agentId/isSidechain`;codex 首行 `SessionMeta.parent_thread_id/source`);③ 子会话可单独 resume/查看;④ 默认不进顶层列表/resume 选择器(cc 子目录隐藏 + isSidechain 过滤;codex source 过滤);⑤ 实时逐条追加;⑥ interrupt 不删文件。
+- **修正冲突**:HANDOFF 记 cc "独立子文件"、refs/README:37 记 cc "存树不存链同文件 isSidechain"——回源坐实**都对但各说一半**:cc 主文件是 uuid/parentUuid 树 + isSidechain=false;子 agent 消息按 `isSidechain && agentId` **物理分流**到 `subagents/agent-<id>.jsonl`(`sessionStorage.ts:1251-1255`),两说不矛盾。
+- **分歧 → kloop 取舍**(平铺范式一致 + 最小,不预抽象,教训 16/17):平铺(codex 派,不抄 cc 子目录——kloop 无目录嵌套范式)+ 首行 `subagent_of` 元数据(对应 codex SessionMeta.parent_thread_id,但做到**行级**——kloop 单文件+行 id 现成的红利,比两家 session 级更精确);**不抄** codex SQLite `thread_spawn_edges`(kloop 无 state DB,扫首行够,会话量小)、cc 每消息带 agentId(子文件文件级归属够)、cc 的 `agent-<id>.meta.json` 恢复受限环境(kloop resume 子会话当通用 agent,agent_type 的 system/工具限制不随 resume 还原,记取舍)。
+
+**实现**(磁盘 schema 往上接线):
+- `rollout.rs`:`LineMeta` 加 `subagent_of: Option<String>`(仅首行,serde skip_if None,前向兼容);`Rollout::new_subagent(path, subagent_of)` + `next_meta` 首行填、其余 None;`last_id()` getter(父取触发行 id);`SessionOrigin{Fork,SubAgent}` + `session_origin`(读首行,subagent_of 优先于 parent)+ `is_subagent_session`(resume 过滤);fork 的 remeta/resume 补 `subagent_of: None`(fork 是独立分支,血缘是 parent 指针不是 subagent)。
+- `config.rs`:`Config` 加 `sessions_dir: PathBuf`(子落盘要用,随 clone 继承);`history.rs`:`History::rollout_last_id()`;`tools/mod.rs`:`ToolCtx` 加 `parent_rollout_id`;`agent.rs`:`turn_rounds` 构造 ToolCtx 时填 `history.rollout_last_id()`(此时父已 record 含 task tool_use 的 assistant 行,正是子的血缘点)。
+- `tools/task.rs`:抽 `sub_history(cfg, agent, subagent_of)`——父有持久会话(`subagent_of` Some 且 `session_id` 非空)时 attach `Rollout::new_subagent`,子文件 `{父id}-{agent-N}`;两条 spawn 路径(同步 handle + 异步 spawn_background)共用;spawn_background 返回文本加 `child_session_note`(子会话 id,父←→子双向可跳,cc 派)。mock/无 session 降级内存(同现状)。
+- `cli/main.rs`:`session_line` 用 `session_origin` 标 `[forked from …]` / `[sub-agent of …]`;`resumable_sessions` 过滤子会话(Continue/pick_session 用,`--list-sessions` 仍列全);`server/lib.rs`:`thread/list` 同样过滤子会话(Config.sessions_dir 走 config_from_env 工厂,已自动带)。
+
+**测试**(394,+6):rollout(首行 subagent_of 往返、session_origin 区分 fork/subagent/fresh、fork 子会话变 Fork 不再是 SubAgent)、task(同步子落盘到 `{父id}-agent-N` + 首行 subagent_of 指回父触发行 + 完整转录 + 归为 sub-agent、background 落盘 + 返回文本带子会话 id、无 session 不落不提)。
+
+**真 key 验收**(anthropic sonnet-5,`--plain --yolo`):模型派 agent-1 跑 `echo SUBAGENT_RAN_OK`;落盘坐实——`20260714-080150-agent-1.jsonl` 首行 `subagent_of=20260714-080150#2`(父 assistant tool_use 行)、`parent=None`、完整 4 消息转录(user→tool_use→tool_result→text);`--list-sessions` 两个都显示、子标 `[sub-agent of 20260714-080150#2]`;`--resume` picker 只给父。**即 plan 17 片 3 "子会话落盘 + parent 链 + `--list-sessions` 标从属" 的完整闭环。**
+
+**提交**:见 HANDOFF 对应条目(fmt/clippy/test 全绿,394 测试)。
+
 ## ✅ 完成记录(2026-07-10,切片 2:自定义 agent 类型)
 
 **选片**:片 2。文件形态开工时问用户,用户选 **A(`config.toml` `[agents.<name>]` 表)**——理由:kloop 一贯把配置收在 config.toml,B 的 `.md` frontmatter 要引 YAML 依赖或手写解析(违教训 8/9)。其余按 cc 形态直接定:system **完全替换**不拼接、model 省略继承父、tools 省略继承全集、未知类型报错列可用清单、清单进 task description、仍深度 1。
@@ -37,7 +58,7 @@
 
 **提交**:f2944c5(fmt/clippy/test 全绿,266 个测试)。
 
-**挂账(未选切片,原样保留在下方候选)**:片 2(自定义 agent 类型——本次调研已备齐 cc frontmatter 字段表/路由/报错形态,见回源结论)、片 3(历史持久化,先做 plan 18)、片 5(hook 事件带 agent 字段 + SubagentStart/Stop)、片 6(异步派发 + mailbox 回灌)。另:并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流——都等有痛感再修。
+**挂账(未选切片,原样保留在下方候选)**:片 2(自定义 agent 类型——本次调研已备齐 cc frontmatter 字段表/路由/报错形态,见回源结论)、~~片 3(历史持久化,先做 plan 18)~~ **已完成(2026-07-14,统一落所有子 agent,见顶部完成记录)**、片 5(hook 事件带 agent 字段 + SubagentStart/Stop)、~~片 6(异步派发 + mailbox 回灌)~~ **已由 plan 26 承接完成**。另:并发批无上限(cc 是 10)、子 agent 的 note(重试/压缩提示)不带标签混在主 note 流——都等有痛感再修。
 
 ## 回源调研结论(2026-07-10,两家对齐)
 

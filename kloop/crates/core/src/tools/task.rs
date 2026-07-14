@@ -19,6 +19,8 @@ use crate::config::Config;
 use crate::history::History;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
+use crate::rollout::session_path;
+use crate::rollout::Rollout;
 use kloop_protocol::Message;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
@@ -68,6 +70,7 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     }
 
     let cancel = ctx.cancel.clone();
+    let subagent_of = ctx.parent_rollout_id.clone();
     ui.agent_start(&agent, &preview);
     // The sub-agent runs as its own tokio task. Besides matching the
     // semantics, this breaks the recursion cycle (execute_tool -> run_turn ->
@@ -75,8 +78,9 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     // which is Send regardless of the recursive future's type.
     let handle = tokio::spawn({
         let ui = ui.clone();
+        let label = agent.clone();
         async move {
-            let mut history = History::new(sub_cfg.offload_dir.clone());
+            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             run_turn(&sub_cfg, &mut history, &ui, &cancel, depth).await
         }
@@ -123,12 +127,14 @@ fn spawn_background(
         .map_err(|msg| anyhow!("task: {msg}"))?;
     let parent_inbox = ctx.cfg.inbox.clone();
     let async_agents = ctx.cfg.async_agents.clone();
+    let subagent_of = ctx.parent_rollout_id.clone();
+    let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
     ui.agent_start(&agent, preview);
     tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
         async move {
-            let mut history = History::new(sub_cfg.offload_dir.clone());
+            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             let outcome = run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await;
             let (status, reinject) = classify_background(outcome);
@@ -150,10 +156,46 @@ fn spawn_background(
         }
     });
     Ok(format!(
-        "Sub-agent {agent} started in the background. Keep working; its result will be delivered \
-         to you as a message when it finishes. Block for it with the wait tool, or stop it with \
-         stop_agent."
+        "Sub-agent {agent} started in the background.{session_note} Keep working; its result will \
+         be delivered to you as a message when it finishes. Block for it with the wait tool, or \
+         stop it with stop_agent."
     ))
+}
+
+/// Build the sub-agent's History, persisting to its own session file when the
+/// parent runs in a persistent session (plan 17 slice 3). The child file is
+/// `{parent session_id}-{agent label}` under the shared sessions dir, and its
+/// first line records `subagent_of` = the parent turn that spawned it, so the
+/// transcript is auditable and separately resumable, yet kept out of the
+/// default resume picker. A parent with no session (mock, tests) or with a
+/// dropped rollout leaves the sub-agent in-memory, exactly as before.
+fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> History {
+    let mut history = History::new(cfg.offload_dir.clone());
+    if let Some(parent_line) = subagent_of {
+        if !cfg.session_id.is_empty() {
+            let path = session_path(&cfg.sessions_dir, &child_session_id(cfg, agent));
+            history.attach_rollout(Rollout::new_subagent(path, parent_line.to_string()));
+        }
+    }
+    history
+}
+
+/// The sub-agent's session id: parent id + its label, so the file name itself
+/// shows the lineage and stays unique (parent id is unique, the label is
+/// process-global monotonic).
+fn child_session_id(cfg: &Config, agent: &str) -> String {
+    format!("{}-{}", cfg.session_id, agent)
+}
+
+/// A pointer to the child's session log for the parent's tool_result — so a
+/// human auditing the parent session can jump to what the sub-agent did.
+/// Empty when the sub-agent isn't being persisted (mock, tests).
+fn child_session_note(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> String {
+    if subagent_of.is_some() && !cfg.session_id.is_empty() {
+        format!(" Its session log is {}.", child_session_id(cfg, agent))
+    } else {
+        String::new()
+    }
 }
 
 /// Map a background sub-agent's terminal outcome to (registry status, optional
@@ -588,6 +630,128 @@ mod tests {
         assert!(
             ctx.cfg.inbox.is_empty(),
             "an interrupted sub-agent reinjects nothing"
+        );
+    }
+
+    /// A sub-agent spawned by a PERSISTENT parent writes its own session file:
+    /// named `{parent id}-{agent-N}`, first line stamped `subagent_of` = the
+    /// parent turn that spawned it, classified as a sub-agent (so it stays out
+    /// of the resume picker), and replaying to the sub-agent's own transcript.
+    #[tokio::test]
+    async fn subagent_persists_to_its_own_session_file() {
+        use crate::rollout::{
+            is_subagent_session, load_session, session_id_of, session_origin, sessions_by_recency,
+            SessionOrigin,
+        };
+
+        let root = std::env::temp_dir().join(format!("kloop-subpersist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sessions = root.join("sessions");
+
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "sub result".into(),
+        }]]);
+        let base = with_provider(test_ctx(0, "subpersist"), provider);
+        let mut cfg = (*base.cfg).clone();
+        cfg.session_id = "20260714-000000".into();
+        cfg.sessions_dir = sessions.clone();
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            parent_rollout_id: Some("20260714-000000#2".into()),
+            ..base
+        };
+
+        let (out, is_error) = run_tool("task", json!({"prompt": "do the sub thing"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out, "sub result");
+
+        let files = sessions_by_recency(&sessions);
+        assert_eq!(files.len(), 1, "the sub-agent left one session file");
+        let path = &files[0];
+        assert!(
+            session_id_of(path).starts_with("20260714-000000-agent-"),
+            "child id shows lineage: {path:?}"
+        );
+        assert_eq!(
+            session_origin(path),
+            Some(SessionOrigin::SubAgent("20260714-000000#2".into())),
+            "first line points back at the spawning parent turn"
+        );
+        assert!(is_subagent_session(path), "kept out of the resume picker");
+        assert_eq!(
+            load_session(path).unwrap(),
+            vec![
+                Message::user_text("do the sub thing"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "sub result".into()
+                }]),
+            ],
+            "replays to the sub-agent's own transcript"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A persistent background spawn names the child's session log in the
+    /// "started" message (so a human auditing the parent can jump to it) and
+    /// the detached sub-agent's file lands on disk.
+    #[tokio::test]
+    async fn background_task_notes_child_session_and_persists() {
+        use crate::rollout::{is_subagent_session, sessions_by_recency};
+
+        let root = std::env::temp_dir().join(format!("kloop-bgpersist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sessions = root.join("sessions");
+
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "bg result".into(),
+        }]]);
+        let base = with_provider(test_ctx(0, "bgpersist"), provider);
+        let mut cfg = (*base.cfg).clone();
+        cfg.session_id = "20260714-111111".into();
+        cfg.sessions_dir = sessions.clone();
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            parent_rollout_id: Some("20260714-111111#2".into()),
+            ..base
+        };
+
+        let (out, is_error) =
+            run_tool("task", json!({"prompt": "go", "background": true}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(
+            out.contains("Its session log is 20260714-111111-agent-"),
+            "the started message points at the child session log: {out}"
+        );
+
+        // Wait for the detached sub-agent to finish and flush its file.
+        for _ in 0..300 {
+            if ctx.cfg.async_agents.running_count() == 0
+                && !sessions_by_recency(&sessions).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let files = sessions_by_recency(&sessions);
+        assert_eq!(
+            files.len(),
+            1,
+            "the background sub-agent persisted its file"
+        );
+        assert!(is_subagent_session(&files[0]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without a persistent parent (empty session_id, as in mock/tests) a
+    /// background spawn names no session log and writes nothing.
+    #[tokio::test]
+    async fn background_task_without_session_notes_nothing() {
+        let provider = Provider::mock(vec![vec![ContentBlock::Text { text: "x".into() }]]);
+        let ctx = with_provider(test_ctx(0, "bg-nosession"), provider);
+        let (out, _) = run_tool("task", json!({"prompt": "go", "background": true}), &ctx).await;
+        assert!(
+            !out.contains("session log"),
+            "an ephemeral parent has no child session log to name: {out}"
         );
     }
 

@@ -113,6 +113,7 @@ mod tests {
             project_instructions: None,
             max_rounds: 5,
             offload_dir: std::env::temp_dir().join("kloop-cmd-test"),
+            sessions_dir: std::env::temp_dir().join("kloop-cmd-test-sessions"),
             context_window: window,
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),

@@ -87,6 +87,14 @@ impl History {
         &self.items
     }
 
+    /// Id of the last line persisted to the session file (`{stem}#{seq}`), or
+    /// None for an in-memory-only history. The task tool reads this right after
+    /// the assistant message carrying a task tool_use is recorded, so a spawned
+    /// sub-agent can point its `subagent_of` back at the exact parent turn.
+    pub fn rollout_last_id(&self) -> Option<&str> {
+        self.rollout.as_ref().and_then(Rollout::last_id)
+    }
+
     /// Record the provider-reported total context size (uncached + cached
     /// input + output — cached tokens still occupy the window) for the
     /// request whose response is the most recently recorded item.

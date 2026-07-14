@@ -163,6 +163,7 @@ mod tests {
             project_instructions: None,
             max_rounds: 5,
             offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
+            sessions_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}-sessions")),
             context_window: Some(200_000),
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),

@@ -344,6 +344,10 @@ async fn turn_rounds(
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            // The assistant message carrying these tool_uses was just recorded,
+            // so this is the id of the turn that a spawned sub-agent descends
+            // from.
+            parent_rollout_id: history.rollout_last_id().map(str::to_string),
             program_result: None,
         };
         let results = dispatch_tools(tool_uses, &ctx).await;
@@ -576,6 +580,7 @@ mod tests {
             project_instructions: None,
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
+            sessions_dir: std::env::temp_dir().join("kloop-test-e2e-sessions"),
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
@@ -669,6 +674,7 @@ mod tests {
             project_instructions: None,
             max_rounds: 10,
             offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
+            sessions_dir: std::env::temp_dir().join(format!("kloop-test-{tag}-sessions")),
             context_window: Some(window),
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
