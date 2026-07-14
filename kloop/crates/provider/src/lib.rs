@@ -9,10 +9,20 @@ pub mod sse;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use serde_json::json;
 use tokio::sync::mpsc;
+
+/// One process-wide HTTP client shared by every adapter. reqwest pools
+/// connections and reuses TLS sessions, but only within a single `Client`, so
+/// a fresh `Client::new()` per request (as each adapter used to do) discarded
+/// that on every turn. Cloning is a cheap Arc bump.
+pub(crate) fn http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;

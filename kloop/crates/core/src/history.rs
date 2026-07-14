@@ -180,8 +180,23 @@ pub fn sync_offload_counter(offload_dir: &Path) {
 
 /// ~4 chars/token heuristic over the serialized wire form, ceiling division.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
-    let bytes = serde_json::to_string(message).map_or(0, |s| s.len());
-    (bytes as u64).div_ceil(4)
+    // Count the serialized bytes without materializing the string — this runs
+    // per message on every predictive-overflow check and every compaction
+    // candidate, and only the length feeds the heuristic. Byte-identical to
+    // `to_string().len()` (both serialize through the same writer path).
+    struct ByteCounter(u64);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter(0);
+    let bytes = serde_json::to_writer(&mut counter, message).map_or(0, |()| counter.0);
+    bytes.div_ceil(4)
 }
 
 #[cfg(test)]

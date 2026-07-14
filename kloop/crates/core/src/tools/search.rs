@@ -195,7 +195,9 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
         }
         OutputMode::FilesWithMatches => {
             // cc sorts newest-first so the freshest files survive the cap.
-            files.sort_by_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
+            // Cached: the key does an mtime() syscall + name clone, so compute
+            // it once per file, not O(n log n) times.
+            files.sort_by_cached_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
             let total = files.len();
             let shown = page(
                 files.into_iter().map(|(_, d)| d).collect(),
@@ -265,7 +267,8 @@ fn run_glob(pattern: &str, root: &Path) -> Result<(String, Vec<String>)> {
         }
     }
     // Newest first: the cap must keep the most recently touched files.
-    files.sort_by_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
+    // Cached so the mtime() syscall + name clone runs once per file.
+    files.sort_by_cached_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
     let total = files.len();
     let paths: Vec<String> = files.into_iter().take(GLOB_LIMIT).map(|(_, d)| d).collect();
     let mut out = if paths.is_empty() {

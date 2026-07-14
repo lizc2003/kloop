@@ -111,7 +111,7 @@ pub(super) async fn stream(
     body: &Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<()> {
-    let resp = reqwest::Client::new()
+    let resp = crate::http_client()
         .post(url)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")

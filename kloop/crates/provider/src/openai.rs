@@ -106,7 +106,7 @@ pub(super) async fn stream(
     body: &Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<()> {
-    let resp = reqwest::Client::new()
+    let resp = crate::http_client()
         .post(url)
         .bearer_auth(key)
         .json(body)
