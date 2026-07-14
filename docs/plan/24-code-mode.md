@@ -378,7 +378,7 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 
 **至此 plan 24 挂账只剩 ⑥ 保存复用 + journal resume**(独立大件,有真实需求再上;plan 24 自评"同步跑 resume 优先级低",现后台化后可议)。
 
-### 追加片:journal resume(挂账⑥,2026-07-14,提交见 HANDOFF)
+### 追加片:journal resume(挂账⑥,2026-07-14,提交 17aad54)
 
 用户"继续 plan 24"→ 定做 ⑥ 的 journal resume。**回源(一个 Explore 真读 cc workflow-engine journal.ts/hooks.ts/WorkflowTool.ts,file:line)纠正了我的怀疑**:我原以为 journal resume 缺"持久 program 身份/resume 入口",但回源坐实——cc 的 resume 就是**一次 tool call 带 `resumeFromRunId`**(WorkflowTool.ts:116,154,164),持久 id = runId(tool_result 里给模型),journal 落 `<projectRoot>/.claude/workflow-runs/<runId>/journal.jsonl`,**天然套 kloop 一次性 run_program tool_use**;且它**真接通、有测试、默认开**(runWorkflow.test.ts:118-169),**不像 budget 是 null 占位**。`agentCallKey=sha256(prompt+规范化params)`,replay 同 key 同位置返缓存跳过 spawn/budget/semaphore(hooks.ts:73-90),只对 `agent()` 生效。**保存复用(A)** cc 就是 Write 文件进 `.claude/workflows/` auto-register 成 `/<name>`(namedWorkflowCommands.ts)= 用户自定义命令族 → **归 plan 23**。
 
