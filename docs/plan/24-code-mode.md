@@ -353,7 +353,7 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 
 **至此 plan 24 code-mode 挂账收窄到:⑤ 后台 program + yield/wait、⑥ 保存复用 + journal resume(都是独立大件,有真实需求再上)。** token budget/UI 富进度树/并发 pacing 均记"不做/deferred 附依据"。
 
-### 追加片:后台 program(挂账⑤,2026-07-14,提交见 HANDOFF)
+### 追加片:后台 program(挂账⑤,2026-07-14,提交 cf40cad)
 
 用户"继续 plan 24"→ 在 ⑤ vs ⑥ 间**定 ⑤**(理由:⑤ 才兑现 code-mode 的"规模"收益、plan 26 异步基建可复用、是 ⑥ 前提)。
 
