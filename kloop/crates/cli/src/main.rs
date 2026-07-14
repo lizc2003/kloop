@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -604,6 +605,66 @@ fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
     Ok(settings)
 }
 
+/// `[codemode]` in `.kloop/config.toml` (all optional; defaults in
+/// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
+/// limits) and `max_agents`, `max_items` (orchestration runaway ceilings). Each
+/// is also overridable via `AGENT_PROGRAM_<KEY>` env, which wins over the config
+/// value. Bounds one `run_program` (code-mode) run.
+fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> {
+    let mut limits = kloop_core::ProgramLimits::default();
+    if let Ok(raw) = std::fs::read_to_string(config_path) {
+        let value: toml::Table = raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        if let Some(section) = value.get("codemode") {
+            let section = section.as_table().context("[codemode] must be a table")?;
+            for (key, v) in section {
+                let need = || {
+                    v.as_integer()
+                        .filter(|&n| n > 0)
+                        .with_context(|| format!("codemode.{key} must be a positive integer"))
+                };
+                match key.as_str() {
+                    "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
+                    "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
+                    "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
+                    "max_agents" => limits.max_agents = need()? as u64,
+                    "max_items" => limits.max_items_per_call = need()? as usize,
+                    other => bail!(
+                        "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_items)"
+                    ),
+                }
+            }
+        }
+    }
+    let env_uint = |name: &str| -> Result<Option<u64>> {
+        match std::env::var(name) {
+            Ok(s) => {
+                Ok(Some(s.parse().with_context(|| {
+                    format!("{name} must be a positive integer")
+                })?))
+            }
+            Err(_) => Ok(None),
+        }
+    };
+    if let Some(n) = env_uint("AGENT_PROGRAM_MEMORY_MB")? {
+        limits.memory_bytes = n as usize * 1024 * 1024;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_STACK_KB")? {
+        limits.max_stack_bytes = n as usize * 1024;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_CPU_SECS")? {
+        limits.cpu_burst = Duration::from_secs(n);
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_AGENTS")? {
+        limits.max_agents = n;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_ITEMS")? {
+        limits.max_items_per_call = n as usize;
+    }
+    Ok(limits)
+}
+
 /// The session sandbox policy, or None with a warning when unavailable —
 /// fail-open like hooks: the permission gate stays the enforcement layer.
 /// Built once per process and shared into every Config (server threads too).
@@ -677,6 +738,12 @@ fn config_from_env(
     };
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
+    // Code-mode resource limits: default unless [codemode]/AGENT_PROGRAM_* set.
+    let program_limits = if args.mock {
+        kloop_core::ProgramLimits::default()
+    } else {
+        load_program_limits(Path::new(PERMISSIONS_CONFIG))?
+    };
     // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
     let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
         Some("off") | Some("0") => None,
@@ -712,6 +779,7 @@ fn config_from_env(
         unlocked_tools: Default::default(),
         todos: Default::default(),
         inbox: Default::default(),
+        program_limits,
     };
     if args.mock {
         return Ok(Config {

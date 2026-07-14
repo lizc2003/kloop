@@ -53,7 +53,17 @@ pub trait HostBridge: Send + Sync + 'static {
     fn log(&self, message: String);
 }
 
-/// Resource ceilings for one program run.
+/// Resource ceilings for one program run. Engine-level limits (memory/stack/
+/// cpu) guard the interpreter; the caps (agents/items) are hard ceilings on
+/// orchestration fan-out — a model-written program loops and fans out
+/// programmatically, so it needs runaway ceilings a hand-written tool_use
+/// batch never hits. Values mirror cc's workflow caps (1000/4096). Two
+/// deliberate non-caps: concurrency is NOT paced (a program firing N concurrent
+/// `agent()` matches N concurrent `task` calls, which kloop runs uncapped —
+/// pacing here would break that precedent; the total ceiling is the guard); and
+/// there is no token budget (cc's `budget.total` ships as a `null` placeholder,
+/// never enforced, and kloop has no turn-level budget source, so it would be a
+/// no-op — deferred, not built).
 #[derive(Clone, Copy)]
 pub struct Limits {
     /// QuickJS heap cap; the interpreter raises out-of-memory past it.
@@ -64,6 +74,13 @@ pub struct Limits {
     /// killed — guards `while(true){}` without penalizing await-heavy programs
     /// (the interpreter is suspended, not looping, while awaiting a tool).
     pub cpu_burst: Duration,
+    /// Hard ceiling on total `agent()` calls in one program run — the runaway
+    /// guard against `while(true){ agent(...) }` (each sub-agent costs tokens).
+    /// The (N+1)th call throws. Enforced host-side in the bridge.
+    pub max_agents: u64,
+    /// Hard ceiling on the array length a single `parallel()`/`pipeline()` may
+    /// take; over it throws (never silently truncates). Enforced in the prelude.
+    pub max_items_per_call: usize,
 }
 
 impl Default for Limits {
@@ -72,6 +89,8 @@ impl Default for Limits {
             memory_bytes: 64 * 1024 * 1024,
             max_stack_bytes: 512 * 1024,
             cpu_burst: Duration::from_secs(5),
+            max_agents: 1000,
+            max_items_per_call: 4096,
         }
     }
 }
@@ -108,7 +127,7 @@ pub async fn run_program(
         .await
         .map_err(|e| anyhow!("codemode: context init failed: {e}"))?;
 
-    let prelude = build_prelude(tool_names);
+    let prelude = build_prelude(tool_names, limits.max_items_per_call);
     let wrapped = wrap_source(source);
 
     ctx.async_with(async |ctx| {
@@ -237,7 +256,7 @@ fn envelope(result: Result<Value, String>) -> String {
 /// The JS prelude: builds the `tools` object (one method per tool name),
 /// `agent`, `log`, `parallel` and `pipeline` on top of the raw `__call_tool`/
 /// `__agent`/`__log` host functions. Kept tiny and dependency-free.
-fn build_prelude(tool_names: &[String]) -> String {
+fn build_prelude(tool_names: &[String], max_items: usize) -> String {
     let names = serde_json::to_string(tool_names).unwrap_or_else(|_| "[]".into());
     format!(
         r#"
@@ -255,14 +274,22 @@ fn build_prelude(tool_names: &[String]) -> String {
             return r.value;
         }};
         globalThis.log = (msg) => __log(typeof msg === 'string' ? msg : JSON.stringify(msg));
-        globalThis.parallel = (thunks) =>
-            Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));
+        const __MAX_ITEMS = {max_items};
+        const __checkItems = (n, who) => {{
+            if (n > __MAX_ITEMS) throw new Error(
+                who + ': ' + n + ' items exceeds the cap of ' + __MAX_ITEMS + ' per call');
+        }};
+        globalThis.parallel = (thunks) => {{
+            __checkItems((thunks ?? []).length, 'parallel');
+            return Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));
+        }};
         // Each item flows through every stage as its own independent async
         // chain — NO barrier between stages, so a fast item can reach stage 3
         // while a slow one is still in stage 1. A stage that throws drops that
         // item to null and skips its remaining stages, mirroring `parallel`.
-        globalThis.pipeline = (items, ...stages) =>
-            Promise.all((items ?? []).map(async (item, index) => {{
+        globalThis.pipeline = (items, ...stages) => {{
+            __checkItems((items ?? []).length, 'pipeline');
+            return Promise.all((items ?? []).map(async (item, index) => {{
                 let value = item;
                 for (const stage of stages) {{
                     try {{ value = await stage(value, item, index); }}
@@ -270,6 +297,7 @@ fn build_prelude(tool_names: &[String]) -> String {
                 }}
                 return value;
             }}));
+        }};
         "#
     )
 }

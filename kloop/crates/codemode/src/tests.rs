@@ -73,6 +73,59 @@ async fn run(source: &str, bridge: Arc<dyn HostBridge>) -> Result<String> {
     .await
 }
 
+async fn run_with_limits(
+    source: &str,
+    bridge: Arc<dyn HostBridge>,
+    limits: Limits,
+) -> Result<String> {
+    run_program(
+        source,
+        &tool_names(),
+        bridge,
+        CancellationToken::new(),
+        limits,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn parallel_and_pipeline_cap_item_count() {
+    let limits = Limits {
+        max_items_per_call: 3,
+        ..Limits::default()
+    };
+    // At the cap: runs fine.
+    let out = run_with_limits(
+        "return JSON.stringify(await parallel([()=>1,()=>2,()=>3]));",
+        TestBridge::echo(),
+        limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "[1,2,3]");
+    // Over the cap: parallel throws, naming itself and the cap — never truncates.
+    let err = run_with_limits(
+        "return await parallel([()=>1,()=>2,()=>3,()=>4]);",
+        TestBridge::echo(),
+        limits,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("parallel") && err.to_string().contains("cap of 3"),
+        "{err}"
+    );
+    // pipeline enforces the same ceiling.
+    let err = run_with_limits(
+        "return await pipeline([1,2,3,4], x=>x);",
+        TestBridge::echo(),
+        limits,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("pipeline"), "{err}");
+}
+
 #[tokio::test]
 async fn tool_call_bridges_through_host_and_returns_value() {
     let out = run(

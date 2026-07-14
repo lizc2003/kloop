@@ -629,6 +629,7 @@ mod tests {
             todos: Default::default(),
             inbox: Default::default(),
             async_agents: Default::default(),
+            program_limits: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -797,6 +798,7 @@ mod tests {
             todos: Default::default(),
             inbox: Default::default(),
             async_agents: Default::default(),
+            program_limits: Default::default(),
         })
     }
 

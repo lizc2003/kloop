@@ -26,3 +26,6 @@ pub mod shell;
 pub mod tools;
 
 pub use config::Config;
+/// Re-exported so the CLI can name the code-mode resource limits type (it lives
+/// in the engine crate) without depending on `kloop-codemode` directly.
+pub use kloop_codemode::Limits as ProgramLimits;

@@ -776,17 +776,34 @@ which `core/src/tools/codemode.rs` implements over the gate — that inversion i
 why `core` can depend on the engine crate without a cycle. `run_program` itself is
 auto-allowed (like `task`): it touches nothing directly. `Promise.all` maps to
 the same concurrency rule as a normal round (read-only calls batch, writes take
-an exclusive lock). Resource limits: per-program QuickJS heap cap and stack cap,
-and an interrupt handler that kills a runaway synchronous loop (a CPU-burst
-deadline that ignores await-suspended time) or a user Ctrl+C.
+an exclusive lock).
+
+**Resource limits** (`Limits`, per program run) are two layers. Engine limits
+guard the interpreter: a QuickJS heap cap, a stack cap, and an interrupt handler
+that kills a runaway synchronous loop (a CPU-burst deadline that ignores
+await-suspended time) or a user Ctrl+C. Orchestration **caps** are hard ceilings
+on fan-out — a model-written program loops and fans out programmatically, so it
+needs ceilings a hand-written tool_use batch never hits: `max_agents` (total
+`agent()` calls; the (N+1)th throws — the guard against `while(true){agent()}`)
+and `max_items` (a single `parallel()`/`pipeline()` array length; over it throws,
+never truncates). Both mirror cc's workflow caps (1000 / 4096). Concurrency is
+deliberately **not** paced — a program firing N concurrent `agent()` is the same
+as a model emitting N concurrent `task` calls, which kloop runs uncapped, so
+pacing here would break that precedent; the total ceiling is the guard that
+matters. All five knobs override via `[codemode]` in `.kloop/config.toml`
+(`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_items`) or
+`AGENT_PROGRAM_*` env (env wins).
 
 A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
-**Not done** (deferred): a token `budget` primitive; a richer progress view
-(cc's `/workflows` tree — kloop shows a flat live trace); background programs
-with `yield`/`wait`; saving a program for reuse with journal-based resume. See
+**Not done** (deferred, with reason): a token `budget` primitive — cc's
+`budget.total` ships as a hardcoded `null` placeholder (its hard cap never
+fires), and kloop has no turn-level budget source, so a budget object would be a
+no-op until there's a real source to feed it; a richer progress view (cc's
+`/workflows` tree — kloop shows a flat live trace); background programs with
+`yield`/`wait`; saving a program for reuse with journal-based resume. See
 `docs/plan/24-code-mode.md` and `docs/plan/27-codemode-mcp-tools.md`.
 
 ## Async sub-agents (Phase 2, eighteenth slice)

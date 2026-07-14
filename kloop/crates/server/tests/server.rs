@@ -157,6 +157,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             todos: Default::default(),
             inbox: Default::default(),
             async_agents: Default::default(),
+            program_limits: Default::default(),
         })
     })
 }

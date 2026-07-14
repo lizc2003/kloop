@@ -130,6 +130,7 @@ mod tests {
             todos: Default::default(),
             inbox: Default::default(),
             async_agents: Default::default(),
+            program_limits: Default::default(),
         })
     }
 

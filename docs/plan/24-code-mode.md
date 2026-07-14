@@ -281,12 +281,14 @@ future 用的 owned guard。
 inline/defer/结构化/glob 四侧验收全过。**plan 27 彻底收尾,无 code-mode-MCP 侧挂账。**
 详见 plan 27 完成记录。
 ③ ~~`pipeline()` 原语~~ **已完成**
-(追加片,见下)+ token `budget`(仍挂账)。④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
+(追加片,见下)+ ~~token `budget`~~ **不做(2026-07-14 回源纠偏:cc 的 `budget.total` 是硬编码
+`null` 占位、硬顶从不触发,kloop 无 turn-level 预算来源,做了是 no-op;改做 caps,见下节完成记录)**。
+④ ~~UI 进度观察~~ **已做 log 实时化 + op 可见**
 (追加片,见上);只剩"更富的进度树
 (cc `/workflows`)",kloop 现为扁平实时 trace。⑤ 后台 program + `yield`/`wait`(codex
 observation frontier;现同步跑完返回)。
-⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ `Limits` 走配置/env(现
-硬编码 64MiB/512KiB/5s)。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `run_program`
+⑥ 保存复用 + journal resume(cc 具名 workflow / agentCallKey)。⑦ ~~`Limits` 走配置/env~~ **已完成
+(2026-07-14,`[codemode]` config + `AGENT_PROGRAM_*` env,见下节)**。⑧ program 里 `agent()` 的深度限沿用 task(depth≥1 bail),但 `run_program`
 本身只在 depth-0(同 task);受限 agent 类型不给 run_program。
 
 ### 追加片:`pipeline()` 原语(同会话续做,提交 8ce4cd6)
@@ -333,3 +335,20 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
   测试/文档全量。**注:首片~pipeline 的旧提交/记录里的 `exec` = 现 `run_program`。**
 
 零行为变更(纯改名),全量 358 测试全绿 + fmt + clippy;真 key 冒烟确认模型按新名 `run_program` 调用。
+
+### 追加片:资源治理 caps + Limits 配置化(挂账③⑦,2026-07-14,提交见 HANDOFF)
+
+开工时用户在"token budget vs caps + Limits 配置化"间**定后者**(附回源依据)。**回源颠覆性发现(教训 11,一个 Explore 真读 cc workflow-engine,file:line)**:cc 的 `budget.total` 是**硬编码 `null` 占位**(`src/workflow/ports.ts:61`、`service.ts:137`,注释"未来从 settings 读"),"+500k" 解析器(`tokenBudget.ts`)存在但**没接进 workflow budget**——所以 cc 生产里 `remaining()` 恒 `Infinity`、`assertCanSpend()` 永不触发,budget 是 no-op 预留。**真正生效的失控保护是 caps**:`MAX_TOTAL_AGENTS=1000`(agent() 超限抛)、`MAX_ITEMS_PER_CALL=4096`(parallel/pipeline 超限抛,不截断)、并发默认 3/上限 16。
+
+**取舍**:token budget **不做**(cc 自己都是占位,kloop 无预算来源,做了是摆设;记 README "Not done"),做 caps + Limits 配置化。
+
+**再取舍(开工中发现,已同步用户)**:cc 的三 caps 里,**并发上限(pacing)不做**——写工具已被 `CoreBridge.gate` 的 write 锁序化(pacing 对写无意义),而"program 发 N 个并发 `agent()`"= "模型发 N 个并发 `task`",kloop **对后者本就 uncapped**(join_all,plan 17 明确"暂不设并发上限");并发 pacing 会破这个先例,且不好确定性测试(写被 gate 序化、读无副作用无法 rendezvous)。真正的失控保护是**硬总量天花板**(max_agents/max_items),它们与 kloop"uncapped 批 + 硬天花板"一致、可确定性测。
+
+**落地**:
+- `codemode/lib.rs`:`Limits` 加 `max_agents`(1000)/`max_items_per_call`(4096)+ Default;`build_prelude(names, max_items)`,`parallel`/`pipeline` 数组超限 throw(`__checkItems`,命名自身 + 报 cap,不截断)。
+- `core/tools/codemode.rs`:`CoreBridge` 加 `agent_count`(AtomicU64)+`max_agents`,`call_agent` 顶部 `n>=max` 抛(fetch_add 同步取 n,并发调用取不同序号);`CoreBridge::new(ctx, limits)`、`run_program_tool` 用 `ctx.cfg.program_limits`。
+- `Config.program_limits: kloop_codemode::Limits`(随 clone 继承子 agent);core 加 `pub use kloop_codemode::Limits as ProgramLimits`(cli 命名用,免加 dep);cli `load_program_limits`——`[codemode]` config(memory_mb/stack_kb/cpu_secs/max_agents/max_items,未知键报错)+ `AGENT_PROGRAM_*` env 覆盖(env 胜);--mock 用 Default。
+- **测试**(+2):引擎层 items cap(cap=3,超限 parallel/pipeline 抛且命名/不截断、恰好在界内通过)+ core 层 agent cap(max_agents=2,第三个 agent() 抛"agent cap (2",前两个真跑)。
+- **真 key**(anthropic sonnet-5,`--plain --yolo`):`.kloop/config.toml` `[codemode] max_items=3` → 模型写 `parallel(5 items)` → 抛 **`parallel: 5 items exceeds the cap of 3 per call`** → 模型报告并建议分批。config→Config.program_limits→prelude cap→抛→模型可见全链闭环。
+
+**至此 plan 24 code-mode 挂账收窄到:⑤ 后台 program + yield/wait、⑥ 保存复用 + journal resume(都是独立大件,有真实需求再上)。** token budget/UI 富进度树/并发 pacing 均记"不做/deferred 附依据"。

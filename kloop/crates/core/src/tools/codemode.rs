@@ -55,18 +55,13 @@ fn program_tool_names(sources: &[Arc<dyn super::ToolSource>]) -> Vec<String> {
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let source = super::str_arg(input, "source", "run_program")?;
     let names = program_tool_names(&ctx.cfg.tool_sources);
-    let bridge = Arc::new(CoreBridge::new(ctx.clone()));
+    let limits = ctx.cfg.program_limits;
+    let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
     // progress narration out of the context is the whole point of code-mode.
-    let out = kloop_codemode::run_program(
-        source,
-        &names,
-        bridge,
-        ctx.cancel.clone(),
-        kloop_codemode::Limits::default(),
-    )
-    .await?;
+    let out =
+        kloop_codemode::run_program(source, &names, bridge, ctx.cancel.clone(), limits).await?;
     Ok(if out.is_empty() {
         "(program completed with no output)".into()
     } else {
@@ -85,10 +80,18 @@ struct CoreBridge {
     // writes take the write lock (serialized) so a program can't race two
     // edits to the same file past the ordering a normal round would enforce.
     gate: Arc<tokio::sync::RwLock<()>>,
+    // Total agent() calls so far and the ceiling; the (max_agents+1)th is
+    // refused — the runaway guard against unbounded sub-agent fan-out. Note we
+    // cap the TOTAL, not the concurrency: a program firing N concurrent agent()
+    // is the same as a model emitting N concurrent `task` calls, which kloop
+    // already runs uncapped (join_all) — so pacing concurrency here would break
+    // that precedent. The hard total ceiling is the guard that matters.
+    agent_count: AtomicU64,
+    max_agents: u64,
 }
 
 impl CoreBridge {
-    fn new(ctx: ToolCtx) -> Self {
+    fn new(ctx: ToolCtx, limits: kloop_codemode::Limits) -> Self {
         // Calls a program fires are "from a program": they skip the deferred-tool
         // lock gate, since the tool is already exposed on the program's `tools`
         // object. All other gates (deny, permission, sandbox, hooks) still apply.
@@ -100,6 +103,8 @@ impl CoreBridge {
             ctx,
             seq: AtomicU64::new(0),
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            agent_count: AtomicU64::new(0),
+            max_agents: limits.max_agents,
         }
     }
 }
@@ -144,7 +149,17 @@ impl HostBridge for CoreBridge {
 
     fn call_agent(&self, prompt: String, opts: Value) -> BoxFuture<Result<String, String>> {
         let ctx = self.ctx.clone();
+        // Claim a slot synchronously so concurrent calls get distinct counts;
+        // the (max_agents+1)th is refused before it can spawn.
+        let n = self.agent_count.fetch_add(1, Ordering::Relaxed);
+        let max = self.max_agents;
         Box::pin(async move {
+            if n >= max {
+                return Err(format!(
+                    "program exceeds the agent cap ({max} agent() calls); it likely fans out \
+                     sub-agents without bound — narrow the work or process items in batches"
+                ));
+            }
             let mut task_input = json!({ "prompt": prompt });
             for key in ["agent_type", "max_rounds"] {
                 if let Some(v) = opts.get(key) {

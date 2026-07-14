@@ -104,4 +104,9 @@ pub struct Config {
     /// everything else, though only the depth-0 agent spawns into it. Kept
     /// separate from `background_shells` on purpose (see [`AsyncAgents`]).
     pub async_agents: Arc<AsyncAgents>,
+    /// Resource ceilings for a `run_program` (code-mode) run — engine limits
+    /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
+    /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
+    /// config or `AGENT_PROGRAM_*` env. Sub-agents inherit it with the Config.
+    pub program_limits: kloop_codemode::Limits,
 }

@@ -56,6 +56,13 @@ fn with_permissions(mut ctx: ToolCtx, perms: Permissions) -> ToolCtx {
     ctx
 }
 
+fn with_program_limits(mut ctx: ToolCtx, limits: kloop_codemode::Limits) -> ToolCtx {
+    let mut cfg = (*ctx.cfg).clone();
+    cfg.program_limits = limits;
+    ctx.cfg = Arc::new(cfg);
+    ctx
+}
+
 async fn run(source: &str, ctx: &ToolCtx) -> (String, bool) {
     run_tool("run_program", json!({ "source": source }), ctx).await
 }
@@ -125,6 +132,40 @@ async fn agent_call_spawns_a_subagent() {
     let (out, is_error) = run(r#"return await agent("do the thing");"#, &ctx).await;
     assert!(!is_error, "{out}");
     assert_eq!(out, "sub-agent result");
+}
+
+/// The agent cap refuses runaway sub-agent fan-out: with max_agents=2 the third
+/// agent() call throws (caught in-program here) before it can spawn, so only two
+/// sub-agents ever run.
+#[tokio::test]
+async fn agent_cap_refuses_runaway_fanout() {
+    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let provider = kloop_provider::Provider::mock(vec![text("one"), text("two")]);
+    let ctx = with_program_limits(
+        with_provider(test_ctx(0, "agentcap"), provider),
+        kloop_codemode::Limits {
+            max_agents: 2,
+            ..Default::default()
+        },
+    );
+    let (out, is_error) = run(
+        r#"
+        const r = [];
+        for (let i = 0; i < 3; i++) {
+            try { r.push(await agent("go " + i)); }
+            catch (e) { r.push("ERR:" + e.message); }
+        }
+        return JSON.stringify(r);
+        "#,
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert!(
+        out.contains("one") && out.contains("two"),
+        "first two ran: {out}"
+    );
+    assert!(out.contains("agent cap (2"), "the third hit the cap: {out}");
 }
 
 /// Intermediate tool results live in program variables; only the return value
