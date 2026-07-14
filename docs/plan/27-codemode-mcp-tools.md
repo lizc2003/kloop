@@ -190,7 +190,7 @@ prompt = "这 10 个单词用 stub__analyze 拿统计,告诉我元音最多的 3
 **这正面印证 plan 27 论点**:补上"别人干不了的活"(MCP 扇出)后,聪明模型不再回退到逐次直调,
 而是自发用 code-mode 编排。教训 18 的闸门(独有生态位)是对的、且 plan 27 把它打开了。
 
-### 切片 3(结构化 `CallToolResult`,已完成,2026-07-14,提交号 <待填>)
+### 切片 3(结构化 `CallToolResult`,已完成,2026-07-14,提交号 638229e)
 
 用户定"完整版"(不走精简"只补 structuredContent 到文本"路)。回源:codex 把工具结果作
 **结构化 JSON 对象**送进 JS(`code-mode/src/runtime/module_loader.rs` `resolve_tool_response`
