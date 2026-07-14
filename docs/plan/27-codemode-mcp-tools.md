@@ -178,6 +178,18 @@ run_program TS 含 source 全量签名(`run_program_def_declares_inline_source_t
 
 完成标准的"真 key 至少一次模型在 program 里调 MCP、gate 生效"两侧(inline + defer)均已过。
 
+### 自发采用验证(教训 18,已过 —— plan 27 打开的生态位真的被模型自发选中)
+
+教训 18 的推论:run_program 的独有生态位 = "编排 bash/直调干不了的工具(MCP)",而这生态位
+**要等 plan 27 才打开**;开了之后要单独验"模型会不会**自发**选它"(验法:不点名 run_program、
+给一个落在该生态位的任务)。stub 加一个 `analyze(word)→{vowels,length}` 工具,`AGENT_ALLOW=stub__analyze`,
+prompt = "这 10 个单词用 stub__analyze 拿统计,告诉我元音最多的 3 个"(**点了工具、没点 run_program**)。
+结果:sonnet-5 **自发写 run_program**——`const words=[...]` 循环里对 10 个词各调 `tools.stub__analyze`
+(trace:1 条 run_program + 其内 10 条 analyze op,顺序为 run_program 先、10 个 analyze 紧随=嵌套),
+只把 top-3 结果回上下文(10 份中间 MCP 结果留在程序里),答案正确(banana/elderberry/honeydew 各 3 元音)。
+**这正面印证 plan 27 论点**:补上"别人干不了的活"(MCP 扇出)后,聪明模型不再回退到逐次直调,
+而是自发用 code-mode 编排。教训 18 的闸门(独有生态位)是对的、且 plan 27 把它打开了。
+
 ### 挂账
 
 - **切片 3**:结构化 `CallToolResult<T>` 结果(codex `description.rs` 有 `CallToolResult<T>` TS +
