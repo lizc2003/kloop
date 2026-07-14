@@ -628,7 +628,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
-            async_agents: Default::default(),
+            background_tasks: Default::default(),
             program_limits: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -797,7 +797,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
-            async_agents: Default::default(),
+            background_tasks: Default::default(),
             program_limits: Default::default(),
         })
     }

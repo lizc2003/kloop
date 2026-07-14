@@ -157,7 +157,7 @@ TUI)+ 轻量 interrupt(`stop_agent`)**;**不做**注册表大泛化(`BackgroundS
    幂等去重)。→ kloop **随 codex:不回灌**(教训 14:参考库里"存在"不等于"收敛";一家的选择别当收敛照抄)。
 2. **注册表是否统一**——plan 想"泛化 `BackgroundShells`→`Tasks`",但 **codex 后台/用户 shell 走
    `UserShellCommandTask`、不进 `AgentRegistry`**(两套独立机制);cc `Task.spawn/render` 已在 #22546 删、
-   只剩 `kill` 多态,**只统一状态模型不统一 spawn**。→ kloop **新开平行的 `AsyncAgents` 注册表、不强行合并**
+   只剩 `kill` 多态,**只统一状态模型不统一 spawn**。→ kloop **新开平行的 `BackgroundTasks` 注册表、不强行合并**
    (教训 16/17:不预抽象、别为整齐照搬;第三个消费者出现再议)。
 
 **方向导数**:codex V2 已**离开 detached completion watcher**(`control.rs:460` `maybe_start_completion_watcher`
@@ -172,11 +172,11 @@ JoinHandle 挂完成逻辑(在 spawned task 尾部),完成时 push 摘要进父 
   "中性字符串队列各自 framing"**——实际旧 `drain_inbox` 把所有项硬套 `STEERING_PREFIX`,类型化后才真正各自 framing
   (教训 16 具体落点:plan 对现码的描述也是二手)。`push` 用 `notify_one`(留 permit 防 race),`notify_activity`
   唤醒不入队(中断子唤醒 `wait`),`drain`/`is_empty`/`notified`。
-- **`core/src/tools/async_agents.rs`(新)**:`AsyncAgents` 注册表(id→{task,status,own-cancel},并发上限 8、
+- **`core/src/tools/background_tasks.rs`(新)**:`BackgroundTasks` 注册表(id→{task,status,own-cancel},并发上限 8、
   Drop 补刀 cancel)+ `AgentStatus` + `wait_tool`(clamp 10s/30s/1h;有 pending 立即返不 drain;无运行且空立即返;
   否则 select notified/timeout/turn-cancel;**信号不搬运**)+ `stop_agent_tool`。
 - **`core/src/tools/task.rs`**:`task` 加 `background` 参数。`background:true` 走 `spawn_background`——注册进
-  `AsyncAgents`(超并发拒)、用**独立 cancel**(非父 turn cancel,父结束不杀它)detached spawn、立即返"已派发"引导;
+  `BackgroundTasks`(超并发拒)、用**独立 cancel**(非父 turn cancel,父结束不杀它)detached spawn、立即返"已派发"引导;
   子终态 `classify_background`(Completed/MaxRounds 透传、Error 截 `MAX_REINJECT_ERROR_CHARS=3600`、Aborted→None)
   push 进**父 inbox**(reinject)或 `notify_activity`(中断)。抽出 `build_sub_config`(fresh todos+fresh inbox 共用)。
 - **`core/src/agent.rs`**:`drain_inbox(&Inbox, ...)` 按 `InboxItem::into_message` 各自 framing;删除本地
@@ -205,7 +205,7 @@ plain/server 无 autowake 是**平台事实**(无事件循环 / 客户端驱动)
 ### 测试(核心 238,+6;TUI 38,+1)
 
 - `inbox.rs`:steer/subagent 各自 framing、push/drain 往返、`notified` 唤醒、race 下 permit 存活。
-- `async_agents.rs`:并发上限、完成腾槽、stop 取消+拒非运行/未知、Drop 补刀;`wait` 无运行立即返 / 有 pending
+- `background_tasks.rs`:并发上限、完成腾槽、stop 取消+拒非运行/未知、Drop 补刀;`wait` 无运行立即返 / 有 pending
   立即返且**不 drain**(经 `run_tool` 全分发路径,含权限门只读放行)。
 - `task.rs`:**背景 spawn 立即返"已派发"(非结果)且 detached 子完成后 reinject 成 `SubAgentResult` 进父 inbox、
   腾槽**;**`stop_agent` 的子 Aborted 不回灌**(端到端:派长 bash 子→stop→轮询 running_count→断言 inbox 空);
@@ -223,7 +223,15 @@ my echo output: PARENT_ECHO_OK."**。**即完成标准的"父异步派子 agent�
 
 ### 挂账(有依据,非因难)
 
-- **注册表大泛化 `BackgroundShells→Tasks`**:回源坐实两家不强合并,`AsyncAgents` 平行即可(见分歧 2)。
+- ~~**注册表大泛化 `BackgroundShells→Tasks`**~~ **已澄清 + 收尾(2026-07-14)**:回源坐实两家不强合并
+  (分歧 2:codex shell 走 `UserShellCommandTask` 不进 `AgentRegistry`;cc 只统一状态模型不统一 spawn),
+  这条**关成"不合并"**——kloop 的两个注册表是**两种交付模型的正确分离**:`BackgroundTasks`(回灌类,
+  结果 → inbox,`wait`/`stop_agent` 消费)vs `BackgroundShells`(文件类,输出 → 文件,`bash_output`/`kill_bash`
+  消费);硬合并只能取最小公分母 + union 状态枚举,为整齐牺牲类型安全(教训 16/17)。**"第三个消费者出现再议"
+  的触发点已发生并确认判断**:plan 24 后台 program(program-N)进的是**回灌类**(`BackgroundTasks`),生命周期与异步子
+  agent 全同,不是 shell 类——所以回灌类该泛化、shell 类该独立,正是现状。**收尾 = 把回灌类的类型名改诚实**(第三个
+  消费者让它名副其实):`BackgroundTasks→BackgroundTasks`、`AgentStatus→TaskStatus`、`Config.async_agents→background_tasks`、
+  模块/文件 `background_tasks.rs→background_tasks.rs`(纯改名,411 测试不变;`BackgroundShells` 不动)。用户拍板"关成不做 + 要改名"。
 - ~~**切片 5 异步子 agent 落盘**(plan 17 片 3)~~ **已完成(2026-07-14,归 plan 17 片 3;开工时用户定统一落所有子 agent 而非只异步,依据回源两家无差别落盘)**。当时判"另一根设计轴不做进本 plan"正确——它确实是独立的持久化子系统(rollout 首行 `subagent_of` 行级父链、`--list-sessions` 标 `[sub-agent of …]`、默认 resume 过滤子会话)。
 - plain/server 的 autowake(平台事实)、cc 式 output-file 指针(kloop 子 agent 不落盘,无指针可给)、
   `list_agents` 独立工具(wait 返回已带 running 计数,够了)。

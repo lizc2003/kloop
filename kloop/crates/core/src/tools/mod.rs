@@ -3,7 +3,7 @@
 //! tool implementations live in the sibling modules; this file is what the
 //! agent loop and the frontends depend on.
 
-mod async_agents;
+mod background_tasks;
 mod bash;
 mod codemode;
 mod discover;
@@ -12,8 +12,8 @@ mod search;
 mod task;
 mod todo;
 
-pub use async_agents::AgentStatus;
-pub use async_agents::AsyncAgents;
+pub use background_tasks::BackgroundTasks;
+pub use background_tasks::TaskStatus;
 pub use bash::BackgroundShells;
 pub use discover::deferred_notice;
 pub use todo::parse_todos;
@@ -651,8 +651,8 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
-            "wait" => async_agents::wait_tool(input, ctx).await,
-            "stop_agent" => async_agents::stop_agent_tool(input, ctx).await,
+            "wait" => background_tasks::wait_tool(input, ctx).await,
+            "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
             other => match find_source(&ctx.cfg.tool_sources, other) {
                 Some(source) => {
@@ -726,7 +726,7 @@ pub(crate) mod testutil {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
-                async_agents: Default::default(),
+                background_tasks: Default::default(),
                 program_limits: Default::default(),
             }),
             ui: Arc::new(SilentUi),
@@ -1212,7 +1212,7 @@ mod tests {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
-                async_agents: Default::default(),
+                background_tasks: Default::default(),
                 program_limits: Default::default(),
             }),
             ui: Arc::new(NullUi),

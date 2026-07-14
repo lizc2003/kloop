@@ -771,7 +771,7 @@ fn config_from_env(
         agent_label: String::new(),
         hooks: Arc::new(hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
-        async_agents: kloop_core::tools::AsyncAgents::new(),
+        background_tasks: kloop_core::tools::BackgroundTasks::new(),
         sandbox,
         agent_types,
         tool_allowlist: None,

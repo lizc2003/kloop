@@ -203,7 +203,7 @@ async fn background_program_returns_immediately_and_reinjects() {
         }
         other => panic!("expected ProgramResult, got {other:?}"),
     }
-    assert_eq!(ctx.cfg.async_agents.running_count(), 0, "slot freed");
+    assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
 }
 
 /// A background program cancelled via stop_agent ends Aborted and reinjects
@@ -224,7 +224,7 @@ async fn stopped_background_program_does_not_reinject() {
         .unwrap()
         .to_string();
     for _ in 0..100 {
-        if ctx.cfg.async_agents.running_count() == 1 {
+        if ctx.cfg.background_tasks.running_count() == 1 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -234,7 +234,7 @@ async fn stopped_background_program_does_not_reinject() {
     assert!(stop_out.contains("Stopping"), "{stop_out}");
 
     for _ in 0..300 {
-        if ctx.cfg.async_agents.running_count() == 0 {
+        if ctx.cfg.background_tasks.running_count() == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

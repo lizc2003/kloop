@@ -21,7 +21,7 @@ use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::async_agents::AgentStatus;
+use super::background_tasks::TaskStatus;
 use super::ToolCtx;
 use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
@@ -178,11 +178,11 @@ fn spawn_background_program(
     let own_cancel = CancellationToken::new();
     let preview = program_preview(&source);
     ctx.cfg
-        .async_agents
+        .background_tasks
         .register(&label, &preview, own_cancel.clone())
         .map_err(|msg| anyhow!("run_program: {msg}"))?;
     let parent_inbox = ctx.cfg.inbox.clone();
-    let async_agents = ctx.cfg.async_agents.clone();
+    let background_tasks = ctx.cfg.background_tasks.clone();
     let ui = ctx.ui.clone();
     // The program's tool calls run on the program's own cancel, not the parent
     // turn's — the parent may end while the program is still going.
@@ -198,7 +198,7 @@ fn spawn_background_program(
                 kloop_codemode::run_program(&source, &names, bridge, own_cancel.clone(), limits)
                     .await;
             let (status, reinject) = classify_program(outcome, &own_cancel, &journal, &run_id);
-            async_agents.set_status(&label, status);
+            background_tasks.set_status(&label, status);
             match reinject {
                 Some(summary) => parent_inbox.push(InboxItem::ProgramResult {
                     label: label.clone(),
@@ -208,7 +208,7 @@ fn spawn_background_program(
                 // `wait` so it re-evaluates instead of blocking its full deadline.
                 None => parent_inbox.notify_activity(),
             }
-            ui.agent_end(&label, matches!(status, AgentStatus::Completed));
+            ui.agent_end(&label, matches!(status, TaskStatus::Completed));
         }
     });
     Ok(format!(
@@ -228,10 +228,10 @@ fn classify_program(
     own_cancel: &CancellationToken,
     journal: &Journal,
     run_id: &str,
-) -> (AgentStatus, Option<String>) {
+) -> (TaskStatus, Option<String>) {
     match outcome {
-        Ok(out) => (AgentStatus::Completed, Some(program_output(out))),
-        Err(_) if own_cancel.is_cancelled() => (AgentStatus::Aborted, None),
+        Ok(out) => (TaskStatus::Completed, Some(program_output(out))),
+        Err(_) if own_cancel.is_cancelled() => (TaskStatus::Aborted, None),
         Err(e) => {
             let mut msg = format!(
                 "[background program failed] {}",
@@ -246,7 +246,7 @@ fn classify_program(
             } else {
                 msg.push_str("\nYou may re-run it or try another approach.");
             }
-            (AgentStatus::Failed, Some(msg))
+            (TaskStatus::Failed, Some(msg))
         }
     }
 }

@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::async_agents::AgentStatus;
+use super::background_tasks::TaskStatus;
 use super::str_arg;
 use super::ToolCtx;
 use crate::agent::run_turn;
@@ -122,11 +122,11 @@ fn spawn_background(
 ) -> Result<String> {
     let own_cancel = CancellationToken::new();
     ctx.cfg
-        .async_agents
+        .background_tasks
         .register(&agent, preview, own_cancel.clone())
         .map_err(|msg| anyhow!("task: {msg}"))?;
     let parent_inbox = ctx.cfg.inbox.clone();
-    let async_agents = ctx.cfg.async_agents.clone();
+    let background_tasks = ctx.cfg.background_tasks.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
     ui.agent_start(&agent, preview);
@@ -138,7 +138,7 @@ fn spawn_background(
             history.record(Message::user_text(prompt));
             let outcome = run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await;
             let (status, reinject) = classify_background(outcome);
-            async_agents.set_status(&label, status);
+            background_tasks.set_status(&label, status);
             match reinject {
                 Some(summary) => parent_inbox.push(InboxItem::SubAgentResult {
                     label: label.clone(),
@@ -151,7 +151,7 @@ fn spawn_background(
             }
             ui.agent_end(
                 &label,
-                matches!(status, AgentStatus::Completed | AgentStatus::MaxRounds),
+                matches!(status, TaskStatus::Completed | TaskStatus::MaxRounds),
             );
         }
     });
@@ -202,24 +202,24 @@ fn child_session_note(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> S
 /// reinjection). Success/round-limit pass through verbatim (codex); a failure
 /// is truncated; an interrupted agent reinjects nothing (codex's is_final —
 /// its partial output is noise, and the model that stopped it already knows).
-fn classify_background(outcome: TurnOutcome) -> (AgentStatus, Option<String>) {
+fn classify_background(outcome: TurnOutcome) -> (TaskStatus, Option<String>) {
     match outcome.reason {
-        EndReason::Completed => (AgentStatus::Completed, Some(outcome.final_text)),
+        EndReason::Completed => (TaskStatus::Completed, Some(outcome.final_text)),
         EndReason::MaxRounds => (
-            AgentStatus::MaxRounds,
+            TaskStatus::MaxRounds,
             Some(format!(
                 "[sub-agent stopped at its round limit]\n{}",
                 outcome.final_text
             )),
         ),
         EndReason::Error(e) => (
-            AgentStatus::Failed,
+            TaskStatus::Failed,
             Some(format!(
                 "[sub-agent failed] {}\nYou may re-dispatch it or try another approach.",
                 truncate_error(&e)
             )),
         ),
-        EndReason::Aborted => (AgentStatus::Aborted, None),
+        EndReason::Aborted => (TaskStatus::Aborted, None),
     }
 }
 
@@ -587,7 +587,7 @@ mod tests {
             }
             other => panic!("expected SubAgentResult, got {other:?}"),
         }
-        assert_eq!(ctx.cfg.async_agents.running_count(), 0, "slot freed");
+        assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
     }
 
     /// A background sub-agent cancelled via stop_agent ends Aborted and
@@ -611,7 +611,7 @@ mod tests {
             .to_string();
         // Let the sub-agent get into its bash before stopping it.
         for _ in 0..100 {
-            if ctx.cfg.async_agents.running_count() == 1 {
+            if ctx.cfg.background_tasks.running_count() == 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -622,7 +622,7 @@ mod tests {
 
         // Wait for it to actually wind down, then assert nothing was reinjected.
         for _ in 0..300 {
-            if ctx.cfg.async_agents.running_count() == 0 {
+            if ctx.cfg.background_tasks.running_count() == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -725,7 +725,7 @@ mod tests {
 
         // Wait for the detached sub-agent to finish and flush its file.
         for _ in 0..300 {
-            if ctx.cfg.async_agents.running_count() == 0
+            if ctx.cfg.background_tasks.running_count() == 0
                 && !sessions_by_recency(&sessions).is_empty()
             {
                 break;
@@ -765,20 +765,20 @@ mod tests {
         // Success passes through verbatim.
         assert_eq!(
             classify_background(outcome(EndReason::Completed)),
-            (AgentStatus::Completed, Some("the answer".into()))
+            (TaskStatus::Completed, Some("the answer".into()))
         );
         // Round limit is framed but still carries the text.
         let (status, msg) = classify_background(outcome(EndReason::MaxRounds));
-        assert_eq!(status, AgentStatus::MaxRounds);
+        assert_eq!(status, TaskStatus::MaxRounds);
         assert!(msg.unwrap().contains("the answer"));
         // A failure is framed with re-dispatch guidance.
         let (status, msg) = classify_background(outcome(EndReason::Error("boom".into())));
-        assert_eq!(status, AgentStatus::Failed);
+        assert_eq!(status, TaskStatus::Failed);
         assert!(msg.unwrap().contains("boom"));
         // Interrupted reinjects nothing.
         assert_eq!(
             classify_background(outcome(EndReason::Aborted)),
-            (AgentStatus::Aborted, None)
+            (TaskStatus::Aborted, None)
         );
     }
 

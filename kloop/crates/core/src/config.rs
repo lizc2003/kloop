@@ -6,8 +6,8 @@ use kloop_provider::Provider;
 use crate::hooks::Hooks;
 use crate::inbox::Inbox;
 use crate::permissions::Permissions;
-use crate::tools::AsyncAgents;
 use crate::tools::BackgroundShells;
+use crate::tools::BackgroundTasks;
 use crate::tools::ToolSource;
 
 /// Everything a turn needs to run. Construction (env parsing, provider
@@ -98,12 +98,15 @@ pub struct Config {
     /// reinjects into a clone of the PARENT's queue captured before the reset.
     /// The front-end holds a clone of this Arc to enqueue while a turn runs.
     pub inbox: Arc<Inbox>,
-    /// Registry of background sub-agents dispatched with task {"background":
-    /// true} (plan 26): tracks in-flight agents for `wait`/`stop_agent` and
-    /// enforces a concurrency cap. Shared into sub-agent configs like
-    /// everything else, though only the depth-0 agent spawns into it. Kept
-    /// separate from `background_shells` on purpose (see [`AsyncAgents`]).
-    pub async_agents: Arc<AsyncAgents>,
+    /// Registry of background async tasks — sub-agents (`task {"background":
+    /// true}`, plan 26) and programs (`run_program {"background": true}`, plan
+    /// 24), which share one lifecycle (detached run, result reinjected into the
+    /// inbox). Tracks in-flight tasks for `wait`/`stop_agent` and enforces a
+    /// concurrency cap. Shared into sub-agent configs like everything else,
+    /// though only the depth-0 agent spawns into it. Kept separate from
+    /// `background_shells` on purpose (a shell delivers via an output file, not
+    /// a reinjected result — a different lifecycle; see [`BackgroundTasks`]).
+    pub background_tasks: Arc<BackgroundTasks>,
     /// Resource ceilings for a `run_program` (code-mode) run — engine limits
     /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`

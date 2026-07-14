@@ -31,14 +31,17 @@ use super::ToolCtx;
 /// How many background sub-agents may run at once. A loose cap to catch runaway
 /// fan-out (codex's V2 residency is 3; cc batches at 10). The parent collects
 /// results via `wait`, so this only bounds concurrency, not total work.
-const MAX_BACKGROUND_AGENTS: usize = 8;
+const MAX_BACKGROUND_TASKS: usize = 8;
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
 const MIN_WAIT_MS: u64 = 10_000;
 const MAX_WAIT_MS: u64 = 3_600_000;
 
+/// Terminal state of a background task. `MaxRounds` only arises for a sub-agent
+/// (a program has no round limit); the rest are shared by sub-agents and
+/// programs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentStatus {
+pub enum TaskStatus {
     Running,
     Completed,
     Failed,
@@ -46,34 +49,35 @@ pub enum AgentStatus {
     Aborted,
 }
 
-fn status_text(s: AgentStatus) -> &'static str {
+fn status_text(s: TaskStatus) -> &'static str {
     match s {
-        AgentStatus::Running => "running",
-        AgentStatus::Completed => "completed",
-        AgentStatus::Failed => "failed",
-        AgentStatus::MaxRounds => "stopped at round limit",
-        AgentStatus::Aborted => "stopped",
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::MaxRounds => "stopped at round limit",
+        TaskStatus::Aborted => "stopped",
     }
 }
 
 struct Entry {
-    /// First line of the prompt, for reporting what is outstanding.
+    /// First line of the prompt/source, for reporting what is outstanding.
     task: String,
-    status: AgentStatus,
-    /// The agent's OWN cancel token — independent of any turn's cancel, so a
-    /// finished parent turn never kills a still-running background agent.
+    status: TaskStatus,
+    /// The task's OWN cancel token — independent of any turn's cancel, so a
+    /// finished parent turn never kills a still-running background task.
     cancel: CancellationToken,
 }
 
-/// Session-scoped registry of background sub-agents (one per Config; sub-agents
-/// share the parent's through the Config clone, though only the depth-0 agent
-/// spawns into it).
+/// Session-scoped registry of background tasks — sub-agents (`agent-N`) and
+/// programs (`program-N`), which share the identical detached + reinject
+/// lifecycle (one per Config; sub-agents share the parent's through the Config
+/// clone, though only the depth-0 agent spawns into it).
 #[derive(Default)]
-pub struct AsyncAgents {
-    agents: Mutex<HashMap<String, Entry>>,
+pub struct BackgroundTasks {
+    tasks: Mutex<HashMap<String, Entry>>,
 }
 
-impl AsyncAgents {
+impl BackgroundTasks {
     pub fn new() -> Arc<Self> {
         Arc::default()
     }
@@ -81,12 +85,12 @@ impl AsyncAgents {
     /// Reserve a slot for a newly spawned agent. Err (model-facing) if the
     /// concurrency cap is already reached.
     pub fn register(&self, id: &str, task: &str, cancel: CancellationToken) -> Result<(), String> {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.tasks.lock().unwrap();
         let running = agents
             .values()
-            .filter(|e| e.status == AgentStatus::Running)
+            .filter(|e| e.status == TaskStatus::Running)
             .count();
-        if running >= MAX_BACKGROUND_AGENTS {
+        if running >= MAX_BACKGROUND_TASKS {
             return Err(format!(
                 "too many background tasks already running ({running}); wait for some to \
                  finish (use the wait tool) before dispatching more"
@@ -96,25 +100,25 @@ impl AsyncAgents {
             id.into(),
             Entry {
                 task: task.into(),
-                status: AgentStatus::Running,
+                status: TaskStatus::Running,
                 cancel,
             },
         );
         Ok(())
     }
 
-    pub fn set_status(&self, id: &str, status: AgentStatus) {
-        if let Some(e) = self.agents.lock().unwrap().get_mut(id) {
+    pub fn set_status(&self, id: &str, status: TaskStatus) {
+        if let Some(e) = self.tasks.lock().unwrap().get_mut(id) {
             e.status = status;
         }
     }
 
     pub fn running_count(&self) -> usize {
-        self.agents
+        self.tasks
             .lock()
             .unwrap()
             .values()
-            .filter(|e| e.status == AgentStatus::Running)
+            .filter(|e| e.status == TaskStatus::Running)
             .count()
     }
 
@@ -123,11 +127,11 @@ impl AsyncAgents {
     /// reinject (codex's is_final: an interrupted child's partial output is
     /// noise).
     fn request_stop(&self, id: &str) -> Result<String, String> {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.tasks.lock().unwrap();
         let Some(e) = agents.get(id) else {
             return Err(format!("no background task with id {id}"));
         };
-        if e.status != AgentStatus::Running {
+        if e.status != TaskStatus::Running {
             return Err(format!(
                 "{id} is not running (status: {})",
                 status_text(e.status)
@@ -138,19 +142,19 @@ impl AsyncAgents {
     }
 }
 
-impl Drop for AsyncAgents {
+impl Drop for BackgroundTasks {
     /// Best-effort reaping at session end: cancel every still-running agent so
     /// detached tasks don't outlive the session.
     fn drop(&mut self) {
-        for e in self.agents.lock().unwrap().values() {
-            if e.status == AgentStatus::Running {
+        for e in self.tasks.lock().unwrap().values() {
+            if e.status == TaskStatus::Running {
                 e.cancel.cancel();
             }
         }
     }
 }
 
-/// `wait`: block until a background sub-agent finishes (or new input arrives, or
+/// `wait`: block until a background task finishes (or new input arrives, or
 /// the deadline passes), then return a status line. Deliberately does NOT drain
 /// — the result is delivered as a user message at the next round boundary, like
 /// codex's wait (signal, don't carry). Interruptible by user steering (a push
@@ -161,7 +165,7 @@ pub(super) async fn wait_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         .unwrap_or(DEFAULT_WAIT_MS)
         .clamp(MIN_WAIT_MS, MAX_WAIT_MS);
     let inbox = &ctx.cfg.inbox;
-    let agents = &ctx.cfg.async_agents;
+    let agents = &ctx.cfg.background_tasks;
 
     if agents.running_count() == 0 && inbox.is_empty() {
         return Ok(
@@ -208,7 +212,7 @@ fn status_report(head: &str, running: usize) -> String {
 /// It ends Aborted and reports no result.
 pub(super) async fn stop_agent_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "agent_id", "stop_agent")?;
-    match ctx.cfg.async_agents.request_stop(id) {
+    match ctx.cfg.background_tasks.request_stop(id) {
         Ok(task) => Ok(format!(
             "Stopping background task {id} ({task}). It will not report a result."
         )),
@@ -247,12 +251,12 @@ mod tests {
 
     #[test]
     fn register_enforces_the_concurrency_cap() {
-        let reg = AsyncAgents::default();
-        for i in 0..MAX_BACKGROUND_AGENTS {
+        let reg = BackgroundTasks::default();
+        for i in 0..MAX_BACKGROUND_TASKS {
             reg.register(&format!("agent-{i}"), "t", CancellationToken::new())
                 .unwrap();
         }
-        assert_eq!(reg.running_count(), MAX_BACKGROUND_AGENTS);
+        assert_eq!(reg.running_count(), MAX_BACKGROUND_TASKS);
         let err = reg
             .register("agent-over", "t", CancellationToken::new())
             .unwrap_err();
@@ -261,13 +265,13 @@ mod tests {
 
     #[test]
     fn finishing_frees_a_slot() {
-        let reg = AsyncAgents::default();
-        for i in 0..MAX_BACKGROUND_AGENTS {
+        let reg = BackgroundTasks::default();
+        for i in 0..MAX_BACKGROUND_TASKS {
             reg.register(&format!("agent-{i}"), "t", CancellationToken::new())
                 .unwrap();
         }
-        reg.set_status("agent-0", AgentStatus::Completed);
-        assert_eq!(reg.running_count(), MAX_BACKGROUND_AGENTS - 1);
+        reg.set_status("agent-0", TaskStatus::Completed);
+        assert_eq!(reg.running_count(), MAX_BACKGROUND_TASKS - 1);
         // A slot opened up, so one more registers.
         reg.register("agent-new", "t", CancellationToken::new())
             .unwrap();
@@ -275,7 +279,7 @@ mod tests {
 
     #[test]
     fn stop_cancels_a_running_agent_and_rejects_the_rest() {
-        let reg = AsyncAgents::default();
+        let reg = BackgroundTasks::default();
         let cancel = CancellationToken::new();
         reg.register("agent-1", "build the thing", cancel.clone())
             .unwrap();
@@ -287,7 +291,7 @@ mod tests {
             .request_stop("agent-99")
             .unwrap_err()
             .contains("no background"));
-        reg.set_status("agent-1", AgentStatus::Aborted);
+        reg.set_status("agent-1", TaskStatus::Aborted);
         assert!(reg
             .request_stop("agent-1")
             .unwrap_err()
@@ -298,7 +302,7 @@ mod tests {
     fn drop_cancels_running_agents() {
         let cancel = CancellationToken::new();
         {
-            let reg = AsyncAgents::default();
+            let reg = BackgroundTasks::default();
             reg.register("agent-1", "t", cancel.clone()).unwrap();
         }
         assert!(
