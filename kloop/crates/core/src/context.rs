@@ -43,8 +43,11 @@ pub struct GitInfo {
 pub enum InstructionScope {
     /// `~/.kloop/` — applies to every project.
     Global,
-    /// Found between the git root and cwd.
+    /// Found between the git root and cwd; checked into the codebase.
     Project,
+    /// Private per-developer override (`AGENTS.local.md`), gitignored; sits
+    /// after Project files in each directory so it carries the most weight.
+    Local,
 }
 
 pub struct InstructionFile {
@@ -124,6 +127,7 @@ pub fn assemble_instructions(files: &[InstructionFile], max_bytes: usize) -> Ass
         let label = match file.scope {
             InstructionScope::Global => "global instructions for all projects",
             InstructionScope::Project => "project instructions",
+            InstructionScope::Local => "local project instructions, not checked in",
         };
         entries.push(format!("Contents of {} ({label}):\n\n{kept}", file.path));
     }
@@ -293,6 +297,19 @@ mod tests {
             )
         );
         assert!(assembled.warnings.is_empty());
+    }
+
+    #[test]
+    fn local_scope_is_labeled_as_not_checked_in() {
+        let files = [file(
+            "/repo/AGENTS.local.md",
+            InstructionScope::Local,
+            "my private overrides",
+        )];
+        let assembled = assemble_instructions(&files, INSTRUCTIONS_MAX_BYTES);
+        assert!(assembled.message.unwrap().contains(
+            "Contents of /repo/AGENTS.local.md (local project instructions, not checked in):"
+        ),);
     }
 
     #[test]

@@ -426,10 +426,23 @@ At startup kloop assembles what the model knows about where it is:
   last 5 commits) labeled as a start-of-session snapshot.
 - **Instruction files**: per directory `AGENTS.md` wins, `CLAUDE.md` is the
   compatibility fallback. Layers, in order: `~/.kloop/` (global), then every
-  directory from the git root down to cwd (closest to cwd last). Without a
-  git root only cwd is consulted. Missing files are simply absent. Total
+  directory from the git root down to cwd (closest to cwd last). Within each
+  project directory the order is the main file, then `.kloop/rules/*.md`
+  (modular fragments, loaded sorted), then a private `AGENTS.local.md` /
+  `CLAUDE.local.md` override (gitignore it — loaded last, so it wins). Without
+  a git root only cwd is consulted. Missing files are simply absent. Total
   budget 32 KiB across all files — over it, the overflowing file is truncated
   and the rest skipped, with startup warnings.
+- **`@import`**: any instruction file can pull in another with a line like
+  `@./coding-style.md` (also `@../x.md`, `@~/x.md`, `@/abs/x.md`) — resolved
+  relative to the importing file, expanded recursively (depth ≤ 5, cycles
+  broken by path), with the imported content placed right after the file that
+  references it. `@` only triggers at a line start or after whitespace (so
+  `a@b.com` and prose `@mentions` are left alone) and imports inside fenced
+  code blocks are ignored. Project/local files may only import from within the
+  project (git root); a global `~/.kloop/` file may import from anywhere. A
+  missing or out-of-project import is skipped with a startup warning, never an
+  error.
 - Following cc and codex, instruction files do **not** go into the system
   prompt: they ride every sampling request as a synthetic first user message
   (`<project-instructions>…</project-instructions>`) that is never recorded
@@ -1340,6 +1353,7 @@ crates/cli/         kloop — the binary
   src/mcp.rs        [mcp.servers] config, startup connection with
                     degrade-to-warning, {server}__{tool} namespacing,
                     the ToolSource adapter
-  src/context.rs    project-context IO: AGENTS.md/CLAUDE.md discovery
-                    (global + git root→cwd), env info, git snapshot commands
+  src/context.rs    project-context IO: instruction-file discovery
+                    (global + git root→cwd; main + .kloop/rules/*.md + local
+                    override per dir; @import expansion), env, git snapshot
 ```
