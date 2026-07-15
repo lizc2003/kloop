@@ -8,6 +8,7 @@ mod bash;
 mod codemode;
 mod fs;
 mod search;
+mod skill;
 mod task;
 mod todo;
 mod tool_search;
@@ -15,6 +16,9 @@ mod tool_search;
 pub use background_tasks::BackgroundTasks;
 pub use background_tasks::TaskStatus;
 pub use bash::BackgroundShells;
+// Registered on the task tool's peer set only at depth 0 with skills loaded
+// (see `turn_rounds`); the pure skill logic it drives lives in `crate::skills`.
+pub(crate) use skill::skill_tool_def;
 pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the task sub-agent machinery.
@@ -651,7 +655,7 @@ fn execute_tool<'a>(
             "glob" => search::glob_tool(input, ctx.program_result.as_ref()).await,
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
-            "skill" => crate::skills::skill_tool(input, ctx).await,
+            "skill" => skill::skill_tool(input, ctx).await,
             "tool_search" => tool_search::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.

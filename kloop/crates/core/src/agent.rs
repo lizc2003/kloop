@@ -181,7 +181,7 @@ async fn turn_rounds(
     // is a prompt-activation seam, not a source tool. Placed before the
     // allowlist filter so a restricted agent type can gate it like any tool.
     if depth == 0 && !cfg.skills.is_empty() && !tools.iter().any(|t| t.name == "skill") {
-        tools.push(crate::skills::skill_tool_def());
+        tools.push(crate::tools::skill_tool_def());
     }
     // A custom agent type may restrict this sub-agent's tools; the main agent
     // (None) keeps them all. read_offloaded is never filtered out.
