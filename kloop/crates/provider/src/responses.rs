@@ -25,7 +25,49 @@ use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
 use kloop_protocol::StreamEvent;
+use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
+
+/// A canonical image source as a Responses `input_image` content item: a
+/// data-URL image_url with detail=auto. Used for both top-level user images and
+/// images embedded in a tool_result's function_call_output.
+fn input_image_item(source: &ImageSource) -> Value {
+    let ImageSource::Base64 { media_type, data } = source;
+    json!({
+        "type": "input_image",
+        "image_url": format!("data:{media_type};base64,{data}"),
+        "detail": "auto",
+    })
+}
+
+/// A tool_result block array as function_call_output `content_items`: text
+/// blocks become `input_text`, images become `input_image`. An error result
+/// prefixes the leading text so the model sees the failure marker.
+fn blocks_to_output_items(blocks: &[ContentBlock], is_error: bool) -> Vec<Value> {
+    let mut text = String::new();
+    let mut items = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text: t } => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
+            }
+            ContentBlock::Image { source } => items.push(input_image_item(source)),
+            _ => {}
+        }
+    }
+    let text = if is_error {
+        format!("[error] {text}")
+    } else {
+        text
+    };
+    if !text.is_empty() {
+        items.insert(0, json!({"type": "input_text", "text": text}));
+    }
+    items
+}
 
 /// Translate canonical (Anthropic-shaped) history into Responses input items.
 pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
@@ -87,10 +129,22 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                             content,
                             is_error,
                         } => {
-                            let output = if *is_error {
-                                format!("[error] {content}")
-                            } else {
-                                content.clone()
+                            // The Responses API carries images natively in the
+                            // function_call_output: `output` is `string |
+                            // array`, so a tool that read an image needs no
+                            // relocation (unlike chat/completions). Text stays a
+                            // bare string to keep the common case unchanged.
+                            let output = match content {
+                                ToolResultContent::Text(s) => {
+                                    if *is_error {
+                                        Value::String(format!("[error] {s}"))
+                                    } else {
+                                        Value::String(s.clone())
+                                    }
+                                }
+                                ToolResultContent::Blocks(blocks) => {
+                                    Value::Array(blocks_to_output_items(blocks, *is_error))
+                                }
                             };
                             out.push(json!({
                                 "type": "function_call_output",
@@ -101,13 +155,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                         ContentBlock::Text { text: t } => text.push_str(t),
                         // Responses carries images as an input_image data URL.
                         // detail=auto matches the OpenAI default.
-                        ContentBlock::Image {
-                            source: ImageSource::Base64 { media_type, data },
-                        } => images.push(json!({
-                            "type": "input_image",
-                            "image_url": format!("data:{media_type};base64,{data}"),
-                            "detail": "auto",
-                        })),
+                        ContentBlock::Image { source } => images.push(input_image_item(source)),
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ToolUse { .. } => {}
@@ -389,6 +437,44 @@ mod tests {
                     {
                         "type": "input_image",
                         "image_url": "data:image/webp;base64,d2VicA==",
+                        "detail": "auto",
+                    },
+                ],
+            })]
+        );
+    }
+
+    /// A tool that returned an image (slice 2): the Responses API carries it
+    /// natively in the function_call_output — `output` becomes a content-items
+    /// array with an `input_image` — so nothing is relocated (unlike
+    /// chat/completions). A leading text block, if any, becomes an `input_text`.
+    #[test]
+    fn tool_result_image_rides_function_call_output_content_items() {
+        let messages = vec![Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "c1".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "here it is".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "aGk=".into(),
+                    },
+                },
+            ]),
+            is_error: false,
+        }])];
+        assert_eq!(
+            to_input_items(&messages),
+            vec![json!({
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": "here it is"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGk=",
                         "detail": "auto",
                     },
                 ],

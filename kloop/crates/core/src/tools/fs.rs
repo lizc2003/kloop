@@ -1,18 +1,37 @@
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
 use super::str_arg;
 use super::ToolCtx;
+use crate::image::detect_media_type;
+use crate::image::image_block_from_bytes;
 
-pub(super) async fn read_file_tool(input: &Value) -> Result<String> {
+/// read_file reads any file the model points at — text or image (cc's Read is
+/// one tool for both). It reads the raw bytes, sniffs the format from magic
+/// bytes (never the extension), and either returns an image block or numbers
+/// the text lines. A binary file that is not a supported image is an error.
+pub(super) async fn read_file_tool(input: &Value) -> Result<ToolResultContent> {
     let path = str_arg(input, "path", "read_file")?;
-    let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
-    let content = tokio::fs::read_to_string(path)
+    let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("read_file: cannot read {path}"))?;
+    // An image file returns a single image block (validated for format and the
+    // 5 MiB cap); offset/limit are line concepts and simply do not apply.
+    if detect_media_type(&bytes).is_some() {
+        let block = image_block_from_bytes(&bytes)
+            .with_context(|| format!("read_file: cannot read image {path}"))?;
+        return Ok(ToolResultContent::Blocks(vec![block]));
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "read_file: {path} is not UTF-8 text or a supported image (png/jpeg/gif/webp)"
+        )
+    })?;
+    let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
+    let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
     let out: Vec<String> = content
         .lines()
         .enumerate()
@@ -21,9 +40,11 @@ pub(super) async fn read_file_tool(input: &Value) -> Result<String> {
         .map(|(i, line)| format!("{}\t{line}", i + 1))
         .collect();
     if out.is_empty() {
-        return Ok("(no lines in requested range)".into());
+        return Ok(ToolResultContent::Text(
+            "(no lines in requested range)".into(),
+        ));
     }
-    Ok(out.join("\n"))
+    Ok(ToolResultContent::Text(out.join("\n")))
 }
 
 pub(super) async fn write_file_tool(input: &Value) -> Result<String> {
@@ -85,12 +106,22 @@ pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::dispatch_tools;
     use crate::tools::testutil::*;
+    use kloop_protocol::ContentBlock;
+    use kloop_protocol::ImageSource;
+    use kloop_protocol::ToolResultContent;
     use serde_json::json;
 
     fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("kloop-tool-{}-{tag}", std::process::id()));
         std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn temp_bytes(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("kloop-tool-{}-{tag}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
         path
     }
 
@@ -111,6 +142,55 @@ mod tests {
             run_tool("read_file", json!({"path": "/nonexistent/kloop"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("cannot read"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// read_file sniffs the magic bytes: a PNG file returns a single image
+    /// block (ToolResultContent::Blocks), not text — offset/limit do not apply.
+    #[tokio::test]
+    async fn read_file_returns_image_block_for_image_file() {
+        // Minimal valid PNG magic bytes; content beyond the signature is opaque.
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        let path = temp_bytes("readimg", png);
+        let ctx = test_ctx(0, "readimg");
+        let results = dispatch_tools(
+            vec![(
+                "t".into(),
+                "read_file".into(),
+                json!({"path": path.to_str().unwrap()}),
+            )],
+            &ctx,
+        )
+        .await;
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &results[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!is_error);
+        let ToolResultContent::Blocks(blocks) = content else {
+            panic!("expected image blocks, got {content:?}");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. },
+            }] if media_type == "image/png"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A binary file that is neither UTF-8 text nor a supported image is a
+    /// clean error, not a panic or garbled read.
+    #[tokio::test]
+    async fn read_file_errors_on_non_image_binary() {
+        let path = temp_bytes("readbin", &[0x00, 0xFF, 0xFE, 0x01, 0x80]);
+        let ctx = test_ctx(0, "readbin");
+        let (out, is_error) =
+            run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("not UTF-8 text or a supported image"), "{out}");
         let _ = std::fs::remove_file(path);
     }
 

@@ -483,7 +483,9 @@ mod tests {
         };
         assert_eq!(tool_use_id, "t2");
         assert!(is_error);
-        assert!(content.contains("missing required string argument 'prompt'"));
+        assert!(content
+            .as_text()
+            .contains("missing required string argument 'prompt'"));
     }
 
     /// agent_type overrides route to the sub-agent's request: its system

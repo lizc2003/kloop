@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::rollout::Rollout;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::ToolResultContent;
 
 /// Offload ids are process-global so a sub-agent's spills never clobber the
 /// parent's files in the shared offload directory.
@@ -72,9 +73,16 @@ impl History {
 
     pub fn record(&mut self, mut msg: Message) {
         for block in &mut msg.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                if content.chars().count() > self.cap {
-                    *content = self.spill(content);
+            // Only text tool results spill to disk. Image blocks must reach the
+            // model as-is (base64 inlines into the rollout) — cc likewise skips
+            // offload for image content.
+            if let ContentBlock::ToolResult {
+                content: ToolResultContent::Text(text),
+                ..
+            } = block
+            {
+                if text.chars().count() > self.cap {
+                    *text = self.spill(text.as_str());
                 }
             }
         }
@@ -211,7 +219,7 @@ mod tests {
     fn tool_result(content: String) -> Message {
         Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
-            content,
+            content: content.into(),
             is_error: false,
         }])
     }
@@ -226,6 +234,7 @@ mod tests {
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
             panic!("expected tool result");
         };
+        let content = content.as_text();
         assert!(content.chars().count() < 9000);
         assert!(content.contains("…[truncated]…"));
         assert!(content.contains("read_offloaded"));
@@ -266,6 +275,7 @@ mod tests {
             let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
                 panic!("expected tool result");
             };
+            let content = content.as_text();
             let start = content.find("id=off-").expect("pointer has id") + 3;
             content[start..start + 8].to_string()
         };
@@ -284,18 +294,18 @@ mod tests {
             },
             ContentBlock::ToolResult {
                 tool_use_id: "big".into(),
-                content: "z".repeat(9_000),
+                content: "z".repeat(9_000).into(),
                 is_error: false,
             },
         ]));
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
             panic!()
         };
-        assert_eq!(content, "tiny");
+        assert_eq!(content.as_text(), "tiny");
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[1] else {
             panic!()
         };
-        assert!(content.contains("read_offloaded"));
+        assert!(content.as_text().contains("read_offloaded"));
     }
 
     #[test]

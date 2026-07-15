@@ -50,10 +50,64 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+}
+
+/// The content of a tool_result: plain text (the overwhelming common case —
+/// every tool that returns a string) or a block array (a tool that returns an
+/// image, e.g. `read_file` on an image file). Serializes **untagged**, exactly
+/// matching Anthropic's `tool_result.content`, which is itself `string |
+/// array`: `Text` becomes a bare JSON string — so a pre-image rollout line
+/// (`"content":"…"`) round-trips unchanged — and `Blocks` becomes a content
+/// array. The OpenAI-compat and Responses adapters translate `Blocks` at their
+/// edge (chat/completions relocates images to a trailing user message; the
+/// Responses API carries them natively in the function_call_output).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl ToolResultContent {
+    /// Text view for surfaces that cannot render blocks: `Text` verbatim;
+    /// `Blocks` joins its text blocks and renders each image as an
+    /// `[image: <media_type>]` tag. Used by offload sizing, hook payloads, the
+    /// codemode program result, and the chat/completions downgrade placeholder.
+    pub fn as_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Text(s) => std::borrow::Cow::Borrowed(s),
+            Self::Blocks(blocks) => std::borrow::Cow::Owned(
+                blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => text.clone(),
+                        ContentBlock::Image {
+                            source: ImageSource::Base64 { media_type, .. },
+                        } => format!("[image: {media_type}]"),
+                        _ => String::new(),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
+    }
+}
+
+impl From<String> for ToolResultContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for ToolResultContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
 }
 
 /// Where an image's bytes come from. Only inline base64 is accepted (remote
@@ -237,7 +291,8 @@ mod tests {
                 "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
             })
         );
-        // is_error omitted when false, present when true.
+        // is_error omitted when false, present when true. Text content
+        // serializes as a bare string (Anthropic's `content: string` form).
         assert_eq!(
             serde_json::to_value(ContentBlock::ToolResult {
                 tool_use_id: "t1".into(),
@@ -256,6 +311,90 @@ mod tests {
             .unwrap(),
             json!({"type": "tool_result", "tool_use_id": "t1", "content": "bad", "is_error": true})
         );
+        // Block content (a tool that read an image) serializes as an array —
+        // Anthropic's `content: array` form. The image block inside is the same
+        // canonical shape as a top-level image.
+        assert_eq!(
+            serde_json::to_value(ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "aGk=".into(),
+                    },
+                }]),
+                is_error: false,
+            })
+            .unwrap(),
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                ],
+            })
+        );
+    }
+
+    /// tool_result content is `string | array` on the wire and survives the
+    /// roundtrip either way. Critically, a pre-image rollout line — where
+    /// `content` was written as a bare string — still reads back as `Text`,
+    /// so old session files remain forward-compatible.
+    #[test]
+    fn tool_result_content_string_or_array_roundtrips() {
+        let text = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: ToolResultContent::Text("plain".into()),
+            is_error: false,
+        };
+        let blocks = ContentBlock::ToolResult {
+            tool_use_id: "t2".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "see image".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/gif".into(),
+                        data: "R0lG".into(),
+                    },
+                },
+            ]),
+            is_error: false,
+        };
+        for block in [&text, &blocks] {
+            let wire = serde_json::to_string(block).unwrap();
+            assert_eq!(&serde_json::from_str::<ContentBlock>(&wire).unwrap(), block);
+        }
+        // A bare-string content field (the pre-image shape) deserializes to Text.
+        let old = r#"{"type":"tool_result","tool_use_id":"t1","content":"legacy"}"#;
+        assert_eq!(
+            serde_json::from_str::<ContentBlock>(old).unwrap(),
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: ToolResultContent::Text("legacy".into()),
+                is_error: false,
+            }
+        );
+    }
+
+    /// as_text() flattens blocks for text-only surfaces: text verbatim, each
+    /// image rendered as an `[image: <media_type>]` tag.
+    #[test]
+    fn as_text_renders_blocks_with_image_tags() {
+        assert_eq!(ToolResultContent::Text("hi".into()).as_text(), "hi");
+        let blocks = ToolResultContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "before".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/webp".into(),
+                    data: "x".into(),
+                },
+            },
+        ]);
+        assert_eq!(blocks.as_text(), "before\n[image: image/webp]");
     }
 
     #[test]

@@ -189,3 +189,82 @@ fmt/clippy/test 全绿,一次 commit;真 key 双轨验收(至少 anthropic 轨:�
 blocks + Chat 轨"搬运"降级 + 模型视觉能力位检测);client 端 resize/降采样;image-cache 落
 盘指针;"看完即弃/不支持则剥离"省 token;PDF/document 块;远程 URL 图;单请求媒体数上限裁
 剪(≤100);TUI 粘贴/拖拽入口 + 实时 turn 转录图占位;暴露 `detail`。
+
+## 完成记录(片 2,提交 `0464725`)
+
+**范围**:工具读图 + `ToolResult` String→blocks + 三轨(anthropic 原生 / responses 原生 /
+openai-chat 搬运降级)。至此 plan 29 主体完成。
+
+**决定落地(开工时逐点与用户敲定,连续三点"参考 cc")**:
+1. **入口 = `read_file` 判 MIME 一把梭,不单开工具**(参考 cc `FileReadTool`,回源真读
+   `packages/builtin-tools/.../FileReadTool.ts:650-666`:一个 Read 工具读文本/图/PDF/
+   notebook,读图返 `tool_result.content:[{type:image,source:base64}]`)。**纠正 plan 备
+   忘**:回源结论原只记了"cc 的 MCP 结果可带 image",漏了 cc 的 FileReadTool 本身判 MIME
+   读图——两家在"单个 Read 判 MIME(cc)vs 单开 view_image(codex)"上就是分歧,用户选
+   cc。工具名 `read_image` 讨论作废(不单开)。cc 的 resize/降采样不抄(plan「不做」),超
+   5 MiB 报错;非图非 UTF-8 二进制干净报错。
+2. **`ToolResult.content`:`String` → `enum ToolResultContent { Text(String),
+   Blocks(Vec<ContentBlock>) }`,`#[serde(untagged)]`**(cc 坐实:cc 的
+   `tool_result.content` 就是 `string | array<block>` 二态,读文本用 string、读图用 array;
+   见 `@ant/.../openaiConvertMessages.ts:convertToolResult`)。untagged 序列化:Text→裸字
+   符串(旧 rollout `content:"…"` **前向兼容白送**)、Blocks→块数组(对齐 Anthropic
+   `tool_result.content` 的 string|array)。便利 API:`From<String>`/`From<&str>`(构造点
+   `.into()` 零成本兼容)、`as_text()->Cow`(Text 原样;Blocks join 文本 + `[image:
+   <mt>]` 标签,给 offload/hook/codemode/降级占位等纯文本面)。
+3. **openai-chat 轨降级 = 搬运**(codex 式,非 cc 的丢弃)。**破例不随 cc**:cc 的 Chat
+   是边缘轨(cc 主轨 Anthropic),丢弃可接受;但 openai-chat 对 kloop 是正经副轨,丢弃 =
+   该轨读图直接废。搬运保信息(回源真读 codex `chat 轨实现:869-940` +
+   `pending_multimodal_tool_outputs` 排序 `:401,537`):tool 消息留占位
+   `[tool output contains image data attached in the following message]`,图另建**紧随的**
+   `user` 消息(`Tool output for call_id X:` + `image_url` data URL)。用户追问"大模型支持
+   吗"——答:OpenAI Chat 允许 tool 消息后接 user 消息、user 的 image_url 是标准视觉输入,
+   唯一硬约束是本轮所有 tool 消息须紧跟 assistant tool_calls(图 user 消息延后)。**kloop
+   利好**:一轮 tool_result 本就聚在一条 `Message::tool_results`,`to_openai_messages` 循环
+   内 tool 消息先 push、图攒到末尾随 user 消息 push,天然满足排序,不用 codex 那样跨
+   Message 缓冲。
+4. **detail = 常量 `"auto"`**(复用片 1,read_image 的 image_url 与片 1 user 图同款 data
+   URL)。
+
+**改造点(自底向上,与片 1 同模式:protocol 加/改块 + 三轨翻译 + 前向兼容)**:
+- `protocol`:`ToolResultContent` enum(untagged)+ `ContentBlock::ToolResult.content` 换
+  类型 + 便利方法;测试锁 string|array 双态往返 + 旧 `content:"…"`→Text 前向兼容 +
+  `as_text` 图标签。
+- `core/tools/fs.rs`:`read_file_tool` 返 `Result<ToolResultContent>`——读**字节**(非
+  read_to_string)→ `detect_media_type` 嗅 magic(复用片 1 `image.rs`)→ 图走
+  `image_block_from_bytes`(校验格式 + 5 MiB)返 `Blocks`;非图 `from_utf8` 失败即报错,成
+  功走行号 offset/limit 返 `Text`。工具描述加"可读图"。
+- `core/tools/mod.rs`:`execute_tool` 返 `Result<ToolResultContent>`——`read_file` 单独早返
+  (唯一能返非文本的工具),其余工具仍返 `String` 统一 `.map(Text)` 包装(改动面最小);
+  `run_one` 的 post_tool hook 与 tool_result 构造用 `as_text()`/`.into()`;`interrupted`/
+  测试 `run_tool` 走 `as_text` 扁平化(既有调用零改)。
+- `core/history.rs`:offload 只 spill `Text` 变体(**图块天然不 offload**,base64 内联
+  rollout,照 cc `toolResultStorage.ts` "skip persistence for image content");
+  `estimate_message_tokens` **零改动**(serde 序列化数字节,base64 长度自动计入,plan D 白
+  送)。
+- `core/tools/codemode.rs`:program 拿工具结果用 `as_text()`(program 编排不能"看"图,图降
+  级成 `[image: …]` 文本;built-in `read_file` 的 TS 声明仍 `Promise<string>` 准确)。
+- 三轨:**anthropic 零改动**(serde 自动,`tool_result.content:[{type:image,…}]`,加契约单
+  测);**responses** `function_call_output.output` = string|array,Blocks 塞
+  `input_text`/`input_image` content_items(codex `FunctionCallOutputBody` 同为 untagged
+  Text/ContentItems,回源坐实);**openai-chat** 搬运(占位 + 紧随 user 消息 + 排序保证)。
+- **TUI/server 零改动**:cells_from_history 本就跳过 tool_result 内容(history-internal,注
+  释在案),read_file 读图的 tool 行照常 ✓;实时/resume 都不特殊处理图 tool_result。
+
+**真 key 验收(双轨过)**:测试 PNG 画秘密词 `MULBERRY-Q92`(900×240,避免片 1 首图右缘裁
+切的坑)。
+- **anthropic 轨**(sonnet-5):`read_file` 读图(仅 read_file、无 bash/python)→ 逐字读出
+  `MULBERRY-Q92`;二行小字追问答 `kloop slice 2 vision check`(resume 未重读文件、直接从内
+  联 image 块答——证明 rollout 内联 + resume 重放正确)。
+- **openai-chat 轨**(gpt-5.4-mini):`read_file` 读图 → 经**搬运降级**看到图 → 转写
+  `SECRET: MULBERRY-Q92`。(首次用"secret token"措辞触发模型误拒,与 kloop 无关,换中立措
+  辞即读出——记:验收 prompt 别用易触发安全拒答的词。)
+- **rollout 内联**:session 文件 tool_result 内 `image` 块 base64 20104 字符、`offloaded=
+  false`(> 8000 cap 但因是 Blocks 变体不 spill)。
+- **responses 轨挂账**:同片 1/plan 15,env.local 的 OPENAI_BASE_URL 是 chat/completions
+  代理非 Responses 端点;responses 轨 `function_call_output` 带 `input_image` 有单测契约,真
+  key 待官方 Responses 端点。
+
+**挂账(片 2 之外)**:MCP 工具图结果(cc `mcp/client.ts` 有);模型视觉能力位检测(codex
+有,kloop 目标模型都支持图,不做);client 端 resize/降采样;image-cache 落盘指针;"看完即
+弃/不支持则剥离"省 token;PDF/document 块;远程 URL 图;单请求媒体数上限(≤100);TUI 粘贴/
+拖拽 + 实时 turn 转录图占位;暴露 `detail`。

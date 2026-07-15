@@ -306,4 +306,34 @@ mod tests {
             }])
         );
     }
+
+    /// A tool that read an image (slice 2) lands its image natively inside
+    /// `tool_result.content` as an array — Anthropic's own shape, so the raw
+    /// serialization is already correct and no adapter work is needed.
+    #[test]
+    fn tool_result_image_serializes_natively() {
+        let messages = vec![Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: kloop_protocol::ToolResultContent::Blocks(vec![ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            }]),
+            is_error: false,
+        }])];
+        assert_eq!(
+            messages_value(&messages, false),
+            json!([{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                    ],
+                }],
+            }])
+        );
+    }
 }

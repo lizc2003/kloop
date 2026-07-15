@@ -17,7 +17,46 @@ use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
 use kloop_protocol::StreamEvent;
+use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
+
+/// Left in the `tool` message when its image is relocated to a trailing user
+/// message (the `tool` role cannot carry images). codex uses this exact text.
+const IMAGE_RELOCATED_PLACEHOLDER: &str =
+    "[tool output contains image data attached in the following message]";
+
+/// One chat/completions `image_url` data-URL part from a canonical image source.
+fn image_url_part(source: &ImageSource) -> Value {
+    let ImageSource::Base64 { media_type, data } = source;
+    json!({
+        "type": "image_url",
+        "image_url": {
+            "url": format!("data:{media_type};base64,{data}"),
+            "detail": "auto",
+        },
+    })
+}
+
+/// Split a tool_result's block array into (joined text, image_url parts): text
+/// blocks are concatenated for the `tool` message; images become parts for the
+/// relocated user message.
+fn split_blocks_for_chat(blocks: &[ContentBlock]) -> (String, Vec<Value>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text: t } => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
+            }
+            ContentBlock::Image { source } => images.push(image_url_part(source)),
+            _ => {}
+        }
+    }
+    (text, images)
+}
 
 /// Translate canonical (Anthropic-shaped) history into chat/completions messages.
 pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
@@ -62,9 +101,13 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
             Role::User => {
                 // Tool results must directly follow the assistant tool_calls
                 // message, so they go first; trailing text/images become a
-                // user msg.
+                // user msg. Images embedded in a tool_result can't ride the
+                // `tool` role (chat/completions forbids it), so they are
+                // RELOCATED to their own trailing user message — pushed after
+                // every tool message so the tool-message-adjacency rule holds.
                 let mut text = String::new();
                 let mut images = Vec::new();
+                let mut relocated: Vec<Value> = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::ToolResult {
@@ -72,30 +115,42 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                             content,
                             is_error,
                         } => {
-                            let content = if *is_error {
-                                format!("[error] {content}")
+                            let (mut tool_text, image_parts) = match content {
+                                ToolResultContent::Text(s) => (s.clone(), Vec::new()),
+                                ToolResultContent::Blocks(blocks) => split_blocks_for_chat(blocks),
+                            };
+                            // The tool message keeps the text and points at the
+                            // relocated image so the model connects the two.
+                            if !image_parts.is_empty() {
+                                if !tool_text.is_empty() {
+                                    tool_text.push('\n');
+                                }
+                                tool_text.push_str(IMAGE_RELOCATED_PLACEHOLDER);
+                            }
+                            let tool_text = if *is_error {
+                                format!("[error] {tool_text}")
                             } else {
-                                content.clone()
+                                tool_text
                             };
                             out.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
-                                "content": content,
+                                "content": tool_text,
                             }));
+                            if !image_parts.is_empty() {
+                                let mut parts = vec![json!({
+                                    "type": "text",
+                                    "text": format!("Tool output for call_id {tool_use_id}:"),
+                                })];
+                                parts.extend(image_parts);
+                                relocated.push(json!({"role": "user", "content": parts}));
+                            }
                         }
                         ContentBlock::Text { text: t } => text.push_str(t),
                         // Chat/completions carries images as a data-URL part.
                         // detail=auto matches the OpenAI default (Anthropic has
                         // no detail; kloop does not expose it yet).
-                        ContentBlock::Image {
-                            source: ImageSource::Base64 { media_type, data },
-                        } => images.push(json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{media_type};base64,{data}"),
-                                "detail": "auto",
-                            },
-                        })),
+                        ContentBlock::Image { source } => images.push(image_url_part(source)),
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ToolUse { .. } => {}
@@ -116,6 +171,9 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                     parts.extend(images);
                     out.push(json!({"role": "user", "content": parts}));
                 }
+                // Relocated tool-output images trail all tool messages (and the
+                // main user message), never interleaving with them.
+                out.extend(relocated);
             }
         }
     }
@@ -396,6 +454,64 @@ mod tests {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64,aGk=",
+                            "detail": "auto",
+                        }},
+                    ],
+                }),
+            ]
+        );
+    }
+
+    /// A tool that returned an image (slice 2): the `tool` role cannot carry
+    /// images, so the image is RELOCATED to a trailing user message. The tool
+    /// message keeps the text plus a placeholder pointing at it; the relocated
+    /// user message leads with a `Tool output for call_id …:` label then the
+    /// image_url data URL. Critically, the relocated user message comes AFTER
+    /// the tool message (OpenAI rejects a user message between tool_calls and
+    /// their tool results).
+    #[test]
+    fn tool_result_image_relocates_to_trailing_user_message() {
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "logo.png"}),
+            }]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "aGk=".into(),
+                    },
+                }]),
+                is_error: false,
+            }]),
+        ];
+        assert_eq!(
+            to_openai_messages("s", &messages),
+            vec![
+                json!({"role": "system", "content": "s"}),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"logo.png\"}"},
+                    }],
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": IMAGE_RELOCATED_PLACEHOLDER,
+                }),
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Tool output for call_id c1:"},
                         {"type": "image_url", "image_url": {
                             "url": "data:image/png;base64,aGk=",
                             "detail": "auto",

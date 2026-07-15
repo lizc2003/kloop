@@ -42,6 +42,7 @@ use crate::agent::Ui;
 use crate::config::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
+use kloop_protocol::ToolResultContent;
 
 /// Past this many tools the definitions would crowd the context window, so
 /// source (MCP) tools are deferred behind tool_search instead of being sent.
@@ -290,7 +291,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_file".into(),
-            description: "Read a text file, returning numbered lines formatted as `{n}\\t{line}`. Reads up to 2000 lines by default.".into(),
+            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` (up to 2000 by default; use offset/limit to page). Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -586,8 +587,10 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             bail!(reason);
         }
         let result = execute_tool(&name, &input, &ctx).await;
-        let (content, is_error) = match &result {
-            Ok(content) => (content.clone(), false),
+        // post_tool hooks (and other text-only surfaces) see the flattened
+        // text; an image result renders as an `[image: <media_type>]` tag.
+        let (text, is_error) = match &result {
+            Ok(content) => (content.as_text().into_owned(), false),
             Err(e) => (format!("{e:#}"), true),
         };
         let context = hooks
@@ -596,7 +599,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 agent,
                 &name,
                 &input,
-                &content,
+                &text,
                 is_error,
                 ctx.ui.as_ref(),
             )
@@ -614,7 +617,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             },
             Err(e) => ContentBlock::ToolResult {
                 tool_use_id: id,
-                content: format!("{e:#}"),
+                content: format!("{e:#}").into(),
                 is_error: true,
             },
         },
@@ -640,13 +643,18 @@ fn execute_tool<'a>(
     name: &'a str,
     input: &'a Value,
     ctx: &'a ToolCtx,
-) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<ToolResultContent>> + Send + 'a>> {
     Box::pin(async move {
-        match name {
+        // read_file is the sole tool that can return non-text: on an image file
+        // it returns an image block (ToolResultContent::Blocks). Every other
+        // tool returns a String, wrapped uniformly into Text below.
+        if name == "read_file" {
+            return fs::read_file_tool(input).await;
+        }
+        let text: Result<String> = match name {
             "bash" => bash::bash_tool(input, ctx).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
-            "read_file" => fs::read_file_tool(input).await,
             "write_file" => fs::write_file_tool(input).await,
             "edit_file" => fs::edit_file_tool(input).await,
             "grep" => search::grep_tool(input).await,
@@ -678,7 +686,8 @@ fn execute_tool<'a>(
                 }
                 None => Err(anyhow!("unknown tool: {other}")),
             },
-        }
+        };
+        text.map(ToolResultContent::Text)
     })
 }
 
@@ -780,7 +789,8 @@ pub(crate) mod testutil {
     }
 
     /// Run a single tool call through the real dispatch path and return
-    /// (content, is_error).
+    /// (text, is_error). A block result (an image) flattens to its text view;
+    /// tests that need the raw blocks call dispatch_tools directly.
     pub(crate) async fn run_tool(name: &str, input: Value, ctx: &ToolCtx) -> (String, bool) {
         let results = dispatch_tools(vec![("t".into(), name.into(), input)], ctx).await;
         let ContentBlock::ToolResult {
@@ -789,7 +799,7 @@ pub(crate) mod testutil {
         else {
             panic!("expected tool result");
         };
-        (content, is_error)
+        (content.as_text().into_owned(), is_error)
     }
 }
 

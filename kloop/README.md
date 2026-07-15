@@ -1011,13 +1011,39 @@ cargo run -- --image a.png --image b.jpg   # multiple images ride one turn
   earlier turn. The TUI transcript shows a `[image: {media_type}]` placeholder
   for a resumed image (the base64 is not printed).
 
-Verified against real keys on two rails: sonnet-5 (anthropic) and a vision model
-(openai-chat) both read a secret token painted into a test PNG, and the image
-replays correctly on `--resume`.
+### Tool-read images (slice 2)
+
+`read_file` reads images too, not just the user. Point it at an image file and
+it returns the picture for the model to see (cc's Read is one tool for both):
+the bytes are sniffed from magic bytes, and png/jpeg/gif/webp up to 5 MiB come
+back as an image — offset/limit don't apply. A binary that is neither UTF-8 text
+nor a supported image is a clean error.
+
+```sh
+# "look at logo.png and describe it" → the model calls read_file(logo.png)
+```
+
+- **`tool_result` content is `string | array`** (`ToolResultContent`): text
+  results stay a bare string (old sessions round-trip unchanged); an image
+  result carries a block array — exactly Anthropic's own `tool_result.content`
+  shape.
+- **Three rails again**: anthropic embeds the image natively in the
+  `tool_result` (serde does it for free); Responses carries it natively too, in
+  the `function_call_output` output items (`input_image`); openai-chat's `tool`
+  role **cannot** hold an image, so the image is **relocated** to a trailing
+  `user` message (`[tool output contains image data attached in the following
+  message]` placeholder + a `Tool output for call_id …:` user message with the
+  data URL) — codex's proven shape, so no information is lost on that rail.
+
+Verified against real keys on two rails: sonnet-5 (anthropic, native embed) and
+a vision model (openai-chat, relocation) both read a secret token painted into a
+test PNG via `read_file`; the image inlines into the rollout (not offloaded) and
+replays correctly on `--resume`. The Responses rail is covered by a unit-test
+contract (no official Responses endpoint to hit — same as slice 1 / plan 15).
 
 **Not done** (deferred): pasting / drag-drop into the TUI (`--image` is the
-entry point for now); tool-read images (a `view_image` tool / MCP image results
-— slice 2); client-side downscaling; a drop-images-when-unsupported token saver;
+entry point for now); MCP image results; client-side downscaling; a
+drop-images-when-unsupported token saver / model-vision capability probe;
 per-request media-count cap; PDF/document blocks; remote-URL images; exposing
 `detail`. See `docs/plan/29-image-input.md`.
 

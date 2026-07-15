@@ -327,16 +327,15 @@ impl HostBridge for CoreBridge {
             else {
                 unreachable!("run_one always builds a tool_result")
             };
+            // A program orchestrates — it cannot "see" an image, so a block
+            // result (read_file on an image) flattens to its `[image: …]` text.
+            let text = content.as_text().into_owned();
             if is_error {
-                Err(content)
+                Err(text)
             } else {
                 // Source (MCP) tools resolve to their structured CallToolResult;
                 // built-ins keep the string contract (text as a JSON string).
-                Ok(slot
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap_or(Value::String(content)))
+                Ok(slot.lock().unwrap().take().unwrap_or(Value::String(text)))
             }
         })
     }

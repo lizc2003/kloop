@@ -607,6 +607,7 @@ async fn denied_tool_call_continues_the_turn() {
         panic!("expected a tool result for the denied call");
     };
     assert!(is_error);
+    let content = content.as_text();
     assert!(content.contains("declined"), "got: {content}");
     assert!(!std::path::Path::new("should-not-exist").exists());
 }
@@ -859,7 +860,7 @@ async fn skill_catalog_injected_and_tool_expands_body_inline() {
     // carries it back to the model.
     let expanded = seen[1].messages.iter().flat_map(|m| &m.content).any(|b| {
         matches!(b, ContentBlock::ToolResult { tool_use_id, content, is_error: false }
-                if tool_use_id == "s1" && content == "Please greet Ada warmly.")
+                if tool_use_id == "s1" && content.as_text() == "Please greet Ada warmly.")
     });
     assert!(
         expanded,
@@ -937,7 +938,7 @@ async fn fork_skill_runs_as_isolated_subagent() {
             tool_use_id,
             content,
             ..
-        } if tool_use_id == "sk1" => Some(content.clone()),
+        } if tool_use_id == "sk1" => Some(content.as_text().into_owned()),
         _ => None,
     };
     let parent_post = seen
@@ -1171,7 +1172,11 @@ async fn deferred_tools_shrink_defs_inject_notice_and_gate_dispatch() {
         panic!("expected tool_result");
     };
     assert!(is_error);
-    assert!(content.contains("call tool_search"), "{content}");
+    assert!(
+        content.as_text().contains("call tool_search"),
+        "{}",
+        content.as_text()
+    );
     // Round 2: the same call now reaches the source.
     let round2 = &history.messages()[4];
     assert_eq!(

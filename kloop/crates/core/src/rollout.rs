@@ -1254,7 +1254,7 @@ mod tests {
             let mut history = History::resume(dir.clone(), messages, rollout);
             history.record(Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "big".into(),
-                content: "x".repeat(9_000),
+                content: "x".repeat(9_000).into(),
                 is_error: false,
             }]));
             let ContentBlock::ToolResult { content, .. } =
@@ -1262,6 +1262,7 @@ mod tests {
             else {
                 panic!("expected tool result");
             };
+            let content = content.as_text();
             let start = content.find("id=off-").expect("pointer has id") + 3;
             content[start..start + 8].to_string()
         };
