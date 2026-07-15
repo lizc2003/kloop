@@ -11,8 +11,5 @@ pub fn run() -> SlashResult {
     for b in BUILTINS {
         output.push_str(&format!("\n  /{:pad$}  {}", b.name, b.summary, pad = pad));
     }
-    SlashResult {
-        output,
-        cleared: false,
-    }
+    SlashResult::message(output)
 }

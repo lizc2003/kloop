@@ -144,3 +144,67 @@ cargo fmt + clippy + test 全绿,一次 commit(写清验证方式,真 key 验"�
 skill"这一条——教训 18);README 同步 skills 用法与载体格式;本文件补完成记录(提交
 号 + 挂账);HANDOFF.md 补教训(尤其 frontmatter 依赖这次躲不躲得掉、以及 skill 复用
 discover 门的语义边界)。
+
+## 完成记录(片 1,提交 <pending>)
+
+**用户开工拍两点**:①载体必须是**公开 Agent Skills 规范**的 `SKILL.md`(目标"下载了就
+能用"),直接否掉 (B) `skill.toml`;②**用 YAML 库**(不自写解析),选 `serde_yaml_ng`
+(archived 的 serde_yaml 的活跃 fork,纯 Rust `unsafe-libyaml`,`#[derive(Deserialize)]`
+未知字段天然忽略)。**这纠正了 plan 一处二手错**:cc 内部 16 字段里的 `when_to_use` 不是
+公开规范字段——真·下载来的 skill 只有 `name`+`description`,**`description` 才是模型匹配
+信号**(既是"做什么"又是"何时用")。渐进披露常驻的因此是 `description`,不是 `when_to_use`。
+
+**落地(片 1 全绿,`kloop/` 下 `cargo fmt+clippy+test` 383 测试通过)**:
+
+- **core `skills.rs`**(纯半,仿 `context.rs`——CLI 做 IO、这里纯解析/组装/展开):`Skill`
+  {name,description,body,dir};`Skill::parse`(`split_frontmatter` 认 `---…---` 栅栏 + serde_yaml_ng
+  解析 frontmatter,name 缺省=目录名、description 缺失/空=Err→CLI 跳过告警);`Skill::lookup`
+  (仿 AgentType,miss 列可用清单,model-facing);`skills_catalog`(渐进披露注入块,搭
+  `injected_context`);`skill_tool_def`(仅有 skill 时注册);`expand_body`
+  (`$ARGUMENTS`/`$N` 0 索引 shell 拆词/`${CLAUDE_SKILL_DIR}` + 无占位符且有参→追加
+  `ARGUMENTS:`);`skill_tool`(查表+展开,**回灌成 tool_result** 让正文进上下文续跑——
+  比 cc 的"queue 一条 user 消息"更省一个机制)。
+- **接线**:`Config.skills: Arc<Vec<Skill>>`(随 clone 继承);`injected_context` 三段
+  (instructions + skills_catalog + deferred_notice,顺序稳定=cache 稳);`turn_rounds` 在
+  all_tool_defs 后、allowlist retain 前 push `skill` def(不计入 defer 阈值、不进 run_program
+  TS——它是"激活 prompt"缝不是 source 工具;放 retain 前故受限 agent_type 可 gate);
+  `execute_tool`/`is_concurrency_safe`/`permissions::CallFacts::is_readonly` 各加 `skill`
+  =readonly 自动放行。
+- **用户 `/name`**:`SlashResult` 加 `run_turn: Option<String>`(附三个私有构造器
+  message/cleared_message/turn,清掉四个 builtin 的字面量);`commands::run` builtin miss →
+  `Skill::lookup` 命中则 `turn(expand_body)`、否则 `unknown`(现也列 skills);三前端处理
+  `run_turn=Some`——plain(`line=prompt` 落回 turn 路)、TUI worker(record+run_turn+TurnEnded)、
+  server(record+run_turn+turn/completed;抽 `turn_completed_params` 复用)。
+- **CLI 发现层**:`load_skills(cwd)` 找 `.kloop/skills`(cwd)+ 全局 `~/.kloop/skills`,
+  **只扫 kloop 自己的 `.kloop/`、不扫 cc 的 `.claude/`**(下载即用靠 SKILL.md 格式合规,
+  拷进 `.kloop/skills` 即可);拆出 `skills_from_roots`(纯,hermetic 可测:优先级+去重+告警);
+  `skills` 穿进 config_from_env/plain_main(两函数补 `#[allow(clippy::too_many_arguments)]`,
+  仿 hooks.rs/agent.rs 既有先例)+ 三 config 工厂;--mock 空。
+
+**真 key 验收(anthropic 代理轨,sonnet-5)**:①样例 `haiku` skill(description 只说"写
+haiku/短诗"),prompt「write me a short poem about the autumn moon」**不点名 skill** → 模型
+自发 `skill({"name":"haiku","arguments":"autumn moon"})`、输出带 skill body 独有的
+`HAIKU-BY-SKILL:` 标记 + 5-7-5(教训 18 的"自发采用"铁证);②`/haiku a quiet sunrise` 手调
+→ 同样展开跑通出正确 haiku(观察:模型收到展开的 user 消息后**又调了一次 skill 工具**——因
+catalog 里也列着 haiku、它把"写 haiku 请求"正式"激活"一遍,冗余但无害、结果正确;可接受)。
+
+**教训**:
+1. **plan 备忘的 frontmatter 字段是 cc 内部实现、非公开规范**——`when_to_use` 是 cc 私有,
+   规范只有 `name`+`description`(description 兼任匹配信号)。回源看"cc 源码有什么"≠"生态
+   规范是什么";"下载即用"这类兼容目标要对着**公开规范**核字段,不是对着某家实现。
+2. **躲 YAML 依赖的理由这次最弱、该躲反而错**:skills 价值恰在结构化描述 + 生态兼容,任意
+   合规 frontmatter 都要能解析,自写解析器会在冷门 YAML 上崩掉破坏"下载即用"承诺——引
+   `serde_yaml_ng` 是对的(kloop 第 2 个为功能引入的依赖,继 similar)。
+3. **skill 复用 discover 门的语义边界**:没有硬塞进 tool_search/unlocked_tools。skill 是
+   "激活一段 prompt"、discover 是"解锁一个 def",两者语义不同。取的是 discover 的**注入骨架**
+   (catalog 搭 `injected_context`、会话稳定 cache 友好),触发另起一个专用 `skill` 工具、
+   回灌**展开后的正文**(tool_result)而非 tool def。inline 执行不需要新注入机制——tool_result
+   进上下文续跑即可,比 cc 的 user-message 注入更省。
+4. **运行期 cwd 陷阱(验收踩)**:skills 按进程 cwd 发现;真机 workspace 在 `kloop/` 子目录、
+   env.local+样例 skill 在仓库根,`cd kloop` 后 cwd 变了 skill 就找不到。直接跑
+   `./kloop/target/debug/kloop`(cwd=仓库根)才对齐。
+
+**片 1 挂账**(按 plan「不做」节 + 片 2/3):`context: fork` 走 task 子 agent;`allowed-tools`
+注入权限、`model`/`effort` 覆盖;bundled 编译期打包 + 懒解压;`paths` 条件激活;使用频率衰减
+排名;远程(`gs://`/`s3://`)/MCP skills;`hooks`/`shell` frontmatter;`` !`cmd` `` frontmatter
+内联 shell 展开;`${CLAUDE_SESSION_ID}` 替换(片 1 只做 SKILL_DIR)。

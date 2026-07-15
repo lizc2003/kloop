@@ -441,6 +441,17 @@ async fn thread_worker(
             if !result.output.is_empty() {
                 ui.notify("system", json!({"text": result.output}));
             }
+            // A skill invoked as `/name` expands to a prompt: record it and run
+            // a turn (streaming via the same notifications as a normal turn)
+            // rather than ending here.
+            if let Some(prompt) = result.run_turn {
+                history.record(Message::user_text(prompt));
+                let dyn_ui: Arc<dyn Ui> = ui.clone();
+                let outcome = run_turn(&cfg, &mut history, &dyn_ui, &turn.cancel, 0).await;
+                running.store(false, Ordering::SeqCst);
+                ui.notify("turn/completed", turn_completed_params(&outcome.reason));
+                continue;
+            }
             running.store(false, Ordering::SeqCst);
             ui.notify("turn/completed", json!({"reason": "completed"}));
             continue;
@@ -449,13 +460,18 @@ async fn thread_worker(
         let dyn_ui: Arc<dyn Ui> = ui.clone();
         let outcome = run_turn(&cfg, &mut history, &dyn_ui, &turn.cancel, 0).await;
         running.store(false, Ordering::SeqCst);
-        let params = match outcome.reason {
-            EndReason::Completed => json!({"reason": "completed"}),
-            EndReason::MaxRounds => json!({"reason": "maxRounds"}),
-            EndReason::Aborted => json!({"reason": "aborted"}),
-            EndReason::Error(e) => json!({"reason": "error", "message": e}),
-        };
-        ui.notify("turn/completed", params);
+        ui.notify("turn/completed", turn_completed_params(&outcome.reason));
+    }
+}
+
+/// The `turn/completed` notification params for a turn's end reason. Shared by
+/// the normal-turn path and a `/name`-invoked skill turn.
+fn turn_completed_params(reason: &EndReason) -> Value {
+    match reason {
+        EndReason::Completed => json!({"reason": "completed"}),
+        EndReason::MaxRounds => json!({"reason": "maxRounds"}),
+        EndReason::Aborted => json!({"reason": "aborted"}),
+        EndReason::Error(e) => json!({"reason": "error", "message": e}),
     }
 }
 

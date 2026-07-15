@@ -112,4 +112,10 @@ pub struct Config {
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
     /// config or `AGENT_PROGRAM_*` env. Sub-agents inherit it with the Config.
     pub program_limits: kloop_codemode::Limits,
+    /// Skills loaded from `<name>/SKILL.md` (plan 28): model-selected reusable
+    /// prompt packs. The CLI discovers and parses them; core advertises just
+    /// name+description in the injected context (progressive disclosure) and
+    /// loads a skill's body only when the `skill` tool triggers it. Empty when
+    /// none are configured. Shared into sub-agent configs like `agent_types`.
+    pub skills: Arc<Vec<crate::skills::Skill>>,
 }

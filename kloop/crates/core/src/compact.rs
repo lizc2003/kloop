@@ -184,6 +184,7 @@ mod tests {
             inbox: Default::default(),
             background_tasks: Default::default(),
             program_limits: Default::default(),
+            skills: Default::default(),
         })
     }
 

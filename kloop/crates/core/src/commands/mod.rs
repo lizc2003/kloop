@@ -27,6 +27,41 @@ mod help;
 pub struct SlashResult {
     pub output: String,
     pub cleared: bool,
+    /// When set, the front-end records this as a user message and runs a turn:
+    /// a skill invoked as `/name args` expands to a prompt to act on, unlike
+    /// the built-in commands which only produce `output` (`output` is empty).
+    pub run_turn: Option<String>,
+}
+
+impl SlashResult {
+    /// A plain command result: text shown to the user, no transcript reset.
+    /// (Private, but visible to the sibling command modules and tests, which
+    /// are descendants of `commands`.)
+    fn message(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            cleared: false,
+            run_turn: None,
+        }
+    }
+
+    /// `/clear`: text plus a transcript reset.
+    fn cleared_message(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            cleared: true,
+            run_turn: None,
+        }
+    }
+
+    /// A skill invoked as `/name`: the expanded prompt runs as a turn.
+    fn turn(prompt: String) -> Self {
+        Self {
+            output: String::new(),
+            cleared: false,
+            run_turn: Some(prompt),
+        }
+    }
 }
 
 /// One registry row: the name (without the leading `/`) and a one-line summary.
@@ -72,7 +107,7 @@ pub async fn run(
     cancel: &CancellationToken,
 ) -> SlashResult {
     let rest = line.strip_prefix('/').unwrap_or(line);
-    let (name, _args) = match rest.split_once(char::is_whitespace) {
+    let (name, args) = match rest.split_once(char::is_whitespace) {
         Some((name, args)) => (name, args.trim()),
         None => (rest, ""),
     };
@@ -81,20 +116,26 @@ pub async fn run(
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
-        _ => unknown(name),
+        // A user-invoked skill: expand its body (same seam the model's `skill`
+        // tool uses) and hand it back as a turn to run. Falls through to the
+        // unknown-command reply — which lists skills too — when the name is
+        // neither a built-in nor a skill.
+        _ => match crate::skills::Skill::lookup(&cfg.skills, name) {
+            Ok(skill) => {
+                SlashResult::turn(crate::skills::expand_body(&skill.body, &skill.dir, args))
+            }
+            Err(_) => unknown(name, cfg),
+        },
     }
 }
 
-fn unknown(name: &str) -> SlashResult {
-    let available = BUILTINS
-        .iter()
-        .map(|b| format!("/{}", b.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    SlashResult {
-        output: format!("unknown command '/{name}' (available: {available})"),
-        cleared: false,
-    }
+fn unknown(name: &str, cfg: &Config) -> SlashResult {
+    let mut available: Vec<String> = BUILTINS.iter().map(|b| format!("/{}", b.name)).collect();
+    available.extend(cfg.skills.iter().map(|s| format!("/{}", s.name)));
+    SlashResult::message(format!(
+        "unknown command '/{name}' (available: {})",
+        available.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -131,6 +172,7 @@ mod tests {
             inbox: Default::default(),
             background_tasks: Default::default(),
             program_limits: Default::default(),
+            skills: Default::default(),
         })
     }
 
@@ -171,10 +213,7 @@ mod tests {
         let result = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
         assert_eq!(
             result,
-            SlashResult {
-                output: "model: test-model\ncontext: ~20000 / 200000 tokens (10%)".into(),
-                cleared: false,
-            }
+            SlashResult::message("model: test-model\ncontext: ~20000 / 200000 tokens (10%)")
         );
     }
 
@@ -202,10 +241,7 @@ mod tests {
         let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
         assert_eq!(
             result,
-            SlashResult {
-                output: "history compacted: 2 summarized, 1 kept verbatim".into(),
-                cleared: false,
-            }
+            SlashResult::message("history compacted: 2 summarized, 1 kept verbatim")
         );
         assert!(history.messages().len() < 3, "history shrank");
     }
@@ -224,13 +260,7 @@ mod tests {
             .push(crate::inbox::InboxItem::Steer("stale steer".into()));
 
         let result = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
-        assert_eq!(
-            result,
-            SlashResult {
-                output: "conversation cleared".into(),
-                cleared: true,
-            }
-        );
+        assert_eq!(result, SlashResult::cleared_message("conversation cleared"));
         assert!(history.messages().is_empty());
         assert!(cfg.todos.lock().unwrap().is_empty());
         assert!(cfg.inbox.is_empty());
@@ -249,11 +279,46 @@ mod tests {
         .await;
         assert_eq!(
             result,
-            SlashResult {
-                output: "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear)"
-                    .into(),
-                cleared: false,
-            }
+            SlashResult::message(
+                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear)"
+            )
+        );
+    }
+
+    /// A `/name` matching a loaded skill expands its body (same substitution the
+    /// model's `skill` tool uses) into a turn to run — it produces no `output`
+    /// and records nothing itself (the front-end runs the returned prompt). An
+    /// unknown `/name` lists the skills alongside the built-ins.
+    #[tokio::test]
+    async fn skill_slash_expands_body_as_a_turn_and_appears_in_unknown_list() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let cfg = Arc::new(Config {
+            skills: Arc::new(vec![crate::skills::Skill {
+                name: "greet".into(),
+                description: "Greet someone.".into(),
+                body: "Say hi to $0.".into(),
+                dir: "/skills/greet".into(),
+            }]),
+            ..(*base).clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+
+        let result = run(
+            "/greet world",
+            &mut history,
+            &cfg,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result, SlashResult::turn("Say hi to world.".into()));
+        assert!(history.messages().is_empty());
+
+        let unknown = run("/nope", &mut history, &cfg, &CancellationToken::new()).await;
+        assert_eq!(
+            unknown,
+            SlashResult::message(
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /greet)"
+            )
         );
     }
 }

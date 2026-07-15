@@ -907,6 +907,64 @@ the next user / `turn/start`; only the TUI has the event loop to be woken.
 Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
 See `docs/plan/26-async-dispatch.md`.
 
+## Skills (Phase 2, nineteenth slice)
+
+A **skill** is a reusable instruction pack the model can pull in on its own when a
+task matches it. It follows the public Agent Skills format, so a skill downloaded
+from the ecosystem works as-is: a directory `<name>/SKILL.md` with YAML
+frontmatter (`name` optional — defaults to the directory; `description` required)
+followed by a markdown body:
+
+```markdown
+---
+name: commit
+description: Write a conventional-commit message and commit. Use when the user asks to commit changes.
+---
+
+Run `git diff --staged`, then write a Conventional Commits message and commit
+with it. Scripts live in ${CLAUDE_SKILL_DIR}/scripts. The change to describe: $ARGUMENTS
+```
+
+Discovery (`core/src/skills.rs` parses; the CLI walks the dirs): project
+`.kloop/skills/` (cwd-relative), then global `~/.kloop/skills/`. Drop an
+ecosystem skill's directory into either and it works as-is — the SKILL.md format
+is what matters, so kloop scans only its own `.kloop/`, not cc's `.claude/`. The
+project layer wins on a name collision, so it overrides a global skill; a
+malformed skill (no `description`, bad frontmatter) is skipped with a startup
+warning, never an error.
+
+Two ways to trigger a skill, both expanding the **same** body:
+
+- **The model selects it** by description. Only `name` + `description` ride the
+  injected context (progressive disclosure — the body stays out until triggered),
+  alongside the deferred-tools notice and session-stable for the prompt cache.
+  When a task matches, the model calls the built-in **`skill`** tool
+  (`skill({"name": ..., "arguments": ...})`), which is registered only when
+  skills are loaded. Its result is the expanded body, so the instructions enter
+  the conversation and the turn continues (inline execution — kloop returns the
+  body as a tool result rather than queueing a separate user message like cc's
+  SkillTool).
+- **The user invokes it** as `/name args` — the same slash seam as the built-in
+  commands (`core/src/commands/`). An unknown `/name` lists skills alongside the
+  built-ins. The expansion runs as a turn (recorded as a user message), in all
+  three front-ends.
+
+Expansion substitutes `$ARGUMENTS` (the whole argument string), `$N` (the Nth
+shell-split word, 0-indexed), and `${CLAUDE_SKILL_DIR}` (the skill's directory,
+so a skill can point at its own bundled `scripts/*`). When the body has no
+argument placeholder but arguments were given, they are appended as an
+`ARGUMENTS:` line. A skill **does not execute anything itself**: to run a bundled
+script the model issues a normal `bash` call on the `${CLAUDE_SKILL_DIR}` path,
+which faces the permission gate like any command. The `skill` tool is read-only
+(activating a skill has no system side effect — cc never prompts for it).
+
+Skills converge across cc (full system) and claw (archived subsystem); the
+codex checkout has neither. **Not done** (deferred): `context: fork`
+execution as a sub-agent, `allowed-tools`/`model`/`effort` frontmatter, bundled
+files with lazy extraction, `paths` conditional activation, usage-frequency
+ranking, remote (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell
+expansion. See `docs/plan/28-skills.md`.
+
 ## Running
 
 ```sh

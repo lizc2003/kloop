@@ -438,6 +438,10 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         // tool_search reads defs and grows the unlock set — monotonic,
         // order-independent state, safe to batch.
         "tool_search" => true,
+        // skill only reads a skill file and returns its expanded body — pure,
+        // no shared-state races (side effects come from tools the returned
+        // instructions later prompt, gated individually).
+        "skill" => true,
         "bash" => {
             input["command"]
                 .as_str()
@@ -644,6 +648,7 @@ fn execute_tool<'a>(
             "glob" => search::glob_tool(input, ctx.program_result.as_ref()).await,
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
+            "skill" => crate::skills::skill_tool(input, ctx).await,
             "tool_search" => discover::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
@@ -728,6 +733,7 @@ pub(crate) mod testutil {
                 inbox: Default::default(),
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
+                skills: Default::default(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -1214,6 +1220,7 @@ mod tests {
                 inbox: Default::default(),
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
+                skills: Default::default(),
             }),
             ui: Arc::new(NullUi),
             cancel,

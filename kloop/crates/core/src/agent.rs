@@ -172,6 +172,14 @@ async fn turn_rounds(
     depth: u8,
 ) -> TurnOutcome {
     let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
+    // The `skill` tool exists only when skills are loaded (its catalog rides
+    // the injected context). Added here, after all_tool_defs, so it is not
+    // counted toward the defer threshold or exposed to run_program's API — it
+    // is a prompt-activation seam, not a source tool. Placed before the
+    // allowlist filter so a restricted agent type can gate it like any tool.
+    if !cfg.skills.is_empty() && !tools.iter().any(|t| t.name == "skill") {
+        tools.push(crate::skills::skill_tool_def());
+    }
     // A custom agent type may restrict this sub-agent's tools; the main agent
     // (None) keeps them all. read_offloaded is never filtered out.
     if cfg.tool_allowlist.is_some() {
@@ -477,17 +485,20 @@ fn drain_inbox(inbox: &Inbox, history: &mut History) -> bool {
 
 const MAX_ATTEMPTS: u32 = 3;
 
-/// The synthetic first user message: project instructions plus the
-/// deferred-tools notice. Both parts are session-stable, so the composed
-/// message is too — the prompt-cache prefix survives across rounds.
+/// The synthetic first user message: project instructions, the skills catalog,
+/// and the deferred-tools notice, in that order. Every part is session-stable,
+/// so the composed message is too — the prompt-cache prefix survives across
+/// rounds.
 fn injected_context(cfg: &Config) -> Option<String> {
-    let notice = crate::tools::deferred_notice(cfg);
-    match (&cfg.project_instructions, notice) {
-        (None, None) => None,
-        (Some(instructions), None) => Some(instructions.clone()),
-        (None, Some(notice)) => Some(notice),
-        (Some(instructions), Some(notice)) => Some(format!("{instructions}\n\n{notice}")),
-    }
+    let parts: Vec<String> = [
+        cfg.project_instructions.clone(),
+        crate::skills::skills_catalog(&cfg.skills),
+        crate::tools::deferred_notice(cfg),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 async fn sample_with_retry(
@@ -651,6 +662,7 @@ mod tests {
             inbox: Default::default(),
             background_tasks: Default::default(),
             program_limits: Default::default(),
+            skills: Default::default(),
         });
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let cancel = CancellationToken::new();
@@ -820,6 +832,7 @@ mod tests {
             inbox: Default::default(),
             background_tasks: Default::default(),
             program_limits: Default::default(),
+            skills: Default::default(),
         })
     }
 
@@ -1393,6 +1406,66 @@ mod tests {
             .messages()
             .iter()
             .all(|m| *m != Message::user_text(instructions)));
+    }
+
+    /// Skills end to end over Mock: with a skill configured, every request
+    /// advertises the `skill` tool and carries the skills catalog in the
+    /// injected first message (progressive disclosure — only name+description,
+    /// not the body). When the model triggers it, the tool_result is the
+    /// expanded body (`$ARGUMENTS` substituted), which the model then acts on.
+    #[tokio::test]
+    async fn skill_catalog_injected_and_tool_expands_body_inline() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use_named(
+                "s1",
+                "skill",
+                json!({"name": "greet", "arguments": "Ada"}),
+            )]),
+            MockTurn::Blocks(text("greeted")),
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "skills-e2e")).clone();
+        cfg.skills = Arc::new(vec![crate::skills::Skill {
+            name: "greet".into(),
+            description: "Greet a person by name.".into(),
+            body: "Please greet $ARGUMENTS warmly.".into(),
+            dir: "/skills/greet".into(),
+        }]);
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("say hi to Ada"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        let seen = seen.lock().unwrap();
+        // The skill tool is advertised, and the catalog (name+description, not
+        // the body) rides the injected first user message.
+        assert!(seen[0].tools.iter().any(|t| t.name == "skill"));
+        let injected = match &seen[0].messages[0].content[0] {
+            ContentBlock::Text { text } => text,
+            other => panic!("expected injected text, got {other:?}"),
+        };
+        assert!(
+            injected.contains("- greet: Greet a person by name."),
+            "{injected}"
+        );
+        assert!(
+            !injected.contains("greet $ARGUMENTS"),
+            "body must not leak: {injected}"
+        );
+        // The trigger's tool_result is the expanded body — the second request
+        // carries it back to the model.
+        let expanded = seen[1].messages.iter().flat_map(|m| &m.content).any(|b| {
+            matches!(b, ContentBlock::ToolResult { tool_use_id, content, is_error: false }
+                if tool_use_id == "s1" && content == "Please greet Ada warmly.")
+        });
+        assert!(
+            expanded,
+            "expanded body missing from follow-up request: {:?}",
+            seen[1].messages
+        );
     }
 
     /// Code-mode end to end over Mock: the model emits one `run_program`

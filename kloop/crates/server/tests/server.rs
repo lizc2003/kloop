@@ -158,6 +158,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             inbox: Default::default(),
             background_tasks: Default::default(),
             program_limits: Default::default(),
+            skills: Default::default(),
         })
     })
 }

@@ -23,6 +23,7 @@ pub mod permissions;
 pub mod rollout;
 pub mod sandbox;
 pub mod shell;
+pub mod skills;
 pub mod tools;
 
 pub use config::Config;

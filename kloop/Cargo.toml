@@ -42,6 +42,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 rquickjs = { version = "0.12", default-features = false, features = ["futures", "parallel", "macro"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Skills frontmatter: parse the SKILL.md YAML block so any spec-compliant skill
+# from the ecosystem loads as-is. serde_yaml_ng is the maintained fork of the
+# archived serde_yaml; unknown frontmatter keys deserialize away for free.
+serde_yaml_ng = "0.10"
 similar = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "signal", "fs", "time", "sync"] }
 tokio-util = "0.7"

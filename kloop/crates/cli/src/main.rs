@@ -47,6 +47,7 @@ use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionOrigin;
+use kloop_core::skills::Skill;
 use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
 use kloop_core::Config;
@@ -545,6 +546,58 @@ fn load_agent_types(config_path: &Path) -> Result<Vec<AgentType>> {
     Ok(types)
 }
 
+/// Skills discovered from `.kloop/skills/<name>/SKILL.md` (plan 28): the
+/// project's dir (cwd-relative), then the global `~/.kloop/skills/`. A skill
+/// downloaded for the Agent Skills ecosystem works as-is once its directory is
+/// dropped in — the SKILL.md format is what matters, so we scan only kloop's
+/// own dir, not cc's `.claude/`. The project layer wins on a name collision,
+/// letting it override a global skill. A malformed skill is skipped with a
+/// warning, never an error; `--mock` skips discovery entirely (hermetic).
+fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
+    let mut roots = vec![cwd.join(".kloop").join("skills")];
+    if let Some(home) = std::env::home_dir() {
+        roots.push(home.join(".kloop").join("skills"));
+    }
+    skills_from_roots(&roots)
+}
+
+/// Walk skill roots in order (earlier roots win on name collision), reading each
+/// `<name>/SKILL.md`. Split from [`load_skills`] so the discovery logic is
+/// testable without touching `$HOME`. Missing roots are simply absent.
+fn skills_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
+    let mut skills = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        // read_dir order is filesystem-dependent; sort so the catalog (and the
+        // prompt-cache prefix it rides in) is stable across runs.
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let skill_md = dir.join("SKILL.md");
+            let Ok(content) = std::fs::read_to_string(&skill_md) else {
+                continue;
+            };
+            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            match Skill::parse(dir_name, &dir.display().to_string(), &content) {
+                // First name wins: a project skill silently overrides a global
+                // one (the ecosystem's expected override), so no shadow warning.
+                Ok(skill) if seen.insert(skill.name.clone()) => skills.push(skill),
+                Ok(_) => {}
+                Err(e) => warnings.push(format!("skipped skill at {}: {e}", skill_md.display())),
+            }
+        }
+    }
+    (skills, warnings)
+}
+
 fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
     let mut settings = SandboxSettings {
         enabled: true,
@@ -718,6 +771,7 @@ fn defer_threshold_from_env() -> Result<usize> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn config_from_env(
     args: &CliArgs,
     approver: Arc<dyn Approver>,
@@ -726,6 +780,7 @@ fn config_from_env(
     project: &context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     agent_types: Arc<Vec<AgentType>>,
+    skills: Arc<Vec<Skill>>,
 ) -> Result<Config> {
     let permissions = Arc::new(build_permissions(args, approver, notify)?);
     // --mock stays hermetic: no config reads, no hook child processes.
@@ -780,6 +835,7 @@ fn config_from_env(
         todos: Default::default(),
         inbox: Default::default(),
         program_limits,
+        skills,
     };
     if args.mock {
         return Ok(Config {
@@ -1082,6 +1138,17 @@ async fn main() -> Result<()> {
     } else {
         load_agent_types(Path::new(PERMISSIONS_CONFIG))?
     });
+    // Skills are process-stable (discovered from disk once); --mock stays
+    // hermetic. Parse-skip warnings surface at startup like the others.
+    let skills = Arc::new(if args.mock {
+        Vec::new()
+    } else {
+        let (skills, warnings) = load_skills(&cwd);
+        for warning in &warnings {
+            eprintln!("\x1b[2m[{warning}]\x1b[0m");
+        }
+        skills
+    });
     if args.serve {
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
@@ -1096,6 +1163,7 @@ async fn main() -> Result<()> {
                     &project,
                     sandbox.clone(),
                     agent_types.clone(),
+                    skills.clone(),
                 )
             })
         };
@@ -1125,6 +1193,7 @@ async fn main() -> Result<()> {
             project,
             sandbox,
             agent_types,
+            skills,
         )
         .await;
     }
@@ -1139,6 +1208,7 @@ async fn main() -> Result<()> {
                 &project,
                 sandbox.clone(),
                 agent_types.clone(),
+                skills.clone(),
             )?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
@@ -1159,6 +1229,7 @@ fn spawn_ctrl_c(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plain_main(
     args: CliArgs,
     mut history: History,
@@ -1167,6 +1238,7 @@ async fn plain_main(
     project: context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     agent_types: Arc<Vec<AgentType>>,
+    skills: Arc<Vec<Skill>>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let mut cfg = config_from_env(
@@ -1177,6 +1249,7 @@ async fn plain_main(
         &project,
         sandbox,
         agent_types,
+        skills,
     )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);
@@ -1204,7 +1277,7 @@ async fn plain_main(
         let Some(line) = lines.next_line().await? else {
             break;
         };
-        let line = line.trim().to_string();
+        let mut line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
@@ -1222,7 +1295,12 @@ async fn plain_main(
             if !result.output.is_empty() {
                 println!("{}", result.output);
             }
-            continue;
+            // A skill invoked as `/name` expands to a prompt; run it as a turn
+            // just like a typed message, falling through to the turn path below.
+            match result.run_turn {
+                Some(prompt) => line = prompt,
+                None => continue,
+            }
         }
 
         history.record(Message::user_text(line));
@@ -1422,6 +1500,63 @@ mod tests {
             std::fs::write(&path, bad).unwrap();
             assert!(load_agent_types(&path).is_err(), "accepted: {bad}");
         }
+    }
+
+    #[test]
+    fn skills_discovery_applies_precedence_and_warns_on_malformed() {
+        let base = std::env::temp_dir().join(format!("kloop-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join(".kloop").join("skills");
+        let global = base.join("home").join(".kloop").join("skills");
+        let write_skill = |root: &Path, name: &str, body: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        };
+        // `commit` in both scopes: the project one must win. A global-only
+        // `review`. A malformed skill (no description) warns and is skipped. A
+        // directory without a SKILL.md is ignored.
+        write_skill(
+            &project,
+            "commit",
+            "---\ndescription: project commit\n---\nproject body",
+        );
+        write_skill(
+            &global,
+            "commit",
+            "---\ndescription: global commit\n---\nglobal body",
+        );
+        write_skill(
+            &global,
+            "review",
+            "---\ndescription: review a diff\n---\nreview body",
+        );
+        write_skill(&global, "broken", "no frontmatter here");
+        std::fs::create_dir_all(global.join("empty-dir")).unwrap();
+
+        let (skills, warnings) = skills_from_roots(&[project.clone(), global.clone()]);
+
+        let by_name = |n: &str| skills.iter().find(|s| s.name == n).unwrap();
+        assert_eq!(
+            skills.len(),
+            2,
+            "commit deduped, broken skipped: {skills:?}"
+        );
+        assert_eq!(by_name("commit").description, "project commit");
+        assert_eq!(by_name("commit").body, "project body");
+        assert_eq!(
+            by_name("commit").dir,
+            project.join("commit").display().to_string()
+        );
+        assert_eq!(by_name("review").description, "review a diff");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the malformed skill warns: {warnings:?}"
+        );
+        assert!(warnings[0].contains("broken") && warnings[0].contains("frontmatter"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

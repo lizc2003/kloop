@@ -572,6 +572,11 @@ impl CallFacts {
             // todo_write mutates only the in-memory task list — nothing on
             // the user's system to sign off on (cc never prompts for it).
             "todo_write" => true,
+            // skill only loads a local skill file's instructions into the
+            // conversation — no system side effect (cc never prompts to
+            // activate one); tools those instructions later prompt are gated
+            // on their own.
+            "skill" => true,
             "bash" => matches!(&self.bash, Some(BashAnalysis::Commands(cmds))
                 if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c))),
             _ => false,

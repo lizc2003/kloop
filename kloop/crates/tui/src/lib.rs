@@ -177,6 +177,16 @@ async fn agent_worker(
                 {
                     return;
                 }
+                // A skill invoked as `/name` expands to a prompt: record it and
+                // run a turn, streaming through `ui` exactly like WorkerMsg::Turn.
+                if let Some(prompt) = result.run_turn {
+                    history.record(Message::user_text(prompt));
+                    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+                    if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 // TurnEnded clears the busy state the key handler set on submit.
                 if events
                     .send(AgentEvent::TurnEnded(EndReason::Completed))

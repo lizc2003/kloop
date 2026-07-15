@@ -26,8 +26,5 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
             cfg.model
         ),
     };
-    SlashResult {
-        output,
-        cleared: false,
-    }
+    SlashResult::message(output)
 }

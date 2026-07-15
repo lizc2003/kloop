@@ -26,8 +26,5 @@ pub async fn run(
         // untouched (run_compaction's invariant); just report why.
         Err(e) => format!("compaction failed: {e:#}"),
     };
-    SlashResult {
-        output,
-        cleared: false,
-    }
+    SlashResult::message(output)
 }

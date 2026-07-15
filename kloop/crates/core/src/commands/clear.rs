@@ -18,8 +18,5 @@ pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
     // brand-new session would look like (both start empty on resume).
     cfg.todos.lock().unwrap().clear();
     cfg.inbox.drain();
-    SlashResult {
-        output: "conversation cleared".into(),
-        cleared: true,
-    }
+    SlashResult::cleared_message("conversation cleared")
 }
