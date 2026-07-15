@@ -1034,18 +1034,27 @@ nor a supported image is a clean error.
   `user` message (`[tool output contains image data attached in the following
   message]` placeholder + a `Tool output for call_id …:` user message with the
   data URL) — codex's proven shape, so no information is lost on that rail.
+- **MCP tools return images too**: an MCP tool whose result carries an image
+  content block (`{type:"image", data, mimeType}`) is lifted into the same
+  canonical image block (when the mime is one the models accept — png/jpeg/gif/
+  webp; anything else stays an `[image: …]` tag rather than risk an API
+  rejection). Surrounding text folds into text blocks around it. So an MCP tool
+  that hands back a screenshot is seen, not summarized to a placeholder.
 
-Verified against real keys on two rails: sonnet-5 (anthropic, native embed) and
-a vision model (openai-chat, relocation) both read a secret token painted into a
-test PNG via `read_file`; the image inlines into the rollout (not offloaded) and
-replays correctly on `--resume`. The Responses rail is covered by a unit-test
-contract (no official Responses endpoint to hit — same as slice 1 / plan 15).
+Verified against real keys: sonnet-5 (anthropic, native embed) and a vision
+model (openai-chat, relocation) both read a secret token painted into a test PNG
+via `read_file`; the image inlines into the rollout (not offloaded) and replays
+correctly on `--resume`. MCP image results verified on the openai-chat rail
+end-to-end (a stub MCP tool returned a badge image; the model read its text),
+with the canonical `[text, image]` blocks inlined in the rollout. The Responses
+rail is covered by a unit-test contract (no official Responses endpoint to hit —
+same as slice 1 / plan 15).
 
 **Not done** (deferred): pasting / drag-drop into the TUI (`--image` is the
-entry point for now); MCP image results; client-side downscaling; a
-drop-images-when-unsupported token saver / model-vision capability probe;
-per-request media-count cap; PDF/document blocks; remote-URL images; exposing
-`detail`. See `docs/plan/29-image-input.md`.
+entry point for now); client-side downscaling; a drop-images-when-unsupported
+token saver / model-vision capability probe; per-request media-count cap;
+PDF/document blocks; remote-URL images; exposing `detail`. See
+`docs/plan/29-image-input.md`.
 
 ## Running
 

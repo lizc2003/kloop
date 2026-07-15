@@ -61,6 +61,10 @@ pub const TOOL_DEFER_THRESHOLD: usize = 30;
 /// `structured: None` → a program gets `text` as a JS string, like a built-in.
 pub struct SourceOutput {
     pub text: String,
+    /// Present when the result carries content the flattened `text` cannot hold
+    /// — an MCP tool that returned an image. `Some(blocks)` makes the
+    /// tool_result an image-bearing block array; `None` uses `text`.
+    pub blocks: Option<Vec<ContentBlock>>,
     pub structured: Option<Value>,
 }
 
@@ -69,7 +73,17 @@ impl SourceOutput {
     pub fn text(text: String) -> Self {
         Self {
             text,
+            blocks: None,
             structured: None,
+        }
+    }
+
+    /// The tool_result content this result becomes: an image-bearing block array
+    /// when the source returned images, else the flattened text.
+    pub fn into_content(self) -> ToolResultContent {
+        match self.blocks {
+            Some(blocks) => ToolResultContent::Blocks(blocks),
+            None => ToolResultContent::Text(self.text),
         }
     }
 }
@@ -645,11 +659,20 @@ fn execute_tool<'a>(
     ctx: &'a ToolCtx,
 ) -> Pin<Box<dyn Future<Output = Result<ToolResultContent>> + Send + 'a>> {
     Box::pin(async move {
-        // read_file is the sole tool that can return non-text: on an image file
-        // it returns an image block (ToolResultContent::Blocks). Every other
-        // tool returns a String, wrapped uniformly into Text below.
+        // read_file is the sole BUILT-IN that can return non-text: on an image
+        // file it returns an image block (ToolResultContent::Blocks).
         if name == "read_file" {
             return fs::read_file_tool(input).await;
+        }
+        // External (source/MCP) tools can also return images — handle them
+        // before the text-returning built-ins so their result can be Text OR
+        // Blocks. A program still gets the structured form via the sink.
+        if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
+            let out = source.call(name, input).await?;
+            if let Some(slot) = &ctx.program_result {
+                *slot.lock().unwrap() = out.structured.clone();
+            }
+            return Ok(out.into_content());
         }
         let text: Result<String> = match name {
             "bash" => bash::bash_tool(input, ctx).await,
@@ -674,18 +697,9 @@ fn execute_tool<'a>(
             "wait" => background_tasks::wait_tool(input, ctx).await,
             "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
-            other => match find_source(&ctx.cfg.tool_sources, other) {
-                Some(source) => {
-                    let out = source.call(other, input).await?;
-                    // A program call gets the structured form; the model-facing
-                    // path (and the tool_result) always gets the text.
-                    if let Some(slot) = &ctx.program_result {
-                        *slot.lock().unwrap() = out.structured;
-                    }
-                    Ok(out.text)
-                }
-                None => Err(anyhow!("unknown tool: {other}")),
-            },
+            // Source (MCP) tools were already handled above (they may return
+            // images); anything reaching here is an unknown tool name.
+            other => Err(anyhow!("unknown tool: {other}")),
         };
         text.map(ToolResultContent::Text)
     })
@@ -823,7 +837,7 @@ mod tests {
                 schema: json!({"type": "object"}),
             };
             Arc::new(StubSource {
-                defs: vec![def("echo"), def("fail")],
+                defs: vec![def("echo"), def("fail"), def("image")],
                 readonly: format!("{prefix}__echo"),
             })
         }
@@ -846,6 +860,20 @@ mod tests {
             Box::pin(async move {
                 if tool.ends_with("__fail") {
                     bail!("stub failure");
+                }
+                // An MCP tool that returned an image: the source hands back
+                // content blocks, not just text (the model must see it).
+                if tool.ends_with("__image") {
+                    return Ok(SourceOutput {
+                        text: "[image: image/png]".into(),
+                        blocks: Some(vec![ContentBlock::Image {
+                            source: kloop_protocol::ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: "aGk=".into(),
+                            },
+                        }]),
+                        structured: None,
+                    });
                 }
                 Ok(SourceOutput::text(format!(
                     "echoed {}",
@@ -897,6 +925,7 @@ mod tests {
                 "stop_agent",
                 "srv__echo",
                 "srv__fail",
+                "srv__image",
                 "run_program",
             ]
         );
@@ -926,9 +955,10 @@ mod tests {
         let colliding: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
         let warnings = tool_merge_warnings(&colliding, TOOL_DEFER_THRESHOLD);
-        assert_eq!(warnings.len(), 2, "one per duplicated name: {warnings:?}");
+        assert_eq!(warnings.len(), 3, "one per duplicated name: {warnings:?}");
         assert!(warnings[0].contains("srv__echo"));
         assert!(warnings[1].contains("srv__fail"));
+        assert!(warnings[2].contains("srv__image"));
 
         let many: Vec<ToolDef> = (0..40)
             .map(|i| ToolDef {
@@ -956,25 +986,26 @@ mod tests {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
         let builtin_count = tool_defs(0).len();
 
-        // Exactly at the threshold: everything inline, no tool_search.
-        let inline = all_tool_defs(0, &sources, builtin_count + 2);
+        // Exactly at the threshold (built-ins + the stub's 3 tools): everything
+        // inline, no tool_search.
+        let inline = all_tool_defs(0, &sources, builtin_count + 3);
         assert!(inline.iter().any(|d| d.name == "srv__echo"));
         assert!(inline.iter().all(|d| d.name != "tool_search"));
-        assert!(deferred_tool_defs(&sources, builtin_count + 2).is_empty());
+        assert!(deferred_tool_defs(&sources, builtin_count + 3).is_empty());
 
         // One past it: built-ins + tool_search + call_tool only; sources
         // deferred.
-        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 1);
+        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2);
         let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
         assert!(!names.contains(&"srv__echo"));
         assert_eq!(deferred_regime.len(), builtin_count + 2);
-        let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 1)
+        let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 2)
             .into_iter()
             .map(|d| d.name)
             .collect();
-        assert_eq!(deferred, vec!["srv__echo", "srv__fail"]);
+        assert_eq!(deferred, vec!["srv__echo", "srv__fail", "srv__image"]);
     }
 
     /// Slice 1: inline (below threshold) source tools get a full typed
@@ -1054,6 +1085,32 @@ mod tests {
         let (out, is_error) = run_tool("other__tool", json!({}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("unknown tool"));
+    }
+
+    /// An external (MCP) tool that returns an image lands a Blocks tool_result,
+    /// not flattened text — the model sees the picture. (run_tool would flatten
+    /// it, so dispatch is driven directly to inspect the raw content.)
+    #[tokio::test]
+    async fn external_tool_image_result_is_a_blocks_tool_result() {
+        let ctx = test_ctx_with_sources(0, "extimg", vec![StubSource::new("srv")]);
+        let results =
+            dispatch_tools(vec![("t".into(), "srv__image".into(), json!({}))], &ctx).await;
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &results[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!is_error);
+        assert_eq!(
+            content,
+            &ToolResultContent::Blocks(vec![ContentBlock::Image {
+                source: kloop_protocol::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            }])
+        );
     }
 
     /// A sub-agent with a tool allowlist has calls to tools outside it

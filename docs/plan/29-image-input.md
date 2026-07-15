@@ -264,7 +264,50 @@ openai-chat 搬运降级)。至此 plan 29 主体完成。
   代理非 Responses 端点;responses 轨 `function_call_output` 带 `input_image` 有单测契约,真
   key 待官方 Responses 端点。
 
-**挂账(片 2 之外)**:MCP 工具图结果(cc `mcp/client.ts` 有);模型视觉能力位检测(codex
+**挂账(片 2 之外)**:模型视觉能力位检测(codex
 有,kloop 目标模型都支持图,不做);client 端 resize/降采样;image-cache 落盘指针;"看完即
 弃/不支持则剥离"省 token;PDF/document 块;远程 URL 图;单请求媒体数上限(≤100);TUI 粘贴/
 拖拽 + 实时 turn 转录图占位;暴露 `detail`。
+
+## 完成记录(片 2 续:MCP 工具图结果,提交 `5efcff9`)
+
+**范围**:承接片 2 挂账里的"MCP 工具图结果"——MCP 工具返回的 image 内容块现在被抬成模型能
+看的图,不再降级成 `[image: …]` 文本标签。地基(`ToolResultContent::Blocks` + 三轨翻译)片
+2 已铺,本次只补 MCP 结果的 image 提取 + 接线。
+
+**回源(cc 真读)**:cc 的 `MCPTool.mapToolResultToToolResultBlockParam`(`MCPTool.ts:70`)
+把 MCP `content` 数组**原样**塞进 `tool_result.content`(`string|array` 二态);MCP 图内容形
+是 spec 的 `{type:"image", data:<base64>, mimeType}`(kloop 的 `render_content` 早已按
+`mimeType` 读)。cc 不降级,image 块透传给模型。
+
+**改造点**:
+- `kloop-mcp`:`render_content` 拆出 per-item `render_item`(文本降级复用);新
+  `content_blocks(content)->Option<Vec<ContentBlock>>`——**只有含可用图时**才走 Blocks 路
+  (text-only 返 None,文本路径字节不变),把 MCP `{type:image,data,mimeType}` 抬成 canonical
+  `ContentBlock::Image{Base64{media_type:mimeType,data}}`,图周围的非图项折成 `Text` 块保序;
+  **unsupported mimeType(非 png/jpeg/gif/webp)不抬**(坏块会整请求失败,降级成 `[image:…]`
+  文本更稳)。`isError:true` 在 `call_tool_structured` 已 Err 化,图只走 success 路。
+- `SourceOutput` 加 `blocks: Option<Vec<ContentBlock>>` + `into_content()`(有 blocks→Blocks,
+  否则 Text);`execute_tool` 把 source 分支像 read_file 一样**上提早返**(能返 Text 或 Blocks),
+  原 `other=>find_source` 收敛成"未知工具"。program 面照旧拿 `structured`(CallToolResult),
+  模型面拿 Blocks。cli `McpToolSource::call` 填 `content_blocks(&structured["content"])`。
+- **三轨全复用片 2**:anthropic 原生内嵌 / responses 原生 content_items / openai-chat 搬运——
+  MCP 图与 read_file 图走完全相同的 `ToolResultContent::Blocks` 下游,零新增翻译。
+
+**真 key 验收**:stub MCP server(Python,stdio JSON-RPC)`badge__get_badge` 返回
+`[{text},{image:png}]`,图画秘密词 `TANGERINE-K7`(只在 MCP 图里)。
+- **openai-chat 轨**(gpt-5.4-mini):调 `badge__get_badge` → MCP 图经 `content_blocks` 抬成
+  Blocks → **搬运降级**看到图 → 读出 `BADGE: TANGERINE-K7`。
+- **rollout 内联**:session 文件 tool_result = canonical `[Text("Here is the badge image."),
+  Image(png,base64 10348)]`(`content_blocks` 的输出原样),未 offload。
+- **anthropic 轨挂账(仅本次)**:代理端 `claude-sonnet-5` 持续 429("No available channel",
+  代理容量问题非 kloop);anthropic **原生内嵌**路径 = `content_blocks`(单测)→
+  `ToolResultContent::Blocks` → serde 自动,与片 2 今日已实机验过的 read_file anthropic 内嵌
+  **同一下游** + 新增 serde 契约单测覆盖,代码路径已验,仅缺一次 MCP-on-anthropic 的实机跑通。
+
+**测试**:`content_blocks`(text-only→None、unsupported mime→None、图抬成 `[Text,Image]` 保序);
+core stub source 返图 → dispatch 出 `Blocks` tool_result;`SourceOutput::into_content`;既有
+defer/collision/counts 测试随 stub 加一个 image 工具同步。
+
+**挂账**:模型视觉能力位检测;client resize;PDF 块;远程 URL 图;媒体数上限;TUI 粘贴入口;
+暴露 detail(同片 2)。MCP 图结果本身**无挂账**(除 anthropic 实机跑一次待代理恢复)。

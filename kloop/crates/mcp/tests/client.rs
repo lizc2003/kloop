@@ -211,6 +211,53 @@ async fn call_tool_round_trip_renders_content_blocks() {
     );
 }
 
+/// content_blocks lifts an MCP result that carries a usable image into
+/// canonical blocks (so the model SEES it), while a text-only result stays on
+/// the flattened-text path (None). Non-image items around the image fold into
+/// Text blocks, preserving order.
+#[test]
+fn content_blocks_lifts_images_and_leaves_text_alone() {
+    use kloop_protocol::ContentBlock;
+    use kloop_protocol::ImageSource;
+
+    // Text-only → None (the text path stays byte-identical).
+    assert_eq!(
+        kloop_mcp::content_blocks(&json!([{"type": "text", "text": "just text"}])),
+        None
+    );
+    // An unsupported image mime is not lifted (a bad block would fail the whole
+    // request) — it stays on the text path.
+    assert_eq!(
+        kloop_mcp::content_blocks(&json!([
+            {"type": "image", "data": "aGk=", "mimeType": "image/svg+xml"}
+        ])),
+        None
+    );
+    // A usable image is lifted; surrounding text/resource items fold into Text
+    // blocks around it, in order.
+    assert_eq!(
+        kloop_mcp::content_blocks(&json!([
+            {"type": "text", "text": "before"},
+            {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+            {"type": "resource_link", "uri": "https://example.com/doc"},
+        ])),
+        Some(vec![
+            ContentBlock::Text {
+                text: "before".into()
+            },
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            },
+            ContentBlock::Text {
+                text: "[resource link: https://example.com/doc]".into()
+            },
+        ])
+    );
+}
+
 /// isError: true is a successful JSON-RPC response that marks a FAILED tool
 /// run — it must surface as Err with the content as the message.
 #[tokio::test]

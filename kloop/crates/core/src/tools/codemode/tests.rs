@@ -521,6 +521,7 @@ impl ToolSource for Srv {
                 // A real MCP CallToolResult: flat text plus structuredContent.
                 return Ok(crate::tools::SourceOutput {
                     text: format!("count={}", text.len()),
+                    blocks: None,
                     structured: Some(json!({
                         "content": [{"type": "text", "text": format!("count={}", text.len())}],
                         "structuredContent": {"len": text.len(), "echo": text}

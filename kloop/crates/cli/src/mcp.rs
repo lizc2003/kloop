@@ -147,12 +147,16 @@ impl ToolSource for McpToolSource {
                 .raw_names
                 .get(tool)
                 .with_context(|| format!("unknown mcp tool: {tool}"))?;
-            // One wire call: the structured CallToolResult for a program, and
-            // its flattened text for the model-facing tool_result.
+            // One wire call: the structured CallToolResult for a program, its
+            // flattened text for the model-facing tool_result, and — when the
+            // result carries a usable image — content blocks so the model sees
+            // the picture instead of an `[image: …]` tag.
             let structured = self.client.call_tool_structured(raw, input).await?;
             let text = kloop_mcp::render_result(&structured);
+            let blocks = kloop_mcp::content_blocks(&structured["content"]);
             Ok(SourceOutput {
                 text,
+                blocks,
                 structured: Some(structured),
             })
         })
