@@ -939,15 +939,26 @@ Two ways to trigger a skill, both expanding the **same** body:
   injected context (progressive disclosure — the body stays out until triggered),
   alongside the deferred-tools notice and session-stable for the prompt cache.
   When a task matches, the model calls the built-in **`skill`** tool
-  (`skill({"name": ..., "arguments": ...})`), which is registered only when
-  skills are loaded. Its result is the expanded body, so the instructions enter
-  the conversation and the turn continues (inline execution — kloop returns the
-  body as a tool result rather than queueing a separate user message like cc's
-  SkillTool).
+  (`skill({"name": ..., "arguments": ...})`), which — like `task` — exists only
+  at depth 0 and only when skills are loaded (a sub-agent gets a focused task,
+  not the whole catalog).
 - **The user invokes it** as `/name args` — the same slash seam as the built-in
   commands (`core/src/commands/`). An unknown `/name` lists skills alongside the
   built-ins. The expansion runs as a turn (recorded as a user message), in all
-  three front-ends.
+  three front-ends; `context: fork` is a model-delegation concern, so a
+  user-invoked skill always runs inline in the user's own conversation.
+
+A skill runs one of two ways (its `context` frontmatter field):
+
+- **`inline`** (default): the expanded body becomes the `skill` tool's result,
+  so the instructions enter the conversation and the turn continues — kloop
+  returns the body as a tool result rather than queueing a separate user message
+  like cc's SkillTool.
+- **`fork`**: the body runs as an **isolated sub-agent** (reusing the `task`
+  machinery), and only its final result comes back — the skill's intermediate
+  work (tool calls, scratch output) stays out of the delegating model's context.
+  A `model` frontmatter field overrides the sub-agent's model. A sub-agent can't
+  spawn one, so a fork skill triggered at depth ≥ 1 degrades to inline.
 
 Expansion substitutes `$ARGUMENTS` (the whole argument string), `$N` (the Nth
 shell-split word, 0-indexed), and `${CLAUDE_SKILL_DIR}` (the skill's directory,
@@ -956,13 +967,16 @@ argument placeholder but arguments were given, they are appended as an
 `ARGUMENTS:` line. A skill **does not execute anything itself**: to run a bundled
 script the model issues a normal `bash` call on the `${CLAUDE_SKILL_DIR}` path,
 which faces the permission gate like any command. The `skill` tool is read-only
-(activating a skill has no system side effect — cc never prompts for it).
+(activating a skill has no system side effect — cc never prompts for it); a fork
+skill's sub-agent and any tool an inline skill's instructions later prompt are
+each gated on their own.
 
 Skills converge across cc (full system) and claw (archived subsystem); the
-codex checkout has neither. **Not done** (deferred): `context: fork`
-execution as a sub-agent, `allowed-tools`/`model`/`effort` frontmatter, bundled
-files with lazy extraction, `paths` conditional activation, usage-frequency
-ranking, remote (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell
+codex checkout has neither. **Not done** (deferred): `allowed-tools`
+(cc's tool names don't map to kloop's, so enforcing it would break downloaded
+skills — a later slice with a name map) and `effort` frontmatter, bundled files
+with lazy extraction, `paths` conditional activation, usage-frequency ranking,
+remote (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell
 expansion. See `docs/plan/28-skills.md`.
 
 ## Running

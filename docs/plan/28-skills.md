@@ -208,3 +208,62 @@ catalog 里也列着 haiku、它把"写 haiku 请求"正式"激活"一遍,冗余
 注入权限、`model`/`effort` 覆盖;bundled 编译期打包 + 懒解压;`paths` 条件激活;使用频率衰减
 排名;远程(`gs://`/`s3://`)/MCP skills;`hooks`/`shell` frontmatter;`` !`cmd` `` frontmatter
 内联 shell 展开;`${CLAUDE_SESSION_ID}` 替换(片 1 只做 SKILL_DIR)。
+
+## 完成记录(片 2,提交 <pending>)
+
+**scope 收敛(开工核对 plan 的自相矛盾)**:plan 片 2 列 `context: fork` + `allowed-tools` +
+`model`/`effort`,但**「不做」节又把 `allowed-tools 权限白名单注入` 列为挂账**("先不动权限,
+skill 继承调用点权限")——plan 自相矛盾。核算后定片 2 = **`context: fork` + `model` 覆盖**,
+`allowed-tools`/`effort` 挂账,依据:
+- **`allowed-tools` 挂账(关键判断)**:公开 skill 用的是 **cc 工具名**(`Read`/`Bash`/`Grep`),
+  与 kloop 的 `read_file`/`bash`/`grep` 不对应。若当**限制**(tool_allowlist)注入,下载来的
+  skill 的 `allowed-tools:[Read,Bash]` → kloop 白名单 {Read,Bash} 一个都不匹配 → 子 agent
+  除 read_offloaded 外**无工具**,直接**破坏"下载即用"**。若当**授权**(自动放行)注入,则是
+  供应链风险(下载的 skill 声明 `[bash]` 就免询问跑任意命令)。两条都不该草率做——留片 3,
+  要做得先定 cc→kloop 工具名映射表。这也和「不做」节自洽。
+- **`effort` 挂账**:是 provider 层参数(responses 的 reasoning / anthropic 的 thinking),
+  烘焙进 Provider Arc,per-skill 覆盖要重建 provider,plumbing 重、价值低。
+
+**落地**:
+- `skills.rs`:`SkillContext{Inline(默认)|Fork}` + `Skill.context`/`Skill.model`;`Frontmatter`
+  加 `context`/`model`(`context:"fork"`→Fork,其余→Inline;model 空→None);`Skill` 派生
+  `Default` 便于测试字面量 `..Default::default()`。`skill_tool` 按 `context` 分流:Inline 回
+  展开正文(片 1 原样),Fork 调 `crate::tools::fork_skill`。
+- `task.rs`(**DRY 重构**):抽 `run_sub_agent_sync`(同步派子 + outcome 映射,`who` 前缀
+  错误)与 `clone_for_subagent`(fresh todos/inbox 的克隆不变量)+ `next_agent_label`;
+  `task_tool` 与新 `fork_skill` 共用。`fork_skill`:body 作子 agent prompt、`model` 覆盖、
+  UI 标签 `[skill:<name>]`;**depth≥1 退化 inline**(子 agent 不能再 spawn,同 task 深度规则,
+  但不 dead-end);`tools/mod.rs` `pub(crate) use task::fork_skill` 供 skills 调。
+- **skills 收敛为 depth-0 only(fork 观察反推的改进)**:片 1 原为 all-depth(catalog 搭
+  `injected_context` 全深度、skill 工具全深度)。真 key 跑 fork 发现子 agent **又看到 catalog、
+  又 re-trigger 了自己那个 skill**(depth-1 inline 退化兜住了、无害但费一轮 + catalog 灌进
+  **每个**子 agent 每请求=真 token 浪费)。skill 本是**顶层编排特性**(同 `task`/`run_program`
+  都 depth-0),故 `turn_rounds` 的 skill 工具注册与 `injected_context` 的 catalog 都 gate
+  `depth==0`(`sample_with_retry` 加 `depth` 参;`deferred_notice`/project_instructions 仍全深度
+  不动)。改后 fork 子 agent 直奔 bash、不再 re-trigger。
+- `/name` 手调**始终 inline**(不看 context):fork 是"模型委派、隔离 token"的关注点,用户
+  亲手 `/name` 是要在自己会话里看结果,inline 才符合直觉——记为**有意与 cc 分歧**。
+
+**真 key 验收(anthropic 代理轨,sonnet-5)**:`wordcount` fork skill(context:fork,body 让
+用 bash `wc -w` 数词、只回数字),prompt「how many words are in '…'」**不点名** → 模型自发
+`skill({name:wordcount})` → **派 `agent-1`(`[skill:wordcount]`)** → bash 在**子 agent 内**跑
+(`[agent-1 · bash …]`)→ `[agent-1 finished]` → 父只拿到结果报数(中间 bash 输出不进父上下文)。
+depth-0 gating 生效:子 agent **不再 re-trigger**(改前会多一条 `[agent-1 · skill …]`)。
+
+**教训**:
+5. **plan 自身可能自相矛盾,开工要通读核对、别只读「建议切片」**:片 2 建议列 `allowed-tools`,
+   「不做」节又把它列挂账。遇到这种要停下判断而非硬做——这里的判断锚点是"下载即用"承诺:
+   `allowed-tools` 用 cc 工具名,当限制注入会让下载的 skill 子 agent 无工具、当授权注入是供应
+   链风险,两头都破承诺,故留片 3(要做先定工具名映射)。教训 11(plan 二手)的推论:plan 内部
+   不同节的结论也可能打架,以"核心承诺 + 现有架构"仲裁。
+6. **一个"能力全深度可用"的设计,真机跑一次才看出它的隐藏成本**:skills 片 1 图省事设 all-depth
+   (catalog 全深度注入),单测全绿看不出问题;fork 片 2 真机一跑才暴露"子 agent 也灌 catalog +
+   fork 子 agent 自我 re-trigger"——catalog 进每个子 agent 每请求是持续 token 浪费。收敛为
+   depth-0(顶层编排特性,同 task/run_program)后既省 token 又去掉 re-trigger。判据:给一个新
+   特性定"作用域/深度"时,先问"它是顶层编排概念还是每层都真需要";拿不准就跑一次多 agent 场景
+   看它在子 agent 里的实际开销。教训 21(先看现有信号)的邻居:先看现有同类特性(task/run_program)
+   的作用域,新特性八成同档。
+
+**片 2 挂账**:`allowed-tools`(需 cc→kloop 工具名映射表 + 限制 vs 授权定性)、`effort`(provider
+烘焙);其余同片 1 挂账(bundled 懒解压 / `paths` / 使用排名 / 远程 + MCP skills / `hooks`/`shell` /
+`` !`cmd` `` / `${CLAUDE_SESSION_ID}`)。

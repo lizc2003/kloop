@@ -24,7 +24,7 @@ use kloop_protocol::ToolDef;
 /// the skill is triggered — the catalog exposes just `name` + `description`
 /// (progressive disclosure). `dir` is the skill's directory, substituted for
 /// `${CLAUDE_SKILL_DIR}` so a skill can point at its own bundled `scripts/*`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Skill {
     pub name: String,
     /// The model-facing match signal: the public spec's `description` carries
@@ -33,6 +33,24 @@ pub struct Skill {
     pub body: String,
     /// Absolute path to the skill's directory (for `${CLAUDE_SKILL_DIR}`).
     pub dir: String,
+    /// How a model-triggered skill runs (plan 28 slice 2). `Inline` (default)
+    /// returns the body into the current context; `Fork` runs it as an isolated
+    /// sub-agent so only its result returns.
+    pub context: SkillContext,
+    /// Model override for a `Fork` skill; None inherits the caller's model.
+    pub model: Option<String>,
+}
+
+/// A skill's execution mode (its `context` frontmatter field).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SkillContext {
+    /// Body is returned into the current conversation and the turn continues.
+    #[default]
+    Inline,
+    /// Body runs as an isolated sub-agent (like a `task`); only its final
+    /// result comes back, keeping the skill's intermediate work out of the
+    /// delegating model's context.
+    Fork,
 }
 
 /// Frontmatter fields we read. serde drops every other key (`allowed-tools`,
@@ -43,6 +61,12 @@ struct Frontmatter {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// `inline` (default) | `fork`. Anything else is treated as inline.
+    #[serde(default)]
+    context: Option<String>,
+    /// Model override, honored only for a `fork` skill's sub-agent.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 impl Skill {
@@ -64,11 +88,21 @@ impl Skill {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .ok_or("missing 'description' (the field the model matches on)")?;
+        let context = match fm.context.as_deref().map(str::trim) {
+            Some("fork") => SkillContext::Fork,
+            _ => SkillContext::Inline,
+        };
+        let model = fm
+            .model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
         Ok(Skill {
             name,
             description,
             body: body.trim().to_string(),
             dir: dir.to_string(),
+            context,
+            model,
         })
     }
 
@@ -149,14 +183,16 @@ pub fn skill_tool_def() -> ToolDef {
     }
 }
 
-/// Execute the `skill` tool: look up the named skill, expand its body with the
-/// given arguments, and return it as the tool result — the instructions thereby
-/// enter the model's context and the turn continues (the inline-execution
-/// path). An unknown name comes back as an is_error result listing the skills
-/// that exist. Read-only: activating a skill touches nothing on the system, so
-/// it auto-allows at the permission gate (see `CallFacts::is_readonly`) — any
-/// side effects come from tool calls the skill's instructions later prompt,
-/// each gated on its own.
+/// Execute the `skill` tool: look up the named skill and expand its body with
+/// the given arguments. An `Inline` skill returns the expanded body as the tool
+/// result — the instructions enter the model's context and the turn continues.
+/// A `Fork` skill (plan 28 slice 2) instead runs the body as an isolated
+/// sub-agent and returns only its final result, keeping the skill's
+/// intermediate work out of the delegating model's context. An unknown name
+/// comes back as an is_error result listing the skills that exist. The tool
+/// itself is read-only (auto-allowed, see `CallFacts::is_readonly`): a fork's
+/// sub-agent and any tool the inline instructions later prompt are each gated
+/// on their own.
 pub(crate) async fn skill_tool(
     input: &serde_json::Value,
     ctx: &crate::tools::ToolCtx,
@@ -167,7 +203,11 @@ pub(crate) async fn skill_tool(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let skill = Skill::lookup(&ctx.cfg.skills, name).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(expand_body(&skill.body, &skill.dir, args))
+    let body = expand_body(&skill.body, &skill.dir, args);
+    match skill.context {
+        SkillContext::Inline => Ok(body),
+        SkillContext::Fork => crate::tools::fork_skill(ctx, skill, body).await,
+    }
 }
 
 /// Expand a skill body for injection: `${CLAUDE_SKILL_DIR}` → the skill's
@@ -272,12 +312,14 @@ mod tests {
                 description: "Write a conventional-commit message. Use when committing.".into(),
                 body: "Write a commit for $ARGUMENTS".into(),
                 dir: "/repo/.kloop/skills/commit".into(),
+                ..Default::default()
             },
             Skill {
                 name: "review".into(),
                 description: "Review a diff.".into(),
                 body: "Review it.".into(),
                 dir: "/repo/.kloop/skills/review".into(),
+                ..Default::default()
             },
         ]
     }
@@ -293,6 +335,7 @@ mod tests {
                 description: "Do a thing. Use when asked.".into(),
                 body: "# Body\n\nSteps here.".into(),
                 dir: "/skills/my-skill".into(),
+                ..Default::default()
             }
         );
     }
@@ -312,6 +355,26 @@ mod tests {
             "---\nname: s\ndescription: >\n  A long folded\n  description line.\n---\nbody";
         let skill = Skill::parse("s", "/s", content).unwrap();
         assert_eq!(skill.description, "A long folded description line.");
+    }
+
+    #[test]
+    fn parse_reads_context_and_model() {
+        let fork = Skill::parse(
+            "s",
+            "/s",
+            "---\ndescription: d\ncontext: fork\nmodel: cheap-1\n---\nb",
+        )
+        .unwrap();
+        assert_eq!(fork.context, SkillContext::Fork);
+        assert_eq!(fork.model.as_deref(), Some("cheap-1"));
+        // Default is inline; an unrecognized context value is also inline; a
+        // missing model stays None.
+        let inline = Skill::parse("s", "/s", "---\ndescription: d\n---\nb").unwrap();
+        assert_eq!(inline.context, SkillContext::Inline);
+        assert_eq!(inline.model, None);
+        let weird =
+            Skill::parse("s", "/s", "---\ndescription: d\ncontext: sideways\n---\nb").unwrap();
+        assert_eq!(weird.context, SkillContext::Inline);
     }
 
     #[test]

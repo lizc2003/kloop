@@ -21,6 +21,7 @@ use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
 use crate::rollout::session_path;
 use crate::rollout::Rollout;
+use crate::skills::Skill;
 use kloop_protocol::Message;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
@@ -55,7 +56,7 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         }
         None => None,
     };
-    let agent = format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed));
+    let agent = next_agent_label();
     let sub_cfg = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
@@ -69,13 +70,33 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         return spawn_background(ctx, sub_cfg, agent, &preview, prompt, depth, ui);
     }
 
+    run_sub_agent_sync(ctx, sub_cfg, agent, preview, prompt, depth, "task").await
+}
+
+/// Process-global monotonic agent label, so parallel spawners never collide.
+fn next_agent_label() -> String {
+    format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Run a sub-agent synchronously and map its outcome to a tool result. The
+/// sub-agent runs as its OWN tokio task — besides matching the semantics, this
+/// breaks the recursion cycle (execute_tool -> run_turn -> dispatch_tools ->
+/// execute_tool): the caller only holds a JoinHandle, which is Send regardless
+/// of the recursive future's type. Shared by the `task` tool and a `fork`
+/// skill; `who` prefixes the error messages.
+async fn run_sub_agent_sync(
+    ctx: &ToolCtx,
+    sub_cfg: Arc<Config>,
+    agent: String,
+    preview: String,
+    prompt: String,
+    depth: u8,
+    who: &str,
+) -> Result<String> {
+    let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     ui.agent_start(&agent, &preview);
-    // The sub-agent runs as its own tokio task. Besides matching the
-    // semantics, this breaks the recursion cycle (execute_tool -> run_turn ->
-    // dispatch_tools -> execute_tool): task_tool only holds a JoinHandle,
-    // which is Send regardless of the recursive future's type.
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -89,7 +110,7 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         Ok(outcome) => outcome,
         Err(e) => {
             ui.agent_end(&agent, false);
-            return Err(anyhow!("task: sub-agent panicked: {e}"));
+            return Err(anyhow!("{who}: sub-agent panicked: {e}"));
         }
     };
     let result = match outcome.reason {
@@ -98,11 +119,39 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             "[sub-agent stopped at its round limit]\n{}",
             outcome.final_text
         )),
-        EndReason::Aborted => Err(anyhow!("task: sub-agent interrupted")),
-        EndReason::Error(e) => Err(anyhow!("task: sub-agent failed: {e}")),
+        EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
+        EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
     };
     ui.agent_end(&agent, result.is_ok());
     result
+}
+
+/// Run a `context: fork` skill (plan 28 slice 2) as an isolated sub-agent: the
+/// expanded body is the sub-agent's task, an optional `model` overrides its
+/// model, and only the final result returns — the skill's intermediate work
+/// stays out of the delegating model's context. A sub-agent cannot spawn one
+/// (depth ≥ 1), so it there degrades to inline (returns the body), matching the
+/// `task` depth rule without dead-ending the skill.
+pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Result<String> {
+    if ctx.depth >= 1 {
+        return Ok(body);
+    }
+    let agent = next_agent_label();
+    let mut sub = clone_for_subagent(ctx, SUBAGENT_MAX_ROUNDS, agent.clone());
+    if let Some(model) = &skill.model {
+        sub.model = model.clone();
+    }
+    let preview = format!("[skill:{}] {}", skill.name, task_preview(&body));
+    run_sub_agent_sync(
+        ctx,
+        Arc::new(sub),
+        agent,
+        preview,
+        body,
+        ctx.depth + 1,
+        "skill",
+    )
+    .await
 }
 
 /// Fire-and-forget spawn (plan 26): register the agent, launch a DETACHED tokio
@@ -231,23 +280,30 @@ fn truncate_error(e: &str) -> String {
     format!("{truncated}… (error truncated)")
 }
 
-/// Build the sub-agent's Config: a fresh todo list and a fresh inbox (a running
-/// sub-agent must never drain the parent's steering, and its own todo_write must
-/// not touch the parent's list — the Config clone would otherwise share both
-/// Arcs), plus any agent_type overrides.
+/// Clone the parent's Config for a sub-agent, with a fresh todo list and inbox
+/// (a running sub-agent must never drain the parent's steering, and its own
+/// todo_write must not touch the parent's list — the Config clone would
+/// otherwise share both Arcs). Callers layer their own overrides on top
+/// (agent_type for `task`, model for a `fork` skill).
+fn clone_for_subagent(ctx: &ToolCtx, max_rounds: usize, agent: String) -> Config {
+    Config {
+        max_rounds,
+        agent_label: agent,
+        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+        inbox: Arc::new(Inbox::default()),
+        ..(*ctx.cfg).clone()
+    }
+}
+
+/// Build the `task` sub-agent's Config: the shared clone plus any agent_type
+/// overrides (system prompt, model, tool allowlist).
 fn build_sub_config(
     ctx: &ToolCtx,
     max_rounds: usize,
     agent: String,
     agent_type: Option<&AgentType>,
 ) -> Arc<Config> {
-    let mut sub = Config {
-        max_rounds,
-        agent_label: agent,
-        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-        inbox: Arc::new(Inbox::default()),
-        ..(*ctx.cfg).clone()
-    };
+    let mut sub = clone_for_subagent(ctx, max_rounds, agent);
     if let Some(at) = agent_type {
         if let Some(system) = &at.system {
             sub.system = system.clone();

@@ -298,6 +298,7 @@ mod tests {
                 description: "Greet someone.".into(),
                 body: "Say hi to $0.".into(),
                 dir: "/skills/greet".into(),
+                ..Default::default()
             }]),
             ..(*base).clone()
         });

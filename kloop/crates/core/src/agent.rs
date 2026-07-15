@@ -172,12 +172,15 @@ async fn turn_rounds(
     depth: u8,
 ) -> TurnOutcome {
     let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
-    // The `skill` tool exists only when skills are loaded (its catalog rides
-    // the injected context). Added here, after all_tool_defs, so it is not
+    // The `skill` tool exists only at depth 0 (like `task`) and only when
+    // skills are loaded. Skills are a top-level orchestration feature: a
+    // sub-agent gets a focused task, not the whole skills catalog (which would
+    // otherwise ride every sub-agent request, and a `fork` skill's own
+    // sub-agent could re-trigger it). Added after all_tool_defs so it is not
     // counted toward the defer threshold or exposed to run_program's API — it
     // is a prompt-activation seam, not a source tool. Placed before the
     // allowlist filter so a restricted agent type can gate it like any tool.
-    if !cfg.skills.is_empty() && !tools.iter().any(|t| t.name == "skill") {
+    if depth == 0 && !cfg.skills.is_empty() && !tools.iter().any(|t| t.name == "skill") {
         tools.push(crate::skills::skill_tool_def());
     }
     // A custom agent type may restrict this sub-agent's tools; the main agent
@@ -200,7 +203,7 @@ async fn turn_rounds(
     let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
     // The injected context message is not part of history, so the overflow
     // prediction must account for it separately.
-    let instructions_tokens = injected_context(cfg).map_or(0, |s| s.len() as u64 / 4);
+    let instructions_tokens = injected_context(cfg, depth).map_or(0, |s| s.len() as u64 / 4);
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
@@ -261,6 +264,7 @@ async fn turn_rounds(
             ui,
             cancel,
             stream_text,
+            depth,
         )
         .await
         {
@@ -488,11 +492,15 @@ const MAX_ATTEMPTS: u32 = 3;
 /// The synthetic first user message: project instructions, the skills catalog,
 /// and the deferred-tools notice, in that order. Every part is session-stable,
 /// so the composed message is too — the prompt-cache prefix survives across
-/// rounds.
-fn injected_context(cfg: &Config) -> Option<String> {
+/// rounds. The skills catalog rides only depth-0 requests (skills are a
+/// top-level feature; see the `skill` tool registration in `turn_rounds`).
+fn injected_context(cfg: &Config, depth: u8) -> Option<String> {
+    let skills_catalog = (depth == 0)
+        .then(|| crate::skills::skills_catalog(&cfg.skills))
+        .flatten();
     let parts: Vec<String> = [
         cfg.project_instructions.clone(),
-        crate::skills::skills_catalog(&cfg.skills),
+        skills_catalog,
         crate::tools::deferred_notice(cfg),
     ]
     .into_iter()
@@ -501,6 +509,7 @@ fn injected_context(cfg: &Config) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sample_with_retry(
     cfg: &Arc<Config>,
     model: &str,
@@ -509,12 +518,13 @@ async fn sample_with_retry(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
+    depth: u8,
 ) -> Sampled {
-    // Project instructions and the deferred-tools notice ride every request
-    // as a synthetic first user message. Never recorded: resume rereads
-    // fresh files, and compaction cannot swallow it.
+    // Project instructions, the (depth-0) skills catalog, and the deferred-tools
+    // notice ride every request as a synthetic first user message. Never
+    // recorded: resume rereads fresh files, and compaction cannot swallow it.
     let injected;
-    let messages = match injected_context(cfg) {
+    let messages = match injected_context(cfg, depth) {
         Some(context) => {
             let mut with_context = Vec::with_capacity(messages.len() + 1);
             with_context.push(Message::user_text(context));
@@ -1430,6 +1440,7 @@ mod tests {
             description: "Greet a person by name.".into(),
             body: "Please greet $ARGUMENTS warmly.".into(),
             dir: "/skills/greet".into(),
+            ..Default::default()
         }]);
         let cfg = Arc::new(cfg);
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -1465,6 +1476,109 @@ mod tests {
             expanded,
             "expanded body missing from follow-up request: {:?}",
             seen[1].messages
+        );
+    }
+
+    /// A `context: fork` skill runs as an isolated sub-agent: the model triggers
+    /// it, the body becomes the sub-agent's task, and only the sub-agent's final
+    /// result comes back as the skill tool_result — the skill body never enters
+    /// the delegating (parent) model's context.
+    #[tokio::test]
+    async fn fork_skill_runs_as_isolated_subagent() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use_named(
+                "sk1",
+                "skill",
+                json!({"name": "research"}),
+            )]),
+            MockTurn::Blocks(text("FORKED_RESULT")), // the forked sub-agent's turn
+            MockTurn::Blocks(text("done")),          // parent wraps up
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "skills-fork")).clone();
+        cfg.skills = Arc::new(vec![crate::skills::Skill {
+            name: "research".into(),
+            description: "Research something in isolation.".into(),
+            body: "SECRET_FORK_BODY — do the research".into(),
+            dir: "/skills/research".into(),
+            context: crate::skills::SkillContext::Fork,
+            ..Default::default()
+        }]);
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        let seen = seen.lock().unwrap();
+        // The body reached the sub-agent (its own request carries it)…
+        let sub_req = seen
+            .iter()
+            .find(|r| {
+                r.messages.iter().any(|m| {
+                    matches!(
+                        &m.content[..],
+                        [ContentBlock::Text { text }] if text.contains("SECRET_FORK_BODY")
+                    )
+                })
+            })
+            .expect("the fork body must reach the sub-agent");
+        // …and skills are depth-0 only, so the sub-agent gets neither the skill
+        // tool nor the catalog (no re-triggering itself, no per-sub-agent bloat).
+        assert!(
+            !sub_req.tools.iter().any(|t| t.name == "skill"),
+            "a sub-agent must not carry the skill tool"
+        );
+        assert!(
+            !sub_req
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(
+                    b,
+                    ContentBlock::Text { text } if text.contains("skills are available")
+                )),
+            "a sub-agent must not carry the skills catalog"
+        );
+        // …but the parent's post-skill request gets only the result, not the body.
+        let tr = |b: &ContentBlock| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == "sk1" => Some(content.clone()),
+            _ => None,
+        };
+        let parent_post = seen
+            .iter()
+            .find(|r| {
+                r.messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|b| tr(b).is_some())
+            })
+            .expect("a parent request carries the skill tool_result");
+        assert_eq!(
+            parent_post
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(tr)
+                .unwrap(),
+            "FORKED_RESULT"
+        );
+        assert!(
+            !parent_post
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(
+                    b,
+                    ContentBlock::Text { text } if text.contains("SECRET_FORK_BODY")
+                ) || tr(b).is_some_and(|c| c.contains("SECRET_FORK_BODY"))),
+            "fork must keep the body out of the parent context"
         );
     }
 

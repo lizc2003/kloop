@@ -16,6 +16,9 @@ pub use background_tasks::BackgroundTasks;
 pub use background_tasks::TaskStatus;
 pub use bash::BackgroundShells;
 pub use discover::deferred_notice;
+// The skills module (`crate::skills`) dispatches a `context: fork` skill here,
+// reusing the task sub-agent machinery.
+pub(crate) use task::fork_skill;
 pub use todo::parse_todos;
 pub use todo::TodoItem;
 pub use todo::TodoStatus;
