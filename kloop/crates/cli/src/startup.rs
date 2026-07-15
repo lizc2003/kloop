@@ -1,0 +1,1045 @@
+//! Startup wiring: reading `.kloop/config.toml` + `AGENT_*` env into the
+//! runtime pieces a session needs (permissions, hooks, sandbox policy, agent
+//! types, skills, code-mode limits) and assembling them into a `Config` via
+//! [`config_from_env`] — the one entry `main`/`plain_main`/the server factory
+//! call. Every loader is fail-soft or a hard parse error, never a silent drop.
+
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::bail;
+use anyhow::Context;
+use anyhow::Result;
+use serde_json::json;
+
+use kloop_core::agent_type::AgentType;
+use kloop_core::hooks::HookDef;
+use kloop_core::hooks::HookEvent;
+use kloop_core::hooks::Hooks;
+use kloop_core::permissions::Approver;
+use kloop_core::permissions::Mode;
+use kloop_core::permissions::PermissionRules;
+use kloop_core::permissions::Permissions;
+use kloop_core::skills::Skill;
+use kloop_core::tools::ToolSource;
+use kloop_core::Config;
+use kloop_protocol::ContentBlock;
+use kloop_provider::Provider;
+use kloop_provider::ThinkingMode;
+
+use crate::args::CliArgs;
+use crate::context;
+
+pub(crate) const PERMISSIONS_CONFIG: &str = ".kloop/config.toml";
+
+/// Parse `[[hooks]]` tables from `.kloop/config.toml`. A missing file or
+/// missing section is an empty list; a malformed entry is an error (a
+/// silently dropped hook would look like a policy that never fires).
+fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(Vec::new());
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(entries) = value.get("hooks") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .context("[[hooks]] must be an array of tables")?;
+    let mut defs = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let spec = entry
+            .as_table()
+            .with_context(|| format!("hooks[{i}] must be a table"))?;
+        for key in spec.keys() {
+            if !matches!(key.as_str(), "event" | "command" | "matcher" | "timeout_ms") {
+                bail!(
+                    "hooks[{i}] has unknown key '{key}' (event | command | matcher | timeout_ms)"
+                );
+            }
+        }
+        let event = spec
+            .get("event")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("hooks[{i}] needs an 'event' string"))?;
+        let event = HookEvent::parse(event).with_context(|| {
+            format!("hooks[{i}] has unknown event '{event}' (pre_turn | post_turn | pre_tool | post_tool | subagent_start | subagent_stop)")
+        })?;
+        let command: Vec<String> = spec
+            .get("command")
+            .and_then(|v| v.as_array())
+            .and_then(|list| {
+                list.iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .with_context(|| format!("hooks[{i}] needs a 'command' string array"))?;
+        if command.is_empty() {
+            bail!("hooks[{i}].command must not be empty");
+        }
+        let matcher = match spec.get("matcher") {
+            None => None,
+            Some(v) => {
+                let m = v
+                    .as_str()
+                    .with_context(|| format!("hooks[{i}].matcher must be a string"))?;
+                if !event.is_tool_event() {
+                    bail!(
+                        "hooks[{i}]: matcher is only valid for pre_tool/post_tool, not {}",
+                        event.name()
+                    );
+                }
+                Some(m.to_string())
+            }
+        };
+        let timeout_ms = match spec.get("timeout_ms") {
+            None => kloop_core::hooks::DEFAULT_TIMEOUT_MS,
+            Some(v) => v
+                .as_integer()
+                .filter(|&t| t > 0)
+                .with_context(|| format!("hooks[{i}].timeout_ms must be a positive integer"))?
+                as u64,
+        };
+        defs.push(HookDef {
+            event,
+            command,
+            matcher,
+            timeout_ms,
+        });
+    }
+    Ok(defs)
+}
+
+/// Rules from `.kloop/config.toml` `[permissions]` (allow/deny/ask string
+/// arrays), with AGENT_ALLOW / AGENT_DENY / AGENT_ASK (comma-separated)
+/// appended on top.
+fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
+    let mut rules = PermissionRules::default();
+    if let Ok(raw) = std::fs::read_to_string(config_path) {
+        let value: toml::Table = raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        let read = |key: &str, out: &mut Vec<String>| -> Result<()> {
+            let Some(entries) = value.get("permissions").and_then(|p| p.get(key)) else {
+                return Ok(());
+            };
+            let list = entries
+                .as_array()
+                .with_context(|| format!("permissions.{key} must be an array of strings"))?;
+            for entry in list {
+                out.push(
+                    entry
+                        .as_str()
+                        .with_context(|| format!("permissions.{key} must be an array of strings"))?
+                        .to_string(),
+                );
+            }
+            Ok(())
+        };
+        read("allow", &mut rules.allow)?;
+        read("deny", &mut rules.deny)?;
+        read("ask", &mut rules.ask)?;
+    }
+    let env = |var: &str, out: &mut Vec<String>| {
+        if let Ok(raw) = std::env::var(var) {
+            out.extend(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    };
+    env("AGENT_ALLOW", &mut rules.allow);
+    env("AGENT_DENY", &mut rules.deny);
+    env("AGENT_ASK", &mut rules.ask);
+    Ok(rules)
+}
+
+/// Append allow rules to `[permissions].allow`, preserving everything else
+/// in the file (toml::Value round-trip; comments are not preserved).
+fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
+    let mut table: toml::Table = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?,
+        Err(_) => toml::Table::new(),
+    };
+    let permissions = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("[permissions] must be a table")?;
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("permissions.allow must be an array")?;
+    for rule in new_rules {
+        if !allow.iter().any(|v| v.as_str() == Some(rule)) {
+            allow.push(toml::Value::String(rule.clone()));
+        }
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(config_path, toml::to_string_pretty(&table)?)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+    Ok(())
+}
+
+/// `approver` and `notify` are the UI-facing halves of the permission gate:
+/// the plain REPL passes a blocking stdin prompt + stderr printer, the TUI a
+/// popup + transcript note.
+fn build_permissions(
+    args: &CliArgs,
+    approver: Arc<dyn Approver>,
+    notify: kloop_tui::NoteFn,
+) -> Result<Permissions> {
+    // --mock runs a canned turn with nobody at the keyboard: no gating at
+    // all. --yolo is bypass mode — deny rules and safety checks still apply.
+    if args.mock {
+        return Ok(Permissions::allow_all());
+    }
+    let mode = if args.yolo {
+        Mode::Bypass
+    } else if args.accept_edits {
+        Mode::AcceptEdits
+    } else {
+        Mode::Default
+    };
+    let config_path = PathBuf::from(PERMISSIONS_CONFIG);
+    let rules = load_permission_rules(&config_path)?;
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let persist =
+        Box::new(
+            move |rules: &[String]| match persist_allow_rules(&config_path, rules) {
+                Ok(()) => notify(&format!(
+                    "saved to {PERMISSIONS_CONFIG}: {}",
+                    rules.join(", ")
+                )),
+                Err(e) => notify(&format!("failed to save allow rule: {e:#}")),
+            },
+        );
+    Permissions::new(mode, &rules, cwd, Some(approver), Some(persist))
+        .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
+}
+
+/// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
+/// `allow_network` (default false), `writable_roots` (extra writable
+/// directories, default none), `auto_allow` (default true: sandboxed bash
+/// skips the asking layers of the permission gate), `escalate` (default
+/// true: a sandbox-denied command is offered for an unsandboxed re-run).
+struct SandboxSettings {
+    enabled: bool,
+    allow_network: bool,
+    writable_roots: Vec<PathBuf>,
+    auto_allow: bool,
+    escalate: bool,
+}
+
+/// Custom agent types from `.kloop/config.toml` `[agents.<name>]`: each is a
+/// table with a required `description` and optional `system` / `model` /
+/// `tools` (string array). Order follows the file so the task description
+/// lists them stably. `--mock` skips this like every other config read.
+pub(crate) fn load_agent_types(config_path: &Path) -> Result<Vec<AgentType>> {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(Vec::new());
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(agents) = value.get("agents") else {
+        return Ok(Vec::new());
+    };
+    let agents = agents
+        .as_table()
+        .context("[agents] must be a table of named agent definitions")?;
+    let mut types = Vec::new();
+    for (name, def) in agents {
+        let def = def
+            .as_table()
+            .with_context(|| format!("[agents.{name}] must be a table"))?;
+        for key in def.keys() {
+            if !matches!(key.as_str(), "description" | "system" | "model" | "tools") {
+                bail!("[agents.{name}] has unknown key '{key}' (description | system | model | tools)");
+            }
+        }
+        let description = def
+            .get("description")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("[agents.{name}] needs a 'description' string"))?
+            .to_string();
+        let str_field = |key: &str| -> Result<Option<String>> {
+            match def.get(key) {
+                None => Ok(None),
+                Some(v) => Ok(Some(
+                    v.as_str()
+                        .with_context(|| format!("[agents.{name}].{key} must be a string"))?
+                        .to_string(),
+                )),
+            }
+        };
+        let tools = match def.get("tools") {
+            None => None,
+            Some(v) => {
+                let list = v.as_array().with_context(|| {
+                    format!("[agents.{name}].tools must be an array of strings")
+                })?;
+                let mut names = Vec::new();
+                for entry in list {
+                    names.push(
+                        entry
+                            .as_str()
+                            .with_context(|| {
+                                format!("[agents.{name}].tools must be an array of strings")
+                            })?
+                            .to_string(),
+                    );
+                }
+                Some(names)
+            }
+        };
+        types.push(AgentType {
+            name: name.clone(),
+            description,
+            system: str_field("system")?,
+            model: str_field("model")?,
+            tools,
+        });
+    }
+    Ok(types)
+}
+
+/// Skills discovered from `.kloop/skills/<name>/SKILL.md` (plan 28): the
+/// project's dir (cwd-relative), then the global `~/.kloop/skills/`. A skill
+/// downloaded for the Agent Skills ecosystem works as-is once its directory is
+/// dropped in — the SKILL.md format is what matters, so we scan only kloop's
+/// own dir, not cc's `.claude/`. The project layer wins on a name collision,
+/// letting it override a global skill. A malformed skill is skipped with a
+/// warning, never an error; `--mock` skips discovery entirely (hermetic).
+pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
+    let mut roots = vec![cwd.join(".kloop").join("skills")];
+    if let Some(home) = std::env::home_dir() {
+        roots.push(home.join(".kloop").join("skills"));
+    }
+    skills_from_roots(&roots)
+}
+
+/// Walk skill roots in order (earlier roots win on name collision), reading each
+/// `<name>/SKILL.md`. Split from [`load_skills`] so the discovery logic is
+/// testable without touching `$HOME`. Missing roots are simply absent.
+fn skills_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
+    let mut skills = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        // read_dir order is filesystem-dependent; sort so the catalog (and the
+        // prompt-cache prefix it rides in) is stable across runs.
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let skill_md = dir.join("SKILL.md");
+            let Ok(content) = std::fs::read_to_string(&skill_md) else {
+                continue;
+            };
+            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            match Skill::parse(dir_name, &dir.display().to_string(), &content) {
+                // First name wins: a project skill silently overrides a global
+                // one (the ecosystem's expected override), so no shadow warning.
+                Ok(skill) if seen.insert(skill.name.clone()) => skills.push(skill),
+                Ok(_) => {}
+                Err(e) => warnings.push(format!("skipped skill at {}: {e}", skill_md.display())),
+            }
+        }
+    }
+    (skills, warnings)
+}
+
+fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
+    let mut settings = SandboxSettings {
+        enabled: true,
+        allow_network: false,
+        writable_roots: Vec::new(),
+        auto_allow: true,
+        escalate: true,
+    };
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return Ok(settings);
+    };
+    let value: toml::Table = raw
+        .parse()
+        .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    let Some(section) = value.get("sandbox") else {
+        return Ok(settings);
+    };
+    let section = section.as_table().context("[sandbox] must be a table")?;
+    for (key, value) in section {
+        match key.as_str() {
+            "enabled" => {
+                settings.enabled = value
+                    .as_bool()
+                    .context("sandbox.enabled must be a boolean")?;
+            }
+            "allow_network" => {
+                settings.allow_network = value
+                    .as_bool()
+                    .context("sandbox.allow_network must be a boolean")?;
+            }
+            "writable_roots" => {
+                let list = value
+                    .as_array()
+                    .context("sandbox.writable_roots must be an array of strings")?;
+                for entry in list {
+                    settings.writable_roots.push(PathBuf::from(
+                        entry
+                            .as_str()
+                            .context("sandbox.writable_roots must be an array of strings")?,
+                    ));
+                }
+            }
+            "auto_allow" => {
+                settings.auto_allow = value
+                    .as_bool()
+                    .context("sandbox.auto_allow must be a boolean")?;
+            }
+            "escalate" => {
+                settings.escalate = value
+                    .as_bool()
+                    .context("sandbox.escalate must be a boolean")?;
+            }
+            other => bail!(
+                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | auto_allow | escalate)"
+            ),
+        }
+    }
+    Ok(settings)
+}
+
+/// `[codemode]` in `.kloop/config.toml` (all optional; defaults in
+/// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
+/// limits) and `max_agents`, `max_items` (orchestration runaway ceilings). Each
+/// is also overridable via `AGENT_PROGRAM_<KEY>` env, which wins over the config
+/// value. Bounds one `run_program` (code-mode) run.
+fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> {
+    let mut limits = kloop_core::ProgramLimits::default();
+    if let Ok(raw) = std::fs::read_to_string(config_path) {
+        let value: toml::Table = raw
+            .parse()
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        if let Some(section) = value.get("codemode") {
+            let section = section.as_table().context("[codemode] must be a table")?;
+            for (key, v) in section {
+                let need = || {
+                    v.as_integer()
+                        .filter(|&n| n > 0)
+                        .with_context(|| format!("codemode.{key} must be a positive integer"))
+                };
+                match key.as_str() {
+                    "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
+                    "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
+                    "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
+                    "max_agents" => limits.max_agents = need()? as u64,
+                    "max_items" => limits.max_items_per_call = need()? as usize,
+                    other => bail!(
+                        "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_items)"
+                    ),
+                }
+            }
+        }
+    }
+    let env_uint = |name: &str| -> Result<Option<u64>> {
+        match std::env::var(name) {
+            Ok(s) => {
+                Ok(Some(s.parse().with_context(|| {
+                    format!("{name} must be a positive integer")
+                })?))
+            }
+            Err(_) => Ok(None),
+        }
+    };
+    if let Some(n) = env_uint("AGENT_PROGRAM_MEMORY_MB")? {
+        limits.memory_bytes = n as usize * 1024 * 1024;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_STACK_KB")? {
+        limits.max_stack_bytes = n as usize * 1024;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_CPU_SECS")? {
+        limits.cpu_burst = Duration::from_secs(n);
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_AGENTS")? {
+        limits.max_agents = n;
+    }
+    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_ITEMS")? {
+        limits.max_items_per_call = n as usize;
+    }
+    Ok(limits)
+}
+
+/// The session sandbox policy, or None with a warning when unavailable —
+/// fail-open like hooks: the permission gate stays the enforcement layer.
+/// Built once per process and shared into every Config (server threads too).
+pub(crate) fn build_sandbox(
+    args: &CliArgs,
+    cwd: &Path,
+    warn: impl Fn(&str),
+) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
+    // --mock stays hermetic; AGENT_SANDBOX=off is the env escape hatch.
+    if args.mock
+        || matches!(
+            std::env::var("AGENT_SANDBOX").ok().as_deref(),
+            Some("off") | Some("0") | Some("false")
+        )
+    {
+        return Ok(None);
+    }
+    let settings = load_sandbox_settings(Path::new(PERMISSIONS_CONFIG))?;
+    if !settings.enabled {
+        return Ok(None);
+    }
+    match kloop_core::sandbox::availability() {
+        Ok(()) => {
+            let mut policy = kloop_core::sandbox::SandboxPolicy::workspace(
+                cwd,
+                &settings.writable_roots,
+                settings.allow_network,
+            );
+            policy.auto_allow = settings.auto_allow;
+            policy.escalate = settings.escalate;
+            Ok(Some(Arc::new(policy)))
+        }
+        Err(reason) => {
+            warn(&format!(
+                "sandbox unavailable ({reason}); bash commands run unsandboxed"
+            ));
+            Ok(None)
+        }
+    }
+}
+
+/// AGENT_DEFER_THRESHOLD: total tool count above which MCP tool definitions
+/// are deferred behind tool_search. Lower it to exercise deferral with a
+/// small server; raise it to effectively disable deferral.
+pub(crate) fn defer_threshold_from_env() -> Result<usize> {
+    match std::env::var("AGENT_DEFER_THRESHOLD").ok() {
+        Some(raw) => raw
+            .parse::<usize>()
+            .context("AGENT_DEFER_THRESHOLD must be a tool count"),
+        None => Ok(kloop_core::tools::TOOL_DEFER_THRESHOLD),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn config_from_env(
+    args: &CliArgs,
+    approver: Arc<dyn Approver>,
+    notify: kloop_tui::NoteFn,
+    tool_sources: &[Arc<dyn ToolSource>],
+    project: &context::GatheredContext,
+    sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
+    agent_types: Arc<Vec<AgentType>>,
+    skills: Arc<Vec<Skill>>,
+) -> Result<Config> {
+    let permissions = Arc::new(build_permissions(args, approver, notify)?);
+    // --mock stays hermetic: no config reads, no hook child processes.
+    let hooks = if args.mock {
+        Hooks::none()
+    } else {
+        Hooks {
+            defs: load_hooks(Path::new(PERMISSIONS_CONFIG))?,
+        }
+    };
+    let offload_dir = PathBuf::from(".kloop/offload");
+    let sessions_dir = PathBuf::from(".kloop/sessions");
+    // Code-mode resource limits: default unless [codemode]/AGENT_PROGRAM_* set.
+    let program_limits = if args.mock {
+        kloop_core::ProgramLimits::default()
+    } else {
+        load_program_limits(Path::new(PERMISSIONS_CONFIG))?
+    };
+    // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
+    let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
+        Some("off") | Some("0") => None,
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .context("AGENT_CONTEXT_WINDOW must be a token count or 'off'")?,
+        ),
+        None => Some(200_000),
+    };
+    let base = Config {
+        provider: Arc::new(Provider::mock(vec![])),
+        model: "mock".into(),
+        system: project.system.clone(),
+        project_instructions: project.instructions.clone(),
+        max_rounds: 30,
+        offload_dir,
+        sessions_dir,
+        context_window,
+        fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
+        permissions,
+        tool_sources: tool_sources.to_vec(),
+        // The caller stamps the real session id once it knows it (after
+        // open_history / per server thread).
+        session_id: String::new(),
+        agent_label: String::new(),
+        hooks: Arc::new(hooks),
+        background_shells: kloop_core::tools::BackgroundShells::new(),
+        background_tasks: kloop_core::tools::BackgroundTasks::new(),
+        sandbox,
+        agent_types,
+        tool_allowlist: None,
+        defer_threshold: defer_threshold_from_env()?,
+        unlocked_tools: Default::default(),
+        todos: Default::default(),
+        inbox: Default::default(),
+        program_limits,
+        skills,
+    };
+    if args.mock {
+        return Ok(Config {
+            provider: Arc::new(Provider::mock(mock_demo_turns())),
+            ..base
+        });
+    }
+
+    let anthropic = || -> Result<Config> {
+        let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
+        // Prompt caching is a pure cost saving, so it defaults on; the escape
+        // hatch is for diagnosing cache behavior against a live endpoint.
+        let cache = !matches!(
+            std::env::var("AGENT_CACHE").ok().as_deref(),
+            Some("off") | Some("0") | Some("false")
+        );
+        // No AGENT_THINKING = no thinking field: current models then run
+        // adaptive on their own. The blocks they send are replayed either way.
+        let thinking = match std::env::var("AGENT_THINKING").ok().as_deref() {
+            None => ThinkingMode::Unset,
+            Some("off") => ThinkingMode::Off,
+            Some("adaptive") => ThinkingMode::Adaptive,
+            Some(raw) => ThinkingMode::Budget(raw.parse().context(
+                "AGENT_THINKING must be off | adaptive | <budget tokens for pre-adaptive models>",
+            )?),
+        };
+        Ok(Config {
+            provider: Arc::new(Provider::Anthropic {
+                key,
+                base: std::env::var("ANTHROPIC_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.anthropic.com".into()),
+                cache,
+                thinking,
+            }),
+            model: std::env::var("AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into()),
+            ..base.clone()
+        })
+    };
+    let openai = |responses: bool| -> Result<Config> {
+        let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
+        let model = std::env::var("AGENT_MODEL")
+            .context("AGENT_MODEL is required for the openai providers")?;
+        let base_url =
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let provider = if responses {
+            Provider::OpenAiResponses {
+                key,
+                base: base_url,
+                // Also the reasoning-capture switch: without the field some
+                // backends never emit reasoning items.
+                effort: std::env::var("AGENT_EFFORT").ok(),
+            }
+        } else {
+            Provider::OpenAiCompat {
+                key,
+                base: base_url,
+            }
+        };
+        Ok(Config {
+            provider: Arc::new(provider),
+            model,
+            ..base.clone()
+        })
+    };
+
+    match std::env::var("AGENT_PROVIDER").ok().as_deref() {
+        Some("anthropic") => anthropic(),
+        Some("openai") | Some("openai-compat") => openai(false),
+        Some("openai-responses") => openai(true),
+        Some(other) => {
+            bail!("unknown AGENT_PROVIDER '{other}' (anthropic | openai | openai-responses)")
+        }
+        None => {
+            if let Ok(cfg) = anthropic() {
+                Ok(cfg)
+            } else if let Ok(cfg) = openai(false) {
+                Ok(cfg)
+            } else {
+                bail!(
+                    "no provider configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
+                         (+ AGENT_MODEL), or run with --mock"
+                )
+            }
+        }
+    }
+}
+
+/// Scripted turns for `--mock`, exercising all five bets (plus the todo list)
+/// without an API key: round 1 lays out a todo list, round 2 batches two
+/// read-only bash calls concurrently, round 3 runs an unsafe command whose
+/// oversized output triggers offloading, round 4 reads it back, round 5 spawns
+/// a sub-agent (round 6 is the sub-agent's own reply), round 7 finishes with
+/// plain text.
+fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
+    let tool_use = |id: &str, name: &str, input: serde_json::Value| ContentBlock::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input,
+    };
+    let text = |t: &str| ContentBlock::Text { text: t.into() };
+    vec![
+        vec![
+            text("Planning the demo as a todo list…\n"),
+            tool_use(
+                "t0",
+                "todo_write",
+                json!({"todos": [
+                    {"content": "Look around", "activeForm": "Looking around", "status": "in_progress"},
+                    {"content": "Offload a big output and read it back", "activeForm": "Offloading a big output", "status": "pending"},
+                    {"content": "Delegate to a sub-agent", "activeForm": "Delegating to a sub-agent", "status": "pending"},
+                ]}),
+            ),
+        ],
+        vec![
+            text("Looking around (these two run as one concurrent batch)…\n"),
+            tool_use("t1", "bash", json!({"command": "pwd"})),
+            tool_use("t2", "bash", json!({"command": "ls"})),
+        ],
+        vec![
+            text("Now a non-read-only command with huge output (runs sequentially, result gets offloaded)…\n"),
+            tool_use("t3", "bash", json!({"command": "yes offload-me | head -n 3000"})),
+        ],
+        vec![
+            text("Reading the offloaded output back…\n"),
+            tool_use("t4", "read_offloaded", json!({"id": "off-0001"})),
+        ],
+        vec![
+            text("Delegating to a sub-agent…\n"),
+            tool_use("t5", "task", json!({"prompt": "say hi"})),
+        ],
+        // consumed by the sub-agent's own run_turn
+        vec![text("hi from the sub-agent")],
+        vec![text("Demo complete: parallel batch, offload + read-back, and a sub-agent all worked.")],
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_types_parse_fields_and_reject_malformed() {
+        let dir = std::env::temp_dir().join(format!("kloop-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / no [agents]: empty.
+        assert!(load_agent_types(&path).unwrap().is_empty());
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert!(load_agent_types(&path).unwrap().is_empty());
+
+        std::fs::write(
+            &path,
+            "[agents.researcher]\n\
+             description = \"Searches the codebase.\"\n\
+             system = \"You research.\"\n\
+             model = \"claude-haiku-4-5\"\n\
+             tools = [\"grep\", \"read_file\"]\n\
+             \n\
+             [agents.reviewer]\n\
+             description = \"Reviews a diff.\"\n",
+        )
+        .unwrap();
+        let types = load_agent_types(&path).unwrap();
+        assert_eq!(types.len(), 2);
+        let researcher = types.iter().find(|t| t.name == "researcher").unwrap();
+        assert_eq!(
+            (
+                researcher.description.as_str(),
+                researcher.system.as_deref(),
+                researcher.model.as_deref(),
+                researcher.tools.clone(),
+            ),
+            (
+                "Searches the codebase.",
+                Some("You research."),
+                Some("claude-haiku-4-5"),
+                Some(vec!["grep".to_string(), "read_file".to_string()]),
+            )
+        );
+        let reviewer = types.iter().find(|t| t.name == "reviewer").unwrap();
+        assert_eq!(reviewer.system, None);
+        assert_eq!(reviewer.model, None);
+        assert_eq!(reviewer.tools, None);
+
+        for bad in [
+            "[agents.x]\n",                                        // no description
+            "[agents.x]\ndescription = 3\n",                       // wrong type
+            "[agents.x]\ndescription = \"d\"\nmodel = 5\n",        // wrong type
+            "[agents.x]\ndescription = \"d\"\ntools = \"grep\"\n", // tools not an array
+            "[agents.x]\ndescription = \"d\"\ntools = [3]\n",      // tools not strings
+            "[agents.x]\ndescription = \"d\"\nprompt = \"p\"\n",   // unknown key
+            "agents = 3\n",                                        // [agents] not a table
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_agent_types(&path).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn skills_discovery_applies_precedence_and_warns_on_malformed() {
+        let base = std::env::temp_dir().join(format!("kloop-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join(".kloop").join("skills");
+        let global = base.join("home").join(".kloop").join("skills");
+        let write_skill = |root: &Path, name: &str, body: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        };
+        // `commit` in both scopes: the project one must win. A global-only
+        // `review`. A malformed skill (no description) warns and is skipped. A
+        // directory without a SKILL.md is ignored.
+        write_skill(
+            &project,
+            "commit",
+            "---\ndescription: project commit\n---\nproject body",
+        );
+        write_skill(
+            &global,
+            "commit",
+            "---\ndescription: global commit\n---\nglobal body",
+        );
+        write_skill(
+            &global,
+            "review",
+            "---\ndescription: review a diff\n---\nreview body",
+        );
+        write_skill(&global, "broken", "no frontmatter here");
+        std::fs::create_dir_all(global.join("empty-dir")).unwrap();
+
+        let (skills, warnings) = skills_from_roots(&[project.clone(), global.clone()]);
+
+        let by_name = |n: &str| skills.iter().find(|s| s.name == n).unwrap();
+        assert_eq!(
+            skills.len(),
+            2,
+            "commit deduped, broken skipped: {skills:?}"
+        );
+        assert_eq!(by_name("commit").description, "project commit");
+        assert_eq!(by_name("commit").body, "project body");
+        assert_eq!(
+            by_name("commit").dir,
+            project.join("commit").display().to_string()
+        );
+        assert_eq!(by_name("review").description, "review a diff");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the malformed skill warns: {warnings:?}"
+        );
+        assert!(warnings[0].contains("broken") && warnings[0].contains("frontmatter"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sandbox_settings_parse_defaults_and_reject_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("kloop-sbxcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / missing section: sandbox on, network off, no
+        // extras, auto-allow on, escalate on.
+        let settings = load_sandbox_settings(&path).unwrap();
+        assert!(settings.enabled);
+        assert!(!settings.allow_network);
+        assert!(settings.writable_roots.is_empty());
+        assert!(settings.auto_allow);
+        assert!(settings.escalate);
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert!(load_sandbox_settings(&path).unwrap().enabled);
+
+        std::fs::write(
+            &path,
+            "[sandbox]\nenabled = true\nallow_network = true\nwritable_roots = [\"/opt/data\"]\n",
+        )
+        .unwrap();
+        let settings = load_sandbox_settings(&path).unwrap();
+        assert!(settings.enabled);
+        assert!(settings.allow_network);
+        assert_eq!(settings.writable_roots, vec![PathBuf::from("/opt/data")]);
+
+        std::fs::write(&path, "[sandbox]\nenabled = false\n").unwrap();
+        assert!(!load_sandbox_settings(&path).unwrap().enabled);
+
+        std::fs::write(&path, "[sandbox]\nauto_allow = false\n").unwrap();
+        assert!(!load_sandbox_settings(&path).unwrap().auto_allow);
+
+        std::fs::write(&path, "[sandbox]\nescalate = false\n").unwrap();
+        assert!(!load_sandbox_settings(&path).unwrap().escalate);
+
+        for bad in [
+            "[sandbox]\nenabled = \"yes\"\n",
+            "[sandbox]\nallow_network = 1\n",
+            "[sandbox]\nwritable_roots = \"/opt\"\n",
+            "[sandbox]\nwritable_roots = [1]\n",
+            "[sandbox]\nauto_allow = \"on\"\n",
+            "[sandbox]\nescalate = 1\n",
+            "[sandbox]\nnetwork = true\n",
+            "sandbox = true\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_sandbox_settings(&path).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn permission_config_round_trip_and_merge() {
+        let dir = std::env::temp_dir().join(format!("kloop-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file: empty rules, no error.
+        assert_eq!(
+            load_permission_rules(&path).unwrap(),
+            PermissionRules::default()
+        );
+
+        // Persist into a file that has unrelated content to preserve.
+        std::fs::write(
+            &path,
+            "[provider]\nname = \"anthropic\"\n\n[permissions]\ndeny = [\"bash(git push *)\"]\n",
+        )
+        .unwrap();
+        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap();
+        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap(); // dedup
+
+        let rules = load_permission_rules(&path).unwrap();
+        assert_eq!(
+            rules,
+            PermissionRules {
+                allow: vec!["bash(cargo build *)".into()],
+                deny: vec!["bash(git push *)".into()],
+                ask: vec![],
+            }
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("[provider]"),
+            "unrelated sections preserved:\n{raw}"
+        );
+        assert_eq!(raw.matches("cargo build").count(), 1, "no duplicate rule");
+
+        // Malformed arrays are an error, not a silent skip.
+        std::fs::write(&path, "[permissions]\nallow = \"not-an-array\"\n").unwrap();
+        assert!(load_permission_rules(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_hooks_full_round_trip() {
+        let dir = std::env::temp_dir().join(format!("kloop-hooks-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // Missing file / missing section: empty, no error.
+        assert_eq!(
+            load_hooks(Path::new("/nonexistent/kloop.toml")).unwrap(),
+            vec![]
+        );
+        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
+        assert_eq!(load_hooks(&path).unwrap(), vec![]);
+
+        std::fs::write(
+            &path,
+            r#"
+[[hooks]]
+event = "pre_tool"
+command = ["./guard.sh", "--strict"]
+matcher = "bash"
+timeout_ms = 5000
+
+[[hooks]]
+event = "post_turn"
+command = ["notify-send"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_hooks(&path).unwrap(),
+            vec![
+                HookDef {
+                    event: HookEvent::PreTool,
+                    command: vec!["./guard.sh".into(), "--strict".into()],
+                    matcher: Some("bash".into()),
+                    timeout_ms: 5000,
+                },
+                HookDef {
+                    event: HookEvent::PostTurn,
+                    command: vec!["notify-send".into()],
+                    matcher: None,
+                    timeout_ms: kloop_core::hooks::DEFAULT_TIMEOUT_MS,
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_hooks_rejects_malformed_entries() {
+        let dir = std::env::temp_dir().join(format!("kloop-hooks-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        for (tag, bad) in [
+            ("noevent", "[[hooks]]\ncommand = [\"x\"]\n"),
+            (
+                "badevent",
+                "[[hooks]]\nevent = \"on_tool\"\ncommand = [\"x\"]\n",
+            ),
+            ("nocmd", "[[hooks]]\nevent = \"pre_tool\"\n"),
+            (
+                "emptycmd",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = []\n",
+            ),
+            (
+                "cmdstr",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = \"x\"\n",
+            ),
+            (
+                "turnmatcher",
+                "[[hooks]]\nevent = \"pre_turn\"\ncommand = [\"x\"]\nmatcher = \"bash\"\n",
+            ),
+            (
+                "badtimeout",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"x\"]\ntimeout_ms = -1\n",
+            ),
+            (
+                "unknownkey",
+                "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"x\"]\nwhen = \"always\"\n",
+            ),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_hooks(&path).is_err(), "{tag} should fail");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
