@@ -267,3 +267,38 @@ depth-0 gating 生效:子 agent **不再 re-trigger**(改前会多一条 `[agent
 **片 2 挂账**:`allowed-tools`(需 cc→kloop 工具名映射表 + 限制 vs 授权定性)、`effort`(provider
 烘焙);其余同片 1 挂账(bundled 懒解压 / `paths` / 使用排名 / 远程 + MCP skills / `hooks`/`shell` /
 `` !`cmd` `` / `${CLAUDE_SESSION_ID}`)。
+
+## 完成记录(片 3,提交 <pending>)
+
+**scope**:片 2 挂账的 `allowed-tools` 落地(用户"继续"点名这项)。定性 = **限制**(scope 子
+agent 工具集,复用 `tool_allowlist`),**非授权**(不注入自动放行——那是供应链风险,片 2 教训 5)。
+只作用于 **fork skill**(inline 在主上下文跑、全工具,限制无意义,忽略)。
+
+**落地**:
+- `skills.rs`:`Skill.allowed_tools: Option<Vec<String>>`;`Frontmatter.allowed-tools` 收
+  `AllowedTools{List|Str}`(untagged;list 或 逗号/空格串,两形态生态都有);`map_tool_name`
+  **cc→kloop 工具名映射**(Read→read_file / Bash→bash / Grep→grep / Glob→glob / Write→write_file
+  / Edit→edit_file / WebFetch→web_fetch / WebSearch→web_search / Task→task / TodoWrite→todo_write
+  / BashOutput→bash_output / KillShell|KillBash→kill_bash / Skill→skill;**未知名透传**——
+  kloop 原生名 `read_file`、MCP 名 `srv__x` 直接匹配;cc scope 限定 `Bash(git:*)` 剥成 `bash`,
+  kloop 靠权限规则 scope 命令、不靠 skill 工具表)。
+- `task.rs` `fork_skill`:`allowed_tools` → 子 agent `tool_allowlist`(与 agent_type.tools 同款
+  限制;`read_offloaded` 恒可用不受限,`agents::tool_available` 的基建例外)。
+
+**真 key 验收(anthropic 轨,sonnet-5)**:`filecheck` fork skill(context:fork,
+`allowed-tools:[Read,Grep,Glob]`,body 让读文件报行数),prompt「how many lines does CLAUDE.md
+have」不点名 → 派 `agent-1` → **子 agent 用 `read_file`**(allowed)、**未碰 bash**(被限制掉)→
+返结果;父(全工具)随后自发 `bash wc -l` 复核——**证明限制精确 scope 到子 agent、父不受限**。
+
+**教训**:
+7. **生态兼容的"名字映射"要双向留活口:已知名映射、未知名透传**。`allowed-tools` 用 cc 工具名,
+   若只做"映射表命中才收、未命中丢弃",kloop 原生名(`read_file`)和 MCP 名(`srv__x`)会被误丢
+   → 限制过紧废掉 skill。正解 = 映射已知 cc 名 + 未知名原样透传(既认下载来的 cc 名、也认 kloop
+   原生/MCP 名),再 fail-soft(限制过紧只是少个工具、模型报"用不了",不静默腐蚀)。判据:跨生态
+   翻译一层标识符时,别做封闭映射(白名单丢弃),做开放映射(命中改写、未命中透传)。这是片 2
+   教训 5(cc 名≠kloop 名会破"下载即用")的正解补全。
+
+**片 3 挂账**:`effort`(provider 烘焙)、bundled 懒解压、`paths` 条件激活、使用频率排名、
+远程 + MCP skills、`hooks`/`shell` frontmatter、`` !`cmd` `` 内联 shell、`${CLAUDE_SESSION_ID}`、
+`user-invocable`/`disable-model-invocation` 开关(最小版两面都可,按需加)。**plan 28 核心生态位
+(模型自选 + 渐进披露 + inline/fork + 工具限制)已完整。**

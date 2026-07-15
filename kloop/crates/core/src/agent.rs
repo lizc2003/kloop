@@ -1582,6 +1582,64 @@ mod tests {
         );
     }
 
+    /// A fork skill's `allowed-tools` restricts its sub-agent's tool set (plan
+    /// 28 slice 3): the sub-agent is offered only the listed tools plus the
+    /// always-on read_offloaded, mapped from cc names to kloop's.
+    #[tokio::test]
+    async fn fork_skill_allowed_tools_restricts_subagent() {
+        use kloop_provider::MockTurn;
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Blocks(vec![tool_use_named(
+                "sk1",
+                "skill",
+                json!({"name": "search"}),
+            )]),
+            MockTurn::Blocks(text("found")), // sub-agent
+            MockTurn::Blocks(text("done")),  // parent
+        ]);
+        let mut cfg = (*compaction_cfg(provider, 200_000, "skills-allowed")).clone();
+        cfg.skills = Arc::new(vec![crate::skills::Skill {
+            name: "search".into(),
+            description: "Search, read-only.".into(),
+            body: "SEARCH_BODY do the search".into(),
+            dir: "/skills/search".into(),
+            context: crate::skills::SkillContext::Fork,
+            allowed_tools: Some(vec!["grep".into(), "read_file".into()]),
+            ..Default::default()
+        }]);
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+        assert_eq!(outcome.reason, EndReason::Completed);
+
+        let seen = seen.lock().unwrap();
+        let sub = seen
+            .iter()
+            .find(|r| {
+                r.messages.iter().any(|m| {
+                    matches!(
+                        &m.content[..],
+                        [ContentBlock::Text { text }] if text.contains("SEARCH_BODY")
+                    )
+                })
+            })
+            .expect("the sub-agent request carries the body");
+        let names: Vec<&str> = sub.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"grep") && names.contains(&"read_file"),
+            "allowed tools offered: {names:?}"
+        );
+        assert!(
+            names.contains(&"read_offloaded"),
+            "infra tool kept: {names:?}"
+        );
+        assert!(!names.contains(&"bash"), "restricted out: {names:?}");
+        assert!(!names.contains(&"write_file"), "restricted out: {names:?}");
+    }
+
     /// Code-mode end to end over Mock: the model emits one `run_program`
     /// tool_use whose program reads a file twice internally, then returns a
     /// summary. The next request to the model carries exactly one run_program

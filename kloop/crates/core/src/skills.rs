@@ -39,6 +39,13 @@ pub struct Skill {
     pub context: SkillContext,
     /// Model override for a `Fork` skill; None inherits the caller's model.
     pub model: Option<String>,
+    /// Tool allowlist for a `Fork` skill's sub-agent (plan 28 slice 3), mapped
+    /// from the frontmatter `allowed-tools` to kloop's tool names. `Some`
+    /// restricts the sub-agent to exactly these (plus the always-on
+    /// `read_offloaded`); None inherits the full set. Ignored for an `Inline`
+    /// skill, which runs in the caller's own context. This is a capability
+    /// restriction, not a permission grant — the tools still face the gate.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// A skill's execution mode (its `context` frontmatter field).
@@ -53,8 +60,8 @@ pub enum SkillContext {
     Fork,
 }
 
-/// Frontmatter fields we read. serde drops every other key (`allowed-tools`,
-/// `metadata`, `version`, …) for free — those are later slices.
+/// Frontmatter fields we read. serde drops every other key (`metadata`,
+/// `version`, `license`, …) for free — those are later slices.
 #[derive(Deserialize)]
 struct Frontmatter {
     #[serde(default)]
@@ -67,6 +74,18 @@ struct Frontmatter {
     /// Model override, honored only for a `fork` skill's sub-agent.
     #[serde(default)]
     model: Option<String>,
+    /// Tools a `fork` skill's sub-agent may use — a YAML list or a
+    /// space/comma-separated string (both appear in the wild).
+    #[serde(default, rename = "allowed-tools")]
+    allowed_tools: Option<AllowedTools>,
+}
+
+/// `allowed-tools` accepts either a list or a single string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AllowedTools {
+    List(Vec<String>),
+    Str(String),
 }
 
 impl Skill {
@@ -96,6 +115,21 @@ impl Skill {
             .model
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
+        let allowed_tools = fm.allowed_tools.and_then(|at| {
+            let raw = match at {
+                AllowedTools::List(v) => v,
+                // Split on comma or whitespace: `"Read, Bash"` and `"Read Bash"`
+                // both occur.
+                AllowedTools::Str(s) => s.split([',', ' ']).map(str::to_string).collect(),
+            };
+            let mapped: Vec<String> = raw
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(map_tool_name)
+                .collect();
+            (!mapped.is_empty()).then_some(mapped)
+        });
         Ok(Skill {
             name,
             description,
@@ -103,6 +137,7 @@ impl Skill {
             dir: dir.to_string(),
             context,
             model,
+            allowed_tools,
         })
     }
 
@@ -123,6 +158,33 @@ impl Skill {
             }
         })
     }
+}
+
+/// Map a cc / Agent-Skills tool name to kloop's, so a downloaded skill's
+/// `allowed-tools: [Read, Bash]` restricts the right kloop tools. Unknown names
+/// pass through unchanged (kloop-native names like `read_file` and MCP names
+/// like `srv__x` already match). A cc scope qualifier (`Bash(git:*)`) is
+/// dropped to the bare tool — kloop scopes commands through permission rules,
+/// not the skill's tool list.
+fn map_tool_name(name: &str) -> String {
+    let base = name.split('(').next().unwrap_or(name).trim();
+    match base {
+        "Read" => "read_file",
+        "Write" => "write_file",
+        "Edit" => "edit_file",
+        "Bash" => "bash",
+        "BashOutput" => "bash_output",
+        "KillShell" | "KillBash" => "kill_bash",
+        "Grep" => "grep",
+        "Glob" => "glob",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        "Task" => "task",
+        "TodoWrite" => "todo_write",
+        "Skill" => "skill",
+        other => other,
+    }
+    .to_string()
 }
 
 /// Split `content` into (frontmatter YAML, body) at the leading `---` fence.
@@ -375,6 +437,40 @@ mod tests {
         let weird =
             Skill::parse("s", "/s", "---\ndescription: d\ncontext: sideways\n---\nb").unwrap();
         assert_eq!(weird.context, SkillContext::Inline);
+    }
+
+    #[test]
+    fn parse_maps_allowed_tools() {
+        // List form: cc names map to kloop's, a scope qualifier is dropped, and
+        // kloop-native / MCP names pass through unchanged.
+        let list = Skill::parse(
+            "s",
+            "/s",
+            "---\ndescription: d\nallowed-tools:\n  - Read\n  - Bash(git log:*)\n  - srv__x\n  - read_file\n---\nb",
+        )
+        .unwrap();
+        assert_eq!(
+            list.allowed_tools.unwrap(),
+            vec!["read_file", "bash", "srv__x", "read_file"]
+        );
+        // String form: comma- or space-separated.
+        let str_form = Skill::parse(
+            "s",
+            "/s",
+            "---\ndescription: d\nallowed-tools: Read, Grep Bash\n---\nb",
+        )
+        .unwrap();
+        assert_eq!(
+            str_form.allowed_tools.unwrap(),
+            vec!["read_file", "grep", "bash"]
+        );
+        // Absent → None.
+        assert_eq!(
+            Skill::parse("s", "/s", "---\ndescription: d\n---\nb")
+                .unwrap()
+                .allowed_tools,
+            None
+        );
     }
 
     #[test]

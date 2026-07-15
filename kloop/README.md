@@ -957,8 +957,12 @@ A skill runs one of two ways (its `context` frontmatter field):
 - **`fork`**: the body runs as an **isolated sub-agent** (reusing the `task`
   machinery), and only its final result comes back — the skill's intermediate
   work (tool calls, scratch output) stays out of the delegating model's context.
-  A `model` frontmatter field overrides the sub-agent's model. A sub-agent can't
-  spawn one, so a fork skill triggered at depth ≥ 1 degrades to inline.
+  A `model` frontmatter field overrides the sub-agent's model, and
+  `allowed-tools` restricts its tool set (a YAML list or space/comma string; cc
+  tool names like `Read`/`Bash` are mapped to kloop's, kloop-native and MCP
+  names pass through) — a capability limit, not a permission grant, so the tools
+  still face the gate. A sub-agent can't spawn one, so a fork skill triggered at
+  depth ≥ 1 degrades to inline.
 
 Expansion substitutes `$ARGUMENTS` (the whole argument string), `$N` (the Nth
 shell-split word, 0-indexed), and `${CLAUDE_SKILL_DIR}` (the skill's directory,
@@ -972,12 +976,11 @@ skill's sub-agent and any tool an inline skill's instructions later prompt are
 each gated on their own.
 
 Skills converge across cc (full system) and claw (archived subsystem); the
-codex checkout has neither. **Not done** (deferred): `allowed-tools`
-(cc's tool names don't map to kloop's, so enforcing it would break downloaded
-skills — a later slice with a name map) and `effort` frontmatter, bundled files
-with lazy extraction, `paths` conditional activation, usage-frequency ranking,
-remote (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell
-expansion. See `docs/plan/28-skills.md`.
+codex checkout has neither. **Not done** (deferred): `effort`
+frontmatter (a provider-baked reasoning param), bundled files with lazy
+extraction, `paths` conditional activation, usage-frequency ranking, remote
+(`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell expansion,
+`${CLAUDE_SESSION_ID}` substitution. See `docs/plan/28-skills.md`.
 
 ## Running
 

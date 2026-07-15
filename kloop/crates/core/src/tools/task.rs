@@ -141,6 +141,12 @@ pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Re
     if let Some(model) = &skill.model {
         sub.model = model.clone();
     }
+    // `allowed-tools` restricts the sub-agent's tool set (like an agent_type's
+    // tools) — a capability limit, not a permission grant; read_offloaded stays
+    // available regardless (see `agents::tool_available`).
+    if let Some(tools) = &skill.allowed_tools {
+        sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
+    }
     let preview = format!("[skill:{}] {}", skill.name, task_preview(&body));
     run_sub_agent_sync(
         ctx,
