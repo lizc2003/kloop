@@ -540,6 +540,14 @@ pub(crate) fn defer_threshold_from_env() -> Result<usize> {
     }
 }
 
+/// Model resolution so one env file can drive both tracks: a provider-specific
+/// var (`ANTHROPIC_MODEL`/`OPENAI_MODEL`) wins over the shared `AGENT_MODEL`,
+/// which both providers would otherwise fight over. `None` when neither is set
+/// (anthropic then falls back to its default, openai errors).
+fn resolve_model(specific: Option<String>, generic: Option<String>) -> Option<String> {
+    specific.or(generic)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn config_from_env(
     args: &CliArgs,
@@ -639,14 +647,21 @@ pub(crate) fn config_from_env(
                 cache,
                 thinking,
             }),
-            model: std::env::var("AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into()),
+            model: resolve_model(
+                std::env::var("ANTHROPIC_MODEL").ok(),
+                std::env::var("AGENT_MODEL").ok(),
+            )
+            .unwrap_or_else(|| "claude-sonnet-5".into()),
             ..base.clone()
         })
     };
     let openai = |responses: bool| -> Result<Config> {
         let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
-        let model = std::env::var("AGENT_MODEL")
-            .context("AGENT_MODEL is required for the openai providers")?;
+        let model = resolve_model(
+            std::env::var("OPENAI_MODEL").ok(),
+            std::env::var("AGENT_MODEL").ok(),
+        )
+        .context("set OPENAI_MODEL or AGENT_MODEL for the openai providers")?;
         let base_url =
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
         let provider = if responses {
@@ -685,7 +700,8 @@ pub(crate) fn config_from_env(
             } else {
                 bail!(
                     "no provider configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
-                         (+ AGENT_MODEL), or run with --mock"
+                         (+ AGENT_MODEL or the per-provider ANTHROPIC_MODEL/OPENAI_MODEL), \
+                         or run with --mock"
                 )
             }
         }
@@ -744,6 +760,20 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_provider_model_wins_over_shared_agent_model() {
+        let s = |x: &str| Some(x.to_string());
+        // Provider-specific (ANTHROPIC_MODEL/OPENAI_MODEL) beats AGENT_MODEL.
+        assert_eq!(
+            resolve_model(s("claude-sonnet-4-6"), s("shared")),
+            s("claude-sonnet-4-6")
+        );
+        // No provider-specific: fall back to the shared AGENT_MODEL.
+        assert_eq!(resolve_model(None, s("shared")), s("shared"));
+        // Neither set: None — anthropic then defaults, openai errors.
+        assert_eq!(resolve_model(None, None), None);
+    }
 
     #[test]
     fn agent_types_parse_fields_and_reject_malformed() {

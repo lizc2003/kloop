@@ -1056,11 +1056,12 @@ nor a supported image is a clean error.
 Verified against real keys: sonnet-5 (anthropic, native embed) and a vision
 model (openai-chat, relocation) both read a secret token painted into a test PNG
 via `read_file`; the image inlines into the rollout (not offloaded) and replays
-correctly on `--resume`. MCP image results verified on the openai-chat rail
-end-to-end (a stub MCP tool returned a badge image; the model read its text),
-with the canonical `[text, image]` blocks inlined in the rollout. The Responses
-rail is covered by a unit-test contract (no official Responses endpoint to hit —
-same as slice 1 / plan 15).
+correctly on `--resume`. MCP image results verified end-to-end on both rails (a
+stub MCP tool returned a badge image; sonnet-5 via the native embed and
+gpt-5.4-mini via relocation both read its text), with the canonical
+`[text, image]` blocks inlined in the rollout. The Responses rail is covered by a
+unit-test contract (no official Responses endpoint to hit — same as slice 1 /
+plan 15).
 
 **Not done** (deferred): pasting / drag-drop into the TUI (`--image` is the
 entry point for now); client-side downscaling; a drop-images-when-unsupported
@@ -1074,7 +1075,8 @@ PDF/document blocks; remote-URL images; exposing `detail`. See
 # keyless demo: scripted Mock provider exercises all five bets (plain output)
 cargo run -- --mock
 
-# Anthropic (default model claude-sonnet-5; override with AGENT_MODEL)
+# Anthropic (default model claude-sonnet-5; override with ANTHROPIC_MODEL, or
+# the shared AGENT_MODEL)
 ANTHROPIC_API_KEY=... cargo run
 # prompt caching is on by default (cache_control breakpoints on the last
 # tool, the system block, and the last message block — the tool set outlives
@@ -1086,9 +1088,13 @@ ANTHROPIC_API_KEY=... cargo run
 # forces a mode (the budget form is for pre-adaptive models and raises
 # max_tokens by the budget)
 
-# any OpenAI-compatible endpoint (AGENT_MODEL required)
-OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
+# any OpenAI-compatible endpoint (OPENAI_MODEL, or the shared AGENT_MODEL,
+# required)
+OPENAI_API_KEY=... OPENAI_MODEL=gpt-5.2 cargo run
 # OPENAI_BASE_URL defaults to https://api.openai.com/v1
+# Per-provider model vars let one env file drive both tracks: ANTHROPIC_MODEL /
+# OPENAI_MODEL each win over the shared AGENT_MODEL, so switching AGENT_PROVIDER
+# auto-picks the matching model instead of both fighting over AGENT_MODEL
 # AGENT_PROVIDER=anthropic|openai|openai-responses forces a provider when
 # both keys are set; openai-responses speaks the /responses wire (stateless
 # store:false, reasoning replayed via encrypted_content) with the same
