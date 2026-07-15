@@ -124,5 +124,31 @@
 - **plan 31(✅ 完成,2026-07-15)** grep/glob 路径级保护:read deny + 敏感路径统一过滤读类工具输出(cc `getFileReadIgnorePatterns` 精神)。`Permissions::read_path_blocked(&Path)` = `PathFacts.sensitive` **或** 任一 deny 规则 `matches_path("read_file", …)`(复用现成机件;whole-tool `read_file` deny 也命中全部);grep/glob 在读内容前对每个命中文件跑一遍、命中即剔除,末尾 `[N path(s) hidden by deny/sensitive rules]`(输出过滤非权限门 ask——树遍历一次碰一堆文件,单路径 ask 不适配)。三决定取倾向(跳过+计数 / 复用 read deny / 敏感一并过滤);仅 `allow_all` 不过滤,`--yolo` 仍过滤(对齐门的 bypass 免疫)。单测 5 新(`cargo test --workspace` 482 绿);**真 key 双轨验收已过**(anthropic sonnet-4-6 + openai gpt-5.4-mini grep 敏感树,rollout 实据证 `.env` 秘密词/`.pem` 正文零泄、遮挡提示被模型逐字转述;sonnet-5 因 429 换 4.6)。挂账见 plan 不做节(独立 allow / `grep(<glob>)` 规则形 / 搜索根 ask 门 / 延伸进 bash cat/rg)。详见 plan 31 完成记录 + 教训 31。
 - **plan 30(✅ 决定不做,2026-07-15)** write_stdin(交互式后台进程):回源三家(codex 唯一有 `unified_exec`+`write_stdin` 且放行;cc/claw 无),用户选 **cc 的取舍——不开交互 stdin 通道**。后台 bash 保持现状(`stdin(Stdio::null())` 不动),要交互走"重构成一次性命令"(`python3 -c`/heredoc/管道,今天就支持)。理由三坑(REPL 逃逸不过门 / 裸管道对真交互程序半吊子要 PTY / 跨 turn 隐藏会话态)见教训 30 + plan 30 决策记录。真有痛感再重启,届时连 PTY 一起做 + 重估权限门。
 - **plan 28(✅ 片 1+2+3 完成,2026-07-15)** skills:模型按 `description` 自选的可复用 prompt 包,公开 Agent Skills 规范 `SKILL.md`(`serde_yaml_ng` 解析),"下载即用"。`.kloop/skills`(项目)+ `~/.kloop/skills`(全局)发现(不扫 `.claude/`);两触发面(模型 `skill` 工具 / 用户 `/name`)同一展开(`$ARGUMENTS`/`$N`/`${CLAUDE_SKILL_DIR}`);catalog 搭 `injected_context` 渐进披露(**depth-0 only**);inline 回灌成 tool_result 续跑。**片 2**:`context: fork` 正文作隔离子 agent 跑(复用 task,`model` 覆盖)、只回结果;`/name` 恒 inline;skills 收敛 depth-0(fork 观察反推,省子 agent token + 去 re-trigger)。**片 3**:`allowed-tools` 限制 fork 子 agent 工具集(cc 工具名映射→kloop、未知透传;复用 tool_allowlist,限制非授权)。真 key anthropic 轨验收已过(不点名自选[教训 18]+ `/name` 手调 + fork 隔离 + 限制精确 scope 子 agent)。**开工两次拍板**:片 1 载体走公开规范否掉 skill.toml + 用 YAML 库(教训 26);片 2 `allowed-tools`/`effort` 挂账(教训 27,片 3 已补 allowed-tools)。**挂账**:`effort`/bundled/`paths`/使用排名/远程+MCP skills/`` !`cmd` ``/`${CLAUDE_SESSION_ID}`/`user-invocable`+`disable-model-invocation`。核心生态位(自选+渐进披露+inline/fork+工具限制)已完整。详见 plan 28 完成记录。
+- **plan 33(备忘,未开工)** 非交互 exec 模式:headless 一次性执行——prompt 位置参数
+  /stdin 管道、`--json` 机器读事件流(倾向复用 server 通知 wire 形状,零新 schema)、
+  审批默认拒(headless 无 approver = deny,放宽走既有 `--yolo`/`--accept-edits`)、退
+  出码 0/1。cc `-p/--print` + codex 整个 `exec` crate 双家收敛;也是 `--mock` CI 端
+  到端与脚本/管道的入口。回源锚点在 plan 文件。
+- **plan 34(备忘,未开工)** MCP 远程传输:streamable HTTP——`[mcp.servers.<name>]`
+  加 `url`(与 `command` 互斥)+ `bearer_token_env_var`(明文 token 拒,codex 形)+
+  `http_headers`;初始化瞬时重试 + session-expired 重握手一次。cc(http=现行/sse=
+  legacy)与 codex(rmcp-client,不做旧 SSE)双家收敛;传输细节以 MCP 官方 spec 为
+  准(教训 9)。OAuth/旧版 SSE/ws 挂账。
+- **plan 35(备忘,未开工)** worktree 隔离:`task` 加 isolation 参数,
+  `.kloop/worktrees/<name>` + 每树一分支,未变更自动删 / 有变更保留 + 回灌报路径分支、
+  **绝不自动合**(两家收敛),创建失败 fail-closed;cwd 联动面(权限/沙箱 writable
+  root/指令文件/git 快照)开工逐项过。打开"并行改代码"生态位(教训 18);enter/exit
+  模型工具与陈旧清理挂账。
+- **plan 36(备忘,未开工)** 用户自定义 slash 命令(plan 23 挂账领编号):回源新事实
+  ——**cc 已把 `.claude/commands` 折进 skills 机制**(`loadedFrom:'commands_DEPRECATED'`),
+  独立 commands 系统不再成立;倾向 `.kloop/commands/*.md` 作 **skills 第二发现根**
+  (单文件即命令、frontmatter 可省、机制零新增)+ `!cmd`/`@file` 注入(全走权限门/
+  `read_path_blocked`,不开旁路)。形态总闸开工问用户。
+- **plan 37(备忘,未开工)** plan mode:权限模式三档 → 四档,加 `plan` 档**硬强制只
+  读**(写类/不可分析 bash 一律拒,deny/安全检查仍最先;cc 是权限硬强制、codex 是
+  prompt 软约束——形态分歧按教训 30 以 kloop 最硬契约[权限门]选 cc 形)+
+  `exit_plan_mode` 工具走审批环(计划文本进 `ConfirmRequest.preview`,白嫖 plan 21/25
+  弹层;批准切回前模式、拒绝留档继续规划)+ CLI `--plan`。enter_plan_mode 工具/plans
+  磁盘目录挂账;兑现 plan 8 "permission modes 全集暂不做"的挂账。
 
 不占编号的小事:首次推远端后看 CI 实跑一次绿(用户已暂缓)。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、`/cost` 累计花费(逐轮 usage 明细 + 每模型价目表,现只做了当前上下文大小)、图片输入余项(MCP 图结果 / client 端 resize / 模型视觉能力位检测 / PDF 块 / TUI 粘贴入口 / 暴露 detail,plan 29「不做」节)。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。
