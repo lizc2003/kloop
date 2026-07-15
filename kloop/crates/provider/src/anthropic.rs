@@ -265,3 +265,45 @@ pub(super) async fn stream(
     // without Done as retryable.
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kloop_protocol::ImageSource;
+    use kloop_protocol::Role;
+
+    /// The anthropic adapter serializes the protocol raw, so an image block
+    /// reaches the wire as `{type:"image", source:{type:"base64", …}}`. The
+    /// moving cache breakpoint may land on it (it is not a thinking block).
+    #[test]
+    fn image_block_serializes_and_takes_cache_breakpoint() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "aGk=".into(),
+                    },
+                },
+            ],
+        }];
+        assert_eq!(
+            messages_value(&messages, true),
+            json!([{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            }])
+        );
+    }
+}

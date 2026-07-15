@@ -6,6 +6,7 @@
 
 mod args;
 mod context;
+mod image;
 mod mcp;
 mod startup;
 mod ui;
@@ -30,6 +31,7 @@ use kloop_core::history::History;
 use kloop_core::skills::Skill;
 use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
+use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
 use crate::args::list_sessions;
@@ -106,6 +108,11 @@ async fn main() -> Result<()> {
         skills
     });
     if args.serve {
+        if !args.images.is_empty() {
+            eprintln!(
+                "\x1b[2m[--image ignored with --serve; send images via the RPC client]\x1b[0m"
+            );
+        }
         // Multi-session JSON-RPC server on stdio; each thread gets its own
         // Config (and thus its own permission gate + session cache).
         let factory: kloop_server::ConfigFactory = {
@@ -138,6 +145,17 @@ async fn main() -> Result<()> {
         &sessions_dir,
     )?;
 
+    // `--image` files are read + validated once, up front, so a bad path fails
+    // fast before any UI owns the terminal. They attach to the first user turn.
+    let pending_images = if args.mock {
+        if !args.images.is_empty() {
+            eprintln!("\x1b[2m[--image ignored with --mock]\x1b[0m");
+        }
+        Vec::new()
+    } else {
+        image::load_images(&args.images)?
+    };
+
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
@@ -150,6 +168,7 @@ async fn main() -> Result<()> {
             sandbox,
             agent_types,
             skills,
+            pending_images,
         )
         .await;
     }
@@ -171,6 +190,7 @@ async fn main() -> Result<()> {
         },
         history,
         session_id,
+        pending_images,
     )
     .await
 }
@@ -195,6 +215,7 @@ async fn plain_main(
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     agent_types: Arc<Vec<AgentType>>,
     skills: Arc<Vec<Skill>>,
+    pending_images: Vec<ContentBlock>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let mut cfg = config_from_env(
@@ -226,6 +247,8 @@ async fn plain_main(
         "kloop — session {session_id}; type a task, /help for commands, \
          'exit' or Ctrl+D to quit, Ctrl+C to interrupt a running turn"
     );
+    // `--image` blocks ride the first user turn; taken once, then empty.
+    let mut pending_images = pending_images;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         print!("> ");
@@ -259,7 +282,12 @@ async fn plain_main(
             }
         }
 
-        history.record(Message::user_text(line));
+        let msg = if pending_images.is_empty() {
+            Message::user_text(line)
+        } else {
+            Message::user_with_blocks(line, std::mem::take(&mut pending_images))
+        };
+        history.record(msg);
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c(cancel.clone());
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;

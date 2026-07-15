@@ -9,6 +9,7 @@ kloop-protocol = { workspace = true }
 kloop-provider = { workspace = true }
 
 anyhow = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
 grep-regex = { workspace = true }

@@ -34,6 +34,7 @@ use kloop_core::rollout::fork_session;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::session_id_of;
 use kloop_core::Config;
+use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
 use crate::app::App;
@@ -87,6 +88,7 @@ pub async fn run(
     make_config: impl FnOnce(Arc<dyn Approver>, NoteFn) -> Result<Config>,
     history: History,
     session_id: String,
+    pending_images: Vec<ContentBlock>,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let channel_ui = Arc::new(ChannelUi::new(event_tx.clone()));
@@ -110,6 +112,7 @@ pub async fn run(
         channel_ui as Arc<dyn Ui>,
         msg_rx,
         event_tx,
+        pending_images,
     ));
 
     let mut terminal = setup_terminal()?;
@@ -137,11 +140,18 @@ async fn agent_worker(
     ui: Arc<dyn Ui>,
     mut msgs: mpsc::UnboundedReceiver<WorkerMsg>,
     events: mpsc::UnboundedSender<AgentEvent>,
+    // `--image` blocks ride the first user turn; taken once, then empty.
+    mut pending_images: Vec<ContentBlock>,
 ) {
     while let Some(msg) = msgs.recv().await {
         match msg {
             WorkerMsg::Turn(turn) => {
-                history.record(Message::user_text(turn.text));
+                let msg = if pending_images.is_empty() {
+                    Message::user_text(turn.text)
+                } else {
+                    Message::user_with_blocks(turn.text, std::mem::take(&mut pending_images))
+                };
+                history.record(msg);
                 let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
                 if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
                     return;

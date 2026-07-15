@@ -86,6 +86,7 @@ async fn mock_end_to_end_three_rounds() {
                     ContentBlock::RedactedThinking { .. } => "redacted_thinking",
                     ContentBlock::ToolUse { .. } => "tool_use",
                     ContentBlock::ToolResult { .. } => "tool_result",
+                    ContentBlock::Image { .. } => "image",
                 })
                 .collect();
             (m.role, kinds)

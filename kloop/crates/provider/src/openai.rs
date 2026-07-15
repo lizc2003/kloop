@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use super::is_overflow_message;
 use super::sse::SseParser;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
@@ -42,7 +43,9 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                         // accept one (deepseek's reasoning_content) tolerate
                         // its absence.
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
-                        ContentBlock::ToolResult { .. } => {}
+                        // Assistant messages never carry images (top-level
+                        // images ride on user messages).
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
                     }
                 }
                 let mut m = json!({"role": "assistant"});
@@ -58,8 +61,10 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
             }
             Role::User => {
                 // Tool results must directly follow the assistant tool_calls
-                // message, so they go first; trailing text becomes a user msg.
+                // message, so they go first; trailing text/images become a
+                // user msg.
                 let mut text = String::new();
+                let mut images = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::ToolResult {
@@ -79,13 +84,37 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                             }));
                         }
                         ContentBlock::Text { text: t } => text.push_str(t),
+                        // Chat/completions carries images as a data-URL part.
+                        // detail=auto matches the OpenAI default (Anthropic has
+                        // no detail; kloop does not expose it yet).
+                        ContentBlock::Image {
+                            source: ImageSource::Base64 { media_type, data },
+                        } => images.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{media_type};base64,{data}"),
+                                "detail": "auto",
+                            },
+                        })),
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ToolUse { .. } => {}
                     }
                 }
-                if !text.is_empty() {
-                    out.push(json!({"role": "user", "content": text}));
+                // With images the content is an array of parts (text first,
+                // then images); without, a plain string keeps the common case
+                // byte-identical to the pre-image wire form.
+                if images.is_empty() {
+                    if !text.is_empty() {
+                        out.push(json!({"role": "user", "content": text}));
+                    }
+                } else {
+                    let mut parts = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    parts.extend(images);
+                    out.push(json!({"role": "user", "content": parts}));
                 }
             }
         }
@@ -338,5 +367,42 @@ mod tests {
         }])];
         let out = to_openai_messages("s", &messages);
         assert!(out[1]["content"].is_null());
+    }
+
+    /// A user message with an image becomes a content-parts array: the text
+    /// part first, then an image_url whose url is a base64 data URL with
+    /// detail=auto (the OpenAI default; Anthropic has no detail field).
+    #[test]
+    fn user_image_becomes_image_url_data_url() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "aGk=".into(),
+                    },
+                },
+            ],
+        }];
+        assert_eq!(
+            to_openai_messages("s", &messages),
+            vec![
+                json!({"role": "system", "content": "s"}),
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64,aGk=",
+                            "detail": "auto",
+                        }},
+                    ],
+                }),
+            ]
+        );
     }
 }

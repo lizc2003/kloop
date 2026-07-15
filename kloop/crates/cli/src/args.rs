@@ -52,6 +52,9 @@ pub(crate) struct CliArgs {
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
+    /// `--image <path>` (repeatable): local image files attached to the first
+    /// user turn. Read + validated after parsing; remote URLs are refused.
+    pub(crate) images: Vec<PathBuf>,
     pub(crate) session: SessionChoice,
 }
 
@@ -63,6 +66,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         list_sessions: false,
         plain: false,
         serve: false,
+        images: Vec::new(),
         session: SessionChoice::New,
     };
     let mut i = 0;
@@ -74,6 +78,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
+            "--image" => {
+                let path = match args.get(i + 1) {
+                    Some(path) if !path.starts_with('-') => path,
+                    _ => bail!("--image needs a file path"),
+                };
+                i += 1;
+                parsed.images.push(PathBuf::from(path));
+            }
             "--continue" => parsed.session = SessionChoice::Continue,
             "--resume" => {
                 parsed.session = match args.get(i + 1) {
@@ -104,7 +116,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                 };
             }
             other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --image <path> | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
         }
         i += 1;
@@ -251,6 +263,7 @@ mod tests {
                 list_sessions: false,
                 plain: false,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::New,
             }
         );
@@ -263,6 +276,7 @@ mod tests {
                 list_sessions: false,
                 plain: false,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::Pick,
             }
         );
@@ -275,6 +289,7 @@ mod tests {
                 list_sessions: false,
                 plain: false,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::Continue,
             }
         );
@@ -287,6 +302,7 @@ mod tests {
                 list_sessions: false,
                 plain: false,
                 serve: true,
+                images: vec![],
                 session: SessionChoice::New,
             }
         );
@@ -299,6 +315,7 @@ mod tests {
                 list_sessions: false,
                 plain: true,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::Resume("20260709-120000".into()),
             }
         );
@@ -311,6 +328,7 @@ mod tests {
                 list_sessions: true,
                 plain: false,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::New,
             }
         );
@@ -323,6 +341,7 @@ mod tests {
                 list_sessions: false,
                 plain: false,
                 serve: false,
+                images: vec![],
                 session: SessionChoice::Fork {
                     id: "20260709-120000".into(),
                     cut: Some(4),
@@ -337,6 +356,17 @@ mod tests {
                 id: "20260709-120000".into(),
                 cut: None,
             }
+        );
+        // --image is repeatable and collects local paths in order.
+        assert_eq!(
+            parse_args(&strings(&["--image", "a.png", "--image", "b.jpg"]))
+                .unwrap()
+                .images,
+            vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")]
+        );
+        assert!(
+            parse_args(&strings(&["--image"])).is_err(),
+            "--image needs a path"
         );
         assert!(parse_args(&strings(&["--fork"])).is_err(), "id required");
         assert!(

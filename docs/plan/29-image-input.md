@@ -133,3 +133,59 @@ fmt/clippy/test 全绿,一次 commit;真 key 双轨验收(至少 anthropic 轨:�
 截图让它描述/据图改代码;openai 轨给视觉模型同任务);README 同步图片用法与三轨/限额;
 本文件补完成记录(提交号 + 挂账);HANDOFF 补教训(尤其 `ToolResult` String→blocks 改造
 的前向兼容、三轨 detail 归一、Chat 轨 tool_result 降级选型)。
+
+## 完成记录(片 1,提交 `ed088d0`)
+
+**范围**:只做片 1(用户顶层图,不碰 `ToolResult`)。片 2(工具读图 + Chat 轨降级 +
+`ToolResult` String→blocks)整体挂账留下一会话。
+
+**决定落地**:
+1. 入口:CLI `--image <path>`(可重复),读盘 + 校验后附到**首个 user 消息**(`plain`
+   与 TUI worker 各持 `pending_images`,首个真 user turn `std::mem::take` 一次;`--mock`/
+   `--serve` 忽略并告警——server 由 client 经 RPC 给图)。远程 URL(http/https 前缀)入口
+   直接拒(只收本地读盘 base64,SSRF 面天然窄,随 codex)。
+2. `ToolResult` 未动(片 1 无降级需求)。
+3. read_file 未动(片 2 再定 view_image vs 判 MIME)。
+4. Chat 轨降级:片 1 无(user 顶层图三轨都原生保留)。
+5. **detail 字段:片 1 不进 protocol**,openai/responses 翻译时发常量 `detail:"auto"`
+   (对齐 OpenAI 默认;anthropic 无此字段)。理由:片 1 CLI 不暴露 detail,`Option<detail>`
+   会是恒 None 死字段;发 `"auto"` 常量已满足三轨契约。**偏离 plan 倾向("内部块带
+   Option<detail>")**——未来真有来源(view_image / CLI 暴露)时给 `Image` 块加字段(内容
+   块字段前向兼容,serde default),openai/responses 只替换那个常量。记挂账。
+
+**改造点**(与 plan 15 thinking 同模式:protocol 加块 + 双/三轨翻译 + 前向兼容):
+- `protocol`:`ContentBlock::Image { source: ImageSource }` + `ImageSource::Base64
+  { media_type, data }`(tag 形,留 `url` 变体余地);`Message::user_with_blocks(text,
+  blocks)`(text 前、附件后;空 text = 纯图消息)。canonical = anthropic wire,序列化即
+  `{type:"image", source:{type:"base64", media_type, data}}`。
+- `core/src/image.rs`(新,纯函数,片 2 view_image 可复用):`detect_media_type`(magic
+  bytes 嗅探,**不信扩展名**:png/jpeg/gif/webp;WEBP=RIFF+偏移 8 WEBP;短 buffer 不
+  panic)、`MAX_IMAGE_BYTES=5MiB`、`image_block_from_bytes`(校验格式+大小→base64→块)。
+  依赖:新引 `base64`(第 3 个功能依赖——标准编码,自写不如引 crate,已在依赖树)。
+- 三轨:**anthropic 零改动**(`serde_json::to_value(messages)` 生 serialize,Image 天然对
+  齐;加 unit test 锁契约,cache 断点可落在 image 块——非 thinking);**openai-chat** user
+  content 有图时变 parts 数组(text part + `image_url` data URL + `detail:"auto"`),无图仍
+  纯 string(旧 wire 逐字节不变);**responses** user content 数组加 `input_image`
+  (`image_url` data URL + `detail:"auto"`)。两 adapter 的 Assistant 分支加 Image 忽略分支
+  (assistant 不产顶层图)。
+- 持久化:**image 块天然不走 offload**(`History::record` 的 offload 只判 `ToolResult`),
+  base64 内联进 rollout;token 记账走既有 `estimate_message_tokens`(按 serialized base64
+  长度,plan D 同法)。
+- TUI:`cells_from_history` 给 resume 的 user 图加 `[image: {media_type}]` 占位行(base64
+  不打印);**实时 `--image` 首个 turn 的转录占位挂账**(UI loop 的 Cell::User 不感知
+  pending_images;模型回应已确认收图)。
+
+**真 key 验收(双轨过)**:测试图 PNG 画秘密词 `KLOOP-VISION-7F3Q`(模型不可能猜)。
+- **anthropic 轨**(claude-sonnet-5):`--plain --image` → 模型逐字读出秘密词 + 第二行。
+- **openai-chat 轨**(自建代理 + gpt-5.4-mini):同任务、同样读出秘密词。
+- **rollout 内联**:两轨 session 文件均含 image 块(base64 3348 字符、`offloaded=false`)。
+- **resume 重放**:`--plain --resume <id>` 后追问"图里第二行是什么",模型答 `sonnet sees
+  this`——证明 rollout 内联的 image 块 resume 时正确重送。
+- **responses 轨真 key 挂账**:env.local 的 OPENAI_BASE_URL 是 openai-compat 代理(chat/
+  completions),非 Responses 端点;responses 轨的 `input_image` 有单测契约覆盖,真 key 待
+  官方 Responses 端点(与 plan 15 responses 轨挂账同因)。
+
+**挂账(片 1 之外)**:片 2(工具读图:view_image / MCP 图结果 + `ToolResult` String→
+blocks + Chat 轨"搬运"降级 + 模型视觉能力位检测);client 端 resize/降采样;image-cache 落
+盘指针;"看完即弃/不支持则剥离"省 token;PDF/document 块;远程 URL 图;单请求媒体数上限裁
+剪(≤100);TUI 粘贴/拖拽入口 + 实时 turn 转录图占位;暴露 `detail`。

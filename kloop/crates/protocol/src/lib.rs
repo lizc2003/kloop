@@ -35,6 +35,14 @@ pub enum ContentBlock {
     RedactedThinking {
         data: String,
     },
+    /// An image supplied by the user (top-level) or, later, read by a tool.
+    /// The canonical shape is Anthropic's: a tagged `source`. The OpenAI-compat
+    /// and Responses adapters translate it into their data-URL shapes at their
+    /// edge. Images are never offloaded (unlike large ToolResult text): the
+    /// base64 must reach the model as-is, so it inlines into the rollout.
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -48,6 +56,18 @@ pub enum ContentBlock {
     },
 }
 
+/// Where an image's bytes come from. Only inline base64 is accepted (remote
+/// URLs are refused at the entry point — SSRF surface, matching codex), but the
+/// tagged wire shape leaves room for `url` later without a breaking change.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    /// Anthropic's `{type:"base64", media_type, data}` — data and media_type
+    /// separate. `media_type` is one of image/png|jpeg|gif|webp; `data` is the
+    /// standard-alphabet base64 of the raw image bytes (no data-URL prefix).
+    Base64 { media_type: String, data: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -59,6 +79,23 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// A user message carrying `text` plus trailing content blocks (images
+    /// supplied via `--image`). Empty text contributes no text block, so an
+    /// image-only message is valid; the text leads so the model reads the ask
+    /// before the attachments.
+    pub fn user_with_blocks(text: impl Into<String>, blocks: Vec<ContentBlock>) -> Self {
+        let text = text.into();
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        content.extend(blocks);
+        Self {
+            role: Role::User,
+            content,
         }
     }
 
@@ -184,6 +221,22 @@ mod tests {
             .unwrap(),
             json!({"type": "redacted_thinking", "data": "blob"})
         );
+        // Image serializes straight to the Anthropic wire shape: a tagged
+        // base64 source with media_type and data separate. The anthropic
+        // adapter serializes the protocol raw, so this IS the request shape.
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            })
+            .unwrap(),
+            json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+            })
+        );
         // is_error omitted when false, present when true.
         assert_eq!(
             serde_json::to_value(ContentBlock::ToolResult {
@@ -238,6 +291,67 @@ mod tests {
         assert_eq!(Message::assistant(vec![]).role, Role::Assistant);
         // Tool results ride on a user message per the wire contract.
         assert_eq!(Message::tool_results(vec![]).role, Role::User);
+    }
+
+    /// An image block survives the serde roundtrip whole, and reading a message
+    /// with no image (the pre-image rollout shape) still works — forward
+    /// compatibility for old session files.
+    #[test]
+    fn image_block_roundtrips_and_old_rollout_still_reads() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "/9j/4AAQ".into(),
+                    },
+                },
+            ],
+        };
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), msg);
+        // A rollout line written before images existed carries no image block
+        // and reads back unchanged.
+        let old = r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#;
+        assert_eq!(
+            serde_json::from_str::<Message>(old).unwrap(),
+            Message::user_text("hi")
+        );
+    }
+
+    #[test]
+    fn user_with_blocks_leads_with_text_and_allows_image_only() {
+        let img = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
+        };
+        // Text leads, then attachments.
+        assert_eq!(
+            Message::user_with_blocks("look", vec![img.clone()]),
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "look".into()
+                    },
+                    img.clone()
+                ],
+            }
+        );
+        // Empty text contributes no text block: an image-only message.
+        assert_eq!(
+            Message::user_with_blocks("", vec![img.clone()]),
+            Message {
+                role: Role::User,
+                content: vec![img],
+            }
+        );
     }
 
     /// total() is the full context size: cached prompt tokens still occupy

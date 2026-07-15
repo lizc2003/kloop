@@ -982,6 +982,45 @@ extraction, `paths` conditional activation, usage-frequency ranking, remote
 (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell expansion,
 `${CLAUDE_SESSION_ID}` substitution. See `docs/plan/28-skills.md`.
 
+## Image input (Phase 2, twentieth slice)
+
+The target models see (sonnet-5, OpenAI vision models); kloop can now feed them
+images. `--image <path>` (repeatable) attaches local image files to the first
+user turn:
+
+```sh
+cargo run -- --image screenshot.png        # then ask "what's in this screenshot?"
+cargo run -- --image a.png --image b.jpg   # multiple images ride one turn
+```
+
+- **Accepted**: png / jpeg / gif / webp, sniffed from magic bytes (not the
+  extension), each ≤ 5 MiB. Oversized images are refused (client-side resizing
+  is deferred — shrink and retry). Only local files: a path that looks like a
+  remote URL is refused outright, keeping the SSRF surface narrow (matching
+  codex, which also takes base64 only).
+- **Three rails, one canonical block** (`Image { source: Base64 { media_type,
+  data } }`, Anthropic's shape): the anthropic adapter serializes it straight to
+  `{type:"image", source:{type:"base64", …}}`; openai-chat translates to an
+  `image_url` data URL (`data:{mime};base64,{data}`, `detail:"auto"`); Responses
+  to `{type:"input_image", image_url:"data:…", detail:"auto"}`. Anthropic has no
+  `detail` field, and kloop does not expose it yet (defaulting the OpenAI rails
+  to `auto`).
+- **Persistence**: images inline into the rollout as base64 — never offloaded,
+  unlike large tool output, because the bytes must reach the model as-is. So
+  `--resume` replays them and the model can still refer back to an image from an
+  earlier turn. The TUI transcript shows a `[image: {media_type}]` placeholder
+  for a resumed image (the base64 is not printed).
+
+Verified against real keys on two rails: sonnet-5 (anthropic) and a vision model
+(openai-chat) both read a secret token painted into a test PNG, and the image
+replays correctly on `--resume`.
+
+**Not done** (deferred): pasting / drag-drop into the TUI (`--image` is the
+entry point for now); tool-read images (a `view_image` tool / MCP image results
+— slice 2); client-side downscaling; a drop-images-when-unsupported token saver;
+per-request media-count cap; PDF/document blocks; remote-URL images; exposing
+`detail`. See `docs/plan/29-image-input.md`.
+
 ## Running
 
 ```sh
@@ -1012,6 +1051,9 @@ OPENAI_API_KEY=... AGENT_MODEL=gpt-5.2 cargo run
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
+
+# attach local images to the first user turn (repeatable) — see Image input
+cargo run -- --image screenshot.png
 
 # multi-session JSON-RPC server on stdio (see Server mode)
 cargo run -- --serve

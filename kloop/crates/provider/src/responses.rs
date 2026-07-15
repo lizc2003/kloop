@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use super::is_overflow_message;
 use super::sse::SseParser;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
@@ -69,14 +70,16 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                             "name": name,
                             "arguments": serde_json::to_string(input).unwrap_or_default(),
                         })),
-                        ContentBlock::ToolResult { .. } => {}
+                        // Assistant messages never carry images.
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
                     }
                 }
             }
             Role::User => {
                 // Tool outputs must directly follow their calls; trailing
-                // text becomes a user message item.
+                // text/images become a user message item.
                 let mut text = String::new();
+                let mut images = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::ToolResult {
@@ -96,16 +99,30 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                             }));
                         }
                         ContentBlock::Text { text: t } => text.push_str(t),
+                        // Responses carries images as an input_image data URL.
+                        // detail=auto matches the OpenAI default.
+                        ContentBlock::Image {
+                            source: ImageSource::Base64 { media_type, data },
+                        } => images.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{media_type};base64,{data}"),
+                            "detail": "auto",
+                        })),
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ToolUse { .. } => {}
                     }
                 }
-                if !text.is_empty() {
+                if !text.is_empty() || !images.is_empty() {
+                    let mut content = Vec::new();
+                    if !text.is_empty() {
+                        content.push(json!({"type": "input_text", "text": text}));
+                    }
+                    content.extend(images);
                     out.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": text}],
+                        "content": content,
                     }));
                 }
             }
@@ -341,6 +358,41 @@ mod tests {
                     "content": [{"type": "input_text", "text": "and hurry"}],
                 }),
             ]
+        );
+    }
+
+    /// A user message with an image becomes a message item whose content
+    /// holds an input_text part then an input_image data URL with detail=auto.
+    #[test]
+    fn user_image_becomes_input_image_data_url() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/webp".into(),
+                        data: "d2VicA==".into(),
+                    },
+                },
+            ],
+        }];
+        assert_eq!(
+            to_input_items(&messages),
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/webp;base64,d2VicA==",
+                        "detail": "auto",
+                    },
+                ],
+            })]
         );
     }
 

@@ -15,6 +15,7 @@ use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
 use kloop_core::tools::TodoStatus;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
 use tokio::sync::oneshot;
@@ -558,6 +559,16 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
             match (message.role, block) {
                 (Role::User, ContentBlock::Text { text }) => {
                     cells.push(Cell::User(text.clone()));
+                }
+                // A user image replays as a placeholder line: the base64 is not
+                // shown, only that an image rode this turn.
+                (
+                    Role::User,
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 { media_type, .. },
+                    },
+                ) => {
+                    cells.push(Cell::User(format!("[image: {media_type}]")));
                 }
                 (Role::Assistant, ContentBlock::Text { text }) => {
                     cells.push(Cell::Assistant(text.clone()));
@@ -1273,6 +1284,29 @@ mod tests {
             cells_from_history(&[]),
             vec![],
             "fresh session: no cells, no note"
+        );
+    }
+
+    /// A resumed user turn carrying an image replays as a placeholder line
+    /// (media type, not the base64), alongside its text.
+    #[test]
+    fn cells_from_history_shows_image_placeholder() {
+        let messages = vec![Message::user_with_blocks(
+            "what is this",
+            vec![ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            }],
+        )];
+        assert_eq!(
+            cells_from_history(&messages),
+            vec![
+                Cell::User("what is this".into()),
+                Cell::User("[image: image/png]".into()),
+                Cell::Note("resumed session — 1 message(s)".into()),
+            ]
         );
     }
 
