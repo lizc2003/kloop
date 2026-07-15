@@ -466,6 +466,18 @@ newest-first sort happens before the cap so truncation drops the stalest
 files, not the freshest. cc has no LS tool anymore; kloop follows (bash `ls`
 is already read-only-whitelisted).
 
+Both read tools honor the read gate's blocklist uniformly (cc's
+`getFileReadIgnorePatterns`; `Permissions::read_path_blocked`, plan 31): a file
+covered by a `read_file` deny rule (`read_file(**/*.pem)`, or the whole-tool
+`read_file` form) or on the sensitive-path list (`.env*`, `.ssh`, `.git`,
+`.kloop`, …) is dropped from grep/glob output — before its contents are read —
+so a deny meant for reads is not slipped by grep, and secrets do not leak
+through a search. The dropped count is reported (`[N path(s) hidden by
+deny/sensitive rules]`) rather than silently swallowed. This is an output
+filter, not an approval prompt (a tree walk touches too many paths for the
+gate's one-path ask); it applies in every mode but `--mock`, `--yolo`
+included.
+
 ## Background bash (Phase 2, tenth slice)
 
 `bash` takes `run_in_background`: the command starts in its own process

@@ -426,6 +426,32 @@ impl Permissions {
         }
     }
 
+    /// Whether a read-class tool (grep/glob) must hide this path from its
+    /// output. cc's `getFileReadIgnorePatterns`: the read-ignore set is one
+    /// verdict that every read tool honors uniformly, not a rule written per
+    /// tool. So a `read_file` deny (`read_file(**/*.pem)`, or the whole-tool
+    /// `read_file` form) and the sensitive-path list (`.env`/`.ssh`/…) both
+    /// apply here — the same read-accessibility judgment the gate makes for
+    /// `read_file`, but as an output filter instead of an ask (the gate's ask
+    /// granularity is one path; a tree walk touches many, so grep/glob drop
+    /// blocked hits and report the count rather than prompting).
+    ///
+    /// deny and the sensitive list survive every mode but `allow_all`
+    /// (tests/`--mock`, where nothing is gated); `--yolo` (Bypass) still
+    /// filters, mirroring the gate where deny and safety checks are
+    /// bypass-immune.
+    pub fn read_path_blocked(&self, path: &Path) -> bool {
+        if self.allow_everything {
+            return false;
+        }
+        let facts = PathFacts::gather(path, &self.cwd);
+        facts.sensitive
+            || self
+                .deny
+                .iter()
+                .any(|r| r.matches_path("read_file", &facts))
+    }
+
     /// The escalation loop's consent step (codex's retry-on-denial): a
     /// bash command the OS sandbox contained failed in a denial-shaped way;
     /// ask whether to re-run it without the sandbox. The command already
@@ -520,7 +546,7 @@ impl CallFacts {
             .then(|| {
                 input["path"]
                     .as_str()
-                    .map(|raw| PathFacts::gather(raw, cwd))
+                    .map(|raw| PathFacts::gather(Path::new(raw), cwd))
             })
             .flatten();
         CallFacts { bash, path }
@@ -585,8 +611,8 @@ impl CallFacts {
 }
 
 impl PathFacts {
-    fn gather(raw: &str, cwd: &Path) -> Self {
-        let normalized = lexical_normalize(cwd, Path::new(raw));
+    fn gather(raw: &Path, cwd: &Path) -> Self {
+        let normalized = lexical_normalize(cwd, raw);
         let relative = normalized.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
         let sensitive = path_is_sensitive(&normalized);
@@ -1464,6 +1490,33 @@ mod tests {
         assert!(!s("/w/proj/src/main.rs"));
         assert!(!s("/w/proj/git/readme.md"), "git dir ≠ .git dir");
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
+    }
+
+    #[tokio::test]
+    async fn read_path_blocked_hides_sensitive_and_read_deny_paths() {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Default,
+            rules(&[], &["read_file(**/*.pem)"], &[]),
+            approver.clone(),
+        );
+        let b = |path: &str| p.read_path_blocked(Path::new(path));
+        // sensitive list — filtered whatever the deny rules say
+        assert!(b("/work/proj/.env"));
+        assert!(b("/work/proj/config/.env.local"));
+        assert!(b("/work/proj/.ssh/id_rsa"));
+        // read_file deny glob — matched via the cwd-relative path
+        assert!(b("/work/proj/certs/server.pem"));
+        assert!(b("/work/proj/secret.pem"));
+        // ordinary readable files pass
+        assert!(!b("/work/proj/src/main.rs"));
+        assert!(!b("/work/proj/notes.txt"));
+
+        // whole-tool `read_file` deny hides every path (grep can't read what
+        // read_file can't); `--mock`/tests (`allow_all`) filter nothing.
+        let p = gate(Mode::Default, rules(&[], &["read_file"], &[]), approver);
+        assert!(p.read_path_blocked(Path::new("/work/proj/src/main.rs")));
+        assert!(!Permissions::allow_all().read_path_blocked(Path::new("/x/.env")));
     }
 
     #[test]

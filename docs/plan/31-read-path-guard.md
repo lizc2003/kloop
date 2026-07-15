@@ -68,3 +68,53 @@ fmt/clippy/test 全绿,一次 commit;README 同步"读类工具统一尊重 deny
 补完成记录(提交号 + 挂账);HANDOFF 补教训(路径级保护从"权限门单路径 ask"扩到"读类工
 具输出过滤"这个粒度转换)。真 key 非必需(纯本地判定,单测足够;可选验一次模型 grep 敏
 感目录被遮挡后的表现)。
+
+## 完成记录(2026-07-15,提交号见 git)
+
+**落点与三决定全按倾向落地**:①命中即**跳过该文件**+计数提示(非整调用拒绝);②**复用
+read_file 的 deny**(不新增 `grep()`/`glob()` 规则形);③`path_is_sensitive` 一并过滤。
+
+**实现**:
+- `permissions.rs`:新增 `pub fn read_path_blocked(&self, path: &Path) -> bool` =
+  `allow_everything`(mock/测试)则不过滤;否则 `PathFacts.sensitive` **或** 任一 deny 规则
+  `matches_path("read_file", …)`。**复用现成机件**:`PathFacts::gather` 签名从 `&str` 改收
+  `&Path`(唯一调用点 `CallFacts::gather` 同步改),`Rule::matches_path` 原样复用——**故
+  whole-tool `read_file` deny 也命中全部路径**(比 plan 原文"deny PathGlob"更宽:read_file
+  整工具被 deny 时 grep 读文件内容是同一能力,理应一并遮;PathGlob 是主用例)。同步/无
+  网络,可直接跑在 `spawn_blocking` 里。
+- `tools/search.rs`:`grep_tool`/`glob_tool` 各加 `perms: Arc<Permissions>` 参;`run_grep`/
+  `run_glob` 在 `is_file()` 后、**读内容前**跑 `read_path_blocked`,命中则 `hidden += 1;
+  continue`;末尾 `hidden > 0` 追加 `\n\n[N path(s) hidden by deny/sensitive rules]`
+  (`hidden_note`)。**过滤在读内容之前**——敏感文件内容一字不落盘/不进上下文。
+- `tools/mod.rs`:两处 dispatch 传 `ctx.cfg.permissions.clone()`。
+
+**决定/取舍沉淀**:
+- **粒度转换**:read 侧保护从"权限门对单路径 ask"变成"读类工具对命中集做减法过滤"——
+  ask 语义(一路径一问)不适配一次碰一堆文件的树遍历,cc 的 `getFileReadIgnorePatterns`
+  正是"读忽略集,读类统一尊重",不是每工具各写规则。
+- **模式覆盖**:只有 `allow_all`(`--mock`/测试)完全不过滤;`--yolo`(Bypass)**仍过滤**
+  ——对齐权限门 deny/safety check 的 bypass 免疫(读 deny + 敏感是安全属性,不被 --yolo 盖
+  过)。read_file 自身行为不变(它已在门上被拦)。
+
+**验证**:fmt/clippy/`cargo test --workspace` 全绿(core 301 测,含 5 新测:permissions 侧
+`read_path_blocked` 单元覆盖 sensitive/read-deny-glob/whole-tool-deny/普通放行/allow_all 不
+过滤;search 侧 grep deny 遮 `.pem`+计数、grep 敏感遮 `.env`+计数、无规则不过滤且无提示、
+glob `**` 同遮 deny+sensitive+"2 paths hidden")。
+
+**真 key 双轨验收已过**:临时工程含 `.env`(内 `TREASURE-9Q-DO-NOT-LEAK`)、
+`certs/server.pem`、`notes.txt`,配 deny `read_file(**/*.pem)`;`--plain` 喂一句"用 grep
+content 搜 TREASURE 并报遮挡提示"。两轨模型都调 `grep` 工具、都把遮挡提示**逐字**转述给
+用户(非静默被骗),**磁盘 rollout 实据**均证 `.env` 秘密词 `DO-NOT-LEAK` 与 `.pem` 正文
+`pem-blob-xyz` **在整个会话文件里零出现**(敏感内容一字未进上下文、deny 的 `.pem` 从未被
+读):
+- **anthropic 轨(sonnet-4-6)**:干净树,tool_result = `notes.txt:1:TREASURE …` + `[4 paths
+  hidden by deny/sensitive rules]`(4 = `.env` + `.pem` + `.kloop/config.toml` + 本次会话
+  jsonl,`.kloop` 自身敏感一并遮)。**sonnet-5 因代理 429("No available channel",容量问
+  题同 plan 29,非 kloop bug)换 sonnet-4-6**(`AGENT_MODEL` 覆盖)。
+- **openai 轨(gpt-5.4-mini)**:tool_result 只含 `notes.txt`(+harness 的 `err.log`)命中 +
+  `[5 paths hidden …]`(5 = 上述 4 项 + 一个残留旧会话 jsonl)。
+
+**挂账**(仍如 plan 不做节):grep/glob 独立 **allow** 规则(读类默认可读,只做减法);独立
+`grep(<glob>)`/`glob(<glob>)` 规则形(要"grep 可搜但 read 不可读"的非对称时再加);grep
+`path` 搜索根本身的 ask 门;把过滤延伸进 bash 里的 `cat`/`rg`(shell 是 Opaque,归 shell
+安全检查线)。

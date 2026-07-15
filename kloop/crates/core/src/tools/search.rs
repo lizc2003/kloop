@@ -28,6 +28,10 @@ use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use serde_json::Value;
 
+use std::sync::Arc;
+
+use crate::permissions::Permissions;
+
 /// cc caps matched lines at 500 columns (`rg --max-columns 500`) so
 /// minified/base64 blobs cannot flood the context; we truncate instead of
 /// omitting the line entirely like rg does.
@@ -93,9 +97,9 @@ impl GrepArgs {
     }
 }
 
-pub async fn grep_tool(input: &Value) -> Result<String> {
+pub async fn grep_tool(input: &Value, perms: Arc<Permissions>) -> Result<String> {
     let args = GrepArgs::parse(input)?;
-    tokio::task::spawn_blocking(move || run_grep(&args))
+    tokio::task::spawn_blocking(move || run_grep(&args, &perms))
         .await
         .map_err(|e| anyhow!("grep: worker panicked: {e}"))?
 }
@@ -103,10 +107,11 @@ pub async fn grep_tool(input: &Value) -> Result<String> {
 pub async fn glob_tool(
     input: &Value,
     program_result: Option<&crate::tools::ProgramResultSink>,
+    perms: Arc<Permissions>,
 ) -> Result<String> {
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
     let root = PathBuf::from(input["path"].as_str().unwrap_or("."));
-    let (text, paths) = tokio::task::spawn_blocking(move || run_glob(&pattern, &root))
+    let (text, paths) = tokio::task::spawn_blocking(move || run_glob(&pattern, &root, &perms))
         .await
         .map_err(|e| anyhow!("glob: worker panicked: {e}"))??;
     // A program gets the path list as an array; the model gets the text.
@@ -116,7 +121,7 @@ pub async fn glob_tool(
     Ok(text)
 }
 
-fn run_grep(args: &GrepArgs) -> Result<String> {
+fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
     if !args.root.exists() {
         bail!("grep: path does not exist: {}", args.root.display());
     }
@@ -136,6 +141,7 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
     let mut counts: Vec<(String, u64)> = Vec::new();
     let started = Instant::now();
     let mut timed_out = false;
+    let mut hidden = 0usize;
 
     for entry in build_walk(&args.root, args.glob.as_deref(), args.file_type.as_deref())? {
         if started.elapsed() > SEARCH_BUDGET {
@@ -144,6 +150,12 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
         }
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        // Read-accessibility filter: a file the read gate would hide (sensitive
+        // path or read_file deny) is skipped before its contents are ever read.
+        if perms.read_path_blocked(entry.path()) {
+            hidden += 1;
             continue;
         }
         let display = display_path(entry.path());
@@ -238,6 +250,9 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
             }
         }
     };
+    if hidden > 0 {
+        out.push_str(&hidden_note(hidden));
+    }
     if timed_out {
         out.push_str(
             "\n\n[search stopped after 20s; results are partial — narrow the path or pattern]",
@@ -246,15 +261,22 @@ fn run_grep(args: &GrepArgs) -> Result<String> {
     Ok(out)
 }
 
+/// Appended when read-blocked files were skipped, so the model knows the
+/// result is filtered rather than empty (never silently pretend nothing exists).
+fn hidden_note(n: usize) -> String {
+    format!("\n\n[{} hidden by deny/sensitive rules]", plural(n, "path"))
+}
+
 /// Returns the model-facing text and the capped list of matched paths (the
 /// array a code-mode program receives). The two share the same paths — the text
 /// is just those paths joined, with truncation/timeout notices appended.
-fn run_glob(pattern: &str, root: &Path) -> Result<(String, Vec<String>)> {
+fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, Vec<String>)> {
     if !root.is_dir() {
         bail!("glob: not a directory: {}", root.display());
     }
     let started = Instant::now();
     let mut timed_out = false;
+    let mut hidden = 0usize;
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     for entry in build_walk(root, Some(pattern), None)? {
         if started.elapsed() > SEARCH_BUDGET {
@@ -263,6 +285,11 @@ fn run_glob(pattern: &str, root: &Path) -> Result<(String, Vec<String>)> {
         }
         let Ok(entry) = entry else { continue };
         if entry.file_type().is_some_and(|t| t.is_file()) {
+            // Same read-accessibility filter as grep: a listed path is a read.
+            if perms.read_path_blocked(entry.path()) {
+                hidden += 1;
+                continue;
+            }
             files.push((entry.path().to_path_buf(), display_path(entry.path())));
         }
     }
@@ -278,6 +305,9 @@ fn run_glob(pattern: &str, root: &Path) -> Result<(String, Vec<String>)> {
     };
     if total > GLOB_LIMIT {
         out.push_str("\n(Results are truncated. Consider using a more specific path or pattern.)");
+    }
+    if hidden > 0 {
+        out.push_str(&hidden_note(hidden));
     }
     if timed_out {
         out.push_str(
@@ -516,12 +546,18 @@ mod tests {
         }
     }
 
+    /// No gating: `allow_all` filters nothing, so every existing case sees
+    /// unfiltered output.
+    fn no_gate() -> Arc<Permissions> {
+        Arc::new(Permissions::allow_all())
+    }
+
     async fn grep(input: Value) -> Result<String> {
-        grep_tool(&input).await
+        grep_tool(&input, no_gate()).await
     }
 
     async fn glob(input: Value) -> Result<String> {
-        glob_tool(&input, None).await
+        glob_tool(&input, None, no_gate()).await
     }
 
     /// Strip the tree root prefix so assertions read relative.
@@ -842,5 +878,107 @@ mod tests {
 
         let err = glob(json!({})).await.unwrap_err();
         assert!(format!("{err:#}").contains("missing required string argument 'pattern'"));
+    }
+
+    /// A gate rooted at the tree so cwd-relative deny globs and the
+    /// sensitive-path list resolve against the scratch files.
+    fn gated(cwd: &str, deny: &[&str]) -> Arc<Permissions> {
+        let rules = crate::permissions::PermissionRules {
+            allow: vec![],
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            ask: vec![],
+        };
+        Arc::new(
+            Permissions::new(
+                crate::permissions::Mode::Default,
+                &rules,
+                PathBuf::from(cwd),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn grep_hides_read_deny_files() {
+        let t = Tree::new(
+            "grep-deny",
+            &[
+                ("src/a.rs", "token needle\n"),
+                ("certs/server.pem", "needle key\n"),
+                ("secret.pem", "needle key\n"),
+            ],
+        );
+        let perms = gated(t.path(), &["read_file(**/*.pem)"]);
+        let out = grep_tool(
+            &json!({"pattern": "needle", "path": t.path(), "output_mode": "content"}),
+            perms,
+        )
+        .await
+        .unwrap();
+        let out = rel(&out, &t);
+        assert!(out.contains("src/a.rs:1:token needle"), "got: {out}");
+        assert!(!out.contains(".pem"), "deny hides both .pem files: {out}");
+        assert!(
+            out.contains("[2 paths hidden by deny/sensitive rules]"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_hides_sensitive_files() {
+        let t = Tree::new(
+            "grep-sensitive",
+            &[("app.rs", "needle here\n"), (".env", "API=needle\n")],
+        );
+        let perms = gated(t.path(), &[]);
+        let out = grep_tool(&json!({"pattern": "needle", "path": t.path()}), perms)
+            .await
+            .unwrap();
+        let out = rel(&out, &t);
+        assert!(out.contains("app.rs"), "got: {out}");
+        assert!(!out.contains(".env"), ".env content stays hidden: {out}");
+        assert!(
+            out.contains("[1 path hidden by deny/sensitive rules]"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_without_rules_is_unfiltered() {
+        let t = Tree::new("grep-open", &[("a.rs", "needle\n"), ("b.pem", "needle\n")]);
+        let perms = gated(t.path(), &[]);
+        let out = grep_tool(&json!({"pattern": "needle", "path": t.path()}), perms)
+            .await
+            .unwrap();
+        let out = rel(&out, &t);
+        // .pem is only blocked when a read_file deny covers it; here nothing does.
+        assert!(out.contains("a.rs") && out.contains("b.pem"), "got: {out}");
+        assert!(!out.contains("hidden by deny"), "no note when nothing hid");
+    }
+
+    #[tokio::test]
+    async fn glob_hides_read_deny_and_sensitive_paths() {
+        let t = Tree::new(
+            "glob-deny",
+            &[
+                ("keep.rs", "x"),
+                ("certs/server.pem", "x"),
+                (".env.local", "x"),
+            ],
+        );
+        let perms = gated(t.path(), &["read_file(**/*.pem)"]);
+        let out = glob_tool(&json!({"pattern": "**", "path": t.path()}), None, perms)
+            .await
+            .unwrap();
+        let out = rel(&out, &t);
+        assert!(out.contains("keep.rs"), "got: {out}");
+        assert!(!out.contains(".pem"), "deny hides .pem: {out}");
+        assert!(!out.contains(".env"), "sensitive hides .env.local: {out}");
+        assert!(
+            out.contains("[2 paths hidden by deny/sensitive rules]"),
+            "got: {out}"
+        );
     }
 }

@@ -680,10 +680,13 @@ fn execute_tool<'a>(
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
             "write_file" => fs::write_file_tool(input).await,
             "edit_file" => fs::edit_file_tool(input).await,
-            "grep" => search::grep_tool(input).await,
+            "grep" => search::grep_tool(input, ctx.cfg.permissions.clone()).await,
             // glob hands a program its path list as a string[] (built-ins are
             // otherwise strings); the model-facing text is unchanged.
-            "glob" => search::glob_tool(input, ctx.program_result.as_ref()).await,
+            "glob" => {
+                search::glob_tool(input, ctx.program_result.as_ref(), ctx.cfg.permissions.clone())
+                    .await
+            }
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
             "skill" => skill::skill_tool(input, ctx).await,
