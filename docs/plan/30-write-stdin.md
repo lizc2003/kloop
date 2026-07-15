@@ -1,5 +1,43 @@
 # Plan 30 — write_stdin(交互式后台进程)
 
+## 决定:不做 —— 采 cc 的取舍,不开交互 stdin 通道(2026-07-15,commit 见完成记录)
+
+开工时回源 + 用户拍板:**不做本 plan**,kloop 后台 bash 保持现状(cc 形态、非交互,
+`spawn_background` 的 `stdin(Stdio::null())` 不动),不加 `write_stdin` 工具。
+
+**三家回源(都真读源码,非 plan 备忘)**:
+
+- **codex —— 唯一有**:`unified_exec` + `write_stdin`;`core/src/tools/handlers/unified_exec/
+  write_stdin.rs:110` 的 `pre_tool_use_payload → None` —— **write_stdin 不走新审批**,注释原话
+  "transport for an existing exec session … continue a command that already ran PreToolUse as
+  Bash",即会话在 `exec_command`(spawn)那一刻已过门,续写是放行的。
+- **claude-code —— 无**:所有 `stdin.write` 全是内部用途(hooks 喂 JSON、sessionRunner 管自己的
+  子进程),**没有面向模型的写 stdin 工具**;后台模型是"auto-backgrounded a long-running
+  **blocking** command"(`ShellCommand.ts:20`)——观测型,非交互。
+- **claw-code —— 无**。
+
+**为何选 cc(不开)而非 codex(开+放行)**:cc 的取舍在**功能层**,不是权限层——它压根不建
+这条通道,理由三点(见 HANDOFF 教训 30):
+
+1. **裸管道 stdin 不够,真交互要 PTY**:只给管道会让 `ssh`/`psql`/`vim` 探 isatty/行编辑失效,
+   "对 `cat` 能用、对真交互程序坏掉"是脚枪;codex 专门有可选 `tty` 参数就是这原因,本 plan
+   的最小切法(不碰 PTY)恰恰落进这个半吊子区。
+2. **不过门的 stdin 通道 = REPL 逃逸**:后台 `python3 -i` 作为 bash 已过门,再 `write_stdin`
+   喂 `os.system("rm -rf …")`——审批只发生在 spawn 那一次,喂进解释器的内容永不面对权限分类器。
+   codex 明确接受这代价(放行),cc 明确拒绝(不开通道)。
+3. **跨 turn 隐藏会话态**:活的交互会话是跨回合的隐藏可变状态,难审计/resume/压缩/回放;cc 偏好
+   无状态一次性命令(全部输入在 history 里可见)。
+
+**替代路径(用户要交互时怎么办)**:走 cc 的路子——重构成自包含一次性命令
+(`python3 -c '…'`、`printf '…' | cmd`、heredoc),kloop **今天就支持**,无新代码。
+
+**若未来真有痛感**(必须驱动活 REPL/ssh 且无法重构成一次性命令)再重启本 plan,且届时要
+**连 PTY 一起做**(否则半吊子)并重估权限门(是否给 `write_stdin` 一道门,而非 codex 式纯放行)。
+
+---
+
+> 以下为原提案,未采纳,保留作背景。
+>
 > 一句话定位:kloop 有后台 bash(`run_in_background`+`bash_output`+`kill_bash`),但后台
 > shell spawn 时 `stdin(Stdio::null())`——**写不进 stdin**,REPL/ssh/交互确认这类"进程活
 > 着、要持续喂输入"的场景做不了。补一个 `write_stdin(bash_id, chars)`,把后台 shell 的
