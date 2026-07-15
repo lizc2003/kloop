@@ -888,8 +888,8 @@ parent's `Config.inbox` — the same step-boundary queue as steering — as a fr
 consumer). A **success passes through verbatim**; a failure is truncated (~900
 tokens, codex's cap) with re-dispatch guidance; an **interrupted sub-agent
 reinjects nothing** (codex's `is_final` — its partial output is noise, and cc
-diverges here by delivering a `killed` partial). A separate `AsyncAgents`
-registry (`core/src/tools/async_agents.rs`) tracks the in-flight agents,
+diverges here by delivering a `killed` partial). A separate `BackgroundTasks`
+registry (`core/src/tools/background_tasks.rs`) tracks the in-flight agents,
 enforces a concurrency cap (8), and reaps on session end — kept **separate** from
 the background-shell registry, because codex keeps its shell tasks and
 sub-agents in distinct mechanisms and cc only unifies the *state* model, not

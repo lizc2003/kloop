@@ -73,7 +73,7 @@ bash——但那是编译期打包形态,和"用户往 skill 目录放脚本"两
   "plug into this same seam — a `custom.rs` sibling + a lookup ahead of `run`'s
   match";`is_command` 解析已拆出 argument 串)。skill 的 inline 正文替换后即成一条
   user 消息进 History,和用户 slash 模板走同一条替换 + 注入路。
-- **渐进披露/模型触发** = plan 16 `discover.rs` 的 `unlocked_tools` + `deferred_notice`
+- **渐进披露/模型触发** = plan 16 `discover.rs`(后改名 `tool_search.rs`)的 `unlocked_tools` + `deferred_notice`
   + 打分门。**关键决定见下**:是把每个 skill 当一个 deferred"能力"挂进这套门(name +
   `when_to_use` 进 notice、触发时载入正文),还是照 cc 平行开一个 `SkillTool` + 把清单
   注入 system(预算截断那套)。kloop 已有 discover,倾向复用;但 skill 的"激活一段

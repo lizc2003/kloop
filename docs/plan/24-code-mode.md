@@ -372,7 +372,7 @@ grep/glob),几乎每样 bash 都能做,故聪明模型优先 bash。
 **落地**:
 - `inbox.rs`:`InboxItem::ProgramResult{label,summary}` + `PROGRAM_PREFIX` framing。
 - `tools/codemode.rs`:`run_program` 加 `background` 参数;`background:true` 走 `spawn_background_program`(仿 `task::spawn_background`)——`PROGRAM_SEQ`→`program-N`、`async_agents.register`、**独立 own_cancel**(父 turn 结束不杀;program 的工具调用也用 own_cancel:`bg_ctx.cancel=own_cancel`)detached spawn、完成 `classify_program` 三态(Completed push `ProgramResult`、Failed 截断 push、Aborted[own_cancel 触发]不回灌只 `notify_activity`)、立即返"已派发"引导;`run_program_def` schema+desc 加 background。
-- `tools/async_agents.rs`:面向模型措辞泛化(background task);模块 doc 更新(第三个消费者到位,programs 与 agents 共表、shells 仍分开)。wait/stop_agent/autowake/三前端 drain **全零改动复用**(只认 inbox 活动)。
+- `tools/async_agents.rs`(后改名 `background_tasks.rs`,plan 26):面向模型措辞泛化(background task);模块 doc 更新(第三个消费者到位,programs 与 agents 共表、shells 仍分开)。wait/stop_agent/autowake/三前端 drain **全零改动复用**(只认 inbox 活动)。
 - **测试**(+3):inbox `ProgramResult` framing、codemode `background_program` 立即返非结果 + detached 完成 push `ProgramResult` 进父 inbox + 腾槽、`stopped_background_program` 的 Aborted 不回灌(派长 bash→stop→轮询→断言 inbox 空)。
 - **真 key**(anthropic sonnet-5,`--plain --yolo`):模型 `run_program{background:true}`(源码 `return await tools.bash({command:"sleep 3 && echo DEEPFIELD99"})`)→ 立即返 `program-1 started` → 父自跑 `echo PARENT_HERE_OK` → `wait` 阻塞 → `program-1 finished` → 回灌 → 终答 **"Program output: DEEPFIELD99 | My own echo output: PARENT_HERE_OK"**。后台派发→continue→wait→回灌→合并全链闭环。
 

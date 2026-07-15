@@ -52,7 +52,7 @@
 **选片**:片 2。文件形态开工时问用户,用户选 **A(`config.toml` `[agents.<name>]` 表)**——理由:kloop 一贯把配置收在 config.toml,B 的 `.md` frontmatter 要引 YAML 依赖或手写解析(违教训 8/9)。其余按 cc 形态直接定:system **完全替换**不拼接、model 省略继承父、tools 省略继承全集、未知类型报错列可用清单、清单进 task description、仍深度 1。
 
 **实现**:
-- `core/src/agents.rs`:`AgentType { name, description, system, model, tools }`(后三者 Option)+ `lookup`(未知报错列可用)+ `tool_available`(白名单门,`read_offloaded` 恒真——基建例外,否则受限子 agent 读不回自己 offload 的大输出被卡)+ `agent_types_hint`(列表进 task description,config 派生故 session 稳定、缓存友好)。
+- `core/src/agents.rs`(后改名 `agent_type.rs`):`AgentType { name, description, system, model, tools }`(后三者 Option)+ `lookup`(未知报错列可用)+ `tool_available`(白名单门,`read_offloaded` 恒真——基建例外,否则受限子 agent 读不回自己 offload 的大输出被卡)+ `agent_types_hint`(列表进 task description,config 派生故 session 稳定、缓存友好)。
 - `Config` 加 `agent_types: Arc<Vec<AgentType>>`(注册表,随 clone 继承)+ `tool_allowlist: Option<Arc<HashSet<String>>>`(仅受限子 agent 设,主 agent 恒 None)。
 - task 加 `agent_type` 参数:`lookup` → 命中则 sub_cfg 覆盖 system/model、tools 设 `tool_allowlist`;label 带 `[type]` 前缀。
 - 两处工具门:`turn_rounds`(agent.rs)按 allowlist `retain` 过滤 defs + depth-0 时把 hint 追加进 task def description;`run_one`(tools/mod.rs)入口拒非白名单调用(在 locked/hooks/权限**之前**——capability 先于一切;防模型幻觉出被过滤掉的工具名)。
