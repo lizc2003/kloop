@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agents::AgentType;
+use kloop_core::agent_type::AgentType;
 use kloop_core::history::History;
 use kloop_core::hooks::HookDef;
 use kloop_core::hooks::HookEvent;

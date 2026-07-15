@@ -14,7 +14,7 @@ use super::ToolCtx;
 use crate::agent::run_turn;
 use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
-use crate::agents::AgentType;
+use crate::agent_type::AgentType;
 use crate::config::Config;
 use crate::history::History;
 use crate::inbox::Inbox;
@@ -143,7 +143,7 @@ pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Re
     }
     // `allowed-tools` restricts the sub-agent's tool set (like an agent_type's
     // tools) — a capability limit, not a permission grant; read_offloaded stays
-    // available regardless (see `agents::tool_available`).
+    // available regardless (see `agent_type::tool_available`).
     if let Some(tools) = &skill.allowed_tools {
         sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
     }

@@ -187,14 +187,14 @@ async fn turn_rounds(
     // (None) keeps them all. read_offloaded is never filtered out.
     if cfg.tool_allowlist.is_some() {
         let allow = cfg.tool_allowlist.as_deref();
-        tools.retain(|t| crate::agents::tool_available(allow, &t.name));
+        tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
     }
     // At depth 0 the task tool exists; list the configured agent types in its
     // description so the model knows what it can dispatch to.
     if depth == 0 && !cfg.agent_types.is_empty() {
         if let Some(task) = tools.iter_mut().find(|t| t.name == "task") {
             task.description
-                .push_str(&crate::agents::agent_types_hint(&cfg.agent_types));
+                .push_str(&crate::agent_type::agent_types_hint(&cfg.agent_types));
         }
     }
     // A sub-agent's text is its deliverable and returns via the tool result;

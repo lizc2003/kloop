@@ -6,16 +6,16 @@
 mod background_tasks;
 mod bash;
 mod codemode;
-mod discover;
 mod fs;
 mod search;
 mod task;
 mod todo;
+mod tool_search;
 
 pub use background_tasks::BackgroundTasks;
 pub use background_tasks::TaskStatus;
 pub use bash::BackgroundShells;
-pub use discover::deferred_notice;
+pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the task sub-agent machinery.
 pub(crate) use task::fork_skill;
@@ -143,8 +143,8 @@ pub fn all_tool_defs(
     // regime) — empty when deferred, where they degrade to a compact name +
     // description list instead (see `run_program_def`).
     let inline_sources = if deferred_regime {
-        defs.push(discover::tool_search_def());
-        defs.push(discover::call_tool_def());
+        defs.push(tool_search::tool_search_def());
+        defs.push(tool_search::call_tool_def());
         Vec::new()
     } else {
         let merged = merged_source_defs(sources);
@@ -483,7 +483,7 @@ pub async fn dispatch_tools(
     let tool_uses: Vec<(String, String, Value)> = tool_uses
         .into_iter()
         .map(|(id, name, input)| {
-            let (name, input) = discover::unwrap_call_tool(name, input);
+            let (name, input) = tool_search::unwrap_call_tool(name, input);
             (id, name, input)
         })
         .collect();
@@ -540,7 +540,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // is filtered out of this sub-agent's defs, so a call to it is a
         // hallucination — reject before hooks or the human are consulted.
         // (The main agent has no allowlist, so this never fires for it.)
-        if !crate::agents::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
+        if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
             bail!("tool '{name}' is not available to this agent type");
         }
         // Locked deferred tools bounce before hooks and permissions: the
@@ -550,7 +550,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // exclusively through a tool_search hit. A program bypasses this gate:
         // its `tools` object already exposes the tool, so it is loaded for the
         // program (the top-level model still must tool_search to direct-call).
-        if !ctx.from_program && discover::locked(&name, &ctx.cfg) {
+        if !ctx.from_program && tool_search::locked(&name, &ctx.cfg) {
             bail!(
                 "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
             );
@@ -652,7 +652,7 @@ fn execute_tool<'a>(
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
             "skill" => crate::skills::skill_tool(input, ctx).await,
-            "tool_search" => discover::tool_search_tool(input, ctx).await,
+            "tool_search" => tool_search::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
             "call_tool" => Err(anyhow!(

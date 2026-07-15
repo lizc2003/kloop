@@ -65,7 +65,7 @@ pub struct Config {
     /// slice 2). Empty when none are configured. Shared into sub-agent
     /// configs so a sub-agent could look them up too (though it cannot spawn
     /// further sub-agents).
-    pub agent_types: Arc<Vec<crate::agents::AgentType>>,
+    pub agent_types: Arc<Vec<crate::agent_type::AgentType>>,
     /// Exact tool-name allowlist for THIS agent; None = the full tool set.
     /// Set only on a sub-agent whose agent_type restricts its tools; the
     /// main agent is always None. `read_offloaded` stays available either way.

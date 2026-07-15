@@ -10,7 +10,7 @@
 //! `kloop` CLI crate.
 
 pub mod agent;
-pub mod agents;
+pub mod agent_type;
 pub mod commands;
 pub mod compact;
 pub mod config;
