@@ -1,24 +1,32 @@
-//! ratatui terminal UI for kloop: a scrolling transcript, a one-line input,
-//! per-tool-call status rows, and a centered permission popup.
+//! ratatui terminal UI for kloop: an inline viewport (plan 38 slice 0) whose
+//! finalized cells scroll into the terminal's native scrollback, a one-line
+//! input, per-tool-call status rows, and a centered permission popup.
 //!
 //! Split of responsibilities: the agent runs on its own tokio task and only
 //! talks through channels ([`events::ChannelUi`] implements both `Ui` and
 //! `Approver`); [`app::App`] folds agent + key events into pure state; and
 //! [`render`] turns that state into lines. Only this module touches the
-//! terminal.
+//! terminal — it owns the inline viewport, freezes overflowing cells into
+//! scrollback with `insert_before`, and reads keys on a dedicated poll thread.
 
 mod app;
 mod events;
 mod render;
 
 use std::io::Write as _;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::Event;
-use crossterm::event::EventStream;
 use crossterm::event::KeyEventKind;
-use futures::StreamExt as _;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget as _;
+use ratatui::TerminalOptions;
+use ratatui::Viewport;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -284,23 +292,100 @@ type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::St
 
 fn setup_terminal() -> Result<Terminal> {
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-    // A panic elsewhere (agent task, draw code) must not leave the terminal
-    // in raw mode with no visible output.
+    // A panic elsewhere (agent task, draw code) must not leave the terminal in
+    // raw mode with no visible output.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
         hook(info);
     }));
-    Ok(ratatui::Terminal::new(
-        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-    )?)
+    // Inline viewport, no alternate screen (plan 38 slice 0): the transcript
+    // scrolls into native scrollback, so the mouse wheel / selection / Cmd+F
+    // reach history directly. The viewport is the full terminal height, so
+    // `insert_before` pushes finalized cells above it into scrollback. This CPR
+    // (cursor-position query) runs before the input thread starts, so nothing
+    // races it for stdin.
+    let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let terminal = ratatui::Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height.max(1)),
+        },
+    )?;
+    Ok(terminal)
 }
 
 fn restore_terminal() {
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-    let _ = std::io::stdout().flush();
+    // No alternate screen to leave; show the cursor and drop below the viewport
+    // so the shell prompt returns on a clean line.
+    let mut out = std::io::stdout();
+    let _ = crossterm::execute!(out, crossterm::cursor::Show, crossterm::style::Print("\n"));
+    let _ = out.flush();
+}
+
+/// Read terminal events on a dedicated OS thread and forward them to the async
+/// loop. Uses `poll(timeout)` + `read()` rather than crossterm's `EventStream`
+/// so the internal reader lock is released between polls: that lets a resize's
+/// `get_cursor_position` (CPR) acquire the lock within one poll interval instead
+/// of deadlocking against a reader parked in a lock-holding blocking read (plan
+/// 38 slice 0, the inline integration trap). The 200ms poll bounds that wait
+/// well under crossterm's 2s CPR timeout and stays idle-cheap.
+fn spawn_input_thread(
+    tx: mpsc::UnboundedSender<Event>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match crossterm::event::poll(Duration::from_millis(200)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                // Timed out with no event: loop to re-check the stop flag.
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Freeze the finalized cells that overflow the live region into native
+/// scrollback via `insert_before`, then drop them from the app's tail. Called
+/// before each draw (unless a popup owns the screen), so the viewport only ever
+/// holds the recent, still-mutable tail.
+fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
+    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+    let width = (w as usize).max(1);
+    // The live region is the viewport minus the status line and composer.
+    let active_h = (h as usize).saturating_sub(2).max(1);
+    let n = render::commit_count(&app.cells, width, active_h);
+    if n == 0 {
+        return Ok(());
+    }
+    // Render each cell to fixed-height lines up front so the borrow of
+    // `app.cells` ends before `drain_committed` takes it mutably.
+    let blocks: Vec<Vec<Line<'static>>> = app.cells[..n]
+        .iter()
+        .map(|c| render::cell_lines(c, width))
+        .collect();
+    for lines in blocks {
+        let height = lines.len() as u16;
+        if height == 0 {
+            continue;
+        }
+        terminal.insert_before(height, |buf| {
+            let area = buf.area;
+            Paragraph::new(lines).render(area, buf);
+        })?;
+    }
+    app.drain_committed(n);
+    Ok(())
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -322,16 +407,40 @@ async fn ui_loop(
     resumed_cells: Vec<app::Cell>,
 ) -> Result<()> {
     let mut app = App::new(session_id);
+    // A resumed session's cells start as the tail and scroll into scrollback as
+    // they overflow, exactly like live output.
     app.cells = resumed_cells;
     // Seed the status-bar badge from the real starting mode (e.g. plan).
     app.mode = permissions.mode();
-    let mut keys = EventStream::new();
+
+    // Keys arrive from a dedicated poll thread, not crossterm's EventStream, so
+    // its reader never parks holding the lock a resize's CPR needs (see
+    // `spawn_input_thread`). Started after `setup_terminal`, so nothing raced
+    // the viewport's construction CPR.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let input_thread = spawn_input_thread(input_tx, stop.clone());
+
     let mut current_cancel: Option<CancellationToken> = None;
-    loop {
-        terminal.draw(|f| render::draw(f, &mut app))?;
+    let outcome = loop {
+        // Match the inline viewport to the terminal (repositions on resize),
+        // then freeze finalized overflow into scrollback before drawing the
+        // tail. Skip committing while a popup owns the screen — scrolling
+        // content out from under an overlay would corrupt it.
+        if let Err(e) = terminal.autoresize() {
+            break Err(e.into());
+        }
+        if app.confirms.is_empty() && app.fork_picker.is_none() {
+            if let Err(e) = commit_overflow(terminal, &mut app) {
+                break Err(e);
+            }
+        }
+        if let Err(e) = terminal.draw(|f| render::draw(f, &mut app)) {
+            break Err(e.into());
+        }
         tokio::select! {
-            key = keys.next() => match key {
-                Some(Ok(Event::Key(k))) if k.kind != KeyEventKind::Release => {
+            input = input_rx.recv() => match input {
+                Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                     match app.on_key(k) {
                         Command::Submit(text) => {
                             let cancel = CancellationToken::new();
@@ -370,18 +479,17 @@ async fn ui_loop(
                                 cancel.cancel();
                             }
                         }
-                        Command::Quit => return Ok(()),
+                        Command::Quit => break Ok(()),
                         Command::None => {}
                     }
                 }
-                // Resize (and any other terminal event) just needs a redraw,
-                // which the top of the loop always does.
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
-                None => return Ok(()),
+                // Resize repositions the viewport (handled by the autoresize at
+                // the top of the loop); any other event just needs a redraw.
+                Some(_) => {}
+                None => break Ok(()),
             },
             event = events.recv() => {
-                let Some(event) = event else { return Ok(()) };
+                let Some(event) = event else { break Ok(()) };
                 app.apply(event);
                 // Drain whatever else already arrived (streaming deltas come
                 // in bursts) so we redraw once per batch, not per token.
@@ -401,7 +509,12 @@ async fn ui_loop(
                 }
             }
         }
-    }
+    };
+    // Stop the input thread (it wakes within one poll interval) before the
+    // caller restores the terminal, so no stray read lands after teardown.
+    stop.store(true, Ordering::Relaxed);
+    let _ = input_thread.join();
+    outcome
 }
 
 #[cfg(test)]

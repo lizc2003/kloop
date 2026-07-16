@@ -9,8 +9,9 @@ kloop-protocol = { workspace = true }
 
 anyhow = { workspace = true }
 crossterm = { workspace = true }
-futures = { workspace = true }
-ratatui = { workspace = true }
+# scrolling-regions: flicker-free `insert_before` into native scrollback for
+# the inline viewport (plan 38 slice 0) — DECSTBM scroll regions, no full repaint.
+ratatui = { workspace = true, features = ["scrolling-regions"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 unicode-width = { workspace = true }

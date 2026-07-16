@@ -32,6 +32,11 @@ pub enum ToolStatus {
 
 /// One transcript entry. Tool calls are collapsed to a single status row —
 /// their full output lives in history/offload, not on screen.
+///
+/// Cells live in [`App::cells`] only while uncommitted (still mutable, or the
+/// recent tail shown in the inline viewport). Once a cell is final and scrolls
+/// past the top of the viewport, the event loop writes it into the terminal's
+/// native scrollback via `insert_before` (plan 38 slice 0) and drops it here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cell {
     User(String),
@@ -110,13 +115,13 @@ pub enum Command {
 
 pub struct App {
     pub session_id: String,
+    /// The uncommitted transcript tail: cells still mutating plus the recent
+    /// finalized ones the viewport shows. Older finalized cells have left for
+    /// native scrollback (see [`Cell`], [`App::drain_committed`]).
     pub cells: Vec<Cell>,
     pub input: String,
     /// Cursor position in `input`, in chars.
     pub cursor: usize,
-    /// How many display lines the transcript view is scrolled up from the
-    /// bottom; 0 = pinned to the latest output.
-    pub scroll_up: usize,
     pub running: bool,
     pub confirms: VecDeque<PendingConfirm>,
     /// Scroll offset (in display lines) into the active confirm popup's body,
@@ -154,7 +159,6 @@ impl App {
             cells: Vec::new(),
             input: String::new(),
             cursor: 0,
-            scroll_up: 0,
             running: false,
             confirms: VecDeque::new(),
             confirm_scroll: 0,
@@ -297,8 +301,10 @@ impl App {
                 self.cells.push(Cell::System(text));
             }
             AgentEvent::ClearTranscript => {
-                // /clear emptied History on the worker; drop the matching view
-                // state so the screen agrees with the model's blank context.
+                // /clear emptied History on the worker; drop the uncommitted
+                // view state. Cells already in native scrollback stay visible
+                // (inline can't erase scrollback) but are out of the model's
+                // context — the System note that follows says so.
                 self.cells.clear();
                 self.tool_cells.clear();
                 self.agent_cells.clear();
@@ -341,7 +347,6 @@ impl App {
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.last_note = None;
-                self.scroll_up = 0;
                 self.fork_picker = None;
             }
             AgentEvent::Confirm { req, reply } => {
@@ -388,6 +393,28 @@ impl App {
         self.cells.get_mut(i)
     }
 
+    /// Drop the first `n` cells: the event loop has just written them into the
+    /// terminal's native scrollback (`insert_before`). Every index-into-`cells`
+    /// map shifts down by `n`; entries that pointed into the committed prefix are
+    /// dropped (their cells can no longer be mutated — they are frozen in
+    /// scrollback, so a late ToolEnd/AgentEnd for them becomes a harmless no-op).
+    pub fn drain_committed(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let n = n.min(self.cells.len());
+        self.cells.drain(0..n);
+        self.tool_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.agent_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.todo_cell = self.todo_cell.and_then(|i| i.checked_sub(n));
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Command {
         // A pending permission prompt captures the keyboard.
         if !self.confirms.is_empty() {
@@ -421,7 +448,6 @@ impl App {
                 }
                 self.input.clear();
                 self.cursor = 0;
-                self.scroll_up = 0;
                 // A slash command runs only when idle; it is not a message, so
                 // no User cell and no new todo block. While a turn runs, a
                 // '/'-line is just steering text (Ctrl+C stays the hard stop).
@@ -467,10 +493,10 @@ impl App {
             }
             (KeyCode::Home, _) => self.cursor = 0,
             (KeyCode::End, _) => self.cursor = self.input.chars().count(),
-            (KeyCode::Up, _) => self.scroll_up += 1,
-            (KeyCode::Down, _) => self.scroll_up = self.scroll_up.saturating_sub(1),
-            (KeyCode::PageUp, _) => self.scroll_up += 10,
-            (KeyCode::PageDown, _) => self.scroll_up = self.scroll_up.saturating_sub(10),
+            // Scrolling the transcript is the terminal's job now (inline
+            // viewport, plan 38 slice 0): history lives in native scrollback,
+            // so the mouse wheel / PageUp reach it directly. The old in-app
+            // scroll keys are retired.
             _ => {}
         }
         Command::None
@@ -786,6 +812,59 @@ mod tests {
                     last_tool: "read_file {\"path\":\"README\"}".into(),
                 },
             ]
+        );
+    }
+
+    /// Committing the front cells to scrollback drops them here and re-bases
+    /// every index-into-`cells` map: entries in the committed prefix vanish,
+    /// the rest shift down by the committed count.
+    #[test]
+    fn drain_committed_rebases_index_maps() {
+        let mut app = App::new("s".into());
+        // Two tool cells and a live todo scattered through the tail.
+        app.apply(AgentEvent::ToolStart {
+            agent: String::new(),
+            id: "t1".into(),
+            name: "bash".into(),
+            summary: "{}".into(),
+        });
+        app.apply(AgentEvent::TodoUpdate {
+            todos: vec![todo("Do", "Doing", TodoStatus::InProgress)],
+        });
+        app.apply(AgentEvent::ToolStart {
+            agent: String::new(),
+            id: "t2".into(),
+            name: "grep".into(),
+            summary: "{}".into(),
+        });
+        // cells: [Tool t1 (0), Todo (1), Tool t2 (2)]
+        assert_eq!(app.cells.len(), 3);
+
+        app.drain_committed(2);
+        // Only Tool t2 remains, now at index 0.
+        assert_eq!(app.cells.len(), 1);
+        assert_eq!(app.tool_cells.get("t1"), None, "committed cell dropped");
+        assert_eq!(app.tool_cells.get("t2"), Some(&0), "survivor shifted down");
+        assert_eq!(app.todo_cell, None, "committed todo cell dropped");
+
+        // A late ToolEnd for the now-frozen t1 is a harmless no-op; t2 resolves.
+        app.apply(AgentEvent::ToolEnd {
+            agent: String::new(),
+            id: "t1".into(),
+            ok: true,
+        });
+        app.apply(AgentEvent::ToolEnd {
+            agent: String::new(),
+            id: "t2".into(),
+            ok: true,
+        });
+        assert_eq!(
+            app.cells,
+            vec![Cell::Tool {
+                name: "grep".into(),
+                summary: "{}".into(),
+                status: ToolStatus::Ok,
+            }]
         );
     }
 

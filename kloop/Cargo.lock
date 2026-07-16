@@ -1056,7 +1056,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
- "futures",
  "kloop-core",
  "kloop-protocol",
  "ratatui",

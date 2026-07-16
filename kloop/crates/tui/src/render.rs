@@ -80,111 +80,153 @@ fn status_mark(status: &ToolStatus) -> (&'static str, Color) {
     }
 }
 
-/// The transcript as display lines: the pure core of the UI. Tool calls
-/// collapse to one status row; user/assistant text wraps to the width.
-pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
+/// The display lines for one cell at `width` columns. Both paths that put a
+/// cell on screen go through this — rendering the live tail in the viewport and
+/// freezing a finalized cell into native scrollback (`insert_before`) — so a
+/// cell looks identical either way. Tool calls collapse to one status row;
+/// user/assistant text wraps to the width.
+pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for cell in cells {
-        match cell {
-            Cell::User(text) => {
-                if !lines.is_empty() {
-                    lines.push(Line::default());
-                }
-                for (i, l) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
-                    let prefix = if i == 0 { "> " } else { "  " };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), Style::new().fg(Color::Cyan)),
-                        Span::styled(l, Style::new().add_modifier(Modifier::BOLD)),
-                    ]));
-                }
-            }
-            Cell::Assistant(text) => {
-                for l in wrap(text, width) {
-                    lines.push(Line::from(l));
-                }
-            }
-            Cell::Thinking(text) => {
-                // Collapsed to a one-line dim preview of the latest reasoning
-                // line; the stream keeps it moving, the transcript stays calm.
-                let last = text.lines().rev().find(|l| !l.trim().is_empty());
-                lines.push(Line::from(Span::styled(
-                    truncate(&format!("∴ {}", last.unwrap_or("thinking…")), width.max(2)),
-                    DIM.add_modifier(Modifier::ITALIC),
-                )));
-            }
-            Cell::Tool {
-                name,
-                summary,
-                status,
-            } => {
-                let (mark, color) = status_mark(status);
+    match cell {
+        Cell::User(text) => {
+            // A blank separator opens every user turn (between turns in
+            // scrollback; a lone blank at the very top of a session is benign).
+            lines.push(Line::default());
+            for (i, l) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
+                let prefix = if i == 0 { "> " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::new().fg(color)),
-                    Span::styled(
-                        truncate(&format!("{name} {summary}"), width.saturating_sub(2)),
-                        DIM,
-                    ),
+                    Span::styled(prefix.to_string(), Style::new().fg(Color::Cyan)),
+                    Span::styled(l, Style::new().add_modifier(Modifier::BOLD)),
                 ]));
             }
-            Cell::Agent {
-                agent,
-                task,
-                status,
-                tools,
-                last_tool,
-            } => {
-                let (mark, color) = status_mark(status);
-                // Live: show what it is doing right now; done: a one-line
-                // summary (its tool detail was never in the transcript).
-                let body = if *status == ToolStatus::Running && *tools > 0 {
-                    format!("{agent} {task} — {tools} tools · {last_tool}")
-                } else if *status == ToolStatus::Running {
-                    format!("{agent} {task}")
-                } else {
-                    format!("{agent} {task} ({tools} tool uses)")
+        }
+        Cell::Assistant(text) => {
+            for l in wrap(text, width) {
+                lines.push(Line::from(l));
+            }
+        }
+        Cell::Thinking(text) => {
+            // Collapsed to a one-line dim preview of the latest reasoning
+            // line; the stream keeps it moving, the transcript stays calm.
+            let last = text.lines().rev().find(|l| !l.trim().is_empty());
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("∴ {}", last.unwrap_or("thinking…")), width.max(2)),
+                DIM.add_modifier(Modifier::ITALIC),
+            )));
+        }
+        Cell::Tool {
+            name,
+            summary,
+            status,
+        } => {
+            let (mark, color) = status_mark(status);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::new().fg(color)),
+                Span::styled(
+                    truncate(&format!("{name} {summary}"), width.saturating_sub(2)),
+                    DIM,
+                ),
+            ]));
+        }
+        Cell::Agent {
+            agent,
+            task,
+            status,
+            tools,
+            last_tool,
+        } => {
+            let (mark, color) = status_mark(status);
+            // Live: show what it is doing right now; done: a one-line
+            // summary (its tool detail was never in the transcript).
+            let body = if *status == ToolStatus::Running && *tools > 0 {
+                format!("{agent} {task} — {tools} tools · {last_tool}")
+            } else if *status == ToolStatus::Running {
+                format!("{agent} {task}")
+            } else {
+                format!("{agent} {task} ({tools} tool uses)")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::new().fg(color)),
+                Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
+            ]));
+        }
+        Cell::Todo(items) => {
+            lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
+            for item in items {
+                // in_progress shows its activeForm (what's happening now);
+                // the others show the plain content.
+                let (mark, color, text, style) = match item.status {
+                    TodoStatus::Completed => ("✓", Color::Green, &item.content, DIM),
+                    TodoStatus::InProgress => (
+                        "▶",
+                        Color::Yellow,
+                        &item.active_form,
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                    TodoStatus::Pending => ("○", Color::DarkGray, &item.content, DIM),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::new().fg(color)),
-                    Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
+                    Span::styled(format!("  {mark} "), Style::new().fg(color)),
+                    Span::styled(truncate(text, width.saturating_sub(4)), style),
                 ]));
             }
-            Cell::Todo(items) => {
-                lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
-                for item in items {
-                    // in_progress shows its activeForm (what's happening now);
-                    // the others show the plain content.
-                    let (mark, color, text, style) = match item.status {
-                        TodoStatus::Completed => ("✓", Color::Green, &item.content, DIM),
-                        TodoStatus::InProgress => (
-                            "▶",
-                            Color::Yellow,
-                            &item.active_form,
-                            Style::new().add_modifier(Modifier::BOLD),
-                        ),
-                        TodoStatus::Pending => ("○", Color::DarkGray, &item.content, DIM),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {mark} "), Style::new().fg(color)),
-                        Span::styled(truncate(text, width.saturating_sub(4)), style),
-                    ]));
-                }
-            }
-            Cell::Note(text) => {
-                lines.push(Line::from(Span::styled(
-                    truncate(&format!("[{text}]"), width),
-                    DIM,
-                )));
-            }
-            Cell::System(text) => {
-                // Slash-command output: dim, but wrapped in full (not collapsed
-                // like a Note) since /help and /cost are multi-line.
-                for l in wrap(text, width) {
-                    lines.push(Line::from(Span::styled(l, DIM)));
-                }
+        }
+        Cell::Note(text) => {
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("[{text}]"), width),
+                DIM,
+            )));
+        }
+        Cell::System(text) => {
+            // Slash-command output: dim, but wrapped in full (not collapsed
+            // like a Note) since /help and /cost are multi-line.
+            for l in wrap(text, width) {
+                lines.push(Line::from(Span::styled(l, DIM)));
             }
         }
     }
     lines
+}
+
+/// The uncommitted tail as flat display lines (each cell via [`cell_lines`]).
+pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
+    cells.iter().flat_map(|c| cell_lines(c, width)).collect()
+}
+
+/// A cell is committable once it can no longer change: everything except a tool
+/// or sub-agent row that is still Running (its ✓/✗ has yet to land).
+fn is_committable(cell: &Cell) -> bool {
+    match cell {
+        Cell::Tool { status, .. } | Cell::Agent { status, .. } => *status != ToolStatus::Running,
+        _ => true,
+    }
+}
+
+/// How many leading cells to freeze into scrollback so the uncommitted tail fits
+/// an `active_h`-row viewport region. Commits only finalized cells and never the
+/// last one (the live cell stays on screen). A still-running cell at the front
+/// holds the line — but only until the backlog behind it grows past a few
+/// screens, at which point it is force-committed (frozen mid-run) so a stuck
+/// tool or background agent can't pin an unbounded tail in memory.
+pub fn commit_count(cells: &[Cell], width: usize, active_h: usize) -> usize {
+    let active_h = active_h.max(1);
+    let heights: Vec<usize> = cells.iter().map(|c| cell_lines(c, width).len()).collect();
+    let total: usize = heights.iter().sum();
+    if total <= active_h {
+        return 0;
+    }
+    let hard_cap = active_h.saturating_mul(4);
+    let mut committed = 0;
+    let mut remaining = total;
+    while remaining > active_h && committed + 1 < cells.len() {
+        if !is_committable(&cells[committed]) && remaining <= hard_cap {
+            break;
+        }
+        remaining -= heights[committed];
+        committed += 1;
+    }
+    committed
 }
 
 /// The input line, windowed so the cursor stays visible in `width` columns.
@@ -247,10 +289,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let width = transcript_area.width as usize;
     let lines = transcript_lines(&app.cells, width.max(1));
     let height = transcript_area.height as usize;
-    app.scroll_up = app.scroll_up.min(lines.len().saturating_sub(height));
-    let end = lines.len() - app.scroll_up;
-    let start = end.saturating_sub(height);
-    f.render_widget(Paragraph::new(lines[start..end].to_vec()), transcript_area);
+    // Bottom-anchor the uncommitted tail just above the composer. The event loop
+    // has already frozen anything that overflowed into native scrollback, so
+    // clipping the top here only bites transiently (e.g. a long answer still
+    // streaming); a shorter tail pads with blank rows so the newest line sits by
+    // the composer. Scrolling back to older output is the terminal's job now.
+    let start = lines.len().saturating_sub(height);
+    let visible = &lines[start..];
+    let pad = height.saturating_sub(visible.len());
+    let mut rows = vec![Line::default(); pad];
+    rows.extend_from_slice(visible);
+    f.render_widget(Paragraph::new(rows), transcript_area);
 
     f.render_widget(
         Paragraph::new(truncate(&status_line(app), width)).style(DIM),
@@ -653,6 +702,7 @@ mod tests {
         assert_eq!(
             texts,
             vec![
+                "", // blank separator opening the user turn
                 "> do the thing",
                 "✓ bash {\"command\":\"ls\"}",
                 "… bash {}",
@@ -660,6 +710,37 @@ mod tests {
                 "done.",
                 "all good",
             ]
+        );
+    }
+
+    /// Nothing overflows: no cell is committed. Once the tail is taller than the
+    /// region, the final leading cells are committed — but never the last one,
+    /// and a still-running tool at the front holds the line.
+    #[test]
+    fn commit_count_freezes_the_overflowing_final_prefix() {
+        // Five one-line assistant cells; region only 3 rows tall.
+        let five: Vec<Cell> = (0..5)
+            .map(|i| Cell::Assistant(format!("line {i}")))
+            .collect();
+        assert_eq!(commit_count(&five, 40, 10), 0, "fits: commit nothing");
+        // total 5 > 3: commit the front 2 so the last 3 fit.
+        assert_eq!(commit_count(&five, 40, 3), 2);
+        // Never commit the last cell even if the region is tiny.
+        assert_eq!(commit_count(&five, 40, 1), 4);
+
+        // A running tool at the front is not committable, so it holds the line
+        // (and everything behind it) until it finishes — as long as the backlog
+        // stays under the force-commit cap.
+        let mut cells = vec![Cell::Tool {
+            name: "bash".into(),
+            summary: "{}".into(),
+            status: ToolStatus::Running,
+        }];
+        cells.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
+        assert_eq!(
+            commit_count(&cells, 40, 2),
+            0,
+            "running front pins the tail"
         );
     }
 

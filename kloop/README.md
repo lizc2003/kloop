@@ -267,35 +267,43 @@ top-level agent can `exit_plan_mode`.
 
 ## TUI (Phase 2, fourth slice)
 
-The default entry point is a ratatui terminal UI (alternate screen): a
-scrolling transcript on top, a one-line status row, and a one-line input at
-the bottom. Tool calls collapse to single status rows (`… bash {...}` while
-running, `✓`/`✗` when done) — their full output lives in history/offload, not
-on screen. Permission prompts appear as a centered y/a/p/n popup; prompts
-from a concurrent tool batch queue and are answered in order.
+The default entry point is a ratatui terminal UI. It renders **inline** (no
+alternate screen, plan 38 slice 0): a full-height viewport holds the still-live
+tail — the streaming answer, any running tool rows, a one-line status row, and
+the input — while every finalized cell scrolls up into the terminal's **native
+scrollback**, so the mouse wheel, text selection, and Cmd+F reach history
+directly (the UI keeps no scroll of its own). Tool calls collapse to single
+status rows (`… bash {...}` while running, `✓`/`✗` when done) — their full
+output lives in history/offload, not on screen. Permission prompts appear as a
+centered y/a/p/n popup over the viewport; prompts from a concurrent tool batch
+queue and are answered in order.
 
 Structure (`crates/tui`): the agent runs on its own tokio task and owns
 `History`; `ChannelUi` implements both `Ui` and `Approver` by forwarding
 everything as events over an mpsc channel (approval decisions travel back
-over a oneshot; a dropped reply means deny). The UI loop `select!`s crossterm
-key events against agent events, folds both into pure state (`App`), and
-renders via pure cell→line functions — which is what makes the transcript
-logic testable without a terminal. Streaming deltas are drained in batches so
-a burst of tokens redraws once, not per token.
+over a oneshot; a dropped reply means deny). Keys arrive from a dedicated
+poll thread (`poll(200ms)+read`, not crossterm's `EventStream`) so the input
+reader never parks holding the lock a resize's cursor-position query needs.
+The UI loop `select!`s those key events against agent events, folds both into
+pure state (`App`, whose `cells` are the uncommitted tail), and renders via
+pure cell→line functions — which is what makes the transcript logic testable
+without a terminal. Before each draw it freezes the finalized cells that
+overflow the viewport into scrollback with `insert_before`. Streaming deltas
+are drained in batches so a burst of tokens redraws once, not per token.
 
 Keys: Enter sends when idle, or **steers** while a turn runs (see below);
 Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+R (idle)
-opens the rewind picker (see [Fork](#fork-and-rewind)), Ctrl+D quits,
-Up/Down/PageUp/PageDown scroll the transcript (view pins back to bottom on
-send). While an approval popup or the rewind picker is up it captures the
-keyboard: for approvals the scroll keys (plus j/k) page through a tall diff and
-y/a/p/n answer; for rewind ↑↓/kj move and Enter/Esc select or cancel. `--plain`
-keeps the old line-based REPL.
+opens the rewind picker (see [Fork](#fork-and-rewind)), Ctrl+D quits. Scrolling
+back through history is the terminal's job now (native scrollback). While an
+approval popup or the rewind picker is up it captures the keyboard: for
+approvals the scroll keys (plus j/k) page through a tall diff and y/a/p/n
+answer; for rewind ↑↓/kj move and Enter/Esc select or cancel. `--plain` keeps
+the old line-based REPL; `--mock` stays on plain output.
 
-`--resume` replays the saved session into the transcript (user/assistant
-text plus tool status rows re-derived from the recorded tool_use/tool_result
-pairs), so a resumed session starts with its conversation visible instead of
-a blank screen.
+`--resume` replays the saved session into the tail (user/assistant text plus
+tool status rows re-derived from the recorded tool_use/tool_result pairs); a
+long history scrolls straight into native scrollback, so a resumed session
+starts with its recent conversation visible instead of a blank screen.
 
 ## Server mode (Phase 2, fifth slice)
 

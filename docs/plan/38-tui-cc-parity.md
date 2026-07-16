@@ -91,11 +91,33 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 > 顺序即依赖:切片 0 是地基,先定渲染模型再做视觉,否则视觉工作要在旧的「全量重画」
 > 模型上做一遍、迁 inline 时返工。1/2 视觉增量最大。3~6 依次。
 
-### 切片 0 — inline 渲染模型迁移(地基,必须先做,风险最高)
+### 切片 0 — inline 渲染模型迁移(地基,必须先做,风险最高) ✅ 完成(2026-07-16)
 
 把渲染从「`App` 持有全部 `cells` + 每帧 `transcript_lines` 全量重画」改为「cell 定稿即
 `insert_before` 写进 scrollback,只有正在流式的 **active cell** + 底部区(状态行 + composer)
 在 inline viewport」。
+
+**完成记录(2026-07-16,提交号待回填)**:
+- `crates/tui/Cargo.toml`:ratatui 开 `scrolling-regions` feature(flicker-free insert_before);删已不用的 `futures` 依赖。
+- `setup_terminal`:去 `EnterAlternateScreen`,改 `Terminal::with_options(Viewport::Inline(满屏高))`;
+  restore 去 alt-screen、show cursor + 换行落到 viewport 下。构造期 CPR 在输入线程启动前跑,无并发。
+- **输入模型**:`spawn_input_thread` 专用 OS 线程 `poll(200ms)+read()` → tokio channel,取代 `EventStream`;
+  `ui_loop` select(input channel, agent events),退出时置 stop 旗 + join。解了 CPR/EventStream 死锁陷阱
+  (关键决定 1、教训 38)。
+- **渲染模型**:上游满高 inline + 溢出提交(**修正关键决定**:上游 ratatui 0.29 不能运行时改 viewport 高度,
+  小 live 区观感需 fork,故取满高 + `insert_before` 溢出落 scrollback,达成 scrollback 目标零 fork——见教训 38)。
+  `render::cell_lines`(单 cell 渲染,viewport 与 insert_before 共用)、`commit_count`(定稿前缀 + 硬 cap
+  兜背景 agent 卡死)、`App::drain_committed`(重基三索引映射);`draw` 底部对齐渲染未提交尾部。`App.cells` 语义
+  变「未提交尾部」;退役 `scroll_up` 及滚动键(交给终端)。
+- **弹层**:confirm / fork picker 仍 viewport 内居中模态,**零改**(满高 viewport 下 `f.area()` = 全屏,原样叠加)。
+- **resume/clear/fork**:resumed cells 进未提交尾部、启动即溢出落 scrollback;`/clear`/rewind 不能擦 scrollback(inline
+  固有,注释说明)。
+- **验收**:fmt+clippy(`-D warnings`)+ 全 workspace test 绿(tui 49 测试,含 `commit_count`/`drain_committed`/
+  端到端 `draw_confirm`)。真 key **双轨** PTY+pyte VT100 驱动:anthropic + openai 各 6/6(inline 渲染 / 流式 /
+  工具行 ✓✗ / resize×2 不花屏[CPR 陷阱] / Ctrl+C 中断);另 anthropic 单验审批弹层(`approve?` 盒 + y 放行 + 工具跑 +
+  结果回报)、60 消息 resume 溢出(尾部对位、composer 钉底、无花屏)。**留真终端人工核一条**:原生 scrollback 回滚
+  (pyte 抓不到 DECSTBM scroll-region scrollback,模拟器保真度限制非 bug)。
+- **教训沉淀**:HANDOFF 教训 38(CPR/poll 线程、上游不能动态改 inline 高度、PTY 测法);教训 12 修订(inline 是中等工程非「太重」)。
 
 - `setup_terminal` 去 `EnterAlternateScreen`,改 `Viewport::Inline`;解决 CPR/stdin 并发
   (关键决定 1);`Cargo.toml` `ratatui` 开 `scrolling-regions`(+ 可选 `unstable-rendered-line-info`)。
@@ -184,7 +206,7 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
 
 ## 开工时定 / 问用户
 
-- 切片 0 是否即刻开工(风险最高但地基,做完才好评估后续手感)。
+- ~~切片 0 是否即刻开工~~(✅ 用户同意即刻开工,已完成)。
 - 关键决定 2:syntect 代码高亮引入 vs 后置(依赖体积权衡)。
 - 切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)可开工时对着真 key 调。
 - **品牌强调色**定 magenta/cyan(styles.md 建议)还是**橙**(靠拢 CC 截图);gutter 提示符
