@@ -72,7 +72,7 @@ fmt/clippy/test 全绿,一次 commit;README 补远程 server 配置示例;本文
 HANDOFF 补能力条目。真 key 验收:接一个真实远程 MCP server(问用户要地址/token)双轨
 跑通 tools/call。
 
-## ✅ 完成记录(2026-07-16,提交 <待填>)
+## ✅ 完成记录(2026-07-16,提交 2cfbac2)
 
 **三个开工决定的落定**:
 1. **HTTP 客户端放哪** → **reqwest 直接进 kloop-mcp**。依赖图看:core 不依赖 mcp、
