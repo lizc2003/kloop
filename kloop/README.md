@@ -650,6 +650,35 @@ Not yet (deliberate): sub-agent history persistence, async dispatch with a
 completion mailbox (codex spawn/wait shape), hook events tagged with the
 agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
 
+### Worktree isolation
+
+A `task` call can add `"isolation": "worktree"` to run its sub-agent in a
+private git worktree, so parallel sub-agents can edit the *same relative path*
+without racing on the shared tree (`crates/core/src/worktree.rs`, plan 35; the
+shape cc and codex converged on). Before spawning, `task` runs
+`git worktree add --no-track -B kloop/worktree/<agent-N> .kloop/worktrees/<agent-N> HEAD`
+and rewires the sub-agent's **cwd anchor** onto the tree — the single value
+(`Config.cwd`) that bash's working directory, relative file/search paths, the
+permission gate's acceptEdits check, and the OS sandbox's writable root all key
+off. The main agent's cwd is the process cwd, so nothing changes there; only a
+worktree sub-agent diverges. `offload_dir` and `sessions_dir` deliberately do
+**not** follow — offload/session files stay alongside the parent's in the main
+repo. The managed `.kloop/worktrees/` dir is added to `.git/info/exclude`.
+
+Lifecycle (no auto-merge, both references stop here): when the sub-agent ends,
+an **untouched** tree (clean working copy, no commits past HEAD) is torn down
+along with its branch; a **changed** tree is kept, and the sub-agent's
+tool_result names its branch + path so the parent — or you — can
+`git merge kloop/worktree/<agent-N>` or discard it. The change probe is
+**fail-closed**: if git can't be trusted, the tree is kept, never silently
+deleted. Creation is fail-closed too — a non-git cwd, a name collision, or a
+git error is an `is_error` result, never a silent fall back to the shared cwd.
+`--mock`/tests without a git repo simply don't request isolation.
+
+Not yet (挂账): the `enter_worktree`/`exit_worktree` model tools and a
+session-level `--worktree` flag (slice 2), an `origin/HEAD` base ref for CI,
+and 30-day stale-tree pruning (`git worktree prune` by hand for now).
+
 ## OS sandbox (Phase 2, thirteenth slice)
 
 On macOS, bash commands run inside a seatbelt sandbox by default

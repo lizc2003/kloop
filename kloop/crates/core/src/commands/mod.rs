@@ -153,6 +153,7 @@ mod tests {
             system: "test".into(),
             project_instructions: None,
             max_rounds: 5,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             offload_dir: std::env::temp_dir().join("kloop-cmd-test"),
             sessions_dir: std::env::temp_dir().join("kloop-cmd-test-sessions"),
             context_window: window,

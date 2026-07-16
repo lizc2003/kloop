@@ -94,7 +94,7 @@ pub trait Approver: Send + Sync {
 /// Sink invoked on [`Decision::AllowAlways`] with the rule strings to
 /// persist; the CLI writes them to `.kloop/config.toml`. Errors are the
 /// sink's problem to report (the gate has no UI).
-pub type PersistFn = Box<dyn Fn(&[String]) + Send + Sync>;
+pub type PersistFn = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 /// Gating mode, after cc's permission modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -265,6 +265,28 @@ impl Permissions {
             cwd: lexical_normalize(Path::new("/"), &cwd),
             persist,
         })
+    }
+
+    /// A copy of this gate anchored at a different `cwd` — for a sub-agent
+    /// running in its own git worktree (plan 35), where acceptEdits and every
+    /// relative-path check must key off the worktree, not the parent's cwd.
+    /// Rules, mode, the approver and the persist sink are shared (so the
+    /// sub-agent's prompts still reach the user and its `AllowAlways` still
+    /// persists); only the session-approval cache starts fresh — an isolated
+    /// worktree gets its own cache rather than inheriting parent-dir-scoped
+    /// file approvals that wouldn't apply to worktree paths anyway.
+    pub fn rebased(&self, cwd: PathBuf) -> Self {
+        Permissions {
+            allow_everything: self.allow_everything,
+            mode: self.mode,
+            allow: Mutex::new(self.allow.lock().unwrap().clone()),
+            deny: self.deny.clone(),
+            ask: self.ask.clone(),
+            session: Mutex::new(HashSet::new()),
+            approver: self.approver.clone(),
+            cwd: lexical_normalize(Path::new("/"), &cwd),
+            persist: self.persist.clone(),
+        }
     }
 
     /// Whether this tool call may run: `Ok(())` to proceed, `Err(reason)`
@@ -1081,6 +1103,30 @@ mod tests {
         assert_eq!(approver.ask_count(), 3);
     }
 
+    /// A `rebased` gate re-anchors acceptEdits: relative and in-tree writes for
+    /// the NEW cwd (a worktree) auto-allow, while a path that was inside the
+    /// OLD cwd now falls outside and asks — the sub-agent can't silently write
+    /// the main tree just because its parent could.
+    #[tokio::test]
+    async fn rebased_reanchors_accept_edits_onto_the_new_cwd() {
+        let approver = ScriptedApprover::new(vec![]);
+        let parent = gate(Mode::AcceptEdits, rules(&[], &[], &[]), approver.clone());
+        let sub = parent.rebased(PathBuf::from("/work/tree"));
+        assert!(
+            ok(&sub, "write_file", file("/work/tree/src/main.rs")).await,
+            "a write inside the worktree auto-allows"
+        );
+        assert!(
+            ok(&sub, "write_file", file("src/main.rs")).await,
+            "a relative write resolves against the worktree and auto-allows"
+        );
+        assert!(
+            !ok(&sub, "write_file", file("/work/proj/src/main.rs")).await,
+            "the parent's tree is now outside cwd and asks"
+        );
+        assert_eq!(approver.ask_count(), 1);
+    }
+
     #[tokio::test]
     async fn allow_rules_match_tool_bash_prefix_and_path_glob() {
         let approver = ScriptedApprover::new(vec![]);
@@ -1166,7 +1212,7 @@ mod tests {
             &rules(&[], &[], &[]),
             PathBuf::from("/work/proj"),
             Some(approver.clone()),
-            Some(Box::new(move |rules| {
+            Some(Arc::new(move |rules| {
                 CALLS.fetch_add(1, Ordering::SeqCst);
                 sink.lock().unwrap().extend(rules.iter().cloned());
             })),

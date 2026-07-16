@@ -75,3 +75,47 @@ git 临时仓 fixture:创建(路径/分支名/`.git/info/exclude` 注入);未变
 fmt/clippy/test 全绿,一次 commit;README 补 isolation 参数;本文件补完成记录;HANDOFF
 补能力条目与教训(cwd 联动清单的取舍)。真 key 验收:两个并行子 agent 各自 worktree
 改同一文件不冲突,变更分支可手动 merge。
+
+## ✅ 完成记录(2026-07-16,提交 <待回填>)
+
+**切片 1 落地,真 key 双轨验收已过。** 关键决定按 plan 倾向:入口=task 的 `isolation`
+参数、base=HEAD、同名报错、offload/sessions 不跟。
+
+**发现:cwd 尚不是 Config 一级字段**。bash/read_file/write_file/edit_file/grep/glob
+全部隐式吃进程 cwd(bash 不 `current_dir`、文件工具直接拿裸 path、grep/glob 默认根
+`"."`)。要真隔离必须把 cwd 提成 `Config.cwd` 并穿进每个工具 IO——主 agent cwd=进程
+cwd 故行为逐字节不变,只有 worktree 子 agent 分叉。这是 plan 预警"cwd 是锚点"的实体,
+比"加个参数"大。落点:
+- `Config.cwd`(新字段,CLI 用 `current_dir()` 填);tools 里 `resolve_path(cwd, raw)`
+  统一锚定;bash `.current_dir(cwd)`;grep/glob 根默认 cwd + `display_path(root,·)`
+  改成根相对(主 agent 输出不变)。
+- `core/src/worktree.rs`:`create`(`git worktree add --no-track -B kloop/worktree/<agent-N>
+  <dir>/<name> HEAD` + `.git/info/exclude` 注入)/`finish`(未变更→删树删枝;有变更→留 +
+  回灌 note 带路径分支)/fail-closed(非 git/名撞/git 错=报错不回退;change 探测出错=当有变更留)。
+- `Permissions::rebased(cwd)`(rules/approver/persist 共享、session 缓存重置、cwd 换;
+  `PersistFn` Box→Arc 才能共享)、`SandboxPolicy::with_writable_root`(worktree 加进可写根)。
+- task `isolation` 参数 + schema `enum[shared,worktree]`;sync 与 background 都覆盖。
+
+**三处真 key 踩坑(mock 用 allow_all 短路全门,全都藏住了)**:
+1. **模型用绝对路径逃逸**:子 agent 继承的 `system` 环境块写着**父** cwd,模型据此拼绝对
+   路径,写穿 worktree 落回主仓。修:`rewire_for_worktree` 把 system 里 `- Working
+   directory:` 那行改成 worktree。(指令文件/git 快照仍继承——HEAD worktree 文件逐字节
+   同,重新发现要 CLI IO,挂账。)
+2. **worktree 建在 `.kloop/` 下与敏感路径规则冲突**:`.kloop` 是权限门 `path_is_sensitive`
+   与沙箱只读子路径双重保护的路径,worktree 里每次写都被判"写 kloop 配置"→安全检查
+   bypass 免疫→headless 无 approver 直接拒。改到 `.kloop-worktrees/`(不含 `.kloop`
+   组件)一并躲开两处。**偏离 plan 的 `.kloop/worktrees` 位置**,理由充分。
+3. **并行 `git worktree add` 竞态**:两个并行子 agent 同仓建树,ref/worktree-admin 锁
+   互踩,一个静默丢树。加进程级 `WORKTREE_LOCK`(tokio Mutex)串行化 create/finish 的
+   git 变更(读探测不锁)。
+
+**回灌 note 修正**:子 agent 改文件但**不 commit** 时变更是 worktree 工作区里的未提交改
+动,`git merge <branch>` 是 no-op。note 改成"改动在 worktree,提交后 merge 或直接看/删"。
+
+真 key 验收(`--permission-mode bypass`,headless `-p`):Anthropic(claude-sonnet-4-6)
+两并行子 agent 各在 worktree 改同一 `shared.txt`→主仓无变更、两分支 AGENT-A/AGENT-B
+互不冲突、commit 后可 merge 回 main;OpenAI(gpt-5.4-mini)子 agent 相对写 `new.txt`
+落 worktree、主仓无泄漏、clean 树自动撤除。
+
+**挂账不变**:enter/exit 模型工具 + `--worktree` 会话级(切片 2);origin/HEAD base;30 天
+陈旧清理;指令文件/git 快照按 worktree 重新组装(需 CLI IO);cc 的 setup 拷贝;跨仓库。

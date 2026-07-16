@@ -210,7 +210,7 @@ fn build_permissions(
     let rules = load_permission_rules(&config_path)?;
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     let persist =
-        Box::new(
+        Arc::new(
             move |rules: &[String]| match persist_allow_rules(&config_path, rules) {
                 Ok(()) => notify(&format!(
                     "saved to {PERMISSIONS_CONFIG}: {}",
@@ -564,6 +564,9 @@ pub(crate) fn config_from_env(
     };
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
+    // The main agent's cwd anchor is the process cwd (same value build_permissions
+    // reads); a worktree sub-agent later rewires its own clone off this.
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
     // Code-mode resource limits: default unless [codemode]/KLOOP_PROGRAM_* set.
     let program_limits = if args.mock {
         kloop_core::ProgramLimits::default()
@@ -585,6 +588,7 @@ pub(crate) fn config_from_env(
         system: project.system.clone(),
         project_instructions: project.instructions.clone(),
         max_rounds: 30,
+        cwd,
         offload_dir,
         sessions_dir,
         context_window,

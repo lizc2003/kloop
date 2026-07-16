@@ -137,6 +137,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             system: "test".into(),
             project_instructions: None,
             max_rounds: 10,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             offload_dir: offload.clone(),
             // Siblings under the same test root (test_dirs), matching the
             // ServerPaths the server lists/creates threads from.

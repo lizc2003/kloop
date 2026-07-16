@@ -401,7 +401,8 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
                     "prompt": {"type": "string", "description": "Complete standalone task description"},
                     "agent_type": {"type": "string", "description": "Name of a configured agent type to use (its own system prompt, model, and tools); omit for a general-purpose sub-agent"},
                     "background": {"type": "boolean", "description": "Fire-and-forget: return an agent id immediately and deliver the result as a message when it finishes, instead of blocking (default false)"},
-                    "max_rounds": {"type": "integer", "description": "Round cap for the sub-agent (default and max 15)"}
+                    "max_rounds": {"type": "integer", "description": "Round cap for the sub-agent (default and max 15)"},
+                    "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "Where the sub-agent works. \"shared\" (default) uses the current working directory. \"worktree\" gives it a private git worktree on its own branch, so parallel sub-agents can edit the same files without conflicting; unmerged changes are reported back on their branch for you to merge. Requires a git repository."}
                 },
                 "required": ["prompt"]
             }),
@@ -662,7 +663,7 @@ fn execute_tool<'a>(
         // read_file is the sole BUILT-IN that can return non-text: on an image
         // file it returns an image block (ToolResultContent::Blocks).
         if name == "read_file" {
-            return fs::read_file_tool(input).await;
+            return fs::read_file_tool(input, ctx).await;
         }
         // External (source/MCP) tools can also return images — handle them
         // before the text-returning built-ins so their result can be Text OR
@@ -678,14 +679,19 @@ fn execute_tool<'a>(
             "bash" => bash::bash_tool(input, ctx).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
-            "write_file" => fs::write_file_tool(input).await,
-            "edit_file" => fs::edit_file_tool(input).await,
-            "grep" => search::grep_tool(input, ctx.cfg.permissions.clone()).await,
+            "write_file" => fs::write_file_tool(input, ctx).await,
+            "edit_file" => fs::edit_file_tool(input, ctx).await,
+            "grep" => search::grep_tool(input, &ctx.cfg.cwd, ctx.cfg.permissions.clone()).await,
             // glob hands a program its path list as a string[] (built-ins are
             // otherwise strings); the model-facing text is unchanged.
             "glob" => {
-                search::glob_tool(input, ctx.program_result.as_ref(), ctx.cfg.permissions.clone())
-                    .await
+                search::glob_tool(
+                    input,
+                    &ctx.cfg.cwd,
+                    ctx.program_result.as_ref(),
+                    ctx.cfg.permissions.clone(),
+                )
+                .await
             }
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
@@ -712,6 +718,21 @@ pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a
     input[key]
         .as_str()
         .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
+}
+
+/// Anchor a tool's path argument at the agent's cwd: an absolute path is used
+/// as-is, a relative one resolves against `cwd`. For the main agent `cwd` is
+/// the process cwd, so this is a no-op there; for a worktree sub-agent (plan
+/// 35) it is what keeps the sub-agent's relative reads/writes inside its own
+/// tree instead of leaking to the process cwd. Same anchor the permission gate
+/// uses, so the check and the IO never disagree about where a path points.
+pub(crate) fn resolve_path(cwd: &std::path::Path, raw: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
 }
 
 /// Shared fixtures for the per-module tool tests: a permissive ToolCtx and
@@ -747,6 +768,7 @@ pub(crate) mod testutil {
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: 5,
+                cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
                 sessions_dir: std::env::temp_dir().join(format!("kloop-tools-sessions-{tag}")),
                 context_window: None,
@@ -1278,6 +1300,7 @@ mod tests {
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: 5,
+                cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
                 sessions_dir: std::env::temp_dir().join("kloop-test-cancel-sessions"),
                 context_window: None,

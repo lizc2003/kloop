@@ -165,6 +165,7 @@ mod tests {
             system: "test".into(),
             project_instructions: None,
             max_rounds: 5,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
             sessions_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}-sessions")),
             context_window: Some(200_000),

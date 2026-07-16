@@ -22,6 +22,7 @@ use crate::inbox::InboxItem;
 use crate::rollout::session_path;
 use crate::rollout::Rollout;
 use crate::skills::Skill;
+use crate::worktree;
 use kloop_protocol::Message;
 
 const SUBAGENT_MAX_ROUNDS: usize = 15;
@@ -56,8 +57,17 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         }
         None => None,
     };
+    // `isolation: "worktree"` gives the sub-agent its own git worktree so it
+    // can edit files without racing sibling sub-agents on the shared tree
+    // (plan 35). Any other value is an error — an unrecognized isolation must
+    // not silently degrade to the shared cwd.
+    let isolate = match input["isolation"].as_str() {
+        None | Some("shared") => false,
+        Some("worktree") => true,
+        Some(other) => bail!("task: unknown isolation '{other}' (expected \"worktree\")"),
+    };
     let agent = next_agent_label();
-    let sub_cfg = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
+    let mut sub = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
     // The label shown next to the running agent carries its type, if any.
@@ -66,11 +76,49 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         None => task_preview(&prompt),
     };
 
+    // Create the worktree BEFORE spawning and rewire the sub-agent's cwd
+    // anchors onto it. Fail-closed: a creation error is the tool's error, never
+    // a fall back to the shared cwd (cc's shape).
+    let worktree = if isolate {
+        let wt = worktree::create(&ctx.cfg.cwd, &agent)
+            .await
+            .map_err(|e| anyhow!("task: {e:#}"))?;
+        rewire_for_worktree(&mut sub, &wt);
+        Some(wt)
+    } else {
+        None
+    };
+    let sub_cfg = Arc::new(sub);
+
     if background {
-        return spawn_background(ctx, sub_cfg, agent, &preview, prompt, depth, ui);
+        return spawn_background(ctx, sub_cfg, agent, &preview, prompt, depth, ui, worktree).await;
     }
 
-    run_sub_agent_sync(ctx, sub_cfg, agent, preview, prompt, depth, "task").await
+    run_sub_agent_sync(
+        ctx, sub_cfg, agent, preview, prompt, depth, "task", worktree,
+    )
+    .await
+}
+
+/// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
+/// (so acceptEdits allows writes inside the tree), the OS sandbox (so its bash
+/// may write the tree), and the working-directory line the model reads in the
+/// system prompt — without that last rewrite the model builds ABSOLUTE paths
+/// from the parent's cwd and writes straight past the worktree (found the hard
+/// way in the plan-35 real-key run). Everything else — offload/sessions dirs,
+/// hooks, tool sources, the instruction files and the git snapshot — stays
+/// inherited: a HEAD-based worktree has byte-identical instruction files, and
+/// re-discovering them (plus a fresh worktree git snapshot) needs the CLI's IO
+/// and is left for a later slice.
+fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) {
+    let old = format!("- Working directory: {}", sub.cwd.display());
+    let new = format!("- Working directory: {}", wt.path.display());
+    sub.system = sub.system.replacen(&old, &new, 1);
+    sub.cwd = wt.path.clone();
+    sub.permissions = Arc::new(sub.permissions.rebased(wt.path.clone()));
+    if let Some(sb) = &sub.sandbox {
+        sub.sandbox = Some(Arc::new(sb.with_writable_root(&wt.path)));
+    }
 }
 
 /// Process-global monotonic agent label, so parallel spawners never collide.
@@ -84,6 +132,7 @@ fn next_agent_label() -> String {
 /// execute_tool): the caller only holds a JoinHandle, which is Send regardless
 /// of the recursive future's type. Shared by the `task` tool and a `fork`
 /// skill; `who` prefixes the error messages.
+#[allow(clippy::too_many_arguments)]
 async fn run_sub_agent_sync(
     ctx: &ToolCtx,
     sub_cfg: Arc<Config>,
@@ -92,6 +141,7 @@ async fn run_sub_agent_sync(
     prompt: String,
     depth: u8,
     who: &str,
+    worktree: Option<worktree::Worktree>,
 ) -> Result<String> {
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
@@ -109,11 +159,15 @@ async fn run_sub_agent_sync(
     let outcome = match handle.await {
         Ok(outcome) => outcome,
         Err(e) => {
+            // A panic still tears down the worktree (dirty ones are kept).
+            if let Some(wt) = worktree {
+                worktree::finish(wt).await;
+            }
             ui.agent_end(&agent, false);
             return Err(anyhow!("{who}: sub-agent panicked: {e}"));
         }
     };
-    let result = match outcome.reason {
+    let mut result = match outcome.reason {
         EndReason::Completed => Ok(outcome.final_text),
         EndReason::MaxRounds => Ok(format!(
             "[sub-agent stopped at its round limit]\n{}",
@@ -122,6 +176,16 @@ async fn run_sub_agent_sync(
         EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
         EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
     };
+    // Tear down or preserve the worktree, and tell the model where a preserved
+    // one lives (only on a success result — an error already routes to is_error
+    // guidance; the changes still sit on the branch for the user).
+    if let Some(wt) = worktree {
+        if let Some(note) = worktree::finish(wt).await {
+            if let Ok(text) = &mut result {
+                text.push_str(&note);
+            }
+        }
+    }
     ui.agent_end(&agent, result.is_ok());
     result
 }
@@ -156,6 +220,7 @@ pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Re
         body,
         ctx.depth + 1,
         "skill",
+        None,
     )
     .await
 }
@@ -166,7 +231,8 @@ pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Re
 /// turn must never kill a still-running background agent. When it ends, it
 /// reinjects its result into the PARENT's inbox (captured before `build_sub_config`
 /// reset the sub-agent's own inbox to fresh).
-fn spawn_background(
+#[allow(clippy::too_many_arguments)]
+async fn spawn_background(
     ctx: &ToolCtx,
     sub_cfg: Arc<Config>,
     agent: String,
@@ -174,12 +240,21 @@ fn spawn_background(
     prompt: String,
     depth: u8,
     ui: Arc<dyn crate::agent::Ui>,
+    worktree: Option<worktree::Worktree>,
 ) -> Result<String> {
     let own_cancel = CancellationToken::new();
-    ctx.cfg
+    if let Err(msg) = ctx
+        .cfg
         .background_tasks
         .register(&agent, preview, own_cancel.clone())
-        .map_err(|msg| anyhow!("task: {msg}"))?;
+    {
+        // The slot couldn't be reserved: nothing will run, so undo the worktree
+        // now instead of leaking an empty tree.
+        if let Some(wt) = worktree {
+            worktree::finish(wt).await;
+        }
+        return Err(anyhow!("task: {msg}"));
+    }
     let parent_inbox = ctx.cfg.inbox.clone();
     let background_tasks = ctx.cfg.background_tasks.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
@@ -192,7 +267,17 @@ fn spawn_background(
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             let outcome = run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await;
-            let (status, reinject) = classify_background(outcome);
+            let (status, mut reinject) = classify_background(outcome);
+            // Tear down or preserve the worktree; a preserved tree's location
+            // is folded into the reinjected result so the parent learns of it.
+            if let Some(wt) = worktree {
+                if let Some(note) = worktree::finish(wt).await {
+                    match &mut reinject {
+                        Some(summary) => summary.push_str(&note),
+                        None => reinject = Some(note.trim_start().to_string()),
+                    }
+                }
+            }
             background_tasks.set_status(&label, status);
             match reinject {
                 Some(summary) => parent_inbox.push(InboxItem::SubAgentResult {
@@ -302,13 +387,14 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: usize, agent: String) -> Config
 }
 
 /// Build the `task` sub-agent's Config: the shared clone plus any agent_type
-/// overrides (system prompt, model, tool allowlist).
+/// overrides (system prompt, model, tool allowlist). Returned unwrapped so the
+/// caller can still rewire it (worktree isolation) before sharing the Arc.
 fn build_sub_config(
     ctx: &ToolCtx,
     max_rounds: usize,
     agent: String,
     agent_type: Option<&AgentType>,
-) -> Arc<Config> {
+) -> Config {
     let mut sub = clone_for_subagent(ctx, max_rounds, agent);
     if let Some(at) = agent_type {
         if let Some(system) = &at.system {
@@ -321,7 +407,7 @@ fn build_sub_config(
             sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
         }
     }
-    Arc::new(sub)
+    sub
 }
 
 /// First line of the prompt, truncated — the label a UI shows next to the
@@ -351,6 +437,256 @@ mod tests {
         let (out, is_error) = run_tool("task", json!({"prompt": "recurse"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("cannot spawn"));
+    }
+
+    /// A throwaway git repo with one commit; returns its canonical root (git
+    /// resolves symlinks, so tests must compare against the canonical path).
+    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("kloop-task-wt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "t"],
+            &["commit", "--allow-empty", "-qm", "base"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        std::fs::canonicalize(&root).unwrap()
+    }
+
+    /// Point a ctx's cwd at `repo` so an isolated sub-agent branches from it.
+    fn ctx_in(mut ctx: ToolCtx, repo: &std::path::Path) -> ToolCtx {
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.cwd = repo.to_path_buf();
+        ctx.cfg = Arc::new(cfg);
+        ctx
+    }
+
+    /// A worktree sub-agent's relative write lands in its OWN tree, never the
+    /// main repo; a tree left dirty is preserved and the result names its
+    /// branch so the parent (or user) can merge it.
+    #[tokio::test]
+    async fn worktree_isolation_confines_writes_and_reports_branch() {
+        let repo = temp_git_repo("confine");
+        let provider = Provider::mock(vec![
+            vec![ContentBlock::ToolUse {
+                id: "w1".into(),
+                name: "write_file".into(),
+                input: json!({"path": "isolated.txt", "content": "sub work"}),
+            }],
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ]);
+        let ctx = ctx_in(with_provider(test_ctx(0, "confine"), provider), &repo);
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "go", "isolation": "worktree"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(
+            out.starts_with("done"),
+            "carries the sub-agent result: {out}"
+        );
+        assert!(
+            out.contains("kloop/worktree/agent-"),
+            "the kept tree's branch is named: {out}"
+        );
+
+        // The write is in the worktree, NOT the main repo.
+        assert!(
+            !repo.join("isolated.txt").exists(),
+            "main repo must be untouched"
+        );
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(trees.len(), 1, "one worktree kept");
+        assert!(
+            trees[0].join("isolated.txt").exists(),
+            "the sub-agent's write landed in its worktree"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The worktree sub-agent's system prompt reports ITS cwd, not the
+    /// parent's — otherwise the model builds absolute paths from the parent's
+    /// working directory and writes straight past the worktree.
+    #[tokio::test]
+    async fn worktree_subagent_system_reports_the_worktree_cwd() {
+        use kloop_provider::MockTurn;
+        let repo = temp_git_repo("sys");
+        let (provider, seen) =
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+                text: "ok".into(),
+            }])]);
+        let base = ctx_in(with_provider(test_ctx(0, "sys"), provider), &repo);
+        let mut cfg = (*base.cfg).clone();
+        cfg.system = format!(
+            "You are a coding agent.\n\n# Environment\n- Working directory: {}\n- Platform: macos",
+            repo.display()
+        );
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "go", "isolation": "worktree"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+
+        let reqs = seen.lock().unwrap();
+        let system = &reqs[0].system;
+        assert!(
+            system.contains(".kloop-worktrees/agent-"),
+            "system points at the worktree: {system}"
+        );
+        assert!(
+            !system.contains(&format!("- Working directory: {}\n", repo.display())),
+            "the parent's working-directory line is gone: {system}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A worktree sub-agent that leaves the tree clean has it (and its branch)
+    /// torn down — no leftover trees, no branch-name note.
+    #[tokio::test]
+    async fn clean_worktree_subagent_is_torn_down() {
+        let repo = temp_git_repo("clean");
+        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+            text: "looked around".into(),
+        }]]);
+        let ctx = ctx_in(with_provider(test_ctx(0, "clean"), provider), &repo);
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "just look", "isolation": "worktree"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out, "looked around", "no branch note for a clean tree");
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+            .map(|d| d.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            trees.is_empty(),
+            "the untouched tree was removed: {trees:?}"
+        );
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "kloop/worktree/*"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "branch deleted"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// TWO isolated sub-agents in one parallel batch each write the same
+    /// relative filename — the point of worktrees. Each write lands in its
+    /// OWN tree (both kept), and the main repo stays clean.
+    #[tokio::test]
+    async fn parallel_worktree_subagents_write_their_own_trees() {
+        let repo = temp_git_repo("parallel");
+        let write = ContentBlock::ToolUse {
+            id: "w".into(),
+            name: "write_file".into(),
+            input: json!({"path": "out.txt", "content": "x"}),
+        };
+        // `max_rounds: 1` makes each sub-agent sample EXACTLY once, and so the two
+        // queued write turns map one-to-one onto the two sub-agents regardless
+        // of how their sampling interleaves (a shared mock queue can't otherwise
+        // guarantee each sub-agent gets a write). The write executes, then the
+        // round limit stops it.
+        let provider = Provider::mock(vec![vec![write.clone()], vec![write]]);
+        let ctx = ctx_in(with_provider(test_ctx(0, "parallel"), provider), &repo);
+
+        let results = dispatch_tools(
+            vec![
+                (
+                    "t1".into(),
+                    "task".into(),
+                    json!({"prompt": "a", "isolation": "worktree", "max_rounds": 1}),
+                ),
+                (
+                    "t2".into(),
+                    "task".into(),
+                    json!({"prompt": "b", "isolation": "worktree", "max_rounds": 1}),
+                ),
+            ],
+            &ctx,
+        )
+        .await;
+        assert_eq!(results.len(), 2);
+
+        assert!(!repo.join("out.txt").exists(), "main repo stays clean");
+        let mut trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        trees.sort();
+        assert_eq!(trees.len(), 2, "both trees kept: {trees:?}");
+        for t in &trees {
+            assert_eq!(
+                std::fs::read_to_string(t.join("out.txt")).unwrap(),
+                "x",
+                "each sub-agent's write is in its own tree: {t:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// An unrecognized isolation value is a hard error — never a silent
+    /// fall back to the shared cwd.
+    #[tokio::test]
+    async fn unknown_isolation_errors() {
+        let ctx = test_ctx(0, "iso-bad");
+        let (out, is_error) =
+            run_tool("task", json!({"prompt": "x", "isolation": "sandbox"}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("unknown isolation 'sandbox'"), "{out}");
+    }
+
+    /// Requesting isolation outside a git repository is an error (fail-closed),
+    /// not a shared-cwd fall back.
+    #[tokio::test]
+    async fn worktree_isolation_requires_a_git_repo() {
+        let dir = std::env::temp_dir().join(format!("kloop-task-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ctx_in(test_ctx(0, "nogit"), &dir);
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "x", "isolation": "worktree"}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error);
+        assert!(out.contains("git repository"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Records the sub-agent lifecycle notifications.

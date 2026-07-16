@@ -26,6 +26,7 @@ pub mod sandbox;
 pub mod shell;
 pub mod skills;
 pub mod tools;
+pub mod worktree;
 
 pub use config::Config;
 /// Re-exported so the CLI can name the code-mode resource limits type (it lives

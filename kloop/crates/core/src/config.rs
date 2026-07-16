@@ -17,6 +17,15 @@ pub struct Config {
     pub provider: Arc<Provider>,
     pub model: String,
     pub system: String,
+    /// Working-directory anchor for THIS agent's tool calls: bash runs here,
+    /// relative file/search paths resolve against it, and the permission gate
+    /// and OS sandbox key their cwd checks off it. The main agent's is the
+    /// process cwd (so behavior is unchanged); a `task {isolation: worktree}`
+    /// sub-agent's is its private git worktree (plan 35), which is how parallel
+    /// sub-agents write the same relative path without colliding. `offload_dir`
+    /// and `sessions_dir` deliberately do NOT follow — they stay in the main
+    /// repo so a sub-agent's offload/session files land alongside the parent's.
+    pub cwd: PathBuf,
     /// Assembled project-instructions message (context::assemble_instructions).
     /// Injected as a synthetic first user message into every sampling request
     /// — never recorded to history, so resume rereads fresh files and

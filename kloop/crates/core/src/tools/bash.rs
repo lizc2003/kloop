@@ -53,8 +53,12 @@ static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 /// policy applies. The env vars are hints only (codex's CODEX_SANDBOX
 /// shape): scripts get a way to detect the sandbox instead of failing
 /// mysteriously; enforcement is the profile.
-fn shell_command(command: &str, sandbox: Option<&SandboxPolicy>) -> tokio::process::Command {
-    match sandbox {
+fn shell_command(
+    command: &str,
+    cwd: &Path,
+    sandbox: Option<&SandboxPolicy>,
+) -> tokio::process::Command {
+    let mut cmd = match sandbox {
         Some(policy) => {
             let (program, args) = sandbox::seatbelt_command(policy, command);
             let mut cmd = tokio::process::Command::new(program);
@@ -70,7 +74,11 @@ fn shell_command(command: &str, sandbox: Option<&SandboxPolicy>) -> tokio::proce
             cmd.arg("-lc").arg(command);
             cmd
         }
-    }
+    };
+    // Run in the agent's cwd — the process cwd for the main agent (unchanged),
+    // its private worktree for a `task {isolation: worktree}` sub-agent.
+    cmd.current_dir(cwd);
+    cmd
 }
 
 /// The session sandbox policy for this call: disable_sandbox is the model's
@@ -99,13 +107,15 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     if input["run_in_background"].as_bool().unwrap_or(false) {
         // No timeout in background mode (cc clears the timer too); the
         // watchdog and kill_bash are the safety net.
-        return ctx
-            .cfg
-            .background_shells
-            .spawn_background(command, &ctx.cfg.offload_dir, sandbox);
+        return ctx.cfg.background_shells.spawn_background(
+            command,
+            &ctx.cfg.cwd,
+            &ctx.cfg.offload_dir,
+            sandbox,
+        );
     }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = run_foreground(command, sandbox, timeout_ms).await?;
+    let output = run_foreground(command, &ctx.cfg.cwd, sandbox, timeout_ms).await?;
     let mut text = format_output(&output);
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
@@ -125,7 +135,7 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
                     .await
                 {
                     EscalationOutcome::Approved => {
-                        let raw = run_foreground(command, None, timeout_ms).await?;
+                        let raw = run_foreground(command, &ctx.cfg.cwd, None, timeout_ms).await?;
                         return Ok(format!(
                             "{}{}",
                             sandbox::ESCALATED_PREFIX,
@@ -147,10 +157,11 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 /// `sandbox`. The caller turns the raw output into model-facing text.
 async fn run_foreground(
     command: &str,
+    cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
     timeout_ms: u64,
 ) -> Result<std::process::Output> {
-    let mut cmd = shell_command(command, sandbox);
+    let mut cmd = shell_command(command, cwd, sandbox);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -321,6 +332,7 @@ impl BackgroundShells {
     fn spawn_background(
         self: &Arc<Self>,
         command: &str,
+        cwd: &Path,
         offload_dir: &Path,
         sandbox: Option<&SandboxPolicy>,
     ) -> Result<String> {
@@ -333,7 +345,7 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut cmd = shell_command(command, sandbox);
+        let mut cmd = shell_command(command, cwd, sandbox);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))

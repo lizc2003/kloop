@@ -67,7 +67,7 @@ struct GrepArgs {
 }
 
 impl GrepArgs {
-    fn parse(input: &Value) -> Result<Self> {
+    fn parse(input: &Value, cwd: &Path) -> Result<Self> {
         let pattern = crate::tools::str_arg(input, "pattern", "grep")?.to_string();
         let mode = match input["output_mode"].as_str().unwrap_or("files_with_matches") {
             "files_with_matches" => OutputMode::FilesWithMatches,
@@ -80,7 +80,12 @@ impl GrepArgs {
         let around = input["-C"].as_u64();
         Ok(GrepArgs {
             pattern,
-            root: PathBuf::from(input["path"].as_str().unwrap_or(".")),
+            // Relative `path` (or its absence) anchors at the agent's cwd, so a
+            // worktree sub-agent searches its own tree, not the process cwd.
+            root: match input["path"].as_str() {
+                Some(p) => crate::tools::resolve_path(cwd, p),
+                None => cwd.to_path_buf(),
+            },
             glob: input["glob"].as_str().map(str::to_string),
             file_type: input["type"].as_str().map(str::to_string),
             mode,
@@ -97,8 +102,8 @@ impl GrepArgs {
     }
 }
 
-pub async fn grep_tool(input: &Value, perms: Arc<Permissions>) -> Result<String> {
-    let args = GrepArgs::parse(input)?;
+pub async fn grep_tool(input: &Value, cwd: &Path, perms: Arc<Permissions>) -> Result<String> {
+    let args = GrepArgs::parse(input, cwd)?;
     tokio::task::spawn_blocking(move || run_grep(&args, &perms))
         .await
         .map_err(|e| anyhow!("grep: worker panicked: {e}"))?
@@ -106,11 +111,15 @@ pub async fn grep_tool(input: &Value, perms: Arc<Permissions>) -> Result<String>
 
 pub async fn glob_tool(
     input: &Value,
+    cwd: &Path,
     program_result: Option<&crate::tools::ProgramResultSink>,
     perms: Arc<Permissions>,
 ) -> Result<String> {
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
-    let root = PathBuf::from(input["path"].as_str().unwrap_or("."));
+    let root = match input["path"].as_str() {
+        Some(p) => crate::tools::resolve_path(cwd, p),
+        None => cwd.to_path_buf(),
+    };
     let (text, paths) = tokio::task::spawn_blocking(move || run_glob(&pattern, &root, &perms))
         .await
         .map_err(|e| anyhow!("glob: worker panicked: {e}"))??;
@@ -158,7 +167,7 @@ fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
             hidden += 1;
             continue;
         }
-        let display = display_path(entry.path());
+        let display = display_path(&args.root, entry.path());
         match args.mode {
             OutputMode::Content => {
                 let sink = ContentSink {
@@ -290,7 +299,7 @@ fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, 
                 hidden += 1;
                 continue;
             }
-            files.push((entry.path().to_path_buf(), display_path(entry.path())));
+            files.push((entry.path().to_path_buf(), display_path(root, entry.path())));
         }
     }
     // Newest first: the cap must keep the most recently touched files.
@@ -378,9 +387,19 @@ fn build_walk(root: &Path, glob: Option<&str>, file_type: Option<&str>) -> Resul
     Ok(walk.build())
 }
 
-/// Walker paths come back rooted at the search path; "./" noise is stripped.
-fn display_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
+/// Model-facing path: relative to the search root (which is the agent's cwd or
+/// the `path` arg resolved against it), so output stays cwd-relative whether
+/// the root is the process cwd or a worktree. Leftover "./" noise is stripped;
+/// the root itself (a single-file target) shows its file name.
+fn display_path(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let s = rel.to_string_lossy();
+    if s.is_empty() {
+        return path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+    }
     s.strip_prefix("./").unwrap_or(&s).to_string()
 }
 
@@ -553,11 +572,11 @@ mod tests {
     }
 
     async fn grep(input: Value) -> Result<String> {
-        grep_tool(&input, no_gate()).await
+        grep_tool(&input, Path::new("."), no_gate()).await
     }
 
     async fn glob(input: Value) -> Result<String> {
-        glob_tool(&input, None, no_gate()).await
+        glob_tool(&input, Path::new("."), None, no_gate()).await
     }
 
     /// Strip the tree root prefix so assertions read relative.
@@ -913,6 +932,7 @@ mod tests {
         let perms = gated(t.path(), &["read_file(**/*.pem)"]);
         let out = grep_tool(
             &json!({"pattern": "needle", "path": t.path(), "output_mode": "content"}),
+            Path::new("."),
             perms,
         )
         .await
@@ -933,9 +953,13 @@ mod tests {
             &[("app.rs", "needle here\n"), (".env", "API=needle\n")],
         );
         let perms = gated(t.path(), &[]);
-        let out = grep_tool(&json!({"pattern": "needle", "path": t.path()}), perms)
-            .await
-            .unwrap();
+        let out = grep_tool(
+            &json!({"pattern": "needle", "path": t.path()}),
+            Path::new("."),
+            perms,
+        )
+        .await
+        .unwrap();
         let out = rel(&out, &t);
         assert!(out.contains("app.rs"), "got: {out}");
         assert!(!out.contains(".env"), ".env content stays hidden: {out}");
@@ -949,9 +973,13 @@ mod tests {
     async fn grep_without_rules_is_unfiltered() {
         let t = Tree::new("grep-open", &[("a.rs", "needle\n"), ("b.pem", "needle\n")]);
         let perms = gated(t.path(), &[]);
-        let out = grep_tool(&json!({"pattern": "needle", "path": t.path()}), perms)
-            .await
-            .unwrap();
+        let out = grep_tool(
+            &json!({"pattern": "needle", "path": t.path()}),
+            Path::new("."),
+            perms,
+        )
+        .await
+        .unwrap();
         let out = rel(&out, &t);
         // .pem is only blocked when a read_file deny covers it; here nothing does.
         assert!(out.contains("a.rs") && out.contains("b.pem"), "got: {out}");
@@ -969,9 +997,14 @@ mod tests {
             ],
         );
         let perms = gated(t.path(), &["read_file(**/*.pem)"]);
-        let out = glob_tool(&json!({"pattern": "**", "path": t.path()}), None, perms)
-            .await
-            .unwrap();
+        let out = glob_tool(
+            &json!({"pattern": "**", "path": t.path()}),
+            Path::new("."),
+            None,
+            perms,
+        )
+        .await
+        .unwrap();
         let out = rel(&out, &t);
         assert!(out.contains("keep.rs"), "got: {out}");
         assert!(!out.contains(".pem"), "deny hides .pem: {out}");

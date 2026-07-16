@@ -4,6 +4,7 @@ use anyhow::Result;
 use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
+use super::resolve_path;
 use super::str_arg;
 use super::ToolCtx;
 use crate::image::detect_media_type;
@@ -13,9 +14,10 @@ use crate::image::image_block_from_bytes;
 /// one tool for both). It reads the raw bytes, sniffs the format from magic
 /// bytes (never the extension), and either returns an image block or numbers
 /// the text lines. A binary file that is not a supported image is an error.
-pub(super) async fn read_file_tool(input: &Value) -> Result<ToolResultContent> {
+pub(super) async fn read_file_tool(input: &Value, ctx: &ToolCtx) -> Result<ToolResultContent> {
     let path = str_arg(input, "path", "read_file")?;
-    let bytes = tokio::fs::read(path)
+    let full = resolve_path(&ctx.cfg.cwd, path);
+    let bytes = tokio::fs::read(&full)
         .await
         .with_context(|| format!("read_file: cannot read {path}"))?;
     // An image file returns a single image block (validated for format and the
@@ -47,23 +49,24 @@ pub(super) async fn read_file_tool(input: &Value) -> Result<ToolResultContent> {
     Ok(ToolResultContent::Text(out.join("\n")))
 }
 
-pub(super) async fn write_file_tool(input: &Value) -> Result<String> {
+pub(super) async fn write_file_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let path = str_arg(input, "path", "write_file")?;
     let content = str_arg(input, "content", "write_file")?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
+    let full = resolve_path(&ctx.cfg.cwd, path);
+    if let Some(parent) = full.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("write_file: cannot create {}", parent.display()))?;
         }
     }
-    tokio::fs::write(path, content)
+    tokio::fs::write(&full, content)
         .await
         .with_context(|| format!("write_file: cannot write {path}"))?;
     Ok(format!("wrote {} bytes to {path}", content.len()))
 }
 
-pub(super) async fn edit_file_tool(input: &Value) -> Result<String> {
+pub(super) async fn edit_file_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let path = str_arg(input, "path", "edit_file")?;
     let old = str_arg(input, "old_string", "edit_file")?;
     let new = str_arg(input, "new_string", "edit_file")?;
@@ -71,7 +74,8 @@ pub(super) async fn edit_file_tool(input: &Value) -> Result<String> {
     if old.is_empty() {
         bail!("edit_file: old_string must not be empty");
     }
-    let content = tokio::fs::read_to_string(path)
+    let full = resolve_path(&ctx.cfg.cwd, path);
+    let content = tokio::fs::read_to_string(&full)
         .await
         .with_context(|| format!("edit_file: cannot read {path}"))?;
     let count = content.matches(old).count();
@@ -86,7 +90,7 @@ pub(super) async fn edit_file_tool(input: &Value) -> Result<String> {
     } else {
         content.replacen(old, new, 1)
     };
-    tokio::fs::write(path, updated)
+    tokio::fs::write(&full, updated)
         .await
         .with_context(|| format!("edit_file: cannot write {path}"))?;
     let n = if replace_all { count } else { 1 };

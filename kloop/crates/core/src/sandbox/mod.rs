@@ -121,6 +121,28 @@ impl SandboxPolicy {
             escalate: true,
         }
     }
+
+    /// A copy of this policy with one more writable root (its literal and
+    /// canonical spellings), for a sub-agent whose cwd is a git worktree (plan
+    /// 35): the sandbox must let its bash write the worktree. The parent's
+    /// roots are kept — a worktree sub-agent's writes land in the worktree via
+    /// its cwd (relative paths + bash `current_dir`), so the extra root only
+    /// needs to *permit* the worktree, not fence off the main tree.
+    pub fn with_writable_root(&self, path: &Path) -> Self {
+        let mut policy = self.clone();
+        for p in [
+            path.to_path_buf(),
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        ] {
+            if !policy.writable_roots.iter().any(|r| r.root == p) {
+                policy.writable_roots.push(WritableRoot {
+                    read_only_subpaths: protected_subpaths(&p),
+                    root: p,
+                });
+            }
+        }
+        policy
+    }
 }
 
 fn protected_subpaths(root: &Path) -> Vec<PathBuf> {
@@ -370,6 +392,36 @@ mod tests {
             );
         }
         assert!(!policy.allow_network);
+    }
+
+    #[test]
+    fn with_writable_root_adds_the_worktree_keeping_the_originals() {
+        let cwd = std::env::temp_dir().join("kloop-sbx-base");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let base = SandboxPolicy::workspace(&cwd, &[], false);
+        let tree = std::env::temp_dir().join("kloop-sbx-tree");
+        std::fs::create_dir_all(&tree).unwrap();
+
+        let policy = base.with_writable_root(&tree);
+        let roots: Vec<&Path> = policy
+            .writable_roots
+            .iter()
+            .map(|w| w.root.as_path())
+            .collect();
+        assert!(roots.contains(&tree.as_path()), "worktree is writable");
+        assert!(roots.contains(&cwd.as_path()), "original roots kept");
+        // The added root protects the same escalation surfaces as the rest.
+        let added = policy
+            .writable_roots
+            .iter()
+            .find(|w| w.root == tree)
+            .unwrap();
+        assert_eq!(added.read_only_subpaths, protected_subpaths(&tree));
+        // Adding the same root twice is a no-op (idempotent).
+        assert_eq!(
+            policy.with_writable_root(&tree).writable_roots.len(),
+            policy.writable_roots.len()
+        );
     }
 
     #[test]
