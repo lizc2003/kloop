@@ -184,8 +184,6 @@ pub struct ActiveWorktree {
     pub permissions: Arc<Permissions>,
     pub sandbox: Option<Arc<SandboxPolicy>>,
     pub system: String,
-    /// Where the session was before entering — reported back on exit.
-    pub original_cwd: PathBuf,
 }
 
 /// Enter a fresh worktree named `name` for the whole session (mutates the
@@ -196,11 +194,10 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
     if cfg.active_worktree.read().unwrap().is_some() {
         bail!("already inside a worktree; call exit_worktree before entering another");
     }
-    // The slot is empty, so effective cwd == cfg.cwd (the main checkout).
-    let base_cwd = cfg.cwd.clone();
-    let wt = create(&base_cwd, name).await?;
+    // The slot is empty, so the base is cfg.cwd (the main checkout).
+    let wt = create(&cfg.cwd, name).await?;
     let (permissions, sandbox, system) = compute_overrides(
-        &base_cwd,
+        &cfg.cwd,
         &cfg.permissions,
         &cfg.sandbox,
         &cfg.system,
@@ -218,7 +215,6 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
         permissions,
         sandbox,
         system,
-        original_cwd: base_cwd,
         wt,
     });
     Ok(msg)
@@ -233,7 +229,9 @@ pub async fn exit(cfg: &Config, discard: bool) -> Result<String> {
     let Some(active) = active else {
         return Ok("Not currently in a worktree.".to_string());
     };
-    let back = active.original_cwd.display().to_string();
+    // The session returns to `cfg.cwd`: enter only proceeds when the slot is
+    // empty (one tree, no nesting), so the pre-entry cwd was always `cfg.cwd`.
+    let back = cfg.cwd.display().to_string();
     if discard {
         let branch = active.wt.branch.clone();
         active.wt.remove().await;
@@ -253,11 +251,8 @@ pub async fn exit(cfg: &Config, discard: bool) -> Result<String> {
 /// removed), if any. Returns a note when a tree was kept, for the caller to
 /// surface. Safe to call when not in a worktree.
 pub async fn finish_active(cfg: &Config) -> Option<String> {
-    let active = cfg.active_worktree.write().unwrap().take();
-    match active {
-        Some(a) => finish(a.wt).await,
-        None => None,
-    }
+    let active = cfg.active_worktree.write().unwrap().take()?;
+    finish(active.wt).await
 }
 
 /// Whether the sub-agent left anything worth keeping: an uncommitted change in
