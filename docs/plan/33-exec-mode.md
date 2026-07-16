@@ -133,4 +133,8 @@ round(round = 一次 sample + 工具),这个数覆盖的是 `cfg.max_rounds`,叫
 产品叫 kloop,自有 env 却用 `AGENT_` 遗留前缀;全部改 `KLOOP_*`(`KLOOP_MODEL`/`PROVIDER`/
 `ALLOW`/`DENY`/`ASK`/`CACHE`/`THINKING`/`EFFORT`/`CONTEXT_WINDOW`/`FALLBACK_MODEL`/
 `DEFER_THRESHOLD`/`SANDBOX`/`PROGRAM_*`),第三方原生 `ANTHROPIC_*`/`OPENAI_*`/`TAVILY_*`
-不动;内部 `AGENT_SEQ` static 非 env 保留。memory `anthropic-429-fallback` 同步。
+不动;内部 `AGENT_SEQ` static 非 env 保留。memory `anthropic-429-fallback` 同步。⑦ **`--json`
+保留(不改名)**——评估过它语义偏窄(是 NDJSON 事件流,非 cc 的单 result 对象;cc 分
+`json`/`stream-json`),但 kloop 只做流式、无歧义对象,保留简洁名 + 文档已注明"是事件流"。
+**命名复盘至此收尾**,CLI 定型:`-p`/`--headless`、`-c`/`-r`、`--permission-mode
+default|accept-edits|bypass`、`--json`、`--max-rounds`、`-h`/`--help`,env 统一 `KLOOP_*`。
