@@ -7,7 +7,7 @@
 //! `exec` crate:
 //! - **No approver is installed** ([`DenyApprover`]): any permission ask is
 //!   auto-denied (fail-safe, like server mode's "reply lost = deny"). Loosen
-//!   with `--permission-mode accept-edits|bypass` / `AGENT_ALLOW`, which act at earlier
+//!   with `--permission-mode accept-edits|bypass` / `KLOOP_ALLOW`, which act at earlier
 //!   gate layers and never reach the approver.
 //! - **`--json` reuses the server's wire shapes** verbatim (method + params,
 //!   `threadId` and all) — one event vocabulary, two front-ends.

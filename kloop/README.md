@@ -48,7 +48,7 @@ Compaction itself asks the model for a structured handoff summary, keeps a
 at the boundary), and replaces the rest with the summary — the one
 sanctioned rewrite of the append-only history.
 
-`AGENT_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
+`KLOOP_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
 `off` disables compaction).
 
 ## Session persistence (Phase 2, second slice)
@@ -190,7 +190,7 @@ allow rule or bypass mode would otherwise pass — wrappers (`sudo`, `env`,
 can't smuggle a command past a rule.
 
 **Rules** live in `.kloop/config.toml` and env vars (comma-separated
-`AGENT_ALLOW` / `AGENT_DENY` / `AGENT_ASK` append on top):
+`KLOOP_ALLOW` / `KLOOP_DENY` / `KLOOP_ASK` append on top):
 
 ```toml
 [permissions]
@@ -348,7 +348,7 @@ them (config parsing, namespacing, the adapter).
 
 ### Deferred tools + tool_search
 
-Past 30 total tools (`AGENT_DEFER_THRESHOLD` overrides; built-ins never
+Past 30 total tools (`KLOOP_DEFER_THRESHOLD` overrides; built-ins never
 defer), MCP tool definitions stop being sent to the model. Instead the
 request carries the built-ins plus two extra tools, and the synthetic
 context message lists the deferred tool names:
@@ -652,7 +652,7 @@ auto_allow = true         # default; false = ask first, then run sandboxed
 escalate = true           # default; false = model-driven disable_sandbox instead
 ```
 
-`AGENT_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
+`KLOOP_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
 (Linux/Windows for now — planned as future slices behind the same seam; or a
 missing `sandbox-run_program`), kloop warns at startup and runs commands bare:
 fail-open, because the permission gate remains the enforcement layer.
@@ -847,7 +847,7 @@ as a model emitting N concurrent `task` calls, which kloop runs uncapped, so
 pacing here would break that precedent; the total ceiling is the guard that
 matters. All five knobs override via `[codemode]` in `.kloop/config.toml`
 (`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_items`) or
-`AGENT_PROGRAM_*` env (env wins).
+`KLOOP_PROGRAM_*` env (env wins).
 
 A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
@@ -1102,7 +1102,7 @@ git diff | kloop -p "review this diff"
 kloop -p --json "fix the failing test" | jq -c 'select(.method=="tool/started")'
 
 # runaway guardrail for scripts; resume a session and run headless on it
-kloop -p --max-turns 8 "keep going"
+kloop -p --max-rounds 8 "keep going"
 kloop --resume 20260716-101500 -p "and now write the tests"
 
 # hermetic end-to-end demo, no key (great for CI)
@@ -1121,15 +1121,15 @@ kloop --mock -p --json
   event vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
-  deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `AGENT_ALLOW`
+  deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `KLOOP_ALLOW`
   — these act before the approver, so they still open the gate. (Sandbox
   auto-allow still covers safe bash without asking.)
 - **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
-  or hitting `--max-turns`.
+  or hitting `--max-rounds`.
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 
-`--max-turns` and `--json` are `-p`/`--headless`-only; a bare prompt without it
+`--max-rounds` and `--json` are `-p`/`--headless`-only; a bare prompt without it
 is an error (interactive mode takes its input at the prompt). Not done (deferred, server
 mode already covers the programmatic side): `--permission-prompt-tool`
 delegation, `--input-format stream-json`, budget/goal guardrails,
@@ -1138,33 +1138,36 @@ delegation, `--input-format stream-json`, budget/goal guardrails,
 ## Running
 
 ```sh
+# usage summary of every flag
+cargo run -- --help
+
 # keyless demo: scripted Mock provider exercises all five bets (plain output)
 cargo run -- --mock
 
 # Anthropic (default model claude-sonnet-5; override with ANTHROPIC_MODEL, or
-# the shared AGENT_MODEL)
+# the shared KLOOP_MODEL)
 ANTHROPIC_API_KEY=... cargo run
 # prompt caching is on by default (cache_control breakpoints on the last
 # tool, the system block, and the last message block — the tool set outlives
 # the volatile system prompt, so a restart still reads the tools prefix);
-# AGENT_CACHE=off disables it for diagnosing cache behavior
+# KLOOP_CACHE=off disables it for diagnosing cache behavior
 # thinking blocks stream dim in the UI and are replayed verbatim (signature
-# included). No AGENT_THINKING = no thinking field sent (current models then
-# run adaptive on their own); AGENT_THINKING=off|adaptive|<budget tokens>
+# included). No KLOOP_THINKING = no thinking field sent (current models then
+# run adaptive on their own); KLOOP_THINKING=off|adaptive|<budget tokens>
 # forces a mode (the budget form is for pre-adaptive models and raises
 # max_tokens by the budget)
 
-# any OpenAI-compatible endpoint (OPENAI_MODEL, or the shared AGENT_MODEL,
+# any OpenAI-compatible endpoint (OPENAI_MODEL, or the shared KLOOP_MODEL,
 # required)
 OPENAI_API_KEY=... OPENAI_MODEL=gpt-5.2 cargo run
 # OPENAI_BASE_URL defaults to https://api.openai.com/v1
 # Per-provider model vars let one env file drive both tracks: ANTHROPIC_MODEL /
-# OPENAI_MODEL each win over the shared AGENT_MODEL, so switching AGENT_PROVIDER
-# auto-picks the matching model instead of both fighting over AGENT_MODEL
-# AGENT_PROVIDER=anthropic|openai|openai-responses forces a provider when
+# OPENAI_MODEL each win over the shared KLOOP_MODEL, so switching KLOOP_PROVIDER
+# auto-picks the matching model instead of both fighting over KLOOP_MODEL
+# KLOOP_PROVIDER=anthropic|openai|openai-responses forces a provider when
 # both keys are set; openai-responses speaks the /responses wire (stateless
 # store:false, reasoning replayed via encrypted_content) with the same
-# OPENAI_* variables. AGENT_EFFORT=minimal|low|medium|high sends the
+# OPENAI_* variables. KLOOP_EFFORT=minimal|low|medium|high sends the
 # reasoning request field (summary=auto) — some backends emit no reasoning
 # items at all without it, so this is also the reasoning-capture switch
 
@@ -1187,18 +1190,18 @@ cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
 cargo run -- --fork <id>       # branch off a session at its end
 
 # MCP servers come from .kloop/config.toml — see MCP client above
-# AGENT_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
+# KLOOP_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
 # (default 30 total tools; lower it to exercise deferral with a small server,
 # raise it to effectively disable)
 
 # permissions (rules also live in .kloop/config.toml — see Permissions)
-AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
-AGENT_DENY='bash(git push *)' cargo run            # hard-block rules
+KLOOP_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
+KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
 cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
 # OS sandbox (macOS seatbelt; see OS sandbox above)
-AGENT_SANDBOX=off cargo run                        # run bash commands bare
+KLOOP_SANDBOX=off cargo run                        # run bash commands bare
 ```
 
 Both frontends: Ctrl+C interrupts the running turn (history is patched and

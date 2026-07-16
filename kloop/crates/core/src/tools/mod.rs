@@ -46,7 +46,7 @@ use kloop_protocol::ToolResultContent;
 
 /// Past this many tools the definitions would crowd the context window, so
 /// source (MCP) tools are deferred behind tool_search instead of being sent.
-/// Default for `Config.defer_threshold` (`AGENT_DEFER_THRESHOLD` overrides).
+/// Default for `Config.defer_threshold` (`KLOOP_DEFER_THRESHOLD` overrides).
 pub const TOOL_DEFER_THRESHOLD: usize = 30;
 
 /// An external provider of tools (an MCP server, in practice). Core only

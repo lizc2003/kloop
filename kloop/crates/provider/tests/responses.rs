@@ -125,7 +125,7 @@ async fn request_body_is_stateless_with_reasoning_include() {
     );
 }
 
-/// AGENT_EFFORT maps to the reasoning request field (with summary=auto for
+/// KLOOP_EFFORT maps to the reasoning request field (with summary=auto for
 /// displayable text); absent effort sends no reasoning field at all.
 #[tokio::test]
 async fn effort_maps_to_reasoning_field() {

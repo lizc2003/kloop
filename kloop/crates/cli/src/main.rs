@@ -54,6 +54,10 @@ use crate::ui::StdoutUi;
 async fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(&args)?;
+    if args.help {
+        print!("{}", args::help_text());
+        return Ok(ExitCode::SUCCESS);
+    }
     let sessions_dir = PathBuf::from(".kloop/sessions");
     if args.list_sessions {
         list_sessions(&sessions_dir);
@@ -184,8 +188,8 @@ async fn main() -> Result<ExitCode> {
         )?;
         cfg.session_id = session_id.clone();
         // The headless runaway guardrail overrides the default round cap.
-        if let Some(max_turns) = args.max_turns {
-            cfg.max_rounds = max_turns;
+        if let Some(max_rounds) = args.max_rounds {
+            cfg.max_rounds = max_rounds;
         }
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c(cancel.clone());

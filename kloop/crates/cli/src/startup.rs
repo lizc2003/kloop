@@ -1,4 +1,4 @@
-//! Startup wiring: reading `.kloop/config.toml` + `AGENT_*` env into the
+//! Startup wiring: reading `.kloop/config.toml` + `KLOOP_*` env into the
 //! runtime pieces a session needs (permissions, hooks, sandbox policy, agent
 //! types, skills, code-mode limits) and assembling them into a `Config` via
 //! [`config_from_env`] — the one entry `main`/`plain_main`/the server factory
@@ -114,7 +114,7 @@ fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
 }
 
 /// Rules from `.kloop/config.toml` `[permissions]` (allow/deny/ask string
-/// arrays), with AGENT_ALLOW / AGENT_DENY / AGENT_ASK (comma-separated)
+/// arrays), with KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK (comma-separated)
 /// appended on top.
 fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
     let mut rules = PermissionRules::default();
@@ -153,9 +153,9 @@ fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
             );
         }
     };
-    env("AGENT_ALLOW", &mut rules.allow);
-    env("AGENT_DENY", &mut rules.deny);
-    env("AGENT_ASK", &mut rules.ask);
+    env("KLOOP_ALLOW", &mut rules.allow);
+    env("KLOOP_DENY", &mut rules.deny);
+    env("KLOOP_ASK", &mut rules.ask);
     Ok(rules)
 }
 
@@ -220,7 +220,7 @@ fn build_permissions(
             },
         );
     Permissions::new(mode, &rules, cwd, Some(approver), Some(persist))
-        .context("invalid permission rules (config.toml / AGENT_ALLOW / AGENT_DENY / AGENT_ASK)")
+        .context("invalid permission rules (config.toml / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK)")
 }
 
 /// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
@@ -424,7 +424,7 @@ fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
 /// `[codemode]` in `.kloop/config.toml` (all optional; defaults in
 /// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
 /// limits) and `max_agents`, `max_items` (orchestration runaway ceilings). Each
-/// is also overridable via `AGENT_PROGRAM_<KEY>` env, which wins over the config
+/// is also overridable via `KLOOP_PROGRAM_<KEY>` env, which wins over the config
 /// value. Bounds one `run_program` (code-mode) run.
 fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> {
     let mut limits = kloop_core::ProgramLimits::default();
@@ -463,19 +463,19 @@ fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> 
             Err(_) => Ok(None),
         }
     };
-    if let Some(n) = env_uint("AGENT_PROGRAM_MEMORY_MB")? {
+    if let Some(n) = env_uint("KLOOP_PROGRAM_MEMORY_MB")? {
         limits.memory_bytes = n as usize * 1024 * 1024;
     }
-    if let Some(n) = env_uint("AGENT_PROGRAM_STACK_KB")? {
+    if let Some(n) = env_uint("KLOOP_PROGRAM_STACK_KB")? {
         limits.max_stack_bytes = n as usize * 1024;
     }
-    if let Some(n) = env_uint("AGENT_PROGRAM_CPU_SECS")? {
+    if let Some(n) = env_uint("KLOOP_PROGRAM_CPU_SECS")? {
         limits.cpu_burst = Duration::from_secs(n);
     }
-    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_AGENTS")? {
+    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_AGENTS")? {
         limits.max_agents = n;
     }
-    if let Some(n) = env_uint("AGENT_PROGRAM_MAX_ITEMS")? {
+    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_ITEMS")? {
         limits.max_items_per_call = n as usize;
     }
     Ok(limits)
@@ -489,10 +489,10 @@ pub(crate) fn build_sandbox(
     cwd: &Path,
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
-    // --mock stays hermetic; AGENT_SANDBOX=off is the env escape hatch.
+    // --mock stays hermetic; KLOOP_SANDBOX=off is the env escape hatch.
     if args.mock
         || matches!(
-            std::env::var("AGENT_SANDBOX").ok().as_deref(),
+            std::env::var("KLOOP_SANDBOX").ok().as_deref(),
             Some("off") | Some("0") | Some("false")
         )
     {
@@ -522,20 +522,20 @@ pub(crate) fn build_sandbox(
     }
 }
 
-/// AGENT_DEFER_THRESHOLD: total tool count above which MCP tool definitions
+/// KLOOP_DEFER_THRESHOLD: total tool count above which MCP tool definitions
 /// are deferred behind tool_search. Lower it to exercise deferral with a
 /// small server; raise it to effectively disable deferral.
 pub(crate) fn defer_threshold_from_env() -> Result<usize> {
-    match std::env::var("AGENT_DEFER_THRESHOLD").ok() {
+    match std::env::var("KLOOP_DEFER_THRESHOLD").ok() {
         Some(raw) => raw
             .parse::<usize>()
-            .context("AGENT_DEFER_THRESHOLD must be a tool count"),
+            .context("KLOOP_DEFER_THRESHOLD must be a tool count"),
         None => Ok(kloop_core::tools::TOOL_DEFER_THRESHOLD),
     }
 }
 
 /// Model resolution so one env file can drive both tracks: a provider-specific
-/// var (`ANTHROPIC_MODEL`/`OPENAI_MODEL`) wins over the shared `AGENT_MODEL`,
+/// var (`ANTHROPIC_MODEL`/`OPENAI_MODEL`) wins over the shared `KLOOP_MODEL`,
 /// which both providers would otherwise fight over. `None` when neither is set
 /// (anthropic then falls back to its default, openai errors).
 fn resolve_model(specific: Option<String>, generic: Option<String>) -> Option<String> {
@@ -564,18 +564,18 @@ pub(crate) fn config_from_env(
     };
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
-    // Code-mode resource limits: default unless [codemode]/AGENT_PROGRAM_* set.
+    // Code-mode resource limits: default unless [codemode]/KLOOP_PROGRAM_* set.
     let program_limits = if args.mock {
         kloop_core::ProgramLimits::default()
     } else {
         load_program_limits(Path::new(PERMISSIONS_CONFIG))?
     };
-    // AGENT_CONTEXT_WINDOW: token budget for compaction ("off" disables).
-    let context_window = match std::env::var("AGENT_CONTEXT_WINDOW").ok().as_deref() {
+    // KLOOP_CONTEXT_WINDOW: token budget for compaction ("off" disables).
+    let context_window = match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
         Some("off") | Some("0") => None,
         Some(raw) => Some(
             raw.parse::<u64>()
-                .context("AGENT_CONTEXT_WINDOW must be a token count or 'off'")?,
+                .context("KLOOP_CONTEXT_WINDOW must be a token count or 'off'")?,
         ),
         None => Some(200_000),
     };
@@ -588,7 +588,7 @@ pub(crate) fn config_from_env(
         offload_dir,
         sessions_dir,
         context_window,
-        fallback_model: std::env::var("AGENT_FALLBACK_MODEL").ok(),
+        fallback_model: std::env::var("KLOOP_FALLBACK_MODEL").ok(),
         permissions,
         tool_sources: tool_sources.to_vec(),
         // The caller stamps the real session id once it knows it (after
@@ -620,17 +620,17 @@ pub(crate) fn config_from_env(
         // Prompt caching is a pure cost saving, so it defaults on; the escape
         // hatch is for diagnosing cache behavior against a live endpoint.
         let cache = !matches!(
-            std::env::var("AGENT_CACHE").ok().as_deref(),
+            std::env::var("KLOOP_CACHE").ok().as_deref(),
             Some("off") | Some("0") | Some("false")
         );
-        // No AGENT_THINKING = no thinking field: current models then run
+        // No KLOOP_THINKING = no thinking field: current models then run
         // adaptive on their own. The blocks they send are replayed either way.
-        let thinking = match std::env::var("AGENT_THINKING").ok().as_deref() {
+        let thinking = match std::env::var("KLOOP_THINKING").ok().as_deref() {
             None => ThinkingMode::Unset,
             Some("off") => ThinkingMode::Off,
             Some("adaptive") => ThinkingMode::Adaptive,
             Some(raw) => ThinkingMode::Budget(raw.parse().context(
-                "AGENT_THINKING must be off | adaptive | <budget tokens for pre-adaptive models>",
+                "KLOOP_THINKING must be off | adaptive | <budget tokens for pre-adaptive models>",
             )?),
         };
         Ok(Config {
@@ -643,7 +643,7 @@ pub(crate) fn config_from_env(
             }),
             model: resolve_model(
                 std::env::var("ANTHROPIC_MODEL").ok(),
-                std::env::var("AGENT_MODEL").ok(),
+                std::env::var("KLOOP_MODEL").ok(),
             )
             .unwrap_or_else(|| "claude-sonnet-5".into()),
             ..base.clone()
@@ -653,9 +653,9 @@ pub(crate) fn config_from_env(
         let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
         let model = resolve_model(
             std::env::var("OPENAI_MODEL").ok(),
-            std::env::var("AGENT_MODEL").ok(),
+            std::env::var("KLOOP_MODEL").ok(),
         )
-        .context("set OPENAI_MODEL or AGENT_MODEL for the openai providers")?;
+        .context("set OPENAI_MODEL or KLOOP_MODEL for the openai providers")?;
         let base_url =
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
         let provider = if responses {
@@ -664,7 +664,7 @@ pub(crate) fn config_from_env(
                 base: base_url,
                 // Also the reasoning-capture switch: without the field some
                 // backends never emit reasoning items.
-                effort: std::env::var("AGENT_EFFORT").ok(),
+                effort: std::env::var("KLOOP_EFFORT").ok(),
             }
         } else {
             Provider::OpenAiCompat {
@@ -679,12 +679,12 @@ pub(crate) fn config_from_env(
         })
     };
 
-    match std::env::var("AGENT_PROVIDER").ok().as_deref() {
+    match std::env::var("KLOOP_PROVIDER").ok().as_deref() {
         Some("anthropic") => anthropic(),
         Some("openai") | Some("openai-compat") => openai(false),
         Some("openai-responses") => openai(true),
         Some(other) => {
-            bail!("unknown AGENT_PROVIDER '{other}' (anthropic | openai | openai-responses)")
+            bail!("unknown KLOOP_PROVIDER '{other}' (anthropic | openai | openai-responses)")
         }
         None => {
             if let Ok(cfg) = anthropic() {
@@ -694,7 +694,7 @@ pub(crate) fn config_from_env(
             } else {
                 bail!(
                     "no provider configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
-                         (+ AGENT_MODEL or the per-provider ANTHROPIC_MODEL/OPENAI_MODEL), \
+                         (+ KLOOP_MODEL or the per-provider ANTHROPIC_MODEL/OPENAI_MODEL), \
                          or run with --mock"
                 )
             }
@@ -758,12 +758,12 @@ mod tests {
     #[test]
     fn per_provider_model_wins_over_shared_agent_model() {
         let s = |x: &str| Some(x.to_string());
-        // Provider-specific (ANTHROPIC_MODEL/OPENAI_MODEL) beats AGENT_MODEL.
+        // Provider-specific (ANTHROPIC_MODEL/OPENAI_MODEL) beats KLOOP_MODEL.
         assert_eq!(
             resolve_model(s("claude-sonnet-4-6"), s("shared")),
             s("claude-sonnet-4-6")
         );
-        // No provider-specific: fall back to the shared AGENT_MODEL.
+        // No provider-specific: fall back to the shared KLOOP_MODEL.
         assert_eq!(resolve_model(None, s("shared")), s("shared"));
         // Neither set: None — anthropic then defaults, openai errors.
         assert_eq!(resolve_model(None, None), None);

@@ -73,12 +73,12 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
 ## 完成记录(2026-07-16,提交 a33864a)✅
 
 **落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`-p`/`--headless`/`--json`/
-`--max-turns`/位置参数解析)+ `cli/src/main.rs`(headless 分发 + `read_stdin_if_piped`)。
+`--max-rounds`/位置参数解析)+ `cli/src/main.rs`(headless 分发 + `read_stdin_if_piped`)。
 
 **四个开工点最终定法**:
 1. **flag 形态 = B(cc 形模式开关)**——开关(不是值容器)进 headless,prompt 走位置参数
    + stdin;`kloop` 无参仍进 TUI(不引入"TUI 初始 prompt"新特性)。位置参数/`--json`/
-   `--max-turns` 都是开关-only(无开关报错引导),保持模式 flag 内聚。**flag 名不跟 cc:**
+   `--max-rounds` 都是开关-only(无开关报错引导),保持模式 flag 内聚。**flag 名不跟 cc:**
    用户复盘"`--print` 不直观"(cc 从"打印结果就退"这个输出行为命名,非模式命名),定名
    **`--headless`**(自解释)+ 短选项 `-p`,**去掉 `--print`**(连兼容别名都不留,免误导)。
    同轮补 cc 的 `-c`(=`--continue`)/`-r`(=`--resume`)短选项对齐 muscle memory。
@@ -88,13 +88,13 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
    并填会话 id**(去掉会破坏 server 客户端复用)。一套 wire 两处用,零新 schema。
 3. **会话落盘 = 进**——headless 复用 `open_history`(默认 New,attach rollout),跑完
    可 `--resume <id>` 续/`--fork`。与 plain 一致。
-4. **`--max-turns` = 带**——覆盖 `cfg.max_rounds`,仅 headless。
+4. **`--max-rounds` = 带**——覆盖 `cfg.max_rounds`,仅 headless。
 
 **两个契约(两家收敛)**:① prompt 双来源——位置参数 + stdin,`assemble_prompt` 纯函数
 (都有则"位置\n stdin",都无报错);② 输出分离——text 模式 final_text 一次性进 stdout
 (`$(kloop -p …)` 干净捕获)、进度 note/tool 进 stderr、流式 delta 抑制不重复;`--json`
 全事件进 stdout。③ **审批默认拒**——headless 挂 `DenyApprover`(confirm 恒 Deny,对齐
-server "回复丢失=deny"),`--permission-mode accept-edits|bypass`/`AGENT_ALLOW` 在 approver 之前放宽。
+server "回复丢失=deny"),`--permission-mode accept-edits|bypass`/`KLOOP_ALLOW` 在 approver 之前放宽。
 ④ 退出码——Completed=0,其余(MaxRounds/Aborted/Error)=1(`main` 返回 `ExitCode`,
 Drop 正常跑,不用 `process::exit`)。
 
@@ -102,7 +102,7 @@ Drop 正常跑,不用 `process::exit`)。
 JsonUi 逐行对齐 server wire/text 模式 final+exit0/json 模式生命周期括起 turn;args 新增
 headless flag 解析 + 校验错误)。真 key(anthropic 轨)闭环验过:text 位置参数出净结果
 exit0、json 走 stdin+read_file 工具事件流(turn/started→tool→text/delta→turn/completed)
-exit0、`--max-turns 2` bound 的 bash 任务(sandbox auto_allow 放行,未触 deny)出结果。
+exit0、`--max-rounds 2` bound 的 bash 任务(sandbox auto_allow 放行,未触 deny)出结果。
 `--mock -p`/`--mock -p --json` 无 key hermetic 端到端跑通。
 
 **偏离/取舍**:
@@ -126,4 +126,11 @@ bypassPermissions/manual),`--dangerously-skip-permissions` = `bypassPermissions`
 kloop 照此**删 `--yolo`/`--accept-edits` 两个独立 flag,合并成 `--permission-mode
 default|accept-edits|bypass`**(取 kloop 内部 `Mode` 三态,kebab 取值),`build_permissions`
 直接读 `args.permission_mode`;`plan` 档留给 plan 37 加第四取值。README/HANDOFF/permissions.rs
-注释同步。
+注释同步。④ **`--max-turns`→`--max-rounds`**——kloop 内部一次 headless = 一 turn = 多
+round(round = 一次 sample + 工具),这个数覆盖的是 `cfg.max_rounds`,叫 `--max-rounds`
+才对齐内部术语(cc 叫 turns 是它的 turn≈kloop 的 round,不跟)。⑤ 补 **`-h`/`--help`**
+(`args::help_text()` 手维护 usage,`CliArgs.help`)。⑥ **env 前缀 `AGENT_`→`KLOOP_`**——
+产品叫 kloop,自有 env 却用 `AGENT_` 遗留前缀;全部改 `KLOOP_*`(`KLOOP_MODEL`/`PROVIDER`/
+`ALLOW`/`DENY`/`ASK`/`CACHE`/`THINKING`/`EFFORT`/`CONTEXT_WINDOW`/`FALLBACK_MODEL`/
+`DEFER_THRESHOLD`/`SANDBOX`/`PROGRAM_*`),第三方原生 `ANTHROPIC_*`/`OPENAI_*`/`TAVILY_*`
+不动;内部 `AGENT_SEQ` static 非 env 保留。memory `anthropic-429-fallback` 同步。

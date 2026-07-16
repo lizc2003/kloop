@@ -110,7 +110,7 @@ pub struct Config {
     /// Resource ceilings for a `run_program` (code-mode) run — engine limits
     /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
-    /// config or `AGENT_PROGRAM_*` env. Sub-agents inherit it with the Config.
+    /// config or `KLOOP_PROGRAM_*` env. Sub-agents inherit it with the Config.
     pub program_limits: kloop_codemode::Limits,
     /// Skills loaded from `<name>/SKILL.md` (plan 28): model-selected reusable
     /// prompt packs. The CLI discovers and parses them; core advertises just

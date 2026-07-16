@@ -48,6 +48,8 @@ pub(crate) enum SessionChoice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliArgs {
     pub(crate) mock: bool,
+    /// `-h`/`--help`: print the usage summary and exit.
+    pub(crate) help: bool,
     /// `--permission-mode <mode>`: the gating mode for this session, cc's
     /// unified permission control. `default` (ask for anything unvouched-for),
     /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
@@ -62,9 +64,10 @@ pub(crate) struct CliArgs {
     /// `--json` (headless only): emit the run as a NDJSON event stream on
     /// stdout, reusing the server mode's notification wire shapes.
     pub(crate) json: bool,
-    /// `--max-turns <n>` (headless only): cap the round count as a runaway
-    /// guardrail for scripts. Overrides the default `max_rounds`.
-    pub(crate) max_turns: Option<usize>,
+    /// `--max-rounds <n>` (headless only): cap the number of sampling rounds
+    /// (one model call + the tool calls it asks for) as a runaway guardrail for
+    /// scripts. Overrides the default `Config.max_rounds`.
+    pub(crate) max_rounds: Option<usize>,
     /// The positional prompt for headless mode, if any (may be combined with
     /// piped stdin at run time).
     pub(crate) prompt: Option<String>,
@@ -77,13 +80,14 @@ pub(crate) struct CliArgs {
 pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
+        help: false,
         permission_mode: Mode::Default,
         list_sessions: false,
         plain: false,
         serve: false,
         headless: false,
         json: false,
-        max_turns: None,
+        max_rounds: None,
         prompt: None,
         images: Vec::new(),
         session: SessionChoice::New,
@@ -91,6 +95,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => parsed.help = true,
             "--mock" => parsed.mock = true,
             "--permission-mode" => {
                 let raw = match args.get(i + 1) {
@@ -112,19 +117,19 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--serve" => parsed.serve = true,
             "-p" | "--headless" => parsed.headless = true,
             "--json" => parsed.json = true,
-            "--max-turns" => {
+            "--max-rounds" => {
                 let raw = match args.get(i + 1) {
                     Some(raw) if !raw.starts_with('-') => raw,
-                    _ => bail!("--max-turns needs a positive integer"),
+                    _ => bail!("--max-rounds needs a positive integer"),
                 };
                 i += 1;
                 let n: usize = raw
                     .parse()
-                    .with_context(|| format!("--max-turns: '{raw}' is not a positive integer"))?;
+                    .with_context(|| format!("--max-rounds: '{raw}' is not a positive integer"))?;
                 if n == 0 {
-                    bail!("--max-turns must be at least 1");
+                    bail!("--max-rounds must be at least 1");
                 }
-                parsed.max_turns = Some(n);
+                parsed.max_rounds = Some(n);
             }
             "--image" => {
                 let path = match args.get(i + 1) {
@@ -166,7 +171,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-p/--headless | --json | --max-turns <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (-h/--help | -p/--headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -177,15 +182,15 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         }
         i += 1;
     }
-    // `--json` / `--max-turns` / a positional prompt only mean something in
+    // `--json` / `--max-rounds` / a positional prompt only mean something in
     // headless mode; requiring `-p`/`--headless` keeps the mode's flags
     // cohesive.
     if !parsed.headless {
         if parsed.json {
             bail!("--json requires -p/--headless (it streams the headless run as JSON)");
         }
-        if parsed.max_turns.is_some() {
-            bail!("--max-turns requires -p/--headless (it is a headless guardrail)");
+        if parsed.max_rounds.is_some() {
+            bail!("--max-rounds requires -p/--headless (it is a headless guardrail)");
         }
         if let Some(prompt) = &parsed.prompt {
             bail!(
@@ -197,6 +202,46 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         bail!("-p/--headless and --serve are different modes; pick one");
     }
     Ok(parsed)
+}
+
+/// The `-h`/`--help` usage summary. Kept in sync by hand with the flags above
+/// (the parser is small enough that a derive isn't worth a dependency).
+pub(crate) fn help_text() -> &'static str {
+    "kloop — a Rust coding agent\n\
+     \n\
+     USAGE:\n\
+     \x20   kloop [OPTIONS]              start the interactive TUI (default)\n\
+     \x20   kloop -p [OPTIONS] [PROMPT]  run one turn headless, then exit\n\
+     \x20   kloop --serve                multi-session JSON-RPC server on stdio\n\
+     \n\
+     MODES:\n\
+     \x20   -p, --headless        run one turn without a REPL/TUI, then exit\n\
+     \x20       --plain           line-based REPL instead of the TUI\n\
+     \x20       --serve           JSON-RPC server over stdio\n\
+     \x20       --mock            keyless scripted demo (hermetic)\n\
+     \n\
+     HEADLESS (-p only):\n\
+     \x20   [PROMPT]              the task; may also be piped on stdin (both combine)\n\
+     \x20       --json            stream the run as NDJSON events on stdout\n\
+     \x20       --max-rounds <n>  cap sampling rounds as a runaway guardrail\n\
+     \n\
+     SESSIONS:\n\
+     \x20   -c, --continue        resume the most recent session\n\
+     \x20   -r, --resume [id]     resume a session (no id = pick from a list)\n\
+     \x20       --fork <id>[#<seq>]  branch a session at line <seq> (rewind)\n\
+     \x20       --list-sessions   list saved sessions and exit\n\
+     \n\
+     PERMISSIONS:\n\
+     \x20       --permission-mode <mode>   default | accept-edits | bypass\n\
+     \n\
+     INPUT:\n\
+     \x20       --image <path>    attach a local image (repeatable)\n\
+     \n\
+     OTHER:\n\
+     \x20   -h, --help            show this help and exit\n\
+     \n\
+     Configuration is via .kloop/config.toml and KLOOP_* / ANTHROPIC_* /\n\
+     OPENAI_* environment variables; see the README.\n"
 }
 
 fn session_line(path: &Path) -> String {
@@ -332,13 +377,14 @@ mod tests {
     fn base() -> CliArgs {
         CliArgs {
             mock: false,
+            help: false,
             permission_mode: Mode::Default,
             list_sessions: false,
             plain: false,
             serve: false,
             headless: false,
             json: false,
-            max_turns: None,
+            max_rounds: None,
             prompt: None,
             images: vec![],
             session: SessionChoice::New,
@@ -475,7 +521,7 @@ mod tests {
     #[test]
     fn parse_args_headless_flags() {
         // `-p` and `--headless` are the same switch; a positional becomes the
-        // prompt; --json and --max-turns ride along.
+        // prompt; --json and --max-rounds ride along.
         assert_eq!(
             parse_args(&strings(&["-p", "fix the bug"])).unwrap(),
             CliArgs {
@@ -488,7 +534,7 @@ mod tests {
             parse_args(&strings(&[
                 "--headless",
                 "--json",
-                "--max-turns",
+                "--max-rounds",
                 "5",
                 "do it"
             ]))
@@ -496,7 +542,7 @@ mod tests {
             CliArgs {
                 headless: true,
                 json: true,
-                max_turns: Some(5),
+                max_rounds: Some(5),
                 prompt: Some("do it".into()),
                 ..base()
             }
@@ -526,30 +572,61 @@ mod tests {
             "--json needs -p"
         );
         assert!(
-            parse_args(&strings(&["--max-turns", "3"])).is_err(),
-            "--max-turns needs -p"
+            parse_args(&strings(&["--max-rounds", "3"])).is_err(),
+            "--max-rounds needs -p"
         );
         assert!(
             parse_args(&strings(&["a prompt"])).is_err(),
             "a bare prompt needs -p"
         );
-        // Two positionals, a bad turn count, and mode conflicts are errors.
+        // Two positionals, a bad round count, and mode conflicts are errors.
         assert!(
             parse_args(&strings(&["-p", "one", "two"])).is_err(),
             "one prompt only"
         );
         assert!(
-            parse_args(&strings(&["-p", "--max-turns", "0", "go"])).is_err(),
-            "max-turns >= 1"
+            parse_args(&strings(&["-p", "--max-rounds", "0", "go"])).is_err(),
+            "max-rounds >= 1"
         );
         assert!(
-            parse_args(&strings(&["-p", "--max-turns", "x", "go"])).is_err(),
-            "max-turns must parse"
+            parse_args(&strings(&["-p", "--max-rounds", "x", "go"])).is_err(),
+            "max-rounds must parse"
         );
         assert!(
             parse_args(&strings(&["-p", "--serve"])).is_err(),
             "print and serve conflict"
         );
+    }
+
+    #[test]
+    fn parse_args_help_flag() {
+        assert_eq!(
+            parse_args(&strings(&["-h"])).unwrap(),
+            CliArgs {
+                help: true,
+                ..base()
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["--help"])).unwrap(),
+            CliArgs {
+                help: true,
+                ..base()
+            }
+        );
+        // The usage text names every mode and the top-level flags.
+        let help = help_text();
+        for needle in [
+            "--headless",
+            "--json",
+            "--max-rounds",
+            "--permission-mode",
+            "--serve",
+            "-c, --continue",
+            "-r, --resume",
+        ] {
+            assert!(help.contains(needle), "help missing {needle}");
+        }
     }
 
     #[test]
