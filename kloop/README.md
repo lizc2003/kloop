@@ -1082,6 +1082,57 @@ token saver / model-vision capability probe; per-request media-count cap;
 PDF/document blocks; remote-URL images; exposing `detail`. See
 `docs/plan/29-image-input.md`.
 
+## Headless mode (Phase 2, twenty-first slice)
+
+`kloop -p/--print` runs one turn without a REPL or TUI and exits — the form
+scripts, pipes, and CI need. cc's `--print` and codex's `exec` crate converged
+here independently, so kloop takes the intersection.
+
+```sh
+# prompt as a positional argument; the final answer is the only thing on stdout
+kloop -p "summarize what CHANGELOG.md says" > summary.txt
+
+# or pipe it on stdin (both sources combine: positional first, then a newline,
+# then stdin)
+git diff | kloop -p "review this diff"
+
+# machine-readable event stream (reuses server mode's notification wire)
+kloop -p --json "fix the failing test" | jq -c 'select(.method=="tool/started")'
+
+# runaway guardrail for scripts; resume a session and run headless on it
+kloop -p --max-turns 8 "keep going"
+kloop --resume 20260716-101500 -p "and now write the tests"
+
+# hermetic end-to-end demo, no key (great for CI)
+kloop --mock -p --json
+```
+
+- **Prompt = positional argument and/or piped stdin** (either alone, or both
+  combined). Neither present is an error. `-p` is a mode switch, not a value
+  holder — the prompt never rides the flag itself (cc's shape).
+- **Two output contracts.** Default (human): the final answer prints once to
+  **stdout**, progress notes go to **stderr**, so `result=$(kloop -p "…")`
+  captures a clean result. `--json` (machine): every event is one NDJSON line on
+  stdout — `turn/started`, `text/delta`, `tool/started|completed`,
+  `agent/started|completed`, `todo/updated`, `note`, `turn/completed` — the
+  **exact same method+params shapes server mode emits**, `threadId` and all. One
+  event vocabulary, two front-ends.
+- **Approval defaults to deny.** There is nobody at the keyboard, so any
+  permission ask is auto-denied (fail-safe, like server mode's "reply lost =
+  deny"). Loosen with `--yolo`, `--accept-edits`, or `AGENT_ALLOW` — these act
+  before the approver, so they still open the gate. (Sandbox auto-allow still
+  covers safe bash without asking.)
+- **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
+  or hitting `--max-turns`.
+- The session persists to `.kloop/sessions/` like every other mode, so a
+  headless run is resumable (`--resume <id>`) and forkable afterward.
+
+`--max-turns` and `--json` are `-p`-only; a bare prompt without `-p` is an error
+(interactive mode takes its input at the prompt). Not done (deferred, server
+mode already covers the programmatic side): `--permission-prompt-tool`
+delegation, `--input-format stream-json`, budget/goal guardrails,
+`--output-schema`. See `docs/plan/33-exec-mode.md`.
+
 ## Running
 
 ```sh

@@ -52,6 +52,18 @@ pub(crate) struct CliArgs {
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
+    /// `-p`/`--print`: run one turn headless (no REPL, no TUI) and exit. The
+    /// prompt comes from the positional argument and/or piped stdin.
+    pub(crate) print: bool,
+    /// `--json` (headless only): emit the run as a NDJSON event stream on
+    /// stdout, reusing the server mode's notification wire shapes.
+    pub(crate) json: bool,
+    /// `--max-turns <n>` (headless only): cap the round count as a runaway
+    /// guardrail for scripts. Overrides the default `max_rounds`.
+    pub(crate) max_turns: Option<usize>,
+    /// The positional prompt for headless mode, if any (may be combined with
+    /// piped stdin at run time).
+    pub(crate) prompt: Option<String>,
     /// `--image <path>` (repeatable): local image files attached to the first
     /// user turn. Read + validated after parsing; remote URLs are refused.
     pub(crate) images: Vec<PathBuf>,
@@ -66,6 +78,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         list_sessions: false,
         plain: false,
         serve: false,
+        print: false,
+        json: false,
+        max_turns: None,
+        prompt: None,
         images: Vec::new(),
         session: SessionChoice::New,
     };
@@ -78,6 +94,22 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
+            "-p" | "--print" => parsed.print = true,
+            "--json" => parsed.json = true,
+            "--max-turns" => {
+                let raw = match args.get(i + 1) {
+                    Some(raw) if !raw.starts_with('-') => raw,
+                    _ => bail!("--max-turns needs a positive integer"),
+                };
+                i += 1;
+                let n: usize = raw
+                    .parse()
+                    .with_context(|| format!("--max-turns: '{raw}' is not a positive integer"))?;
+                if n == 0 {
+                    bail!("--max-turns must be at least 1");
+                }
+                parsed.max_turns = Some(n);
+            }
             "--image" => {
                 let path = match args.get(i + 1) {
                     Some(path) if !path.starts_with('-') => path,
@@ -115,11 +147,38 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                     },
                 };
             }
-            other => bail!(
-                "unknown argument '{other}' (--mock | --yolo | --accept-edits | --plain | --serve | --image <path> | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+            // A leading dash is an unknown flag; anything else is the headless
+            // positional prompt (only one is allowed).
+            other if other.starts_with('-') => bail!(
+                "unknown argument '{other}' (-p/--print | --json | --max-turns <n> | --mock | --yolo | --accept-edits | --plain | --serve | --image <path> | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
+            prompt => {
+                if parsed.prompt.is_some() {
+                    bail!("unexpected extra argument '{prompt}' (pass a single prompt)");
+                }
+                parsed.prompt = Some(prompt.to_string());
+            }
         }
         i += 1;
+    }
+    // `--json` / `--max-turns` / a positional prompt only mean something in
+    // headless mode; requiring `-p` keeps the mode's flags cohesive (and
+    // matches cc, where these are all `--print`-mode options).
+    if !parsed.print {
+        if parsed.json {
+            bail!("--json requires -p/--print (it streams the headless run as JSON)");
+        }
+        if parsed.max_turns.is_some() {
+            bail!("--max-turns requires -p/--print (it is a headless guardrail)");
+        }
+        if let Some(prompt) = &parsed.prompt {
+            bail!(
+                "a prompt argument ('{prompt}') requires -p/--print; interactive mode takes input at its prompt"
+            );
+        }
+    }
+    if parsed.print && parsed.serve {
+        bail!("-p/--print and --serve are different modes; pick one");
     }
     Ok(parsed)
 }
@@ -252,100 +311,75 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The all-false / all-None default, so each case below asserts the whole
+    /// object while spelling out only what that flag changes.
+    fn base() -> CliArgs {
+        CliArgs {
+            mock: false,
+            yolo: false,
+            accept_edits: false,
+            list_sessions: false,
+            plain: false,
+            serve: false,
+            print: false,
+            json: false,
+            max_turns: None,
+            prompt: None,
+            images: vec![],
+            session: SessionChoice::New,
+        }
+    }
+
     #[test]
     fn parse_args_covers_all_flags() {
-        assert_eq!(
-            parse_args(&[]).unwrap(),
-            CliArgs {
-                mock: false,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
-                plain: false,
-                serve: false,
-                images: vec![],
-                session: SessionChoice::New,
-            }
-        );
+        assert_eq!(parse_args(&[]).unwrap(), base());
         assert_eq!(
             parse_args(&strings(&["--mock", "--resume"])).unwrap(),
             CliArgs {
                 mock: true,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
-                plain: false,
-                serve: false,
-                images: vec![],
                 session: SessionChoice::Pick,
+                ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&["--continue"])).unwrap(),
             CliArgs {
-                mock: false,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
-                plain: false,
-                serve: false,
-                images: vec![],
                 session: SessionChoice::Continue,
+                ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&["--serve"])).unwrap(),
             CliArgs {
-                mock: false,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
-                plain: false,
                 serve: true,
-                images: vec![],
-                session: SessionChoice::New,
+                ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&["--resume", "20260709-120000", "--plain"])).unwrap(),
             CliArgs {
-                mock: false,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
                 plain: true,
-                serve: false,
-                images: vec![],
                 session: SessionChoice::Resume("20260709-120000".into()),
+                ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&["--list-sessions", "--yolo", "--accept-edits"])).unwrap(),
             CliArgs {
-                mock: false,
                 yolo: true,
                 accept_edits: true,
                 list_sessions: true,
-                plain: false,
-                serve: false,
-                images: vec![],
-                session: SessionChoice::New,
+                ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&["--fork", "20260709-120000#4"])).unwrap(),
             CliArgs {
-                mock: false,
-                yolo: false,
-                accept_edits: false,
-                list_sessions: false,
-                plain: false,
-                serve: false,
-                images: vec![],
                 session: SessionChoice::Fork {
                     id: "20260709-120000".into(),
                     cut: Some(4),
                 },
+                ..base()
             }
         );
         assert_eq!(
@@ -374,6 +408,86 @@ mod tests {
             "seq must parse"
         );
         assert!(parse_args(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn parse_args_headless_flags() {
+        // `-p` and `--print` are the same switch; a positional becomes the
+        // prompt; --json and --max-turns ride along.
+        assert_eq!(
+            parse_args(&strings(&["-p", "fix the bug"])).unwrap(),
+            CliArgs {
+                print: true,
+                prompt: Some("fix the bug".into()),
+                ..base()
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "--print",
+                "--json",
+                "--max-turns",
+                "5",
+                "do it"
+            ]))
+            .unwrap(),
+            CliArgs {
+                print: true,
+                json: true,
+                max_turns: Some(5),
+                prompt: Some("do it".into()),
+                ..base()
+            }
+        );
+        // Headless composes with session selection (resume + run headless).
+        assert_eq!(
+            parse_args(&strings(&["--resume", "20260709-120000", "-p", "continue"])).unwrap(),
+            CliArgs {
+                print: true,
+                prompt: Some("continue".into()),
+                session: SessionChoice::Resume("20260709-120000".into()),
+                ..base()
+            }
+        );
+        // -p with no prompt is legal (stdin supplies it at run time).
+        assert_eq!(
+            parse_args(&strings(&["-p"])).unwrap(),
+            CliArgs {
+                print: true,
+                ..base()
+            }
+        );
+
+        // Headless-only flags without -p are rejected.
+        assert!(
+            parse_args(&strings(&["--json"])).is_err(),
+            "--json needs -p"
+        );
+        assert!(
+            parse_args(&strings(&["--max-turns", "3"])).is_err(),
+            "--max-turns needs -p"
+        );
+        assert!(
+            parse_args(&strings(&["a prompt"])).is_err(),
+            "a bare prompt needs -p"
+        );
+        // Two positionals, a bad turn count, and mode conflicts are errors.
+        assert!(
+            parse_args(&strings(&["-p", "one", "two"])).is_err(),
+            "one prompt only"
+        );
+        assert!(
+            parse_args(&strings(&["-p", "--max-turns", "0", "go"])).is_err(),
+            "max-turns >= 1"
+        );
+        assert!(
+            parse_args(&strings(&["-p", "--max-turns", "x", "go"])).is_err(),
+            "max-turns must parse"
+        );
+        assert!(
+            parse_args(&strings(&["-p", "--serve"])).is_err(),
+            "print and serve conflict"
+        );
     }
 
     #[test]

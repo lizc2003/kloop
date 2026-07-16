@@ -6,6 +6,7 @@
 
 mod args;
 mod context;
+mod headless;
 mod image;
 mod mcp;
 mod startup;
@@ -15,7 +16,9 @@ mod web;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -48,13 +51,13 @@ use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(&args)?;
     let sessions_dir = PathBuf::from(".kloop/sessions");
     if args.list_sessions {
         list_sessions(&sessions_dir);
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
@@ -130,14 +133,15 @@ async fn main() -> Result<()> {
                 )
             })
         };
-        return kloop_server::serve_stdio(
+        kloop_server::serve_stdio(
             factory,
             kloop_server::ServerPaths {
                 sessions_dir,
                 offload_dir: PathBuf::from(".kloop/offload"),
             },
         )
-        .await;
+        .await?;
+        return Ok(ExitCode::SUCCESS);
     }
     let (history, session_id) = open_history(
         PathBuf::from(".kloop/offload"),
@@ -156,10 +160,54 @@ async fn main() -> Result<()> {
         image::load_images(&args.images)?
     };
 
+    // Headless (`-p`/`--print`) takes precedence over the interactive
+    // front-ends — including --mock, so `--mock -p` is a hermetic end-to-end
+    // run for CI. One turn, print the result, exit by outcome.
+    if args.print {
+        let prompt = if args.mock {
+            // The scripted demo needs no real prompt; the trigger is fixed.
+            "run the demo".to_string()
+        } else {
+            let piped = read_stdin_if_piped().await?;
+            headless::assemble_prompt(args.prompt.as_deref(), piped.as_deref())?
+        };
+        let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+        let mut cfg = config_from_env(
+            &args,
+            Arc::new(headless::DenyApprover),
+            notify,
+            &tool_sources,
+            &project,
+            sandbox,
+            agent_types,
+            skills,
+        )?;
+        cfg.session_id = session_id.clone();
+        // The headless runaway guardrail overrides the default round cap.
+        if let Some(max_turns) = args.max_turns {
+            cfg.max_rounds = max_turns;
+        }
+        let cancel = CancellationToken::new();
+        let watcher = spawn_ctrl_c(cancel.clone());
+        let code = headless::run_headless(
+            Arc::new(cfg),
+            history,
+            session_id,
+            prompt,
+            pending_images,
+            args.json,
+            Arc::new(Mutex::new(std::io::stdout())),
+            cancel,
+        )
+        .await;
+        watcher.abort();
+        return Ok(ExitCode::from(code as u8));
+    }
+
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        return plain_main(
+        plain_main(
             args,
             history,
             session_id,
@@ -170,7 +218,8 @@ async fn main() -> Result<()> {
             skills,
             pending_images,
         )
-        .await;
+        .await?;
+        return Ok(ExitCode::SUCCESS);
     }
     let factory_session_id = session_id.clone();
     kloop_tui::run(
@@ -192,7 +241,27 @@ async fn main() -> Result<()> {
         session_id,
         pending_images,
     )
+    .await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read all of stdin when it is a pipe/redirect, or None when it is an
+/// interactive terminal (reading would block waiting for the user). The
+/// blocking read runs off the async runtime.
+async fn read_stdin_if_piped() -> Result<Option<String>> {
+    use std::io::IsTerminal as _;
+    use std::io::Read as _;
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let text = tokio::task::spawn_blocking(|| {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+    })
     .await
+    .context("stdin reader panicked")?
+    .context("cannot read stdin")?;
+    Ok(Some(text))
 }
 
 /// A task that cancels `cancel` on the first Ctrl+C; the caller aborts it once
