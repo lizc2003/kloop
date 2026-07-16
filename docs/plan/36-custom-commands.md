@@ -4,7 +4,7 @@
 > `SkillSource::Command` 进同一 skill 注册表,复用 skills 全部展开/触发/slash 机制。
 > 二片(`!cmd`/`@file` 注入,提交 93570b1):`/name` 展开时执行内嵌 bash(走 bash 权限
 > 门)+ `@file` 读文件附进 prompt(走 `read_path_blocked`)。三片(注入统一到 `skill`
-> 工具路径,提交号待回填):模型激活的 skill 也展开注入,两条触发路径行为一致。决定与记录见文末。
+> 工具路径,提交 2446ee5):模型激活的 skill 也展开注入,两条触发路径行为一致。决定与记录见文末。
 
 > 一句话定位:plan 23 挂账的"用户自定义 `.kloop/commands/*.md` 带参模板"正式领编号。
 > 但生态位已变:plan 28 的 skills 已覆盖"用户自定义带参 prompt 包"(`/name` 触发 +
@@ -160,7 +160,7 @@ world.`(参数替换先行)、`@notes.txt` 附文件内容(allow_all + 临时 cw
 象(rollout 里标记原样、无文件内容)——`target/debug/kloop` 是陈旧二进制,`cargo test`/
 `build -p kloop-core`/`clippy` 都不产它;`cargo build -p kloop` 重建后即闭环。
 
-## 完成记录(三片:注入统一到 `skill` 工具路径,提交号待回填)
+## 完成记录(三片:注入统一到 `skill` 工具路径,提交 2446ee5)
 
 二片只在 `/name` 用户路径展开注入,模型经 `skill` 工具激活的 skill 不展开——行为不一致,
 也把 plan 28 的 `` !`cmd` `` 挂账悬着。三片补齐:`skill` 工具在 `expand_body` 后调
