@@ -678,7 +678,11 @@ gate and the sandbox); a sibling `.kloop-worktrees/` dodges both.
   mutable slot the `Config.effective_*` accessors read) and `exit_worktree` to
   leave; `kloop --worktree[=<name>]` enters one at startup. One tree per
   session; a sub-agent spawned while in it inherits the tree as its base cwd.
-  These tools appear only in the CLI/TUI/plain session, not server threads.
+  Works in every session but `--mock`, **including server threads** (each
+  thread has its own slot; a `thread/worktree` notification — `{cwd, branch,
+  active}` — reports each switch so an IDE can follow it, and an un-exited tree
+  is torn down when the thread ends). The `--worktree` startup flag stays
+  single-session (rejected with `--serve`).
 
 Lifecycle (no auto-merge, both references stop here): an **untouched** tree
 (clean, no commits past HEAD) is torn down with its branch; a **changed** tree
@@ -689,8 +693,8 @@ change probe is **fail-closed** (git untrusted → tree kept). Creation is
 fail-closed too — a non-git cwd, a name collision, or a git error is an error,
 never a silent fall back to the shared cwd.
 
-Not yet (挂账): an `origin/HEAD` base ref for CI, 30-day stale-tree pruning
-(`git worktree prune` by hand for now), and server-mode session worktrees.
+Not yet (挂账): an `origin/HEAD` base ref for CI, and 30-day stale-tree pruning
+(`git worktree prune` by hand for now).
 
 ## OS sandbox (Phase 2, thirteenth slice)
 

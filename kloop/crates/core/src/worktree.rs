@@ -178,6 +178,9 @@ pub(crate) fn compute_overrides(
 pub struct ActiveWorktree {
     wt: Worktree,
     pub cwd: PathBuf,
+    /// The tree's branch (`kloop/worktree/<name>`), surfaced to a client that
+    /// tracks the session cwd (the server's `thread/worktree` notification).
+    pub branch: String,
     pub permissions: Arc<Permissions>,
     pub sandbox: Option<Arc<SandboxPolicy>>,
     pub system: String,
@@ -211,6 +214,7 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
     );
     *cfg.active_worktree.write().unwrap() = Some(ActiveWorktree {
         cwd: wt.path.clone(),
+        branch: wt.branch.clone(),
         permissions,
         sandbox,
         system,

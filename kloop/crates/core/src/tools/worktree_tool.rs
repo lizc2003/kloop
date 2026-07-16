@@ -57,17 +57,26 @@ pub(super) async fn enter_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<
     guard(ctx, "enter_worktree")?;
     let name = str_arg(input, "name", "enter_worktree")?;
     validate_name(name)?;
-    worktree::enter(&ctx.cfg, name)
+    let msg = worktree::enter(&ctx.cfg, name)
         .await
-        .map_err(|e| anyhow!("enter_worktree: {e:#}"))
+        .map_err(|e| anyhow!("enter_worktree: {e:#}"))?;
+    // Tell a cwd-tracking client (the server) the session moved into the tree.
+    if let Some(a) = ctx.cfg.active_worktree.read().unwrap().as_ref() {
+        ctx.ui
+            .cwd_changed(&a.cwd.display().to_string(), Some(&a.branch));
+    }
+    Ok(msg)
 }
 
 pub(super) async fn exit_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     guard(ctx, "exit_worktree")?;
     let discard = input["discard_changes"].as_bool().unwrap_or(false);
-    worktree::exit(&ctx.cfg, discard)
+    let msg = worktree::exit(&ctx.cfg, discard)
         .await
-        .map_err(|e| anyhow!("exit_worktree: {e:#}"))
+        .map_err(|e| anyhow!("exit_worktree: {e:#}"))?;
+    // Back in the main checkout (slot cleared) — announce the cwd is `cfg.cwd`.
+    ctx.ui.cwd_changed(&ctx.cfg.cwd.display().to_string(), None);
+    Ok(msg)
 }
 
 /// Both tools are top-level and session-scoped: a sub-agent gets isolation via

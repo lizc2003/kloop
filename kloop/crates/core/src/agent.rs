@@ -80,6 +80,17 @@ pub trait Ui: Send + Sync {
             None => self.note(&format!("{prefix}todos {done}/{} done", todos.len())),
         }
     }
+    /// The session's working directory changed — it entered or left a worktree
+    /// (plan 35 slice 2). `branch` is the tree's branch when entering, None
+    /// when back in the main checkout. The default collapses to a note; a
+    /// client that tracks the session cwd (the server) opts in with a
+    /// structured notification so an IDE can follow the switch.
+    fn cwd_changed(&self, cwd: &str, branch: Option<&str>) {
+        match branch {
+            Some(b) => self.note(&format!("working directory → {cwd} (branch {b})")),
+            None => self.note(&format!("working directory → {cwd}")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

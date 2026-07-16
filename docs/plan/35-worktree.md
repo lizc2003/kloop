@@ -157,3 +157,29 @@ CLI 同样落树无泄漏。
 
 **切片 2 挂账**:server 会话 worktree;origin/HEAD base;30 天陈旧清理;指令文件/git 快照按
 worktree 重组;cc setup 拷贝;跨仓库。
+
+## ✅ server 支持收尾(2026-07-16,提交 <待回填>)
+
+切片 2 挂的 server 会话 worktree 补齐(用户后续要求)。server 每 thread 独立 Config(工厂
+闭包造)+ 独立 active_worktree 槽,天然隔离;要补的三点:
+- **worktree_enabled 对 server 开**:`config_from_env` 从 `!serve && !mock` 改 `!mock`
+  (server 也启用,只 mock 关);enter/exit 工具在 server thread 注册。
+- **cwd 切换通知(客户端感知,当初挂账的核心理由)**:`Ui` trait 加 `cwd_changed(cwd,
+  branch)` 默认方法(默认退化 note,本地前端也显示);`ThreadUi` 覆盖发结构化
+  `thread/worktree` 通知 `{cwd, branch, active}`;enter/exit 工具在切换后调 `ctx.ui.
+  cwd_changed`(enter 读槽拿 branch、exit 报回 `cfg.cwd` + null)。`ActiveWorktree` 加 pub
+  `branch`。
+- **生命周期清理**:`thread_worker` turn 循环结束(server 关闭/turn 通道断)后
+  `worktree::finish_active(&cfg)`——模型没 exit 的残留树脏留净删,不泄漏过会话。
+
+`--worktree` 启动 flag 仍单会话(与 `--serve` 互斥保留;server 多会话没有"启动进哪棵"的语
+义,worktree 由模型 `enter_worktree` 按需触发)。同名并发:两 thread 同 name enter 撞,
+`WORKTREE_LOCK` 串行下第二个报错(模型/客户端该给不同名)。
+
+真 key 验收(Python 驱动 JSON-RPC client 跑真 `--serve`,anthropic sonnet-4-6):模型在
+server 会话 `enter_worktree→write_file→exit_worktree`,客户端收到两条 `thread/worktree`
+(active:true branch=kloop/worktree/srv → active:false branch=null)、写落 worktree、主仓
+无泄漏、exit 脏留分支;server 契约(mock)另测通知形态 + 未 exit 树 shutdown 清理。
+
+**仍挂账**:origin/HEAD base;30 天陈旧清理;指令文件/git 快照按 worktree 重组;cc setup
+拷贝;跨仓库;server 同名 worktree 的客户端协调。

@@ -166,6 +166,175 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
     })
 }
 
+fn tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
+    ContentBlock::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input,
+    }
+}
+
+/// A throwaway git repo (canonical path) to serve as a thread's cwd, so
+/// enter_worktree has somewhere to branch from.
+fn temp_git_repo(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("kloop-srv-wt-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for a in [
+        &["init", "-q"][..],
+        &["config", "user.email", "t@e.com"],
+        &["config", "user.name", "t"],
+        &["commit", "--allow-empty", "-qm", "base"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(a)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::canonicalize(&root).unwrap()
+}
+
+/// Like `factory` but with worktree mode ON and cwd pointed at a real git repo
+/// (allow_all gate — the worktree tools auto-allow anyway).
+fn worktree_factory(
+    turns: Vec<Vec<ContentBlock>>,
+    offload: PathBuf,
+    cwd: PathBuf,
+) -> ConfigFactory {
+    Arc::new(move |_approver, _notify| {
+        Ok(Config {
+            provider: Arc::new(Provider::mock(turns.clone())),
+            model: "mock".into(),
+            system: "test".into(),
+            project_instructions: None,
+            max_rounds: 10,
+            cwd: cwd.clone(),
+            offload_dir: offload.clone(),
+            sessions_dir: offload.with_file_name("sessions"),
+            context_window: None,
+            fallback_model: None,
+            permissions: Arc::new(Permissions::allow_all()),
+            tool_sources: Vec::new(),
+            session_id: String::new(),
+            agent_label: String::new(),
+            hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
+            background_shells: kloop_core::tools::BackgroundShells::new(),
+            sandbox: None,
+            agent_types: std::sync::Arc::new(Vec::new()),
+            tool_allowlist: None,
+            defer_threshold: 30,
+            unlocked_tools: Default::default(),
+            todos: Default::default(),
+            inbox: Default::default(),
+            background_tasks: Default::default(),
+            program_limits: Default::default(),
+            skills: Default::default(),
+            active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            worktree_enabled: true,
+        })
+    })
+}
+
+/// A thread whose model enters a worktree, writes inside it, and exits: the
+/// client gets `thread/worktree` notifications on both switches, the write
+/// lands in the tree (not the main repo), and the dirty tree is kept on exit.
+#[tokio::test]
+async fn worktree_enter_write_exit_notifies_and_isolates() {
+    let dirs = test_dirs("worktree");
+    let repo = temp_git_repo("srv");
+    let turns = vec![
+        vec![tool_use("t1", "enter_worktree", json!({"name": "srv"}))],
+        vec![tool_use(
+            "t2",
+            "write_file",
+            json!({"path": "s.txt", "content": "S"}),
+        )],
+        vec![tool_use("t3", "exit_worktree", json!({}))],
+        vec![text("done")],
+    ];
+    let mut client = start_server(
+        worktree_factory(turns, dirs.offload.clone(), repo.clone()),
+        &dirs,
+    );
+
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let thread_id = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": "go"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    // Two thread/worktree notifications: enter (active, branch set) then exit.
+    let wt: Vec<&Value> = log
+        .iter()
+        .filter(|m| m["method"] == "thread/worktree")
+        .collect();
+    assert_eq!(wt.len(), 2, "enter + exit notifications");
+    assert_eq!(wt[0]["params"]["active"], true);
+    assert_eq!(wt[0]["params"]["branch"], "kloop/worktree/srv");
+    assert!(wt[0]["params"]["cwd"]
+        .as_str()
+        .unwrap()
+        .ends_with(".kloop-worktrees/srv"));
+    assert_eq!(wt[1]["params"]["active"], false);
+    assert_eq!(wt[1]["params"]["branch"], Value::Null);
+
+    // The write landed in the worktree, not the main repo; the dirty tree is
+    // kept (model exited with default keep).
+    assert!(repo.join(".kloop-worktrees/srv/s.txt").exists());
+    assert!(!repo.join("s.txt").exists());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A model that enters a worktree but never exits: the tree is torn down (or
+/// kept if dirty) when the thread ends on server shutdown, not leaked.
+#[tokio::test]
+async fn unexited_worktree_is_cleaned_up_on_shutdown() {
+    let dirs = test_dirs("wt-shutdown");
+    let repo = temp_git_repo("noexit");
+    let turns = vec![
+        vec![tool_use("t1", "enter_worktree", json!({"name": "leak"}))],
+        vec![text("entered, not exiting")],
+    ];
+    let mut client = start_server(
+        worktree_factory(turns, dirs.offload.clone(), repo.clone()),
+        &dirs,
+    );
+    client
+        .send(json!({"id": 1, "method": "thread/start", "params": {}}))
+        .await;
+    let thread_id = client.recv().await["result"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": "go"}}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert!(
+        repo.join(".kloop-worktrees/leak").exists(),
+        "tree exists mid-session"
+    );
+
+    // Shutdown closes the turn channel; the worker tears down the clean tree.
+    client.shutdown().await;
+    assert!(
+        !repo.join(".kloop-worktrees/leak").exists(),
+        "clean tree removed on shutdown"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 fn methods_for_thread<'a>(log: &'a [Value], thread_id: &str) -> Vec<&'a str> {
     log.iter()
         .filter(|m| m["params"]["threadId"] == thread_id)

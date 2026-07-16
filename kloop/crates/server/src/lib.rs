@@ -462,6 +462,12 @@ async fn thread_worker(
         running.store(false, Ordering::SeqCst);
         ui.notify("turn/completed", turn_completed_params(&outcome.reason));
     }
+    // The thread is ending (turn channel closed on server shutdown): tear down
+    // its active worktree if the model never exited (dirty kept on its branch,
+    // clean removed), so trees don't leak past the session.
+    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+        ui.note(note.trim());
+    }
 }
 
 /// The `turn/completed` notification params for a turn's end reason. Shared by
@@ -535,6 +541,16 @@ impl Ui for ThreadUi {
             params["agent"] = Value::String(agent.to_string());
         }
         self.notify("todo/updated", params);
+    }
+
+    fn cwd_changed(&self, cwd: &str, branch: Option<&str>) {
+        // The thread entered (branch = Some) or left (None) a worktree; a client
+        // tracking the session cwd follows the switch. `active` mirrors branch
+        // presence for a one-field check.
+        self.notify(
+            "thread/worktree",
+            json!({"cwd": cwd, "branch": branch, "active": branch.is_some()}),
+        );
     }
 }
 

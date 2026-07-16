@@ -612,10 +612,12 @@ pub(crate) fn config_from_env(
         program_limits,
         skills,
         active_worktree: Arc::new(std::sync::RwLock::new(None)),
-        // Worktree mode (enter/exit tools + --worktree) is for the single
-        // interactive/headless session; server threads don't support it yet and
-        // --mock stays hermetic (no git).
-        worktree_enabled: !args.serve && !args.mock,
+        // Worktree mode (enter/exit tools) is on everywhere but --mock (which is
+        // hermetic, no git). Server threads support it too — each thread gets
+        // its own active-worktree slot and a `thread/worktree` notification on
+        // switch. (The `--worktree` startup flag is still single-session only;
+        // main.rs rejects it with --serve.)
+        worktree_enabled: !args.mock,
     };
     if args.mock {
         return Ok(Config {
