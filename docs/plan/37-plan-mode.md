@@ -54,8 +54,10 @@
 
 ## 关键决定(开工时定 / 问用户)
 
-1. **与 bypass/yolo 的交互**:cc 是"bypass 可用则放行全部"——kloop 倾向 `--yolo` 与
-   `--plan` 互斥报错(两者语义相反,静默一边赢是坑)。
+1. **与 bypass 的交互**:cc 是"bypass 可用则放行全部"——kloop 倾向 `--permission-mode
+   bypass` 与 `plan` 互斥报错(两者语义相反,静默一边赢是坑)。注:plan 33 后续把
+   `--yolo`/`--accept-edits` 已合并成统一 `--permission-mode default|accept-edits|bypass`
+   flag(`args.rs`),plan 档只需给它加第四个取值 `plan` + 管线 enforcement。
 2. **计划载体**:入参内联(倾向,最小)vs 磁盘 plans 目录(cc 形,挂账;真要复盘时
    rollout 里本来就有)。
 3. **TUI 入口**:只 CLI flag 起步,还是加模式切换键 + 状态栏显示当前档位(TUI 现无档
@@ -72,7 +74,7 @@
 ## 测试
 
 权限管线 plan 档:写类拒(write/edit/不可分析 bash)、只读放行(grep/glob/read/只读
-bash)、deny 仍最先、acceptEdits 语义被 plan 覆盖、`--yolo` 互斥报错;`exit_plan_mode`
+bash)、deny 仍最先、acceptEdits 语义被 plan 覆盖、`--permission-mode bypass` 互斥报错;`exit_plan_mode`
 审批往返:preview 带计划全文、批准切回前模式、拒绝留档 + 引导文案;子 agent 继承
 (plan 档下子 agent 的写调用被拒);system 注入含 plan 指引;`--plan` 解析。
 

@@ -231,7 +231,7 @@ pub struct Permissions {
 
 impl Permissions {
     /// No gating at all — for tests and the keyless `--mock` demo, where
-    /// nobody is at the keyboard. The CLI's `--yolo` is NOT this; it is
+    /// nobody is at the keyboard. The CLI's `--permission-mode bypass` is NOT this; it is
     /// [`Mode::Bypass`], which deny rules and safety checks survive.
     pub fn allow_all() -> Self {
         Permissions {
@@ -437,7 +437,7 @@ impl Permissions {
     /// blocked hits and report the count rather than prompting).
     ///
     /// deny and the sensitive list survive every mode but `allow_all`
-    /// (tests/`--mock`, where nothing is gated); `--yolo` (Bypass) still
+    /// (tests/`--mock`, where nothing is gated); `--permission-mode bypass` still
     /// filters, mirroring the gate where deny and safety checks are
     /// bypass-immune.
     pub fn read_path_blocked(&self, path: &Path) -> bool {
@@ -464,7 +464,7 @@ impl Permissions {
         if self.allow_everything {
             return EscalationOutcome::NotAttempted;
         }
-        // Bypass (`--yolo`) means "don't ask" — escalate as the model-driven
+        // Bypass (`--permission-mode bypass`) means "don't ask" — escalate as the model-driven
         // disable_sandbox retry already would (it auto-passes the bypass
         // layer of the gate).
         if self.mode == Mode::Bypass {
@@ -1380,7 +1380,7 @@ mod tests {
             .description
             .contains("[sandbox denied — run without sandbox?] bash: npm install"));
 
-        // Bypass (--yolo): escalate without asking.
+        // Bypass (--permission-mode bypass): escalate without asking.
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
         assert_eq!(

@@ -19,7 +19,6 @@ use kloop_core::hooks::HookDef;
 use kloop_core::hooks::HookEvent;
 use kloop_core::hooks::Hooks;
 use kloop_core::permissions::Approver;
-use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::skills::Skill;
@@ -201,17 +200,12 @@ fn build_permissions(
     notify: kloop_tui::NoteFn,
 ) -> Result<Permissions> {
     // --mock runs a canned turn with nobody at the keyboard: no gating at
-    // all. --yolo is bypass mode — deny rules and safety checks still apply.
+    // all. Otherwise the mode comes straight from --permission-mode (default);
+    // bypass still enforces deny rules and safety checks.
     if args.mock {
         return Ok(Permissions::allow_all());
     }
-    let mode = if args.yolo {
-        Mode::Bypass
-    } else if args.accept_edits {
-        Mode::AcceptEdits
-    } else {
-        Mode::Default
-    };
+    let mode = args.permission_mode;
     let config_path = PathBuf::from(PERMISSIONS_CONFIG);
     let rules = load_permission_rules(&config_path)?;
     let cwd = std::env::current_dir().context("cannot determine cwd")?;

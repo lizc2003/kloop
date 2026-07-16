@@ -238,10 +238,11 @@ it** (↑/↓/j/k/PageUp/PageDown, with a `↑↓ more` hint in the border and t
 y/a/p/n options pinned below the scroll region), the plain REPL prints the
 same ANSI, the server adds a `preview` field to `approval/request`.
 
-**Modes**: default (ask for anything unvouched-for), `--accept-edits`
-(file writes inside the working directory auto-pass), `--yolo` (bypass:
-everything passes *except* deny rules and safety checks). `--mock` disables
-the gate entirely — nobody is at the keyboard.
+**Modes**: one flag `--permission-mode <mode>` (cc's unified control) picks the
+gate mode — `default` (ask for anything unvouched-for), `accept-edits` (file
+writes inside the working directory auto-pass), or `bypass` (everything passes
+*except* deny rules and safety checks). `--mock` disables the gate entirely —
+nobody is at the keyboard.
 
 ## TUI (Phase 2, fourth slice)
 
@@ -488,8 +489,8 @@ so a deny meant for reads is not slipped by grep, and secrets do not leak
 through a search. The dropped count is reported (`[N path(s) hidden by
 deny/sensitive rules]`) rather than silently swallowed. This is an output
 filter, not an approval prompt (a tree walk touches too many paths for the
-gate's one-path ask); it applies in every mode but `--mock`, `--yolo`
-included.
+gate's one-path ask); it applies in every mode but `--mock`, `--permission-mode
+bypass` included.
 
 ## Background bash (Phase 2, tenth slice)
 
@@ -620,8 +621,8 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   The accepted trade-off: a contained command can still modify the workspace
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `auto_allow = false` reverts to pure containment (approve
-  first, then run sandboxed). `--yolo` bypasses approvals but not the
-  sandbox.
+  first, then run sandboxed). `--permission-mode bypass` bypasses approvals but
+  not the sandbox.
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
@@ -630,8 +631,8 @@ disables network), there are two escalation paths:
 - **Code-level loop** (`escalate`, default on — codex's retry-on-denial):
   the tool asks once ("run this without the sandbox?") and, on approval,
   re-runs the command unsandboxed within the same tool call — one fewer
-  model round-trip. `--yolo` auto-approves it; declining keeps the failure
-  and steers the model to a different approach. This is the default.
+  model round-trip. `--permission-mode bypass` auto-approves it; declining keeps
+  the failure and steers the model to a different approach. This is the default.
 - **Model-driven** (fallback when `escalate = false`, or when there is no
   approver): the result is annotated with guidance and the model retries
   that one call with `disable_sandbox: true`, which faces the permission
@@ -1120,9 +1121,9 @@ kloop --mock -p --json
   event vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
-  deny"). Loosen with `--yolo`, `--accept-edits`, or `AGENT_ALLOW` — these act
-  before the approver, so they still open the gate. (Sandbox auto-allow still
-  covers safe bash without asking.)
+  deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `AGENT_ALLOW`
+  — these act before the approver, so they still open the gate. (Sandbox
+  auto-allow still covers safe bash without asking.)
 - **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
   or hitting `--max-turns`.
 - The session persists to `.kloop/sessions/` like every other mode, so a
@@ -1193,8 +1194,8 @@ cargo run -- --fork <id>       # branch off a session at its end
 # permissions (rules also live in .kloop/config.toml — see Permissions)
 AGENT_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
 AGENT_DENY='bash(git push *)' cargo run            # hard-block rules
-cargo run -- --accept-edits                        # auto-allow cwd file writes
-cargo run -- --yolo                                # bypass (deny/safety still apply)
+cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
+cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
 # OS sandbox (macOS seatbelt; see OS sandbox above)
 AGENT_SANDBOX=off cargo run                        # run bash commands bare

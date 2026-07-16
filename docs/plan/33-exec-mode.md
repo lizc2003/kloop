@@ -94,7 +94,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
 (都有则"位置\n stdin",都无报错);② 输出分离——text 模式 final_text 一次性进 stdout
 (`$(kloop -p …)` 干净捕获)、进度 note/tool 进 stderr、流式 delta 抑制不重复;`--json`
 全事件进 stdout。③ **审批默认拒**——headless 挂 `DenyApprover`(confirm 恒 Deny,对齐
-server "回复丢失=deny"),`--yolo`/`--accept-edits`/`AGENT_ALLOW` 在 approver 之前放宽。
+server "回复丢失=deny"),`--permission-mode accept-edits|bypass`/`AGENT_ALLOW` 在 approver 之前放宽。
 ④ 退出码——Completed=0,其余(MaxRounds/Aborted/Error)=1(`main` 返回 `ExitCode`,
 Drop 正常跑,不用 `process::exit`)。
 
@@ -117,3 +117,13 @@ exit0、`--max-turns 2` bound 的 bash 任务(sandbox auto_allow 放行,未触 d
 **挂账(不做,plan 已列)**:`--permission-prompt-tool` 委托、`--input-format stream-json`、
 budget/goal 护栏、`--output-schema`、`--output-last-message FILE`(text 输出即最后消息,
 已覆盖)。
+
+**后续 flag 命名复盘(同会话,用户逐点定)**:① headless 开关 `--print`→`--headless`(留
+`-p`,去 `--print` 别名);② 补 cc 的 `-c`(=`--continue`)/`-r`(=`--resume`)短选项;
+③ **权限 flag 统一**——查最新 cc(claude-code-guide 查官方 docs.claude.com)确认 cc 用单一
+`--permission-mode <mode>` 控全部权限模式(default/acceptEdits/plan/auto/dontAsk/
+bypassPermissions/manual),`--dangerously-skip-permissions` = `bypassPermissions` 快捷。
+kloop 照此**删 `--yolo`/`--accept-edits` 两个独立 flag,合并成 `--permission-mode
+default|accept-edits|bypass`**(取 kloop 内部 `Mode` 三态,kebab 取值),`build_permissions`
+直接读 `args.permission_mode`;`plan` 档留给 plan 37 加第四取值。README/HANDOFF/permissions.rs
+注释同步。

@@ -12,6 +12,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 use kloop_core::history::History;
+use kloop_core::permissions::Mode;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
@@ -47,8 +48,11 @@ pub(crate) enum SessionChoice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliArgs {
     pub(crate) mock: bool,
-    pub(crate) yolo: bool,
-    pub(crate) accept_edits: bool,
+    /// `--permission-mode <mode>`: the gating mode for this session, cc's
+    /// unified permission control. `default` (ask for anything unvouched-for),
+    /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
+    /// deny rules + safety checks). `--mock` ignores it (no gate at all).
+    pub(crate) permission_mode: Mode,
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
@@ -73,8 +77,7 @@ pub(crate) struct CliArgs {
 pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
-        yolo: false,
-        accept_edits: false,
+        permission_mode: Mode::Default,
         list_sessions: false,
         plain: false,
         serve: false,
@@ -89,8 +92,21 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     while i < args.len() {
         match args[i].as_str() {
             "--mock" => parsed.mock = true,
-            "--yolo" => parsed.yolo = true,
-            "--accept-edits" => parsed.accept_edits = true,
+            "--permission-mode" => {
+                let raw = match args.get(i + 1) {
+                    Some(mode) if !mode.starts_with('-') => mode,
+                    _ => bail!("--permission-mode needs a mode (default | accept-edits | bypass)"),
+                };
+                i += 1;
+                parsed.permission_mode = match raw.as_str() {
+                    "default" => Mode::Default,
+                    "accept-edits" => Mode::AcceptEdits,
+                    "bypass" => Mode::Bypass,
+                    other => bail!(
+                        "unknown permission mode '{other}' (default | accept-edits | bypass)"
+                    ),
+                };
+            }
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
@@ -150,7 +166,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-p/--headless | --json | --max-turns <n> | --mock | --yolo | --accept-edits | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (-p/--headless | --json | --max-turns <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -316,8 +332,7 @@ mod tests {
     fn base() -> CliArgs {
         CliArgs {
             mock: false,
-            yolo: false,
-            accept_edits: false,
+            permission_mode: Mode::Default,
             list_sessions: false,
             plain: false,
             serve: false,
@@ -386,13 +401,38 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&strings(&["--list-sessions", "--yolo", "--accept-edits"])).unwrap(),
+            parse_args(&strings(&["--list-sessions"])).unwrap(),
             CliArgs {
-                yolo: true,
-                accept_edits: true,
                 list_sessions: true,
                 ..base()
             }
+        );
+        // --permission-mode is cc's unified gate control: one flag, three modes.
+        assert_eq!(
+            parse_args(&strings(&["--permission-mode", "bypass"]))
+                .unwrap()
+                .permission_mode,
+            Mode::Bypass
+        );
+        assert_eq!(
+            parse_args(&strings(&["--permission-mode", "accept-edits"]))
+                .unwrap()
+                .permission_mode,
+            Mode::AcceptEdits
+        );
+        assert_eq!(
+            parse_args(&strings(&["--permission-mode", "default"]))
+                .unwrap()
+                .permission_mode,
+            Mode::Default
+        );
+        assert!(
+            parse_args(&strings(&["--permission-mode", "wild"])).is_err(),
+            "unknown mode rejected"
+        );
+        assert!(
+            parse_args(&strings(&["--permission-mode"])).is_err(),
+            "mode value required"
         );
         assert_eq!(
             parse_args(&strings(&["--fork", "20260709-120000#4"])).unwrap(),
