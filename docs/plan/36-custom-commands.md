@@ -2,7 +2,7 @@
 
 > ✅ **两片全完成**。首片(纯发现根,提交 56f3e51):`.kloop/commands/*.md` 单文件作
 > `SkillSource::Command` 进同一 skill 注册表,复用 skills 全部展开/触发/slash 机制。
-> 二片(`!cmd`/`@file` 注入,提交号待回填):`/name` 展开时执行内嵌 bash(走 bash 权限
+> 二片(`!cmd`/`@file` 注入,提交 93570b1):`/name` 展开时执行内嵌 bash(走 bash 权限
 > 门)+ `@file` 读文件附进 prompt(走 `read_path_blocked`)。决定与记录见文末。
 
 > 一句话定位:plan 23 挂账的"用户自定义 `.kloop/commands/*.md` 带参模板"正式领编号。
@@ -120,7 +120,7 @@ description + `$0`)→ `/greet Ada` → 模型回 `kloop-cmd-ok greeting Ada`;
 `/plain hi there` → 模型回 `plain-ok hi there`。发现 + frontmatter 可省 + 首行描述 +
 `$0`/`$ARGUMENTS` 展开 + slash→turn 全闭环。(`--mock` 跳过发现,验不了,故用真 key。)
 
-## 完成记录(二片:`!cmd`/`@file` 注入,提交号待回填)
+## 完成记录(二片:`!cmd`/`@file` 注入,提交 93570b1)
 
 **回源核对(2026-07-16)**:cc `~/work/claude-code`——`!cmd` 在
 `src/utils/promptShellExecution.ts`:`BLOCK_PATTERN=/```!\s*\n?([\s\S]*?)\n?```/g` +
