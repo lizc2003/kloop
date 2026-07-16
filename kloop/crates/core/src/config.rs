@@ -127,4 +127,62 @@ pub struct Config {
     /// loads a skill's body only when the `skill` tool triggers it. Empty when
     /// none are configured. Shared into sub-agent configs like `agent_types`.
     pub skills: Arc<Vec<crate::skills::Skill>>,
+    /// Session-level active worktree (plan 35 slice 2). None = the session
+    /// works in `cwd`; Some = it has `enter_worktree`'d, and the `effective_*`
+    /// accessors return the tree's cwd/permissions/sandbox/system instead. A
+    /// mutable slot (not a plain field) because enter/exit flip it mid-session,
+    /// immediately, without rebuilding the Config. Sub-agents get a FRESH empty
+    /// slot — they can't enter/exit; see `clone_for_subagent`.
+    pub active_worktree: Arc<std::sync::RwLock<Option<crate::worktree::ActiveWorktree>>>,
+    /// Whether this session exposes the enter/exit worktree tools and honors
+    /// `--worktree` (cc's `isWorktreeModeEnabled` gate). True for the single
+    /// CLI/TUI/plain session; false for server threads (worktree semantics
+    /// there is unbuilt) and `--mock`.
+    pub worktree_enabled: bool,
+}
+
+impl Config {
+    /// The working directory in effect for tool calls right now: the active
+    /// worktree's if the session has entered one, else `cwd`. Every tool that
+    /// resolves a relative path (or picks a git/search root) reads this, so
+    /// `enter_worktree` takes effect immediately.
+    pub fn effective_cwd(&self) -> PathBuf {
+        self.active_worktree
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// The permission gate in effect now — re-anchored at the active worktree
+    /// when in one (so acceptEdits keys off the tree), else the base gate.
+    pub fn effective_permissions(&self) -> Arc<Permissions> {
+        self.active_worktree
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.permissions.clone())
+            .unwrap_or_else(|| self.permissions.clone())
+    }
+
+    /// The OS sandbox policy in effect now — with the active worktree added as
+    /// a writable root when in one, else the base policy.
+    pub fn effective_sandbox(&self) -> Option<Arc<crate::sandbox::SandboxPolicy>> {
+        match self.active_worktree.read().unwrap().as_ref() {
+            Some(a) => a.sandbox.clone(),
+            None => self.sandbox.clone(),
+        }
+    }
+
+    /// The system prompt in effect now — its working-directory line rewritten
+    /// to the active worktree when in one, else the base system.
+    pub fn effective_system(&self) -> String {
+        self.active_worktree
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.system.clone())
+            .unwrap_or_else(|| self.system.clone())
+    }
 }

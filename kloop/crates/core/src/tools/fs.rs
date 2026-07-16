@@ -16,7 +16,7 @@ use crate::image::image_block_from_bytes;
 /// the text lines. A binary file that is not a supported image is an error.
 pub(super) async fn read_file_tool(input: &Value, ctx: &ToolCtx) -> Result<ToolResultContent> {
     let path = str_arg(input, "path", "read_file")?;
-    let full = resolve_path(&ctx.cfg.cwd, path);
+    let full = resolve_path(&ctx.cfg.effective_cwd(), path);
     let bytes = tokio::fs::read(&full)
         .await
         .with_context(|| format!("read_file: cannot read {path}"))?;
@@ -52,7 +52,7 @@ pub(super) async fn read_file_tool(input: &Value, ctx: &ToolCtx) -> Result<ToolR
 pub(super) async fn write_file_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let path = str_arg(input, "path", "write_file")?;
     let content = str_arg(input, "content", "write_file")?;
-    let full = resolve_path(&ctx.cfg.cwd, path);
+    let full = resolve_path(&ctx.cfg.effective_cwd(), path);
     if let Some(parent) = full.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent)
@@ -74,7 +74,7 @@ pub(super) async fn edit_file_tool(input: &Value, ctx: &ToolCtx) -> Result<Strin
     if old.is_empty() {
         bail!("edit_file: old_string must not be empty");
     }
-    let full = resolve_path(&ctx.cfg.cwd, path);
+    let full = resolve_path(&ctx.cfg.effective_cwd(), path);
     let content = tokio::fs::read_to_string(&full)
         .await
         .with_context(|| format!("edit_file: cannot read {path}"))?;

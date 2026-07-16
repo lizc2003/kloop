@@ -12,6 +12,7 @@ mod skill;
 mod task;
 mod todo;
 mod tool_search;
+mod worktree_tool;
 
 pub use background_tasks::BackgroundTasks;
 pub use background_tasks::TaskStatus;
@@ -155,6 +156,7 @@ pub fn all_tool_defs(
     depth: u8,
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
+    worktree_enabled: bool,
 ) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth);
     let deferred_regime = defer_active(sources, defer_threshold);
@@ -185,6 +187,14 @@ pub fn all_tool_defs(
             &inline_sources,
             &deferred,
         ));
+        // Session worktree tools (plan 35 slice 2): only when the front-end
+        // enables worktree mode (CLI/TUI/plain — not server threads or --mock),
+        // and only top-level (a sub-agent isolates via task {isolation}). Kept
+        // out of run_program's TS API and the deferral count on purpose.
+        if worktree_enabled {
+            defs.push(worktree_tool::enter_worktree_def());
+            defs.push(worktree_tool::exit_worktree_def());
+        }
     }
     defs
 }
@@ -593,9 +603,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             }
         }
         let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &ctx);
+        // effective_*: gate on the active worktree's re-anchored permissions
+        // when the session entered one (plan 35 slice 2), else the base gate.
         if let Err(reason) = ctx
             .cfg
-            .permissions
+            .effective_permissions()
             .check_call(&name, &input, ctx.depth, sandbox_auto_allow)
             .await
         {
@@ -681,15 +693,18 @@ fn execute_tool<'a>(
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
             "write_file" => fs::write_file_tool(input, ctx).await,
             "edit_file" => fs::edit_file_tool(input, ctx).await,
-            "grep" => search::grep_tool(input, &ctx.cfg.cwd, ctx.cfg.permissions.clone()).await,
+            "grep" => {
+                search::grep_tool(input, &ctx.cfg.effective_cwd(), ctx.cfg.effective_permissions())
+                    .await
+            }
             // glob hands a program its path list as a string[] (built-ins are
             // otherwise strings); the model-facing text is unchanged.
             "glob" => {
                 search::glob_tool(
                     input,
-                    &ctx.cfg.cwd,
+                    &ctx.cfg.effective_cwd(),
                     ctx.program_result.as_ref(),
-                    ctx.cfg.permissions.clone(),
+                    ctx.cfg.effective_permissions(),
                 )
                 .await
             }
@@ -703,6 +718,8 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
+            "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
+            "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
             "wait" => background_tasks::wait_tool(input, ctx).await,
             "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
@@ -789,6 +806,8 @@ pub(crate) mod testutil {
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
+                active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                worktree_enabled: false,
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -823,6 +842,50 @@ pub(crate) mod testutil {
     pub(crate) fn with_sandbox(mut ctx: ToolCtx, policy: crate::sandbox::SandboxPolicy) -> ToolCtx {
         let mut cfg = (*ctx.cfg).clone();
         cfg.sandbox = Some(Arc::new(policy));
+        ctx.cfg = Arc::new(cfg);
+        ctx
+    }
+
+    /// A throwaway git repo with one commit; returns its canonical root (git
+    /// resolves symlinks, so tests compare against the canonical path). Shared
+    /// by the worktree tests (slice 1 sub-agent isolation, slice 2 enter/exit).
+    pub(crate) fn temp_git_repo(tag: &str) -> std::path::PathBuf {
+        // A process-global counter so two tests sharing a tag never collide on
+        // one directory (they run concurrently and would delete each other's).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("kloop-gitwt-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for a in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@e.com"],
+            &["config", "user.name", "t"],
+            &["commit", "--allow-empty", "-qm", "base"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(a)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::canonicalize(&root).unwrap()
+    }
+
+    /// Rebuild the ctx with cwd pointed at `repo` and worktree mode toggled —
+    /// for the session enter/exit tests (slice 2).
+    pub(crate) fn git_ctx(
+        mut ctx: ToolCtx,
+        repo: &std::path::Path,
+        worktree_enabled: bool,
+    ) -> ToolCtx {
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.cwd = repo.to_path_buf();
+        cfg.worktree_enabled = worktree_enabled;
         ctx.cfg = Arc::new(cfg);
         ctx
     }
@@ -924,7 +987,7 @@ mod tests {
     fn all_tool_defs_appends_sources_and_skips_collisions() {
         let sources: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let names: Vec<String> = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD)
+        let names: Vec<String> = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, false)
             .into_iter()
             .map(|d| d.name)
             .collect();
@@ -964,7 +1027,7 @@ mod tests {
             }],
             readonly: String::new(),
         })];
-        let defs = all_tool_defs(0, &builtin_clash, TOOL_DEFER_THRESHOLD);
+        let defs = all_tool_defs(0, &builtin_clash, TOOL_DEFER_THRESHOLD, false);
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
@@ -1013,14 +1076,14 @@ mod tests {
 
         // Exactly at the threshold (built-ins + the stub's 3 tools): everything
         // inline, no tool_search.
-        let inline = all_tool_defs(0, &sources, builtin_count + 3);
+        let inline = all_tool_defs(0, &sources, builtin_count + 3, false);
         assert!(inline.iter().any(|d| d.name == "srv__echo"));
         assert!(inline.iter().all(|d| d.name != "tool_search"));
         assert!(deferred_tool_defs(&sources, builtin_count + 3).is_empty());
 
         // One past it: built-ins + tool_search + call_tool only; sources
         // deferred.
-        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2);
+        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2, false);
         let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
@@ -1038,7 +1101,7 @@ mod tests {
     #[test]
     fn run_program_def_declares_inline_source_tools() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
-        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD);
+        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, false);
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("srv__echo(args:"),
@@ -1059,7 +1122,7 @@ mod tests {
     fn run_program_def_lists_deferred_source_tools_as_a_manifest() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
         // One source (2 tools) past the built-in count forces the defer regime.
-        let defs = all_tool_defs(0, &sources, tool_defs(0).len());
+        let defs = all_tool_defs(0, &sources, tool_defs(0).len(), false);
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("- tools.srv__echo:"),
@@ -1321,6 +1384,8 @@ mod tests {
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
+                active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                worktree_enabled: false,
             }),
             ui: Arc::new(NullUi),
             cancel,

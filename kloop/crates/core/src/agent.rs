@@ -170,7 +170,12 @@ async fn turn_rounds(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold);
+    let mut tools = all_tool_defs(
+        depth,
+        &cfg.tool_sources,
+        cfg.defer_threshold,
+        cfg.worktree_enabled,
+    );
     // The `skill` tool exists only at depth 0 (like `task`) and only when
     // skills are loaded. Skills are a top-level orchestration feature: a
     // sub-agent gets a focused task, not the whole skills catalog (which would

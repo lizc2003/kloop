@@ -652,32 +652,45 @@ agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
 
 ### Worktree isolation
 
-A `task` call can add `"isolation": "worktree"` to run its sub-agent in a
-private git worktree, so parallel sub-agents can edit the *same relative path*
-without racing on the shared tree (`crates/core/src/worktree.rs`, plan 35; the
-shape cc and codex converged on). Before spawning, `task` runs
-`git worktree add --no-track -B kloop/worktree/<agent-N> .kloop/worktrees/<agent-N> HEAD`
-and rewires the sub-agent's **cwd anchor** onto the tree — the single value
-(`Config.cwd`) that bash's working directory, relative file/search paths, the
-permission gate's acceptEdits check, and the OS sandbox's writable root all key
-off. The main agent's cwd is the process cwd, so nothing changes there; only a
-worktree sub-agent diverges. `offload_dir` and `sessions_dir` deliberately do
-**not** follow — offload/session files stay alongside the parent's in the main
-repo. The managed `.kloop/worktrees/` dir is added to `.git/info/exclude`.
+Two entry points put an agent into a private git worktree — a separate checkout
+on its own branch — so edits to the *same relative path* don't race on the
+shared tree (`crates/core/src/worktree.rs`, plan 35; the shape cc and codex
+converged on). Both create `git worktree add --no-track -B
+kloop/worktree/<name> .kloop-worktrees/<name> HEAD` (the managed dir is added to
+`.git/info/exclude`) and rewire the **cwd anchor** onto the tree.
 
-Lifecycle (no auto-merge, both references stop here): when the sub-agent ends,
-an **untouched** tree (clean working copy, no commits past HEAD) is torn down
-along with its branch; a **changed** tree is kept, and the sub-agent's
-tool_result names its branch + path so the parent — or you — can
-`git merge kloop/worktree/<agent-N>` or discard it. The change probe is
-**fail-closed**: if git can't be trusted, the tree is kept, never silently
-deleted. Creation is fail-closed too — a non-git cwd, a name collision, or a
-git error is an `is_error` result, never a silent fall back to the shared cwd.
-`--mock`/tests without a git repo simply don't request isolation.
+`Config.cwd` is that anchor: bash's working directory, relative file/search
+paths, the permission gate's acceptEdits check, and the OS sandbox's writable
+root all key off it (a fifth thing rewrites too — the system prompt's
+`Working directory:` line, or the model builds absolute paths from the old cwd
+and writes past the tree). The main agent's cwd is the process cwd, so nothing
+changes there; only a worktree agent diverges. `offload_dir` and `sessions_dir`
+deliberately do **not** follow — offload/session files stay in the main repo.
+Not under `.kloop/` (that's a protected sensitive path in both the permission
+gate and the sandbox); a sibling `.kloop-worktrees/` dodges both.
 
-Not yet (挂账): the `enter_worktree`/`exit_worktree` model tools and a
-session-level `--worktree` flag (slice 2), an `origin/HEAD` base ref for CI,
-and 30-day stale-tree pruning (`git worktree prune` by hand for now).
+- **Sub-agent isolation** (slice 1): a `task` call adds `"isolation":
+  "worktree"`, so parallel sub-agents each get a throwaway tree. Parallel `git
+  worktree add`/`remove` are serialized under a process lock (concurrent ones
+  race on the repo's ref locks and silently lose a tree).
+- **Session worktrees** (slice 2): the model calls `enter_worktree {name}` to
+  move the *whole session* into a tree (its cwd switches immediately via a
+  mutable slot the `Config.effective_*` accessors read) and `exit_worktree` to
+  leave; `kloop --worktree[=<name>]` enters one at startup. One tree per
+  session; a sub-agent spawned while in it inherits the tree as its base cwd.
+  These tools appear only in the CLI/TUI/plain session, not server threads.
+
+Lifecycle (no auto-merge, both references stop here): an **untouched** tree
+(clean, no commits past HEAD) is torn down with its branch; a **changed** tree
+is kept, and the result names its branch + path so you can `git merge
+kloop/worktree/<name>` (commit first if uncommitted) or discard it.
+`exit_worktree {discard_changes:true}` force-removes even a dirty tree. The
+change probe is **fail-closed** (git untrusted → tree kept). Creation is
+fail-closed too — a non-git cwd, a name collision, or a git error is an error,
+never a silent fall back to the shared cwd.
+
+Not yet (挂账): an `origin/HEAD` base ref for CI, 30-day stale-tree pruning
+(`git worktree prune` by hand for now), and server-mode session worktrees.
 
 ## OS sandbox (Phase 2, thirteenth slice)
 

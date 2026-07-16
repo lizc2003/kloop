@@ -85,11 +85,13 @@ fn shell_command(
 /// per-call escape hatch (cc's dangerouslyDisableSandbox shape). The call
 /// still went through the permission gate like any other — escaping changes
 /// the execution wrapper, never the asking.
-fn call_sandbox<'a>(input: &Value, ctx: &'a ToolCtx) -> Option<&'a SandboxPolicy> {
+fn call_sandbox(input: &Value, ctx: &ToolCtx) -> Option<Arc<SandboxPolicy>> {
     if input["disable_sandbox"].as_bool().unwrap_or(false) {
         None
     } else {
-        ctx.cfg.sandbox.as_deref()
+        // effective_*: the active worktree's policy when the session entered
+        // one (plan 35 slice 2), else the base policy.
+        ctx.cfg.effective_sandbox()
     }
 }
 
@@ -104,23 +106,25 @@ pub(super) fn sandbox_auto_allowed(name: &str, input: &Value, ctx: &ToolCtx) -> 
 pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let command = str_arg(input, "command", "bash")?;
     let sandbox = call_sandbox(input, ctx);
+    // effective cwd: the active worktree's when the session entered one.
+    let cwd = ctx.cfg.effective_cwd();
     if input["run_in_background"].as_bool().unwrap_or(false) {
         // No timeout in background mode (cc clears the timer too); the
         // watchdog and kill_bash are the safety net.
         return ctx.cfg.background_shells.spawn_background(
             command,
-            &ctx.cfg.cwd,
+            &cwd,
             &ctx.cfg.offload_dir,
-            sandbox,
+            sandbox.as_deref(),
         );
     }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = run_foreground(command, &ctx.cfg.cwd, sandbox, timeout_ms).await?;
+    let output = run_foreground(command, &cwd, sandbox.as_deref(), timeout_ms).await?;
     let mut text = format_output(&output);
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
     // disable_sandbox / no policy leaves `sandbox` None and skips it.
-    if let Some(policy) = sandbox {
+    if let Some(policy) = &sandbox {
         if !output.status.success()
             && sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
         {
@@ -130,12 +134,12 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
                 // one fewer model round-trip than the disable_sandbox hint.
                 match ctx
                     .cfg
-                    .permissions
+                    .effective_permissions()
                     .escalate_sandbox(command, ctx.depth)
                     .await
                 {
                     EscalationOutcome::Approved => {
-                        let raw = run_foreground(command, &ctx.cfg.cwd, None, timeout_ms).await?;
+                        let raw = run_foreground(command, &cwd, None, timeout_ms).await?;
                         return Ok(format!(
                             "{}{}",
                             sandbox::ESCALATED_PREFIX,

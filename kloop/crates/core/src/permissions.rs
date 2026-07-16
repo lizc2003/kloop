@@ -607,6 +607,12 @@ impl CallFacts {
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
+            // enter/exit_worktree only manage the session's isolated worktree
+            // (create a tree under .kloop-worktrees/, or tear one down keeping
+            // dirty changes on its branch) — non-destructive workspace control,
+            // auto-allowed like task; the work done INSIDE the tree is gated
+            // per call as usual.
+            "enter_worktree" | "exit_worktree" => true,
             // wait only blocks; stop_agent only signals a sub-agent this agent
             // itself spawned — neither touches anything the sub-agent's own
             // calls weren't already gated on (same reasoning as kill_bash).

@@ -319,6 +319,8 @@ mod tests {
             inbox: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
+            active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            worktree_enabled: false,
         }
     }
 

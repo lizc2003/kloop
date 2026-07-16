@@ -16,12 +16,17 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::permissions::Permissions;
+use crate::sandbox::SandboxPolicy;
 
 /// Repo-relative directory holding managed worktrees, one subdir per sub-agent.
 /// Deliberately NOT under `.kloop/`: `.kloop` is a protected sensitive path in
@@ -115,21 +120,140 @@ pub async fn create(cwd: &Path, name: &str) -> Result<Worktree> {
 pub async fn finish(wt: Worktree) -> Option<String> {
     if has_changes(&wt).await {
         return Some(format!(
-            "\n\n[This sub-agent left changes in its worktree {path} (branch {branch}); they were \
-             NOT merged. Inspect them there — commit and `git merge {branch}` to bring them in, or \
+            "\n\n[Changes were left in the worktree {path} (branch {branch}); they were NOT \
+             merged. Inspect them there — commit and `git merge {branch}` to bring them in, or \
              `git worktree remove {path}` to discard.]",
             branch = wt.branch,
             path = wt.path.display(),
         ));
     }
-    // Untouched: remove the tree and its branch. --force covers a tree git
-    // still considers "in use"; branch -D since it was never merged. Under the
-    // lock — a remove racing a sibling's `worktree add` corrupts the registry.
-    let path_str = wt.path.to_string_lossy().to_string();
-    let _guard = WORKTREE_LOCK.lock().await;
-    let _ = git(&wt.repo_root, &["worktree", "remove", "--force", &path_str]).await;
-    let _ = git(&wt.repo_root, &["branch", "-D", &wt.branch]).await;
+    // Untouched: remove the tree and its branch.
+    wt.remove().await;
     None
+}
+
+impl Worktree {
+    /// Delete the tree and its (never-merged) branch. `--force` covers a tree
+    /// git still considers "in use"; under the lock so a remove racing a
+    /// sibling's `worktree add` can't corrupt the registry.
+    async fn remove(&self) {
+        let path_str = self.path.to_string_lossy().to_string();
+        let _guard = WORKTREE_LOCK.lock().await;
+        let _ = git(
+            &self.repo_root,
+            &["worktree", "remove", "--force", &path_str],
+        )
+        .await;
+        let _ = git(&self.repo_root, &["branch", "-D", &self.branch]).await;
+    }
+}
+
+/// The cwd-anchored overrides a worktree imposes, computed from a base (the
+/// agent's current effective state) — shared by the `task` sub-agent rewire
+/// (slice 1) and the session-level [`enter`] (slice 2). Rewriting the system
+/// prompt's working-directory line is what stops the model building absolute
+/// paths from the OLD cwd and writing past the tree. Returns everything but the
+/// cwd itself (which is just `wt_path`).
+pub(crate) fn compute_overrides(
+    base_cwd: &Path,
+    base_permissions: &Arc<Permissions>,
+    base_sandbox: &Option<Arc<SandboxPolicy>>,
+    base_system: &str,
+    wt_path: &Path,
+) -> (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String) {
+    let old = format!("- Working directory: {}", base_cwd.display());
+    let new = format!("- Working directory: {}", wt_path.display());
+    let system = base_system.replacen(&old, &new, 1);
+    let permissions = Arc::new(base_permissions.rebased(wt_path.to_path_buf()));
+    let sandbox = base_sandbox
+        .as_ref()
+        .map(|sb| Arc::new(sb.with_writable_root(wt_path)));
+    (permissions, sandbox, system)
+}
+
+/// A worktree the *session itself* has entered (slice 2: `enter_worktree` /
+/// `--worktree`), as opposed to a `task` sub-agent's throwaway tree. Held in a
+/// mutable slot on [`Config`] so `enter`/`exit` switch the session's cwd at
+/// runtime; the `effective_*` accessors read it. One per session at a time.
+pub struct ActiveWorktree {
+    wt: Worktree,
+    pub cwd: PathBuf,
+    pub permissions: Arc<Permissions>,
+    pub sandbox: Option<Arc<SandboxPolicy>>,
+    pub system: String,
+    /// Where the session was before entering — reported back on exit.
+    pub original_cwd: PathBuf,
+}
+
+/// Enter a fresh worktree named `name` for the whole session (mutates the
+/// active-worktree slot so the switch takes effect immediately). Errors if
+/// already inside one (one tree per session, codex's rule) or if creation
+/// fails (fail-closed). Returns the model-facing confirmation.
+pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
+    if cfg.active_worktree.read().unwrap().is_some() {
+        bail!("already inside a worktree; call exit_worktree before entering another");
+    }
+    // The slot is empty, so effective cwd == cfg.cwd (the main checkout).
+    let base_cwd = cfg.cwd.clone();
+    let wt = create(&base_cwd, name).await?;
+    let (permissions, sandbox, system) = compute_overrides(
+        &base_cwd,
+        &cfg.permissions,
+        &cfg.sandbox,
+        &cfg.system,
+        &wt.path,
+    );
+    let msg = format!(
+        "Entered worktree {path} on branch {branch}. Your working directory is now this tree; \
+         edits here are isolated from the main checkout until you exit_worktree.",
+        path = wt.path.display(),
+        branch = wt.branch,
+    );
+    *cfg.active_worktree.write().unwrap() = Some(ActiveWorktree {
+        cwd: wt.path.clone(),
+        permissions,
+        sandbox,
+        system,
+        original_cwd: base_cwd,
+        wt,
+    });
+    Ok(msg)
+}
+
+/// Exit the session's active worktree. Without `discard` it follows the slice-1
+/// lifecycle (changes kept on the branch, a clean tree removed); `discard`
+/// force-removes even a dirty tree. A friendly no-op when not in one.
+pub async fn exit(cfg: &Config, discard: bool) -> Result<String> {
+    // Take out of the slot BEFORE any await — never hold the lock across one.
+    let active = cfg.active_worktree.write().unwrap().take();
+    let Some(active) = active else {
+        return Ok("Not currently in a worktree.".to_string());
+    };
+    let back = active.original_cwd.display().to_string();
+    if discard {
+        let branch = active.wt.branch.clone();
+        active.wt.remove().await;
+        return Ok(format!(
+            "Exited and discarded the worktree (branch {branch} deleted). Back in {back}."
+        ));
+    }
+    match finish(active.wt).await {
+        Some(note) => Ok(format!("Exited worktree. Back in {back}.{note}")),
+        None => Ok(format!(
+            "Exited worktree (no changes; tree removed). Back in {back}."
+        )),
+    }
+}
+
+/// Tear down the session's active worktree at shutdown (dirty kept, clean
+/// removed), if any. Returns a note when a tree was kept, for the caller to
+/// surface. Safe to call when not in a worktree.
+pub async fn finish_active(cfg: &Config) -> Option<String> {
+    let active = cfg.active_worktree.write().unwrap().take();
+    match active {
+        Some(a) => finish(a.wt).await,
+        None => None,
+    }
 }
 
 /// Whether the sub-agent left anything worth keeping: an uncommitted change in

@@ -74,6 +74,11 @@ pub(crate) struct CliArgs {
     /// `--image <path>` (repeatable): local image files attached to the first
     /// user turn. Read + validated after parsing; remote URLs are refused.
     pub(crate) images: Vec<PathBuf>,
+    /// `--worktree[=<name>]` (plan 35 slice 2): start the session inside an
+    /// isolated git worktree named `<name>` (default `session`). `Some(name)`
+    /// when requested, `None` otherwise. The `=` form avoids swallowing a
+    /// headless positional prompt.
+    pub(crate) worktree: Option<String>,
     pub(crate) session: SessionChoice,
 }
 
@@ -90,6 +95,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         max_rounds: None,
         prompt: None,
         images: Vec::new(),
+        worktree: None,
         session: SessionChoice::New,
     };
     let mut i = 0;
@@ -115,6 +121,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
+            "--worktree" => parsed.worktree = Some("session".into()),
+            w if w.starts_with("--worktree=") => {
+                let name = w.trim_start_matches("--worktree=");
+                parsed.worktree = Some(if name.is_empty() { "session" } else { name }.to_string());
+            }
             "-p" | "--headless" => parsed.headless = true,
             "--json" => parsed.json = true,
             "--max-rounds" => {
@@ -237,6 +248,9 @@ pub(crate) fn help_text() -> &'static str {
      \n\
      INPUT:\n\
      \x20       --image <path>    attach a local image (repeatable)\n\
+     \n\
+     WORKTREE:\n\
+     \x20       --worktree[=<name>]  run the session in an isolated git worktree\n\
      \n\
      OTHER:\n\
      \x20   -h, --help            show this help and exit\n\
@@ -388,6 +402,7 @@ mod tests {
             max_rounds: None,
             prompt: None,
             images: vec![],
+            worktree: None,
             session: SessionChoice::New,
         }
     }

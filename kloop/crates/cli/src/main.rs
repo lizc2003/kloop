@@ -88,6 +88,11 @@ async fn main() -> Result<ExitCode> {
         list_sessions(&sessions_dir);
         return Ok(ExitCode::SUCCESS);
     }
+    // Worktree mode is the single-session feature (plan 35 slice 2): --serve has
+    // per-thread configs and no client cwd-switch protocol, --mock has no git.
+    if args.worktree.is_some() && (args.serve || args.mock) {
+        anyhow::bail!("--worktree is not supported with --serve or --mock");
+    }
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
     // --mock stays hermetic: no child processes, no config reads.
@@ -216,10 +221,19 @@ async fn main() -> Result<ExitCode> {
         if let Some(max_rounds) = args.max_rounds {
             cfg.max_rounds = max_rounds;
         }
+        let cfg = Arc::new(cfg);
+        // `--worktree`: run this headless turn inside an isolated tree (plan 35
+        // slice 2). Fail-closed — abort if it can't be created.
+        if let Some(name) = &args.worktree {
+            if let Err(e) = kloop_core::worktree::enter(&cfg, name).await {
+                eprintln!("worktree: {e:#}");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c(cancel.clone());
         let code = headless::run_headless(
-            Arc::new(cfg),
+            cfg.clone(),
             history,
             session_id,
             prompt,
@@ -230,6 +244,10 @@ async fn main() -> Result<ExitCode> {
         )
         .await;
         watcher.abort();
+        // Tear down the worktree (dirty kept on its branch, clean removed).
+        if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+            eprintln!("{}", note.trim());
+        }
         return Ok(ExitCode::from(code as u8));
     }
 
@@ -251,6 +269,7 @@ async fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let factory_session_id = session_id.clone();
+    let worktree = args.worktree.clone();
     kloop_tui::run(
         move |approver, notify| {
             let mut cfg = config_from_env(
@@ -269,6 +288,7 @@ async fn main() -> Result<ExitCode> {
         history,
         session_id,
         pending_images,
+        worktree,
     )
     .await?;
     Ok(ExitCode::SUCCESS)
@@ -341,6 +361,15 @@ async fn plain_main(
         return Ok(());
     }
 
+    // `--worktree`: enter an isolated tree for the session (plan 35 slice 2).
+    // Fail-closed like the TUI path — abort if the tree can't be created.
+    if let Some(name) = &args.worktree {
+        match kloop_core::worktree::enter(&cfg, name).await {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => return Err(e),
+        }
+    }
+
     println!(
         "kloop — session {session_id}; type a task, /help for commands, \
          'exit' or Ctrl+D to quit, Ctrl+C to interrupt a running turn"
@@ -399,6 +428,11 @@ async fn plain_main(
             }
             EndReason::Error(e) => println!("[error: {e}]"),
         }
+    }
+    // Tear down the session worktree on exit (dirty kept on its branch, clean
+    // removed); the kept-tree note tells the user where its changes live.
+    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+        println!("{}", note.trim());
     }
     Ok(())
 }

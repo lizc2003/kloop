@@ -89,6 +89,7 @@ pub async fn run(
     history: History,
     session_id: String,
     pending_images: Vec<ContentBlock>,
+    worktree: Option<String>,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let channel_ui = Arc::new(ChannelUi::new(event_tx.clone()));
@@ -97,6 +98,19 @@ pub async fn run(
         channel_ui.clone(),
         Arc::new(move |s: &str| note_ui.note(s)),
     )?);
+    // `--worktree`: enter an isolated tree for the whole session before any
+    // turn runs (plan 35 slice 2). Fail-closed — the user asked for isolation,
+    // so a creation error aborts rather than silently working in the main tree.
+    // The note buffers in the event channel and shows once the UI loop starts.
+    if let Some(name) = &worktree {
+        match kloop_core::worktree::enter(&cfg, name).await {
+            Ok(msg) => channel_ui.note(&msg),
+            Err(e) => return Err(e),
+        }
+    }
+    // A shared handle to tear the worktree down after the session (the worker
+    // moves `cfg`, but both point at the same active-worktree slot).
+    let cfg_shutdown = cfg.clone();
     // Shared with the worker's Config: the UI loop enqueues steering here while
     // a turn runs, the agent loop drains it at round boundaries (plan 22).
     let inbox = cfg.inbox.clone();
@@ -129,6 +143,11 @@ pub async fn run(
     // The worker holds the session rollout; aborting mid-write is equivalent
     // to a killed session, which resume already repairs.
     worker.abort();
+    // Tear down the session worktree (dirty kept on its branch, clean removed);
+    // the terminal is restored, so the kept-tree note prints to stderr.
+    if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
+        eprintln!("{}", note.trim());
+    }
     result
 }
 

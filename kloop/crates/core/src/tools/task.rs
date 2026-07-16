@@ -111,14 +111,17 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 /// re-discovering them (plus a fresh worktree git snapshot) needs the CLI's IO
 /// and is left for a later slice.
 fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) {
-    let old = format!("- Working directory: {}", sub.cwd.display());
-    let new = format!("- Working directory: {}", wt.path.display());
-    sub.system = sub.system.replacen(&old, &new, 1);
+    let (permissions, sandbox, system) = worktree::compute_overrides(
+        &sub.cwd,
+        &sub.permissions,
+        &sub.sandbox,
+        &sub.system,
+        &wt.path,
+    );
     sub.cwd = wt.path.clone();
-    sub.permissions = Arc::new(sub.permissions.rebased(wt.path.clone()));
-    if let Some(sb) = &sub.sandbox {
-        sub.sandbox = Some(Arc::new(sb.with_writable_root(&wt.path)));
-    }
+    sub.permissions = permissions;
+    sub.sandbox = sandbox;
+    sub.system = system;
 }
 
 /// Process-global monotonic agent label, so parallel spawners never collide.
@@ -382,6 +385,17 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: usize, agent: String) -> Config
         agent_label: agent,
         todos: Arc::new(std::sync::Mutex::new(Vec::new())),
         inbox: Arc::new(Inbox::default()),
+        // Freeze the parent's CURRENT effective state (it may be inside an
+        // entered worktree, plan 35 slice 2) as this sub-agent's base, and give
+        // it a FRESH empty worktree slot — a sub-agent can't enter/exit, and
+        // must not alias the parent's active-worktree Arc (the clone otherwise
+        // would). A `task {isolation:worktree}` sub-agent then rewires this base
+        // onto its own tree.
+        cwd: ctx.cfg.effective_cwd(),
+        permissions: ctx.cfg.effective_permissions(),
+        sandbox: ctx.cfg.effective_sandbox(),
+        system: ctx.cfg.effective_system(),
+        active_worktree: Arc::new(std::sync::RwLock::new(None)),
         ..(*ctx.cfg).clone()
     }
 }
@@ -439,36 +453,11 @@ mod tests {
         assert!(out.contains("cannot spawn"));
     }
 
-    /// A throwaway git repo with one commit; returns its canonical root (git
-    /// resolves symlinks, so tests must compare against the canonical path).
-    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("kloop-task-wt-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "t@example.com"],
-            &["config", "user.name", "t"],
-            &["commit", "--allow-empty", "-qm", "base"],
-        ] {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(args)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed");
-        }
-        std::fs::canonicalize(&root).unwrap()
-    }
-
-    /// Point a ctx's cwd at `repo` so an isolated sub-agent branches from it.
-    fn ctx_in(mut ctx: ToolCtx, repo: &std::path::Path) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
-        cfg.cwd = repo.to_path_buf();
-        ctx.cfg = Arc::new(cfg);
-        ctx
+    /// Point a ctx's cwd at `repo` so an isolated sub-agent branches from it
+    /// (worktree mode off — sub-agent isolation doesn't use the enter/exit
+    /// tools). `temp_git_repo` comes from testutil, shared with slice 2.
+    fn ctx_in(ctx: ToolCtx, repo: &std::path::Path) -> ToolCtx {
+        git_ctx(ctx, repo, false)
     }
 
     /// A worktree sub-agent's relative write lands in its OWN tree, never the

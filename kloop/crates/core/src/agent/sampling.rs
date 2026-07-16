@@ -110,7 +110,10 @@ async fn sample_once(
     cancel: &CancellationToken,
     stream_text: bool,
 ) -> Result<SampleOk, SampleError> {
-    let mut rx = cfg.provider.stream(model, &cfg.system, messages, tools);
+    // effective_system: working-directory line rewritten to the active
+    // worktree when the session entered one (plan 35 slice 2).
+    let system = cfg.effective_system();
+    let mut rx = cfg.provider.stream(model, &system, messages, tools);
     let mut blocks = Vec::new();
     loop {
         tokio::select! {

@@ -119,3 +119,41 @@ cwd 故行为逐字节不变,只有 worktree 子 agent 分叉。这是 plan 预�
 
 **挂账不变**:enter/exit 模型工具 + `--worktree` 会话级(切片 2);origin/HEAD base;30 天
 陈旧清理;指令文件/git 快照按 worktree 重新组装(需 CLI IO);cc 的 setup 拷贝;跨仓库。
+
+## ✅ 切片 2 完成记录(2026-07-16,提交 <待回填>)
+
+会话级 enter/exit + `--worktree` CLI,真 key 双轨验收已过。范围(开工问用户定):CLI
+`--worktree` + TUI/plain 的 enter/exit,**server 挂账**(每 thread 独立 config、审批不跨
+thread、客户端要感知 cwd 切换,需单独设计)。
+
+**核心:运行时可变 cwd(对切片 1"Config 不可变字段"的扩展)**。切片 1 子 agent 的 cwd 是
+spawn 前定死的字段;会话级 enter/exit 要**中途立即切换**(对齐 cc `setCwd`/codex
+`EnvironmentSwitcher`,一 thread 一棵)。落点:
+- `Config.active_worktree: Arc<RwLock<Option<ActiveWorktree>>>`(可变槽)+ `worktree_enabled`
+  开关;`effective_cwd/permissions/sandbox/system()` 收口——槽有则用 worktree 的,否则回
+  退字段。工具 IO(bash/fs/search/dispatch 权限/sampling system)全改读 effective_*,故
+  enter 立即生效。**主 agent 无槽时 effective==字段,存量逐字节不变**。
+- `worktree::compute_overrides`(切片 1 的 rewire 4 样抽出)+ `enter/exit/finish_active`
+  操作槽;`Worktree::remove` 抽出供 finish/discard 复用。
+- `enter_worktree {name}`/`exit_worktree {discard_changes?}` 工具(`tools/worktree_tool.rs`,
+  depth-0 + `worktree_enabled` 才注册 + 才允许调;name 消毒 `[A-Za-z0-9._-]` 无 `..`;一次
+  一棵已入报错;进 is_readonly 自动放行,不进 is_concurrency_safe 保串行)。exit 无参=脏留
+  净删(切片 1 铁律),`discard_changes` 强删。
+- `--worktree[=<name>]`(缺省名 `session`,`=` 绑定避开 headless 位置 prompt);启动 enter、
+  会话结束 finish_active(脏留 note 打 stderr);**三前端都挂**(tui::run/plain_main/headless
+  各一处 enter+finish);与 `--serve`/`--mock` 互斥报错。
+- 子 agent 继承:`clone_for_subagent` 用 `effective_*` 定格主 agent 当前有效状态为子 base,
+  并给子**全新空槽**(子 agent 不能 enter/exit,不能 alias 父槽 Arc)。
+
+**踩坑**:① headless 是**第三条会话路径**(tui/plain 之外),初版只在 tui/plain 挂 enter/
+finish,`--worktree -p` 写穿主仓——真 key 抓到,补 headless 分支(教训:会话级副作用要挂
+**所有**前端路径)。② `finish` 的 note 切片 1 写死 "This sub-agent left changes",会话复用后
+措辞不符,改中性 "Changes were left in the worktree"。
+
+真 key 验收(headless `-p`,bypass):Anthropic(sonnet-4-6)`--worktree=feat` 启动进树、模型
+相对写 out.txt 落 worktree/主仓无、结束脏留 note;模型自调 `enter_worktree→write_file→
+exit_worktree` 三步,probe.txt 落 worktree、分支 exp 保留。OpenAI(gpt-5.4-mini)`--worktree`
+CLI 同样落树无泄漏。
+
+**切片 2 挂账**:server 会话 worktree;origin/HEAD base;30 天陈旧清理;指令文件/git 快照按
+worktree 重组;cc setup 拷贝;跨仓库。

@@ -109,8 +109,12 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     let mut found: Vec<ToolDef> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     if let Some(rest) = query.strip_prefix("select:") {
-        let loaded =
-            super::all_tool_defs(ctx.depth, &ctx.cfg.tool_sources, ctx.cfg.defer_threshold);
+        let loaded = super::all_tool_defs(
+            ctx.depth,
+            &ctx.cfg.tool_sources,
+            ctx.cfg.defer_threshold,
+            ctx.cfg.worktree_enabled,
+        );
         for name in rest.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             if let Some(def) = deferred.iter().find(|d| d.name == name) {
                 found.push(def.clone());
