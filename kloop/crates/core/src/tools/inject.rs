@@ -6,10 +6,13 @@
 //! before the turn — so the model sees fresh command output and file contents,
 //! not the raw markers.
 //!
-//! Only the user-initiated slash path uses this ([`expand_slash_injections`],
-//! called from `commands::run`); a model-activated skill (the `skill` tool) does
-//! not expand injections — running bash because the model picked a skill is a
-//! different risk profile, left to a later slice.
+//! Both trigger paths expand injections, on the same body: the user-initiated
+//! slash path ([`expand_slash_injections`], from `commands::run`, which builds a
+//! minimal top-level context) and a model-activated skill ([`expand`], from the
+//! `skill` tool, which already holds a real [`ToolCtx`]). A `!cmd` faces the
+//! bash gate either way, so "the model picked a skill that runs bash" is gated
+//! exactly like the model calling bash itself. kloop has no remote/MCP skills,
+//! so cc's "never execute an MCP skill's `!cmd`" carve-out has no analogue here.
 //!
 //! Both gates are the security boundary and are never bypassed here: `!cmd` runs
 //! through the same `check_call("bash", …)` a real bash tool call faces (deny /
@@ -82,8 +85,13 @@ impl Ui for SilentUi {
 
 /// Run `!cmd` (inline output in place) then append `@file` contents. `@file`
 /// mentions are scanned on the original `body`, not the bash-expanded result, so
-/// command output can never drive a file read.
-async fn expand(body: &str, ctx: &ToolCtx) -> Result<String> {
+/// command output can never drive a file read. Called directly by the `skill`
+/// tool (which holds a real [`ToolCtx`]); the slash path reaches it through
+/// [`expand_slash_injections`]. A body with no markers returns unchanged.
+pub(super) async fn expand(body: &str, ctx: &ToolCtx) -> Result<String> {
+    if !has_injections(body) {
+        return Ok(body.to_string());
+    }
     let with_bash = run_embedded_bash(body, ctx).await?;
     let attachments = collect_file_attachments(body, ctx);
     Ok(format!("{with_bash}{attachments}"))

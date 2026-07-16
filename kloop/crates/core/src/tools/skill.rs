@@ -57,6 +57,11 @@ pub(super) async fn skill_tool(input: &Value, ctx: &ToolCtx) -> anyhow::Result<S
         .filter(|s| s.source == SkillSource::Skill);
     let skill = Skill::lookup(candidates, name).map_err(|e| anyhow::anyhow!(e))?;
     let body = expand_body(&skill.body, &skill.dir, args);
+    // Then run any `!cmd` / `@file` injections (plan 36 slice 3), gated exactly
+    // like a bash/read call. A `fork` skill expands before forking, so its
+    // sub-agent sees the resolved output; a blocked/failed `!cmd` propagates as
+    // an is_error tool_result. This is the same expansion the slash path runs.
+    let body = super::inject::expand(&body, ctx).await?;
     match skill.context {
         SkillContext::Inline => Ok(body),
         SkillContext::Fork => fork_skill(ctx, skill, body).await,
@@ -117,6 +122,59 @@ mod tests {
         let (out, is_error) = run_tool("skill", json!({"name": "research"}), &ctx).await;
         assert!(!is_error);
         assert_eq!(out, "forked result", "the sub-agent's result, not the body");
+    }
+
+    /// A skill activated by the model expands its `` !`cmd` `` injection through
+    /// the (here allow-all) gate, inlining the output — the same expansion the
+    /// slash path runs, so both trigger paths behave alike (plan 36 slice 3).
+    #[tokio::test]
+    async fn skill_tool_expands_embedded_bash_injection() {
+        let skills = vec![Skill {
+            name: "status".into(),
+            description: "d".into(),
+            body: "Marker: !`echo INJECTED`.".into(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(0, "skill-inject"), skills);
+        let (out, is_error) = run_tool("skill", json!({"name": "status"}), &ctx).await;
+        assert!(!is_error);
+        assert_eq!(out, "Marker: INJECTED.");
+    }
+
+    /// A `!cmd` the permission gate denies makes activation fail: the skill tool
+    /// returns an is_error result, not the half-expanded body.
+    #[tokio::test]
+    async fn skill_tool_denied_injection_errors() {
+        let skills = vec![Skill {
+            name: "danger".into(),
+            description: "d".into(),
+            body: "cleanup !`rm nope`".into(),
+            ..Default::default()
+        }];
+        let mut ctx = test_ctx(0, "skill-inject-deny");
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.permissions = std::sync::Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Default,
+                &crate::permissions::PermissionRules {
+                    allow: Vec::new(),
+                    deny: vec!["bash(rm *)".into()],
+                    ask: Vec::new(),
+                },
+                std::env::current_dir().unwrap(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        cfg.skills = std::sync::Arc::new(skills);
+        ctx.cfg = std::sync::Arc::new(cfg);
+        let (out, is_error) = run_tool("skill", json!({"name": "danger"}), &ctx).await;
+        assert!(is_error);
+        assert!(
+            out.contains("blocked by a deny permission rule"),
+            "got: {out}"
+        );
     }
 
     /// An unknown skill name comes back as an is_error result that lists what is

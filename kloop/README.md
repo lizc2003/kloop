@@ -1153,14 +1153,17 @@ raw markers (`core/src/tools/inject.rs`):
   existing file is left alone (so `@someone` prose is untouched). Contents are
   truncated to 100 KB.
 
-Only the user-initiated `/name` path expands injections; a model-activated skill
-(the `skill` tool) does not — running bash because the model picked a skill is a
-different risk profile.
+Both trigger paths expand injections on the same body: the user's `/name` and a
+model-activated skill (the `skill` tool). Because a `!cmd` always faces the bash
+gate, "the model picked a skill that runs a command" is gated exactly like the
+model calling bash directly — a `fork` skill expands before forking, so its
+sub-agent sees the resolved output. (kloop has no remote/MCP skills, so cc's
+"never run an MCP skill's `!cmd`" carve-out has no analogue.)
 
-**Not done** (deferred): injections for model-activated skills; `allowed-tools`
-frontmatter pre-authorizing a command's own `!cmd`; `@file#Lstart-end` line
-ranges and `@~/…` home expansion; subdirectory `namespace:command`; commands
-entering the model catalog. See `docs/plan/36-custom-commands.md`.
+**Not done** (deferred): `allowed-tools` frontmatter pre-authorizing a command's
+own `!cmd`; `@file#Lstart-end` line ranges and `@~/…` home expansion;
+subdirectory `namespace:command`; commands entering the model catalog. See
+`docs/plan/36-custom-commands.md`.
 
 ## Image input (Phase 2, twentieth slice)
 

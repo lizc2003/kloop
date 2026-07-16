@@ -1,9 +1,10 @@
 # Plan 36 — 用户自定义 slash 命令(plan 23 挂账领编号)✅
 
-> ✅ **两片全完成**。首片(纯发现根,提交 56f3e51):`.kloop/commands/*.md` 单文件作
+> ✅ **三片全完成**。首片(纯发现根,提交 56f3e51):`.kloop/commands/*.md` 单文件作
 > `SkillSource::Command` 进同一 skill 注册表,复用 skills 全部展开/触发/slash 机制。
 > 二片(`!cmd`/`@file` 注入,提交 93570b1):`/name` 展开时执行内嵌 bash(走 bash 权限
-> 门)+ `@file` 读文件附进 prompt(走 `read_path_blocked`)。决定与记录见文末。
+> 门)+ `@file` 读文件附进 prompt(走 `read_path_blocked`)。三片(注入统一到 `skill`
+> 工具路径,提交号待回填):模型激活的 skill 也展开注入,两条触发路径行为一致。决定与记录见文末。
 
 > 一句话定位:plan 23 挂账的"用户自定义 `.kloop/commands/*.md` 带参模板"正式领编号。
 > 但生态位已变:plan 28 的 skills 已覆盖"用户自定义带参 prompt 包"(`/name` 触发 +
@@ -159,10 +160,26 @@ world.`(参数替换先行)、`@notes.txt` 附文件内容(allow_all + 临时 cw
 象(rollout 里标记原样、无文件内容)——`target/debug/kloop` 是陈旧二进制,`cargo test`/
 `build -p kloop-core`/`clippy` 都不产它;`cargo build -p kloop` 重建后即闭环。
 
+## 完成记录(三片:注入统一到 `skill` 工具路径,提交号待回填)
+
+二片只在 `/name` 用户路径展开注入,模型经 `skill` 工具激活的 skill 不展开——行为不一致,
+也把 plan 28 的 `` !`cmd` `` 挂账悬着。三片补齐:`skill` 工具在 `expand_body` 后调
+`inject::expand(&body, ctx)`(`skill` 工具本就持真 `ToolCtx`,不用 slash 路径的最小 ctx),
+inline 返回展开后正文、**fork 在展开后再 fork**(子 agent 看到解析后的输出)、deny/失败的
+`!cmd` 上浮成 is_error tool_result。**风险复核**:模型激活 skill 触发 bash 与模型直接调
+bash 工具走同一权限门,无新风险面(二片挂它是切片纪律,机制验过即补);kloop 无远程/MCP
+skill,cc 的"MCP skill 永不执行 `!cmd`"约束无对应物。落法极轻(inject::expand 改
+`pub(super)` + `skill_tool` 加一行调用);`inject::expand` 自带 `has_injections` fast-path,
+无标记的 skill 逐字节不变。**测试(+2)**:skill.rs — 模型激活的 skill 的 `!`echo INJECTED``
+经门内联、deny 规则挡 `!`rm nope`` → is_error。**真 key 验收(anthropic 轨,`--headless
+--permission-mode bypass`)**:`.kloop/skills/livecheck/SKILL.md`(catalog 可见,body 含
+`!`echo SKILL-MARKER-99``)→ "Use the livecheck skill …" → 模型自发调 `skill` 工具、激活时
+执行 bash、答 `SKILL-MARKER-99`;rollout 证原始 `echo` 标记消失、展开后正文进 tool_result。
+
 ## 未做(挂账,滚进后续片/plan)
 
-- 注入用于**模型激活的 skill**(`skill` 工具路径,当前只 `/name` 用户路径注入);命令
-  `allowed-tools` frontmatter 预授权其自身 `!cmd`(cc 注进本 turn `alwaysAllowRules`)。
+- 命令 `allowed-tools` frontmatter 预授权其自身 `!cmd`(cc 注进本 turn
+  `alwaysAllowRules`;kloop 现每个 `!cmd` 都过门,命令作者不能免批准)。
 - `@file` 的 `#Lstart-end` 行范围、`@~/…` home 展开;`!cmd` 输出截断/超时精调(现抄 bash
   工具现值)。
 - 子目录命名空间 `namespace:command`;commands 进 catalog(`disable-model-invocation`
