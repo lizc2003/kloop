@@ -1,9 +1,9 @@
 # Plan 36 — 用户自定义 slash 命令(plan 23 挂账领编号)✅
 
-> ✅ 首片(纯发现根)完成(提交 56f3e51)。**方案 A**(commands 目录作 skills 第二发现
-> 根)落地:`.kloop/commands/*.md` 单文件作 `SkillSource::Command` 进同一 skill 注册
-> 表,复用 skills 全部展开/触发/slash 机制。决定见文末完成记录。`!cmd`/`@file` 注入按
-> 决定切到下一片(未做,见下)。
+> ✅ **两片全完成**。首片(纯发现根,提交 56f3e51):`.kloop/commands/*.md` 单文件作
+> `SkillSource::Command` 进同一 skill 注册表,复用 skills 全部展开/触发/slash 机制。
+> 二片(`!cmd`/`@file` 注入,提交号待回填):`/name` 展开时执行内嵌 bash(走 bash 权限
+> 门)+ `@file` 读文件附进 prompt(走 `read_path_blocked`)。决定与记录见文末。
 
 > 一句话定位:plan 23 挂账的"用户自定义 `.kloop/commands/*.md` 带参模板"正式领编号。
 > 但生态位已变:plan 28 的 skills 已覆盖"用户自定义带参 prompt 包"(`/name` 触发 +
@@ -120,11 +120,51 @@ description + `$0`)→ `/greet Ada` → 模型回 `kloop-cmd-ok greeting Ada`;
 `/plain hi there` → 模型回 `plain-ok hi there`。发现 + frontmatter 可省 + 首行描述 +
 `$0`/`$ARGUMENTS` 展开 + slash→turn 全闭环。(`--mock` 跳过发现,验不了,故用真 key。)
 
+## 完成记录(二片:`!cmd`/`@file` 注入,提交号待回填)
+
+**回源核对(2026-07-16)**:cc `~/work/claude-code`——`!cmd` 在
+`src/utils/promptShellExecution.ts`:`BLOCK_PATTERN=/```!\s*\n?([\s\S]*?)\n?```/g` +
+`INLINE_PATTERN=/(?<=^|\s)!`([^`]+)`/gm`(inline 要求 `!` 前是行首/空白),在命令
+`call()` 里**参数替换、`${CLAUDE_SKILL_DIR}` 替换之后**执行;先 `hasPermissionsToUseTool(
+BashTool)` 校验、非 allow 抛 `MalformedCommandError` 中止,再 `shellTool.call` 跑、输出
+`String.replace` 内联(函数 replacer 防 `$&` 破坏);命令 frontmatter `allowed-tools` 注进
+本 turn 权限上下文的 `alwaysAllowRules.command`;**MCP skill 永不执行**内嵌 bash。`@file`
+在 `processSlashCommand.tsx`:展开正文文本经 `getAttachmentMessages` 解析 @-mention,读文件
+内容附成**独立消息**(与普通 @-mention 同机制)。
+
+**落点(kloop,只在 `/name` 用户路径,`skill` 工具模型路径挂账)**:注入是有副作用的展开,
+不能进纯函数 `expand_body`,新 `core/src/tools/inject.rs`——手解析(core 无通用 regex,只
+grep-regex)两种 `!cmd` 形态 + `@file` mention,`expand_slash_injections(body,cfg,cancel)`
+建**最小 depth-0 ToolCtx**(SilentUi:注入无 UI 行,唯一交互是权限门经 approver)跑展开;
+`commands::run` 在 `expand_body` 后调它,`Ok`→turn / `Err`→`SlashResult::message`(不跑
+turn)。**`!cmd`**:`run_gated_bash` 走**与真 bash 调用同一** `check_call("bash",…)`(deny/
+安全/ask/approver + sandbox_auto)再 `bash::bash_tool`——命令作者写的也不豁免(教训 19b);
+deny/失败(spawn/timeout)抛错中止,非零退出照常内联输出(带 `[exit N]`,同 bash 工具);
+多个标记顺序执行(不并发,避免审批提示抢终端)。**`@file`**:`@path` 解析到 `effective_cwd`,
+是**现存文件**才注入(否则当 prose 留字面,`@someone` 天然不触发)、`read_path_blocked`
+(plan 31,deny+敏感路径)命中则记 `[access blocked …]` 不注入(不泄密)、内容截 100KB 附在
+prompt 末(mention 原样留)。扫 `@file` 用**原始 body**(非 `!cmd` 展开后),命令输出不能驱动
+文件读。fast-path:`has_injections` 无标记则原样返(存量命令零改动、零副作用)。
+
+**测试(全绿,+7)**:inject.rs — `find_embedded`(block+守卫 inline、`x!` `/`$!` 不匹配、
+未终止/空跳过、行首允许)、`find_mentions`(前导字符守卫、`a@b.com` 不匹配、路径字符)、
+`floor_char_boundary` 不切 UTF-8;commands/mod.rs — `!`echo hi`` 经门内联成 `Say hi to
+world.`(参数替换先行)、`@notes.txt` 附文件内容(allow_all + 临时 cwd)、deny 规则挡
+`!`rm nope`` → 无 turn + 报 `blocked by a deny permission rule`。
+
+**真 key 验收(anthropic 轨,scratch cwd `--plain --permission-mode bypass`)**:命令
+`brief.md` 含 `Bash says: !`echo LIVE-MARKER-42`. … @data.txt …`,`data.txt`=`SECRET-TANGERINE`
+→ 模型回 `LIVE-MARKER-42 SECRET-TANGERINE`;rollout 实据:原始 `!`echo…`` 标记消失(执行→
+内联)、`SECRET-TANGERINE` 出现 2 次(注入 + 模型转述)。**踩坑(教训)**:首跑得"没生效"假
+象(rollout 里标记原样、无文件内容)——`target/debug/kloop` 是陈旧二进制,`cargo test`/
+`build -p kloop-core`/`clippy` 都不产它;`cargo build -p kloop` 重建后即闭环。
+
 ## 未做(挂账,滚进后续片/plan)
 
-- `!cmd` 内嵌 bash 注入(展开时执行、输出内联,**必走 bash 权限门**,教训 19b)。
-- `@file` 附件注入(读文件附进消息,走 read 权限/敏感路径判定,复用 plan 31
-  `read_path_blocked`)。
+- 注入用于**模型激活的 skill**(`skill` 工具路径,当前只 `/name` 用户路径注入);命令
+  `allowed-tools` frontmatter 预授权其自身 `!cmd`(cc 注进本 turn `alwaysAllowRules`)。
+- `@file` 的 `#Lstart-end` 行范围、`@~/…` home 展开;`!cmd` 输出截断/超时精调(现抄 bash
+  工具现值)。
 - 子目录命名空间 `namespace:command`;commands 进 catalog(`disable-model-invocation`
   反向语义);`argument-hint`/命名参数 `$foo`(skills 侧一并挂账);managed/policy 层;
   命令里再调命令。

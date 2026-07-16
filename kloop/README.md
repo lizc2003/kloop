@@ -1134,10 +1134,33 @@ directory form is fuller), so a command only fills a name no skill claimed. A
 malformed command is skipped with a startup warning, never an error; `--mock`
 skips discovery entirely.
 
-**Not done** (deferred to a later slice): `` !`cmd` `` inline bash injection and
-`@file` attachment (both carry their own permission surface — bash gate,
-read-path gate), subdirectory `namespace:command`, and commands entering the
-model catalog. See `docs/plan/36-custom-commands.md`.
+**Injections** (`` !`cmd` `` and `@file`) run at `/name` expansion time — after
+argument substitution, before the turn — so the model sees fresh output, not the
+raw markers (`core/src/tools/inject.rs`):
+
+- **`` !`cmd` `` / ```` ```!\n…\n``` ````** — an embedded shell command is
+  executed and its output inlined in place. It runs through the **same permission
+  gate a real `bash` call faces** (deny → safety checks → ask → approver → cache,
+  then the OS sandbox): a `!cmd` is not privileged because a command author wrote
+  it. A blocked or failed command aborts the expansion — the error is shown and
+  no turn runs — while a command that merely exits non-zero inlines its output
+  (with the `[exit N]` tail), like the bash tool. The inline form only fires when
+  `!` sits at line start or after whitespace (so `foo!`bar`` and `$!` don't).
+- **`@file`** — a `@path` mention that resolves to a readable file has its
+  contents appended to the prompt (the mention stays in place). It honors the
+  **read-path gate** (`read_path_blocked`: deny rules + the sensitive-path list,
+  plan 31) — a blocked file is noted, never inlined — and a mention that isn't an
+  existing file is left alone (so `@someone` prose is untouched). Contents are
+  truncated to 100 KB.
+
+Only the user-initiated `/name` path expands injections; a model-activated skill
+(the `skill` tool) does not — running bash because the model picked a skill is a
+different risk profile.
+
+**Not done** (deferred): injections for model-activated skills; `allowed-tools`
+frontmatter pre-authorizing a command's own `!cmd`; `@file#Lstart-end` line
+ranges and `@~/…` home expansion; subdirectory `namespace:command`; commands
+entering the model catalog. See `docs/plan/36-custom-commands.md`.
 
 ## Image input (Phase 2, twentieth slice)
 

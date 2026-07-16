@@ -7,6 +7,7 @@ mod background_tasks;
 mod bash;
 mod codemode;
 mod fs;
+mod inject;
 mod search;
 mod skill;
 mod task;
@@ -17,6 +18,9 @@ mod worktree_tool;
 pub use background_tasks::BackgroundTasks;
 pub use background_tasks::TaskStatus;
 pub use bash::BackgroundShells;
+// Slash-path prompt injections (`!cmd` / `@file`) for `/name` commands; the
+// dispatch layer (`crate::commands`) calls this before running the turn.
+pub(crate) use inject::expand_slash_injections;
 // Registered on the task tool's peer set only at depth 0 with skills loaded
 // (see `turn_rounds`); the pure skill logic it drives lives in `crate::skills`.
 pub(crate) use skill::skill_tool_def;

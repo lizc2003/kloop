@@ -8,7 +8,10 @@
 //! system: the CLI loads them as `SkillSource::Command` entries in the same
 //! skill registry, so they resolve through the [`run`] fall-through below,
 //! reusing the skills' argument expansion (which is why parsing already splits
-//! off an argument string).
+//! off an argument string). After substitution, [`run`] runs any `` !`cmd` `` /
+//! `@file` injections ([`crate::tools::expand_slash_injections`], slice 2) —
+//! each through the same permission gate a real bash/read call faces — before
+//! handing back the prompt.
 
 use std::sync::Arc;
 
@@ -126,7 +129,14 @@ pub async fn run(
         // neither a built-in nor a loaded entry.
         _ => match crate::skills::Skill::lookup(cfg.skills.iter(), name) {
             Ok(skill) => {
-                SlashResult::turn(crate::skills::expand_body(&skill.body, &skill.dir, args))
+                let body = crate::skills::expand_body(&skill.body, &skill.dir, args);
+                // Then run any `!cmd` / `@file` injections (plan 36 slice 2),
+                // gated exactly like a bash/read call. A blocked or failed
+                // `!cmd` aborts: show the error, don't start a turn.
+                match crate::tools::expand_slash_injections(&body, cfg, cancel).await {
+                    Ok(prompt) => SlashResult::turn(prompt),
+                    Err(e) => SlashResult::message(format!("/{name}: {e:#}")),
+                }
             }
             Err(_) => unknown(name, cfg),
         },
@@ -364,6 +374,109 @@ mod tests {
             SlashResult::message(
                 "unknown command '/nope' (available: /help, /cost, /compact, /clear, /deploy)"
             )
+        );
+    }
+
+    /// A command body's `` !`cmd` `` runs through the (here allow-all) gate at
+    /// expansion time, its output inlined into the prompt — after argument
+    /// substitution, so `$0` is already resolved.
+    #[tokio::test]
+    async fn injection_runs_embedded_bash_and_inlines_output() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let cfg = Arc::new(Config {
+            skills: Arc::new(vec![crate::skills::Skill {
+                name: "greet".into(),
+                description: "d".into(),
+                body: "Say !`echo hi` to $0.".into(),
+                source: crate::skills::SkillSource::Command,
+                ..Default::default()
+            }]),
+            ..(*base).clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        let result = run(
+            "/greet world",
+            &mut history,
+            &cfg,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result, SlashResult::turn("Say hi to world.".into()));
+    }
+
+    /// A `@file` mention that resolves to a readable file has its contents
+    /// appended to the prompt (the mention itself stays in place).
+    #[tokio::test]
+    async fn injection_appends_atfile_contents() {
+        let dir = std::env::temp_dir().join(format!("kloop-inject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "FILE-BODY-XYZ").unwrap();
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let cfg = Arc::new(Config {
+            cwd: dir.clone(),
+            skills: Arc::new(vec![crate::skills::Skill {
+                name: "ctx".into(),
+                description: "d".into(),
+                body: "Review @notes.txt now.".into(),
+                source: crate::skills::SkillSource::Command,
+                ..Default::default()
+            }]),
+            ..(*base).clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        let prompt = run("/ctx", &mut history, &cfg, &CancellationToken::new())
+            .await
+            .run_turn
+            .expect("a turn");
+        assert!(prompt.starts_with("Review @notes.txt now."));
+        assert!(
+            prompt.contains("\n\n@notes.txt:\nFILE-BODY-XYZ"),
+            "got: {prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `!cmd` the permission gate denies aborts the expansion: no turn runs,
+    /// and the reason is shown to the user.
+    #[tokio::test]
+    async fn injection_denied_bash_aborts_with_message() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let perms = crate::permissions::Permissions::new(
+            crate::permissions::Mode::Default,
+            &crate::permissions::PermissionRules {
+                allow: Vec::new(),
+                deny: vec!["bash(rm *)".into()],
+                ask: Vec::new(),
+            },
+            std::env::current_dir().unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let cfg = Arc::new(Config {
+            permissions: Arc::new(perms),
+            skills: Arc::new(vec![crate::skills::Skill {
+                name: "danger".into(),
+                description: "d".into(),
+                body: "cleanup: !`rm nope`".into(),
+                source: crate::skills::SkillSource::Command,
+                ..Default::default()
+            }]),
+            ..(*base).clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        let result = run("/danger", &mut history, &cfg, &CancellationToken::new()).await;
+        assert_eq!(result.run_turn, None, "blocked: no turn runs");
+        assert!(
+            result.output.starts_with("/danger:"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("blocked by a deny permission rule"),
+            "got: {}",
+            result.output
         );
     }
 }
