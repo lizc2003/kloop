@@ -120,7 +120,7 @@ cwd 故行为逐字节不变,只有 worktree 子 agent 分叉。这是 plan 预�
 **挂账不变**:enter/exit 模型工具 + `--worktree` 会话级(切片 2);origin/HEAD base;30 天
 陈旧清理;指令文件/git 快照按 worktree 重新组装(需 CLI IO);cc 的 setup 拷贝;跨仓库。
 
-## ✅ 切片 2 完成记录(2026-07-16,提交 <待回填>)
+## ✅ 切片 2 完成记录(2026-07-16,提交 b17439f)
 
 会话级 enter/exit + `--worktree` CLI,真 key 双轨验收已过。范围(开工问用户定):CLI
 `--worktree` + TUI/plain 的 enter/exit,**server 挂账**(每 thread 独立 config、审批不跨
