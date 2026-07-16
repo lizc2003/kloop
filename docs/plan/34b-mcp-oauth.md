@@ -152,7 +152,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 OAuth server 配置 + 登录命�
 补完成记录;HANDOFF 补能力条目。真 key 验收:接一个真实需 OAuth 的远程 MCP server
 (问用户要地址;或自建最小 OAuth MCP server)双轨跑通登录 + tools/call。
 
-## ✅ 完成记录(2026-07-16,提交 <待回填>)
+## ✅ 完成记录(2026-07-16,提交 5faec32)
 
 **开工定的点**:①借 crate vs 手写 → **手写协议原语**(PKCE=sha2+base64、token/refresh=
 一个 form POST、discovery=两个 GET、DCR=一个 JSON POST),只引 `sha2`+`getrandom` 两个
