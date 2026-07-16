@@ -132,7 +132,7 @@ tokio BufReader 预读吞掉管道输入(既有局限,非本 plan bug),TUI appro
 磁盘目录 + slug;cc auto/分类器模式与 `allowedPrompts`;plan V2 多 agent 探索;codex
 `<proposed_plan>` 流式块;settings 默认档位;bypass 进 shift+Tab 循环;PTY 驱动的 TUI 批准闭环活体验收。
 
-## ✅ 后续(同会话,2026-07-16,提交 <待回填>):default → manual 彻底改名
+## ✅ 后续(同会话,2026-07-16,提交 cd8231e):default → manual 彻底改名
 
 用户看 cc 现行文档后拍板:**去掉 `default`,彻底改名 `manual`**;`--permission-mode` 不给即
 `manual`(缺省档)。回源现行 cc([permission-modes 官方文档](https://code.claude.com/docs/en/permission-modes)):
