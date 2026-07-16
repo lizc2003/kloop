@@ -84,7 +84,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 plan mode;本文件补完成记�
 能力条目(permission modes 从三档到四档)与教训。真 key 验收:`--plan` 下模型探索代码
 库产计划 → 弹层批准 → 切回 default 动手改文件闭环;拒绝一次验"留档继续规划"。
 
-## ✅ 完成记录(2026-07-16,提交 <待回填>)
+## ✅ 完成记录(2026-07-16,提交 877cca1)
 
 **开工定的点**(问用户):不加 `--plan` 别名——只 `--permission-mode` 加第四取值 `plan`
 (单 flag,bypass 冲突问题自然消失);TUI 取 **B**——shift+Tab 档位循环 + 状态栏显示当前
