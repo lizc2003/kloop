@@ -97,7 +97,7 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 `insert_before` 写进 scrollback,只有正在流式的 **active cell** + 底部区(状态行 + composer)
 在 inline viewport」。
 
-**完成记录(2026-07-16,提交号待回填)**:
+**完成记录(2026-07-16,提交 1f993ef)**:
 - `crates/tui/Cargo.toml`:ratatui 开 `scrolling-regions` feature(flicker-free insert_before);删已不用的 `futures` 依赖。
 - `setup_terminal`:去 `EnterAlternateScreen`,改 `Terminal::with_options(Viewport::Inline(满屏高))`;
   restore 去 alt-screen、show cursor + 换行落到 viewport 下。构造期 CPR 在输入线程启动前跑,无并发。
