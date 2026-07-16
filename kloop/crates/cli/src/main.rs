@@ -160,10 +160,10 @@ async fn main() -> Result<ExitCode> {
         image::load_images(&args.images)?
     };
 
-    // Headless (`-p`/`--print`) takes precedence over the interactive
+    // Headless (`-p`/`--headless`) takes precedence over the interactive
     // front-ends — including --mock, so `--mock -p` is a hermetic end-to-end
     // run for CI. One turn, print the result, exit by outcome.
-    if args.print {
+    if args.headless {
         let prompt = if args.mock {
             // The scripted demo needs no real prompt; the trigger is fixed.
             "run the demo".to_string()

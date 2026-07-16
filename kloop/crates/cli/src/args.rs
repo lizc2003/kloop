@@ -52,9 +52,9 @@ pub(crate) struct CliArgs {
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
-    /// `-p`/`--print`: run one turn headless (no REPL, no TUI) and exit. The
+    /// `-p`/`--headless`: run one turn headless (no REPL, no TUI) and exit. The
     /// prompt comes from the positional argument and/or piped stdin.
-    pub(crate) print: bool,
+    pub(crate) headless: bool,
     /// `--json` (headless only): emit the run as a NDJSON event stream on
     /// stdout, reusing the server mode's notification wire shapes.
     pub(crate) json: bool,
@@ -78,7 +78,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         list_sessions: false,
         plain: false,
         serve: false,
-        print: false,
+        headless: false,
         json: false,
         max_turns: None,
         prompt: None,
@@ -94,7 +94,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--list-sessions" => parsed.list_sessions = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
-            "-p" | "--print" => parsed.print = true,
+            "-p" | "--headless" => parsed.headless = true,
             "--json" => parsed.json = true,
             "--max-turns" => {
                 let raw = match args.get(i + 1) {
@@ -118,8 +118,8 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                 i += 1;
                 parsed.images.push(PathBuf::from(path));
             }
-            "--continue" => parsed.session = SessionChoice::Continue,
-            "--resume" => {
+            "-c" | "--continue" => parsed.session = SessionChoice::Continue,
+            "-r" | "--resume" => {
                 parsed.session = match args.get(i + 1) {
                     Some(id) if !id.starts_with('-') => {
                         i += 1;
@@ -150,7 +150,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-p/--print | --json | --max-turns <n> | --mock | --yolo | --accept-edits | --plain | --serve | --image <path> | --continue | --resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (-p/--headless | --json | --max-turns <n> | --mock | --yolo | --accept-edits | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -162,23 +162,23 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         i += 1;
     }
     // `--json` / `--max-turns` / a positional prompt only mean something in
-    // headless mode; requiring `-p` keeps the mode's flags cohesive (and
-    // matches cc, where these are all `--print`-mode options).
-    if !parsed.print {
+    // headless mode; requiring `-p`/`--headless` keeps the mode's flags
+    // cohesive.
+    if !parsed.headless {
         if parsed.json {
-            bail!("--json requires -p/--print (it streams the headless run as JSON)");
+            bail!("--json requires -p/--headless (it streams the headless run as JSON)");
         }
         if parsed.max_turns.is_some() {
-            bail!("--max-turns requires -p/--print (it is a headless guardrail)");
+            bail!("--max-turns requires -p/--headless (it is a headless guardrail)");
         }
         if let Some(prompt) = &parsed.prompt {
             bail!(
-                "a prompt argument ('{prompt}') requires -p/--print; interactive mode takes input at its prompt"
+                "a prompt argument ('{prompt}') requires -p/--headless; interactive mode takes input at its prompt"
             );
         }
     }
-    if parsed.print && parsed.serve {
-        bail!("-p/--print and --serve are different modes; pick one");
+    if parsed.headless && parsed.serve {
+        bail!("-p/--headless and --serve are different modes; pick one");
     }
     Ok(parsed)
 }
@@ -321,7 +321,7 @@ mod tests {
             list_sessions: false,
             plain: false,
             serve: false,
-            print: false,
+            headless: false,
             json: false,
             max_turns: None,
             prompt: None,
@@ -345,6 +345,28 @@ mod tests {
             parse_args(&strings(&["--continue"])).unwrap(),
             CliArgs {
                 session: SessionChoice::Continue,
+                ..base()
+            }
+        );
+        // Short options mirror cc: -c = --continue, -r = --resume.
+        assert_eq!(
+            parse_args(&strings(&["-c"])).unwrap(),
+            CliArgs {
+                session: SessionChoice::Continue,
+                ..base()
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["-r", "20260709-120000"])).unwrap(),
+            CliArgs {
+                session: SessionChoice::Resume("20260709-120000".into()),
+                ..base()
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["-r"])).unwrap(),
+            CliArgs {
+                session: SessionChoice::Pick,
                 ..base()
             }
         );
@@ -412,19 +434,19 @@ mod tests {
 
     #[test]
     fn parse_args_headless_flags() {
-        // `-p` and `--print` are the same switch; a positional becomes the
+        // `-p` and `--headless` are the same switch; a positional becomes the
         // prompt; --json and --max-turns ride along.
         assert_eq!(
             parse_args(&strings(&["-p", "fix the bug"])).unwrap(),
             CliArgs {
-                print: true,
+                headless: true,
                 prompt: Some("fix the bug".into()),
                 ..base()
             }
         );
         assert_eq!(
             parse_args(&strings(&[
-                "--print",
+                "--headless",
                 "--json",
                 "--max-turns",
                 "5",
@@ -432,7 +454,7 @@ mod tests {
             ]))
             .unwrap(),
             CliArgs {
-                print: true,
+                headless: true,
                 json: true,
                 max_turns: Some(5),
                 prompt: Some("do it".into()),
@@ -441,9 +463,9 @@ mod tests {
         );
         // Headless composes with session selection (resume + run headless).
         assert_eq!(
-            parse_args(&strings(&["--resume", "20260709-120000", "-p", "continue"])).unwrap(),
+            parse_args(&strings(&["-r", "20260709-120000", "-p", "continue"])).unwrap(),
             CliArgs {
-                print: true,
+                headless: true,
                 prompt: Some("continue".into()),
                 session: SessionChoice::Resume("20260709-120000".into()),
                 ..base()
@@ -453,12 +475,12 @@ mod tests {
         assert_eq!(
             parse_args(&strings(&["-p"])).unwrap(),
             CliArgs {
-                print: true,
+                headless: true,
                 ..base()
             }
         );
 
-        // Headless-only flags without -p are rejected.
+        // Headless-only flags without -p/--headless are rejected.
         assert!(
             parse_args(&strings(&["--json"])).is_err(),
             "--json needs -p"

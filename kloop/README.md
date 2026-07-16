@@ -1084,9 +1084,10 @@ PDF/document blocks; remote-URL images; exposing `detail`. See
 
 ## Headless mode (Phase 2, twenty-first slice)
 
-`kloop -p/--print` runs one turn without a REPL or TUI and exits — the form
+`kloop -p`/`--headless` runs one turn without a REPL or TUI and exits — the form
 scripts, pipes, and CI need. cc's `--print` and codex's `exec` crate converged
-here independently, so kloop takes the intersection.
+here independently, so kloop takes the intersection (under a self-describing name
+rather than cc's output-flavored `--print`).
 
 ```sh
 # prompt as a positional argument; the final answer is the only thing on stdout
@@ -1127,8 +1128,8 @@ kloop --mock -p --json
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 
-`--max-turns` and `--json` are `-p`-only; a bare prompt without `-p` is an error
-(interactive mode takes its input at the prompt). Not done (deferred, server
+`--max-turns` and `--json` are `-p`/`--headless`-only; a bare prompt without it
+is an error (interactive mode takes its input at the prompt). Not done (deferred, server
 mode already covers the programmatic side): `--permission-prompt-tool`
 delegation, `--input-format stream-json`, budget/goal guardrails,
 `--output-schema`. See `docs/plan/33-exec-mode.md`.
@@ -1176,11 +1177,11 @@ cargo run -- --image screenshot.png
 cargo run -- --serve
 cargo run -- --mock --serve   # keyless: scripted provider behind the protocol
 
-# sessions
+# sessions (-c = --continue, -r = --resume, mirroring cc)
 cargo run -- --list-sessions   # what's on disk, most recent first
-cargo run -- --continue        # continue the most recent session
-cargo run -- --resume          # pick a session from a numbered list
-cargo run -- --resume <id>     # continue a specific session
+cargo run -- -c                # continue the most recent session (--continue)
+cargo run -- -r                # pick a session from a numbered list (--resume)
+cargo run -- -r <id>           # continue a specific session
 cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
 cargo run -- --fork <id>       # branch off a session at its end
 

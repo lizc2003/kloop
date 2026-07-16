@@ -72,14 +72,16 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
 
 ## 完成记录(2026-07-16,提交 a33864a)✅
 
-**落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`-p`/`--print`/`--json`/
+**落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`-p`/`--headless`/`--json`/
 `--max-turns`/位置参数解析)+ `cli/src/main.rs`(headless 分发 + `read_stdin_if_piped`)。
 
 **四个开工点最终定法**:
-1. **flag 形态 = B(cc 形)**——`-p`/`--print` 是模式开关(不是值容器),prompt 走
-   位置参数 + stdin。理由:kloop 全程贴 cc harness,muscle memory 一致;`kloop`
-   无参仍进 TAUI(不引入"TUI 初始 prompt"新特性)。位置参数/`--json`/`--max-turns`
-   都是 `-p`-only(无 `-p` 报错引导),保持模式 flag 内聚。
+1. **flag 形态 = B(cc 形模式开关)**——开关(不是值容器)进 headless,prompt 走位置参数
+   + stdin;`kloop` 无参仍进 TUI(不引入"TUI 初始 prompt"新特性)。位置参数/`--json`/
+   `--max-turns` 都是开关-only(无开关报错引导),保持模式 flag 内聚。**flag 名不跟 cc:**
+   用户复盘"`--print` 不直观"(cc 从"打印结果就退"这个输出行为命名,非模式命名),定名
+   **`--headless`**(自解释)+ 短选项 `-p`,**去掉 `--print`**(连兼容别名都不留,免误导)。
+   同轮补 cc 的 `-c`(=`--continue`)/`-r`(=`--resume`)短选项对齐 muscle memory。
 2. **`--json` = 复用 server 通知 wire**——method + params 形状逐字节照抄 server 的
    `ThreadUi`(text/delta、tool/started|completed、agent/started|completed、
    todo/updated、note),外加 turn/started、turn/completed 生命周期;**threadId 保留

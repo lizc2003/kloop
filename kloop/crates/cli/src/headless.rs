@@ -1,4 +1,4 @@
-//! Non-interactive headless mode (`-p`/`--print`): assemble the prompt from the
+//! Non-interactive headless mode (`-p`/`--headless`): assemble the prompt from the
 //! positional argument and/or piped stdin, run exactly one turn, then either
 //! print the final text (human) or stream the run as a NDJSON event line stream
 //! (`--json`) and exit 0/1 by outcome.
