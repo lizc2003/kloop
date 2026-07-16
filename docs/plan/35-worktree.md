@@ -76,7 +76,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 isolation 参数;本文件补完
 补能力条目与教训(cwd 联动清单的取舍)。真 key 验收:两个并行子 agent 各自 worktree
 改同一文件不冲突,变更分支可手动 merge。
 
-## ✅ 完成记录(2026-07-16,提交 <待回填>)
+## ✅ 完成记录(2026-07-16,提交 9e7c87f)
 
 **切片 1 落地,真 key 双轨验收已过。** 关键决定按 plan 倾向:入口=task 的 `isolation`
 参数、base=HEAD、同名报错、offload/sessions 不跟。
