@@ -70,7 +70,7 @@ server 通知形状对齐断言);stdin 管道 prompt;位置参数 + stdin 并用
 fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完成记录;HANDOFF
 补能力条目与教训。
 
-## 完成记录(2026-07-16)✅
+## 完成记录(2026-07-16,提交 a33864a)✅
 
 **落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`-p`/`--print`/`--json`/
 `--max-turns`/位置参数解析)+ `cli/src/main.rs`(headless 分发 + `read_stdin_if_piped`)。
