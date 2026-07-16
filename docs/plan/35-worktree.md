@@ -158,7 +158,7 @@ CLI 同样落树无泄漏。
 **切片 2 挂账**:server 会话 worktree;origin/HEAD base;30 天陈旧清理;指令文件/git 快照按
 worktree 重组;cc setup 拷贝;跨仓库。
 
-## ✅ server 支持收尾(2026-07-16,提交 <待回填>)
+## ✅ server 支持收尾(2026-07-16,提交 72a64ac)
 
 切片 2 挂的 server 会话 worktree 补齐(用户后续要求)。server 每 thread 独立 Config(工厂
 闭包造)+ 独立 active_worktree 槽,天然隔离;要补的三点:
