@@ -163,9 +163,9 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-deny rules → safety checks → ask rules → sandbox auto-allow → bypass
-→ read-only self-verdict → acceptEdits → allow rules → session cache
-→ ask the user
+deny rules → plan-mode read-only gate → safety checks → ask rules →
+sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
+allow rules → session cache → ask the user
 ```
 
 Two invariants carried over from claude-code: **deny always beats allow**,
@@ -240,9 +240,28 @@ same ANSI, the server adds a `preview` field to `approval/request`.
 
 **Modes**: one flag `--permission-mode <mode>` (cc's unified control) picks the
 gate mode — `default` (ask for anything unvouched-for), `accept-edits` (file
-writes inside the working directory auto-pass), or `bypass` (everything passes
-*except* deny rules and safety checks). `--mock` disables the gate entirely —
-nobody is at the keyboard.
+writes inside the working directory auto-pass), `bypass` (everything passes
+*except* deny rules and safety checks), or `plan` (read-only until the plan is
+approved, below). `--mock` disables the gate entirely — nobody is at the
+keyboard. In the TUI, **shift+Tab** cycles the mode live (default → accept-edits
+→ plan → default; the status bar shows the current one), while bypass stays
+opt-in via the flag.
+
+**Plan mode** (`--permission-mode plan`, cc's `plan`) is read-only exploration
+until you sign off on a plan. The gate sits just below deny: every write or
+side-effecting command is refused outright — not asked — so a destructive
+command is a flat "no", not a `[destructive]` prompt whose yes would break the
+promise ("what the gate shows = what runs" is the hardest contract, so the
+enforcement is the hard gate, not a prompt the model may ignore — codex's
+Plan is a soft prompt; kloop takes cc's hard form). Reads, searches, read-only
+bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
+rides every request so the model knows to plan, not act. When ready, the model
+calls **`exit_plan_mode`** with the plan text; it rides the same approval popup
+a change-diff does (the plan is the scrollable `preview`). Approve → plan mode
+turns off, restoring the mode it was entered from (default at startup), and the
+model implements; reject → it stays in plan mode and keeps planning. Sub-agents
+inherit plan mode with the session and are read-only in it, but only the
+top-level agent can `exit_plan_mode`.
 
 ## TUI (Phase 2, fourth slice)
 

@@ -1,14 +1,22 @@
 //! permissions — the layered gate run before every tool execution, shaped
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
-//! deny rules → safety checks → ask rules → sandbox auto-allow → bypass →
-//! read-only self-verdict → acceptEdits → allow rules → session cache →
-//! ask the user.
+//! deny rules → plan-mode read-only gate → safety checks → ask rules →
+//! sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
+//! allow rules → session cache → ask the user.
 //!
 //! Two invariants carried over from cc: **deny always beats allow**, and
 //! **safety checks (destructive commands, sensitive paths) are immune to
 //! bypass mode**. A denial becomes an is_error tool_result — the model can
 //! take another approach; the turn does not end.
+//!
+//! Plan mode ([`Mode::Plan`], cc's `plan` permission mode) sits right below
+//! deny: a write/mutating call is refused outright — not even asked — so the
+//! agent explores read-only and acts only after the user approves the plan via
+//! `exit_plan_mode`. It is placed above safety on purpose: a destructive
+//! command in plan mode is a flat "no", not a "[destructive] approve?" prompt
+//! whose yes would break the read-only promise. `exit_plan_mode` counts as
+//! read-only here (it only shows the plan and flips the mode), so it passes.
 //!
 //! The sandbox auto-allow layer (cc's `autoAllowBashIfSandboxed`) is the
 //! sandbox/approval coupling: a bash call the OS sandbox will contain needs
@@ -30,6 +38,8 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -106,6 +116,64 @@ pub enum Mode {
     /// Everything is approved except deny rules and safety checks (cc
     /// `bypassPermissions` semantics — those two layers are immune).
     Bypass,
+    /// Read-only exploration only: every write/mutating call is refused so the
+    /// agent plans first and acts only after the user approves the plan via the
+    /// `exit_plan_mode` tool (cc's `plan` permission mode).
+    Plan,
+}
+
+impl Mode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Mode::Default => 0,
+            Mode::AcceptEdits => 1,
+            Mode::Bypass => 2,
+            Mode::Plan => 3,
+        }
+    }
+
+    fn from_u8(v: u8) -> Mode {
+        match v {
+            1 => Mode::AcceptEdits,
+            2 => Mode::Bypass,
+            3 => Mode::Plan,
+            _ => Mode::Default,
+        }
+    }
+
+    /// Short name shown in the CLI flag, the TUI status bar, and prompt text.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Default => "default",
+            Mode::AcceptEdits => "accept-edits",
+            Mode::Bypass => "bypass",
+            Mode::Plan => "plan",
+        }
+    }
+
+    /// The next mode in the shift+Tab cycle. Bypass is deliberately NOT reached
+    /// by cycling — it is the dangerous one, opted into explicitly with
+    /// `--permission-mode bypass`; stepping out of it lands on default.
+    pub fn cycled(self) -> Mode {
+        match self {
+            Mode::Default => Mode::AcceptEdits,
+            Mode::AcceptEdits => Mode::Plan,
+            Mode::Plan => Mode::Default,
+            Mode::Bypass => Mode::Default,
+        }
+    }
+}
+
+/// The outcome of [`Permissions::confirm_exit_plan`] — `exit_plan_mode`'s
+/// approval step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanExitOutcome {
+    /// Approved (or no gate): plan mode is off; the restored mode is returned.
+    Approved(Mode),
+    /// The user declined: the session stays in plan mode.
+    Declined,
+    /// No approver available (headless / no TTY): the tool reports the block.
+    NoApprover,
 }
 
 /// Raw rule strings by behavior, before parsing. Formats:
@@ -218,7 +286,15 @@ fn parse_rules(entries: &[String]) -> Result<Vec<Rule>> {
 pub struct Permissions {
     /// Tests and `--mock` only: skip every layer including deny.
     allow_everything: bool,
-    mode: Mode,
+    /// The gating mode, held in a shared atomic cell so it can change at runtime
+    /// (shift+Tab in the TUI, `exit_plan_mode`) and — because `rebased` clones
+    /// the Arc, not the value — a mode change is seen by the base gate, an active
+    /// worktree's re-anchored gate, and every sub-agent at once.
+    mode: Arc<AtomicU8>,
+    /// The mode to restore when `exit_plan_mode` is approved: whatever was active
+    /// when plan mode was entered (default if it was never recorded). Shared like
+    /// `mode`.
+    pre_plan: Arc<AtomicU8>,
     /// Mutable: `AllowAlways` appends at runtime.
     allow: Mutex<Vec<Rule>>,
     deny: Vec<Rule>,
@@ -236,7 +312,8 @@ impl Permissions {
     pub fn allow_all() -> Self {
         Permissions {
             allow_everything: true,
-            mode: Mode::Bypass,
+            mode: Arc::new(AtomicU8::new(Mode::Bypass.as_u8())),
+            pre_plan: Arc::new(AtomicU8::new(Mode::Default.as_u8())),
             allow: Mutex::new(Vec::new()),
             deny: Vec::new(),
             ask: Vec::new(),
@@ -256,7 +333,9 @@ impl Permissions {
     ) -> Result<Self> {
         Ok(Permissions {
             allow_everything: false,
-            mode,
+            mode: Arc::new(AtomicU8::new(mode.as_u8())),
+            // No prior mode at construction, so exit_plan_mode restores default.
+            pre_plan: Arc::new(AtomicU8::new(Mode::Default.as_u8())),
             allow: Mutex::new(parse_rules(&rules.allow)?),
             deny: parse_rules(&rules.deny)?,
             ask: parse_rules(&rules.ask)?,
@@ -278,7 +357,10 @@ impl Permissions {
     pub fn rebased(&self, cwd: PathBuf) -> Self {
         Permissions {
             allow_everything: self.allow_everything,
-            mode: self.mode,
+            // Share the mode cells (clone the Arc): a shift+Tab / exit_plan_mode
+            // in the base gate is seen here too — the mode is session-global.
+            mode: self.mode.clone(),
+            pre_plan: self.pre_plan.clone(),
             allow: Mutex::new(self.allow.lock().unwrap().clone()),
             deny: self.deny.clone(),
             ask: self.ask.clone(),
@@ -286,6 +368,54 @@ impl Permissions {
             approver: self.approver.clone(),
             cwd: lexical_normalize(Path::new("/"), &cwd),
             persist: self.persist.clone(),
+        }
+    }
+
+    /// The gating mode in effect right now.
+    pub fn mode(&self) -> Mode {
+        Mode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Change the gating mode at runtime (the TUI's shift+Tab cycle). Entering
+    /// plan mode from a non-plan mode records what to restore on a later
+    /// `exit_plan_mode` approval.
+    pub fn set_mode(&self, mode: Mode) {
+        if mode == Mode::Plan && self.mode() != Mode::Plan {
+            self.pre_plan.store(self.mode().as_u8(), Ordering::Relaxed);
+        }
+        self.mode.store(mode.as_u8(), Ordering::Relaxed);
+    }
+
+    /// Leave plan mode, restoring the mode active when it was entered (default
+    /// if none was recorded); returns the restored mode.
+    fn exit_plan(&self) -> Mode {
+        let restore = Mode::from_u8(self.pre_plan.load(Ordering::Relaxed));
+        self.mode.store(restore.as_u8(), Ordering::Relaxed);
+        restore
+    }
+
+    /// `exit_plan_mode`'s approval step: present the plan for sign-off. On
+    /// approval, leave plan mode (restoring the pre-plan mode) and return it; on
+    /// denial, stay in plan mode. Like [`Permissions::escalate_sandbox`], this
+    /// does not re-litigate the call — it only shows the plan and flips the mode.
+    pub async fn confirm_exit_plan(&self, plan: &str, depth: u8) -> PlanExitOutcome {
+        // Tests / `--mock`: no gate at all, so honor the exit without a prompt.
+        if self.allow_everything {
+            return PlanExitOutcome::Approved(self.exit_plan());
+        }
+        let Some(approver) = &self.approver else {
+            return PlanExitOutcome::NoApprover;
+        };
+        let req = ConfirmRequest {
+            description: describe_plan_exit(depth),
+            remember_rules: None,
+            preview: Some(plan.to_string()),
+        };
+        match approver.confirm(req).await {
+            Decision::Allow | Decision::AllowSession | Decision::AllowAlways => {
+                PlanExitOutcome::Approved(self.exit_plan())
+            }
+            Decision::Deny => PlanExitOutcome::Declined,
         }
     }
 
@@ -322,7 +452,21 @@ impl Permissions {
             ));
         }
 
-        // 2. Safety checks — bypass-immune, straight to the user.
+        // 2. Plan mode — read-only exploration only. A mutating call is refused
+        // outright (deny above still wins; safety/ask below never see one), so
+        // the model plans and acts only after the user approves exit_plan_mode.
+        // Above safety on purpose: a destructive command here is a flat "no",
+        // not a "[destructive] approve?" whose yes would break the promise.
+        if self.mode() == Mode::Plan && !call.is_readonly(name) {
+            return Err(format!(
+                "{name}: this session is in plan mode, so only read-only exploration is allowed \
+                 — file edits and commands with side effects are blocked. Keep investigating \
+                 read-only, then call exit_plan_mode with your plan to get the user's approval \
+                 before making any changes."
+            ));
+        }
+
+        // 3. Safety checks — bypass-immune, straight to the user.
         if let Some(hazard) = call.hazard(name) {
             let remember = hazard
                 .rememberable
@@ -333,42 +477,42 @@ impl Permissions {
                 .await;
         }
 
-        // 3. Explicit ask rules — "always confirm this"; never remembered.
+        // 4. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
             return self.ask_user(name, input, depth, None, None).await;
         }
 
-        // 4. Sandbox auto-allow — the OS sandbox will contain this call, so
+        // 5. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
         if sandbox_auto_allow {
             return Ok(());
         }
 
-        // 5. Bypass mode.
-        if self.mode == Mode::Bypass {
+        // 6. Bypass mode.
+        if self.mode() == Mode::Bypass {
             return Ok(());
         }
 
-        // 6. Read-only self-verdict.
+        // 7. Read-only self-verdict.
         if call.is_readonly(name) {
             return Ok(());
         }
 
-        // 7. acceptEdits: file writes inside the working directory.
-        if self.mode == Mode::AcceptEdits
+        // 8. acceptEdits: file writes inside the working directory.
+        if self.mode() == Mode::AcceptEdits
             && matches!(name, "write_file" | "edit_file")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
         {
             return Ok(());
         }
 
-        // 8. Allow rules.
+        // 9. Allow rules.
         if self.matches_allow(name, &call) {
             return Ok(());
         }
 
-        // 9. Session cache.
+        // 10. Session cache.
         let remember = remember_payload(name, &call);
         if let Some(remember) = &remember {
             let session = self.session.lock().unwrap();
@@ -377,7 +521,7 @@ impl Permissions {
             }
         }
 
-        // 10. Ask.
+        // 11. Ask.
         self.ask_user(name, input, depth, None, remember).await
     }
 
@@ -489,7 +633,7 @@ impl Permissions {
         // Bypass (`--permission-mode bypass`) means "don't ask" — escalate as the model-driven
         // disable_sandbox retry already would (it auto-passes the bypass
         // layer of the gate).
-        if self.mode == Mode::Bypass {
+        if self.mode() == Mode::Bypass {
             return EscalationOutcome::Approved;
         }
         let Some(approver) = &self.approver else {
@@ -613,6 +757,10 @@ impl CallFacts {
             // auto-allowed like task; the work done INSIDE the tree is gated
             // per call as usual.
             "enter_worktree" | "exit_worktree" => true,
+            // exit_plan_mode only shows the plan and flips the session mode —
+            // no system side effect. Read-only here so it passes the plan-mode
+            // gate above and does its own approval (Permissions::confirm_exit_plan).
+            "exit_plan_mode" => true,
             // wait only blocks; stop_agent only signals a sub-agent this agent
             // itself spawned — neither touches anything the sub-agent's own
             // calls weren't already gated on (same reasoning as kill_bash).
@@ -823,6 +971,13 @@ fn describe_escalation(command: &str, depth: u8) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let cmd: String = command.chars().take(200).collect();
     format!("{agent}[sandbox denied — run without sandbox?] bash: {cmd}")
+}
+
+/// The exit-plan-mode prompt heading; the plan text itself rides in the
+/// popup's scrollable `preview`.
+fn describe_plan_exit(depth: u8) -> String {
+    let agent = if depth > 0 { "[sub-agent] " } else { "" };
+    format!("{agent}Exit plan mode and start on this plan?")
 }
 
 #[cfg(test)]
@@ -1482,6 +1637,138 @@ mod tests {
             .check("write_file", &file(".git/hooks/x"), 0)
             .await
             .is_ok());
+    }
+
+    // ── plan mode ───────────────────────────────────────────────────────
+
+    /// Plan mode passes read-only exploration and refuses every mutating call
+    /// outright — without consulting the approver (the point of the mode).
+    /// exit_plan_mode is read-only here, so it is not blocked.
+    #[tokio::test]
+    async fn plan_mode_allows_reads_and_blocks_mutations() {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Plan, rules(&[], &[], &[]), approver.clone());
+        // Reads and read-only bash pass.
+        assert!(ok(&p, "read_file", json!({"path": "x"})).await);
+        assert!(ok(&p, "grep", json!({"pattern": "fn"})).await);
+        assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
+        assert!(ok(&p, "bash", bash("git status && ls")).await);
+        assert!(ok(&p, "task", json!({"prompt": "look around"})).await);
+        assert!(ok(&p, "exit_plan_mode", json!({"plan": "do X"})).await);
+        // Writes and side-effecting bash are refused.
+        for (name, input) in [
+            ("write_file", file("src/main.rs")),
+            (
+                "edit_file",
+                json!({"path": "a.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            ("bash", bash("echo hi > f.txt")),
+            ("bash", bash("cargo build")),
+        ] {
+            let err = p.check(name, &input, 0).await.unwrap_err();
+            assert!(err.contains("plan mode"), "{name}: {err}");
+        }
+        assert_eq!(approver.ask_count(), 0, "plan mode never asks");
+    }
+
+    /// Plan mode sits above safety: a destructive command is a flat "no", not a
+    /// "[destructive] approve?" prompt. A deny rule still wins over the mode.
+    #[tokio::test]
+    async fn plan_mode_blocks_destructive_before_asking_but_deny_still_wins() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let p = gate(
+            Mode::Plan,
+            rules(&[], &["bash(git push *)"], &[]),
+            approver.clone(),
+        );
+        let err = p.check("bash", &bash("rm -rf build"), 0).await.unwrap_err();
+        assert!(err.contains("plan mode"), "{err}");
+        assert_eq!(
+            approver.ask_count(),
+            0,
+            "no [destructive] prompt in plan mode"
+        );
+        // Deny is checked before the plan gate, so its message is the one seen.
+        let err = p
+            .check("bash", &bash("git push origin main"), 0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("deny permission rule"), "{err}");
+    }
+
+    /// exit_plan_mode's approval step: approve → leave plan mode restoring the
+    /// pre-plan mode; deny → stay in plan mode. set_mode records the mode plan
+    /// was entered from.
+    #[tokio::test]
+    async fn confirm_exit_plan_switches_back_or_stays() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        // Enter plan from accept-edits: that becomes the restore target.
+        p.set_mode(Mode::AcceptEdits);
+        p.set_mode(Mode::Plan);
+        assert_eq!(p.mode(), Mode::Plan);
+
+        assert_eq!(
+            p.confirm_exit_plan("the plan", 0).await,
+            PlanExitOutcome::Approved(Mode::AcceptEdits)
+        );
+        assert_eq!(p.mode(), Mode::AcceptEdits, "restored the pre-plan mode");
+        // The approver saw the plan text as the popup preview.
+        assert_eq!(approver.asked()[0].preview.as_deref(), Some("the plan"));
+
+        // Back into plan, this time deny: stay put.
+        p.set_mode(Mode::Plan);
+        assert_eq!(
+            p.confirm_exit_plan("v2", 0).await,
+            PlanExitOutcome::Declined
+        );
+        assert_eq!(p.mode(), Mode::Plan, "denied exit keeps plan mode");
+    }
+
+    /// A construction-time plan mode restores to default on exit (no prior mode).
+    #[tokio::test]
+    async fn confirm_exit_plan_restores_default_when_started_in_plan() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let p = gate(Mode::Plan, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.confirm_exit_plan("plan", 0).await,
+            PlanExitOutcome::Approved(Mode::Default)
+        );
+    }
+
+    /// No approver (headless): exit is reported as blocked, not silently taken.
+    #[tokio::test]
+    async fn confirm_exit_plan_without_approver_reports_no_approver() {
+        let p = Permissions::new(
+            Mode::Plan,
+            &PermissionRules::default(),
+            PathBuf::from("/work/proj"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.confirm_exit_plan("plan", 0).await,
+            PlanExitOutcome::NoApprover
+        );
+        assert_eq!(p.mode(), Mode::Plan, "still in plan mode");
+    }
+
+    /// A rebased gate (a worktree sub-agent) shares the session mode: a mode
+    /// change on the base is seen through the rebased copy, and vice versa.
+    #[test]
+    fn rebased_shares_the_session_mode() {
+        let approver = ScriptedApprover::new(vec![]);
+        let base = gate(Mode::Default, rules(&[], &[], &[]), approver);
+        let sub = base.rebased(PathBuf::from("/work/tree"));
+        base.set_mode(Mode::Plan);
+        assert_eq!(
+            sub.mode(),
+            Mode::Plan,
+            "mode change propagates to the rebase"
+        );
+        sub.set_mode(Mode::Default);
+        assert_eq!(base.mode(), Mode::Default, "and back the other way");
     }
 
     /// The contract MCP integration relies on: an unknown (external) tool

@@ -53,7 +53,8 @@ pub(crate) struct CliArgs {
     /// `--permission-mode <mode>`: the gating mode for this session, cc's
     /// unified permission control. `default` (ask for anything unvouched-for),
     /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
-    /// deny rules + safety checks). `--mock` ignores it (no gate at all).
+    /// deny rules + safety checks), `plan` (read-only until the model's plan is
+    /// approved via exit_plan_mode). `--mock` ignores it (no gate at all).
     pub(crate) permission_mode: Mode,
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
@@ -108,15 +109,18 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--permission-mode" => {
                 let raw = match args.get(i + 1) {
                     Some(mode) if !mode.starts_with('-') => mode,
-                    _ => bail!("--permission-mode needs a mode (default | accept-edits | bypass)"),
+                    _ => bail!(
+                        "--permission-mode needs a mode (default | accept-edits | bypass | plan)"
+                    ),
                 };
                 i += 1;
                 parsed.permission_mode = match raw.as_str() {
                     "default" => Mode::Default,
                     "accept-edits" => Mode::AcceptEdits,
                     "bypass" => Mode::Bypass,
+                    "plan" => Mode::Plan,
                     other => bail!(
-                        "unknown permission mode '{other}' (default | accept-edits | bypass)"
+                        "unknown permission mode '{other}' (default | accept-edits | bypass | plan)"
                     ),
                 };
             }
@@ -245,7 +249,7 @@ pub(crate) fn help_text() -> &'static str {
      \x20       --list-sessions   list saved sessions and exit\n\
      \n\
      PERMISSIONS:\n\
-     \x20       --permission-mode <mode>   default | accept-edits | bypass\n\
+     \x20       --permission-mode <mode>   default | accept-edits | bypass | plan\n\
      \n\
      INPUT:\n\
      \x20       --image <path>    attach a local image (repeatable)\n\
@@ -488,6 +492,12 @@ mod tests {
                 .unwrap()
                 .permission_mode,
             Mode::Default
+        );
+        assert_eq!(
+            parse_args(&strings(&["--permission-mode", "plan"]))
+                .unwrap()
+                .permission_mode,
+            Mode::Plan
         );
         assert!(
             parse_args(&strings(&["--permission-mode", "wild"])).is_err(),

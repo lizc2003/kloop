@@ -11,6 +11,7 @@ use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
 use kloop_core::tools::TodoStatus;
@@ -99,6 +100,9 @@ pub enum Command {
     /// is delivered as a user message at the next round boundary, without
     /// interrupting the turn. Only produced while a turn is running.
     Steer(String),
+    /// Cycle the permission mode (shift+Tab): the loop applies it to the shared
+    /// gate. App state already updated its own `mode` mirror.
+    SetMode(Mode),
     /// Cancel the in-flight turn's CancellationToken.
     Interrupt,
     Quit,
@@ -136,6 +140,11 @@ pub struct App {
     /// The rewind picker while it is open (Ctrl+R when idle); None otherwise.
     /// While open it captures the keyboard, like a confirm prompt.
     pub fork_picker: Option<ForkPicker>,
+    /// The current permission mode, shown in the status bar. A display mirror of
+    /// the shared gate: shift+Tab updates it here and via `Command::SetMode`; an
+    /// `exit_plan_mode` approval refreshes it via `AgentEvent::ModeChanged`. The
+    /// loop seeds it from the real gate before the first draw.
+    pub mode: Mode,
 }
 
 impl App {
@@ -156,6 +165,7 @@ impl App {
             agent_cells: HashMap::new(),
             todo_cell: None,
             fork_picker: None,
+            mode: Mode::default(),
         }
     }
 
@@ -337,6 +347,11 @@ impl App {
             AgentEvent::Confirm { req, reply } => {
                 self.confirms.push_back(PendingConfirm { req, reply });
             }
+            AgentEvent::ModeChanged(mode) => {
+                // exit_plan_mode flipped the gate on the agent side; keep the
+                // status-bar badge in step.
+                self.mode = mode;
+            }
             AgentEvent::TurnEnded(reason) => {
                 self.running = false;
                 self.assistant_open = false;
@@ -426,6 +441,13 @@ impl App {
                 self.todo_cell = None;
                 self.running = true;
                 return Command::Submit(text);
+            }
+            // shift+Tab cycles the permission mode (default → accept-edits →
+            // plan → default; bypass is opt-in via the CLI flag only). Allowed
+            // any time — the gate reads the mode live per tool call.
+            (KeyCode::BackTab, _) => {
+                self.mode = self.mode.cycled();
+                return Command::SetMode(self.mode);
             }
             (KeyCode::Char(c), false) => {
                 let at = byte_index(&self.input, self.cursor);
@@ -636,6 +658,35 @@ mod tests {
         for c in s.chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
+    }
+
+    /// shift+Tab cycles the mode (default → accept-edits → plan → default),
+    /// updating the App's badge and emitting SetMode for the loop to apply; an
+    /// exit_plan_mode approval (ModeChanged) refreshes the badge without a key.
+    #[test]
+    fn shift_tab_cycles_mode_and_mode_changed_syncs_badge() {
+        let mut app = App::new("s".into());
+        assert_eq!(app.mode, Mode::Default);
+        assert_eq!(
+            app.on_key(key(KeyCode::BackTab)),
+            Command::SetMode(Mode::AcceptEdits)
+        );
+        assert_eq!(app.mode, Mode::AcceptEdits);
+        assert_eq!(
+            app.on_key(key(KeyCode::BackTab)),
+            Command::SetMode(Mode::Plan)
+        );
+        assert_eq!(app.mode, Mode::Plan);
+        assert_eq!(
+            app.on_key(key(KeyCode::BackTab)),
+            Command::SetMode(Mode::Default)
+        );
+        assert_eq!(app.mode, Mode::Default);
+
+        // The agent side leaving plan mode syncs the badge with no keypress.
+        app.mode = Mode::Plan;
+        app.apply(AgentEvent::ModeChanged(Mode::AcceptEdits));
+        assert_eq!(app.mode, Mode::AcceptEdits);
     }
 
     #[test]

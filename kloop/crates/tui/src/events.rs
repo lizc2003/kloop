@@ -9,6 +9,7 @@ use kloop_core::agent::Ui;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
 use kloop_protocol::Message;
@@ -73,6 +74,9 @@ pub enum AgentEvent {
         req: ConfirmRequest,
         reply: oneshot::Sender<Decision>,
     },
+    /// The permission mode changed on the agent side (exit_plan_mode was
+    /// approved): refresh the status-bar badge so it never lies.
+    ModeChanged(Mode),
     TurnEnded(EndReason),
 }
 
@@ -145,6 +149,10 @@ impl Ui for ChannelUi {
                 todos: todos.to_vec(),
             });
         }
+    }
+
+    fn mode_changed(&self, mode: Mode) {
+        self.send(AgentEvent::ModeChanged(mode));
     }
 }
 

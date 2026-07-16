@@ -91,6 +91,12 @@ pub trait Ui: Send + Sync {
             None => self.note(&format!("working directory → {cwd}")),
         }
     }
+    /// The permission mode changed — the model left plan mode via
+    /// `exit_plan_mode` (plan 37). The default collapses to a note; the TUI
+    /// opts in to refresh its status-bar badge without a stale display.
+    fn mode_changed(&self, mode: crate::permissions::Mode) {
+        self.note(&format!("permission mode → {}", mode.label()));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,16 +495,31 @@ fn drain_inbox(inbox: &Inbox, history: &mut History) -> bool {
     true
 }
 
-/// The synthetic first user message: project instructions, the skills catalog,
-/// and the deferred-tools notice, in that order. Every part is session-stable,
-/// so the composed message is too — the prompt-cache prefix survives across
-/// rounds. The skills catalog rides only depth-0 requests (skills are a
-/// top-level feature; see the `skill` tool registration in `turn_rounds`).
+/// The plan-mode operating instructions, injected while the session is in plan
+/// mode (plan 37): the hard gate blocks writes, this tells the model what to do
+/// instead. Rides every depth — a sub-agent is read-only in plan mode too.
+const PLAN_MODE_REMINDER: &str = "<plan-mode>\nThis session is in PLAN MODE. Only read-only \
+exploration is allowed: read files, search, and run read-only commands to understand the task. \
+Do NOT modify files or run commands with side effects — such calls are blocked by the permission \
+gate. Produce a concrete, step-by-step plan for the requested change. When the plan is ready, \
+call the exit_plan_mode tool with the full plan text to present it to the user; wait for their \
+approval before making any changes.\n</plan-mode>";
+
+/// The synthetic first user message: the plan-mode reminder (when in plan mode),
+/// project instructions, the skills catalog, and the deferred-tools notice, in
+/// that order. Every part but the mode reminder is session-stable, and the mode
+/// toggles rarely, so the composed message is stable enough for the prompt-cache
+/// prefix to survive across rounds. The skills catalog rides only depth-0
+/// requests (skills are a top-level feature; see the `skill` tool registration
+/// in `turn_rounds`).
 fn injected_context(cfg: &Config, depth: u8) -> Option<String> {
+    let plan_reminder = (cfg.effective_permissions().mode() == crate::permissions::Mode::Plan)
+        .then(|| PLAN_MODE_REMINDER.to_string());
     let skills_catalog = (depth == 0)
         .then(|| crate::skills::skills_catalog(&cfg.skills))
         .flatten();
     let parts: Vec<String> = [
+        plan_reminder,
         cfg.project_instructions.clone(),
         skills_catalog,
         crate::tools::deferred_notice(cfg),

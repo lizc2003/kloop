@@ -114,6 +114,11 @@ pub async fn run(
     // Shared with the worker's Config: the UI loop enqueues steering here while
     // a turn runs, the agent loop drains it at round boundaries (plan 22).
     let inbox = cfg.inbox.clone();
+    // The permission gate is shared (Arc) with the worker's Config, so the loop
+    // can apply shift+Tab mode changes to it and seed the status-bar badge from
+    // the real starting mode (--permission-mode). effective_permissions covers
+    // a session started in a worktree, whose gate shares the mode cell anyway.
+    let permissions = cfg.effective_permissions();
 
     // Snapshot before the worker takes History: a resumed session replays
     // into the transcript instead of starting on a blank screen.
@@ -135,6 +140,7 @@ pub async fn run(
         event_rx,
         msg_tx,
         inbox,
+        permissions,
         session_id,
         resumed_cells,
     )
@@ -311,11 +317,14 @@ async fn ui_loop(
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     msgs: mpsc::UnboundedSender<WorkerMsg>,
     inbox: Arc<Inbox>,
+    permissions: Arc<kloop_core::permissions::Permissions>,
     session_id: String,
     resumed_cells: Vec<app::Cell>,
 ) -> Result<()> {
     let mut app = App::new(session_id);
     app.cells = resumed_cells;
+    // Seed the status-bar badge from the real starting mode (e.g. plan).
+    app.mode = permissions.mode();
     let mut keys = EventStream::new();
     let mut current_cancel: Option<CancellationToken> = None;
     loop {
@@ -341,6 +350,12 @@ async fn ui_loop(
                             // drains it at the next round boundary. The user's
                             // raw text already showed as a User cell.
                             inbox.push(InboxItem::Steer(text));
+                        }
+                        Command::SetMode(mode) => {
+                            // shift+Tab: apply the new mode to the shared gate;
+                            // subsequent tool calls read it live. The badge is
+                            // already updated in the App.
+                            permissions.set_mode(mode);
                         }
                         Command::RequestForkPoints => {
                             // The worker owns the rollout path; it reads the

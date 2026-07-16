@@ -8,6 +8,7 @@ mod bash;
 mod codemode;
 mod fs;
 mod inject;
+mod plan_mode;
 mod search;
 mod skill;
 mod task;
@@ -191,6 +192,13 @@ pub fn all_tool_defs(
             &inline_sources,
             &deferred,
         ));
+        // Plan mode (plan 37): the model presents its plan for approval and, on
+        // approval, leaves plan mode. Session-control like the worktree tools —
+        // depth-0 only, kept out of run_program's TS API and the defer count.
+        // Advertised unconditionally so the tool array stays byte-stable while
+        // the mode toggles (shift+Tab / exit) within the session; it errors
+        // cleanly when called outside plan mode.
+        defs.push(plan_mode::exit_plan_mode_def());
         // Session worktree tools (plan 35 slice 2): only when the front-end
         // enables worktree mode (CLI/TUI/plain — not server threads or --mock),
         // and only top-level (a sub-agent isolates via task {isolation}). Kept
@@ -722,6 +730,7 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
+            "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx).await,
             "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
             "wait" => background_tasks::wait_tool(input, ctx).await,
@@ -1019,6 +1028,7 @@ mod tests {
                 "srv__fail",
                 "srv__image",
                 "run_program",
+                "exit_plan_mode",
             ]
         );
 
@@ -1086,13 +1096,14 @@ mod tests {
         assert!(deferred_tool_defs(&sources, builtin_count + 3).is_empty());
 
         // One past it: built-ins + tool_search + call_tool only; sources
-        // deferred.
+        // deferred. (+1 for the always-present depth-0 exit_plan_mode tool.)
         let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2, false);
         let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
+        assert!(names.contains(&"exit_plan_mode"));
         assert!(!names.contains(&"srv__echo"));
-        assert_eq!(deferred_regime.len(), builtin_count + 2);
+        assert_eq!(deferred_regime.len(), builtin_count + 3);
         let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 2)
             .into_iter()
             .map(|d| d.name)

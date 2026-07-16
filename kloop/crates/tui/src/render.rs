@@ -220,15 +220,18 @@ pub fn status_line(app: &App) -> String {
     if app.fork_picker.is_some() {
         return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
     }
+    // The permission mode badge leads every non-rewind status: it is always
+    // relevant, and plan mode especially must be unmissable.
+    let mode = format!("[{}] ", app.mode.label());
     if !app.confirms.is_empty() {
-        return "awaiting approval".into();
+        return format!("{mode}awaiting approval");
     }
     if app.running {
         let note = app.last_note.as_deref().unwrap_or("");
-        return format!("working… {note}  (Ctrl+C to interrupt)");
+        return format!("{mode}working… {note}  (Ctrl+C to interrupt)");
     }
     format!(
-        "session {} — Enter to send · /help for commands · Ctrl+R to rewind · Ctrl+D to quit",
+        "{mode}session {} — Enter to send · shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",
         app.session_id
     )
 }
@@ -611,6 +614,21 @@ mod tests {
                 ("⋮".to_string(), DIM),
             ]
         );
+    }
+
+    /// The status bar leads with the permission-mode badge in every state and
+    /// names shift+Tab when idle; plan mode is spelled out so it is unmissable.
+    #[test]
+    fn status_line_shows_the_mode_badge() {
+        use kloop_core::permissions::Mode;
+        let mut app = App::new("sess".into());
+        assert!(status_line(&app).starts_with("[default] "));
+        assert!(status_line(&app).contains("shift+Tab"));
+        app.mode = Mode::Plan;
+        let line = status_line(&app);
+        assert!(line.starts_with("[plan] "), "{line}");
+        app.running = true;
+        assert!(status_line(&app).starts_with("[plan] working…"));
     }
 
     #[test]
