@@ -82,7 +82,8 @@ bash)、deny 仍最先、acceptEdits 语义被 plan 覆盖、`--permission-mode 
 
 fmt/clippy/test 全绿,一次 commit;README 补 plan mode;本文件补完成记录;HANDOFF 补
 能力条目(permission modes 从三档到四档)与教训。真 key 验收:`--plan` 下模型探索代码
-库产计划 → 弹层批准 → 切回 default 动手改文件闭环;拒绝一次验"留档继续规划"。
+库产计划 → 弹层批准 → 切回 manual 动手改文件闭环;拒绝一次验"留档继续规划"。
+(注:入口最终为 `--permission-mode plan`,`default` 档后续改名 `manual`——见完成记录 + 后续节。)
 
 ## ✅ 完成记录(2026-07-16,提交 877cca1)
 
@@ -109,7 +110,7 @@ task/run_program 在 plan 档可用(内部每调用再过门);exit_plan_mode 内
   (随档位 toggle 准确,子 agent 各深度都带;token 估算同源自动一致)。
 - TUI(B):`Ui::mode_changed(Mode)` 默认降级 note;`ChannelUi`→`AgentEvent::ModeChanged`;
   `App.mode` 镜像 + `Command::SetMode`;shift+Tab(`KeyCode::BackTab`)`Mode::cycled()`
-  (default→accept-edits→plan→default,**bypass 不入循环**,只 CLI flag);状态栏
+  (manual→accept-edits→plan→manual,**bypass 不入循环**,只 CLI flag);状态栏
   `[<档位>]` 徽标常显(plan 尤其醒目)+ "shift+Tab to change mode" 提示;`lib.rs` 克隆
   `effective_permissions()` 传 ui_loop,起始 seed `app.mode`,`SetMode`→`set_mode`。
 
@@ -130,3 +131,17 @@ tokio BufReader 预读吞掉管道输入(既有局限,非本 plan bug),TUI appro
 **挂账(未做)**:`enter_plan_mode` 模型工具(人发起 `--permission-mode plan` 够用);plans
 磁盘目录 + slug;cc auto/分类器模式与 `allowedPrompts`;plan V2 多 agent 探索;codex
 `<proposed_plan>` 流式块;settings 默认档位;bypass 进 shift+Tab 循环;PTY 驱动的 TUI 批准闭环活体验收。
+
+## ✅ 后续(同会话,2026-07-16,提交 <待回填>):default → manual 彻底改名
+
+用户看 cc 现行文档后拍板:**去掉 `default`,彻底改名 `manual`**;`--permission-mode` 不给即
+`manual`(缺省档)。回源现行 cc([permission-modes 官方文档](https://code.claude.com/docs/en/permission-modes)):
+cc 的**值仍是 `default`** 但 UI **标签叫 "Manual"**、状态栏 `⏸ manual mode on`,且**收 `manual` 别名**
+(v2.1.200+)——旧参考快照 2.8.3 还是 `Default` 命名,一度让我误答"cc 没用过 manual",被用户截图纠正
+(教训:参考快照会过时,活体文档/用户手上的版本才是当前真相,`verify-refs` 同款)。kloop 比 cc 更进一步:
+**不留 `default` 名/别名,`manual` 是唯一名(值+标签一致)**。落法:`Mode::Default`→`Mode::Manual`
+(变体 + `#[default]` 保留,`Mode::default()` 仍返 Manual)全量重命名(57 处)、`label()`="manual"、
+`--permission-mode manual`(`default` 值移除、传 `default` 报错)、缺省 `Mode::Manual`、shift+Tab 循环
+`manual→accept-edits→plan→manual`、状态栏 `[manual]`、README/plan/HANDOFF 同步。fmt/clippy/test 全绿
+(583 测试)。**不做 auto、dontAsk**(cc 另两档:auto=托管 classifier 子系统[教训 17 归因,大件另开 plan]、
+dontAsk=非 allow 一律拒;均挂账)。

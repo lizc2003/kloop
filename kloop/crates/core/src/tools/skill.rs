@@ -155,7 +155,7 @@ mod tests {
         let mut cfg = (*ctx.cfg).clone();
         cfg.permissions = std::sync::Arc::new(
             crate::permissions::Permissions::new(
-                crate::permissions::Mode::Default,
+                crate::permissions::Mode::Manual,
                 &crate::permissions::PermissionRules {
                     allow: Vec::new(),
                     deny: vec!["bash(rm *)".into()],

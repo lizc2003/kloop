@@ -829,7 +829,7 @@ mod tests {
                 asked: asked.clone(),
             });
             let perms = crate::permissions::Permissions::new(
-                crate::permissions::Mode::Default,
+                crate::permissions::Mode::Manual,
                 &Default::default(),
                 root.clone(),
                 Some(approver),
@@ -1000,7 +1000,7 @@ mod tests {
             let no_approver = || {
                 Arc::new(
                     crate::permissions::Permissions::new(
-                        crate::permissions::Mode::Default,
+                        crate::permissions::Mode::Manual,
                         &Default::default(),
                         root.clone(),
                         None,

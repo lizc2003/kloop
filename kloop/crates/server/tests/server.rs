@@ -122,7 +122,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
     Arc::new(move |approver, _notify| {
         let permissions = if gated {
             Permissions::new(
-                Mode::Default,
+                Mode::Manual,
                 &PermissionRules::default(),
                 std::env::temp_dir(),
                 Some(approver),

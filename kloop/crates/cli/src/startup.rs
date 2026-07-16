@@ -200,7 +200,7 @@ fn build_permissions(
     notify: kloop_tui::NoteFn,
 ) -> Result<Permissions> {
     // --mock runs a canned turn with nobody at the keyboard: no gating at
-    // all. Otherwise the mode comes straight from --permission-mode (default);
+    // all. Otherwise the mode comes straight from --permission-mode (manual);
     // bypass still enforces deny rules and safety checks.
     if args.mock {
         return Ok(Permissions::allow_all());

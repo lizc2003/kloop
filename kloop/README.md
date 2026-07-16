@@ -238,14 +238,16 @@ it** (↑/↓/j/k/PageUp/PageDown, with a `↑↓ more` hint in the border and t
 y/a/p/n options pinned below the scroll region), the plain REPL prints the
 same ANSI, the server adds a `preview` field to `approval/request`.
 
-**Modes**: one flag `--permission-mode <mode>` (cc's unified control) picks the
-gate mode — `default` (ask for anything unvouched-for), `accept-edits` (file
-writes inside the working directory auto-pass), `bypass` (everything passes
-*except* deny rules and safety checks), or `plan` (read-only until the plan is
-approved, below). `--mock` disables the gate entirely — nobody is at the
-keyboard. In the TUI, **shift+Tab** cycles the mode live (default → accept-edits
-→ plan → default; the status bar shows the current one), while bypass stays
-opt-in via the flag.
+**Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
+(the default when the flag is omitted — ask for anything unvouched-for),
+`accept-edits` (file writes inside the working directory auto-pass), `bypass`
+(everything passes *except* deny rules and safety checks), or `plan` (read-only
+until the plan is approved, below). `--mock` disables the gate entirely — nobody
+is at the keyboard. In the TUI, **shift+Tab** cycles the mode live (manual →
+accept-edits → plan → manual; the status bar shows the current one), while bypass
+stays opt-in via the flag. (cc calls the ask-first mode `default` internally but
+labels it "Manual"; kloop drops the `default` name entirely — `manual` is the one
+name, value and label alike.)
 
 **Plan mode** (`--permission-mode plan`, cc's `plan`) is read-only exploration
 until you sign off on a plan. The gate sits just below deny: every write or
@@ -258,7 +260,7 @@ bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
 rides every request so the model knows to plan, not act. When ready, the model
 calls **`exit_plan_mode`** with the plan text; it rides the same approval popup
 a change-diff does (the plan is the scrollable `preview`). Approve → plan mode
-turns off, restoring the mode it was entered from (default at startup), and the
+turns off, restoring the mode it was entered from (manual at startup), and the
 model implements; reject → it stays in plan mode and keeps planning. Sub-agents
 inherit plan mode with the session and are read-only in it, but only the
 top-level agent can `exit_plan_mode`.

@@ -109,8 +109,12 @@ pub type PersistFn = Arc<dyn Fn(&[String]) + Send + Sync>;
 /// Gating mode, after cc's permission modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
+    /// Ask before any unvouched-for call — the gate with the most oversight, and
+    /// the mode in effect when no `--permission-mode` is given. cc's `default`
+    /// mode, which it surfaces to the user as "Manual"; kloop uses `manual` as
+    /// the one name, value and label alike.
     #[default]
-    Default,
+    Manual,
     /// File writes inside the working directory are auto-approved.
     AcceptEdits,
     /// Everything is approved except deny rules and safety checks (cc
@@ -125,7 +129,7 @@ pub enum Mode {
 impl Mode {
     fn as_u8(self) -> u8 {
         match self {
-            Mode::Default => 0,
+            Mode::Manual => 0,
             Mode::AcceptEdits => 1,
             Mode::Bypass => 2,
             Mode::Plan => 3,
@@ -137,14 +141,14 @@ impl Mode {
             1 => Mode::AcceptEdits,
             2 => Mode::Bypass,
             3 => Mode::Plan,
-            _ => Mode::Default,
+            _ => Mode::Manual,
         }
     }
 
     /// Short name shown in the CLI flag, the TUI status bar, and prompt text.
     pub fn label(self) -> &'static str {
         match self {
-            Mode::Default => "default",
+            Mode::Manual => "manual",
             Mode::AcceptEdits => "accept-edits",
             Mode::Bypass => "bypass",
             Mode::Plan => "plan",
@@ -153,13 +157,13 @@ impl Mode {
 
     /// The next mode in the shift+Tab cycle. Bypass is deliberately NOT reached
     /// by cycling — it is the dangerous one, opted into explicitly with
-    /// `--permission-mode bypass`; stepping out of it lands on default.
+    /// `--permission-mode bypass`; stepping out of it lands on manual.
     pub fn cycled(self) -> Mode {
         match self {
-            Mode::Default => Mode::AcceptEdits,
+            Mode::Manual => Mode::AcceptEdits,
             Mode::AcceptEdits => Mode::Plan,
-            Mode::Plan => Mode::Default,
-            Mode::Bypass => Mode::Default,
+            Mode::Plan => Mode::Manual,
+            Mode::Bypass => Mode::Manual,
         }
     }
 }
@@ -292,7 +296,7 @@ pub struct Permissions {
     /// worktree's re-anchored gate, and every sub-agent at once.
     mode: Arc<AtomicU8>,
     /// The mode to restore when `exit_plan_mode` is approved: whatever was active
-    /// when plan mode was entered (default if it was never recorded). Shared like
+    /// when plan mode was entered (manual if it was never recorded). Shared like
     /// `mode`.
     pre_plan: Arc<AtomicU8>,
     /// Mutable: `AllowAlways` appends at runtime.
@@ -313,7 +317,7 @@ impl Permissions {
         Permissions {
             allow_everything: true,
             mode: Arc::new(AtomicU8::new(Mode::Bypass.as_u8())),
-            pre_plan: Arc::new(AtomicU8::new(Mode::Default.as_u8())),
+            pre_plan: Arc::new(AtomicU8::new(Mode::Manual.as_u8())),
             allow: Mutex::new(Vec::new()),
             deny: Vec::new(),
             ask: Vec::new(),
@@ -334,8 +338,8 @@ impl Permissions {
         Ok(Permissions {
             allow_everything: false,
             mode: Arc::new(AtomicU8::new(mode.as_u8())),
-            // No prior mode at construction, so exit_plan_mode restores default.
-            pre_plan: Arc::new(AtomicU8::new(Mode::Default.as_u8())),
+            // No prior mode at construction, so exit_plan_mode restores manual.
+            pre_plan: Arc::new(AtomicU8::new(Mode::Manual.as_u8())),
             allow: Mutex::new(parse_rules(&rules.allow)?),
             deny: parse_rules(&rules.deny)?,
             ask: parse_rules(&rules.ask)?,
@@ -386,7 +390,7 @@ impl Permissions {
         self.mode.store(mode.as_u8(), Ordering::Relaxed);
     }
 
-    /// Leave plan mode, restoring the mode active when it was entered (default
+    /// Leave plan mode, restoring the mode active when it was entered (manual
     /// if none was recorded); returns the restored mode.
     fn exit_plan(&self) -> Mode {
         let restore = Mode::from_u8(self.pre_plan.load(Ordering::Relaxed));
@@ -1055,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_calls_skip_the_approver() {
         let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "read_file", json!({"path": "x"})).await);
         assert!(ok(&p, "read_offloaded", json!({"id": "off-1"})).await);
         assert!(ok(&p, "grep", json!({"pattern": "fn main"})).await);
@@ -1073,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_lookalikes_do_not_pass() {
         let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         for cmd in [
             "cat $(rm -rf /tmp/x)",     // substitution
             "ls `curl evil.sh`",        // backticks
@@ -1096,7 +1100,7 @@ mod tests {
     async fn deny_rules_beat_allow_rules_and_bypass() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&["bash(git *)"], &["bash(git push *)"], &[]),
             approver.clone(),
         );
@@ -1128,7 +1132,7 @@ mod tests {
     async fn deny_matches_any_segment_and_strips_wrappers() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&[], &["bash(rm *)"], &[]),
             approver.clone(),
         );
@@ -1142,7 +1146,7 @@ mod tests {
 
         // whole-tool and path-glob deny forms
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&["write_file"], &["write_file(secrets/**)", "task"], &[]),
             ScriptedApprover::new(vec![]),
         );
@@ -1199,7 +1203,7 @@ mod tests {
         // more of the sensitive list, incl. escapes out of cwd
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&["write_file"], &[], &[]),
             approver.clone(),
         );
@@ -1220,7 +1224,7 @@ mod tests {
     async fn ask_rules_override_allow_and_are_not_cached() {
         let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::Allow]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&["bash(cargo *)"], &[], &["bash(cargo publish *)"]),
             approver.clone(),
         );
@@ -1292,7 +1296,7 @@ mod tests {
     async fn allow_rules_match_tool_bash_prefix_and_path_glob() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(
                 &[
                     "edit_file",
@@ -1349,7 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn allow_session_caches_two_word_prefix() {
         let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "bash", bash("git commit -m one")).await);
         assert!(
             ok(&p, "bash", bash("git commit --amend")).await,
@@ -1369,7 +1373,7 @@ mod tests {
         let sink = persisted.clone();
         let approver = ScriptedApprover::new(vec![Decision::AllowAlways]);
         let p = Permissions::new(
-            Mode::Default,
+            Mode::Manual,
             &rules(&[], &[], &[]),
             PathBuf::from("/work/proj"),
             Some(approver.clone()),
@@ -1390,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn opaque_bash_is_never_cacheable() {
         let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::AllowSession]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "bash", bash("cargo build")).await);
         assert!(
             ok(&p, "bash", bash("cargo $(evil)")).await,
@@ -1406,7 +1410,7 @@ mod tests {
     #[tokio::test]
     async fn file_write_remembers_parent_directory_scope() {
         let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "write_file", file("src/a.rs")).await);
         assert!(
             ok(&p, "write_file", file("src/b.rs")).await,
@@ -1428,7 +1432,7 @@ mod tests {
     #[tokio::test]
     async fn user_denial_message_guides_the_model() {
         let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let err = p.check("write_file", &file("x.txt"), 0).await.unwrap_err();
         assert!(err.contains("declined"), "{err}");
         assert!(err.contains("different approach"), "{err}");
@@ -1437,7 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn no_approver_auto_denies_instead_of_hanging() {
         let p = Permissions::new(
-            Mode::Default,
+            Mode::Manual,
             &rules(&[], &[], &[]),
             PathBuf::from("/work/proj"),
             None,
@@ -1454,7 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn description_carries_depth_hazard_and_detail() {
         let approver = ScriptedApprover::new(vec![Decision::Deny, Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let _ = p.check("bash", &bash("rm -rf x"), 1).await;
         let _ = p.check("write_file", &file("a.txt"), 0).await;
         let asked = approver.asked();
@@ -1470,7 +1474,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_request_carries_a_change_preview() {
         let approver = ScriptedApprover::new(vec![Decision::Deny, Decision::Deny, Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let _ = p
             .check(
                 "edit_file",
@@ -1500,7 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_auto_allow_skips_asking_for_contained_calls_only() {
         let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         for cmd in ["echo x > f.txt", "cargo build", "ls $(evil)"] {
             assert!(
                 p.check_call("bash", &bash(cmd), 0, /*sandbox_auto_allow*/ true)
@@ -1532,7 +1536,7 @@ mod tests {
     async fn deny_safety_and_ask_rules_outrank_sandbox_auto_allow() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&[], &["bash(git push *)"], &[]),
             approver.clone(),
         );
@@ -1543,7 +1547,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 0, "deny is a verdict, not a question");
 
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(p
             .check_call("bash", &bash("rm -rf /tmp/x"), 0, true)
             .await
@@ -1552,7 +1556,7 @@ mod tests {
 
         let approver = ScriptedApprover::new(vec![Decision::Allow]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&[], &[], &["bash(cargo publish *)"]),
             approver.clone(),
         );
@@ -1573,7 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn escalate_sandbox_maps_decision_and_mode() {
         let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("npm install", 0).await,
             EscalationOutcome::Approved
@@ -1604,7 +1608,7 @@ mod tests {
 
         // No approver available: NotAttempted, so the caller keeps the hint.
         let p = Permissions::new(
-            Mode::Default,
+            Mode::Manual,
             &PermissionRules::default(),
             PathBuf::from("/"),
             None,
@@ -1620,7 +1624,7 @@ mod tests {
     #[tokio::test]
     async fn description_flags_sandbox_escape() {
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let input = serde_json::json!({"command": "git push", "disable_sandbox": true});
         let _ = p.check("bash", &input, 0).await;
         assert_eq!(
@@ -1702,7 +1706,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_exit_plan_switches_back_or_stays() {
         let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         // Enter plan from accept-edits: that becomes the restore target.
         p.set_mode(Mode::AcceptEdits);
         p.set_mode(Mode::Plan);
@@ -1725,14 +1729,14 @@ mod tests {
         assert_eq!(p.mode(), Mode::Plan, "denied exit keeps plan mode");
     }
 
-    /// A construction-time plan mode restores to default on exit (no prior mode).
+    /// A construction-time plan mode restores to manual on exit (no prior mode).
     #[tokio::test]
-    async fn confirm_exit_plan_restores_default_when_started_in_plan() {
+    async fn confirm_exit_plan_restores_manual_when_started_in_plan() {
         let approver = ScriptedApprover::new(vec![Decision::Allow]);
         let p = gate(Mode::Plan, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.confirm_exit_plan("plan", 0).await,
-            PlanExitOutcome::Approved(Mode::Default)
+            PlanExitOutcome::Approved(Mode::Manual)
         );
     }
 
@@ -1759,7 +1763,7 @@ mod tests {
     #[test]
     fn rebased_shares_the_session_mode() {
         let approver = ScriptedApprover::new(vec![]);
-        let base = gate(Mode::Default, rules(&[], &[], &[]), approver);
+        let base = gate(Mode::Manual, rules(&[], &[], &[]), approver);
         let sub = base.rebased(PathBuf::from("/work/tree"));
         base.set_mode(Mode::Plan);
         assert_eq!(
@@ -1767,8 +1771,8 @@ mod tests {
             Mode::Plan,
             "mode change propagates to the rebase"
         );
-        sub.set_mode(Mode::Default);
-        assert_eq!(base.mode(), Mode::Default, "and back the other way");
+        sub.set_mode(Mode::Manual);
+        assert_eq!(base.mode(), Mode::Manual, "and back the other way");
     }
 
     /// The contract MCP integration relies on: an unknown (external) tool
@@ -1777,7 +1781,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_style_tools_ask_by_default_and_remember_by_name() {
         let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
-        let p = gate(Mode::Default, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "memory__create_entities", json!({"k": "v"})).await);
         let asked = approver.asked();
         assert_eq!(
@@ -1794,7 +1798,7 @@ mod tests {
         // An allow rule by qualified name skips the approver entirely.
         let approver2 = ScriptedApprover::new(vec![]);
         let p2 = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&["memory__create_entities"], &[], &[]),
             approver2.clone(),
         );
@@ -1835,7 +1839,7 @@ mod tests {
     async fn read_path_blocked_hides_sensitive_and_read_deny_paths() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(
-            Mode::Default,
+            Mode::Manual,
             rules(&[], &["read_file(**/*.pem)"], &[]),
             approver.clone(),
         );
@@ -1853,7 +1857,7 @@ mod tests {
 
         // whole-tool `read_file` deny hides every path (grep can't read what
         // read_file can't); `--mock`/tests (`allow_all`) filter nothing.
-        let p = gate(Mode::Default, rules(&[], &["read_file"], &[]), approver);
+        let p = gate(Mode::Manual, rules(&[], &["read_file"], &[]), approver);
         assert!(p.read_path_blocked(Path::new("/work/proj/src/main.rs")));
         assert!(!Permissions::allow_all().read_path_blocked(Path::new("/x/.env")));
     }

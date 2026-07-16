@@ -443,7 +443,7 @@ mod tests {
     async fn injection_denied_bash_aborts_with_message() {
         let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let perms = crate::permissions::Permissions::new(
-            crate::permissions::Mode::Default,
+            crate::permissions::Mode::Manual,
             &crate::permissions::PermissionRules {
                 allow: Vec::new(),
                 deny: vec!["bash(rm *)".into()],

@@ -50,8 +50,8 @@ pub(crate) struct CliArgs {
     pub(crate) mock: bool,
     /// `-h`/`--help`: print the usage summary and exit.
     pub(crate) help: bool,
-    /// `--permission-mode <mode>`: the gating mode for this session, cc's
-    /// unified permission control. `default` (ask for anything unvouched-for),
+    /// `--permission-mode <mode>`: the gating mode for this session. `manual`
+    /// (the default when the flag is omitted — ask for anything unvouched-for),
     /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
     /// deny rules + safety checks), `plan` (read-only until the model's plan is
     /// approved via exit_plan_mode). `--mock` ignores it (no gate at all).
@@ -89,7 +89,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
         help: false,
-        permission_mode: Mode::Default,
+        permission_mode: Mode::Manual,
         list_sessions: false,
         plain: false,
         serve: false,
@@ -110,17 +110,17 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                 let raw = match args.get(i + 1) {
                     Some(mode) if !mode.starts_with('-') => mode,
                     _ => bail!(
-                        "--permission-mode needs a mode (default | accept-edits | bypass | plan)"
+                        "--permission-mode needs a mode (manual | accept-edits | bypass | plan)"
                     ),
                 };
                 i += 1;
                 parsed.permission_mode = match raw.as_str() {
-                    "default" => Mode::Default,
+                    "manual" => Mode::Manual,
                     "accept-edits" => Mode::AcceptEdits,
                     "bypass" => Mode::Bypass,
                     "plan" => Mode::Plan,
                     other => bail!(
-                        "unknown permission mode '{other}' (default | accept-edits | bypass | plan)"
+                        "unknown permission mode '{other}' (manual | accept-edits | bypass | plan)"
                     ),
                 };
             }
@@ -249,7 +249,7 @@ pub(crate) fn help_text() -> &'static str {
      \x20       --list-sessions   list saved sessions and exit\n\
      \n\
      PERMISSIONS:\n\
-     \x20       --permission-mode <mode>   default | accept-edits | bypass | plan\n\
+     \x20       --permission-mode <mode>   manual (default) | accept-edits | bypass | plan\n\
      \n\
      INPUT:\n\
      \x20       --image <path>    attach a local image (repeatable)\n\
@@ -398,7 +398,7 @@ mod tests {
         CliArgs {
             mock: false,
             help: false,
-            permission_mode: Mode::Default,
+            permission_mode: Mode::Manual,
             list_sessions: false,
             plain: false,
             serve: false,
@@ -474,7 +474,7 @@ mod tests {
                 ..base()
             }
         );
-        // --permission-mode is cc's unified gate control: one flag, three modes.
+        // --permission-mode is the unified gate control: one flag, four modes.
         assert_eq!(
             parse_args(&strings(&["--permission-mode", "bypass"]))
                 .unwrap()
@@ -488,11 +488,15 @@ mod tests {
             Mode::AcceptEdits
         );
         assert_eq!(
-            parse_args(&strings(&["--permission-mode", "default"]))
+            parse_args(&strings(&["--permission-mode", "manual"]))
                 .unwrap()
                 .permission_mode,
-            Mode::Default
+            Mode::Manual
         );
+        // No flag at all is manual (the omit-the-flag default).
+        assert_eq!(parse_args(&[]).unwrap().permission_mode, Mode::Manual);
+        // `default` is gone — it is no longer an accepted value.
+        assert!(parse_args(&strings(&["--permission-mode", "default"])).is_err());
         assert_eq!(
             parse_args(&strings(&["--permission-mode", "plan"]))
                 .unwrap()

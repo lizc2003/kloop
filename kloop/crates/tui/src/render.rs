@@ -622,7 +622,7 @@ mod tests {
     fn status_line_shows_the_mode_badge() {
         use kloop_core::permissions::Mode;
         let mut app = App::new("sess".into());
-        assert!(status_line(&app).starts_with("[default] "));
+        assert!(status_line(&app).starts_with("[manual] "));
         assert!(status_line(&app).contains("shift+Tab"));
         app.mode = Mode::Plan;
         let line = status_line(&app);

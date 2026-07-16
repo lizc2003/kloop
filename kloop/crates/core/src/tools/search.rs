@@ -909,7 +909,7 @@ mod tests {
         };
         Arc::new(
             Permissions::new(
-                crate::permissions::Mode::Default,
+                crate::permissions::Mode::Manual,
                 &rules,
                 PathBuf::from(cwd),
                 None,

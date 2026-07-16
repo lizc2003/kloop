@@ -442,8 +442,8 @@ impl App {
                 self.running = true;
                 return Command::Submit(text);
             }
-            // shift+Tab cycles the permission mode (default → accept-edits →
-            // plan → default; bypass is opt-in via the CLI flag only). Allowed
+            // shift+Tab cycles the permission mode (manual → accept-edits →
+            // plan → manual; bypass is opt-in via the CLI flag only). Allowed
             // any time — the gate reads the mode live per tool call.
             (KeyCode::BackTab, _) => {
                 self.mode = self.mode.cycled();
@@ -660,13 +660,13 @@ mod tests {
         }
     }
 
-    /// shift+Tab cycles the mode (default → accept-edits → plan → default),
+    /// shift+Tab cycles the mode (manual → accept-edits → plan → manual),
     /// updating the App's badge and emitting SetMode for the loop to apply; an
     /// exit_plan_mode approval (ModeChanged) refreshes the badge without a key.
     #[test]
     fn shift_tab_cycles_mode_and_mode_changed_syncs_badge() {
         let mut app = App::new("s".into());
-        assert_eq!(app.mode, Mode::Default);
+        assert_eq!(app.mode, Mode::Manual);
         assert_eq!(
             app.on_key(key(KeyCode::BackTab)),
             Command::SetMode(Mode::AcceptEdits)
@@ -679,9 +679,9 @@ mod tests {
         assert_eq!(app.mode, Mode::Plan);
         assert_eq!(
             app.on_key(key(KeyCode::BackTab)),
-            Command::SetMode(Mode::Default)
+            Command::SetMode(Mode::Manual)
         );
-        assert_eq!(app.mode, Mode::Default);
+        assert_eq!(app.mode, Mode::Manual);
 
         // The agent side leaving plan mode syncs the badge with no keypress.
         app.mode = Mode::Plan;

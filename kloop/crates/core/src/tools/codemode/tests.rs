@@ -97,7 +97,7 @@ async fn tool_calls_pass_the_permission_gate() {
         deny: vec!["write_file".into()],
         ask: vec![],
     };
-    let perms = Permissions::new(Mode::Default, &rules, std::env::temp_dir(), None, None).unwrap();
+    let perms = Permissions::new(Mode::Manual, &rules, std::env::temp_dir(), None, None).unwrap();
     let ctx = with_permissions(test_ctx(0, "gate"), perms);
 
     let (out, is_error) = run(
@@ -554,7 +554,7 @@ async fn denied_mcp_source_tool_is_refused_in_a_program() {
         deny: vec!["srv__echo".into()],
         ask: vec![],
     };
-    let perms = Permissions::new(Mode::Default, &rules, std::env::temp_dir(), None, None).unwrap();
+    let perms = Permissions::new(Mode::Manual, &rules, std::env::temp_dir(), None, None).unwrap();
     let ctx = with_permissions(test_ctx_with_sources(0, "mcp-deny", vec![srv()]), perms);
     let (out, is_error) = run(
         r#"try { await tools.srv__echo({ text: "x" }); return "RAN"; }

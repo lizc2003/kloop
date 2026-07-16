@@ -588,7 +588,7 @@ async fn denied_tool_call_continues_the_turn() {
     let mut cfg = (*compaction_cfg(provider, 200_000, "denied")).clone();
     cfg.permissions = Arc::new(
         Permissions::new(
-            Mode::Default,
+            Mode::Manual,
             &PermissionRules::default(),
             std::env::temp_dir(),
             Some(Arc::new(DenyAll)),

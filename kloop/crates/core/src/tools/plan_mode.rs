@@ -135,7 +135,7 @@ mod tests {
         }
     }
 
-    /// Approve: plan mode turns off (restores default), the result confirms it,
+    /// Approve: plan mode turns off (restores manual), the result confirms it,
     /// and the approver was shown the plan text as the popup preview.
     #[tokio::test]
     async fn approve_exits_plan_mode_and_reports_it() {
@@ -144,15 +144,15 @@ mod tests {
         let (out, is_error) =
             run_tool("exit_plan_mode", json!({"plan": "1. do X\n2. do Y"}), &ctx).await;
         assert!(!is_error, "{out}");
-        assert!(out.contains("approved") && out.contains("default"), "{out}");
-        assert_eq!(ctx.cfg.permissions.mode(), Mode::Default, "left plan mode");
+        assert!(out.contains("approved") && out.contains("manual"), "{out}");
+        assert_eq!(ctx.cfg.permissions.mode(), Mode::Manual, "left plan mode");
         assert_eq!(
             approver.previews.lock().unwrap().as_slice(),
             &[Some("1. do X\n2. do Y".to_string())]
         );
 
         // The loop closes: a write that was hard-blocked in plan mode now
-        // reaches the ordinary ask path (default mode) — the block message is
+        // reaches the ordinary ask path (manual mode) — the block message is
         // gone, so the switch actually took effect. (The approver's script is
         // spent, so the ask resolves to deny, but with the "declined" wording.)
         let err = ctx
