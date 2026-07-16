@@ -9,6 +9,7 @@
 //! core never depends on this crate.
 
 mod http;
+pub mod oauth;
 mod sse;
 
 use std::collections::BTreeMap;
@@ -36,6 +37,8 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::sync::oneshot;
+
+use crate::oauth::OAuthSession;
 
 /// Sent in `initialize`. Servers negotiate back the version they support;
 /// this client accepts whatever comes back (minimal-client stance).
@@ -108,12 +111,18 @@ impl McpClient {
     }
 
     /// Speak MCP to a remote server over streamable HTTP. `headers` are extra
-    /// request headers (e.g. `Authorization: Bearer …`, custom headers) — the
-    /// CLI resolves any secrets before they reach here. Fails only if a header
-    /// name/value is malformed.
-    pub fn http(url: String, headers: BTreeMap<String, String>) -> Result<Self> {
+    /// static request headers (custom headers, or a static `Authorization:
+    /// Bearer …` — the CLI resolves any secrets before they reach here).
+    /// `oauth`, when present, injects (and refreshes) the bearer per request
+    /// instead — the two auth modes are mutually exclusive by construction.
+    /// Fails only if a header name/value is malformed.
+    pub fn http(
+        url: String,
+        headers: BTreeMap<String, String>,
+        oauth: Option<Arc<OAuthSession>>,
+    ) -> Result<Self> {
         Ok(Self {
-            transport: Box::new(http::HttpTransport::new(url, headers)?),
+            transport: Box::new(http::HttpTransport::new(url, headers, oauth)?),
         })
     }
 

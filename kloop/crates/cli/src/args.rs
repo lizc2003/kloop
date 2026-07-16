@@ -213,6 +213,7 @@ pub(crate) fn help_text() -> &'static str {
      \x20   kloop [OPTIONS]              start the interactive TUI (default)\n\
      \x20   kloop -p [OPTIONS] [PROMPT]  run one turn headless, then exit\n\
      \x20   kloop --serve                multi-session JSON-RPC server on stdio\n\
+     \x20   kloop mcp login <name>       OAuth login to a remote MCP server\n\
      \n\
      MODES:\n\
      \x20   -p, --headless        run one turn without a REPL/TUI, then exit\n\

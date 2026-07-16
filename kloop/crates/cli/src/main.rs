@@ -9,6 +9,7 @@ mod context;
 mod headless;
 mod image;
 mod mcp;
+mod mcp_auth;
 mod startup;
 mod ui;
 mod web;
@@ -50,10 +51,34 @@ use crate::startup::PERMISSIONS_CONFIG;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
 
+/// `kloop mcp <subcommand>`. Only `login <server-name>` exists today (interactive
+/// OAuth for a remote server); logout/list are noted as future work in the plan.
+async fn mcp_subcommand(args: &[String]) -> Result<ExitCode> {
+    const USAGE: &str = "usage: kloop mcp login <server-name>";
+    match args.first().map(String::as_str) {
+        Some("login") => match args.get(1) {
+            Some(name) if !name.starts_with('-') && args.len() == 2 => {
+                mcp_auth::run_login(name).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+            _ => anyhow::bail!("{USAGE}"),
+        },
+        Some(other) => {
+            anyhow::bail!("unknown `kloop mcp` subcommand '{other}' ({USAGE})")
+        }
+        None => anyhow::bail!("{USAGE}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args = parse_args(&args)?;
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // `kloop mcp …` is the one subcommand (OAuth login); everything else is
+    // flag-shaped and goes through the flag parser.
+    if raw.first().map(String::as_str) == Some("mcp") {
+        return mcp_subcommand(&raw[1..]).await;
+    }
+    let args = parse_args(&raw)?;
     if args.help {
         print!("{}", args::help_text());
         return Ok(ExitCode::SUCCESS);

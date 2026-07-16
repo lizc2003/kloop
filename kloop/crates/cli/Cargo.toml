@@ -13,7 +13,11 @@ kloop-tui = { workspace = true }
 kloop-web = { workspace = true }
 
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# MCP OAuth token store (plan 34b): serde derives the on-disk credential record,
+# sha2 keys it by name|hash(url) so a re-pointed server URL invalidates its token.
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }

@@ -151,3 +151,64 @@ keyring/浏览器打开不进单测(交互/系统副作用)。
 fmt/clippy/test 全绿,一次 commit;README 补 OAuth server 配置 + 登录命令示例;本文件
 补完成记录;HANDOFF 补能力条目。真 key 验收:接一个真实需 OAuth 的远程 MCP server
 (问用户要地址;或自建最小 OAuth MCP server)双轨跑通登录 + tools/call。
+
+## ✅ 完成记录(2026-07-16,提交 <待回填>)
+
+**开工定的点**:①借 crate vs 手写 → **手写协议原语**(PKCE=sha2+base64、token/refresh=
+一个 form POST、discovery=两个 GET、DCR=一个 JSON POST),只引 `sha2`+`getrandom` 两个
+纯用途小 crate(都已在 lockfile,getrandom 0.2 复用),reqwest 复用 mcp 内已有;②client_id
+→ **预配 + DCR 并存**(配了 `oauth_client_id` 就用,否则 POST `registration_endpoint`
+自注册 public client);③存储 → **单文件 `.kloop/mcp-oauth.json`(0600)**,keyring 后置;
+④登录入口 → **问用户 = 子命令 `kloop mcp login <name>`**(kloop 首个子命令,main 早分支);
+⑤真 key server → **问用户 = 自建本地 OAuth MCP server**。
+
+**落点**:
+- `crates/mcp/src/oauth.rs`(新,协议原语 + 登录流 + 请求期 session):PKCE(32B verifier→
+  sha256→base64url challenge)+ CSRF state;两步 path-aware discovery(GET server URL 读
+  401 `WWW-Authenticate` 抠 `resource_metadata`,缺则退 origin 的 well-known → PRM 取
+  `authorization_servers[0]` → AS metadata,候选含 `/.well-known/x/<path>` 与
+  `/<path>/.well-known/x` 及 openid 变体,PRM 失败退 origin 当 issuer);DCR;
+  手写 loopback 回调(`tokio::net::TcpListener` 绑 `127.0.0.1:0`,读一行 GET、校验
+  state、回 200 HTML,`await_callback` 收 timeout 参数,~5min);token 交换(带
+  `code_verifier`+`resource`,`expires_in`→**绝对 `expires_at`**);`OAuthSession`
+  (token 槽 + `refresh_lock` + `on_update` persist 回调 + `needs_relogin`):`bearer()`
+  临期主动刷、`refresh_after_401(used)` 401 兜底,两者共用 `refresh_if_current(stale)`
+  —— 用「当前 access==失败的那个」去重,把并发 401 惊群收敛成一次刷新;refresh 失败
+  (invalid_grant)清 + 标记需重登。`login()` 组装全流程,`open_url` 闭包把浏览器/打印留给
+  cli,reqwest 不外泄。
+- `crates/mcp/src/http.rs`:`HttpTransport` 加 `Option<Arc<OAuthSession>>`,`post_inner`
+  注入 `Authorization: Bearer`(记住 used bearer),401 → `Attempt::Unauthorized(bearer)`
+  → `request()` 刷一次重放(仍 401 则报错引导重登);`McpClient::http` 签名加 oauth。
+- `crates/cli/src/mcp_auth.rs`(新):`CredentialStore`(读改写 `.kloop/mcp-oauth.json`,
+  key=`name|hash16(sha256(url))`,0600,url 变即失效;`session_for` 建 `OAuthSession`+
+  刷新回填闭包)、`run_login`(解析 config→`oauth::login`→开浏览器→存)、`open_browser`
+  (mac `open`/linux `xdg-open`/win `start`,best-effort,URL 总打印)。
+- `crates/cli/src/mcp.rs`:`McpTransport::Http` 加 `oauth_client_id`/`oauth_scopes`
+  (与 `bearer_token_env_var` 互斥,混用报错);`connect_servers` 无静态 bearer 的 http
+  server 走 OAuth:有存 token 建 session,失败降级警告 + 提示 `kloop mcp login <name>`。
+- `crates/cli/src/main.rs`:`raw[0]=="mcp"` → `mcp_subcommand`(仅 `login <name>`)。
+
+**测试**:mcp 24 lib(oauth 15:WWW-Authenticate 解析、path-aware 候选、PKCE=sha256、
+authorize URL 形态、绝对 expires_at、near_expiry skew、discovery 两步 wiremock、DCR、
+回调收 code/拒错 state/超时、token 交换带 verifier+resource、session 主动刷+持久化、
+refresh 失败标记重登、login 端到端 mock 浏览器)+ http 加 401→刷→重放;cli mcp_auth
+5(key 依赖 name+url、存取往返+url 变失效、update_token 只改 token、session_for、0600)+
+mcp config 2 新增(oauth 键往返、bearer+oauth 混用拒)。fmt/clippy 干净,workspace 全绿。
+
+**真 key 双轨验收**(自建 stdlib Python OAuth 2.1 MCP server:discovery+DCR+authorize
+自批+token 校 PKCE+`/mcp` bearer 门,一个 `get_vault_code` 工具回不可猜的 `KLP-…`):
+- `kloop mcp login local`:401→PRM→AS metadata、DCR 拿 client_id、authorize URL(S256+
+  state+resource)、loopback 回调(随机端口)、PKCE 校验过、token 存盘(绝对 expires_at、
+  0600)—— 全链打通。
+- **anthropic 轨**(claude-sonnet-4-6)+ **openai 轨**(gpt-5.4-mini):都用存好的 token
+  连上(`connected, 1 tool`)、调 `get_vault_code`、答出当次 `KLP-02B42933` ✓。
+- **请求期主动刷新**:把存盘 `expires_at` 改成过期→跑一轮,传输层刷 `/token`、答对、
+  盘上 token 轮换 + `expires_at` 刷到未来(persist 回调生效)✓。
+- **无 token 降级**:删 token 文件→连接 401→降级警告带 `run: kloop mcp login local`,
+  不阻塞启动 ✓。
+
+**未做(仍挂账,记为可能性)**:keyring/加密后端 + 跨进程刷新文件锁、CIMD(SEP-991)、
+XAA(SEP-990)、step-up(403 insufficient_scope 提权)、手动粘贴回调(无浏览器降级)、
+`headersHelper` 动态头、多 server 共用回调的 callback_id 消歧、固定端口/自定义 redirect_uri
+配置、旧版 SSE / ws / sdk / claudeai-proxy 传输(延续 plan 34)、client_credentials /
+device code 等其它 grant。

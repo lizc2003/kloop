@@ -21,6 +21,8 @@ use kloop_core::tools::ToolSource;
 use kloop_mcp::McpClient;
 use kloop_protocol::ToolDef;
 
+use crate::mcp_auth::CredentialStore;
+
 /// Model-visible tool names must satisfy the providers' `[a-zA-Z0-9_-]`
 /// pattern AND kloop's permission-rule grammar (alnum + `_` only, so a
 /// "p"-persisted allow rule parses back on the next start). 64 is the
@@ -47,18 +49,31 @@ pub enum McpTransport {
     },
     Http {
         url: String,
-        /// Name of the env var holding the bearer token — never the token
-        /// itself (secrets don't belong in config; codex form).
+        /// Name of the env var holding a static bearer token — never the token
+        /// itself (secrets don't belong in config; codex form). Mutually
+        /// exclusive with the OAuth path below.
         bearer_token_env_var: Option<String>,
         /// Static extra request headers.
         http_headers: BTreeMap<String, String>,
+        /// OAuth (plan 34b): a preconfigured client_id to skip dynamic client
+        /// registration. Only meaningful on the OAuth path (no static bearer).
+        oauth_client_id: Option<String>,
+        /// OAuth: scopes to request at login, overriding those advertised by
+        /// discovery. Empty = let discovery/the server decide.
+        oauth_scopes: Vec<String>,
     },
 }
 
 /// Keys valid only for one transport, so a stdio-only key under a `url` server
 /// (or vice-versa) is a loud error, not a silent no-op.
 const STDIO_ONLY_KEYS: &[&str] = &["command", "env"];
-const HTTP_ONLY_KEYS: &[&str] = &["url", "bearer_token_env_var", "http_headers"];
+const HTTP_ONLY_KEYS: &[&str] = &[
+    "url",
+    "bearer_token_env_var",
+    "http_headers",
+    "oauth_client_id",
+    "oauth_scopes",
+];
 
 /// Parse `[mcp.servers.<name>]` tables from `.kloop/config.toml`. A missing
 /// file or missing section is an empty list; a malformed section is an error
@@ -160,11 +175,34 @@ fn parse_server(name: &str, spec: &toml::Table) -> Result<McpServerConfig> {
                 ),
                 None => None,
             };
+            let oauth_client_id = match spec.get("oauth_client_id") {
+                Some(v) => Some(
+                    v.as_str()
+                        .with_context(|| {
+                            format!("[mcp.servers.{name}].oauth_client_id must be a string")
+                        })?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            let oauth_scopes = str_list("oauth_scopes")?;
+            // Static bearer and OAuth are two different auth modes; OAuth keys
+            // under a static-bearer server would silently do nothing.
+            if bearer_token_env_var.is_some()
+                && (oauth_client_id.is_some() || !oauth_scopes.is_empty())
+            {
+                bail!(
+                    "[mcp.servers.{name}] mixes bearer_token_env_var (static bearer) with \
+                     oauth_client_id/oauth_scopes; pick one auth mode"
+                );
+            }
             (
                 McpTransport::Http {
                     url,
                     bearer_token_env_var,
                     http_headers: str_table("http_headers")?,
+                    oauth_client_id,
+                    oauth_scopes,
                 },
                 STDIO_ONLY_KEYS,
             )
@@ -315,8 +353,19 @@ pub async fn connect_servers(
     servers: Vec<McpServerConfig>,
     warn: &dyn Fn(&str),
 ) -> Vec<Arc<dyn ToolSource>> {
+    let store = Arc::new(CredentialStore::default_path());
     let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
     for server in servers {
+        // A remote server with no static bearer takes the OAuth path: use a
+        // stored token if the user has logged in; else connect unauthenticated
+        // and, if that's rejected, point them at the login command.
+        let oauth_capable = matches!(
+            &server.transport,
+            McpTransport::Http {
+                bearer_token_env_var: None,
+                ..
+            }
+        );
         let connect = async {
             let client = match &server.transport {
                 McpTransport::Stdio { command, env } => McpClient::spawn(command, env)?,
@@ -324,9 +373,15 @@ pub async fn connect_servers(
                     url,
                     bearer_token_env_var,
                     http_headers,
+                    ..
                 } => {
                     let headers = http_headers_for(bearer_token_env_var, http_headers)?;
-                    McpClient::http(url.clone(), headers)?
+                    let oauth = if bearer_token_env_var.is_none() {
+                        store.session_for(&server.name, url)
+                    } else {
+                        None
+                    };
+                    McpClient::http(url.clone(), headers, oauth)?
                 }
             };
             client.initialize().await?;
@@ -343,10 +398,17 @@ pub async fn connect_servers(
                 ));
                 sources.push(Arc::new(source));
             }
-            Err(e) => warn(&format!(
-                "mcp server '{}' unavailable, skipped: {e:#}",
-                server.name
-            )),
+            Err(e) => {
+                let hint = if oauth_capable {
+                    format!("; if it needs OAuth, run: kloop mcp login {}", server.name)
+                } else {
+                    String::new()
+                };
+                warn(&format!(
+                    "mcp server '{}' unavailable, skipped: {e:#}{hint}",
+                    server.name
+                ))
+            }
         }
     }
     sources
@@ -385,6 +447,11 @@ url = "https://mcp.example.com/mcp"
 bearer_token_env_var = "EXAMPLE_MCP_TOKEN"
 http_headers = { X-Tenant = "acme" }
 readonly = ["search"]
+
+[mcp.servers.oauthy]
+url = "https://oauth.example.com/mcp"
+oauth_client_id = "preconfigured-123"
+oauth_scopes = ["mcp.read", "mcp.write"]
 "#,
         );
         let servers = load_mcp_servers(&path).unwrap();
@@ -412,11 +479,24 @@ readonly = ["search"]
                     readonly: vec!["read_graph".into(), "search_nodes".into()],
                 },
                 McpServerConfig {
+                    name: "oauthy".into(),
+                    transport: McpTransport::Http {
+                        url: "https://oauth.example.com/mcp".into(),
+                        bearer_token_env_var: None,
+                        http_headers: BTreeMap::new(),
+                        oauth_client_id: Some("preconfigured-123".into()),
+                        oauth_scopes: vec!["mcp.read".into(), "mcp.write".into()],
+                    },
+                    readonly: vec![],
+                },
+                McpServerConfig {
                     name: "remote".into(),
                     transport: McpTransport::Http {
                         url: "https://mcp.example.com/mcp".into(),
                         bearer_token_env_var: Some("EXAMPLE_MCP_TOKEN".into()),
                         http_headers: BTreeMap::from([("X-Tenant".into(), "acme".into())]),
+                        oauth_client_id: None,
+                        oauth_scopes: vec![],
                     },
                     readonly: vec!["search".into()],
                 },
@@ -467,6 +547,11 @@ readonly = ["search"]
             (
                 "plaintext",
                 "[mcp.servers.x]\nurl = \"https://h/mcp\"\nbearer_token = \"sk-secret\"\n",
+            ),
+            // Static bearer + OAuth keys is a contradiction.
+            (
+                "bearerplusoauth",
+                "[mcp.servers.x]\nurl = \"https://h/mcp\"\nbearer_token_env_var = \"T\"\noauth_client_id = \"c\"\n",
             ),
         ] {
             let path = write_config(tag, bad);

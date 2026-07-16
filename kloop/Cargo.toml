@@ -41,6 +41,12 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# MCP remote OAuth (plan 34b): PKCE challenge = base64url(sha256(verifier)); a
+# CSPRNG for the verifier/state. Both are tiny single-purpose crates (kloop's
+# "borrow a small crate, not a framework" line) already resolved in the tree —
+# getrandom 0.2 reuses the transitive copy; sha2 is RustCrypto, no new toolchain.
+getrandom = "0.2"
+sha2 = "0.10"
 # QuickJS engine for code-mode. `futures` = AsyncRuntime/AsyncContext, `parallel` =
 # Send+Sync handles for the multi-thread tokio runtime, `macro` = the binding macros.
 # `bindgen` is deliberately OFF: rquickjs-sys ships pregenerated bindings, so no libclang.

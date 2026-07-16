@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -26,10 +27,12 @@ use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
 use reqwest::header::ACCEPT;
+use reqwest::header::AUTHORIZATION;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::json;
 use serde_json::Value;
 
+use crate::oauth::OAuthSession;
 use crate::sse::SseParser;
 use crate::Transport;
 
@@ -60,17 +63,26 @@ pub(crate) struct HttpTransport {
     /// Serializes session recovery so a burst of concurrent 404s re-handshakes
     /// once, not once per caller.
     reinit_lock: tokio::sync::Mutex<()>,
+    /// OAuth (plan 34b): when set, the bearer is injected (and refreshed) per
+    /// request from here instead of being a fixed `base_headers` entry. Absent
+    /// for no-auth and static-bearer servers.
+    oauth: Option<Arc<OAuthSession>>,
     retry_delays: Vec<Duration>,
 }
 
 impl HttpTransport {
-    pub(crate) fn new(url: String, headers: BTreeMap<String, String>) -> Result<Self> {
-        Self::with_retry(url, headers, DEFAULT_RETRY_DELAYS.to_vec())
+    pub(crate) fn new(
+        url: String,
+        headers: BTreeMap<String, String>,
+        oauth: Option<Arc<OAuthSession>>,
+    ) -> Result<Self> {
+        Self::with_retry(url, headers, oauth, DEFAULT_RETRY_DELAYS.to_vec())
     }
 
     fn with_retry(
         url: String,
         headers: BTreeMap<String, String>,
+        oauth: Option<Arc<OAuthSession>>,
         retry_delays: Vec<Duration>,
     ) -> Result<Self> {
         let mut base_headers = HeaderMap::new();
@@ -90,6 +102,7 @@ impl HttpTransport {
             protocol_version: Mutex::new(None),
             init_params: Mutex::new(None),
             reinit_lock: tokio::sync::Mutex::new(()),
+            oauth,
             retry_delays,
         })
     }
@@ -109,6 +122,7 @@ impl HttpTransport {
             match self.post_once(body, expect_id, timeout).await {
                 Ok(v) => return Ok(v),
                 Err(Attempt::SessionExpired) => return Err(PostError::SessionExpired),
+                Err(Attempt::Unauthorized(bearer)) => return Err(PostError::Unauthorized(bearer)),
                 Err(Attempt::Fatal(e)) => return Err(PostError::Other(e)),
                 Err(Attempt::Retryable(e)) => {
                     let Some(delay) = self.retry_delays.get(attempt).copied() else {
@@ -147,6 +161,16 @@ impl HttpTransport {
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
             .json(body);
+        // OAuth bearer, refreshed proactively if near expiry. Remembered so a
+        // 401 can refresh exactly the token that failed (the herd-dedup key).
+        let used_bearer = match &self.oauth {
+            Some(oauth) => {
+                let bearer = oauth.bearer().await.map_err(Attempt::Fatal)?;
+                req = req.header(AUTHORIZATION, format!("Bearer {bearer}"));
+                Some(bearer)
+            }
+            None => None,
+        };
         let had_session = {
             let session = self.session_id.lock().unwrap();
             if let Some(sid) = session.as_deref() {
@@ -179,9 +203,16 @@ impl HttpTransport {
             if code == 404 && had_session {
                 return Err(Attempt::SessionExpired);
             }
+            // With OAuth, a 401 means the token was rejected — refresh it once
+            // and replay (handled in `request`). Without OAuth it's terminal.
+            if code == 401 {
+                if let Some(bearer) = used_bearer {
+                    return Err(Attempt::Unauthorized(bearer));
+                }
+            }
             let text = resp.text().await.unwrap_or_default();
             let msg = anyhow!("mcp http {status}: {text}");
-            // 401/403 and other 4xx are terminal (retrying won't help); the
+            // 403 and other 4xx are terminal (retrying won't help); the
             // server-error and transient-load codes retry.
             if code == 408 || code == 429 || (500..600).contains(&code) {
                 return Err(Attempt::Retryable(msg));
@@ -289,6 +320,24 @@ impl Transport for HttpTransport {
                         .await
                         .map_err(PostError::into_anyhow)?
                 }
+                Err(PostError::Unauthorized(used_bearer)) => {
+                    // `Unauthorized` is only produced when oauth is set.
+                    let oauth = self
+                        .oauth
+                        .as_ref()
+                        .expect("Unauthorized requires an OAuth session");
+                    oauth.refresh_after_401(&used_bearer).await?;
+                    match self.post_with_retry(&body, Some(id), timeout).await {
+                        Ok(v) => v,
+                        Err(PostError::Unauthorized(_)) => {
+                            return Err(anyhow!(
+                                "mcp http: still unauthorized after refreshing the OAuth token; \
+                                 re-run `kloop mcp login`"
+                            ))
+                        }
+                        Err(other) => return Err(other.into_anyhow()),
+                    }
+                }
                 Err(other) => return Err(other.into_anyhow()),
             };
             result.context("mcp http: request produced no response")
@@ -316,6 +365,9 @@ impl Transport for HttpTransport {
 /// Outcome of the full retry loop.
 enum PostError {
     SessionExpired,
+    /// A 401 under OAuth, carrying the bearer that was rejected so `request`
+    /// can refresh exactly that token and replay.
+    Unauthorized(String),
     Other(anyhow::Error),
 }
 
@@ -323,6 +375,7 @@ impl PostError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             PostError::SessionExpired => anyhow!("mcp session expired"),
+            PostError::Unauthorized(_) => anyhow!("mcp http: unauthorized (401)"),
             PostError::Other(e) => e,
         }
     }
@@ -331,6 +384,8 @@ impl PostError {
 /// Outcome of one HTTP attempt.
 enum Attempt {
     SessionExpired,
+    /// A 401 under OAuth; carries the rejected bearer for the refresh dedup.
+    Unauthorized(String),
     Retryable(anyhow::Error),
     Fatal(anyhow::Error),
 }
@@ -381,11 +436,13 @@ fn pick_message(value: &Value, want: u64) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::OAuthToken;
     use crate::McpClient;
     use serde_json::json;
     use wiremock::matchers::body_partial_json;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
+    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::Request;
@@ -393,9 +450,18 @@ mod tests {
     use wiremock::ResponseTemplate;
 
     fn client(url: String, headers: BTreeMap<String, String>) -> McpClient {
+        client_with_oauth(url, headers, None)
+    }
+
+    fn client_with_oauth(
+        url: String,
+        headers: BTreeMap<String, String>,
+        oauth: Option<std::sync::Arc<OAuthSession>>,
+    ) -> McpClient {
         // Zero backoff keeps the retry tests fast.
         let transport =
-            HttpTransport::with_retry(url, headers, vec![Duration::ZERO, Duration::ZERO]).unwrap();
+            HttpTransport::with_retry(url, headers, oauth, vec![Duration::ZERO, Duration::ZERO])
+                .unwrap();
         McpClient::from_transport(Box::new(transport))
     }
 
@@ -625,5 +691,58 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
         client.initialize().await.unwrap();
         let out = client.call_tool("echo", &json!({})).await.unwrap();
         assert_eq!(out, "recovered");
+    }
+
+    /// An OAuth server: the stale bearer 401s, the transport refreshes it once
+    /// (POST /token), and the replayed request carries the fresh bearer.
+    #[tokio::test]
+    async fn oauth_401_refreshes_bearer_and_replays() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        // Refresh endpoint mints a new access token (form-encoded body).
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=refresh_token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "at-new", "expires_in": 3600})),
+            )
+            .mount(&server)
+            .await;
+        // The MCP endpoint: stale bearer → 401, fresh bearer → result.
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer at-old"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired token"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer at-new"))
+            .respond_with(RpcResult::new(
+                json!({"content": [{"type": "text", "text": "authed"}]}),
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(OAuthSession::new(
+            format!("{base}/token"),
+            "client-1".into(),
+            format!("{base}/mcp"),
+            OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-1".into()),
+                expires_at: None, // not proactively refreshed — force the 401 path
+                scope: None,
+            },
+            Box::new(|_| {}),
+        ));
+        let client = client_with_oauth(format!("{base}/mcp"), BTreeMap::new(), Some(session));
+        let out = client.call_tool("echo", &json!({})).await.unwrap();
+        assert_eq!(out, "authed");
     }
 }

@@ -326,11 +326,16 @@ command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "sandbox"]
 env = { }                                          # merged onto the process env
 readonly = ["read_text_file", "list_directory"]    # eligible for concurrent dispatch
 
-[mcp.servers.remote]                               # streamable HTTP: remote server
+[mcp.servers.remote]                               # streamable HTTP: static bearer
 url = "https://mcp.example.com/mcp"
 bearer_token_env_var = "EXAMPLE_MCP_TOKEN"         # env var NAME, never the token itself
 http_headers = { X-Tenant = "acme" }               # static extra request headers
 readonly = ["search"]
+
+[mcp.servers.github]                               # streamable HTTP: OAuth (plan 34b)
+url = "https://api.githubcopilot.com/mcp/"
+# oauth_client_id = "..."                          # optional: skip dynamic registration
+# oauth_scopes = ["repo", "read:user"]             # optional: override discovered scopes
 ```
 
 Secrets never live in the config: `bearer_token_env_var` names an environment
@@ -341,7 +346,28 @@ Over HTTP, one POST carries each request, the reply comes back as
 `Mcp-Session-Id` header rides every subsequent request; a `404` for a
 session-bearing request re-runs the handshake once, and 408/429/5xx and
 transient network errors retry (250ms, 1s, then a final try) while 401/403 are
-terminal. OAuth and the legacy SSE transport are out of scope (see the plan).
+terminal.
+
+**OAuth (plan 34b).** A remote server with no `bearer_token_env_var` takes the
+OAuth 2.1 authorization-code path — the way the hosted MCP servers (GitHub,
+Linear, Notion) authenticate a user. Log in once:
+
+```
+kloop mcp login github
+```
+
+This runs two-step discovery (RFC 9728 → RFC 8414, from the server's `401
+WWW-Authenticate` header), registers a client if none is preconfigured
+(RFC 7591 dynamic client registration), opens your browser to authorize with
+PKCE (S256) + a CSRF `state`, catches the redirect on a loopback listener, and
+saves the token to `.kloop/mcp-oauth.json` (mode `0600`, keyed by
+`name|hash(url)`, with an **absolute** expiry). Thereafter kloop injects the
+bearer per request and refreshes it proactively before expiry (and once more on
+a 401); a failed refresh clears the token and asks you to log in again. Startup
+never blocks: a server that needs OAuth but has no stored token degrades to a
+warning pointing at `kloop mcp login <name>`. Keyring storage, cross-process
+refresh locks, the legacy SSE transport, and the manual-paste (no-browser)
+fallback are out of scope (see the plan).
 
 Servers are spawned/connected once at startup (stdio children killed on exit);
 the handshake is `initialize` → `notifications/initialized` → `tools/list`
@@ -363,8 +389,11 @@ whole-tool granularity.
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (protocol layer transport-agnostic behind a
 `Transport` trait — stdio and HTTP both implement it; it pulls `reqwest` for
-the HTTP transport but core never depends on it); the CLI glues them (config
-parsing, secret resolution, namespacing, the adapter).
+the HTTP transport and the OAuth wire — PKCE/discovery/token exchange/refresh in
+`oauth.rs` — but core never depends on it); the CLI glues them (config parsing,
+secret resolution, namespacing, the adapter, and the OAuth login command + token
+store in `mcp_auth.rs`, so nothing with a terminal/config-file side-effect
+leaks into the wire crate).
 
 ### Deferred tools + tool_search
 
@@ -1320,6 +1349,13 @@ saved and resumable — see Session persistence above.
   `Mcp-Session-Id`/`MCP-Protocol-Version` headers, tools/call over an SSE
   response with an image block, bearer-header injection, 5xx retry then
   success, 401 terminal (no retry), and 404 session-expiry re-handshaking once.
+  OAuth (plan 34b) is tested in `oauth.rs`: `WWW-Authenticate` parsing,
+  path-aware discovery candidates, two-step discovery + DCR + token exchange
+  over wiremock (verifier/resource sent, absolute `expires_at`), a real loopback
+  callback (matching state, CSRF rejection, timeout), proactive + refresh-fail
+  session behaviour, and full login end-to-end with a mock browser; the CLI's
+  `mcp_auth.rs` covers the keyed 0600 token store. The transport's 401→refresh
+  →replay is a `http.rs` test.
 - **kloop-codemode** — the QuickJS engine in isolation: the async op bridge
   (a tool call returns a JS promise resolved from a Rust future), real
   concurrency proven with a 2-party barrier that a serial engine would
@@ -1410,7 +1446,7 @@ crates/server/      kloop-server — multi-session JSON-RPC frontend
   src/wire.rs       envelopes (request/response/notification/server request)
   src/lib.rs        serve loop, per-thread workers, approval routing
 
-crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP (protocol + reqwest)
+crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAuth (protocol + reqwest)
   src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
                     tools/list pagination, tools/call, content rendering
 
@@ -1433,6 +1469,8 @@ crates/cli/         kloop — the binary
   src/mcp.rs        [mcp.servers] config, startup connection with
                     degrade-to-warning, {server}__{tool} namespacing,
                     the ToolSource adapter
+  src/mcp_auth.rs   MCP OAuth: `kloop mcp login`, the 0600 token store,
+                    connect-time OAuthSession build (plan 34b)
   src/context.rs    project-context IO: instruction-file discovery
                     (global + git root→cwd; main + .kloop/rules/*.md + local
                     override per dir; @import expansion), env, git snapshot
