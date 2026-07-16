@@ -1,6 +1,6 @@
 # Plan 36 — 用户自定义 slash 命令(plan 23 挂账领编号)✅
 
-> ✅ 首片(纯发现根)完成(提交号待回填,随后 docs 提交补)。**方案 A**(commands 目录作 skills 第二发现
+> ✅ 首片(纯发现根)完成(提交 56f3e51)。**方案 A**(commands 目录作 skills 第二发现
 > 根)落地:`.kloop/commands/*.md` 单文件作 `SkillSource::Command` 进同一 skill 注册
 > 表,复用 skills 全部展开/触发/slash 机制。决定见文末完成记录。`!cmd`/`@file` 注入按
 > 决定切到下一片(未做,见下)。
@@ -75,7 +75,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 commands 目录;本文件补完�
 补能力条目;plan 23/28 的挂账清单同步销账。真 key 验一次 `/name args` 展开 + `!cmd`
 注入闭环。
 
-## 完成记录(首片:纯发现根,提交号待回填)
+## 完成记录(首片:纯发现根,提交 56f3e51)
 
 **决定(开工时定,用户"同意"倾向)**:① 形态总闸取**方案 A**(commands 目录作 skills 第
 二发现根,机制零新增);② 首片只做**纯发现根**,`!cmd`/`@file` 注入切到下一片(各带权
