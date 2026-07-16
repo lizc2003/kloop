@@ -314,22 +314,40 @@ dropped/never-answered reply denies (interrupt the turn to unblock).
 
 ## MCP client (Phase 2, sixth slice)
 
-kloop connects to external MCP tool servers over stdio (JSON-RPC 2.0,
-newline-delimited JSON — one object per line). Declare servers in
-`.kloop/config.toml`:
+kloop connects to external MCP tool servers over one of two transports: a
+local child process over **stdio** (JSON-RPC 2.0, newline-delimited JSON — one
+object per line) or a remote endpoint over **streamable HTTP** (plan 34).
+Declare servers in `.kloop/config.toml`; `command` selects stdio, `url`
+selects HTTP (exactly one, or it's a config error):
 
 ```toml
-[mcp.servers.fs]
+[mcp.servers.fs]                                   # stdio: local child process
 command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "sandbox"]
 env = { }                                          # merged onto the process env
 readonly = ["read_text_file", "list_directory"]    # eligible for concurrent dispatch
+
+[mcp.servers.remote]                               # streamable HTTP: remote server
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "EXAMPLE_MCP_TOKEN"         # env var NAME, never the token itself
+http_headers = { X-Tenant = "acme" }               # static extra request headers
+readonly = ["search"]
 ```
 
-Servers are spawned once at startup (killed on exit); the handshake is
-`initialize` → `notifications/initialized` → `tools/list` (with `nextCursor`
-pagination), and each advertised tool joins the model's tool list as
-`{server}__{tool}` with its inputSchema passed through verbatim. A failing
-server degrades to a startup warning — MCP never blocks kloop. Name
+Secrets never live in the config: `bearer_token_env_var` names an environment
+variable that kloop reads at connect time into `Authorization: Bearer <token>`
+(an inline `bearer_token` is refused; a referenced-but-unset var is an error).
+Over HTTP, one POST carries each request, the reply comes back as
+`application/json` or a short-lived `text/event-stream`, and the server's
+`Mcp-Session-Id` header rides every subsequent request; a `404` for a
+session-bearing request re-runs the handshake once, and 408/429/5xx and
+transient network errors retry (250ms, 1s, then a final try) while 401/403 are
+terminal. OAuth and the legacy SSE transport are out of scope (see the plan).
+
+Servers are spawned/connected once at startup (stdio children killed on exit);
+the handshake is `initialize` → `notifications/initialized` → `tools/list`
+(with `nextCursor` pagination), and each advertised tool joins the model's tool
+list as `{server}__{tool}` with its inputSchema passed through verbatim. A
+failing server degrades to a startup warning — MCP never blocks kloop. Name
 sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
 allow rules round-trip through the permission-rule grammar); collisions warn
 at startup and the colliding later definitions are skipped.
@@ -343,8 +361,10 @@ for permission unless covered by an allow rule (`memory__create_entities` in
 whole-tool granularity.
 
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
-client is the `kloop-mcp` crate (depends only on protocol); the CLI glues
-them (config parsing, namespacing, the adapter).
+client is the `kloop-mcp` crate (protocol layer transport-agnostic behind a
+`Transport` trait — stdio and HTTP both implement it; it pulls `reqwest` for
+the HTTP transport but core never depends on it); the CLI glues them (config
+parsing, secret resolution, namespacing, the adapter).
 
 ### Deferred tools + tool_search
 
@@ -1295,7 +1315,11 @@ saved and resumable — see Session persistence above.
   schema passthrough, tools/call round-trip with content-block rendering,
   isError→Err and JSON-RPC-error→Err mapping, EOF fails pending requests,
   server-initiated requests refused with -32601 amid noise, concurrent
-  calls routed by id.
+  calls routed by id. Streamable HTTP transport (plan 34) has wiremock
+  contract tests: HTTP handshake + paginated tools/list echoing the
+  `Mcp-Session-Id`/`MCP-Protocol-Version` headers, tools/call over an SSE
+  response with an image block, bearer-header injection, 5xx retry then
+  success, 401 terminal (no retry), and 404 session-expiry re-handshaking once.
 - **kloop-codemode** — the QuickJS engine in isolation: the async op bridge
   (a tool call returns a JS promise resolved from a Rust future), real
   concurrency proven with a 2-party barrier that a serial engine would
@@ -1386,7 +1410,7 @@ crates/server/      kloop-server — multi-session JSON-RPC frontend
   src/wire.rs       envelopes (request/response/notification/server request)
   src/lib.rs        serve loop, per-thread workers, approval routing
 
-crates/mcp/         kloop-mcp — MCP stdio wire client (depends on protocol only)
+crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP (protocol + reqwest)
   src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
                     tools/list pagination, tools/call, content rendering
 

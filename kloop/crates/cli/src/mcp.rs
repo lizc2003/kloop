@@ -30,12 +30,35 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
-    pub command: Vec<String>,
-    pub env: BTreeMap<String, String>,
+    pub transport: McpTransport,
     /// Raw (un-prefixed) tool names the user vouches are read-only: eligible
     /// for concurrent dispatch. Everything else runs serial.
     pub readonly: Vec<String>,
 }
+
+/// How to reach a server: a local child over stdio, or a remote endpoint over
+/// streamable HTTP. `command` vs `url` in the config selects between them
+/// (untagged, like codex).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpTransport {
+    Stdio {
+        command: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        url: String,
+        /// Name of the env var holding the bearer token — never the token
+        /// itself (secrets don't belong in config; codex form).
+        bearer_token_env_var: Option<String>,
+        /// Static extra request headers.
+        http_headers: BTreeMap<String, String>,
+    },
+}
+
+/// Keys valid only for one transport, so a stdio-only key under a `url` server
+/// (or vice-versa) is a loud error, not a silent no-op.
+const STDIO_ONLY_KEYS: &[&str] = &["command", "env"];
+const HTTP_ONLY_KEYS: &[&str] = &["url", "bearer_token_env_var", "http_headers"];
 
 /// Parse `[mcp.servers.<name>]` tables from `.kloop/config.toml`. A missing
 /// file or missing section is an empty list; a malformed section is an error
@@ -58,52 +81,131 @@ pub fn load_mcp_servers(config_path: &Path) -> Result<Vec<McpServerConfig>> {
         let spec = spec
             .as_table()
             .with_context(|| format!("[mcp.servers.{name}] must be a table"))?;
-        let str_list = |key: &str, required: bool| -> Result<Vec<String>> {
-            let Some(entries) = spec.get(key) else {
-                if required {
-                    bail!("[mcp.servers.{name}] is missing '{key}'");
-                }
-                return Ok(Vec::new());
-            };
-            entries
-                .as_array()
-                .and_then(|list| {
-                    list.iter()
-                        .map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .with_context(|| format!("[mcp.servers.{name}].{key} must be a string array"))
-        };
-        let command = str_list("command", /*required*/ true)?;
-        if command.is_empty() {
-            bail!("[mcp.servers.{name}].command must not be empty");
-        }
-        let readonly = str_list("readonly", /*required*/ false)?;
-        let mut env = BTreeMap::new();
-        if let Some(env_spec) = spec.get("env") {
-            let env_spec = env_spec
-                .as_table()
-                .with_context(|| format!("[mcp.servers.{name}].env must be a table"))?;
-            for (k, v) in env_spec {
-                let v = v
-                    .as_str()
-                    .with_context(|| format!("[mcp.servers.{name}].env.{k} must be a string"))?;
-                env.insert(k.clone(), v.to_string());
-            }
-        }
-        for key in spec.keys() {
-            if !matches!(key.as_str(), "command" | "env" | "readonly") {
-                bail!("[mcp.servers.{name}] has unknown key '{key}' (command | env | readonly)");
-            }
-        }
-        out.push(McpServerConfig {
-            name: name.clone(),
-            command,
-            env,
-            readonly,
-        });
+        out.push(parse_server(name, spec)?);
     }
     Ok(out)
+}
+
+fn parse_server(name: &str, spec: &toml::Table) -> Result<McpServerConfig> {
+    // Secrets belong in an env var referenced by name, never inline.
+    if spec.contains_key("bearer_token") {
+        bail!(
+            "[mcp.servers.{name}] has plaintext 'bearer_token'; use \
+             bearer_token_env_var = \"<ENV_VAR_NAME>\" (secrets don't belong in config)"
+        );
+    }
+    let str_list = |key: &str| -> Result<Vec<String>> {
+        let Some(entries) = spec.get(key) else {
+            return Ok(Vec::new());
+        };
+        entries
+            .as_array()
+            .and_then(|list| {
+                list.iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .with_context(|| format!("[mcp.servers.{name}].{key} must be a string array"))
+    };
+    let str_table = |key: &str| -> Result<BTreeMap<String, String>> {
+        let mut map = BTreeMap::new();
+        if let Some(table) = spec.get(key) {
+            let table = table
+                .as_table()
+                .with_context(|| format!("[mcp.servers.{name}].{key} must be a table"))?;
+            for (k, v) in table {
+                let v = v
+                    .as_str()
+                    .with_context(|| format!("[mcp.servers.{name}].{key}.{k} must be a string"))?;
+                map.insert(k.clone(), v.to_string());
+            }
+        }
+        Ok(map)
+    };
+
+    let has_command = spec.contains_key("command");
+    let has_url = spec.contains_key("url");
+    let (transport, allowed_extra): (McpTransport, &[&str]) = match (has_command, has_url) {
+        (true, true) => {
+            bail!("[mcp.servers.{name}] sets both 'command' and 'url'; pick one transport")
+        }
+        (false, false) => {
+            bail!("[mcp.servers.{name}] must set 'command' (stdio) or 'url' (remote http)")
+        }
+        (true, false) => {
+            let command = str_list("command")?;
+            if command.is_empty() {
+                bail!("[mcp.servers.{name}].command must not be empty");
+            }
+            (
+                McpTransport::Stdio {
+                    command,
+                    env: str_table("env")?,
+                },
+                HTTP_ONLY_KEYS,
+            )
+        }
+        (false, true) => {
+            let url = spec["url"]
+                .as_str()
+                .with_context(|| format!("[mcp.servers.{name}].url must be a string"))?
+                .to_string();
+            let bearer_token_env_var = match spec.get("bearer_token_env_var") {
+                Some(v) => Some(
+                    v.as_str()
+                        .with_context(|| {
+                            format!("[mcp.servers.{name}].bearer_token_env_var must be a string")
+                        })?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            (
+                McpTransport::Http {
+                    url,
+                    bearer_token_env_var,
+                    http_headers: str_table("http_headers")?,
+                },
+                STDIO_ONLY_KEYS,
+            )
+        }
+    };
+
+    for key in spec.keys() {
+        if allowed_extra.contains(&key.as_str()) {
+            bail!("[mcp.servers.{name}] has '{key}', which does not apply to this transport",);
+        }
+        let known = STDIO_ONLY_KEYS.contains(&key.as_str())
+            || HTTP_ONLY_KEYS.contains(&key.as_str())
+            || key == "readonly";
+        if !known {
+            bail!("[mcp.servers.{name}] has unknown key '{key}'");
+        }
+    }
+
+    Ok(McpServerConfig {
+        name: name.to_string(),
+        transport,
+        readonly: str_list("readonly")?,
+    })
+}
+
+/// Build the extra HTTP request headers for a remote server: the static
+/// `http_headers` plus, if `bearer_token_env_var` is set, an `Authorization:
+/// Bearer <token>` resolved from the process environment (a missing env var is
+/// an error — a silently-unauthenticated request would just 401).
+fn http_headers_for(
+    bearer_token_env_var: &Option<String>,
+    http_headers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut headers = http_headers.clone();
+    if let Some(var) = bearer_token_env_var {
+        let token = std::env::var(var).with_context(|| {
+            format!("bearer_token_env_var '{var}' is not set in the environment")
+        })?;
+        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+    }
+    Ok(headers)
 }
 
 /// `{server}__{tool}` with every character outside `[A-Za-z0-9_]` replaced
@@ -216,7 +318,17 @@ pub async fn connect_servers(
     let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
     for server in servers {
         let connect = async {
-            let client = McpClient::spawn(&server.command, &server.env)?;
+            let client = match &server.transport {
+                McpTransport::Stdio { command, env } => McpClient::spawn(command, env)?,
+                McpTransport::Http {
+                    url,
+                    bearer_token_env_var,
+                    http_headers,
+                } => {
+                    let headers = http_headers_for(bearer_token_env_var, http_headers)?;
+                    McpClient::http(url.clone(), headers)?
+                }
+            };
             client.initialize().await?;
             let advertised = client.list_tools().await?;
             anyhow::Ok((client, advertised))
@@ -267,6 +379,12 @@ readonly = ["read_graph", "search_nodes"]
 
 [mcp.servers.fs]
 command = ["mcp-fs"]
+
+[mcp.servers.remote]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "EXAMPLE_MCP_TOKEN"
+http_headers = { X-Tenant = "acme" }
+readonly = ["search"]
 "#,
         );
         let servers = load_mcp_servers(&path).unwrap();
@@ -275,19 +393,32 @@ command = ["mcp-fs"]
             vec![
                 McpServerConfig {
                     name: "fs".into(),
-                    command: vec!["mcp-fs".into()],
-                    env: BTreeMap::new(),
+                    transport: McpTransport::Stdio {
+                        command: vec!["mcp-fs".into()],
+                        env: BTreeMap::new(),
+                    },
                     readonly: vec![],
                 },
                 McpServerConfig {
                     name: "memory".into(),
-                    command: vec![
-                        "npx".into(),
-                        "-y".into(),
-                        "@modelcontextprotocol/server-memory".into()
-                    ],
-                    env: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
+                    transport: McpTransport::Stdio {
+                        command: vec![
+                            "npx".into(),
+                            "-y".into(),
+                            "@modelcontextprotocol/server-memory".into()
+                        ],
+                        env: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
+                    },
                     readonly: vec!["read_graph".into(), "search_nodes".into()],
+                },
+                McpServerConfig {
+                    name: "remote".into(),
+                    transport: McpTransport::Http {
+                        url: "https://mcp.example.com/mcp".into(),
+                        bearer_token_env_var: Some("EXAMPLE_MCP_TOKEN".into()),
+                        http_headers: BTreeMap::from([("X-Tenant".into(), "acme".into())]),
+                    },
+                    readonly: vec!["search".into()],
                 },
             ]
         );
@@ -308,7 +439,7 @@ command = ["mcp-fs"]
     #[test]
     fn load_mcp_servers_rejects_malformed_sections() {
         for (tag, bad) in [
-            ("nocmd", "[mcp.servers.x]\nenv = {}\n"),
+            ("notransport", "[mcp.servers.x]\nenv = {}\n"),
             ("emptycmd", "[mcp.servers.x]\ncommand = []\n"),
             ("cmdstr", "[mcp.servers.x]\ncommand = \"npx\"\n"),
             (
@@ -319,11 +450,56 @@ command = ["mcp-fs"]
                 "badenv",
                 "[mcp.servers.x]\ncommand = [\"a\"]\nenv = { K = 1 }\n",
             ),
+            // command + url together, and stdio-only/http-only key crossover.
+            (
+                "both",
+                "[mcp.servers.x]\ncommand = [\"a\"]\nurl = \"https://h/mcp\"\n",
+            ),
+            (
+                "envonhttp",
+                "[mcp.servers.x]\nurl = \"https://h/mcp\"\nenv = { K = \"v\" }\n",
+            ),
+            (
+                "headersonstdio",
+                "[mcp.servers.x]\ncommand = [\"a\"]\nhttp_headers = { X = \"y\" }\n",
+            ),
+            // Plaintext secret is refused, pointing at bearer_token_env_var.
+            (
+                "plaintext",
+                "[mcp.servers.x]\nurl = \"https://h/mcp\"\nbearer_token = \"sk-secret\"\n",
+            ),
         ] {
             let path = write_config(tag, bad);
             assert!(load_mcp_servers(&path).is_err(), "{tag} should fail");
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
+    }
+
+    #[test]
+    fn http_headers_resolve_bearer_token_from_env() {
+        // Uniquely-named var so the global-env read doesn't race sibling tests.
+        let var = format!("KLOOP_TEST_MCP_TOKEN_{}", std::process::id());
+        std::env::set_var(&var, "sk-abc");
+        let headers = http_headers_for(
+            &Some(var.clone()),
+            &BTreeMap::from([("X-Tenant".into(), "acme".into())]),
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            BTreeMap::from([
+                ("Authorization".into(), "Bearer sk-abc".into()),
+                ("X-Tenant".into(), "acme".into()),
+            ])
+        );
+        std::env::remove_var(&var);
+        // A referenced-but-unset env var is an error, not a silent no-auth.
+        assert!(http_headers_for(&Some(var), &BTreeMap::new()).is_err());
+        // No bearer var ⇒ just the static headers.
+        assert_eq!(
+            http_headers_for(&None, &BTreeMap::from([("A".into(), "b".into())])).unwrap(),
+            BTreeMap::from([("A".into(), "b".into())])
+        );
     }
 
     #[test]

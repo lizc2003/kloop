@@ -1,13 +1,20 @@
-//! kloop-mcp — minimal MCP client: JSON-RPC 2.0 over newline-delimited JSON
-//! on a child process's stdio (the MCP stdio transport; one JSON object per
-//! `\n`-terminated line — NOT LSP-style Content-Length framing).
+//! kloop-mcp — MCP client speaking JSON-RPC 2.0 over one of two transports:
+//! a child process's stdio (newline-delimited JSON, one object per line — NOT
+//! LSP-style Content-Length framing) or streamable HTTP (one POST per request,
+//! replies as `application/json` or a short-lived `text/event-stream`, with
+//! `Mcp-Session-Id` sessions; plan 34).
 //!
 //! This crate speaks the wire protocol only. Tool naming (`{server}__{tool}`),
-//! config, and the `ToolSource` adapter live in the CLI; core never depends
-//! on this crate.
+//! config, secret resolution, and the `ToolSource` adapter live in the CLI;
+//! core never depends on this crate.
+
+mod http;
+mod sse;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -37,11 +44,11 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// `npx -y ...` servers re-resolve against the registry on every start —
 /// 13s cold-ish starts measured in the wild. 30s matches both reference
 /// implementations' startup timeouts.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// tools/list can be slower on servers that generate schemas lazily.
-const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the built-in bash tool's default budget.
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Descriptions from OpenAPI-generated servers have been seen at 15-60KB;
 /// cap them before they land in every sampling request (cc uses the same
@@ -51,22 +58,31 @@ const MAX_DESCRIPTION_CHARS: usize = 2048;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 
-/// One connected MCP server. All methods take `&self`; concurrent calls are
-/// multiplexed by request id. Dropping the client kills the child process
-/// (kill_on_drop) and stops the reader task.
-pub struct McpClient {
-    writer: SharedWriter,
-    pending: Pending,
-    next_id: AtomicU64,
-    reader: tokio::task::JoinHandle<()>,
-    /// Held only so kill_on_drop fires when the client is dropped.
-    _child: Option<tokio::process::Child>,
+/// A JSON-RPC message channel under [`McpClient`]: send a request and await its
+/// response, or fire a notification. Stdio (a persistent read loop keyed by id)
+/// and streamable HTTP (one POST per request) both implement it, so the
+/// protocol layer — handshake, pagination, tools/call, content blocks — stays
+/// transport-agnostic.
+pub(crate) trait Transport: Send + Sync {
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
+
+    fn notify<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        self.reader.abort();
-    }
+/// One connected MCP server. All methods take `&self`; concurrent calls are
+/// multiplexed by the transport. Dropping the client tears the transport down
+/// (stdio kills the child via kill_on_drop and stops the reader task).
+pub struct McpClient {
+    transport: Box<dyn Transport>,
 }
 
 impl McpClient {
@@ -74,24 +90,9 @@ impl McpClient {
     /// environment) and speak MCP over its stdio. stderr goes to null: the
     /// TUI owns the terminal, and a chatty server would corrupt it.
     pub fn spawn(command: &[String], env: &BTreeMap<String, String>) -> Result<Self> {
-        let (program, args) = command
-            .split_first()
-            .context("mcp server command must not be empty")?;
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
-            .envs(env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("cannot spawn mcp server '{program}'"))?;
-        let stdin = child.stdin.take().context("mcp child stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("mcp child stdout unavailable")?;
-        Ok(Self::over(stdout, stdin, Some(child)))
+        Ok(Self {
+            transport: Box::new(StdioTransport::spawn(command, env)?),
+        })
     }
 
     /// Wire the client over any byte streams — the testing seam (duplex
@@ -101,34 +102,47 @@ impl McpClient {
         writer: impl AsyncWrite + Send + Unpin + 'static,
         child: Option<tokio::process::Child>,
     ) -> Self {
-        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let reader_task = tokio::spawn(read_loop(reader, writer.clone(), pending.clone()));
-        McpClient {
-            writer,
-            pending,
-            next_id: AtomicU64::new(1),
-            reader: reader_task,
-            _child: child,
+        Self {
+            transport: Box::new(StdioTransport::over(reader, writer, child)),
         }
+    }
+
+    /// Speak MCP to a remote server over streamable HTTP. `headers` are extra
+    /// request headers (e.g. `Authorization: Bearer …`, custom headers) — the
+    /// CLI resolves any secrets before they reach here. Fails only if a header
+    /// name/value is malformed.
+    pub fn http(url: String, headers: BTreeMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            transport: Box::new(http::HttpTransport::new(url, headers)?),
+        })
+    }
+
+    /// Wrap a pre-built transport — the seam the HTTP module's tests use to
+    /// inject a fast retry schedule.
+    #[cfg(test)]
+    pub(crate) fn from_transport(transport: Box<dyn Transport>) -> Self {
+        Self { transport }
     }
 
     /// The MCP handshake: `initialize`, then the REQUIRED
     /// `notifications/initialized` (strict servers refuse further requests
     /// without it).
     pub async fn initialize(&self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
-            }),
-            HANDSHAKE_TIMEOUT,
-        )
-        .await
-        .context("mcp initialize failed")?;
-        self.notify("notifications/initialized", None).await
+        self.transport
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
+                }),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await
+            .context("mcp initialize failed")?;
+        self.transport
+            .notify("notifications/initialized", None)
+            .await
     }
 
     /// Full tool list (follows `nextCursor` pagination). Names are the raw
@@ -142,7 +156,10 @@ impl McpClient {
                 Some(c) => json!({"cursor": c}),
                 None => json!({}),
             };
-            let result = self.request("tools/list", params, LIST_TIMEOUT).await?;
+            let result = self
+                .transport
+                .request("tools/list", params, LIST_TIMEOUT)
+                .await?;
             let listed = result["tools"]
                 .as_array()
                 .context("tools/list result has no tools array")?;
@@ -180,6 +197,7 @@ impl McpClient {
     /// run) surfaces as Err with the rendered content, like a failing built-in.
     pub async fn call_tool_structured(&self, name: &str, arguments: &Value) -> Result<Value> {
         let result = self
+            .transport
             .request(
                 "tools/call",
                 json!({"name": name, "arguments": arguments}),
@@ -199,32 +217,105 @@ impl McpClient {
             &self.call_tool_structured(name, arguments).await?,
         ))
     }
+}
 
-    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if let Err(e) = write_line(&self.writer, &msg).await {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(anyhow!("{method}: connection closed before response")),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(anyhow!("{method}: no response within {timeout:?}"))
-            }
-        }
+/// The stdio transport: newline-delimited JSON over a child process's (or, in
+/// tests, a duplex pipe's) byte streams. A background reader task routes
+/// responses to pending requests by id.
+struct StdioTransport {
+    writer: SharedWriter,
+    pending: Pending,
+    next_id: AtomicU64,
+    reader: tokio::task::JoinHandle<()>,
+    /// Held only so kill_on_drop fires when the transport is dropped.
+    _child: Option<tokio::process::Child>,
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl StdioTransport {
+    fn spawn(command: &[String], env: &BTreeMap<String, String>) -> Result<Self> {
+        let (program, args) = command
+            .split_first()
+            .context("mcp server command must not be empty")?;
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("cannot spawn mcp server '{program}'"))?;
+        let stdin = child.stdin.take().context("mcp child stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("mcp child stdout unavailable")?;
+        Ok(Self::over(stdout, stdin, Some(child)))
     }
 
-    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
-        let msg = match params {
-            Some(params) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
-            None => json!({"jsonrpc": "2.0", "method": method}),
-        };
-        write_line(&self.writer, &msg).await
+    fn over(
+        reader: impl AsyncRead + Send + Unpin + 'static,
+        writer: impl AsyncWrite + Send + Unpin + 'static,
+        child: Option<tokio::process::Child>,
+    ) -> Self {
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let reader_task = tokio::spawn(read_loop(reader, writer.clone(), pending.clone()));
+        StdioTransport {
+            writer,
+            pending,
+            next_id: AtomicU64::new(1),
+            reader: reader_task,
+            _child: child,
+        }
+    }
+}
+
+impl Transport for StdioTransport {
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().unwrap().insert(id, tx);
+            let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            if let Err(e) = write_line(&self.writer, &msg).await {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(e);
+            }
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(anyhow!("{method}: connection closed before response")),
+                Err(_) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    Err(anyhow!("{method}: no response within {timeout:?}"))
+                }
+            }
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let msg = match params {
+                Some(params) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                None => json!({"jsonrpc": "2.0", "method": method}),
+            };
+            write_line(&self.writer, &msg).await
+        })
     }
 }
 

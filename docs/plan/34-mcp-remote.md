@@ -71,3 +71,55 @@ session-expired 重握手一次、401 不重试直接报错;`[mcp.servers]` 解�
 fmt/clippy/test 全绿,一次 commit;README 补远程 server 配置示例;本文件补完成记录;
 HANDOFF 补能力条目。真 key 验收:接一个真实远程 MCP server(问用户要地址/token)双轨
 跑通 tools/call。
+
+## ✅ 完成记录(2026-07-16,提交 <待填>)
+
+**三个开工决定的落定**:
+1. **HTTP 客户端放哪** → **reqwest 直接进 kloop-mcp**。依赖图看:core 不依赖 mcp、
+   只有 cli 依赖 mcp,web/provider 已各自引 reqwest,所以整条 MCP 线协议(握手/翻页/
+   tools/call/图块)留一个 crate 复用,不往 cli 抬(注入方案要在 cli 重实现传输,更差)。
+2. **认证首片** → `bearer_token_env_var` + 静态 `http_headers`,明文 `bearer_token`
+   直接拒(报错引导用环境变量名,codex 形);OAuth/旧 SSE/ws/动态头全挂账。
+3. **版本头** → `MCP-Protocol-Version` 用 initialize 回包 body 里协商到的版本(transport
+   自己从 result 的 `protocolVersion` 抓,不硬编码);`Mcp-Session-Id` 从响应头抓、后续
+   请求全回带。
+
+**落点**:`McpClient` 抽出 `Transport` trait(`request`/`notify`,Pin<Box<Future>> 对齐
+`ToolSource` 风格),stdio 收进 `StdioTransport`(原读循环/写行/Drop abort 整体搬),新
+`http.rs` 的 `HttpTransport` 实现同 trait。协议层(initialize/list_tools/call_tool_
+structured/render/content_blocks)零改动,只把私有 `request`/`notify` 换成走
+`self.transport`。**streamable HTTP**:每请求一次 POST(`Accept: application/json,
+text/event-stream`),响应 `application/json` 直解、`text/event-stream` 用本地 mini
+`SseParser`(只收 data,多字节跨块安全)流式读到匹配 id 的消息;通知(无 id)POST 收
+202 无体;`Mcp-Session-Id` 响应头进 `Mutex<Option>`、后续全带;protocolVersion 从 init
+result 抓进 `Mutex`。**恢复最小面**:退避表 250ms/1s + 终局(3 次,408/429/5xx 与瞬时网
+络错可重试,401/403 与其他 4xx 终局);**404+有 session → 重放存好的 initialize params
++ notifications/initialized 一次再重试**(`tokio::Mutex` 串行 + 比对失败前 session 防惊
+群重握手)。timeouts 30/30/60 复用。
+
+**配置**:`McpServerConfig.transport: McpTransport{Stdio|Http}`(untagged,`command`
+选 stdio、`url` 选 http,二者互斥/缺一即报错);http 侧 `bearer_token_env_var`(名字,不
+落密)+`http_headers`;stdio-only(`env`)与 http-only(`url`/`bearer_token_env_var`/
+`http_headers`)交叉使用即报错;明文 `bearer_token` 拒。cli 在 connect 时把
+`bearer_token_env_var` 解析成 `Authorization: Bearer <token>`(缺变量报错,不静默无鉴权),
+连同 `http_headers` 传 `McpClient::http(url, BTreeMap)`(reqwest 不入 cli,mcp 内部转
+`HeaderMap`,头名/值非法报错)。命名消毒/超时/readonly/权限默认询问全部零改动继承。
+
+**测试**:mcp 侧 wiremock 契约(retry delay 可注入 → 0 延迟跑得快):HTTP 握手 + 翻页
+tools/list 回带 session+version 头、tools/call over SSE 带图块、bearer 头注入、5xx 重试
+后成功、401 不重试(`expect(1)`)、404 session 过期重握手一次;sse 单元测(多字节/keep-
+alive);cli 侧配置解析(url/command 互斥、缺一、明文拒、env-on-http/headers-on-stdio 交
+叉拒)+ `http_headers_for` env 解析(缺变量报错)。全绿:mcp 17 test、cli 45 test、
+workspace 全绿,fmt/clippy 干净。
+
+**真 key 双轨验收**:本地起一个 Python streamable-HTTP MCP server(bearer 门 + 分配
+`Mcp-Session-Id` + 要求后续回带 + 一个 `secret_gauge` 工具回不可猜的 8391),隔离 rundir
+配 `url`+`bearer_token_env_var`,真 key 跑 `--headless`:
+- **anthropic 轨**(claude-sonnet-4-6):连上、调 `verify__secret_gauge{"city":"Tokyo"}`、答 8391 ✓
+- **openai 轨**(gpt-5.4-mini):连上、调 `{"city":"Paris"}`、答 8391 ✓
+- server 日志证实全链:无 bearer→401、带 bearer→200 建 session、
+  `notifications/initialized`/`tools/list`/`tools/call` 全回带 session id、id 递增。
+
+**未做(仍挂账,记为可能性)**:OAuth(授权码+回调+keyring,独立 plan 级)、旧版 SSE 传
+输、ws/sdk/claudeai-proxy、`headersHelper` 动态头、后台自动重连管理层、GET 打开的
+server→client SSE 流(minimal client 不需)、`required` server 启动失败即退出。

@@ -952,9 +952,12 @@ name = "kloop-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "kloop-protocol",
+ "reqwest",
  "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
