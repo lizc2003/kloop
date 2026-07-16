@@ -848,10 +848,8 @@ this feature among the three references (claw has built-in slash but no user
 templates; the codex checkout has neither) — the shape follows cc.
 Server mode runs the same commands: a `turn/start` with a `/`-prefixed input is
 dispatched to the command layer in the thread worker (see the server section
-above). **Not done** (deferred to their own plan): user-defined
-`.kloop/commands/*.md` prompt templates with `$ARGUMENTS`/`$N` substitution —
-they plug into this same seam (a `custom.rs` sibling); `!bash`/`@file`
-injection.
+above). User-defined `.kloop/commands/*.md` prompt templates plug into this same
+seam — see **User commands** under Skills below.
 
 ## Code mode (Phase 2, seventeenth slice)
 
@@ -983,8 +981,8 @@ fires), and kloop has no turn-level budget source, so a budget object would be a
 no-op until there's a real source to feed it; a richer progress view (cc's
 `/workflows` tree — kloop shows a flat live trace); saving a program as a named,
 reusable command (cc does this by writing a file into `.claude/workflows/` — for
-kloop that's the same seam as user-defined slash commands, which is plan 23's
-deferred piece, not a code-mode one). See `docs/plan/24-code-mode.md` and
+kloop that's the same seam as user commands, the User-commands slice under
+Skills, not a code-mode one). See `docs/plan/24-code-mode.md` and
 `docs/plan/27-codemode-mcp-tools.md`.
 
 ## Async sub-agents (Phase 2, eighteenth slice)
@@ -1102,6 +1100,44 @@ frontmatter (a provider-baked reasoning param), bundled files with lazy
 extraction, `paths` conditional activation, usage-frequency ranking, remote
 (`gs://`/`s3://`) and MCP skills, `` !`cmd` `` frontmatter shell expansion,
 `${CLAUDE_SESSION_ID}` substitution. See `docs/plan/28-skills.md`.
+
+### User commands (Phase 2, plan 36)
+
+A **user command** is a `/name` shortcut you drop in as a single markdown file —
+the same shape cc converged on when it folded its `.claude/commands/` into the
+skills mechanism (`loadedFrom: commands_DEPRECATED`). kloop follows suit: a
+command is **not a separate system**, just a second discovery root feeding the
+same skill registry. Discovery adds project `.kloop/commands/*.md` (cwd-relative)
+then global `~/.kloop/commands/`; each top-level `*.md` becomes one command
+(subdirectory namespaces are deferred).
+
+A command file is lighter than a `SKILL.md`:
+
+- The **command name is the file stem** (`deploy.md` → `/deploy`); a frontmatter
+  `name` is ignored (matches cc).
+- **Frontmatter is optional**, and `description` may be omitted — it then falls
+  back to the body's first non-empty line (markdown header stripped, truncated to
+  100 chars), so the smallest command is a plain `.md` file with no `---` block.
+
+```markdown
+Run the deploy for $ARGUMENTS, then post the release notes.
+```
+
+Everything else is **reused** from skills: the same `$ARGUMENTS`/`$N`/
+`${CLAUDE_SKILL_DIR}` expansion, and the same `/name args` slash seam (an unknown
+`/name` lists commands alongside skills and the built-ins). The one deliberate
+difference is **who may invoke it**: a command is a user shortcut, so it is
+`/name`-only — it is kept out of the model's catalog and the `skill` tool
+(`SkillSource::Command`; cc's legacy `disable-model-invocation` default), whereas
+a `SKILL.md` skill is model-selectable. On a name collision a skill wins (the
+directory form is fuller), so a command only fills a name no skill claimed. A
+malformed command is skipped with a startup warning, never an error; `--mock`
+skips discovery entirely.
+
+**Not done** (deferred to a later slice): `` !`cmd` `` inline bash injection and
+`@file` attachment (both carry their own permission surface — bash gate,
+read-path gate), subdirectory `namespace:command`, and commands entering the
+model catalog. See `docs/plan/36-custom-commands.md`.
 
 ## Image input (Phase 2, twentieth slice)
 

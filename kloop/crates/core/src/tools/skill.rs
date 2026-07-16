@@ -13,6 +13,7 @@ use super::ToolCtx;
 use crate::skills::expand_body;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
+use crate::skills::SkillSource;
 use kloop_protocol::ToolDef;
 
 /// The `skill` tool definition: how the model triggers a skill. Registered only
@@ -47,7 +48,14 @@ pub(crate) fn skill_tool_def() -> ToolDef {
 pub(super) async fn skill_tool(input: &Value, ctx: &ToolCtx) -> anyhow::Result<String> {
     let name = str_arg(input, "name", "skill")?;
     let args = input.get("arguments").and_then(Value::as_str).unwrap_or("");
-    let skill = Skill::lookup(&ctx.cfg.skills, name).map_err(|e| anyhow::anyhow!(e))?;
+    // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is
+    // `/name`-only and must not be reachable here even if the model guesses it.
+    let candidates = ctx
+        .cfg
+        .skills
+        .iter()
+        .filter(|s| s.source == SkillSource::Skill);
+    let skill = Skill::lookup(candidates, name).map_err(|e| anyhow::anyhow!(e))?;
     let body = expand_body(&skill.body, &skill.dir, args);
     match skill.context {
         SkillContext::Inline => Ok(body),

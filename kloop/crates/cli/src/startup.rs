@@ -317,11 +317,75 @@ pub(crate) fn load_agent_types(config_path: &Path) -> Result<Vec<AgentType>> {
 /// letting it override a global skill. A malformed skill is skipped with a
 /// warning, never an error; `--mock` skips discovery entirely (hermetic).
 pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
-    let mut roots = vec![cwd.join(".kloop").join("skills")];
-    if let Some(home) = std::env::home_dir() {
-        roots.push(home.join(".kloop").join("skills"));
+    let home = std::env::home_dir();
+    let mut skill_roots = vec![cwd.join(".kloop").join("skills")];
+    let mut command_roots = vec![cwd.join(".kloop").join("commands")];
+    if let Some(home) = &home {
+        skill_roots.push(home.join(".kloop").join("skills"));
+        command_roots.push(home.join(".kloop").join("commands"));
     }
-    skills_from_roots(&roots)
+    let (skills, mut warnings) = skills_from_roots(&skill_roots);
+    // User commands (plan 36) join the same registry as `SkillSource::Command`
+    // entries, so the rest of the wiring is unchanged.
+    let (commands, command_warnings) = commands_from_roots(&command_roots);
+    warnings.extend(command_warnings);
+    (merge_commands(skills, commands), warnings)
+}
+
+/// Fold discovered commands into the skill registry, with a skill winning on a
+/// name collision — the directory form is the fuller one, so a command only
+/// fills a name no skill already claimed (silently, like project-over-global).
+/// Split out so the precedence is testable without touching the filesystem.
+fn merge_commands(mut skills: Vec<Skill>, commands: Vec<Skill>) -> Vec<Skill> {
+    let taken: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    let fresh: Vec<Skill> = commands
+        .into_iter()
+        .filter(|c| !taken.contains(c.name.as_str()))
+        .collect();
+    skills.extend(fresh);
+    skills
+}
+
+/// Walk command roots in order (earlier roots win on name collision), reading
+/// each top-level `*.md` as a single-file user command (plan 36). Subdirectory
+/// namespaces are deferred, so nested files are not walked. Mirrors
+/// [`skills_from_roots`]; a malformed command is skipped with a warning.
+fn commands_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
+    let mut commands = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        // Stable order so the unknown-command listing is deterministic.
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")))
+            .collect();
+        files.sort();
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let name = file
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let dir = file
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            match Skill::parse_command(name, &dir, &content) {
+                // First name wins: a project command overrides a global one.
+                Ok(cmd) if seen.insert(cmd.name.clone()) => commands.push(cmd),
+                Ok(_) => {}
+                Err(e) => warnings.push(format!("skipped command at {}: {e}", file.display())),
+            }
+        }
+    }
+    (commands, warnings)
 }
 
 /// Walk skill roots in order (earlier roots win on name collision), reading each
@@ -894,6 +958,92 @@ mod tests {
         assert!(warnings[0].contains("broken") && warnings[0].contains("frontmatter"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn commands_discovery_reads_single_files_with_precedence() {
+        let base = std::env::temp_dir().join(format!("kloop-commands-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join(".kloop").join("commands");
+        let global = base.join("home").join(".kloop").join("commands");
+        let write = |root: &Path, file: &str, body: &str| {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join(file), body).unwrap();
+        };
+        // `deploy` in both scopes: the project one wins. A global-only `note`
+        // whose description falls back to its first line. A malformed command
+        // (unparseable frontmatter) warns and is skipped. A non-`.md` file and a
+        // subdirectory (namespaces deferred) are ignored.
+        write(
+            &project,
+            "deploy.md",
+            "---\ndescription: project deploy\n---\nbody",
+        );
+        write(
+            &global,
+            "deploy.md",
+            "---\ndescription: global deploy\n---\nbody",
+        );
+        write(&global, "note.md", "# Jot a note\n\nDetails.");
+        write(&global, "broken.md", "---\nnot: [valid\n---\nbody");
+        write(&global, "readme.txt", "ignored, not markdown");
+        std::fs::create_dir_all(global.join("sub")).unwrap();
+        std::fs::write(global.join("sub").join("nested.md"), "nested").unwrap();
+
+        let (commands, warnings) = commands_from_roots(&[project.clone(), global.clone()]);
+
+        let by_name = |n: &str| commands.iter().find(|c| c.name == n).unwrap();
+        assert_eq!(
+            commands.len(),
+            2,
+            "deploy deduped, broken skipped: {commands:?}"
+        );
+        assert_eq!(by_name("deploy").description, "project deploy");
+        assert_eq!(
+            by_name("deploy").source,
+            kloop_core::skills::SkillSource::Command
+        );
+        assert_eq!(by_name("note").description, "Jot a note");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the malformed command warns: {warnings:?}"
+        );
+        assert!(warnings[0].contains("broken.md"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_commands_lets_skills_win_on_name_collision() {
+        let skill = |name: &str| Skill {
+            name: name.into(),
+            description: format!("skill {name}"),
+            source: kloop_core::skills::SkillSource::Skill,
+            ..Default::default()
+        };
+        let command = |name: &str| Skill {
+            name: name.into(),
+            description: format!("command {name}"),
+            source: kloop_core::skills::SkillSource::Command,
+            ..Default::default()
+        };
+        let merged = merge_commands(
+            vec![skill("commit")],
+            vec![command("commit"), command("deploy")],
+        );
+        // `commit` keeps the skill (the command is dropped); `deploy` is added.
+        assert_eq!(merged.len(), 2);
+        let by_name = |n: &str| merged.iter().find(|s| s.name == n).unwrap();
+        assert_eq!(by_name("commit").description, "skill commit");
+        assert_eq!(
+            by_name("commit").source,
+            kloop_core::skills::SkillSource::Skill
+        );
+        assert_eq!(
+            by_name("deploy").source,
+            kloop_core::skills::SkillSource::Command
+        );
     }
 
     #[test]

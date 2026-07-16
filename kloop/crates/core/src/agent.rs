@@ -187,15 +187,21 @@ async fn turn_rounds(
         cfg.defer_threshold,
         cfg.worktree_enabled,
     );
-    // The `skill` tool exists only at depth 0 (like `task`) and only when
-    // skills are loaded. Skills are a top-level orchestration feature: a
-    // sub-agent gets a focused task, not the whole skills catalog (which would
-    // otherwise ride every sub-agent request, and a `fork` skill's own
-    // sub-agent could re-trigger it). Added after all_tool_defs so it is not
-    // counted toward the defer threshold or exposed to run_program's API — it
-    // is a prompt-activation seam, not a source tool. Placed before the
-    // allowlist filter so a restricted agent type can gate it like any tool.
-    if depth == 0 && !cfg.skills.is_empty() && !tools.iter().any(|t| t.name == "skill") {
+    // The `skill` tool exists only at depth 0 (like `task`) and only when a
+    // model-invocable skill is loaded — user commands (`SkillSource::Command`)
+    // are `/name`-only and don't warrant the tool on their own. Skills are a
+    // top-level orchestration feature: a sub-agent gets a focused task, not the
+    // whole skills catalog (which would otherwise ride every sub-agent request,
+    // and a `fork` skill's own sub-agent could re-trigger it). Added after
+    // all_tool_defs so it is not counted toward the defer threshold or exposed
+    // to run_program's API — it is a prompt-activation seam, not a source tool.
+    // Placed before the allowlist filter so a restricted agent type can gate it
+    // like any tool.
+    let has_model_skill = cfg
+        .skills
+        .iter()
+        .any(|s| s.source == crate::skills::SkillSource::Skill);
+    if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
         tools.push(crate::tools::skill_tool_def());
     }
     // A custom agent type may restrict this sub-agent's tools; the main agent

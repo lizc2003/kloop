@@ -1,4 +1,9 @@
-# Plan 36 — 用户自定义 slash 命令(plan 23 挂账领编号)
+# Plan 36 — 用户自定义 slash 命令(plan 23 挂账领编号)✅
+
+> ✅ 首片(纯发现根)完成(提交号待回填,随后 docs 提交补)。**方案 A**(commands 目录作 skills 第二发现
+> 根)落地:`.kloop/commands/*.md` 单文件作 `SkillSource::Command` 进同一 skill 注册
+> 表,复用 skills 全部展开/触发/slash 机制。决定见文末完成记录。`!cmd`/`@file` 注入按
+> 决定切到下一片(未做,见下)。
 
 > 一句话定位:plan 23 挂账的"用户自定义 `.kloop/commands/*.md` 带参模板"正式领编号。
 > 但生态位已变:plan 28 的 skills 已覆盖"用户自定义带参 prompt 包"(`/name` 触发 +
@@ -69,3 +74,57 @@
 fmt/clippy/test 全绿,一次 commit;README 补 commands 目录;本文件补完成记录;HANDOFF
 补能力条目;plan 23/28 的挂账清单同步销账。真 key 验一次 `/name args` 展开 + `!cmd`
 注入闭环。
+
+## 完成记录(首片:纯发现根,提交号待回填)
+
+**决定(开工时定,用户"同意"倾向)**:① 形态总闸取**方案 A**(commands 目录作 skills 第
+二发现根,机制零新增);② 首片只做**纯发现根**,`!cmd`/`@file` 注入切到下一片(各带权
+限面);③ commands **不进模型 catalog / `skill` 工具**(只 `/name` 可调,cc 的
+`disable-model-invocation` 默认);④ 命名空间/子目录挂账(单人工具先平铺)。
+
+**回源核对(2026-07-16,复核 plan 备忘无误)**:cc `~/work/claude-code`
+`src/skills/loadSkillsDir.ts` — `loadSkillsFromCommandsDir` 确支持单文件 `*.md`(+目录
+SKILL.md),`loadedFrom:'commands_DEPRECATED'`,命令名=去 `.md` 文件名(frontmatter
+`name` 被 `displayName:undefined` 覆盖),默认 `userInvocable:true`;无 `description`
+时 `extractDescriptionFromMarkdown`(`src/utils/markdownConfigLoader.ts:52`)取首个非
+空行、`^#+\s+` 剥标题、截 100 字("..." 收尾)、空则 "Custom command"。kloop 照此
+1:1 落。codex/claw 无用户命令模板(本 checkout 无变化)。
+
+**改动(纯逻辑在 core、IO 在 cli,照 skills 分层)**:
+- `core/src/skills.rs`:`Skill` 加 `source: SkillSource{Skill,Command}`(Default=Skill,
+  旧构造零改动);`Frontmatter` 加 `Default`(无 frontmatter 即默认);抽
+  `Frontmatter::into_skill` 共享 context/model/allowed-tools 装配;新
+  `Skill::parse_command`(name=文件名、description 可省取首行、source=Command);新
+  `description_from_body`(cc `extractDescriptionFromMarkdown` 移植);`skills_catalog`
+  过滤掉 Command;`lookup` 改吃 `impl Iterator+Clone` 让调用方定作用域(slash=全部,
+  `skill` 工具=仅 model-invocable)。
+- `core/src/tools/skill.rs`:`skill` 工具 lookup 只搜 `SkillSource::Skill`(模型猜中命令
+  名也够不着)。
+- `core/src/agent.rs`:`skill` 工具注册条件从"有 skills"改成"有 model-invocable skill"
+  (只装了命令不白挂工具)。
+- `core/src/commands/mod.rs`:slash fall-through lookup 传 `cfg.skills.iter()`(搜全部);
+  模块 doc 更新(不再是"future plan / custom.rs")。
+- `cli/src/startup.rs`:`load_skills` 顺带 `commands_from_roots`(项目 `.kloop/commands/`
+  → 全局 `~/.kloop/commands/`,顶层 `*.md`、稳定排序、malformed 告警跳过)+
+  `merge_commands`(撞名 skill 优先、命令补空位)。装配线其余一字不改(commands 就是
+  Command 源的 Skill,随 `Config.skills` 流进所有 thread/子 agent)。
+
+**测试(全绿)**:skills.rs — `parse_command` 文件名/source、首行取描述+标题剥离+截断、
+catalog 排除 Command、`lookup` 作用域(命令对模型不可见);commands/mod.rs — Command 经
+slash 展开成 turn + 进 unknown 列表;startup.rs — `commands_from_roots` 发现/首行描述/
+项目优先/非 md 与子目录忽略/malformed 告警、`merge_commands` skill 撞名优先。
+
+**真 key 验收(anthropic 轨,scratch cwd 跑 `--plain`)**:`.kloop/commands/greet.md`(带
+description + `$0`)→ `/greet Ada` → 模型回 `kloop-cmd-ok greeting Ada`;
+`.kloop/commands/plain.md`(**无 frontmatter**,首行取描述 + `$ARGUMENTS`)→
+`/plain hi there` → 模型回 `plain-ok hi there`。发现 + frontmatter 可省 + 首行描述 +
+`$0`/`$ARGUMENTS` 展开 + slash→turn 全闭环。(`--mock` 跳过发现,验不了,故用真 key。)
+
+## 未做(挂账,滚进后续片/plan)
+
+- `!cmd` 内嵌 bash 注入(展开时执行、输出内联,**必走 bash 权限门**,教训 19b)。
+- `@file` 附件注入(读文件附进消息,走 read 权限/敏感路径判定,复用 plan 31
+  `read_path_blocked`)。
+- 子目录命名空间 `namespace:command`;commands 进 catalog(`disable-model-invocation`
+  反向语义);`argument-hint`/命名参数 `$foo`(skills 侧一并挂账);managed/policy 层;
+  命令里再调命令。

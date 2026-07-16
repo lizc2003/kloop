@@ -43,6 +43,26 @@ pub struct Skill {
     /// skill, which runs in the caller's own context. This is a capability
     /// restriction, not a permission grant — the tools still face the gate.
     pub allowed_tools: Option<Vec<String>>,
+    /// Where this entry came from, which decides who may invoke it. A
+    /// `SKILL.md` is a model capability (`Skill`): it rides the catalog and the
+    /// model can trigger it. A `.kloop/commands/*.md` file is a `Command`: a
+    /// user shortcut, `/name`-invocable only, kept out of the catalog and the
+    /// `skill` tool (plan 36 — cc's legacy `disable-model-invocation` default).
+    pub source: SkillSource,
+}
+
+/// What kind of entry a [`Skill`] is — which discovery root it came from and,
+/// consequently, whether the model may invoke it. Defaults to `Skill` so an
+/// entry built without naming a source is a full model-facing skill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SkillSource {
+    /// A `SKILL.md` skill: listed in the catalog and triggerable by the model
+    /// via the `skill` tool, as well as `/name`-invocable.
+    #[default]
+    Skill,
+    /// A single-file user command (`.kloop/commands/*.md`): `/name`-invocable
+    /// only, never advertised to or triggerable by the model.
+    Command,
 }
 
 /// A skill's execution mode (its `context` frontmatter field).
@@ -58,8 +78,9 @@ pub enum SkillContext {
 }
 
 /// Frontmatter fields we read. serde drops every other key (`metadata`,
-/// `version`, `license`, …) for free — those are later slices.
-#[derive(Deserialize)]
+/// `version`, `license`, …) for free — those are later slices. `Default` is the
+/// "no frontmatter at all" case for a single-file command (plan 36).
+#[derive(Deserialize, Default)]
 struct Frontmatter {
     #[serde(default)]
     name: Option<String>,
@@ -85,34 +106,28 @@ enum AllowedTools {
     Str(String),
 }
 
-impl Skill {
-    /// Parse one `SKILL.md`. `dir_name` is the containing directory's name (the
-    /// default skill name); `dir` its display path. Errors are strings the CLI
-    /// turns into skip-with-warning — a malformed skill never aborts startup.
-    pub fn parse(dir_name: &str, dir: &str, content: &str) -> Result<Skill, String> {
-        let (yaml, body) = split_frontmatter(content)
-            .ok_or("no YAML frontmatter (expected a `---` delimited block at the top)")?;
-        let fm: Frontmatter =
-            serde_yaml_ng::from_str(yaml).map_err(|e| format!("invalid frontmatter: {e}"))?;
-        let name = fm
-            .name
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| dir_name.to_string());
-        let description = fm
-            .description
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty())
-            .ok_or("missing 'description' (the field the model matches on)")?;
-        let context = match fm.context.as_deref().map(str::trim) {
+impl Frontmatter {
+    /// Build a [`Skill`] from the already-resolved `name`/`description`/`body`,
+    /// filling `context`/`model`/`allowed_tools` from the remaining frontmatter.
+    /// Shared by [`Skill::parse`] and [`Skill::parse_command`], which differ
+    /// only in how they derive name and description.
+    fn into_skill(
+        self,
+        name: String,
+        description: String,
+        body: String,
+        dir: &str,
+        source: SkillSource,
+    ) -> Skill {
+        let context = match self.context.as_deref().map(str::trim) {
             Some("fork") => SkillContext::Fork,
             _ => SkillContext::Inline,
         };
-        let model = fm
+        let model = self
             .model
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
-        let allowed_tools = fm.allowed_tools.and_then(|at| {
+        let allowed_tools = self.allowed_tools.and_then(|at| {
             let raw = match at {
                 AllowedTools::List(v) => v,
                 // Split on comma or whitespace: `"Read, Bash"` and `"Read Bash"`
@@ -127,32 +142,130 @@ impl Skill {
                 .collect();
             (!mapped.is_empty()).then_some(mapped)
         });
-        Ok(Skill {
+        Skill {
             name,
             description,
-            body: body.trim().to_string(),
+            body,
             dir: dir.to_string(),
             context,
             model,
             allowed_tools,
-        })
+            source,
+        }
+    }
+}
+
+/// A command's description when its frontmatter omits one: the body's first
+/// non-empty line, a markdown header prefix stripped, truncated to 100 chars —
+/// cc's `extractDescriptionFromMarkdown`. An empty body yields a generic label.
+fn description_from_body(body: &str) -> String {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Strip a leading `#`-header only when it is `#+` followed by
+        // whitespace (`## Title` → `Title`); `#foo` is left intact, like cc.
+        let rest = trimmed.trim_start_matches('#');
+        let text = if rest.len() < trimmed.len() && rest.starts_with(char::is_whitespace) {
+            rest.trim_start()
+        } else {
+            trimmed
+        };
+        return if text.chars().count() > 100 {
+            format!("{}...", text.chars().take(97).collect::<String>())
+        } else {
+            text.to_string()
+        };
+    }
+    "Custom command".to_string()
+}
+
+impl Skill {
+    /// Parse one `SKILL.md`. `dir_name` is the containing directory's name (the
+    /// default skill name); `dir` its display path. Errors are strings the CLI
+    /// turns into skip-with-warning — a malformed skill never aborts startup.
+    pub fn parse(dir_name: &str, dir: &str, content: &str) -> Result<Skill, String> {
+        let (yaml, body) = split_frontmatter(content)
+            .ok_or("no YAML frontmatter (expected a `---` delimited block at the top)")?;
+        let mut fm: Frontmatter =
+            serde_yaml_ng::from_str(yaml).map_err(|e| format!("invalid frontmatter: {e}"))?;
+        let name = fm
+            .name
+            .take()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| dir_name.to_string());
+        let description = fm
+            .description
+            .take()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .ok_or("missing 'description' (the field the model matches on)")?;
+        Ok(fm.into_skill(
+            name,
+            description,
+            body.trim().to_string(),
+            dir,
+            SkillSource::Skill,
+        ))
     }
 
-    /// Resolve a skill by name, or an error naming the available skills — the
-    /// same discoverable shape as an unknown agent_type. Model-facing (it rides
-    /// back as an is_error tool_result), so it doubles as a correction.
-    pub fn lookup<'a>(skills: &'a [Skill], name: &str) -> Result<&'a Skill, String> {
-        skills.iter().find(|s| s.name == name).ok_or_else(|| {
-            if skills.is_empty() {
-                format!("unknown skill '{name}': no skills are defined")
-            } else {
-                let available = skills
-                    .iter()
-                    .map(|s| s.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("unknown skill '{name}' (available: {available})")
-            }
+    /// Parse one single-file user command (`.kloop/commands/*.md`, plan 36).
+    /// Unlike a `SKILL.md`: the frontmatter is optional and `description` may be
+    /// omitted — it then falls back to the body's first non-empty line (cc's
+    /// legacy-command behavior). `name` is the file stem (the command name; a
+    /// frontmatter `name` is ignored, matching cc). The result is a
+    /// `SkillSource::Command`, so it is `/name`-invocable but stays out of the
+    /// model's catalog and the `skill` tool.
+    pub fn parse_command(name: &str, dir: &str, content: &str) -> Result<Skill, String> {
+        let (mut fm, body) = match split_frontmatter(content) {
+            Some((yaml, body)) => (
+                serde_yaml_ng::from_str::<Frontmatter>(yaml)
+                    .map_err(|e| format!("invalid frontmatter: {e}"))?,
+                body,
+            ),
+            // No `---` fence: the whole file is the body.
+            None => (Frontmatter::default(), content),
+        };
+        let body = body.trim().to_string();
+        let description = fm
+            .description
+            .take()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| description_from_body(&body));
+        Ok(fm.into_skill(
+            name.to_string(),
+            description,
+            body,
+            dir,
+            SkillSource::Command,
+        ))
+    }
+
+    /// Resolve a skill by name among `candidates`, or an error naming what is
+    /// available — the same discoverable shape as an unknown agent_type, and
+    /// model-facing (it rides back as an is_error tool_result), so it doubles as
+    /// a correction. Callers scope `candidates`: the slash path searches every
+    /// loaded entry, the `skill` tool only the model-invocable ones (so a user
+    /// command can't be triggered by the model, and the error never points at
+    /// one).
+    pub fn lookup<'a>(
+        candidates: impl Iterator<Item = &'a Skill> + Clone,
+        name: &str,
+    ) -> Result<&'a Skill, String> {
+        if let Some(skill) = candidates.clone().find(|s| s.name == name) {
+            return Ok(skill);
+        }
+        let available = candidates.map(|s| s.name.as_str()).collect::<Vec<_>>();
+        Err(if available.is_empty() {
+            format!("unknown skill '{name}': no skills are defined")
+        } else {
+            format!(
+                "unknown skill '{name}' (available: {})",
+                available.join(", ")
+            )
         })
     }
 }
@@ -206,7 +319,13 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 /// Session-stable (config-derived), so it stays byte-stable for the prompt
 /// cache. None when no skills are loaded.
 pub fn skills_catalog(skills: &[Skill]) -> Option<String> {
-    if skills.is_empty() {
+    // User commands (`SkillSource::Command`) are `/name`-only; they never enter
+    // the model's catalog (plan 36 decision 3).
+    let listed: Vec<&Skill> = skills
+        .iter()
+        .filter(|s| s.source == SkillSource::Skill)
+        .collect();
+    if listed.is_empty() {
         return None;
     }
     let mut out = String::from(
@@ -216,7 +335,7 @@ pub fn skills_catalog(skills: &[Skill]) -> Option<String> {
          the `skill` tool with its name. Activate a skill when the task matches its \
          description; otherwise ignore this list.\n",
     );
-    for s in skills {
+    for s in listed {
         out.push_str(&format!("\n- {}: {}", s.name, s.description));
     }
     out.push_str("\n</system-reminder>");
@@ -447,13 +566,16 @@ mod tests {
     #[test]
     fn lookup_finds_by_name_and_lists_available_on_miss() {
         let skills = skills();
-        assert_eq!(Skill::lookup(&skills, "review").unwrap().name, "review");
         assert_eq!(
-            Skill::lookup(&skills, "ghost").unwrap_err(),
+            Skill::lookup(skills.iter(), "review").unwrap().name,
+            "review"
+        );
+        assert_eq!(
+            Skill::lookup(skills.iter(), "ghost").unwrap_err(),
             "unknown skill 'ghost' (available: commit, review)"
         );
         assert_eq!(
-            Skill::lookup(&[], "ghost").unwrap_err(),
+            Skill::lookup([].iter(), "ghost").unwrap_err(),
             "unknown skill 'ghost': no skills are defined"
         );
     }
@@ -523,5 +645,116 @@ mod tests {
         assert_eq!(split_words("'a b' c"), vec!["a b", "c"]);
         assert_eq!(split_words(r#""a b" c\ d"#), vec!["a b", "c d"]);
         assert_eq!(split_words("   "), Vec::<String>::new());
+    }
+
+    /// A single-file command: the name is the file stem (a frontmatter `name` is
+    /// ignored, unlike a skill), the source is `Command`, and it reuses the same
+    /// body/argument machinery. Frontmatter is optional.
+    #[test]
+    fn parse_command_uses_file_stem_and_marks_source() {
+        let cmd = Skill::parse_command(
+            "deploy",
+            "/repo/.kloop/commands",
+            "---\nname: ignored-name\ndescription: Ship it.\n---\nRun the deploy for $ARGUMENTS.",
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Skill {
+                name: "deploy".into(),
+                description: "Ship it.".into(),
+                body: "Run the deploy for $ARGUMENTS.".into(),
+                dir: "/repo/.kloop/commands".into(),
+                source: SkillSource::Command,
+                ..Default::default()
+            }
+        );
+        // No frontmatter at all: whole file is the body.
+        let bare = Skill::parse_command("note", "/c", "Just do the thing with $0.").unwrap();
+        assert_eq!(bare.body, "Just do the thing with $0.");
+        assert_eq!(bare.source, SkillSource::Command);
+    }
+
+    /// A command's description falls back to the body's first non-empty line
+    /// (markdown header stripped), unlike a skill where it is required.
+    #[test]
+    fn parse_command_description_falls_back_to_first_line() {
+        // No description in frontmatter → first body line, `#`-header stripped.
+        let headed = Skill::parse_command(
+            "c",
+            "/c",
+            "---\nmodel: x\n---\n\n# Summarize the diff\n\nDetails follow.",
+        )
+        .unwrap();
+        assert_eq!(headed.description, "Summarize the diff");
+        // No frontmatter → still the first non-empty line.
+        let plain = Skill::parse_command("c", "/c", "\n\nFirst real line.\nSecond.").unwrap();
+        assert_eq!(plain.description, "First real line.");
+        // Empty body → a generic label, never an error.
+        assert_eq!(
+            Skill::parse_command("c", "/c", "---\nmodel: x\n---\n")
+                .unwrap()
+                .description,
+            "Custom command"
+        );
+    }
+
+    #[test]
+    fn description_from_body_strips_headers_and_truncates() {
+        assert_eq!(description_from_body("## Title here\nbody"), "Title here");
+        // `#` without following whitespace is not a header.
+        assert_eq!(description_from_body("#hashtag stays"), "#hashtag stays");
+        assert_eq!(description_from_body("   \n\n  real  \n"), "real");
+        assert_eq!(description_from_body(""), "Custom command");
+        let long = "x".repeat(200);
+        let out = description_from_body(&long);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with("..."));
+    }
+
+    /// The catalog is the model's view: it lists `SKILL.md` skills but never
+    /// user commands, and is `None` when only commands are loaded.
+    #[test]
+    fn catalog_excludes_commands() {
+        let mut mixed = skills();
+        mixed.push(Skill {
+            name: "deploy".into(),
+            description: "Ship it.".into(),
+            source: SkillSource::Command,
+            ..Default::default()
+        });
+        let catalog = skills_catalog(&mixed).unwrap();
+        assert!(catalog.contains("\n- commit:") && catalog.contains("\n- review:"));
+        assert!(!catalog.contains("deploy"), "commands stay out: {catalog}");
+        // Only commands loaded → nothing to advertise.
+        let only_commands = vec![Skill {
+            name: "deploy".into(),
+            description: "Ship it.".into(),
+            source: SkillSource::Command,
+            ..Default::default()
+        }];
+        assert_eq!(skills_catalog(&only_commands), None);
+    }
+
+    /// `lookup` searches whatever candidates the caller scopes to: the model's
+    /// `skill`-tool view (skills only) can't reach a command, while the slash
+    /// path (everything) can.
+    #[test]
+    fn lookup_respects_candidate_scope() {
+        let mut all = skills();
+        all.push(Skill {
+            name: "deploy".into(),
+            description: "Ship it.".into(),
+            source: SkillSource::Command,
+            ..Default::default()
+        });
+        // Slash path: every entry is reachable.
+        assert_eq!(Skill::lookup(all.iter(), "deploy").unwrap().name, "deploy");
+        // Model path: commands filtered out, so `deploy` is unknown and unlisted.
+        let invocable = all.iter().filter(|s| s.source == SkillSource::Skill);
+        assert_eq!(
+            Skill::lookup(invocable, "deploy").unwrap_err(),
+            "unknown skill 'deploy' (available: commit, review)"
+        );
     }
 }

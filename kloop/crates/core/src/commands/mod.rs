@@ -4,9 +4,11 @@
 //! error), and the dispatch. Commands run only when no turn is in flight — they
 //! read or rewrite History directly, which the turn loop is otherwise using.
 //!
-//! User-defined `.kloop/commands/*.md` templates are a future plan; they plug
-//! into this same seam (a `custom.rs` sibling + a lookup ahead of [`run`]'s
-//! match), which is why parsing already splits off an argument string.
+//! User-defined `.kloop/commands/*.md` templates (plan 36) are not a separate
+//! system: the CLI loads them as `SkillSource::Command` entries in the same
+//! skill registry, so they resolve through the [`run`] fall-through below,
+//! reusing the skills' argument expansion (which is why parsing already splits
+//! off an argument string).
 
 use std::sync::Arc;
 
@@ -116,11 +118,13 @@ pub async fn run(
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
-        // A user-invoked skill: expand its body (same seam the model's `skill`
-        // tool uses) and hand it back as a turn to run. Falls through to the
-        // unknown-command reply — which lists skills too — when the name is
-        // neither a built-in nor a skill.
-        _ => match crate::skills::Skill::lookup(&cfg.skills, name) {
+        // A user-invoked skill or command: expand its body (same seam the
+        // model's `skill` tool uses) and hand it back as a turn to run. Searches
+        // every loaded entry — both `SKILL.md` skills and `.kloop/commands/*.md`
+        // user commands are `/name`-invocable. Falls through to the
+        // unknown-command reply — which lists them too — when the name is
+        // neither a built-in nor a loaded entry.
+        _ => match crate::skills::Skill::lookup(cfg.skills.iter(), name) {
             Ok(skill) => {
                 SlashResult::turn(crate::skills::expand_body(&skill.body, &skill.dir, args))
             }
@@ -322,6 +326,43 @@ mod tests {
             unknown,
             SlashResult::message(
                 "unknown command '/nope' (available: /help, /cost, /compact, /clear, /greet)"
+            )
+        );
+    }
+
+    /// A user command (`SkillSource::Command`) is `/name`-invocable through the
+    /// same fall-through — the slash path doesn't distinguish source — and is
+    /// listed in the unknown-command reply like any other entry.
+    #[tokio::test]
+    async fn command_slash_expands_and_appears_in_unknown_list() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let cfg = Arc::new(Config {
+            skills: Arc::new(vec![crate::skills::Skill {
+                name: "deploy".into(),
+                description: "Ship it.".into(),
+                body: "Deploy $0 now.".into(),
+                dir: "/repo/.kloop/commands".into(),
+                source: crate::skills::SkillSource::Command,
+                ..Default::default()
+            }]),
+            ..(*base).clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+
+        let result = run(
+            "/deploy prod",
+            &mut history,
+            &cfg,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result, SlashResult::turn("Deploy prod now.".into()));
+
+        let unknown = run("/nope", &mut history, &cfg, &CancellationToken::new()).await;
+        assert_eq!(
+            unknown,
+            SlashResult::message(
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /deploy)"
             )
         );
     }
