@@ -1180,35 +1180,36 @@ PDF/document blocks; remote-URL images; exposing `detail`. See
 
 ## Headless mode (Phase 2, twenty-first slice)
 
-`kloop -p`/`--headless` runs one turn without a REPL or TUI and exits — the form
+`kloop --headless` runs one turn without a REPL or TUI and exits — the form
 scripts, pipes, and CI need. cc's `--print` and codex's `exec` crate converged
 here independently, so kloop takes the intersection (under a self-describing name
-rather than cc's output-flavored `--print`).
+rather than cc's output-flavored `--print`; no short alias, headless is not a hot
+path).
 
 ```sh
 # prompt as a positional argument; the final answer is the only thing on stdout
-kloop -p "summarize what CHANGELOG.md says" > summary.txt
+kloop --headless "summarize what CHANGELOG.md says" > summary.txt
 
 # or pipe it on stdin (both sources combine: positional first, then a newline,
 # then stdin)
-git diff | kloop -p "review this diff"
+git diff | kloop --headless "review this diff"
 
 # machine-readable event stream (reuses server mode's notification wire)
-kloop -p --json "fix the failing test" | jq -c 'select(.method=="tool/started")'
+kloop --headless --json "fix the failing test" | jq -c 'select(.method=="tool/started")'
 
 # runaway guardrail for scripts; resume a session and run headless on it
-kloop -p --max-rounds 8 "keep going"
-kloop --resume 20260716-101500 -p "and now write the tests"
+kloop --headless --max-rounds 8 "keep going"
+kloop -r 20260716-101500 --headless "and now write the tests"
 
 # hermetic end-to-end demo, no key (great for CI)
-kloop --mock -p --json
+kloop --mock --headless --json
 ```
 
 - **Prompt = positional argument and/or piped stdin** (either alone, or both
-  combined). Neither present is an error. `-p` is a mode switch, not a value
-  holder — the prompt never rides the flag itself (cc's shape).
+  combined). Neither present is an error. `--headless` is a mode switch, not a
+  value holder — the prompt never rides the flag itself (cc's shape).
 - **Two output contracts.** Default (human): the final answer prints once to
-  **stdout**, progress notes go to **stderr**, so `result=$(kloop -p "…")`
+  **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
   stdout — `turn/started`, `text/delta`, `tool/started|completed`,
   `agent/started|completed`, `todo/updated`, `note`, `turn/completed` — the
@@ -1224,7 +1225,7 @@ kloop --mock -p --json
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 
-`--max-rounds` and `--json` are `-p`/`--headless`-only; a bare prompt without it
+`--max-rounds` and `--json` are `--headless`-only; a bare prompt without it
 is an error (interactive mode takes its input at the prompt). Not done (deferred, server
 mode already covers the programmatic side): `--permission-prompt-tool`
 delegation, `--input-format stream-json`, budget/goal guardrails,

@@ -1,4 +1,4 @@
-//! Non-interactive headless mode (`-p`/`--headless`): assemble the prompt from the
+//! Non-interactive headless mode (`--headless`): assemble the prompt from the
 //! positional argument and/or piped stdin, run exactly one turn, then either
 //! print the final text (human) or stream the run as a NDJSON event line stream
 //! (`--json`) and exit 0/1 by outcome.
@@ -45,7 +45,7 @@ pub(crate) fn assemble_prompt(positional: Option<&str>, stdin: Option<&str>) -> 
         (Some(p), None) => Ok(p.to_string()),
         (None, Some(s)) => Ok(s.to_string()),
         (None, None) => {
-            bail!("no prompt: pass one as an argument (kloop -p \"…\") or pipe it on stdin")
+            bail!("no prompt: pass one as an argument (kloop --headless \"…\") or pipe it on stdin")
         }
     }
 }
@@ -149,7 +149,7 @@ impl<W: Write + Send + 'static> Ui for JsonUi<W> {
     }
 }
 
-/// The text front-end: the final answer goes to stdout once, so `$(kloop -p …)`
+/// The text front-end: the final answer goes to stdout once, so `$(kloop --headless …)`
 /// captures a clean result. Progress (notes, tool calls) is human context and
 /// goes to stderr; streamed assistant deltas are suppressed to avoid printing
 /// the answer twice.

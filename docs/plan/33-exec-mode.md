@@ -72,7 +72,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
 
 ## 完成记录(2026-07-16,提交 a33864a)✅
 
-**落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`-p`/`--headless`/`--json`/
+**落点**:`cli/src/headless.rs`(新)+ `cli/src/args.rs`(`--headless`/`--json`/
 `--max-rounds`/位置参数解析)+ `cli/src/main.rs`(headless 分发 + `read_stdin_if_piped`)。
 
 **四个开工点最终定法**:
@@ -92,7 +92,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 headless 用法;本文件补完�
 
 **两个契约(两家收敛)**:① prompt 双来源——位置参数 + stdin,`assemble_prompt` 纯函数
 (都有则"位置\n stdin",都无报错);② 输出分离——text 模式 final_text 一次性进 stdout
-(`$(kloop -p …)` 干净捕获)、进度 note/tool 进 stderr、流式 delta 抑制不重复;`--json`
+(`$(kloop --headless …)` 干净捕获)、进度 note/tool 进 stderr、流式 delta 抑制不重复;`--json`
 全事件进 stdout。③ **审批默认拒**——headless 挂 `DenyApprover`(confirm 恒 Deny,对齐
 server "回复丢失=deny"),`--permission-mode accept-edits|bypass`/`KLOOP_ALLOW` 在 approver 之前放宽。
 ④ 退出码——Completed=0,其余(MaxRounds/Aborted/Error)=1(`main` 返回 `ExitCode`,
@@ -103,7 +103,7 @@ JsonUi 逐行对齐 server wire/text 模式 final+exit0/json 模式生命周期�
 headless flag 解析 + 校验错误)。真 key(anthropic 轨)闭环验过:text 位置参数出净结果
 exit0、json 走 stdin+read_file 工具事件流(turn/started→tool→text/delta→turn/completed)
 exit0、`--max-rounds 2` bound 的 bash 任务(sandbox auto_allow 放行,未触 deny)出结果。
-`--mock -p`/`--mock -p --json` 无 key hermetic 端到端跑通。
+`--mock --headless`/`--mock --headless --json` 无 key hermetic 端到端跑通。
 
 **偏离/取舍**:
 - **退出码 MaxRounds=1**(非 0):护栏触发 = 任务未自然完成,脚本应视为失败;cc 达 max-turns
@@ -136,5 +136,8 @@ round(round = 一次 sample + 工具),这个数覆盖的是 `cfg.max_rounds`,叫
 不动;内部 `AGENT_SEQ` static 非 env 保留。memory `anthropic-429-fallback` 同步。⑦ **`--json`
 保留(不改名)**——评估过它语义偏窄(是 NDJSON 事件流,非 cc 的单 result 对象;cc 分
 `json`/`stream-json`),但 kloop 只做流式、无歧义对象,保留简洁名 + 文档已注明"是事件流"。
-**命名复盘至此收尾**,CLI 定型:`-p`/`--headless`、`-c`/`-r`、`--permission-mode
-default|accept-edits|bypass`、`--json`、`--max-rounds`、`-h`/`--help`,env 统一 `KLOOP_*`。
+⑧ **再复盘去掉短选项 `-p`**(推翻 ① 的"留 `-p`")——headless 非高频路径,且 `-p`(cc 的
+print 缩写)与长名 `--headless` 字母不匹配,只留长名;对比 `-c`/`-r` 保留(高频会话操作
++ 字母匹配 continue/resume)。**命名复盘至此收尾**,CLI 定型:`--headless`、`-c`/`-r`、
+`--permission-mode default|accept-edits|bypass`、`--json`、`--max-rounds`、`-h`/`--help`,
+env 统一 `KLOOP_*`。

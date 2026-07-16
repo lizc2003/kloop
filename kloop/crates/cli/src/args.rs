@@ -58,8 +58,10 @@ pub(crate) struct CliArgs {
     pub(crate) list_sessions: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
-    /// `-p`/`--headless`: run one turn headless (no REPL, no TUI) and exit. The
-    /// prompt comes from the positional argument and/or piped stdin.
+    /// `--headless`: run one turn headless (no REPL, no TUI) and exit. The
+    /// prompt comes from the positional argument and/or piped stdin. No short
+    /// alias — headless is not a hot path, and `-p` (cc's print) wouldn't match
+    /// the `--headless` name anyway.
     pub(crate) headless: bool,
     /// `--json` (headless only): emit the run as a NDJSON event stream on
     /// stdout, reusing the server mode's notification wire shapes.
@@ -126,7 +128,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                 let name = w.trim_start_matches("--worktree=");
                 parsed.worktree = Some(if name.is_empty() { "session" } else { name }.to_string());
             }
-            "-p" | "--headless" => parsed.headless = true,
+            "--headless" => parsed.headless = true,
             "--json" => parsed.json = true,
             "--max-rounds" => {
                 let raw = match args.get(i + 1) {
@@ -182,7 +184,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-h/--help | -p/--headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (-h/--help | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -194,23 +196,22 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         i += 1;
     }
     // `--json` / `--max-rounds` / a positional prompt only mean something in
-    // headless mode; requiring `-p`/`--headless` keeps the mode's flags
-    // cohesive.
+    // headless mode; requiring `--headless` keeps the mode's flags cohesive.
     if !parsed.headless {
         if parsed.json {
-            bail!("--json requires -p/--headless (it streams the headless run as JSON)");
+            bail!("--json requires --headless (it streams the headless run as JSON)");
         }
         if parsed.max_rounds.is_some() {
-            bail!("--max-rounds requires -p/--headless (it is a headless guardrail)");
+            bail!("--max-rounds requires --headless (it is a headless guardrail)");
         }
         if let Some(prompt) = &parsed.prompt {
             bail!(
-                "a prompt argument ('{prompt}') requires -p/--headless; interactive mode takes input at its prompt"
+                "a prompt argument ('{prompt}') requires --headless; interactive mode takes input at its prompt"
             );
         }
     }
     if parsed.headless && parsed.serve {
-        bail!("-p/--headless and --serve are different modes; pick one");
+        bail!("--headless and --serve are different modes; pick one");
     }
     Ok(parsed)
 }
@@ -222,17 +223,17 @@ pub(crate) fn help_text() -> &'static str {
      \n\
      USAGE:\n\
      \x20   kloop [OPTIONS]              start the interactive TUI (default)\n\
-     \x20   kloop -p [OPTIONS] [PROMPT]  run one turn headless, then exit\n\
+     \x20   kloop --headless [OPTS] [PROMPT]  run one turn headless, then exit\n\
      \x20   kloop --serve                multi-session JSON-RPC server on stdio\n\
      \x20   kloop mcp login <name>       OAuth login to a remote MCP server\n\
      \n\
      MODES:\n\
-     \x20   -p, --headless        run one turn without a REPL/TUI, then exit\n\
+     \x20       --headless        run one turn without a REPL/TUI, then exit\n\
      \x20       --plain           line-based REPL instead of the TUI\n\
      \x20       --serve           JSON-RPC server over stdio\n\
      \x20       --mock            keyless scripted demo (hermetic)\n\
      \n\
-     HEADLESS (-p only):\n\
+     HEADLESS (--headless only):\n\
      \x20   [PROMPT]              the task; may also be piped on stdin (both combine)\n\
      \x20       --json            stream the run as NDJSON events on stdout\n\
      \x20       --max-rounds <n>  cap sampling rounds as a runaway guardrail\n\
@@ -536,10 +537,10 @@ mod tests {
 
     #[test]
     fn parse_args_headless_flags() {
-        // `-p` and `--headless` are the same switch; a positional becomes the
+        // `--headless` is the switch (no short alias); a positional becomes the
         // prompt; --json and --max-rounds ride along.
         assert_eq!(
-            parse_args(&strings(&["-p", "fix the bug"])).unwrap(),
+            parse_args(&strings(&["--headless", "fix the bug"])).unwrap(),
             CliArgs {
                 headless: true,
                 prompt: Some("fix the bug".into()),
@@ -565,7 +566,13 @@ mod tests {
         );
         // Headless composes with session selection (resume + run headless).
         assert_eq!(
-            parse_args(&strings(&["-r", "20260709-120000", "-p", "continue"])).unwrap(),
+            parse_args(&strings(&[
+                "-r",
+                "20260709-120000",
+                "--headless",
+                "continue"
+            ]))
+            .unwrap(),
             CliArgs {
                 headless: true,
                 prompt: Some("continue".into()),
@@ -573,44 +580,44 @@ mod tests {
                 ..base()
             }
         );
-        // -p with no prompt is legal (stdin supplies it at run time).
+        // --headless with no prompt is legal (stdin supplies it at run time).
         assert_eq!(
-            parse_args(&strings(&["-p"])).unwrap(),
+            parse_args(&strings(&["--headless"])).unwrap(),
             CliArgs {
                 headless: true,
                 ..base()
             }
         );
 
-        // Headless-only flags without -p/--headless are rejected.
+        // Headless-only flags without --headless are rejected.
         assert!(
             parse_args(&strings(&["--json"])).is_err(),
-            "--json needs -p"
+            "--json needs --headless"
         );
         assert!(
             parse_args(&strings(&["--max-rounds", "3"])).is_err(),
-            "--max-rounds needs -p"
+            "--max-rounds needs --headless"
         );
         assert!(
             parse_args(&strings(&["a prompt"])).is_err(),
-            "a bare prompt needs -p"
+            "a bare prompt needs --headless"
         );
         // Two positionals, a bad round count, and mode conflicts are errors.
         assert!(
-            parse_args(&strings(&["-p", "one", "two"])).is_err(),
+            parse_args(&strings(&["--headless", "one", "two"])).is_err(),
             "one prompt only"
         );
         assert!(
-            parse_args(&strings(&["-p", "--max-rounds", "0", "go"])).is_err(),
+            parse_args(&strings(&["--headless", "--max-rounds", "0", "go"])).is_err(),
             "max-rounds >= 1"
         );
         assert!(
-            parse_args(&strings(&["-p", "--max-rounds", "x", "go"])).is_err(),
+            parse_args(&strings(&["--headless", "--max-rounds", "x", "go"])).is_err(),
             "max-rounds must parse"
         );
         assert!(
-            parse_args(&strings(&["-p", "--serve"])).is_err(),
-            "print and serve conflict"
+            parse_args(&strings(&["--headless", "--serve"])).is_err(),
+            "headless and serve conflict"
         );
     }
 
