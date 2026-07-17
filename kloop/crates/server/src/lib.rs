@@ -431,6 +431,18 @@ async fn thread_worker(
         // also emits `thread/cleared` so the client resets its transcript.
         if commands::is_command(&turn.input) {
             let result = commands::run(&turn.input, &mut history, &cfg, &turn.cancel).await;
+            // `/exit` is a client-side concept: quitting one thread must never
+            // stop a multi-session server. Relay a note instead of acting on it,
+            // and close the turn bracket like any other command.
+            if result.quit {
+                running.store(false, Ordering::SeqCst);
+                ui.notify(
+                    "system",
+                    json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
+                );
+                ui.notify("turn/completed", json!({"reason": "completed"}));
+                continue;
+            }
             // Clear first, then show the output on the now-blank transcript —
             // matching the TUI order (crates/tui/src/lib.rs). Reversed, a
             // client that resets its transcript on `thread/cleared` would wipe

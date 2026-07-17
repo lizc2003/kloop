@@ -401,6 +401,10 @@ async fn plain_main(
             if !result.output.is_empty() {
                 println!("{}", result.output);
             }
+            // `/exit` quits the REPL, like the bare `exit` word above.
+            if result.quit {
+                break;
+            }
             // A skill invoked as `/name` expands to a prompt; run it as a turn
             // just like a typed message, falling through to the turn path below.
             match result.run_turn {

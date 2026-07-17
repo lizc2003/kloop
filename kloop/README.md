@@ -324,8 +324,8 @@ so approval session caches never leak across threads.
 
 Notifications stream per thread: `turn/started`, `text/delta`, `note`,
 `tool/started`, `tool/completed`, `turn/completed {reason}`. A `turn/start`
-whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`) runs
-the command instead of the model: its output comes back as a `system`
+whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an
+inert `/exit`) runs the command instead of the model: its output comes back as a `system`
 notification (not `text/delta`), `/clear` also emits `thread/cleared` so the
 client resets its transcript, and the turn/started..turn/completed bracket is
 unchanged. Approvals are
@@ -869,6 +869,9 @@ the model. The set is small and lives one-file-per-command under
   append-only compacted-to-nothing marker that resume replays to empty; it
   does **not** fork a new session file). Process-state (todos, steering queue)
   resets too.
+- `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
+  teardown as a two-tap Ctrl+C); in server mode it is inert — quitting one
+  thread must not stop a multi-session process, so it just relays a note.
 
 An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). Commands run **only when idle** — they read or

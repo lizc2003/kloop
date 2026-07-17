@@ -319,6 +319,9 @@ impl App {
                 self.thinking_open = false;
                 self.last_note = None;
             }
+            // The UI loop intercepts Quit before apply; this arm only keeps the
+            // match exhaustive.
+            AgentEvent::Quit => {}
             AgentEvent::ForkPoints(points) => {
                 if points.is_empty() {
                     self.cells

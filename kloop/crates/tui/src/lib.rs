@@ -220,6 +220,12 @@ async fn agent_worker(
                 {
                     return;
                 }
+                // `/exit`: tell the loop to quit (it tears the terminal down
+                // exactly like a two-tap Ctrl+C). No TurnEnded is needed.
+                if result.quit {
+                    let _ = events.send(AgentEvent::Quit);
+                    return;
+                }
                 // A skill invoked as `/name` expands to a prompt: record it and
                 // run a turn, streaming through `ui` exactly like WorkerMsg::Turn.
                 if let Some(prompt) = result.run_turn {
@@ -501,11 +507,24 @@ async fn ui_loop(
             },
             event = events.recv() => {
                 let Some(event) = event else { break Ok(()) };
-                app.apply(event);
+                // `/exit` (AgentEvent::Quit) ends the loop; the caller restores
+                // the terminal. Filter it out of the batch so app.apply never
+                // sees it.
+                let mut quit = matches!(event, AgentEvent::Quit);
+                if !quit {
+                    app.apply(event);
+                }
                 // Drain whatever else already arrived (streaming deltas come
                 // in bursts) so we redraw once per batch, not per token.
                 while let Ok(event) = events.try_recv() {
-                    app.apply(event);
+                    if matches!(event, AgentEvent::Quit) {
+                        quit = true;
+                    } else {
+                        app.apply(event);
+                    }
+                }
+                if quit {
+                    break Ok(());
                 }
                 // Autowake (plan 26): a background sub-agent finished (its
                 // agent_end woke this select) and left a result in the inbox

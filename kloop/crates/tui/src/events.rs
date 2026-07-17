@@ -30,6 +30,9 @@ pub enum AgentEvent {
     System(String),
     /// `/clear` emptied History; the loop resets its transcript view to match.
     ClearTranscript,
+    /// `/exit` ran on the worker; the UI loop quits (same clean teardown as a
+    /// two-tap Ctrl+C).
+    Quit,
     /// The rewind targets the worker read off the session file (plan 18): the
     /// UI loop opens the fork picker with them. Empty means nothing to rewind
     /// to, surfaced as a System note instead.

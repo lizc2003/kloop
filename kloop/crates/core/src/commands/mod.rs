@@ -23,6 +23,7 @@ use crate::history::History;
 mod clear;
 mod compact;
 mod cost;
+mod exit;
 mod help;
 
 /// What a command produced. `output` is shown to the user as-is; `cleared`
@@ -36,6 +37,9 @@ pub struct SlashResult {
     /// a skill invoked as `/name args` expands to a prompt to act on, unlike
     /// the built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
+    /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
+    /// ignores it — one client leaving must not stop a multi-session process.
+    pub quit: bool,
 }
 
 impl SlashResult {
@@ -47,6 +51,7 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
+            quit: false,
         }
     }
 
@@ -56,6 +61,7 @@ impl SlashResult {
             output: output.into(),
             cleared: true,
             run_turn: None,
+            quit: false,
         }
     }
 
@@ -65,6 +71,17 @@ impl SlashResult {
             output: String::new(),
             cleared: false,
             run_turn: Some(prompt),
+            quit: false,
+        }
+    }
+
+    /// `/exit`: interactive front-ends quit after showing `output`.
+    fn quit(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            cleared: false,
+            run_turn: None,
+            quit: true,
         }
     }
 }
@@ -94,6 +111,10 @@ pub const BUILTINS: &[Builtin] = &[
         name: "clear",
         summary: clear::SUMMARY,
     },
+    Builtin {
+        name: "exit",
+        summary: exit::SUMMARY,
+    },
 ];
 
 /// Whether an input line is a slash-command invocation: a leading `/` followed
@@ -121,6 +142,7 @@ pub async fn run(
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
+        "exit" => exit::run(),
         // A user-invoked skill or command: expand its body (same seam the
         // model's `skill` tool uses) and hand it back as a turn to run. Searches
         // every loaded entry — both `SKILL.md` skills and `.kloop/commands/*.md`
@@ -297,7 +319,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear)"
+                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear, /exit)"
             )
         );
     }
@@ -335,7 +357,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /greet)"
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /exit, /greet)"
             )
         );
     }
@@ -372,7 +394,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /deploy)"
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /exit, /deploy)"
             )
         );
     }
