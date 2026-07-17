@@ -291,14 +291,17 @@ without a terminal. Before each draw it freezes the finalized cells that
 overflow the viewport into scrollback with `insert_before`. Streaming deltas
 are drained in batches so a burst of tokens redraws once, not per token.
 
-Keys: Enter sends when idle, or **steers** while a turn runs (see below);
-Ctrl+C interrupts the running turn or clears the input when idle, Ctrl+R (idle)
-opens the rewind picker (see [Fork](#fork-and-rewind)), Ctrl+D quits. Scrolling
+Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
+(see below); **Esc** interrupts the running turn and clears the input line when
+idle; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
+to exit" hint, the second quits, any other key disarms) — the same everywhere,
+including inside a popup, so it is the single quit path (Ctrl+D is disabled);
+Ctrl+R (idle) opens the rewind picker (see [Fork](#fork-and-rewind)). Scrolling
 back through history is the terminal's job now (native scrollback). While an
 approval popup or the rewind picker is up it captures the keyboard: for
 approvals the scroll keys (plus j/k) page through a tall diff and y/a/p/n
-answer; for rewind ↑↓/kj move and Enter/Esc select or cancel. `--plain` keeps
-the old line-based REPL; `--mock` stays on plain output.
+answer, Esc denies; for rewind ↑↓/kj move and Enter/Esc select or cancel.
+`--plain` keeps the old line-based REPL; `--mock` stays on plain output.
 
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a
@@ -1391,9 +1394,10 @@ cargo run -- --permission-mode bypass              # bypass (deny/safety still a
 KLOOP_SANDBOX=off cargo run                        # run bash commands bare
 ```
 
-Both frontends: Ctrl+C interrupts the running turn (history is patched and
-stays legal), Ctrl+D quits (`exit` also works in `--plain`). Every session is
-saved and resumable — see Session persistence above.
+Interrupting a running turn patches history so it stays legal either way. In
+the TUI, Esc interrupts and Ctrl+C (two taps) exits (see the TUI section); in
+`--plain`, Ctrl+C interrupts the turn and Ctrl+D (or `exit`) quits. Every
+session is saved and resumable — see Session persistence above.
 
 ## Verification
 

@@ -444,7 +444,6 @@ impl App {
             return self.on_fork_key(key);
         }
         match (key.code, ctrl) {
-            (KeyCode::Char('d'), true) => return Command::Quit,
             // Esc interrupts a running turn (CC parity, the advertised key);
             // idle it clears the input line. A confirm popup / rewind picker
             // capture Esc before this (they return early at the top of on_key).
@@ -524,13 +523,11 @@ impl App {
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
+        // Ctrl-modified keys are inert here: Ctrl+C (two-tap quit) is intercepted
+        // before routing, and no other Ctrl combo should trigger a y/n/j/k
+        // answer. Esc denies the prompt (below); to stop the turn, deny then Esc.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => return Command::Quit,
-                // Ctrl+C is the two-tap quit, intercepted before routing here.
-                // Esc denies the prompt (below); to stop the turn, deny then Esc.
-                _ => return Command::None,
-            }
+            return Command::None;
         }
         // Scroll the popup body (a tall diff) instead of answering. j/k mirror
         // Up/Down for keyboard-home users; the render clamps the offset.
@@ -574,11 +571,9 @@ impl App {
     /// the two-tap quit, intercepted before routing here).
     fn on_fork_key(&mut self, key: KeyEvent) -> Command {
         let picker = self.fork_picker.as_mut().expect("checked some");
+        // Ctrl-modified keys are inert here (Ctrl+C two-tap quit is intercepted
+        // before routing; no Ctrl combo should move the cursor).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if key.code == KeyCode::Char('d') {
-                return Command::Quit;
-            }
-            // Ctrl+C is the two-tap quit, intercepted before routing here.
             return Command::None;
         }
         match key.code {
@@ -1265,12 +1260,13 @@ mod tests {
             "back to the first tap"
         );
 
-        // Works while running too (quit aborts the turn); Ctrl+D stays immediate.
+        // Works while running too (quit aborts the turn).
         app.on_key(key(KeyCode::Char('y'))); // disarm
         app.running = true;
         assert_eq!(app.on_key(ctrl('c')), Command::None);
         assert_eq!(app.on_key(ctrl('c')), Command::Quit);
-        assert_eq!(app.on_key(ctrl('d')), Command::Quit);
+        // Ctrl+D is disabled — the only quit path is the two-tap Ctrl+C.
+        assert_eq!(app.on_key(ctrl('d')), Command::None);
     }
 
     /// Esc interrupts a running turn (the advertised key) and clears the input
@@ -1322,10 +1318,10 @@ mod tests {
         );
         assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
 
-        // Ctrl+D still quits a popup immediately.
+        // Ctrl+D is disabled in popups too (inert Ctrl combo).
         let mut app = App::new("s".into());
         app.apply(AgentEvent::ForkPoints(vec![fp(4, "one")]));
-        assert_eq!(app.on_key(ctrl('d')), Command::Quit);
+        assert_eq!(app.on_key(ctrl('d')), Command::None);
     }
 
     #[tokio::test]
