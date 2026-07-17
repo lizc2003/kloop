@@ -77,6 +77,14 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 2. **依赖新增**:`pulldown-cmark`(markdown,轻)。`syntect`+`two-face`(代码高亮)较重
    (编译慢、体积大;kloop 一贯克制依赖,web crate 曾手写 HTML→text 避 turndown)——
    **开工时定**:引入 vs 先只做边框+dim 背景不高亮、syntect 后置为独立小片。
+   **✅ 2026-07-17 定库:改用 `synoptic`(≈2.2.9)替 syntect**——纯 Rust、正则式,主依赖
+   仅 `regex`/`char_index`/`if_chain`/`nohash-hasher`/`unicode-width`(无 C 编译),内置
+   ~30 语言规则(Rust/Py/JS/TS/JSON/Bash/Go/C/CSS/YAML/TOML/SQL…)。API `run(&code)` 逐行
+   `line(n,&line)` → `TokOpt::Some(text,kind)`/`None(text)`,**一 token 一 `Span::styled`** 与
+   `markdown.rs` 的 Line/Span 1:1;token kind 映射到 styles.md 安全配色(避 black/white/blue/
+   yellow 前景)、叠在现有 `CODE_BG=Indexed(236)` 上。精度是正则级(聊天代码块够用,非编辑器
+   级)。放弃 tree-sitter 路线(syntastica/inkjet):虽复用已有 tree-sitter,但每语言一个 C 语法
+   crate,编译负担反比 synoptic 重。**本次只定库,实现留到高亮小片(见切片 6 或独立片)。**
 3. **resize 不 reflow scrollback**:已进原生 scrollback 的历史,宽度变了不重排(CC 与
    终端本身也如此)——接受,仅活动 viewport 每帧重画。codex 的 `draw_with_resize_reflow`
    是大工程,不做。
@@ -142,7 +150,7 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 ### 切片 1 — markdown 渲染 + 代码高亮 ✅ 完成(2026-07-17)
 
 助手消息 pulldown-cmark → 富 `Line`(标题 / 粗斜体 / 有序无序列表 / 引用块 / 行内 code /
-表格 box-drawing);代码块 syntect+two-face 高亮(或先边框+dim 背景,见关键决定 2)。
+表格 box-drawing);代码块高亮(先边框+dim 背景;高亮库后定为 `synoptic`,见关键决定 2)。
 **流式安全边界缓冲**(借 claw:空行 / 围栏闭合才吐已稳定段,`ContentBlockStop` flush 余下)
 避免半个 markdown 块被撕裂重排;表格未闭合整体扣住。`normalize_nested_fences` 修嵌套围栏。
 
@@ -231,6 +239,9 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 次要 dim;避免 black/white/blue/yellow 前景);diff 渲染升级 GitHub 风格(行号 + gutter +/-/space
 + 语法高亮 + `+N -M` 统计),放宽 plan 21/25 的行数截断到 diff overlay 里看全(可选)。
 
+**代码块 + diff 语法高亮用 `synoptic`**(2026-07-17 定库,关键决定 2):token kind → styles.md
+配色叠在 `CODE_BG` 上;可与本片一起做,或拆成独立高亮小片(实现未开工,只定了库)。
+
 - 验收:开场头美观、全局配色一致、diff 可读。
 
 ## 不做(裁剪,记为可能性)
@@ -250,7 +261,8 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
 ## 开工时定 / 问用户
 
 - ~~切片 0 是否即刻开工~~(✅ 用户同意即刻开工,已完成)。
-- ~~关键决定 2:syntect 代码高亮引入 vs 后置~~(✅ 切片 1 拍板**后置**:代码块先做暗底,syntect 留独立小片)。
+- ~~关键决定 2:syntect 代码高亮引入 vs 后置~~(✅ 切片 1 拍板**后置**:代码块先做暗底,高亮留独立小片)。
+  ~~高亮用哪个库~~(✅ 2026-07-17 定 **synoptic** 替 syntect,轻量纯 Rust;理由见关键决定 2)。
 - ~~切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)~~(✅ 定:bullet `●`(running,黄)/`✓`/`✗`,结果 gutter `└ `/`    `;对着真 key 调过,对齐、消毒制表符)。
 - **品牌强调色**定 magenta/cyan(styles.md 建议)还是**橙**(靠拢 CC 截图);gutter 提示符
   `›`、mode 行 `⏵⏵`、thinking `∗` 等具体字形对着真 key 调。
