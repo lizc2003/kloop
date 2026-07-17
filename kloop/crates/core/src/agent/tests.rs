@@ -1350,7 +1350,7 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
     impl Ui for SteerOnToolUi {
         fn text_delta(&self, _: &str) {}
         fn note(&self, _: &str) {}
-        fn tool_start(&self, _: &str, _: &str, _: &str, _: &str) {
+        fn tool_start(&self, _: &str, _: &str, _: &str, _: &str, _: &serde_json::Value) {
             if !self.fired.swap(true, Ordering::SeqCst) {
                 self.inbox
                     .push(InboxItem::Steer("also check the logs".into()));
@@ -1460,7 +1460,7 @@ async fn subagent_does_not_drain_parent_steering() {
     impl Ui for SteerParentUi {
         fn text_delta(&self, _: &str) {}
         fn note(&self, _: &str) {}
-        fn tool_start(&self, agent: &str, _: &str, _: &str, _: &str) {
+        fn tool_start(&self, agent: &str, _: &str, _: &str, _: &str, _: &serde_json::Value) {
             if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
                 self.inbox.push(InboxItem::Steer("parent steer".into()));
             }

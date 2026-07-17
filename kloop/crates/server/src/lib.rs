@@ -520,7 +520,7 @@ impl Ui for ThreadUi {
         self.notify("note", json!({"text": s}));
     }
 
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, _input: &Value) {
         let mut params = json!({"callId": id, "name": name, "summary": summary});
         // Only sub-agent calls carry the field; the main agent's stay as
         // before so existing clients see an unchanged shape.
@@ -530,7 +530,7 @@ impl Ui for ThreadUi {
         self.notify("tool/started", params);
     }
 
-    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
+    fn tool_end(&self, agent: &str, id: &str, ok: bool, _output: &str) {
         let mut params = json!({"callId": id, "ok": ok});
         if !agent.is_empty() {
             params["agent"] = Value::String(agent.to_string());

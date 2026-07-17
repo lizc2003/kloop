@@ -116,7 +116,7 @@ impl<W: Write + Send + 'static> Ui for JsonUi<W> {
         self.emit("note", json!({"text": s}));
     }
 
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, _input: &Value) {
         let mut params = json!({"callId": id, "name": name, "summary": summary});
         if !agent.is_empty() {
             params["agent"] = Value::String(agent.to_string());
@@ -124,7 +124,7 @@ impl<W: Write + Send + 'static> Ui for JsonUi<W> {
         self.emit("tool/started", params);
     }
 
-    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
+    fn tool_end(&self, agent: &str, id: &str, ok: bool, _output: &str) {
         let mut params = json!({"callId": id, "ok": ok});
         if !agent.is_empty() {
             params["agent"] = Value::String(agent.to_string());
@@ -261,9 +261,9 @@ mod tests {
         ui.emit("turn/started", json!({}));
         ui.text_delta("hi");
         ui.note("saved");
-        ui.tool_start("", "c1", "bash", "ls");
-        ui.tool_start("agent-1", "c2", "grep", "x");
-        ui.tool_end("", "c1", true);
+        ui.tool_start("", "c1", "bash", "ls", &json!({"command": "ls"}));
+        ui.tool_start("agent-1", "c2", "grep", "x", &json!({"pattern": "x"}));
+        ui.tool_end("", "c1", true, "ok");
         ui.agent_start("agent-1", "do x");
         ui.agent_end("agent-1", false);
         ui.emit(

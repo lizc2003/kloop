@@ -120,17 +120,18 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         }
         Cell::Tool {
             name,
-            summary,
+            input,
             status,
+            output,
         } => {
-            let (mark, color) = status_mark(status);
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::new().fg(color)),
-                Span::styled(
-                    truncate(&format!("{name} {summary}"), width.saturating_sub(2)),
-                    DIM,
-                ),
-            ]));
+            // Human-readable header + result preview (plan 38 slice 2).
+            lines.extend(crate::toolrow::tool_cell_lines(
+                name,
+                input,
+                *status,
+                output.as_deref(),
+                width,
+            ));
         }
         Cell::Agent {
             agent,
@@ -762,13 +763,15 @@ mod tests {
             Cell::User("do the thing".into()),
             Cell::Tool {
                 name: "bash".into(),
-                summary: "{\"command\":\"ls\"}".into(),
+                input: "{\"command\":\"ls\"}".into(),
                 status: ToolStatus::Ok,
+                output: None,
             },
             Cell::Tool {
                 name: "bash".into(),
-                summary: "{}".into(),
+                input: "{}".into(),
                 status: ToolStatus::Running,
+                output: None,
             },
             Cell::Note("compacting history".into()),
             // Assistant text now renders as markdown: a single newline inside a
@@ -782,8 +785,10 @@ mod tests {
             vec![
                 "", // blank separator opening the user turn
                 "> do the thing",
-                "✓ bash {\"command\":\"ls\"}",
-                "… bash {}",
+                // Human-readable tool rows (plan 38 slice 2): verb + argument,
+                // status-marked (● running / ✓ ok / ✗ fail).
+                "✓ Bash $ ls",
+                "● Bash $ ",
                 "[compacting history]",
                 "done. all good",
             ]
@@ -810,8 +815,9 @@ mod tests {
         // stays under the force-commit cap.
         let mut cells = vec![Cell::Tool {
             name: "bash".into(),
-            summary: "{}".into(),
+            input: "{}".into(),
             status: ToolStatus::Running,
+            output: None,
         }];
         cells.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
         assert_eq!(
@@ -934,16 +940,18 @@ mod tests {
     }
 
     #[test]
-    fn long_tool_rows_collapse_to_one_truncated_line() {
+    fn long_tool_rows_truncate_the_header_to_one_line() {
+        let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(100));
         let cells = vec![Cell::Tool {
             name: "bash".into(),
-            summary: "x".repeat(100),
+            input,
             status: ToolStatus::Failed,
+            output: None,
         }];
         let lines = transcript_lines(&cells, 20);
         assert_eq!(lines.len(), 1);
         let text = line_text(&lines[0]);
-        assert!(text.starts_with("✗ bash x"));
+        assert!(text.starts_with("✗ Bash $ x"), "{text}");
         assert!(text.ends_with('…'));
     }
 

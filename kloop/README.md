@@ -272,11 +272,16 @@ alternate screen, plan 38 slice 0): a full-height viewport holds the still-live
 tail — the streaming answer, any running tool rows, a one-line status row, and
 the input — while every finalized cell scrolls up into the terminal's **native
 scrollback**, so the mouse wheel, text selection, and Cmd+F reach history
-directly (the UI keeps no scroll of its own). Tool calls collapse to single
-status rows (`… bash {...}` while running, `✓`/`✗` when done) — their full
-output lives in history/offload, not on screen. Permission prompts appear as a
-centered y/a/p/n popup over the viewport; prompts from a concurrent tool batch
-queue and are answered in order.
+directly (the UI keeps no scroll of its own). Tool calls render as
+human-readable rows (plan 38 slice 2, `crates/tui/src/toolrow.rs`): a
+status-marked verb and its key argument — `● Bash $ ls -la` (running, yellow),
+`✓ Read src/main.rs`, `✓ Grep TODO in src`, `✗ Write notes.txt` (failed, red),
+an MCP `server__tool` verbatim — over a few lines of the result indented under a
+`└` gutter (double-limited by lines and chars, control chars sanitized, the rest
+left in history/offload). `edit_file` shows a one-line `- old` / `+ new` diff
+from its input instead. Permission prompts appear as a centered y/a/p/n popup
+over the viewport; prompts from a concurrent tool batch queue and are answered
+in order.
 
 Assistant messages render as **markdown** (plan 38 slice 1, `crates/tui/src/markdown.rs`
 via `pulldown-cmark`): headings and `**bold**`/`*italic*`/`~~strike~~` weight,

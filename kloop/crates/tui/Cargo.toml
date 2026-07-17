@@ -14,9 +14,8 @@ crossterm = { workspace = true }
 ratatui = { workspace = true, features = ["scrolling-regions"] }
 # Markdown → styled lines for assistant messages (plan 38 slice 1).
 pulldown-cmark = { workspace = true }
+# Tool-input parsing to format human-readable tool rows (plan 38 slice 2).
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 unicode-width = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }

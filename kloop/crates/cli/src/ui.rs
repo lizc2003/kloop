@@ -97,7 +97,14 @@ impl Ui for StdoutUi {
         eprintln!("\x1b[2m[{s}]\x1b[0m");
     }
 
-    fn tool_start(&self, agent: &str, _id: &str, name: &str, summary: &str) {
+    fn tool_start(
+        &self,
+        agent: &str,
+        _id: &str,
+        name: &str,
+        summary: &str,
+        _input: &serde_json::Value,
+    ) {
         // todo_write is rendered as a checklist by todo_update, not a note.
         if name == "todo_write" {
             return;

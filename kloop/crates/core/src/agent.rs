@@ -34,16 +34,21 @@ pub trait Ui: Send + Sync {
     /// for calls made inside a task — parallel sub-agents interleave on this
     /// stream and the label is what tells them apart. The defaults collapse
     /// to the plain note stream so line-based UIs need not care about call ids.
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
-        let _ = id;
+    /// `summary` is a short one-line preview (the input JSON truncated); `input`
+    /// is the full tool input, for UIs that format a human-readable row per tool
+    /// type (the TUI). The default note-based path only needs `summary`.
+    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, input: &Value) {
+        let _ = (id, input);
         if agent.is_empty() {
             self.note(&format!("{name} {summary}"));
         } else {
             self.note(&format!("{agent} · {name} {summary}"));
         }
     }
-    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
-        let _ = (agent, id, ok);
+    /// `output` is the tool result flattened to text (bounded for transport), so
+    /// a UI can preview it under the call row; the default drops it.
+    fn tool_end(&self, agent: &str, id: &str, ok: bool, output: &str) {
+        let _ = (agent, id, ok, output);
     }
     /// Sub-agent lifecycle: a task call spawned `agent` to work on `task`
     /// (first line of the prompt, truncated). Ends exactly once per start.

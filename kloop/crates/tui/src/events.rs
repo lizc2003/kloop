@@ -13,6 +13,7 @@ use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoItem;
 use kloop_protocol::Message;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -49,12 +50,17 @@ pub enum AgentEvent {
         agent: String,
         id: String,
         name: String,
-        summary: String,
+        /// The full tool input as a JSON string; the renderer formats a
+        /// human-readable row from it (`toolrow`), so it must not be truncated.
+        input: String,
     },
     ToolEnd {
         agent: String,
         id: String,
         ok: bool,
+        /// The tool result flattened to text (bounded in core), for the preview
+        /// the renderer shows under the call row.
+        output: String,
     },
     /// A task call spawned a sub-agent; ends exactly once per start.
     AgentStart {
@@ -113,20 +119,23 @@ impl Ui for ChannelUi {
         self.send(AgentEvent::Note(s.to_string()));
     }
 
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str) {
+    fn tool_start(&self, agent: &str, id: &str, name: &str, _summary: &str, input: &Value) {
+        // The TUI formats its own row from the structured input, so it forwards
+        // the full input JSON, not the truncated one-line `summary`.
         self.send(AgentEvent::ToolStart {
             agent: agent.to_string(),
             id: id.to_string(),
             name: name.to_string(),
-            summary: summary.to_string(),
+            input: input.to_string(),
         });
     }
 
-    fn tool_end(&self, agent: &str, id: &str, ok: bool) {
+    fn tool_end(&self, agent: &str, id: &str, ok: bool, output: &str) {
         self.send(AgentEvent::ToolEnd {
             agent: agent.to_string(),
             id: id.to_string(),
             ok,
+            output: output.to_string(),
         });
     }
 
@@ -187,12 +196,24 @@ mod tests {
 
         ui.text_delta("hel");
         ui.text_delta("lo");
-        ui.tool_start("", "t1", "bash", "{\"command\":\"ls\"}");
+        ui.tool_start(
+            "",
+            "t1",
+            "bash",
+            "ignored",
+            &serde_json::json!({"command": "ls"}),
+        );
         ui.note("retrying");
-        ui.tool_end("", "t1", true);
+        ui.tool_end("", "t1", true, "file.txt");
         ui.agent_start("agent-1", "look things up");
-        ui.tool_start("agent-1", "t2", "grep", "{\"pattern\":\"x\"}");
-        ui.tool_end("agent-1", "t2", true);
+        ui.tool_start(
+            "agent-1",
+            "t2",
+            "grep",
+            "ignored",
+            &serde_json::json!({"pattern": "x"}),
+        );
+        ui.tool_end("agent-1", "t2", true, "3 matches");
         ui.agent_end("agent-1", true);
 
         let mut got = Vec::new();
@@ -204,12 +225,12 @@ mod tests {
             vec![
                 r#"TextDelta("hel")"#,
                 r#"TextDelta("lo")"#,
-                r#"ToolStart { agent: "", id: "t1", name: "bash", summary: "{\"command\":\"ls\"}" }"#,
+                r#"ToolStart { agent: "", id: "t1", name: "bash", input: "{\"command\":\"ls\"}" }"#,
                 r#"Note("retrying")"#,
-                r#"ToolEnd { agent: "", id: "t1", ok: true }"#,
+                r#"ToolEnd { agent: "", id: "t1", ok: true, output: "file.txt" }"#,
                 r#"AgentStart { agent: "agent-1", task: "look things up" }"#,
-                r#"ToolStart { agent: "agent-1", id: "t2", name: "grep", summary: "{\"pattern\":\"x\"}" }"#,
-                r#"ToolEnd { agent: "agent-1", id: "t2", ok: true }"#,
+                r#"ToolStart { agent: "agent-1", id: "t2", name: "grep", input: "{\"pattern\":\"x\"}" }"#,
+                r#"ToolEnd { agent: "agent-1", id: "t2", ok: true, output: "3 matches" }"#,
                 r#"AgentEnd { agent: "agent-1", ok: true }"#,
             ]
         );

@@ -46,8 +46,13 @@ pub enum Cell {
     Thinking(String),
     Tool {
         name: String,
-        summary: String,
+        /// The tool input as a JSON string; the renderer (`toolrow`) formats a
+        /// human-readable row from it (`● Bash $ ls`, `Read file.rs`, …).
+        input: String,
         status: ToolStatus,
+        /// The result text preview (bounded in core), filled in at ToolEnd and
+        /// shown under the row. None while running or when there was no output.
+        output: Option<String>,
     },
     /// One live row per sub-agent: its tool calls fold into a counter plus a
     /// preview of the latest call instead of separate rows, so parallel
@@ -213,19 +218,22 @@ impl App {
                 agent,
                 id,
                 name,
-                summary,
+                input,
             } => {
+                // A one-line "verb detail" preview used by the note stream and
+                // the folded sub-agent row (the full cell is formatted at render).
+                let preview = crate::toolrow::tool_preview(&name, &input);
                 if !agent.is_empty() {
                     // A sub-agent's call folds into its Agent row: bump the
                     // counter, refresh the preview. No per-call cell, so
                     // parallel agents cannot interleave.
-                    self.last_note = Some(format!("{agent} · {name} {summary}"));
+                    self.last_note = Some(format!("{agent} · {preview}"));
                     if let Some(Cell::Agent {
                         tools, last_tool, ..
                     }) = self.agent_cell(&agent)
                     {
                         *tools += 1;
-                        *last_tool = format!("{name} {summary}");
+                        *last_tool = preview;
                     }
                     return;
                 }
@@ -236,27 +244,43 @@ impl App {
                 if name == "todo_write" {
                     return;
                 }
-                self.last_note = Some(format!("{name} {summary}"));
+                self.last_note = Some(preview);
                 self.tool_cells.insert(id, self.cells.len());
                 self.cells.push(Cell::Tool {
                     name,
-                    summary,
+                    input,
                     status: ToolStatus::Running,
+                    output: None,
                 });
             }
-            AgentEvent::ToolEnd { agent, id, ok } => {
+            AgentEvent::ToolEnd {
+                agent,
+                id,
+                ok,
+                output,
+            } => {
                 // Sub-agent calls have no cell of their own; their agent's
                 // row is resolved by AgentEnd.
                 if !agent.is_empty() {
                     return;
                 }
                 if let Some(&i) = self.tool_cells.get(&id) {
-                    if let Some(Cell::Tool { status, .. }) = self.cells.get_mut(i) {
+                    if let Some(Cell::Tool {
+                        status,
+                        output: out,
+                        ..
+                    }) = self.cells.get_mut(i)
+                    {
                         *status = if ok {
                             ToolStatus::Ok
                         } else {
                             ToolStatus::Failed
                         };
+                        // Keep the preview for the transcript; empty output
+                        // leaves the row a single line.
+                        if !output.is_empty() {
+                            *out = Some(output);
+                        }
                     }
                 }
             }
@@ -617,15 +641,20 @@ impl App {
 /// orphans as interrupted errors anyway). Tool-result blocks themselves are
 /// skipped — their content is history-internal.
 pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
-    let result_errors: HashMap<&str, bool> = messages
+    // Pair each tool_use with its result: the is_error decides ✓/✗ and the
+    // (bounded) content becomes the preview under the row, same as the live path.
+    let results: HashMap<&str, (bool, String)> = messages
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|b| match b {
             ContentBlock::ToolResult {
                 tool_use_id,
                 is_error,
-                ..
-            } => Some((tool_use_id.as_str(), *is_error)),
+                content,
+            } => Some((
+                tool_use_id.as_str(),
+                (*is_error, content.as_text().chars().take(4000).collect()),
+            )),
             _ => None,
         })
         .collect();
@@ -666,14 +695,17 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                     }
                 }
                 (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
+                    let (status, output) = match results.get(id.as_str()) {
+                        Some((false, text)) => (ToolStatus::Ok, Some(text.clone())),
+                        Some((true, text)) => (ToolStatus::Failed, Some(text.clone())),
+                        // Orphaned call (killed session): failed, no result yet.
+                        None => (ToolStatus::Failed, None),
+                    };
                     cells.push(Cell::Tool {
                         name: name.clone(),
-                        // Same 120-char cap as the live tool_start summary.
-                        summary: input.to_string().chars().take(120).collect(),
-                        status: match result_errors.get(id.as_str()) {
-                            Some(false) => ToolStatus::Ok,
-                            Some(true) | None => ToolStatus::Failed,
-                        },
+                        input: input.to_string(),
+                        status,
+                        output,
                     });
                 }
                 _ => {}
@@ -752,13 +784,14 @@ mod tests {
             agent: String::new(),
             id: "t1".into(),
             name: "bash".into(),
-            summary: "{}".into(),
+            input: "{}".into(),
         });
         app.apply(AgentEvent::TextDelta("world".into()));
         app.apply(AgentEvent::ToolEnd {
             agent: String::new(),
             id: "t1".into(),
             ok: false,
+            output: String::new(),
         });
 
         assert_eq!(
@@ -767,8 +800,9 @@ mod tests {
                 Cell::Assistant("hello".into()),
                 Cell::Tool {
                     name: "bash".into(),
-                    summary: "{}".into(),
+                    input: "{}".into(),
                     status: ToolStatus::Failed,
+                    output: None,
                 },
                 Cell::Assistant("world".into()),
             ]
@@ -794,24 +828,25 @@ mod tests {
             agent: "agent-1".into(),
             id: "t1".into(),
             name: "grep".into(),
-            summary: "{\"pattern\":\"bug\"}".into(),
+            input: "{\"pattern\":\"bug\"}".into(),
         });
         app.apply(AgentEvent::ToolStart {
             agent: "agent-2".into(),
             id: "t2".into(),
             name: "read_file".into(),
-            summary: "{\"path\":\"README\"}".into(),
+            input: "{\"path\":\"README\"}".into(),
         });
         app.apply(AgentEvent::ToolEnd {
             agent: "agent-1".into(),
             id: "t1".into(),
             ok: true,
+            output: String::new(),
         });
         app.apply(AgentEvent::ToolStart {
             agent: "agent-1".into(),
             id: "t3".into(),
             name: "bash".into(),
-            summary: "{\"command\":\"cargo test\"}".into(),
+            input: "{\"command\":\"cargo test\"}".into(),
         });
         app.apply(AgentEvent::AgentEnd {
             agent: "agent-1".into(),
@@ -830,14 +865,15 @@ mod tests {
                     task: "find the bug".into(),
                     status: ToolStatus::Ok,
                     tools: 2,
-                    last_tool: "bash {\"command\":\"cargo test\"}".into(),
+                    // The folded preview is the human-readable form now.
+                    last_tool: "Bash $ cargo test".into(),
                 },
                 Cell::Agent {
                     agent: "agent-2".into(),
                     task: "write the docs".into(),
                     status: ToolStatus::Failed,
                     tools: 1,
-                    last_tool: "read_file {\"path\":\"README\"}".into(),
+                    last_tool: "Read README".into(),
                 },
             ]
         );
@@ -854,7 +890,7 @@ mod tests {
             agent: String::new(),
             id: "t1".into(),
             name: "bash".into(),
-            summary: "{}".into(),
+            input: "{}".into(),
         });
         app.apply(AgentEvent::TodoUpdate {
             todos: vec![todo("Do", "Doing", TodoStatus::InProgress)],
@@ -863,7 +899,7 @@ mod tests {
             agent: String::new(),
             id: "t2".into(),
             name: "grep".into(),
-            summary: "{}".into(),
+            input: "{}".into(),
         });
         // cells: [Tool t1 (0), Todo (1), Tool t2 (2)]
         assert_eq!(app.cells.len(), 3);
@@ -880,18 +916,21 @@ mod tests {
             agent: String::new(),
             id: "t1".into(),
             ok: true,
+            output: String::new(),
         });
         app.apply(AgentEvent::ToolEnd {
             agent: String::new(),
             id: "t2".into(),
             ok: true,
+            output: String::new(),
         });
         assert_eq!(
             app.cells,
             vec![Cell::Tool {
                 name: "grep".into(),
-                summary: "{}".into(),
+                input: "{}".into(),
                 status: ToolStatus::Ok,
+                output: None,
             }]
         );
     }
@@ -959,7 +998,7 @@ mod tests {
             agent: String::new(),
             id: "t1".into(),
             name: "todo_write".into(),
-            summary: "{\"todos\":[...]}".into(),
+            input: "{\"todos\":[...]}".into(),
         });
         // No tool row appeared for the suppressed call.
         assert!(app.cells.is_empty());
@@ -989,6 +1028,7 @@ mod tests {
             agent: String::new(),
             id: "t1".into(),
             ok: true,
+            output: String::new(),
         });
         assert_eq!(app.cells.len(), 1);
     }
@@ -1495,23 +1535,26 @@ mod tests {
                 Cell::Assistant("on it".into()),
                 Cell::Tool {
                     name: "bash".into(),
-                    summary: r#"{"command":"ls"}"#.into(),
+                    input: r#"{"command":"ls"}"#.into(),
                     status: ToolStatus::Ok,
+                    output: Some("big output not shown".into()),
                 },
                 Cell::Tool {
                     name: "write_file".into(),
-                    summary: r#"{"path":"x"}"#.into(),
+                    input: r#"{"path":"x"}"#.into(),
                     status: ToolStatus::Failed,
+                    output: Some("declined".into()),
                 },
                 Cell::Assistant("done".into()),
                 Cell::Tool {
                     name: "bash".into(),
-                    summary: r#"{"command":"true"}"#.into(),
+                    input: r#"{"command":"true"}"#.into(),
                     status: ToolStatus::Failed,
+                    output: None,
                 },
                 Cell::Note("resumed session — 4 message(s)".into()),
             ],
-            "tool_result content stays out of the transcript; only status pairs back"
+            "a resumed tool call pairs back its status and result preview; an orphan is failed with no output"
         );
 
         assert_eq!(

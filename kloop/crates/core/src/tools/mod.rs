@@ -576,7 +576,7 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
     let summary: String = input.to_string().chars().take(120).collect();
     ctx.ui
-        .tool_start(&ctx.cfg.agent_label, &id, &name, &summary);
+        .tool_start(&ctx.cfg.agent_label, &id, &name, &summary, &input);
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -664,13 +664,17 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let ContentBlock::ToolResult {
         tool_use_id,
         is_error,
-        ..
+        content,
     } = &result
     else {
         unreachable!("run_one always builds a tool_result")
     };
+    // Bound the transport: a UI previews only a few lines, and a huge bash
+    // output would otherwise be cloned onto the event channel wholesale. The UI
+    // truncates further for display.
+    let output: String = content.as_text().chars().take(4000).collect();
     ctx.ui
-        .tool_end(&ctx.cfg.agent_label, tool_use_id, !is_error);
+        .tool_end(&ctx.cfg.agent_label, tool_use_id, !is_error, &output);
     result
 }
 

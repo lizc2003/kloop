@@ -156,7 +156,7 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 - 验收:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 65 测试,新增 markdown 结构/表格/右对齐/嵌套围栏/代码块暗底/安全边界/流式前缀+裸尾/CJK 等)。真 key **双轨** PTY+pyte VT100 驱动(CPR 由驱动模拟应答,解 inline 构造陷阱):anthropic + openai 默认 prompt 各 10/10(标题 bold / 粗体 attr / 行内 code / bullets `•` / box-drawing 表格对齐 + Alice/Bob 行 / 代码块 bg=索引236(pyte 见 `303030`));另 anthropic 单验多行 fenced 代码块渲染成三行暗底矩形、内容保真。
 - 教训沉淀:HANDOFF 教训「markdown 流式安全边界与 inline commit 模型的解耦」。
 
-### 切片 2 — 人类可读工具行 + 输出预览
+### 切片 2 — 人类可读工具行 + 输出预览 ✅ 完成(2026-07-17)
 
 工具行按类型格式化(借 claw `format_*` 信息架构):`● Bash($ ls -la)` / `Read(file.rs)` /
 `Write(file, N lines)` / `Edit(file)` + 一行 diff / `Grep 🔎 pattern` / MCP `server__tool(...)`;
@@ -166,6 +166,13 @@ gutter 视觉语言统一 `● › │ └`,左槽宽度常量对齐。连续 re
 (可选,后置)。
 
 - 验收:各工具人类可读摘要 + 输出预览;拒绝/失败/中断状态正确。
+
+**完成记录(2026-07-17)**:
+- **数据流**:工具结果内容此前没传到 TUI(`tool_end` 只有 `ok`),工具行格式化又需结构化 input(此前只有截断到 120 的 JSON)。给 `Ui::tool_start` 加 `input: &Value`、`tool_end` 加 `output: &str`(现有实现——server/plain/headless/测试 mock——只加忽略参数,最小 ripple,只 TUI 用);`run_one` 传 `&input` + `content.as_text()` 有界到 4000 字符(传输界,UI 再截断显示)。`AgentEvent::ToolStart.summary→input`(全 JSON 不截断)、`ToolEnd` 加 `output`;`Cell::Tool` 加 `input`+`output: Option<String>`。
+- **新模块 `crates/tui/src/toolrow.rs`**(纯函数,`(name, input-json, status, output) → Vec<Line>`,不碰终端可单测):`tool_label` 按工具名 → (verb, detail):Bash `$ cmd`(后台标 `(background)`)/ Read path / Write `path (N lines)`/ Edit path / Grep `pat in scope` / Glob / Fetch / Search / read_offloaded / bash_output / kill_bash / tool_search / skill / call_tool(拆内层工具名)/ 其它(MCP `server__tool` 等)保留原名 + 紧凑 JSON。状态 bullet `●`(running,黄)/`✓`(绿)/`✗`(红);verb bold、detail dim 且按宽截断。edit 走 `- old`/`+ new` 一行 diff(红/绿,取自 input);其它工具走 `preview_lines`——`└ `/`    ` gutter、双限截断(`PREVIEW_MAX_LINES=5`/`PREVIEW_MAX_CHARS=400`)、失败红/正常 dim、超行提示 `… full result in session`。**`clean()` 消毒**:read_file 的 `{n}\t{line}` 制表符在 ratatui 里宽度 0 会重叠错位(真终端也错,非仅 pyte),tab→空格、其它控制字符丢弃。`tool_preview` 给折叠的子 agent 行复用同一 label。
+- 接线:`render::cell_lines` 的 `Cell::Tool` 一行委托 `toolrow::tool_cell_lines`;子 agent 折叠行的 `last_tool` 与 note 用 `tool_preview`;`cells_from_history` 按 tool_use↔tool_result 配对回填 status + output 预览(孤儿 = 失败无输出)。
+- **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 75 测试,新增 bash/read/write/grep 标签、后台标记、edit 一行 diff、双限截断+more 提示、失败红、空输出无预览、MCP 保原名、制表符消毒、长 detail 截断)。真 key **双轨** PTY+pyte(`--permission-mode bypass` 免审批)：anthropic + openai 各 4/4(`✓ Bash $ echo…`+`└ hello/world` 预览 / `✓ Read Cargo.toml`+内容预览+`… full result in session` / `✓ Grep workspace in Cargo.toml`+匹配预览;无原始 JSON 行;制表符消毒后行号列对齐)。
+- 教训沉淀:HANDOFF 教训 40(工具结果原文的传输/展示分层 + 制表符/控制字符消毒是渲染正确性)。
 
 ### 切片 3 — 多行 composer
 
@@ -223,6 +230,6 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
 
 - ~~切片 0 是否即刻开工~~(✅ 用户同意即刻开工,已完成)。
 - ~~关键决定 2:syntect 代码高亮引入 vs 后置~~(✅ 切片 1 拍板**后置**:代码块先做暗底,syntect 留独立小片)。
-- 切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)可开工时对着真 key 调。
+- ~~切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)~~(✅ 定:bullet `●`(running,黄)/`✓`/`✗`,结果 gutter `└ `/`    `;对着真 key 调过,对齐、消毒制表符)。
 - **品牌强调色**定 magenta/cyan(styles.md 建议)还是**橙**(靠拢 CC 截图);gutter 提示符
   `›`、mode 行 `⏵⏵`、thinking `∗` 等具体字形对着真 key 调。

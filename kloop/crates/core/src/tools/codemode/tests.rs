@@ -36,10 +36,17 @@ impl Ui for RecordUi {
     fn note(&self, s: &str) {
         self.0.lock().unwrap().push(format!("note: {s}"));
     }
-    fn tool_start(&self, _agent: &str, _id: &str, name: &str, _summary: &str) {
+    fn tool_start(
+        &self,
+        _agent: &str,
+        _id: &str,
+        name: &str,
+        _summary: &str,
+        _input: &serde_json::Value,
+    ) {
         self.0.lock().unwrap().push(format!("tool_start: {name}"));
     }
-    fn tool_end(&self, _agent: &str, _id: &str, ok: bool) {
+    fn tool_end(&self, _agent: &str, _id: &str, ok: bool, _output: &str) {
         self.0.lock().unwrap().push(format!("tool_end: {ok}"));
     }
 }

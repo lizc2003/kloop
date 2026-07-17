@@ -13,6 +13,7 @@ mod app;
 mod events;
 mod markdown;
 mod render;
+mod toolrow;
 
 use std::io::Write as _;
 use std::sync::atomic::AtomicBool;
