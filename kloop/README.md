@@ -327,10 +327,13 @@ insert a newline (Ctrl+J is the portable one — many terminals do not distingui
 Shift+Enter); arrow keys move the cursor across lines, and **↑/↓ on the first/last
 line** step through the input history instead. A **large paste** collapses to a
 `[Pasted N chars]` placeholder that expands to the full text on submit (so the
-composer stays readable); a pasted or dragged **image-file path** attaches as an
-image — shown on a `📎` line above the composer — and rides the turn (reusing the
-`--image` ingestion), merged with any startup `--image` blocks. (OS-clipboard
-image capture, which needs platform code, is deferred.)
+composer stays readable). **Ctrl+V / Alt+V** pastes an image straight off the OS
+clipboard (a screenshot, a browser copy, or a Finder-copied file) — terminals
+keep Cmd+V for their own text paste, so a distinct key reads the clipboard, the
+same choice Claude Code and codex make; a pasted or dragged **image-file path**
+attaches too. The image shows on a `📎` line above the composer and rides the
+turn (reusing the `--image` ingestion — `crates/tui/src/clipboard.rs` via
+`arboard`), merged with any startup `--image` blocks.
 
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a

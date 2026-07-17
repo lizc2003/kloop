@@ -27,6 +27,12 @@ kloop-tui = { path = "crates/tui" }
 kloop-web = { path = "crates/web" }
 
 anyhow = "1"
+# OS clipboard image paste in the TUI (plan 38 slice 3): Ctrl+V reads an image
+# off the system clipboard (like Claude Code / codex, which reserve Cmd+V for the
+# terminal's own text paste). arboard reads it (its macOS backend pulls only
+# image[tiff]); `png` encodes the raw RGBA it returns into bytes core validates.
+arboard = "3"
+png = "0.17"
 # Image input (plan 29): standard base64 for the wire `data` field. 3rd
 # function dependency (after similar, serde_yaml_ng); base64 is an unambiguous
 # standard codec, so a crate beats hand-rolling it. Already in the tree

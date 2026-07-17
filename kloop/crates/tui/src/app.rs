@@ -116,6 +116,9 @@ pub enum Command {
     SetMode(Mode),
     /// Cancel the in-flight turn's CancellationToken.
     Interrupt,
+    /// Read an image off the OS clipboard (Ctrl+V) and attach it. The read is a
+    /// side effect, so it runs in the event loop, not here.
+    PasteClipboardImage,
     Quit,
 }
 
@@ -495,6 +498,12 @@ impl App {
         {
             self.composer.insert_newline();
             return Command::None;
+        }
+        // Ctrl+V / Alt+V pastes an image off the OS clipboard (the terminal keeps
+        // Cmd+V for its own text paste, so a distinct key like codex / CC). The
+        // read is a side effect the loop performs.
+        if (ctrl || alt) && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+            return Command::PasteClipboardImage;
         }
         match (key.code, ctrl) {
             // Esc interrupts a running turn (CC parity, the advertised key);
@@ -1348,6 +1357,19 @@ mod tests {
         assert_eq!(app.on_key(ctrl('c')), Command::Quit);
         // Ctrl+D is disabled — the only quit path is the two-tap Ctrl+C.
         assert_eq!(app.on_key(ctrl('d')), Command::None);
+    }
+
+    /// Ctrl+V and Alt+V request an OS-clipboard image paste (the loop performs
+    /// the read); the reserved terminal Cmd+V is unaffected.
+    #[test]
+    fn ctrl_or_alt_v_requests_clipboard_image() {
+        let mut app = App::new("s".into());
+        assert_eq!(app.on_key(ctrl('v')), Command::PasteClipboardImage);
+        let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        assert_eq!(app.on_key(alt_v), Command::PasteClipboardImage);
+        // A plain 'v' just types.
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.composer.text(), "v");
     }
 
     /// Esc interrupts a running turn (the advertised key) and clears the input

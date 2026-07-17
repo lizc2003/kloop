@@ -8,7 +8,10 @@ kloop-core = { workspace = true }
 kloop-protocol = { workspace = true }
 
 anyhow = { workspace = true }
+# OS clipboard image paste (Ctrl+V, plan 38 slice 3).
+arboard = { workspace = true }
 crossterm = { workspace = true }
+png = { workspace = true }
 # scrolling-regions: flicker-free `insert_before` into native scrollback for
 # the inline viewport (plan 38 slice 0) — DECSTBM scroll regions, no full repaint.
 ratatui = { workspace = true, features = ["scrolling-regions"] }

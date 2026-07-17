@@ -10,6 +10,7 @@
 //! scrollback with `insert_before`, and reads keys on a dedicated poll thread.
 
 mod app;
+mod clipboard;
 mod composer;
 mod events;
 mod markdown;
@@ -552,6 +553,14 @@ async fn ui_loop(
                         Command::Interrupt => {
                             if let Some(cancel) = &current_cancel {
                                 cancel.cancel();
+                            }
+                        }
+                        Command::PasteClipboardImage => {
+                            // Read the OS clipboard here (a side effect); attach
+                            // an image, or note why there was none.
+                            match clipboard::clipboard_image() {
+                                Ok((label, block)) => app.attach_image(label, block),
+                                Err(e) => app.apply(AgentEvent::Note(e)),
                             }
                         }
                         Command::Quit => break Ok(()),
