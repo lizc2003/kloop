@@ -321,6 +321,17 @@ approvals the scroll keys (plus j/k) page through a tall diff and y/a/p/n
 answer, Esc denies; for rewind ↑↓/kj move and Enter/Esc select or cancel.
 `--plain` keeps the old line-based REPL; `--mock` stays on plain output.
 
+The input is a **multi-line composer** (plan 38 slice 3, `crates/tui/src/composer.rs`),
+a `›` prompt over a dim placeholder when empty. **Shift+Enter / Alt+Enter / Ctrl+J**
+insert a newline (Ctrl+J is the portable one — many terminals do not distinguish
+Shift+Enter); arrow keys move the cursor across lines, and **↑/↓ on the first/last
+line** step through the input history instead. A **large paste** collapses to a
+`[Pasted N chars]` placeholder that expands to the full text on submit (so the
+composer stays readable); a pasted or dragged **image-file path** attaches as an
+image — shown on a `📎` line above the composer — and rides the turn (reusing the
+`--image` ingestion), merged with any startup `--image` blocks. (OS-clipboard
+image capture, which needs platform code, is deferred.)
+
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a
 long history scrolls straight into native scrollback, so a resumed session

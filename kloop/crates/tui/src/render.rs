@@ -256,33 +256,22 @@ pub fn commit_count(cells: &[Cell], width: usize, active_h: usize) -> usize {
     committed
 }
 
-/// The input line, windowed so the cursor stays visible in `width` columns.
-/// Returns the visible slice and the cursor's column within it.
-pub fn input_view(input: &str, cursor: usize, width: usize) -> (String, u16) {
-    let width = width.max(2);
-    let chars: Vec<(char, usize)> = input.chars().map(|c| (c, c.width().unwrap_or(0))).collect();
-    let cursor = cursor.min(chars.len());
-    // Slide the window start right until the cursor fits inside width-1
-    // columns (one column reserved so the cursor can sit past the last char).
-    let mut start = 0;
-    loop {
-        let cursor_cols: usize = chars[start..cursor].iter().map(|(_, w)| w).sum();
-        if cursor_cols < width || start >= cursor {
-            break;
-        }
-        start += 1;
-    }
-    let mut out = String::new();
-    let mut cols = 0;
-    for (c, w) in &chars[start..] {
-        if cols + w > width - 1 {
-            break;
-        }
-        out.push(*c);
-        cols += w;
-    }
-    let x: usize = chars[start..cursor].iter().map(|(_, w)| w).sum();
-    (out, x as u16)
+/// The on-screen height of the composer at `width`: its wrapped rows (already
+/// capped inside the composer) plus one row for the attachment line when images
+/// are pending. Both [`draw`] and the event loop's overflow-commit size the
+/// bottom chrome from this.
+pub fn composer_height(app: &App, width: usize) -> usize {
+    let rows = app.composer.view(width).rows.len();
+    let attach = usize::from(!app.composer.attachments().is_empty());
+    (rows + attach).max(1)
+}
+
+/// The dim `📎 a.png, b.png` line above the composer when images are attached.
+fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate(&format!("📎 {}", labels.join(", ")), width),
+        DIM,
+    ))
 }
 
 /// The dynamic "what's happening now" line, shown at the BOTTOM of the
@@ -321,20 +310,26 @@ pub fn footer_line(app: &App) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // Bottom-up: a stable footer (mode + hints), the composer fenced by a rule
-    // above and below, and the transcript — whose last line carries the live
-    // activity status (CC's information architecture: the dynamic "what's
-    // happening" sits by the composer where it is seen, the footer stays still).
+    // Bottom-up: a stable footer (mode + hints), the multi-line composer fenced
+    // by a rule above and below, and the transcript — whose last line carries
+    // the live activity status (CC's information architecture: the dynamic
+    // "what's happening" sits by the composer where it is seen, the footer stays
+    // still). The composer's height is dynamic (it grows with the input).
+    let full = f.area();
+    let width = full.width as usize;
+    let view = app.composer.view(width.max(1));
+    let labels: Vec<String> = app.composer.attachments().to_vec();
+    let attach_h = u16::from(!labels.is_empty());
+    let composer_h = (view.rows.len() as u16 + attach_h).max(1);
     let [transcript_area, rule_top, input_area, rule_bottom, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(composer_h),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(f.area());
+    .areas(full);
 
-    let width = transcript_area.width as usize;
     let mut lines = visible_transcript(app, width.max(1));
     // The activity status is the last transcript line — rendered here, never a
     // cell, so it is never frozen into scrollback. A blank spacer sets it off.
@@ -368,16 +363,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         footer_area,
     );
 
-    let input_width = (input_area.width as usize).saturating_sub(2);
-    let (visible, x) = input_view(&app.input, app.cursor, input_width.max(2));
-    f.render_widget(Paragraph::new(format!("> {visible}")), input_area);
+    // Composer: the attachment line (if any) above the wrapped input rows.
+    let mut comp_rows: Vec<Line> = Vec::new();
+    if attach_h == 1 {
+        comp_rows.push(attachment_line(&labels, width));
+    }
+    comp_rows.extend(view.rows);
+    f.render_widget(Paragraph::new(comp_rows), input_area);
 
     if !app.confirms.is_empty() {
-        draw_confirm(f, app, f.area());
+        draw_confirm(f, app, full);
     } else if app.fork_picker.is_some() {
-        draw_fork_picker(f, app, f.area());
+        draw_fork_picker(f, app, full);
     } else {
-        f.set_cursor_position((input_area.x + 2 + x, input_area.y));
+        f.set_cursor_position((
+            input_area.x + view.cursor_col,
+            input_area.y + attach_h + view.cursor_row,
+        ));
     }
 }
 
@@ -953,23 +955,5 @@ mod tests {
         let text = line_text(&lines[0]);
         assert!(text.starts_with("✗ Bash $ x"), "{text}");
         assert!(text.ends_with('…'));
-    }
-
-    #[test]
-    fn input_view_windows_around_the_cursor() {
-        // Fits entirely.
-        assert_eq!(input_view("abc", 1, 10), ("abc".into(), 1));
-        // Cursor at the end of a long input: window shows the tail.
-        let (visible, x) = input_view("abcdefghij", 10, 6);
-        assert_eq!(visible, "fghij");
-        assert_eq!(x, 5);
-        // Cursor back at the start: window shows the head.
-        let (visible, x) = input_view("abcdefghij", 0, 6);
-        assert_eq!(visible, "abcde");
-        assert_eq!(x, 0);
-        // Wide chars count double.
-        let (visible, x) = input_view("你好世界", 4, 5);
-        assert_eq!(visible, "世界");
-        assert_eq!(x, 4);
     }
 }

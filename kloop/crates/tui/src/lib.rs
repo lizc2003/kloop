@@ -10,6 +10,7 @@
 //! scrollback with `insert_before`, and reads keys on a dedicated poll thread.
 
 mod app;
+mod composer;
 mod events;
 mod markdown;
 mod render;
@@ -59,6 +60,9 @@ pub type NoteFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Turn {
     text: String,
+    /// Images the composer attached to this turn (plan 38 slice 3); merged with
+    /// any `--image` blocks that still ride the first turn.
+    images: Vec<ContentBlock>,
     cancel: CancellationToken,
 }
 
@@ -181,10 +185,14 @@ async fn agent_worker(
     while let Some(msg) = msgs.recv().await {
         match msg {
             WorkerMsg::Turn(turn) => {
-                let msg = if pending_images.is_empty() {
+                // `--image` blocks ride the first turn; the composer's attached
+                // images ride the turn they were sent with. Merge both.
+                let mut images = std::mem::take(&mut pending_images);
+                images.extend(turn.images);
+                let msg = if images.is_empty() {
                     Message::user_text(turn.text)
                 } else {
-                    Message::user_with_blocks(turn.text, std::mem::take(&mut pending_images))
+                    Message::user_with_blocks(turn.text, images)
                 };
                 history.record(msg);
                 let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
@@ -300,6 +308,12 @@ type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::St
 
 fn setup_terminal() -> Result<Terminal> {
     crossterm::terminal::enable_raw_mode()?;
+    // Bracketed paste (plan 38 slice 3): the terminal wraps pasted text so a
+    // large paste arrives as one `Event::Paste` (collapsed to a placeholder)
+    // instead of a burst of keystrokes, and a dragged image-file path can be
+    // recognized. This is a plain control sequence — no CPR, so it does not race
+    // stdin like the viewport probe does.
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     // A panic elsewhere (agent task, draw code) must not leave the terminal in
     // raw mode with no visible output.
     let hook = std::panic::take_hook();
@@ -336,6 +350,7 @@ fn restore_terminal() {
         .unwrap_or(0);
     let _ = crossterm::execute!(
         out,
+        crossterm::event::DisableBracketedPaste,
         crossterm::cursor::Show,
         crossterm::cursor::MoveTo(0, bottom),
         crossterm::style::Print("\r\n"),
@@ -381,13 +396,15 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (w as usize).max(1);
     // The live region is the viewport minus the bottom chrome: two rules that
-    // fence the composer, the composer, and the footer (4). When an activity
-    // line is showing it eats a blank spacer + its own row at the transcript
-    // bottom, so reserve two more (see render::draw).
-    let reserve = 4 + if render::activity_line(app).is_some() {
-        2
-    } else {
-        0
+    // fence the composer, the composer itself (now multi-line, plan 38 slice 3),
+    // and the footer. When an activity line is showing it eats a blank spacer +
+    // its own row at the transcript bottom, so reserve two more (see render::draw).
+    let reserve = 2 + render::composer_height(app, width) + 1 + {
+        if render::activity_line(app).is_some() {
+            2
+        } else {
+            0
+        }
     };
     let active_h = (h as usize).saturating_sub(reserve).max(1);
     let n = render::commit_count(&app.cells, width, active_h);
@@ -412,6 +429,31 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
     }
     app.drain_committed(n);
     Ok(())
+}
+
+/// Recognize a pasted/dragged image-file path and load it into an Image block
+/// (plan 38 slice 3). Terminals paste a dropped file as its (often quoted) path;
+/// a single-line path with an image extension that reads and validates becomes
+/// an attachment, otherwise the paste is plain text. Returns the display label
+/// (file name) and the block.
+fn load_image_paste(s: &str) -> Option<(String, ContentBlock)> {
+    let path = s.trim().trim_matches(['\'', '"']).trim();
+    if path.is_empty() || path.contains('\n') {
+        return None;
+    }
+    let p = std::path::Path::new(path);
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return None;
+    }
+    let bytes = std::fs::read(p).ok()?;
+    let block = kloop_core::image::image_block_from_bytes(&bytes).ok()?;
+    let label = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string();
+    Some((label, block))
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -471,7 +513,14 @@ async fn ui_loop(
                         Command::Submit(text) => {
                             let cancel = CancellationToken::new();
                             current_cancel = Some(cancel.clone());
-                            let _ = msgs.send(WorkerMsg::Turn(Turn { text, cancel }));
+                            // Attachments live on the App (ContentBlock isn't Eq,
+                            // so they can't ride the Command); take them here.
+                            let images = app.take_submit_images();
+                            let _ = msgs.send(WorkerMsg::Turn(Turn {
+                                text,
+                                images,
+                                cancel,
+                            }));
                         }
                         Command::Slash(line) => {
                             // Runs on the worker (owns History); its cancel lets
@@ -509,6 +558,13 @@ async fn ui_loop(
                         Command::None => {}
                     }
                 }
+                // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
+                // path attaches as an image, anything else goes to the composer
+                // (a large paste collapses to a placeholder there).
+                Some(Event::Paste(s)) => match load_image_paste(&s) {
+                    Some((label, block)) => app.attach_image(label, block),
+                    None => app.paste_text(&s),
+                },
                 // Resize repositions the viewport (handled by the autoresize at
                 // the top of the loop); any other event just needs a redraw.
                 Some(_) => {}

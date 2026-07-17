@@ -21,6 +21,7 @@ use kloop_protocol::Message;
 use kloop_protocol::Role;
 use tokio::sync::oneshot;
 
+use crate::composer::Composer;
 use crate::events::AgentEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,9 +125,13 @@ pub struct App {
     /// finalized ones the viewport shows. Older finalized cells have left for
     /// native scrollback (see [`Cell`], [`App::drain_committed`]).
     pub cells: Vec<Cell>,
-    pub input: String,
-    /// Cursor position in `input`, in chars.
-    pub cursor: usize,
+    /// The multi-line input widget (plan 38 slice 3): text, cursor, input
+    /// history, paste placeholders, and image attachments.
+    pub composer: Composer,
+    /// Images attached to the just-submitted turn, taken by the event loop to
+    /// build the user message. Held here rather than on `Command::Submit`
+    /// because `ContentBlock` isn't `Eq` (Command derives it).
+    submit_images: Vec<ContentBlock>,
     pub running: bool,
     pub confirms: VecDeque<PendingConfirm>,
     /// Scroll offset (in display lines) into the active confirm popup's body,
@@ -167,8 +172,8 @@ impl App {
         Self {
             session_id,
             cells: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            composer: Composer::new(),
+            submit_images: Vec::new(),
             running: false,
             confirms: VecDeque::new(),
             confirm_scroll: 0,
@@ -480,16 +485,26 @@ impl App {
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
         }
+        // A newline inside the composer instead of a submit: Ctrl+J (the reliable
+        // LF), or Shift/Alt+Enter where the terminal distinguishes it (many do
+        // not — Ctrl+J is the portable path).
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if (key.code == KeyCode::Enter && (shift || alt))
+            || (key.code == KeyCode::Char('j') && ctrl)
+        {
+            self.composer.insert_newline();
+            return Command::None;
+        }
         match (key.code, ctrl) {
             // Esc interrupts a running turn (CC parity, the advertised key);
-            // idle it clears the input line. A confirm popup / rewind picker
+            // idle it clears the composer. A confirm popup / rewind picker
             // capture Esc before this (they return early at the top of on_key).
             (KeyCode::Esc, _) => {
                 if self.running {
                     return Command::Interrupt;
                 }
-                self.input.clear();
-                self.cursor = 0;
+                self.composer.clear();
             }
             (KeyCode::Char('r'), true) => {
                 // Rewind (plan 18) is idle-only: a running turn owns History, so
@@ -498,33 +513,7 @@ impl App {
                     return Command::RequestForkPoints;
                 }
             }
-            (KeyCode::Enter, _) => {
-                let text = self.input.trim().to_string();
-                if text.is_empty() {
-                    return Command::None;
-                }
-                self.input.clear();
-                self.cursor = 0;
-                // A slash command runs only when idle; it is not a message, so
-                // no User cell and no new todo block. While a turn runs, a
-                // '/'-line is just steering text (Ctrl+C stays the hard stop).
-                if !self.running && kloop_core::commands::is_command(&text) {
-                    self.running = true;
-                    return Command::Slash(text);
-                }
-                self.cells.push(Cell::User(text.clone()));
-                if self.running {
-                    // Steering: the running turn absorbs this at its next round
-                    // boundary. It does not start a new turn, reset the todo
-                    // block, or interrupt tools (Ctrl+C stays the hard stop).
-                    return Command::Steer(text);
-                }
-                // A new turn starts a fresh todo block instead of mutating the
-                // previous turn's (which stays in the transcript as history).
-                self.todo_cell = None;
-                self.running = true;
-                return Command::Submit(text);
-            }
+            (KeyCode::Enter, _) => return self.on_enter(),
             // shift+Tab cycles the permission mode (manual → accept-edits →
             // plan → manual; bypass is opt-in via the CLI flag only). Allowed
             // any time — the gate reads the mode live per tool call.
@@ -532,24 +521,16 @@ impl App {
                 self.mode = self.mode.cycled();
                 return Command::SetMode(self.mode);
             }
-            (KeyCode::Char(c), false) => {
-                let at = byte_index(&self.input, self.cursor);
-                self.input.insert(at, c);
-                self.cursor += 1;
-            }
-            (KeyCode::Backspace, _) => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = byte_index(&self.input, self.cursor);
-                    self.input.remove(at);
-                }
-            }
-            (KeyCode::Left, _) => self.cursor = self.cursor.saturating_sub(1),
-            (KeyCode::Right, _) => {
-                self.cursor = (self.cursor + 1).min(self.input.chars().count());
-            }
-            (KeyCode::Home, _) => self.cursor = 0,
-            (KeyCode::End, _) => self.cursor = self.input.chars().count(),
+            // Up/Down move the composer cursor, or step through input history at
+            // the first/last line (plan 38 slice 3).
+            (KeyCode::Up, _) => self.composer.up(),
+            (KeyCode::Down, _) => self.composer.down(),
+            (KeyCode::Char(c), false) => self.composer.insert_char(c),
+            (KeyCode::Backspace, _) => self.composer.backspace(),
+            (KeyCode::Left, _) => self.composer.left(),
+            (KeyCode::Right, _) => self.composer.right(),
+            (KeyCode::Home, _) => self.composer.home(),
+            (KeyCode::End, _) => self.composer.end(),
             // Scrolling the transcript is the terminal's job now (inline
             // viewport, plan 38 slice 0): history lives in native scrollback,
             // so the mouse wheel / PageUp reach it directly. The old in-app
@@ -557,6 +538,60 @@ impl App {
             _ => {}
         }
         Command::None
+    }
+
+    /// Enter: submit the composer (or run a slash command / steer a running
+    /// turn). Newline-insert (Shift/Alt+Enter, Ctrl+J) is handled before this.
+    fn on_enter(&mut self) -> Command {
+        if self.composer.is_blank() {
+            return Command::None;
+        }
+        // The compact display text (placeholders intact) — shown in the
+        // transcript and used for slash detection; the submission carries the
+        // expanded text.
+        let display = self.composer.text().trim().to_string();
+        // A slash command runs only when idle; it is not a message, so no User
+        // cell and no new todo block. While a turn runs, a '/'-line is steering.
+        if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
+            let _ = self.composer.submit();
+            self.running = true;
+            return Command::Slash(display);
+        }
+        let labels = self.composer.attachments().to_vec();
+        let sub = self.composer.submit().expect("checked not blank");
+        self.submit_images = sub.images;
+        if !display.is_empty() {
+            self.cells.push(Cell::User(display));
+        }
+        // Each attached image replays as a placeholder line, like a resumed one.
+        for label in &labels {
+            self.cells.push(Cell::User(format!("[image: {label}]")));
+        }
+        if self.running {
+            // Steering: the running turn absorbs the text at its next round
+            // boundary (images ride a fresh turn only). No new turn / todo reset.
+            return Command::Steer(sub.text);
+        }
+        self.todo_cell = None;
+        self.running = true;
+        Command::Submit(sub.text)
+    }
+
+    /// Take the images attached to the turn just submitted (the event loop builds
+    /// the user message with them). Empty for a text-only turn.
+    pub fn take_submit_images(&mut self) -> Vec<ContentBlock> {
+        std::mem::take(&mut self.submit_images)
+    }
+
+    /// A bracketed-paste of text (the event loop routes image-file pastes to
+    /// [`App::attach_image`] instead).
+    pub fn paste_text(&mut self, s: &str) {
+        self.composer.paste(s);
+    }
+
+    /// Attach a pasted image (the loop already read + validated it into a block).
+    pub fn attach_image(&mut self, label: String, block: ContentBlock) {
+        self.composer.attach_image(label, block);
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
@@ -719,13 +754,6 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
         )));
     }
     cells
-}
-
-fn byte_index(s: &str, char_index: usize) -> usize {
-    s.char_indices()
-        .nth(char_index)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -1111,12 +1139,12 @@ mod tests {
         app.on_key(key(KeyCode::Home));
         app.on_key(key(KeyCode::Right));
         type_str(&mut app, "x");
-        assert_eq!(app.input, "你x好b");
+        assert_eq!(app.composer.text(), "你x好b");
 
         let cmd = app.on_key(key(KeyCode::Enter));
         assert_eq!(cmd, Command::Submit("你x好b".into()));
         assert!(app.running);
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         assert_eq!(app.cells, vec![Cell::User("你x好b".into())]);
 
         // While running, Enter steers instead of starting a new turn.
@@ -1143,7 +1171,7 @@ mod tests {
         let cmd = app.on_key(key(KeyCode::Enter));
         assert_eq!(cmd, Command::Steer("also do X".into()));
         assert!(app.running, "steering does not end or restart the turn");
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         assert_eq!(app.todo_cell, Some(0), "a steer keeps the live todo block");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
     }
@@ -1158,7 +1186,7 @@ mod tests {
         let cmd = app.on_key(key(KeyCode::Enter));
         assert_eq!(cmd, Command::Slash("/help".into()));
         assert!(app.running, "the app shows busy until the worker replies");
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         assert!(app.cells.is_empty(), "a command is not a User message");
 
         // While running, a '/'-line is just steering text, not a command.
@@ -1223,7 +1251,7 @@ mod tests {
 
         // A stray character is captured by the picker, not inserted as input.
         app.on_key(key(KeyCode::Char('x')));
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
 
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 0);
@@ -1299,7 +1327,7 @@ mod tests {
         // First Ctrl+C arms (no quit, input untouched).
         assert_eq!(app.on_key(ctrl('c')), Command::None);
         assert!(app.ctrl_c_exit_armed);
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.text(), "draft");
         // Second Ctrl+C quits.
         assert_eq!(app.on_key(ctrl('c')), Command::Quit);
 
@@ -1330,7 +1358,7 @@ mod tests {
         type_str(&mut app, "draft");
         // Idle: Esc clears the line.
         assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         // Running: Esc interrupts.
         app.running = true;
         assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
@@ -1393,7 +1421,7 @@ mod tests {
 
         // Normal typing is captured by the prompt, not the input line.
         app.on_key(key(KeyCode::Char('x')));
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         assert!(rx.try_recv().is_err());
 
         app.on_key(key(KeyCode::Char('a')));
@@ -1435,7 +1463,7 @@ mod tests {
         app.on_key(key(KeyCode::PageUp));
         assert_eq!(app.confirm_scroll, 0);
         // None of that reached the input line.
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.text(), "");
         // Below-zero is saturated, not wrapped.
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.confirm_scroll, 0);
