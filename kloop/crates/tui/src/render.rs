@@ -271,7 +271,7 @@ pub fn status_line(app: &App) -> String {
     if app.running {
         // Stable while a turn runs — per-event activity (tool rows, notes,
         // thinking) shows in the transcript, not by churning the status bar.
-        return format!("{mode}working… (Ctrl+C to interrupt)");
+        return format!("{mode}working… (Esc to interrupt)");
     }
     format!(
         "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",

@@ -436,6 +436,14 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
             }
+            // Esc interrupts a running turn (CC parity, the advertised key);
+            // idle it is a no-op. A confirm popup / rewind picker capture Esc
+            // before this (they return early at the top of on_key).
+            (KeyCode::Esc, _) => {
+                if self.running {
+                    return Command::Interrupt;
+                }
+            }
             (KeyCode::Char('r'), true) => {
                 // Rewind (plan 18) is idle-only: a running turn owns History, so
                 // Ctrl+R is ignored mid-turn. The worker answers with ForkPoints.
@@ -1232,7 +1240,19 @@ mod tests {
 
         app.running = true;
         assert_eq!(app.on_key(ctrl('c')), Command::Interrupt);
+        // Esc is the advertised interrupt key (CC parity) while running…
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
         assert_eq!(app.on_key(ctrl('d')), Command::Quit);
+    }
+
+    /// Esc interrupts only while a turn runs; idle it is a no-op (it does not
+    /// clear the input, which is Ctrl+C's job).
+    #[test]
+    fn esc_interrupts_only_when_running() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "draft");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.input, "draft", "idle Esc leaves the input alone");
     }
 
     #[tokio::test]
