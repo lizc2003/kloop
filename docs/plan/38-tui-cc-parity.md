@@ -119,6 +119,13 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
   (pyte 抓不到 DECSTBM scroll-region scrollback,模拟器保真度限制非 bug)。
 - **教训沉淀**:HANDOFF 教训 38(CPR/poll 线程、上游不能动态改 inline 高度、PTY 测法);教训 12 修订(inline 是中等工程非「太重」)。
 
+**切片 0 会话后续的交互打磨(同会话用户逐条提,已提交,下会话别重做)**:
+- **底部信息架构**(对齐 CC,提交 cfcd125/bf268d6/383acc3/12310cb/eac0977):布局 `transcript / 上规则 ─ / composer `>` / 下规则 ─ / footer`;**动态活动行**(`render::activity_line`)在**转录区最下方、composer 正上方**(running→`working…` / armed→`press Ctrl+C again to exit` / awaiting→`awaiting your approval` / idle→None)——**这就是切片 5 的 HUD 落点,结构已就位,只差 spinner/shimmer/动词过去式/耗时/token(需 FrameRequester + 计时,pure App 无时钟,得在 ui_loop 引入)**;**稳定 footer**(`render::footer_line`)在最底,`[mode]` 徽标 + 键位,仅 running/idle 两套 hint + 徽标在边界变、不逐事件 churn;去掉了运行态 status 里 churn 的 `last_note`(字段保留给 HUD)。
+- **CC 键位**(提交 cd73648/32b1213/69a076d/e7fd1a5):**Esc** = running 中断 / idle 清输入行;**Ctrl+C** = 两拍退出(首拍 armed 提示、次拍退,其它键 disarm),在主输入+confirm 弹层+rewind picker **一致**(逻辑在 `on_key` 顶部、路由前);**Ctrl+D 屏蔽**(TUI 唯一退出路径 = Ctrl+C 两拍);弹层「取消/拒绝」交给 Esc。
+- **退出光标**(提交 cb8a729):restore 时 `MoveTo(0, 底行)+\r\n`,光标落列 0 消除 zsh `%`。
+- **`/exit` 命令**(提交 9c7c6f5,跨 core+三前端):`SlashResult.quit` + `commands/exit.rs`;TUI 发 `AgentEvent::Quit` 走同一 restore、plain break、server 惰性回提示。
+- **切片 5/6 交接**:footer 两行 + 活动行 + 键位 hint **结构已落**;切片 5 只剩 shimmer/motion 动画 + FrameRequester 按需渲染 + 耗时/token HUD 内容;切片 6 的配色体系/会话头/diff 升级未动,footer 的品牌色也待「品牌强调色」定夺(见开工时定)。
+
 - `setup_terminal` 去 `EnterAlternateScreen`,改 `Viewport::Inline`;解决 CPR/stdin 并发
   (关键决定 1);`Cargo.toml` `ratatui` 开 `scrolling-regions`(+ 可选 `unstable-rendered-line-info`)。
 - 引入 per-cell `display_lines(width) -> Vec<Line>` 渲染接口(替代大 `transcript_lines`
