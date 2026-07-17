@@ -86,6 +86,11 @@ pub enum AgentEvent {
     /// The permission mode changed on the agent side (exit_plan_mode was
     /// approved): refresh the status-bar badge so it never lies.
     ModeChanged(Mode),
+    /// Context size refresh (plan 38 slice 5): the worker reports
+    /// `History::estimated_tokens` after each turn so the footer's context gauge
+    /// stays current. The window and model are static (seeded at startup), so
+    /// only the used-token estimate travels here.
+    Usage(u64),
     TurnEnded(EndReason),
 }
 

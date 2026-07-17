@@ -17,6 +17,8 @@ use unicode_width::UnicodeWidthChar;
 
 use kloop_core::tools::TodoStatus;
 
+use std::time::Duration;
+
 use crate::app::App;
 use crate::app::Cell;
 use crate::app::ToolStatus;
@@ -24,6 +26,18 @@ use crate::menu;
 use crate::menu::Popup;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+
+/// Wall-clock timing the event loop feeds each frame (the pure `App` has no
+/// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
+/// live thinking block's durations (None when not active); `phase` drives the
+/// spinner/shimmer (`elapsed_ms / anim::STEP_MS`); `reduced_motion` freezes them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hud {
+    pub elapsed: Option<Duration>,
+    pub thinking: Option<Duration>,
+    pub phase: usize,
+    pub reduced_motion: bool,
+}
 
 /// Hard-wrap `text` to `width` display columns (CJK chars count as 2),
 /// breaking on newlines and at column boundaries. Never returns an empty vec.
@@ -73,6 +87,24 @@ pub fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// The one-line thinking display (plan 38 slice 5): a `∗` gutter + a CC-style
+/// verb and elapsed, dim italic. `live_secs = Some(n)` renders the present-tense
+/// running form (`∗ Thinking… (Xs)`); otherwise it is sealed — `∗ Thought for Xs`
+/// with `sealed_secs`, or a bare `∗ Thought` when there is no timing (resumed).
+fn thinking_line(sealed_secs: Option<u64>, live_secs: Option<u64>, width: usize) -> Line<'static> {
+    let body = match live_secs {
+        Some(s) => format!("∗ Thinking… ({})", crate::anim::format_elapsed(s)),
+        None => match sealed_secs {
+            Some(s) => format!("∗ Thought for {}", crate::anim::format_elapsed(s)),
+            None => "∗ Thought".to_string(),
+        },
+    };
+    Line::from(Span::styled(
+        truncate(&body, width.max(2)),
+        DIM.add_modifier(Modifier::ITALIC),
+    ))
+}
+
 /// The status glyph and colour shared by tool rows and sub-agent rows.
 fn status_mark(status: &ToolStatus) -> (&'static str, Color) {
     match status {
@@ -111,14 +143,11 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             // sealed and safe to parse in full.
             lines.extend(crate::markdown::markdown_lines(text, width));
         }
-        Cell::Thinking(text) => {
-            // Collapsed to a one-line dim preview of the latest reasoning
-            // line; the stream keeps it moving, the transcript stays calm.
-            let last = text.lines().rev().find(|l| !l.trim().is_empty());
-            lines.push(Line::from(Span::styled(
-                truncate(&format!("∴ {}", last.unwrap_or("thinking…")), width.max(2)),
-                DIM.add_modifier(Modifier::ITALIC),
-            )));
+        Cell::Thinking { seconds, .. } => {
+            // Sealed reasoning: a CC-style verb + elapsed, not the text (plan 38
+            // slice 5). The live block is rendered by `visible_transcript` with a
+            // running clock; here it is frozen with its final time.
+            lines.push(thinking_line(*seconds, None, width));
         }
         Cell::Tool {
             name,
@@ -205,17 +234,22 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
 }
 
 /// The uncommitted tail for the on-screen viewport: like [`transcript_lines`],
-/// but the last cell — when it is an Assistant still receiving deltas — renders
-/// through the streaming safe-boundary buffer so a half-formed markdown block
-/// shows raw instead of reflowing each frame. Only the last cell can be
-/// streaming (any other event seals it), so this is the sole special case.
-pub fn visible_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
+/// but the last cell gets a live treatment when it is still streaming. An
+/// Assistant renders through the streaming safe-boundary buffer (a half-formed
+/// markdown block shows raw instead of reflowing each frame); a Thinking block
+/// shows a running clock (`hud.thinking`). Only the last cell can be streaming
+/// (any other event seals it), so these are the sole special cases.
+pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let last = app.cells.len().saturating_sub(1);
     for (i, cell) in app.cells.iter().enumerate() {
         match cell {
             Cell::Assistant(text) if i == last && app.streaming_assistant() => {
                 lines.extend(crate::markdown::assistant_stream_lines(text, width));
+            }
+            Cell::Thinking { .. } if i == last && app.streaming_thinking() => {
+                let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
+                lines.push(thinking_line(None, Some(secs), width));
             }
             _ => lines.extend(cell_lines(cell, width)),
         }
@@ -276,45 +310,106 @@ fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
     ))
 }
 
-/// The dynamic "what's happening now" line, shown at the BOTTOM of the
-/// transcript (just above the composer) where it is most prominent — the eye
-/// lands here, not on the footer. `None` when nothing is happening (idle). This
-/// is the spot the animated verb/elapsed/token HUD grows into (plan 38 slice 5);
-/// for now it is the placeholder text. Kept out of the footer so the footer can
-/// stay still.
-pub fn activity_line(app: &App) -> Option<String> {
-    if app.ctrl_c_exit_armed {
-        // Unmissable, right above the composer where Ctrl+C was pressed.
-        Some("press Ctrl+C again to exit".into())
-    } else if !app.confirms.is_empty() {
-        Some("awaiting your approval".into())
-    } else if app.running {
-        Some("working…".into())
-    } else {
-        None
-    }
+/// Whether [`activity_line`] will render a row. Used by `commit_overflow` for
+/// its layout reservation, where no `Hud` is available; mirrors the conditions
+/// in `activity_line`.
+pub fn has_activity_line(app: &App) -> bool {
+    app.ctrl_c_exit_armed || !app.confirms.is_empty() || app.running
 }
 
-/// The stable bottom bar: the permission-mode badge plus the key hints. It
-/// barely moves — only the mode badge (shift+Tab) and the running/idle hint set
-/// change, both at turn/mode boundaries, never per event. Live activity lives in
-/// [`activity_line`], not here.
-pub fn footer_line(app: &App) -> String {
+/// The dynamic "what's happening now" line, shown at the BOTTOM of the
+/// transcript (just above the composer) where it is most prominent — the eye
+/// lands here, not on the footer (plan 38 slice 5). Running: an animated spinner
+/// + a shimmering verb + `(elapsed · esc to interrupt)`. `None` when idle.
+pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
+    if app.ctrl_c_exit_armed {
+        // Unmissable, right above the composer where Ctrl+C was pressed.
+        return Some(Line::from("press Ctrl+C again to exit".to_string()));
+    }
+    if !app.confirms.is_empty() {
+        return Some(Line::from("awaiting your approval".to_string()));
+    }
+    if !app.running {
+        return None;
+    }
+    let glyph = crate::anim::spinner_glyph(hud.phase, hud.reduced_motion);
+    let mut spans = vec![Span::styled(
+        format!("{glyph} "),
+        Style::new().fg(Color::Cyan),
+    )];
+    spans.extend(crate::anim::shimmer_spans(
+        "Working",
+        hud.phase,
+        hud.reduced_motion,
+    ));
+    let secs = hud.elapsed.map(|d| d.as_secs()).unwrap_or(0);
+    spans.push(Span::styled(
+        format!(
+            " ({} · esc to interrupt)",
+            crate::anim::format_elapsed(secs)
+        ),
+        DIM,
+    ));
+    Some(Line::from(spans))
+}
+
+/// The stable bottom bar: the permission-mode badge and key hints on the left,
+/// the system status (model + context gauge) flush right. Only the badge, the
+/// running/idle hint set, and the (per-turn) context gauge change — never per
+/// event — so the bar barely moves. Live activity lives in [`activity_line`].
+pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     if app.fork_picker.is_some() {
-        return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
+        return Line::from(Span::styled(
+            "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".to_string(),
+            DIM,
+        ));
     }
     if app.popup.is_some() {
-        return "↑↓ choose · Tab/⏎ complete · Esc cancel".into();
+        return Line::from(Span::styled(
+            "↑↓ choose · Tab/⏎ complete · Esc cancel".to_string(),
+            DIM,
+        ));
     }
     let mode = format!("[{}]  ", app.mode.label());
-    if app.running {
+    let left = if app.running {
         format!("{mode}esc to interrupt · Ctrl+C to exit")
     } else {
         format!("{mode}shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit")
+    };
+    // Right-aligned system status; dropped if the row is too narrow to fit it
+    // after the hints (the hints matter more).
+    let right = system_status(app);
+    let lw = display_width(&left);
+    let rw = display_width(&right);
+    if !right.is_empty() && lw + 3 + rw <= width {
+        let pad = width - lw - rw;
+        Line::from(vec![
+            Span::styled(left, DIM),
+            Span::styled(" ".repeat(pad), DIM),
+            Span::styled(right, DIM),
+        ])
+    } else {
+        Line::from(Span::styled(truncate(&left, width), DIM))
     }
 }
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// The footer's right-hand status: model name and the context gauge
+/// (`~used/window (pct%)`, or `~used tok` with the window off). Empty when no
+/// model is known (mock/tests).
+fn system_status(app: &App) -> String {
+    if app.model.is_empty() {
+        return String::new();
+    }
+    match app.context_window {
+        Some(window) if window > 0 => {
+            let pct = (app.context_used as f64 / window as f64 * 100.0).round() as u64;
+            format!("{} · {}% ctx", app.model, pct.min(100))
+        }
+        _ => format!("{} · ~{} tok", app.model, app.context_used),
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     // Bottom-up: a stable footer (mode + hints), the multi-line composer fenced
     // by a rule above and below, and the transcript — whose last line carries
     // the live activity status (CC's information architecture: the dynamic
@@ -335,14 +430,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(full);
 
-    let mut lines = visible_transcript(app, width.max(1));
+    let mut lines = visible_transcript(app, hud, width.max(1));
     // The activity status is the last transcript line — rendered here, never a
     // cell, so it is never frozen into scrollback. A blank spacer sets it off.
-    if let Some(activity) = activity_line(app) {
+    if let Some(activity) = activity_line(app, hud) {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.push(Line::from(truncate(&activity, width.max(1))));
+        lines.push(activity);
     }
     let height = transcript_area.height as usize;
     // Bottom-anchor the uncommitted tail just above the composer. The event loop
@@ -362,11 +457,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(rule.clone()).style(DIM), rule_top);
     f.render_widget(Paragraph::new(rule).style(DIM), rule_bottom);
 
-    // Stable footer at the very bottom.
-    f.render_widget(
-        Paragraph::new(truncate(&footer_line(app), width)).style(DIM),
-        footer_area,
-    );
+    // Stable footer at the very bottom (mode + hints left, system status right).
+    f.render_widget(Paragraph::new(footer_line(app, width)), footer_area);
 
     // Composer: the attachment line (if any) above the wrapped input rows.
     let mut comp_rows: Vec<Line> = Vec::new();
@@ -762,7 +854,7 @@ mod tests {
 
         // Pinned to the top: early diff lines show, the tail does not, and the
         // options plus a `↓ more` hint are on screen.
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
         let screen = rows(&term).join("\n");
         assert!(
             screen.contains("+1  line 1"),
@@ -782,7 +874,7 @@ mod tests {
         // Over-scroll: the offset self-corrects to the last window, the tail
         // shows, the top scrolls off, and the hint flips — options stay pinned.
         app.confirm_scroll = 999;
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
         let screen = rows(&term).join("\n");
         assert!(app.confirm_scroll < 999, "offset clamped to a valid range");
         assert!(
@@ -869,7 +961,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
         let buf = term.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
@@ -913,29 +1005,94 @@ mod tests {
     #[test]
     fn footer_shows_mode_badge_activity_shows_state() {
         use kloop_core::permissions::Mode;
+        let hud = Hud::default();
         let mut app = App::new("sess".into());
         // Idle: footer has the badge + hints; no activity line.
-        assert!(footer_line(&app).starts_with("[manual]  "));
-        assert!(footer_line(&app).contains("shift+Tab"));
-        assert_eq!(activity_line(&app), None);
+        assert!(line_text(&footer_line(&app, 80)).starts_with("[manual]  "));
+        assert!(line_text(&footer_line(&app, 80)).contains("shift+Tab"));
+        assert!(activity_line(&app, &hud).is_none());
+        assert!(!has_activity_line(&app));
 
         app.mode = Mode::Plan;
-        assert!(footer_line(&app).starts_with("[plan]  "));
+        assert!(line_text(&footer_line(&app, 80)).starts_with("[plan]  "));
 
-        // Running: activity says "working…", footer switches to the interrupt
-        // hint (still leading with the badge, still no per-event churn).
+        // Running: the activity line shows the verb, footer switches to the
+        // interrupt hint (still leading with the badge, no per-event churn).
         app.running = true;
-        assert_eq!(activity_line(&app).as_deref(), Some("working…"));
-        let footer = footer_line(&app);
+        assert!(has_activity_line(&app));
+        let activity = line_text(&activity_line(&app, &hud).expect("running shows activity"));
+        assert!(activity.contains("Working"), "{activity}");
+        let footer = line_text(&footer_line(&app, 80));
         assert!(footer.starts_with("[plan]  "), "{footer}");
         assert!(footer.contains("esc to interrupt"), "{footer}");
 
         // Armed / awaiting-approval take over the activity line, not the footer.
         app.ctrl_c_exit_armed = true;
         assert_eq!(
-            activity_line(&app).as_deref(),
-            Some("press Ctrl+C again to exit")
+            line_text(&activity_line(&app, &hud).unwrap()),
+            "press Ctrl+C again to exit"
         );
+    }
+
+    /// The footer's right side carries the model + context gauge when Config
+    /// seeded them; it is dropped on a narrow row so the hints survive.
+    #[test]
+    fn footer_shows_context_gauge_on_the_right() {
+        let app = App::new("s".into()).with_context("sonnet-5".into(), Some(200_000), 40_000);
+        let footer = line_text(&footer_line(&app, 100));
+        assert!(footer.contains("sonnet-5"), "{footer}");
+        assert!(footer.contains("20% ctx"), "{footer}"); // 40k / 200k
+                                                         // Too narrow for the status: only the hints render.
+        let narrow = line_text(&footer_line(&app, 30));
+        assert!(!narrow.contains("sonnet-5"), "{narrow}");
+        assert!(narrow.contains("["), "the mode badge still shows: {narrow}");
+    }
+
+    /// The activity line while running: an animated spinner glyph, a shimmering
+    /// verb, and the elapsed + interrupt hint.
+    #[test]
+    fn activity_line_shows_spinner_and_elapsed() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        let hud = Hud {
+            elapsed: Some(Duration::from_secs(65)),
+            phase: 2,
+            ..Default::default()
+        };
+        let line = activity_line(&app, &hud).unwrap();
+        let text = line_text(&line);
+        assert!(text.contains("Working"), "{text}");
+        assert!(text.contains("1m05s"), "{text}");
+        assert!(text.contains("esc to interrupt"), "{text}");
+    }
+
+    /// The thinking cell shows a verb + elapsed: present tense with a running
+    /// clock, past tense once sealed, and a bare verb when there is no timing.
+    #[test]
+    fn thinking_cell_shows_verb_and_elapsed() {
+        // Live (in the streaming path): present tense + running clock.
+        assert_eq!(
+            line_text(&thinking_line(None, Some(8), 40)),
+            "∗ Thinking… (8s)"
+        );
+        // Sealed with a time.
+        let sealed = cell_lines(
+            &Cell::Thinking {
+                text: "…".into(),
+                seconds: Some(12),
+            },
+            40,
+        );
+        assert_eq!(line_text(&sealed[0]), "∗ Thought for 12s");
+        // Sealed without timing (resumed): a bare verb.
+        let bare = cell_lines(
+            &Cell::Thinking {
+                text: "…".into(),
+                seconds: None,
+            },
+            40,
+        );
+        assert_eq!(line_text(&bare[0]), "∗ Thought");
     }
 
     #[test]
@@ -1094,19 +1251,6 @@ mod tests {
                 "  ○ Write docs",
             ]
         );
-    }
-
-    /// Thinking collapses to one dim line previewing the latest non-empty
-    /// reasoning line, however long the accumulated text.
-    #[test]
-    fn thinking_collapses_to_last_line_preview() {
-        let cells = vec![
-            Cell::Thinking("first thought\nsecond thought\n  \n".into()),
-            Cell::Thinking(String::new()),
-        ];
-        let lines = transcript_lines(&cells, 40);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(texts, vec!["∴ second thought", "∴ thinking…"]);
     }
 
     #[test]

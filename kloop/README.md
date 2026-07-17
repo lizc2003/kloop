@@ -348,6 +348,20 @@ the query and re-filters. At most one menu is open at a time, and a pending
 approval prompt or rewind picker takes precedence. The slash menu is suppressed
 while a turn runs (a `/` line is then steering text).
 
+While a turn runs, an **animated status line** (plan 38 slice 5,
+`crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
+"shimmer" light band sweeping the verb, and `(elapsed · esc to interrupt)`. The
+**footer** carries the mode badge and key hints on the left and the **system
+status** — model name and a context gauge (`model · N% ctx`, refreshed after
+each turn from the same usage accounting `/cost` reads) — flush right (dropped on
+a narrow row so the hints win). A **thinking block** shows a CC-style verb and
+elapsed rather than its text: `∗ Thinking… (Xs)` while it streams, `∗ Thought for
+Xs` once sealed. The animation self-drives — a frame tick wakes the loop only
+while a turn runs, so an idle session redraws on nothing and spends no CPU (tokio
+plays the FrameRequester role); `KLOOP_NO_ANIM` (or a `dumb` terminal) freezes
+the spinner and drops the shimmer for reduced motion. The pure `App` has no
+clock — the event loop owns the timing and feeds it in as a `Hud` each frame.
+
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a
 long history scrolls straight into native scrollback, so a resumed session

@@ -220,7 +220,7 @@ gutter 视觉语言统一 `● › │ └`,左槽宽度常量对齐。连续 re
 - 未做(记为可能性):数字键快选(与打字查询的数字冲突,故略)、`@` 补目录下钻、模糊高亮片段、搜索防抖(现每键一搜,本地有界够快)、`@file` 在普通消息里自动内联内容(仅命令体 `expand_slash_injections` 展开,菜单只助打字)。
 - 教训沉淀:HANDOFF 教训 43(补全菜单的纯/IO 分层 + PTY 需 TIOCSWINSZ 否则 inline viewport 塌成默认高)。
 
-### 切片 5 — 动画状态行 + HUD + 按需渲染
+### 切片 5 — 动画状态行 + HUD + 按需渲染 ✅ 完成(2026-07-17)
 
 spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to interrupt)` 耗时,
 借 `shimmer.rs`+`motion.rs` ~260 行,尊重 reduced-motion);**FrameRequester 按需渲染**
@@ -231,6 +231,16 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 沿用的 `∴` 最后一行预览。
 
 - 验收:运行时有平滑动画 + 耗时;空闲无 CPU 空转;token/context 正确。
+
+**完成记录(2026-07-17)**:
+- **动画纯函数 `crates/tui/src/anim.rs`**(纯,单测):`spinner_glyph(phase,reduced)`(10 帧盲文,reduced→静态 `●`)、`shimmer_spans(text,phase,reduced)`(光带:整词 DIM,`BAND=4` 宽亮带按 phase 从左扫过再出画,相邻同亮度合并成 span;reduced→单 BOLD span)、`format_elapsed`(`8s`/`1m05s`/`2h03m`)、`reduced_motion()`(`KLOOP_NO_ANIM` 或 `TERM=dumb`)。`STEP_MS=100` 同时是相位步长和帧节奏。**没抄 codex 的 `shimmer.rs`+`motion.rs` ~260 行**(只抄手法),亮度式 shimmer 主题安全(styles.md 铁律,不押色相)。
+- **计时在 loop、App 保持纯**:pure App 无时钟,`ui_loop` 持 `turn_started`/`thinking_started: Option<Instant>`——turn 钟随 `app.running` 起停(reconcile 在 loop 顶),thinking 钟在 events 分支按 `streaming_thinking()` 开/关转换起停,关闭时 `app.seal_thinking(secs)` 把耗时盖进 cell。每帧构 `render::Hud{elapsed,thinking,phase,reduced_motion}`(phase=`elapsed_ms/STEP_MS`)喂给 `draw`。
+- **按需渲染 = tokio select 扮 FrameRequester**:loop 本就 select 驱动(idle 阻塞在 input/events 上、零 CPU),新增第三分支 `_ = sleep(tick_ms), if animating`——`animating = running && 无弹层`;idle 时该分支禁用(`if` 卫词),只在跑 turn 时按 `tick_ms`(reduced→1s,否则 100ms)唤醒重画推进 spinner/耗时。**不必自研 FrameRequester,select 卫词即达「无变化不重画、无 CPU 空转」**(修正 plan「取代每 loop draw」的假设:原 loop 已是事件驱动非空转,缺的只是动画的定时唤醒)。
+- **活动行动画 `render.rs`**:`activity_line(app,hud)` 返回 styled `Line`——running→`{spinner} {shimmer(Working)} ({elapsed} · esc to interrupt)`;armed/awaiting 保持原静态文案;`has_activity_line`(无 Hud 版,给 `commit_overflow` 预留行用)。**thinking**:`Cell::Thinking(String)`→`{text,seconds:Option}`;`thinking_line(sealed,live,width)`——live(`visible_transcript` 特判流式末 cell,同 assistant 教训 39)→`∗ Thinking… (Xs)`、sealed→`∗ Thought for Xs`(无计时 resumed→`∗ Thought`),取代 `∴ 末行预览`。
+- **footer 加系统状态**:`footer_line(app,width)` 返回 `Line`,左 `[mode]`+键位、右 `system_status`(`model · N% ctx`,窗口关→`~N tok`;model 空则省);右侧放不下(窄行)→只留左侧 hints。context 复用 usage 记账:新 `AgentEvent::Usage(u64)`,worker 每 turn 后发 `history.estimated_tokens()`;model/window 启动时 `App::with_context` 从 cfg 播种、initial used 从 history。
+- **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 112 测试:anim 3、footer 徽标/gauge/窄行、活动行 spinner+耗时、thinking verb+耗时、Usage 事件、thinking 流式→seal)。真 key **双轨** PTY+pyte 各 6/6(spinner 盲文字符 / 动词 `Working` / `(Ns · esc to interrupt)` 耗时递增 / turn 后 footer `claude-sonnet-4-6 · 3% ctx`(openai `gpt-5.4-mini · 2% ctx`)context gauge 随 turn 增长 / idle footer 徽标+hints)。**空闲无 CPU 由 select 卫词架构保证**(PTY 测不了 CPU,但 `if animating` 卫词即证)。
+- 未做(记为可能性):thinking 动词与 spinner 动词同源池(现固定 "Working"/"Thinking",没做 CC 式随机动词)、footer 双行独立布局(现复用 composer+footer 两行结构,系统状态挤右侧)、`last_note` 进 HUD(字段留着未用)、context gauge 精确到 token 数(现只显 %)。
+- 教训沉淀:HANDOFF 教训 44(pure App 无时钟→计时在 loop + Hud 喂参;tokio select 卫词即 FrameRequester,不必自研;shimmer 用亮度不押色相主题安全)。
 
 ### 切片 6 — 会话头 + 配色体系 + diff 升级
 

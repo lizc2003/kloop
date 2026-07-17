@@ -9,6 +9,7 @@
 //! terminal — it owns the inline viewport, freezes overflowing cells into
 //! scrollback with `insert_before`, and reads keys on a dedicated poll thread.
 
+mod anim;
 mod app;
 mod clipboard;
 mod composer;
@@ -23,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::Event;
@@ -141,7 +143,13 @@ pub async fn run(
     // catalog (built-ins then loaded skills/commands — the same set
     // `commands::run` dispatches, plan 38 slice 4). The `@` menu searches from
     // the project cwd.
-    let mut app = App::new(session_id).with_commands(slash_catalog(&cfg));
+    let mut app = App::new(session_id)
+        .with_commands(slash_catalog(&cfg))
+        .with_context(
+            cfg.model.clone(),
+            cfg.context_window,
+            history.estimated_tokens(),
+        );
     app.cells = app::cells_from_history(history.messages());
     let cwd = cfg.cwd.clone();
 
@@ -221,6 +229,7 @@ async fn agent_worker(
                 };
                 history.record(msg);
                 let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
+                let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
                 if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
                     return;
                 }
@@ -239,6 +248,7 @@ async fn agent_worker(
                     continue;
                 }
                 let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+                let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
                 if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
                     return;
                 }
@@ -266,6 +276,7 @@ async fn agent_worker(
                 if let Some(prompt) = result.run_turn {
                     history.record(Message::user_text(prompt));
                     let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+                    let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
                     if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
                         return;
                     }
@@ -425,7 +436,7 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
     // and the footer. When an activity line is showing it eats a blank spacer +
     // its own row at the transcript bottom, so reserve two more (see render::draw).
     let reserve = 2 + render::composer_height(app, width) + 1 + {
-        if render::activity_line(app).is_some() {
+        if render::has_activity_line(app) {
             2
         } else {
             0
@@ -513,7 +524,31 @@ async fn ui_loop(
     let input_thread = spawn_input_thread(input_tx, stop.clone());
 
     let mut current_cancel: Option<CancellationToken> = None;
+    // Wall-clock timing for the animated HUD (plan 38 slice 5). The pure `App`
+    // has no clock, so the loop owns it: the turn clock runs while `app.running`,
+    // the thinking clock while a thinking block streams.
+    let reduced_motion = anim::reduced_motion();
+    let mut turn_started: Option<Instant> = None;
+    let mut thinking_started: Option<Instant> = None;
     let outcome = loop {
+        // Reconcile the turn clock with the app's running state (starts on the
+        // first frame of a turn, clears when it ends).
+        if app.running {
+            turn_started.get_or_insert_with(Instant::now);
+        } else {
+            turn_started = None;
+            thinking_started = None;
+        }
+        let elapsed = turn_started.map(|t| t.elapsed());
+        let hud = render::Hud {
+            elapsed,
+            thinking: thinking_started.map(|t| t.elapsed()),
+            phase: elapsed
+                .map(|d| (d.as_millis() as u64 / anim::STEP_MS) as usize)
+                .unwrap_or(0),
+            reduced_motion,
+        };
+
         // Match the inline viewport to the terminal (repositions on resize),
         // then freeze finalized overflow into scrollback before drawing the
         // tail. Skip committing while a popup owns the screen — scrolling
@@ -526,9 +561,18 @@ async fn ui_loop(
                 break Err(e);
             }
         }
-        if let Err(e) = terminal.draw(|f| render::draw(f, &mut app)) {
+        if let Err(e) = terminal.draw(|f| render::draw(f, &mut app, &hud)) {
             break Err(e.into());
         }
+        // Animation self-drives: while a turn runs (and no overlay owns the
+        // screen), a frame tick wakes the loop to advance the spinner/elapsed;
+        // idle, the tick is disabled so `select` blocks with zero CPU (the
+        // FrameRequester role, played by tokio, plan 38 slice 5).
+        let animating = app.running
+            && app.confirms.is_empty()
+            && app.fork_picker.is_none()
+            && app.popup.is_none();
+        let tick_ms = if reduced_motion { 1000 } else { anim::STEP_MS };
         tokio::select! {
             input = input_rx.recv() => match input {
                 Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
@@ -621,6 +665,9 @@ async fn ui_loop(
             },
             event = events.recv() => {
                 let Some(event) = event else { break Ok(()) };
+                // Snapshot before applying: a thinking block that was streaming
+                // and is no longer gets its elapsed stamped into the sealed cell.
+                let was_thinking = app.streaming_thinking();
                 // `/exit` (AgentEvent::Quit) ends the loop; the caller restores
                 // the terminal. Filter it out of the batch so app.apply never
                 // sees it.
@@ -640,6 +687,15 @@ async fn ui_loop(
                 if quit {
                     break Ok(());
                 }
+                // Time the thinking block: start the clock when it opens, seal the
+                // cell with its final elapsed when it closes.
+                if app.streaming_thinking() {
+                    thinking_started.get_or_insert_with(Instant::now);
+                } else if was_thinking {
+                    if let Some(t) = thinking_started.take() {
+                        app.seal_thinking(t.elapsed().as_secs());
+                    }
+                }
                 // Autowake (plan 26): a background sub-agent finished (its
                 // agent_end woke this select) and left a result in the inbox
                 // while the agent sits idle. Start a turn to deliver it without
@@ -652,6 +708,9 @@ async fn ui_loop(
                     let _ = msgs.send(WorkerMsg::Wake { cancel });
                 }
             }
+            // Frame tick: only armed while animating, so an idle loop never wakes
+            // here. Firing just redraws (elapsed/spinner advance at the top).
+            _ = tokio::time::sleep(Duration::from_millis(tick_ms)), if animating => {}
         }
     };
     // Stop the input thread (it wakes within one poll interval) before the

@@ -43,9 +43,15 @@ pub enum ToolStatus {
 pub enum Cell {
     User(String),
     Assistant(String),
-    /// Model reasoning; accumulates like Assistant but renders collapsed to a
-    /// one-line dim preview (full text lives in history, not on screen).
-    Thinking(String),
+    /// Model reasoning. The text accumulates like Assistant but is not shown;
+    /// the cell renders as a CC-style verb + elapsed (`∗ Thinking… (Xs)` live,
+    /// `∗ Thought for Xs` once sealed). `seconds` is stamped by the event loop
+    /// when the block closes — None while live or when resumed (no timing on
+    /// disk).
+    Thinking {
+        text: String,
+        seconds: Option<u64>,
+    },
     Tool {
         name: String,
         /// The tool input as a JSON string; the renderer (`toolrow`) formats a
@@ -180,6 +186,13 @@ pub struct App {
     /// The slash-command catalog (built-ins + skills/commands), used to filter
     /// the `/` menu. Seeded once at startup via [`App::with_commands`].
     commands: Vec<menu::CommandInfo>,
+    /// Model name shown in the footer's system status. Static per session.
+    pub model: String,
+    /// Estimated context tokens in use (footer gauge), refreshed by the worker's
+    /// `Usage` events after each turn.
+    pub context_used: u64,
+    /// The context window, if any (footer gauge denominator). Static per session.
+    pub context_window: Option<u64>,
 }
 
 impl App {
@@ -203,12 +216,24 @@ impl App {
             ctrl_c_exit_armed: false,
             popup: None,
             commands: Vec::new(),
+            model: String::new(),
+            context_used: 0,
+            context_window: None,
         }
     }
 
     /// Seed the slash-command catalog for the `/` menu (built-ins + skills).
     pub fn with_commands(mut self, commands: Vec<menu::CommandInfo>) -> Self {
         self.commands = commands;
+        self
+    }
+
+    /// Seed the footer's system status (model + context window) from Config. The
+    /// used-token estimate then arrives via `Usage` events.
+    pub fn with_context(mut self, model: String, window: Option<u64>, used: u64) -> Self {
+        self.model = model;
+        self.context_window = window;
+        self.context_used = used;
         self
     }
 
@@ -228,12 +253,15 @@ impl App {
             AgentEvent::ThinkingDelta(t) => {
                 self.assistant_open = false;
                 if self.thinking_open {
-                    if let Some(Cell::Thinking(text)) = self.cells.last_mut() {
+                    if let Some(Cell::Thinking { text, .. }) = self.cells.last_mut() {
                         text.push_str(&t);
                         return;
                     }
                 }
-                self.cells.push(Cell::Thinking(t));
+                self.cells.push(Cell::Thinking {
+                    text: t,
+                    seconds: None,
+                });
                 self.thinking_open = true;
             }
             AgentEvent::Note(n) => {
@@ -418,6 +446,11 @@ impl App {
                 // status-bar badge in step.
                 self.mode = mode;
             }
+            AgentEvent::Usage(used) => {
+                // The worker's post-turn context estimate; the footer gauge reads
+                // it against the (static) window.
+                self.context_used = used;
+            }
             AgentEvent::TurnEnded(reason) => {
                 self.running = false;
                 self.assistant_open = false;
@@ -457,6 +490,27 @@ impl App {
     /// is the single place the live/sealed distinction lives.
     pub fn streaming_assistant(&self) -> bool {
         self.assistant_open && matches!(self.cells.last(), Some(Cell::Assistant(_)))
+    }
+
+    /// The mirror of [`streaming_assistant`] for a live thinking block: the last
+    /// cell is a Thinking still receiving deltas. The event loop renders this one
+    /// with a running elapsed; any other cell is sealed and shows its final time.
+    pub fn streaming_thinking(&self) -> bool {
+        self.thinking_open && matches!(self.cells.last(), Some(Cell::Thinking { .. }))
+    }
+
+    /// Stamp the just-closed thinking block with how long it ran, so the frozen
+    /// cell can show `∗ Thought for Xs`. Applies to the newest unsealed Thinking
+    /// cell — at most one is open at a time, and it is the one just closed.
+    pub fn seal_thinking(&mut self, seconds: u64) {
+        if let Some(Cell::Thinking { seconds: s, .. }) = self
+            .cells
+            .iter_mut()
+            .rev()
+            .find(|c| matches!(c, Cell::Thinking { seconds: None, .. }))
+        {
+            *s = Some(seconds);
+        }
     }
 
     fn agent_cell(&mut self, agent: &str) -> Option<&mut Cell> {
@@ -850,7 +904,12 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                 (Role::Assistant, ContentBlock::Thinking { thinking, .. })
                     if !thinking.is_empty() =>
                 {
-                    cells.push(Cell::Thinking(thinking.clone()));
+                    // No timing on disk, so a resumed block shows `∗ Thought`
+                    // without an elapsed.
+                    cells.push(Cell::Thinking {
+                        text: thinking.clone(),
+                        seconds: None,
+                    });
                 }
                 // A historical todo_write replays as its checklist block, the
                 // same shape the live path renders (never a generic tool row).
@@ -1132,9 +1191,15 @@ mod tests {
         assert_eq!(
             app.cells,
             vec![
-                Cell::Thinking("let me see".into()),
+                Cell::Thinking {
+                    text: "let me see".into(),
+                    seconds: None
+                },
                 Cell::Assistant("answer".into()),
-                Cell::Thinking("more thought".into()),
+                Cell::Thinking {
+                    text: "more thought".into(),
+                    seconds: None
+                },
                 Cell::Assistant("!".into()),
             ]
         );
@@ -1704,7 +1769,7 @@ mod tests {
             cells_from_history(&messages),
             vec![
                 Cell::User("do two things".into()),
-                Cell::Thinking("planning".into()),
+                Cell::Thinking { text: "planning".into(), seconds: None },
                 Cell::Assistant("on it".into()),
                 Cell::Tool {
                     name: "bash".into(),
@@ -1916,5 +1981,44 @@ mod tests {
             .map(|i| i.label.as_str())
             .collect();
         assert_eq!(labels, vec!["/cost", "/compact"]);
+    }
+
+    // --- HUD state (plan 38 slice 5) -----------------------------------------
+
+    /// A Usage event refreshes the footer's context estimate; the window/model
+    /// stay put (seeded once).
+    #[test]
+    fn usage_event_updates_context_estimate() {
+        let mut app = App::new("s".into()).with_context("m".into(), Some(1000), 100);
+        assert_eq!(app.context_used, 100);
+        app.apply(AgentEvent::Usage(250));
+        assert_eq!(app.context_used, 250);
+        assert_eq!(app.context_window, Some(1000));
+        assert_eq!(app.model, "m");
+    }
+
+    /// A live thinking block is the streaming last cell; sealing it stamps the
+    /// elapsed into that cell so the frozen render shows the final time.
+    #[test]
+    fn thinking_streams_then_seals_with_elapsed() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ThinkingDelta("pon".into()));
+        app.apply(AgentEvent::ThinkingDelta("dering".into()));
+        assert!(
+            app.streaming_thinking(),
+            "the open block is the streaming last cell"
+        );
+
+        // A text delta closes the block; the loop seals it with its elapsed.
+        app.apply(AgentEvent::TextDelta("answer".into()));
+        assert!(!app.streaming_thinking());
+        app.seal_thinking(9);
+        assert_eq!(
+            app.cells[0],
+            Cell::Thinking {
+                text: "pondering".into(),
+                seconds: Some(9),
+            }
+        );
     }
 }
