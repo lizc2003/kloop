@@ -40,6 +40,11 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+# Markdown rendering in the TUI (plan 38 slice 1): parse assistant messages to
+# styled ratatui lines. default-features off drops the html/escape + getopts
+# (CLI-only) pieces — we only drive the pull parser. Syntax highlighting
+# (syntect) is deliberately deferred to a later slice (plan 38 关键决定 2).
+pulldown-cmark = { version = "0.13", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # MCP remote OAuth (plan 34b): PKCE challenge = base64url(sha256(verifier)); a
 # CSPRNG for the verifier/state. Both are tiny single-purpose crates (kloop's

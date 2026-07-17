@@ -12,6 +12,8 @@ crossterm = { workspace = true }
 # scrolling-regions: flicker-free `insert_before` into native scrollback for
 # the inline viewport (plan 38 slice 0) — DECSTBM scroll regions, no full repaint.
 ratatui = { workspace = true, features = ["scrolling-regions"] }
+# Markdown → styled lines for assistant messages (plan 38 slice 1).
+pulldown-cmark = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 unicode-width = { workspace = true }

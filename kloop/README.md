@@ -278,6 +278,19 @@ output lives in history/offload, not on screen. Permission prompts appear as a
 centered y/a/p/n popup over the viewport; prompts from a concurrent tool batch
 queue and are answered in order.
 
+Assistant messages render as **markdown** (plan 38 slice 1, `crates/tui/src/markdown.rs`
+via `pulldown-cmark`): headings and `**bold**`/`*italic*`/`~~strike~~` weight,
+inline `code` and fenced code blocks over a dim background, ordered and unordered
+lists with a hanging indent, block quotes with a `│` bar, and GitHub-style tables
+drawn with box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single
+newline inside a paragraph reflows to a space (CommonMark soft break), so answers
+re-wrap to the terminal width. Code-block syntax highlighting (syntect) is
+deliberately deferred to a later slice — the source shows raw for now. While a
+message is still streaming, only the part up to the last **stable boundary** (a
+blank line, or a closed code fence) is rendered as markdown; the forming tail
+shows raw, so a half-written table or fence never reflows mid-stream, and it
+snaps to markdown once it completes.
+
 Structure (`crates/tui`): the agent runs on its own tokio task and owns
 `History`; `ChannelUi` implements both `Ui` and `Approver` by forwarding
 everything as events over an mpsc channel (approval decisions travel back

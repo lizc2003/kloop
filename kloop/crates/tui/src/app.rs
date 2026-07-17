@@ -397,6 +397,16 @@ impl App {
         }
     }
 
+    /// Whether the last cell is an Assistant cell still receiving text deltas.
+    /// The renderer streams that one cell with a safe-boundary buffer (so a
+    /// half-formed markdown block shows raw, not reflowing); every other
+    /// Assistant cell is sealed and renders as full markdown. A streaming
+    /// Assistant is always the last cell — any other event closes it — so this
+    /// is the single place the live/sealed distinction lives.
+    pub fn streaming_assistant(&self) -> bool {
+        self.assistant_open && matches!(self.cells.last(), Some(Cell::Assistant(_)))
+    }
+
     fn agent_cell(&mut self, agent: &str) -> Option<&mut Cell> {
         let &i = self.agent_cells.get(agent)?;
         self.cells.get_mut(i)

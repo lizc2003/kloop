@@ -11,6 +11,7 @@
 
 mod app;
 mod events;
+mod markdown;
 mod render;
 
 use std::io::Write as _;

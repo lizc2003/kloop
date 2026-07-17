@@ -139,7 +139,7 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 - 验收:真 key,流式 / 工具行 / 审批 y-a-p-n / Ctrl+C 中断 / resize 不花屏 / resume 全过;
   终端原生滚轮+选择+搜索历史可用;`--plain`/`--mock` 不受影响。
 
-### 切片 1 — markdown 渲染 + 代码高亮
+### 切片 1 — markdown 渲染 + 代码高亮 ✅ 完成(2026-07-17)
 
 助手消息 pulldown-cmark → 富 `Line`(标题 / 粗斜体 / 有序无序列表 / 引用块 / 行内 code /
 表格 box-drawing);代码块 syntect+two-face 高亮(或先边框+dim 背景,见关键决定 2)。
@@ -147,6 +147,14 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
 避免半个 markdown 块被撕裂重排;表格未闭合整体扣住。`normalize_nested_fences` 修嵌套围栏。
 
 - 验收:markdown 结构正确、代码块高亮、流式增量不撕裂、CJK 宽度不错位。
+
+**完成记录(2026-07-17)**:
+- 依赖:`pulldown-cmark 0.13`(`default-features=false`,只驱 pull parser,不引 html/escape/getopts)。**关键决定 2 拍板:syntect 后置**,代码块只做暗底(`Color::Indexed(236)`)+ 原文保真,语法高亮留独立小片。
+- 新模块 `crates/tui/src/markdown.rs`:`Renderer` 走 pulldown 事件流,累积 inline styled chars → 按块 flush。支持标题(bold)、`**bold**`/`*italic*`/`~~strike~~`、行内 code(暗底)、有序/无序列表(marker + 悬挂缩进)、引用块(`│ ` dim gutter)、fenced 代码块(暗底矩形,`wrap` 硬折行 + padding)、hr、任务列表 `[x]`、链接/图片(下划线,丢 URL)、**box-drawing 表格**(`┌┬┐├┼┤└┴┘`,列宽按内容增长再按可用宽收窄、超宽 `…` 截断、按 `Alignment` 左/中/右对齐、表头 bold)。自带 CJK 宽度感知 word-wrap(`wrap_words`:空格断词、超长词硬断、`\n`(HardBreak)强制换行;CJK 无空格→逐字硬断)。**SoftBreak → 空格**(CommonMark 语义,段内单换行重排以支持按宽 reflow)。
+- 流式:`assistant_stream_lines` 用移植自 claw 的 `find_stream_safe_boundary`(空行 / 围栏闭合定边界)切 stable 前缀 → markdown、forming 尾 → 裸文本(不 reflow);`normalize_nested_fences`(嵌套围栏升级到更长栅栏)防 pulldown 把内层 ``` 当闭合。
+- 接线:`render::cell_lines` 的 `Cell::Assistant` 走 `markdown_lines`(封口渲染);`render::visible_transcript`(draw 专用)对**流式末 cell** 特判走 `assistant_stream_lines`——`App::streaming_assistant()`(`assistant_open && 末 cell 是 Assistant`)是 live/sealed 唯一判定点(流式 Assistant 恒是末 cell,commit_count 从不冻结末 cell,故 commit 路径见到的 Assistant 必已封口,可整体 parse)。`transcript_lines` 降级为 `#[cfg(test)]` 测试便利。
+- 验收:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 65 测试,新增 markdown 结构/表格/右对齐/嵌套围栏/代码块暗底/安全边界/流式前缀+裸尾/CJK 等)。真 key **双轨** PTY+pyte VT100 驱动(CPR 由驱动模拟应答,解 inline 构造陷阱):anthropic + openai 默认 prompt 各 10/10(标题 bold / 粗体 attr / 行内 code / bullets `•` / box-drawing 表格对齐 + Alice/Bob 行 / 代码块 bg=索引236(pyte 见 `303030`));另 anthropic 单验多行 fenced 代码块渲染成三行暗底矩形、内容保真。
+- 教训沉淀:HANDOFF 教训「markdown 流式安全边界与 inline commit 模型的解耦」。
 
 ### 切片 2 — 人类可读工具行 + 输出预览
 
@@ -214,7 +222,7 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
 ## 开工时定 / 问用户
 
 - ~~切片 0 是否即刻开工~~(✅ 用户同意即刻开工,已完成)。
-- 关键决定 2:syntect 代码高亮引入 vs 后置(依赖体积权衡)。
+- ~~关键决定 2:syntect 代码高亮引入 vs 后置~~(✅ 切片 1 拍板**后置**:代码块先做暗底,syntect 留独立小片)。
 - 切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)可开工时对着真 key 调。
 - **品牌强调色**定 magenta/cyan(styles.md 建议)还是**橙**(靠拢 CC 截图);gutter 提示符
   `›`、mode 行 `⏵⏵`、thinking `∗` 等具体字形对着真 key 调。

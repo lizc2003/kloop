@@ -102,9 +102,12 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             }
         }
         Cell::Assistant(text) => {
-            for l in wrap(text, width) {
-                lines.push(Line::from(l));
-            }
+            // Sealed assistant message: render the whole thing as markdown. The
+            // live streaming path (draw) renders the still-open last cell via
+            // `markdown::assistant_stream_lines` instead — see `commit_count`
+            // never freezes the last cell, so a committed Assistant is always
+            // sealed and safe to parse in full.
+            lines.extend(crate::markdown::markdown_lines(text, width));
         }
         Cell::Thinking(text) => {
             // Collapsed to a one-line dim preview of the latest reasoning
@@ -189,9 +192,32 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The uncommitted tail as flat display lines (each cell via [`cell_lines`]).
+/// The uncommitted tail as flat display lines (each cell via [`cell_lines`]),
+/// every cell sealed. A test-only convenience for asserting on a fixed slice of
+/// cells; the draw path uses [`visible_transcript`], which additionally streams
+/// the open last cell.
+#[cfg(test)]
 pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
     cells.iter().flat_map(|c| cell_lines(c, width)).collect()
+}
+
+/// The uncommitted tail for the on-screen viewport: like [`transcript_lines`],
+/// but the last cell — when it is an Assistant still receiving deltas — renders
+/// through the streaming safe-boundary buffer so a half-formed markdown block
+/// shows raw instead of reflowing each frame. Only the last cell can be
+/// streaming (any other event seals it), so this is the sole special case.
+pub fn visible_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let last = app.cells.len().saturating_sub(1);
+    for (i, cell) in app.cells.iter().enumerate() {
+        match cell {
+            Cell::Assistant(text) if i == last && app.streaming_assistant() => {
+                lines.extend(crate::markdown::assistant_stream_lines(text, width));
+            }
+            _ => lines.extend(cell_lines(cell, width)),
+        }
+    }
+    lines
 }
 
 /// A cell is committable once it can no longer change: everything except a tool
@@ -308,7 +334,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .areas(f.area());
 
     let width = transcript_area.width as usize;
-    let mut lines = transcript_lines(&app.cells, width.max(1));
+    let mut lines = visible_transcript(app, width.max(1));
     // The activity status is the last transcript line — rendered here, never a
     // cell, so it is never frozen into scrollback. A blank spacer sets it off.
     if let Some(activity) = activity_line(app) {
@@ -745,6 +771,8 @@ mod tests {
                 status: ToolStatus::Running,
             },
             Cell::Note("compacting history".into()),
+            // Assistant text now renders as markdown: a single newline inside a
+            // paragraph is a soft break and reflows to a space.
             Cell::Assistant("done.\nall good".into()),
         ];
         let lines = transcript_lines(&cells, 40);
@@ -757,8 +785,7 @@ mod tests {
                 "✓ bash {\"command\":\"ls\"}",
                 "… bash {}",
                 "[compacting history]",
-                "done.",
-                "all good",
+                "done. all good",
             ]
         );
     }
