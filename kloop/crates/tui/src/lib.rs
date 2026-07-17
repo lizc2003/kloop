@@ -379,8 +379,15 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (w as usize).max(1);
     // The live region is the viewport minus the bottom chrome: two rules that
-    // fence the composer, the composer, and the status line (see render::draw).
-    let active_h = (h as usize).saturating_sub(4).max(1);
+    // fence the composer, the composer, and the footer (4). When an activity
+    // line is showing it eats a blank spacer + its own row at the transcript
+    // bottom, so reserve two more (see render::draw).
+    let reserve = 4 + if render::activity_line(app).is_some() {
+        2
+    } else {
+        0
+    };
+    let active_h = (h as usize).saturating_sub(reserve).max(1);
     let n = render::commit_count(&app.cells, width, active_h);
     if n == 0 {
         return Ok(());

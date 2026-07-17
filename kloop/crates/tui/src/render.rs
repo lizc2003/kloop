@@ -258,37 +258,47 @@ pub fn input_view(input: &str, cursor: usize, width: usize) -> (String, u16) {
     (out, x as u16)
 }
 
-pub fn status_line(app: &App) -> String {
-    // The permission mode badge leads every status: it is always relevant, and
-    // plan mode especially must be unmissable.
-    let mode = format!("[{}] ", app.mode.label());
-    // A single Ctrl+C armed the two-tap quit — say so over everything, including
-    // an open popup (Ctrl+C quits from there too, so the hint must reach it).
+/// The dynamic "what's happening now" line, shown at the BOTTOM of the
+/// transcript (just above the composer) where it is most prominent — the eye
+/// lands here, not on the footer. `None` when nothing is happening (idle). This
+/// is the spot the animated verb/elapsed/token HUD grows into (plan 38 slice 5);
+/// for now it is the placeholder text. Kept out of the footer so the footer can
+/// stay still.
+pub fn activity_line(app: &App) -> Option<String> {
     if app.ctrl_c_exit_armed {
-        return format!("{mode}press Ctrl+C again to exit");
+        // Unmissable, right above the composer where Ctrl+C was pressed.
+        Some("press Ctrl+C again to exit".into())
+    } else if !app.confirms.is_empty() {
+        Some("awaiting your approval".into())
+    } else if app.running {
+        Some("working…".into())
+    } else {
+        None
     }
+}
+
+/// The stable bottom bar: the permission-mode badge plus the key hints. It
+/// barely moves — only the mode badge (shift+Tab) and the running/idle hint set
+/// change, both at turn/mode boundaries, never per event. Live activity lives in
+/// [`activity_line`], not here.
+pub fn footer_line(app: &App) -> String {
     if app.fork_picker.is_some() {
         return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
     }
-    if !app.confirms.is_empty() {
-        return format!("{mode}awaiting approval");
-    }
+    let mode = format!("[{}]  ", app.mode.label());
     if app.running {
-        // Stable while a turn runs — per-event activity (tool rows, notes,
-        // thinking) shows in the transcript, not by churning the status bar.
-        return format!("{mode}working… (Esc to interrupt)");
+        format!("{mode}esc to interrupt · Ctrl+C to exit")
+    } else {
+        format!("{mode}shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit")
     }
-    format!(
-        "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit",
-        app.session_id
-    )
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // The composer is fenced by a horizontal rule above and below it; the
-    // status/mode line is the very bottom row (CC's footer order — the mode
-    // indicator lives below the input, not above it).
-    let [transcript_area, rule_top, input_area, rule_bottom, status_area] = Layout::vertical([
+    // Bottom-up: a stable footer (mode + hints), the composer fenced by a rule
+    // above and below, and the transcript — whose last line carries the live
+    // activity status (CC's information architecture: the dynamic "what's
+    // happening" sits by the composer where it is seen, the footer stays still).
+    let [transcript_area, rule_top, input_area, rule_bottom, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -298,7 +308,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .areas(f.area());
 
     let width = transcript_area.width as usize;
-    let lines = transcript_lines(&app.cells, width.max(1));
+    let mut lines = transcript_lines(&app.cells, width.max(1));
+    // The activity status is the last transcript line — rendered here, never a
+    // cell, so it is never frozen into scrollback. A blank spacer sets it off.
+    if let Some(activity) = activity_line(app) {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(truncate(&activity, width.max(1))));
+    }
     let height = transcript_area.height as usize;
     // Bottom-anchor the uncommitted tail just above the composer. The event loop
     // has already frozen anything that overflowed into native scrollback, so
@@ -317,9 +335,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(rule.clone()).style(DIM), rule_top);
     f.render_widget(Paragraph::new(rule).style(DIM), rule_bottom);
 
+    // Stable footer at the very bottom.
     f.render_widget(
-        Paragraph::new(truncate(&status_line(app), width)).style(DIM),
-        status_area,
+        Paragraph::new(truncate(&footer_line(app), width)).style(DIM),
+        footer_area,
     );
 
     let input_width = (input_area.width as usize).saturating_sub(2);
@@ -681,19 +700,34 @@ mod tests {
         );
     }
 
-    /// The status bar leads with the permission-mode badge in every state and
-    /// names shift+Tab when idle; plan mode is spelled out so it is unmissable.
+    /// The footer leads with the mode badge and names shift+Tab when idle; the
+    /// live "what's happening" text lives in the activity line, not the footer.
     #[test]
-    fn status_line_shows_the_mode_badge() {
+    fn footer_shows_mode_badge_activity_shows_state() {
         use kloop_core::permissions::Mode;
         let mut app = App::new("sess".into());
-        assert!(status_line(&app).starts_with("[manual] "));
-        assert!(status_line(&app).contains("shift+Tab"));
+        // Idle: footer has the badge + hints; no activity line.
+        assert!(footer_line(&app).starts_with("[manual]  "));
+        assert!(footer_line(&app).contains("shift+Tab"));
+        assert_eq!(activity_line(&app), None);
+
         app.mode = Mode::Plan;
-        let line = status_line(&app);
-        assert!(line.starts_with("[plan] "), "{line}");
+        assert!(footer_line(&app).starts_with("[plan]  "));
+
+        // Running: activity says "working…", footer switches to the interrupt
+        // hint (still leading with the badge, still no per-event churn).
         app.running = true;
-        assert!(status_line(&app).starts_with("[plan] working…"));
+        assert_eq!(activity_line(&app).as_deref(), Some("working…"));
+        let footer = footer_line(&app);
+        assert!(footer.starts_with("[plan]  "), "{footer}");
+        assert!(footer.contains("esc to interrupt"), "{footer}");
+
+        // Armed / awaiting-approval take over the activity line, not the footer.
+        app.ctrl_c_exit_armed = true;
+        assert_eq!(
+            activity_line(&app).as_deref(),
+            Some("press Ctrl+C again to exit")
+        );
     }
 
     #[test]
