@@ -318,10 +318,20 @@ fn setup_terminal() -> Result<Terminal> {
 
 fn restore_terminal() {
     let _ = crossterm::terminal::disable_raw_mode();
-    // No alternate screen to leave; show the cursor and drop below the viewport
-    // so the shell prompt returns on a clean line.
+    // No alternate screen to leave. The last draw left the cursor mid-viewport
+    // (at the composer); drop it to the bottom row and emit an explicit CR+LF so
+    // the shell prompt returns on a fresh line at column 0 — otherwise zsh marks
+    // the partial line with a "%". The last frame stays in scrollback.
     let mut out = std::io::stdout();
-    let _ = crossterm::execute!(out, crossterm::cursor::Show, crossterm::style::Print("\n"));
+    let bottom = crossterm::terminal::size()
+        .map(|(_, h)| h.saturating_sub(1))
+        .unwrap_or(0);
+    let _ = crossterm::execute!(
+        out,
+        crossterm::cursor::Show,
+        crossterm::cursor::MoveTo(0, bottom),
+        crossterm::style::Print("\r\n"),
+    );
     let _ = out.flush();
 }
 
