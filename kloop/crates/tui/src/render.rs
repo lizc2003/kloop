@@ -259,15 +259,16 @@ pub fn input_view(input: &str, cursor: usize, width: usize) -> (String, u16) {
 }
 
 pub fn status_line(app: &App) -> String {
-    if app.fork_picker.is_some() {
-        return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
-    }
-    // The permission mode badge leads every non-rewind status: it is always
-    // relevant, and plan mode especially must be unmissable.
+    // The permission mode badge leads every status: it is always relevant, and
+    // plan mode especially must be unmissable.
     let mode = format!("[{}] ", app.mode.label());
-    // A single Ctrl+C armed the two-tap quit — say so, over everything else.
+    // A single Ctrl+C armed the two-tap quit — say so over everything, including
+    // an open popup (Ctrl+C quits from there too, so the hint must reach it).
     if app.ctrl_c_exit_armed {
         return format!("{mode}press Ctrl+C again to exit");
+    }
+    if app.fork_picker.is_some() {
+        return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
     }
     if !app.confirms.is_empty() {
         return format!("{mode}awaiting approval");

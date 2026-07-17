@@ -422,6 +422,19 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Command {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+C is a two-tap quit on every surface — main input, confirm popup,
+        // rewind picker: the first press arms a hint, the second quits, any other
+        // key disarms. Handle it before routing so all three agree (CC parity —
+        // Esc does interrupt/dismiss, Ctrl+C exits). Ctrl+D stays immediate.
+        let was_armed = std::mem::take(&mut self.ctrl_c_exit_armed);
+        if ctrl && key.code == KeyCode::Char('c') {
+            if was_armed {
+                return Command::Quit;
+            }
+            self.ctrl_c_exit_armed = true;
+            return Command::None;
+        }
         // A pending permission prompt captures the keyboard.
         if !self.confirms.is_empty() {
             return self.on_confirm_key(key);
@@ -430,21 +443,8 @@ impl App {
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
         }
-        // Ctrl+C is a two-tap quit: any key other than a second Ctrl+C disarms
-        // it. Take the flag up front so every arm below sees a clean slate.
-        let ctrl_c_armed = std::mem::take(&mut self.ctrl_c_exit_armed);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
             (KeyCode::Char('d'), true) => return Command::Quit,
-            // CC parity: Ctrl+C exits the app (not interrupt — Esc does that),
-            // but only on the second press; a stray Ctrl+C arms a hint instead
-            // of quitting mid-work. Ctrl+D stays an immediate quit.
-            (KeyCode::Char('c'), true) => {
-                if ctrl_c_armed {
-                    return Command::Quit;
-                }
-                self.ctrl_c_exit_armed = true;
-            }
             // Esc interrupts a running turn (CC parity, the advertised key);
             // idle it clears the input line. A confirm popup / rewind picker
             // capture Esc before this (they return early at the top of on_key).
@@ -527,9 +527,8 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => return Command::Quit,
-                // Ctrl+C during a prompt interrupts the whole turn; the
-                // dropped reply senders resolve as Deny on the agent side.
-                KeyCode::Char('c') => return Command::Interrupt,
+                // Ctrl+C is the two-tap quit, intercepted before routing here.
+                // Esc denies the prompt (below); to stop the turn, deny then Esc.
                 _ => return Command::None,
             }
         }
@@ -571,15 +570,15 @@ impl App {
     }
 
     /// Keys while the rewind picker is open. ↑↓/kj move the cursor, Enter forks
-    /// at the selected point, Esc/Ctrl+C back out without touching History.
+    /// at the selected point, Esc backs out without touching History (Ctrl+C is
+    /// the two-tap quit, intercepted before routing here).
     fn on_fork_key(&mut self, key: KeyEvent) -> Command {
         let picker = self.fork_picker.as_mut().expect("checked some");
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('d') => return Command::Quit,
-                KeyCode::Char('c') => self.fork_picker = None,
-                _ => {}
+            if key.code == KeyCode::Char('d') {
+                return Command::Quit;
             }
+            // Ctrl+C is the two-tap quit, intercepted before routing here.
             return Command::None;
         }
         match key.code {
@@ -1286,6 +1285,47 @@ mod tests {
         // Running: Esc interrupts.
         app.running = true;
         assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
+    }
+
+    /// Ctrl+C is the same two-tap quit inside a popup as in the main input —
+    /// intercepted before routing, so the popup is untouched by the first tap
+    /// (its own dismissal is Esc). Ctrl+D still quits a popup immediately.
+    #[tokio::test]
+    async fn ctrl_c_two_tap_quits_from_popups() {
+        // Confirm prompt up.
+        let mut app = App::new("s".into());
+        app.running = true;
+        let (reply, _rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "bash: rm x".into(),
+                remember_rules: None,
+                preview: None,
+            },
+            reply,
+        });
+        assert_eq!(app.on_key(ctrl('c')), Command::None, "first tap arms");
+        assert!(app.ctrl_c_exit_armed);
+        assert!(
+            !app.confirms.is_empty(),
+            "the prompt is untouched by the tap"
+        );
+        assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
+
+        // Rewind picker up.
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "one")]));
+        assert_eq!(app.on_key(ctrl('c')), Command::None, "first tap arms");
+        assert!(
+            app.fork_picker.is_some(),
+            "the picker is untouched by the tap"
+        );
+        assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
+
+        // Ctrl+D still quits a popup immediately.
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "one")]));
+        assert_eq!(app.on_key(ctrl('d')), Command::Quit);
     }
 
     #[tokio::test]
