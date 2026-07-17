@@ -273,7 +273,7 @@ pub fn status_line(app: &App) -> String {
         return format!("{mode}working… {note}  (Ctrl+C to interrupt)");
     }
     format!(
-        "{mode}session {} — Enter to send · shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",
+        "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",
         app.session_id
     )
 }
