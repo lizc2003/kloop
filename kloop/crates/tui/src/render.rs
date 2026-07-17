@@ -265,6 +265,10 @@ pub fn status_line(app: &App) -> String {
     // The permission mode badge leads every non-rewind status: it is always
     // relevant, and plan mode especially must be unmissable.
     let mode = format!("[{}] ", app.mode.label());
+    // A single Ctrl+C armed the two-tap quit — say so, over everything else.
+    if app.ctrl_c_exit_armed {
+        return format!("{mode}press Ctrl+C again to exit");
+    }
     if !app.confirms.is_empty() {
         return format!("{mode}awaiting approval");
     }
@@ -274,7 +278,7 @@ pub fn status_line(app: &App) -> String {
         return format!("{mode}working… (Esc to interrupt)");
     }
     format!(
-        "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",
+        "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit",
         app.session_id
     )
 }

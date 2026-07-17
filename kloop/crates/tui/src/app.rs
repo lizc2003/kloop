@@ -152,6 +152,9 @@ pub struct App {
     /// `exit_plan_mode` approval refreshes it via `AgentEvent::ModeChanged`. The
     /// loop seeds it from the real gate before the first draw.
     pub mode: Mode,
+    /// Ctrl+C is a two-tap quit (CC parity): the first press arms this and shows
+    /// a hint; the next Ctrl+C quits, any other key disarms it.
+    pub ctrl_c_exit_armed: bool,
 }
 
 impl App {
@@ -172,6 +175,7 @@ impl App {
             todo_cell: None,
             fork_picker: None,
             mode: Mode::default(),
+            ctrl_c_exit_armed: false,
         }
     }
 
@@ -426,23 +430,30 @@ impl App {
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
         }
+        // Ctrl+C is a two-tap quit: any key other than a second Ctrl+C disarms
+        // it. Take the flag up front so every arm below sees a clean slate.
+        let ctrl_c_armed = std::mem::take(&mut self.ctrl_c_exit_armed);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
             (KeyCode::Char('d'), true) => return Command::Quit,
+            // CC parity: Ctrl+C exits the app (not interrupt — Esc does that),
+            // but only on the second press; a stray Ctrl+C arms a hint instead
+            // of quitting mid-work. Ctrl+D stays an immediate quit.
             (KeyCode::Char('c'), true) => {
+                if ctrl_c_armed {
+                    return Command::Quit;
+                }
+                self.ctrl_c_exit_armed = true;
+            }
+            // Esc interrupts a running turn (CC parity, the advertised key);
+            // idle it clears the input line. A confirm popup / rewind picker
+            // capture Esc before this (they return early at the top of on_key).
+            (KeyCode::Esc, _) => {
                 if self.running {
                     return Command::Interrupt;
                 }
                 self.input.clear();
                 self.cursor = 0;
-            }
-            // Esc interrupts a running turn (CC parity, the advertised key);
-            // idle it is a no-op. A confirm popup / rewind picker capture Esc
-            // before this (they return early at the top of on_key).
-            (KeyCode::Esc, _) => {
-                if self.running {
-                    return Command::Interrupt;
-                }
             }
             (KeyCode::Char('r'), true) => {
                 // Rewind (plan 18) is idle-only: a running turn owns History, so
@@ -1231,28 +1242,50 @@ mod tests {
         assert!(app.cells.is_empty());
     }
 
+    /// Ctrl+C is a two-tap quit (CC parity): the first press arms a hint and
+    /// leaves the input alone, the second quits, any other key disarms. It no
+    /// longer interrupts or clears the input — Esc does both.
     #[test]
-    fn ctrl_c_interrupts_when_running_and_clears_input_when_idle() {
+    fn ctrl_c_two_tap_quits() {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
+        // First Ctrl+C arms (no quit, input untouched).
         assert_eq!(app.on_key(ctrl('c')), Command::None);
-        assert_eq!(app.input, "");
+        assert!(app.ctrl_c_exit_armed);
+        assert_eq!(app.input, "draft");
+        // Second Ctrl+C quits.
+        assert_eq!(app.on_key(ctrl('c')), Command::Quit);
 
+        // Any other key between the taps disarms it.
+        app.on_key(ctrl('c'));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(!app.ctrl_c_exit_armed, "a non-Ctrl+C key disarms");
+        assert_eq!(
+            app.on_key(ctrl('c')),
+            Command::None,
+            "back to the first tap"
+        );
+
+        // Works while running too (quit aborts the turn); Ctrl+D stays immediate.
+        app.on_key(key(KeyCode::Char('y'))); // disarm
         app.running = true;
-        assert_eq!(app.on_key(ctrl('c')), Command::Interrupt);
-        // Esc is the advertised interrupt key (CC parity) while running…
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
+        assert_eq!(app.on_key(ctrl('c')), Command::None);
+        assert_eq!(app.on_key(ctrl('c')), Command::Quit);
         assert_eq!(app.on_key(ctrl('d')), Command::Quit);
     }
 
-    /// Esc interrupts only while a turn runs; idle it is a no-op (it does not
-    /// clear the input, which is Ctrl+C's job).
+    /// Esc interrupts a running turn (the advertised key) and clears the input
+    /// line when idle.
     #[test]
-    fn esc_interrupts_only_when_running() {
+    fn esc_interrupts_running_and_clears_input_idle() {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
+        // Idle: Esc clears the line.
         assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
-        assert_eq!(app.input, "draft", "idle Esc leaves the input alone");
+        assert_eq!(app.input, "");
+        // Running: Esc interrupts.
+        app.running = true;
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
     }
 
     #[tokio::test]
