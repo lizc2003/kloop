@@ -279,11 +279,13 @@ pub fn status_line(app: &App) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // Composer sits directly under the transcript; the status/mode line is the
-    // very bottom row (CC's footer order — the mode indicator lives below the
-    // input, not above it).
-    let [transcript_area, input_area, status_area] = Layout::vertical([
+    // The composer is fenced by a horizontal rule above and below it; the
+    // status/mode line is the very bottom row (CC's footer order — the mode
+    // indicator lives below the input, not above it).
+    let [transcript_area, rule_top, input_area, rule_bottom, status_area] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -303,6 +305,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut rows = vec![Line::default(); pad];
     rows.extend_from_slice(visible);
     f.render_widget(Paragraph::new(rows), transcript_area);
+
+    // Rules that fence the composer, above and below it.
+    let rule = "─".repeat(width);
+    f.render_widget(Paragraph::new(rule.clone()).style(DIM), rule_top);
+    f.render_widget(Paragraph::new(rule).style(DIM), rule_bottom);
 
     f.render_widget(
         Paragraph::new(truncate(&status_line(app), width)).style(DIM),
