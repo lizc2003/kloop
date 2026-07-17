@@ -188,7 +188,10 @@ gutter 视觉语言统一 `● › │ └`,左槽宽度常量对齐。连续 re
 - **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 86 测试,新增 composer 12 项:换行+光标/goal_col/首末行历史/编辑采纳草稿/大段占位+展开/小粘贴/图片随提交/空提交 None/view 换行+光标/占位串/tall 窗口/CJK)。真 key **双轨** PTY+pyte:anthropic + openai 各 4/4(多行 `› first line`/`  second line` via Alt+Enter=`ESC CR`;500 字大段粘贴→`[Pasted #1: 500 chars]`;图片路径粘贴→`📎 shot.png` 附件;submit 真轮后 ↑ 调回 `say hi in one word`)。另 anthropic 端到端:粘贴真 64×64 PNG + 提问,模型答 "YES" 确认图片随 turn 送达(1×1 透明退化图 400 是 Bedrock `Could not process image`,与 `--image` 同路径同拒,非 bug)。
 - 教训沉淀:HANDOFF 教训 41(bracketed paste + 终端换行键歧义 + 非 Eq 富数据走 App 字段而非 Command)。
 - **OS 剪贴板直接取图(同会话追加,真 key 双轨端到端验收已过)**:参考 codex `clipboard_paste.rs`——触发键 **`Ctrl+V`/`Alt+V`**(终端把 Cmd+V 留给自己的文本粘贴,故用独立键,cc/codex 同款),不是空 paste 猜测。新 `crates/tui/src/clipboard.rs`(`arboard` 读 + `png` 编码):兼容两形态——**文件列表** `get().file_list()`(Finder 复制)读字节复用 `image_block_from_bytes`、**RGBA** `get_image()`(截图/浏览器复制)→ `png` 编码 → `image_block_from_bytes`。剪贴板读是副作用 → `on_key` 纯返回 `Command::PasteClipboardImage`,`ui_loop` 执行读取(成功 `attach_image`、失败 `Note`),保持 on_key 纯。依赖:`arboard 3`(macOS 后端只拉 `image[tiff]`,轻)+ `png 0.17`(RGBA→PNG)。验收:tui 88 测试(clipboard 2 项:RGBA→PNG→block 往返、坏缓冲拒绝;on_key 1 项:Ctrl/Alt+V→Command);真 key 双轨——osascript 把 64×64 PNG 塞剪贴板 + PTY 送 `\x16`(Ctrl+V)→ `📎 pasted image 64×64` 附件,提交后 anthropic+openai 模型均答 "YES"(图片经剪贴板→附件→turn→API 送达)。教训 42。
-- **未做(后置)**:composer vim normal 模式、鼠标点选(已在「不做」);Linux/Windows 剪贴板取图未在本机验(arboard 跨平台支持在,darwin 已验)。
+- **未做(后置)**:composer vim normal 模式、鼠标点选(已在「不做」)。
+- **Windows/WSL 剪贴板状态(核过依赖+代码,darwin 已端到端验;非 darwin 未上真机)**:
+  - **原生 Windows**:预期零改动可用——`clipboard.rs` 无任何 `cfg`/`target_os`/macOS 专属调用,arboard 的 Windows backend `get_image`(CF_DIB→RGBA)+`file_list`(CF_HDROP)公开 API 未被 cfg 掉,arboard 声明的 `cfg(windows)` `windows-sys` 依赖已进 Cargo.lock(lock 跨 target)。**只差在真 Windows/CI 跑一次销账**(本机 macOS 跑不了)。
+  - **WSL**:是缺口——WSL 里 arboard 看到的是 WSL Linux 剪贴板非 Windows 的,Ctrl+V 抓不到图,当前**优雅降级**为 `[no image on the clipboard: …]` Note(不崩)。codex `clipboard_paste.rs` 有 PowerShell 兜底(`cfg(target_os="linux")` + WSL 探测 + shell 出去 `powershell.exe` dump 剪贴板图到临时文件 + Windows→WSL 路径转换),**待用户确认是否需要 WSL 再移植**(本机 macOS 验不了,需 WSL 环境真跑)。
 
 ### 切片 4 — 斜杠命令菜单 + @文件补全
 
