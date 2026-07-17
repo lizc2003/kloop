@@ -20,6 +20,8 @@ use kloop_core::tools::TodoStatus;
 use crate::app::App;
 use crate::app::Cell;
 use crate::app::ToolStatus;
+use crate::menu;
+use crate::menu::Popup;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -301,6 +303,9 @@ pub fn footer_line(app: &App) -> String {
     if app.fork_picker.is_some() {
         return "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".into();
     }
+    if app.popup.is_some() {
+        return "↑↓ choose · Tab/⏎ complete · Esc cancel".into();
+    }
     let mode = format!("[{}]  ", app.mode.label());
     if app.running {
         format!("{mode}esc to interrupt · Ctrl+C to exit")
@@ -376,11 +381,96 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else if app.fork_picker.is_some() {
         draw_fork_picker(f, app, full);
     } else {
+        // A completion menu (if open) floats just above the composer; the cursor
+        // stays in the input, since the user is still typing the query.
+        if let Some(popup) = &app.popup {
+            draw_menu(f, popup, rule_top, width);
+        }
         f.set_cursor_position((
             input_area.x + view.cursor_col,
             input_area.y + attach_h + view.cursor_row,
         ));
     }
+}
+
+/// The slash/file completion menu (plan 38 slice 4): a borderless flat list
+/// floating directly above the composer's top rule, the highlighted row
+/// reversed (theme-safe, like the rewind picker). Grows upward from the rule so
+/// the most-relevant top rows sit nearest the input.
+fn draw_menu(f: &mut Frame, popup: &Popup, rule_top: Rect, width: usize) {
+    let lines = menu_lines(popup, width, menu::MENU_ROWS);
+    let height = lines.len() as u16;
+    if height == 0 {
+        return;
+    }
+    let y = rule_top.y.saturating_sub(height);
+    let area = Rect {
+        x: rule_top.x,
+        y,
+        width: rule_top.width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The menu's rows for one width, windowed to `max_rows` around the cursor. The
+/// selected row is reversed across its full width; others show the label plus a
+/// dim detail. Pure and testable.
+pub fn menu_lines(popup: &Popup, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let n = popup.items.len();
+    if n == 0 || width == 0 {
+        return Vec::new();
+    }
+    let visible = n.min(max_rows);
+    // Window so the cursor row stays in view as the list scrolls.
+    let start = popup.cursor.saturating_sub(visible - 1).min(n - visible);
+    (start..start + visible)
+        .map(|i| {
+            let item = &popup.items[i];
+            let selected = i == popup.cursor;
+            let text = if item.detail.is_empty() {
+                item.label.clone()
+            } else {
+                format!("{}  {}", item.label, item.detail)
+            };
+            if selected {
+                // Reversed across the whole width: pad the text so the highlight
+                // fills the row.
+                let padded = pad(&text, width);
+                Line::from(Span::styled(
+                    padded,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                ))
+            } else {
+                // Label at default weight, detail dim; truncated to width.
+                let label = truncate(&item.label, width);
+                let label_w = display_width(&label);
+                let mut spans = vec![Span::raw(label)];
+                if !item.detail.is_empty() && label_w + 2 < width {
+                    let rest = truncate(&format!("  {}", item.detail), width - label_w);
+                    spans.push(Span::styled(rest, DIM));
+                }
+                Line::from(spans)
+            }
+        })
+        .collect()
+}
+
+/// Right-pad `text` with spaces to `width` display columns (truncating first if
+/// it is already wider), so a reversed highlight fills the whole row.
+fn pad(text: &str, width: usize) -> String {
+    let mut s = truncate(text, width);
+    let w = display_width(&s);
+    if w < width {
+        s.push_str(&" ".repeat(width - w));
+    }
+    s
+}
+
+/// Display width of `s` in terminal columns (CJK counts as 2).
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// The rewind picker popup (plan 18): one row per fork point, the cursor row
@@ -709,6 +799,95 @@ mod tests {
         );
         assert!(screen.contains("↑ more"), "up hint shown:\n{screen}");
         assert!(!screen.contains("↓ more"), "no down hint at end:\n{screen}");
+    }
+
+    /// The menu highlights the cursor row (reversed) and windows a long list to
+    /// keep the cursor visible near the bottom (rows nearest the composer).
+    #[test]
+    fn menu_lines_highlight_cursor_and_window_long_lists() {
+        let items: Vec<menu::MenuItem> = (0..20)
+            .map(|i| menu::MenuItem {
+                label: format!("/cmd{i}"),
+                detail: format!("desc {i}"),
+                insert: format!("/cmd{i}"),
+            })
+            .collect();
+        let popup = Popup {
+            kind: menu::PopupKind::Slash,
+            query: String::new(),
+            items,
+            cursor: 12,
+        };
+        let lines = menu_lines(&popup, 40, 8);
+        assert_eq!(lines.len(), 8, "windowed to max_rows");
+        // The cursor row (12) is the last visible row, and it is reversed.
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts.last().unwrap().starts_with("/cmd12"),
+            "cursor row last: {texts:?}"
+        );
+        assert!(
+            lines.last().unwrap().spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "selected row reversed"
+        );
+        // A non-selected row is not reversed and carries a dim detail span.
+        assert!(!lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    /// End-to-end (TestBackend): an open menu floats directly above the composer
+    /// (its top rule), not in the footer, and shows the candidates.
+    #[test]
+    fn draw_floats_the_menu_above_the_composer() {
+        let popup = Popup {
+            kind: menu::PopupKind::Slash,
+            query: "co".into(),
+            items: vec![
+                menu::MenuItem {
+                    label: "/cost".into(),
+                    detail: "session cost".into(),
+                    insert: "/cost".into(),
+                },
+                menu::MenuItem {
+                    label: "/compact".into(),
+                    detail: "compact history".into(),
+                    insert: "/compact".into(),
+                },
+            ],
+            cursor: 0,
+        };
+        let mut app = App::new("s".into());
+        app.popup = Some(popup);
+        // Type the trigger into the composer so the cursor sits in the input.
+        app.composer.paste("/co");
+
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                    .collect::<String>()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("/cost"), "menu candidate shown:\n{screen}");
+        assert!(
+            screen.contains("/compact"),
+            "menu candidate shown:\n{screen}"
+        );
+        // The menu sits above the composer's `›` prompt row.
+        let menu_row = rows.iter().position(|r| r.contains("/cost")).unwrap();
+        let prompt_row = rows.iter().position(|r| r.contains("›")).unwrap();
+        assert!(menu_row < prompt_row, "menu above composer:\n{screen}");
     }
 
     #[test]

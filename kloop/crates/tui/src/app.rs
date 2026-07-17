@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 
 use crate::composer::Composer;
 use crate::events::AgentEvent;
+use crate::menu;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -119,6 +120,10 @@ pub enum Command {
     /// Read an image off the OS clipboard (Ctrl+V) and attach it. The read is a
     /// side effect, so it runs in the event loop, not here.
     PasteClipboardImage,
+    /// The composer's current `@`-token asks for file candidates: the loop walks
+    /// the tree (an I/O search) and feeds matches back via
+    /// [`App::set_file_results`]. Carries the query after the `@`.
+    SearchFiles(String),
     Quit,
 }
 
@@ -168,6 +173,13 @@ pub struct App {
     /// Ctrl+C is a two-tap quit (CC parity): the first press arms this and shows
     /// a hint; the next Ctrl+C quits, any other key disarms it.
     pub ctrl_c_exit_armed: bool,
+    /// The open completion popup (slash `/` or file `@`), or None. At most one is
+    /// open at a time; it floats above the composer and captures navigation /
+    /// accept / cancel keys (plan 38 slice 4).
+    pub popup: Option<menu::Popup>,
+    /// The slash-command catalog (built-ins + skills/commands), used to filter
+    /// the `/` menu. Seeded once at startup via [`App::with_commands`].
+    commands: Vec<menu::CommandInfo>,
 }
 
 impl App {
@@ -189,7 +201,15 @@ impl App {
             fork_picker: None,
             mode: Mode::default(),
             ctrl_c_exit_armed: false,
+            popup: None,
+            commands: Vec::new(),
         }
+    }
+
+    /// Seed the slash-command catalog for the `/` menu (built-ins + skills).
+    pub fn with_commands(mut self, commands: Vec<menu::CommandInfo>) -> Self {
+        self.commands = commands;
+        self
     }
 
     pub fn apply(&mut self, event: AgentEvent) {
@@ -488,6 +508,14 @@ impl App {
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
         }
+        // An open completion popup (slash `/` or file `@`) captures navigation /
+        // accept / cancel; every other key falls through to edit the composer,
+        // after which the tail re-syncs the popup (re-filter or close).
+        if self.popup.is_some() {
+            if let Some(cmd) = self.on_popup_key(key) {
+                return cmd;
+            }
+        }
         // A newline inside the composer instead of a submit: Ctrl+J (the reliable
         // LF), or Shift/Alt+Enter where the terminal distinguishes it (many do
         // not — Ctrl+J is the portable path).
@@ -497,7 +525,7 @@ impl App {
             || (key.code == KeyCode::Char('j') && ctrl)
         {
             self.composer.insert_newline();
-            return Command::None;
+            return self.after_edit();
         }
         // Ctrl+V / Alt+V pastes an image off the OS clipboard (the terminal keeps
         // Cmd+V for its own text paste, so a distinct key like codex / CC). The
@@ -544,9 +572,104 @@ impl App {
             // viewport, plan 38 slice 0): history lives in native scrollback,
             // so the mouse wheel / PageUp reach it directly. The old in-app
             // scroll keys are retired.
-            _ => {}
+            _ => return Command::None,
         }
-        Command::None
+        // A composer-editing key ran: re-sync the completion popup from the new
+        // text/cursor (open/refilter a `/`/`@` menu, request a file search, or
+        // close it). Non-editing arms above return directly and skip this.
+        self.after_edit()
+    }
+
+    /// Re-derive the completion popup from the composer after an edit. Returns
+    /// [`Command::SearchFiles`] when an `@`-token needs the loop to walk the
+    /// tree; otherwise resolves the slash menu (or closes the popup) here and
+    /// returns [`Command::None`].
+    fn after_edit(&mut self) -> Command {
+        match menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running) {
+            Some(menu::Trigger::Slash(query)) => {
+                let items = menu::slash_items(&self.commands, &query);
+                self.popup = (!items.is_empty()).then_some(menu::Popup {
+                    kind: menu::PopupKind::Slash,
+                    query,
+                    items,
+                    cursor: 0,
+                });
+                Command::None
+            }
+            // The loop searches and calls `set_file_results`; leave the current
+            // popup (if any) until the results land so the menu doesn't flicker.
+            Some(menu::Trigger::File(query)) => Command::SearchFiles(query),
+            None => {
+                self.popup = None;
+                Command::None
+            }
+        }
+    }
+
+    /// A key while a completion popup is open. `Some(cmd)` when the popup consumed
+    /// it (navigation / accept / cancel); `None` to let it fall through to
+    /// composer editing (which then re-syncs via [`App::after_edit`]).
+    fn on_popup_key(&mut self, key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => {
+                self.popup.as_mut()?.move_up();
+                Some(Command::None)
+            }
+            KeyCode::Down => {
+                self.popup.as_mut()?.move_down();
+                Some(Command::None)
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.popup.as_mut()?.move_up();
+                Some(Command::None)
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.popup.as_mut()?.move_down();
+                Some(Command::None)
+            }
+            // Tab / Enter complete the highlighted entry into the composer; Enter
+            // does not submit while the menu is open (plan: Tab/Enter 补全).
+            KeyCode::Tab | KeyCode::Enter => {
+                self.accept_popup();
+                Some(Command::None)
+            }
+            // Esc closes the menu without touching the composer (a running turn's
+            // interrupt / idle clear is a second Esc, once the menu is gone).
+            KeyCode::Esc => {
+                self.popup = None;
+                Some(Command::None)
+            }
+            _ => None,
+        }
+    }
+
+    /// Insert the highlighted entry's replacement token and close the popup. The
+    /// completed token carries a trailing space, so its trigger no longer fires.
+    fn accept_popup(&mut self) {
+        if let Some(popup) = self.popup.take() {
+            if let Some(item) = popup.selected() {
+                self.composer.replace_token(&item.insert);
+            }
+        }
+    }
+
+    /// Fill the file menu with the loop's search results for `query`. Ignored if
+    /// the composer has moved on (the `@`-token no longer matches `query`), so a
+    /// late result can't reopen a stale menu; an empty result closes the popup.
+    pub fn set_file_results(&mut self, query: &str, paths: Vec<String>) {
+        let current =
+            menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running);
+        if !matches!(&current, Some(menu::Trigger::File(q)) if q == query) {
+            return;
+        }
+        let items = menu::file_items(paths);
+        self.popup = (!items.is_empty()).then_some(menu::Popup {
+            kind: menu::PopupKind::File,
+            query: query.to_string(),
+            items,
+            cursor: 0,
+        });
     }
 
     /// Enter: submit the composer (or run a slash command / steer a running
@@ -1662,5 +1785,136 @@ mod tests {
         assert_eq!(app.cells[1], Cell::Note("error: boom".into()));
         app.apply(AgentEvent::TurnEnded(EndReason::Completed));
         assert_eq!(app.cells.len(), 2, "completed turns add no note");
+    }
+
+    // --- completion popups (plan 38 slice 4) ---------------------------------
+
+    fn app_with_commands() -> App {
+        let commands = ["help", "cost", "compact", "clear", "exit"]
+            .iter()
+            .map(|n| menu::CommandInfo {
+                name: n.to_string(),
+                description: format!("the {n} command"),
+            })
+            .collect();
+        App::new("s".into()).with_commands(commands)
+    }
+
+    /// Typing `/` then a prefix opens a filtered slash menu; Enter completes the
+    /// highlighted command into the composer (with a trailing space) and closes
+    /// the menu without submitting.
+    #[test]
+    fn slash_menu_opens_filters_and_enter_completes_without_submitting() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/co");
+        let popup = app.popup.as_ref().expect("slash menu open");
+        assert_eq!(popup.kind, menu::PopupKind::Slash);
+        let labels: Vec<&str> = popup.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["/cost", "/compact"]);
+
+        // Down highlights the second, and is captured (no submit, no history).
+        assert_eq!(app.on_key(key(KeyCode::Down)), Command::None);
+        assert_eq!(app.popup.as_ref().unwrap().cursor, 1);
+
+        // Enter completes it into the composer and closes the menu — it does not
+        // start a turn (that is a second Enter).
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert!(app.popup.is_none(), "menu closed after accept");
+        assert_eq!(app.composer.text(), "/compact ");
+        assert!(!app.running, "accept did not submit");
+    }
+
+    /// Esc closes an open menu but leaves the composer text alone (a running
+    /// interrupt / idle clear is the next Esc, once the menu is gone).
+    #[test]
+    fn esc_closes_the_menu_without_clearing_the_composer() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/he");
+        assert!(app.popup.is_some());
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert!(app.popup.is_none());
+        assert_eq!(app.composer.text(), "/he", "composer untouched");
+    }
+
+    /// An unknown `/name` shows no menu, so Enter still runs it (and gets the
+    /// unknown-command reply from the worker).
+    #[test]
+    fn no_menu_for_an_unmatched_slash_prefix() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/zzz");
+        assert!(app.popup.is_none());
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Command::Slash("/zzz".into())
+        );
+    }
+
+    /// The slash menu is suppressed while a turn runs — a `/` line is steering.
+    #[test]
+    fn slash_menu_suppressed_while_running() {
+        let mut app = app_with_commands();
+        app.running = true;
+        type_str(&mut app, "/co");
+        assert!(app.popup.is_none());
+    }
+
+    /// Typing an `@`-token asks the loop to search; feeding results opens a file
+    /// menu, and Enter completes the chosen path (prefix included).
+    #[test]
+    fn at_token_requests_search_then_completes_a_file() {
+        let mut app = app_with_commands();
+        // Each keystroke of the token re-issues the search with the new query.
+        type_str(&mut app, "see @sr");
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('c'))),
+            Command::SearchFiles("src".into())
+        );
+
+        app.set_file_results("src", vec!["src/main.rs".into(), "src/lib.rs".into()]);
+        let popup = app.popup.as_ref().expect("file menu open");
+        assert_eq!(popup.kind, menu::PopupKind::File);
+        assert_eq!(popup.items[0].label, "src/main.rs");
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert!(app.popup.is_none());
+        assert_eq!(app.composer.text(), "see @src/main.rs ");
+    }
+
+    /// A stale search result (the composer moved past the query) is ignored, and
+    /// an empty result closes the menu.
+    #[test]
+    fn file_results_ignore_stale_queries_and_close_on_empty() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "@ab");
+        // Result for an older query the composer no longer shows: ignored.
+        app.set_file_results("a", vec!["a.txt".into()]);
+        assert!(app.popup.is_none(), "stale query ignored");
+        // Matching query but no matches: menu stays closed.
+        app.set_file_results("ab", vec![]);
+        assert!(app.popup.is_none());
+        // Matching query with matches: opens.
+        app.set_file_results("ab", vec!["abc.rs".into()]);
+        assert!(app.popup.is_some());
+    }
+
+    /// While the menu is open, Up/Down drive the cursor instead of the composer's
+    /// history, and a printable key still edits the composer and refilters.
+    #[test]
+    fn menu_captures_navigation_but_typing_still_edits_and_refilters() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/c");
+        assert_eq!(app.popup.as_ref().unwrap().items.len(), 3); // cost, compact, clear
+                                                                // A printable key falls through: edits the composer, refilters the menu.
+        type_str(&mut app, "o");
+        assert_eq!(app.composer.text(), "/co");
+        let labels: Vec<&str> = app
+            .popup
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["/cost", "/compact"]);
     }
 }

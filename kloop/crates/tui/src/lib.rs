@@ -14,6 +14,7 @@ mod clipboard;
 mod composer;
 mod events;
 mod markdown;
+mod menu;
 mod render;
 mod toolrow;
 
@@ -135,9 +136,14 @@ pub async fn run(
     // a session started in a worktree, whose gate shares the mode cell anyway.
     let permissions = cfg.effective_permissions();
 
-    // Snapshot before the worker takes History: a resumed session replays
-    // into the transcript instead of starting on a blank screen.
-    let resumed_cells = app::cells_from_history(history.messages());
+    // Build the UI state before the worker takes History: a resumed session
+    // replays into the transcript, and the `/` menu is seeded with the command
+    // catalog (built-ins then loaded skills/commands — the same set
+    // `commands::run` dispatches, plan 38 slice 4). The `@` menu searches from
+    // the project cwd.
+    let mut app = App::new(session_id).with_commands(slash_catalog(&cfg));
+    app.cells = app::cells_from_history(history.messages());
+    let cwd = cfg.cwd.clone();
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let worker = tokio::spawn(agent_worker(
@@ -156,8 +162,8 @@ pub async fn run(
         msg_tx,
         inbox,
         permissions,
-        session_id,
-        resumed_cells,
+        app,
+        cwd,
     )
     .await;
     restore_terminal();
@@ -170,6 +176,24 @@ pub async fn run(
         eprintln!("{}", note.trim());
     }
     result
+}
+
+/// The slash-menu catalog: the built-in commands, then the loaded skills and
+/// user commands (both `/name`-invocable through `commands::run`). Order matches
+/// what the `/help` and unknown-command listings show.
+fn slash_catalog(cfg: &Config) -> Vec<menu::CommandInfo> {
+    let mut out: Vec<menu::CommandInfo> = kloop_core::commands::BUILTINS
+        .iter()
+        .map(|b| menu::CommandInfo {
+            name: b.name.to_string(),
+            description: b.summary.to_string(),
+        })
+        .collect();
+    out.extend(cfg.skills.iter().map(|s| menu::CommandInfo {
+        name: s.name.clone(),
+        description: s.description.clone(),
+    }));
+    out
 }
 
 /// Owns History for its whole lifetime and runs turns strictly one at a time;
@@ -472,14 +496,12 @@ async fn ui_loop(
     msgs: mpsc::UnboundedSender<WorkerMsg>,
     inbox: Arc<Inbox>,
     permissions: Arc<kloop_core::permissions::Permissions>,
-    session_id: String,
-    resumed_cells: Vec<app::Cell>,
+    mut app: App,
+    cwd: std::path::PathBuf,
 ) -> Result<()> {
-    let mut app = App::new(session_id);
-    // A resumed session's cells start as the tail and scroll into scrollback as
-    // they overflow, exactly like live output.
-    app.cells = resumed_cells;
-    // Seed the status-bar badge from the real starting mode (e.g. plan).
+    // Seed the status-bar badge from the real starting mode (e.g. plan). The
+    // App is built in `run` (transcript replay + `/` menu catalog); a resumed
+    // session's cells start as the tail and scroll into scrollback on overflow.
     app.mode = permissions.mode();
 
     // Keys arrive from a dedicated poll thread, not crossterm's EventStream, so
@@ -499,7 +521,7 @@ async fn ui_loop(
         if let Err(e) = terminal.autoresize() {
             break Err(e.into());
         }
-        if app.confirms.is_empty() && app.fork_picker.is_none() {
+        if app.confirms.is_empty() && app.fork_picker.is_none() && app.popup.is_none() {
             if let Err(e) = commit_overflow(terminal, &mut app) {
                 break Err(e);
             }
@@ -562,6 +584,24 @@ async fn ui_loop(
                                 Ok((label, block)) => app.attach_image(label, block),
                                 Err(e) => app.apply(AgentEvent::Note(e)),
                             }
+                        }
+                        Command::SearchFiles(query) => {
+                            // Walk the tree off-thread (the `@` menu's I/O) and
+                            // feed matches back. Awaited inline: the composer
+                            // hasn't changed by the time results land, so the
+                            // menu shows before the next draw with no stale race.
+                            let root = cwd.clone();
+                            let q = query.clone();
+                            let paths = tokio::task::spawn_blocking(move || {
+                                kloop_core::fs_complete::complete_files(
+                                    &root,
+                                    &q,
+                                    menu::FILE_MENU_MAX,
+                                )
+                            })
+                            .await
+                            .unwrap_or_default();
+                            app.set_file_results(&query, paths);
                         }
                         Command::Quit => break Ok(()),
                         Command::None => {}

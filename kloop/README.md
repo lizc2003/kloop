@@ -335,6 +335,19 @@ attaches too. The image shows on a `📎` line above the composer and rides the
 turn (reusing the `--image` ingestion — `crates/tui/src/clipboard.rs` via
 `arboard`), merged with any startup `--image` blocks.
 
+Typing a **`/`** at the start of the line or a **`@`** anywhere opens a
+**completion menu** (plan 38 slice 4, `crates/tui/src/menu.rs`) that floats just
+above the composer: `/` filters the slash-command catalog (built-ins plus loaded
+skills and user commands — the same set `commands::run` dispatches), and `@`
+lists files, searched from the project cwd off-thread with the same `ignore`
+crate the `grep`/`glob` tools use (`kloop_core::fs_complete`, so it honors
+.gitignore and skips VCS dirs). **↑/↓** move the selection, **Tab / Enter**
+complete the highlighted entry into the composer (Enter completes rather than
+submits while the menu is open), **Esc** dismisses it, and every other key edits
+the query and re-filters. At most one menu is open at a time, and a pending
+approval prompt or rewind picker takes precedence. The slash menu is suppressed
+while a turn runs (a `/` line is then steering text).
+
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a
 long history scrolls straight into native scrollback, so a resumed session

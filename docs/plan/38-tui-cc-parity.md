@@ -193,7 +193,7 @@ gutter 视觉语言统一 `● › │ └`,左槽宽度常量对齐。连续 re
   - **原生 Windows**:预期零改动可用——`clipboard.rs` 无任何 `cfg`/`target_os`/macOS 专属调用,arboard 的 Windows backend `get_image`(CF_DIB→RGBA)+`file_list`(CF_HDROP)公开 API 未被 cfg 掉,arboard 声明的 `cfg(windows)` `windows-sys` 依赖已进 Cargo.lock(lock 跨 target)。**只差在真 Windows/CI 跑一次销账**(本机 macOS 跑不了)。
   - **WSL**:是缺口——WSL 里 arboard 看到的是 WSL Linux 剪贴板非 Windows 的,Ctrl+V 抓不到图,当前**优雅降级**为 `[no image on the clipboard: …]` Note(不崩)。codex `clipboard_paste.rs` 有 PowerShell 兜底(`cfg(target_os="linux")` + WSL 探测 + shell 出去 `powershell.exe` dump 剪贴板图到临时文件 + Windows→WSL 路径转换),**待用户确认是否需要 WSL 再移植**(本机 macOS 验不了,需 WSL 环境真跑)。
 
-### 切片 4 — 斜杠命令菜单 + @文件补全
+### 切片 4 — 斜杠命令菜单 + @文件补全 ✅ 完成(2026-07-17)
 
 输入 `/` 弹命令候选菜单(名 + 描述,`Tab`/`Enter` 补全,来源 `commands::` + skills);
 `@` 弹文件选择器(后台异步文件搜索,尊重 .gitignore,复用 plan 14 的 ignore 族)。通用
@@ -201,6 +201,16 @@ gutter 视觉语言统一 `● › │ └`,左槽宽度常量对齐。连续 re
 选中行 `accent`(cyan bold)整行上色,两列自适应,数字键快选,可滚动)。同一时刻至多一个 popup。
 
 - 验收:`/` 菜单选/补全、`@` 文件选中插入、菜单键不漏给 composer。
+
+**完成记录(2026-07-17)**:
+- **触发检测(纯)`crates/tui/src/menu.rs`**:`detect_trigger(text, cursor, allow_slash)` 取「光标处回扫到空白」的当前 token——`/` 前缀且 token 在**输入首位**(整行开头才是命令)→ `Slash(query)`,`@` 前缀(**任意位置**,mid-line 文件提及)→ `File(query)`;`allow_slash=!running`(turn 运行时 `/` 是 steering 文本,菜单压制)。`slash_items` 按名字**前缀**(大小写不敏感)过滤目录序(built-ins 先),空匹配 → 不弹(未知 `/name` 仍照旧跑 + 报错)。`Popup{kind,query,items,cursor}`(move_up/down 钳制、selected)。
+- **文件搜索(IO,core)`crates/core/src/fs_complete.rs`**:`complete_files(root, query, cap)` 复用 `ignore::WalkBuilder`(honor .gitignore、含隐藏文件、`filter_entry` 跳 `.git/.hg/.svn/.jj`),按相对路径打分排序——basename 前缀(0)> basename 子串(1)> 路径子串(2)> 散列子序列(3),再按路径长度(浅优先)+字典序;只出文件(目录仍下钻),`SCAN_CAP=4000` 访问上限防大树卡键、`cap=50` 出参。放 core 因 `ignore` 依赖已在此,TUI 不必新引。
+- **App 接线 `app.rs`**:`popup: Option<menu::Popup>` + `commands`(启动播种);`on_key` 顶部(confirm/fork 之后)插 popup 捕获——`↑↓`/`Ctrl+P/N` 移光标、`Tab/Enter` **accept(补全不提交)**、`Esc` 关菜单(不清 composer、不 interrupt),**其它键放行**去编辑 composer 再走 `after_edit` 重算菜单;`Command::SearchFiles(String)` 让 loop 去搜(App 保持纯,不碰 IO,与 clipboard 同款);`set_file_results(query, paths)` 带**陈旧守卫**(composer 已变则忽略、空结果关菜单)。`accept_popup` 用 composer 新增 `replace_token`(回扫替换当前 token + 尾空格,前缀随 item.insert)。
+- **渲染 `render.rs`**:`menu_lines`(纯,选中行整行 `REVERSED`——主题安全,同 fork picker;非选中行 label 常规 + detail dim,窗口到 `MENU_ROWS=8` 环绕光标)+ `draw_menu`(浮在 composer 上规则正上方、`Clear` 叠加,向上生长最相关行贴近输入);footer 开菜单时切「↑↓ choose · Tab/⏎ complete · Esc cancel」。`commit_overflow` 开菜单时跳过(同 confirm/fork,别在浮层下滚屏)。
+- **lib.rs**:`slash_catalog(cfg)`(BUILTINS + skills/commands)+ cwd 传入;`Command::SearchFiles` 用 `spawn_blocking` 跑 `fs_complete`(await 内联,composer 未变,菜单本帧即显、无竞态);App 改在 `run()` 建好(带 catalog + resumed cells)传入 `ui_loop`(压参数,避 too_many_args)。
+- **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 105 测试:menu 触发/过滤/钳制、composer replace_token、app slash 开/过滤/Down+Tab 补全/Esc 关/未匹配不弹/running 压制/@ 请求搜索+补全/陈旧守卫/键不漏、render menu_lines 高亮+窗口 + draw 浮层在 composer 上;core fs_complete 4 测试)。真 key **双轨** PTY+pyte(CPR 驱动模拟应答、TIOCSWINSZ 置窗)：anthropic + openai 各 5/5(`/co`→菜单列 `/cost`+`/compact`+描述 / ↑↓+Tab 补 `/compact` 且关菜单 / `@src`→列 `crates/*/src/*.rs` / Enter 补 `@crates/cli/src/ui.rs` / 箭头键不漏进 composer)。**菜单纯本地(无模型调用)**,双轨只为确认 TUI 在两 provider 配置下都构建+渲染。
+- 未做(记为可能性):数字键快选(与打字查询的数字冲突,故略)、`@` 补目录下钻、模糊高亮片段、搜索防抖(现每键一搜,本地有界够快)、`@file` 在普通消息里自动内联内容(仅命令体 `expand_slash_injections` 展开,菜单只助打字)。
+- 教训沉淀:HANDOFF 教训 43(补全菜单的纯/IO 分层 + PTY 需 TIOCSWINSZ 否则 inline viewport 塌成默认高)。
 
 ### 切片 5 — 动画状态行 + HUD + 按需渲染
 

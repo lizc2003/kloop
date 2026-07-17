@@ -100,6 +100,12 @@ impl Composer {
         self.text.trim().is_empty() && self.images.is_empty()
     }
 
+    /// The cursor's char index into [`text`](Self::text), for the completion
+    /// menu's trigger detection ([`crate::menu::detect_trigger`]).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// Display labels of attached images, for the attachment line.
     pub fn attachments(&self) -> &[String] {
         &self.labels
@@ -145,6 +151,28 @@ impl Composer {
         let at = byte_index(&self.text, self.cursor);
         self.text.insert_str(at, s);
         self.cursor += s.chars().count();
+        self.goal_col = None;
+    }
+
+    /// Replace the current whitespace-delimited token (the run of non-space
+    /// chars ending at the cursor) with `replacement` plus a trailing space, and
+    /// put the cursor after it. Used by the completion menu to insert a chosen
+    /// command or file path; the replacement includes its `/`/`@` prefix, so the
+    /// typed trigger is overwritten in place. A completed token is ordinary text,
+    /// so pastes and history are left untouched.
+    pub fn replace_token(&mut self, replacement: &str) {
+        self.begin_edit();
+        let chars: Vec<char> = self.text.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let mut start = cursor;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let start_b = byte_index(&self.text, start);
+        let end_b = byte_index(&self.text, cursor);
+        let insert = format!("{replacement} ");
+        self.text.replace_range(start_b..end_b, &insert);
+        self.cursor = start + insert.chars().count();
         self.goal_col = None;
     }
 
@@ -639,6 +667,26 @@ mod tests {
         let v = c.view(40);
         assert_eq!(v.rows.len(), MAX_ROWS);
         assert_eq!(v.cursor_row, (MAX_ROWS - 1) as u16);
+    }
+
+    #[test]
+    fn replace_token_swaps_the_current_word_and_trails_a_space() {
+        // Slash completion: the whole `/co` token becomes `/compact `.
+        let mut c = typed("/co");
+        c.replace_token("/compact");
+        assert_eq!(c.text(), "/compact ");
+        assert_eq!(c.cursor(), 9);
+
+        // File completion mid-line: only the `@` token is replaced.
+        let mut c = typed("review @src/ma");
+        c.replace_token("@src/main.rs");
+        assert_eq!(c.text(), "review @src/main.rs ");
+
+        // Cursor mid-token replaces only up to the cursor (the suffix stays).
+        let mut c = typed("@src/main");
+        c.left(); // cursor before the trailing 'n'... actually after "@src/mai"
+        c.replace_token("@src/lib");
+        assert_eq!(c.text(), "@src/lib n");
     }
 
     #[test]
