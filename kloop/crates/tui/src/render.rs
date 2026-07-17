@@ -279,7 +279,10 @@ pub fn status_line(app: &App) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [transcript_area, status_area, input_area] = Layout::vertical([
+    // Composer sits directly under the transcript; the status/mode line is the
+    // very bottom row (CC's footer order — the mode indicator lives below the
+    // input, not above it).
+    let [transcript_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
