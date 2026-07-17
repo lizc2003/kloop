@@ -128,7 +128,9 @@ pub struct App {
     /// so a diff taller than the popup can be read in full. Reset to 0 when the
     /// front prompt changes; clamped to a valid range at render time.
     pub confirm_scroll: usize,
-    /// Latest agent note, surfaced in the status line while running.
+    /// Latest agent activity (note / tool / sub-agent / todo). No longer churned
+    /// into the status line — activity shows in the transcript. Kept as recent
+    /// state for the animated status HUD (plan 38 slice 5).
     pub last_note: Option<String>,
     /// Whether the last Assistant cell still accepts text deltas. A tool row,
     /// note, or thinking cell in between closes it so ordering is preserved.

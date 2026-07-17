@@ -269,8 +269,9 @@ pub fn status_line(app: &App) -> String {
         return format!("{mode}awaiting approval");
     }
     if app.running {
-        let note = app.last_note.as_deref().unwrap_or("");
-        return format!("{mode}working… {note}  (Ctrl+C to interrupt)");
+        // Stable while a turn runs — per-event activity (tool rows, notes,
+        // thinking) shows in the transcript, not by churning the status bar.
+        return format!("{mode}working… (Ctrl+C to interrupt)");
     }
     format!(
         "{mode}session {} — shift+Tab to change mode · Ctrl+R to rewind · Ctrl+D to quit",
