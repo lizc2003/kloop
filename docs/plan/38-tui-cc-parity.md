@@ -287,7 +287,7 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 切片 6 拆出的独立高亮小片(关键决定 2 定库 `synoptic`)。markdown fenced 代码块按语言
 `synoptic::from_extension` 逐行 tokenize,token kind → styles.md 安全配色叠在 `CODE_BG` 上。
 
-**完成记录(2026-07-17,提交 <PENDING>)**:
+**完成记录(2026-07-17,提交 3de88bf)**:
 - 依赖:`synoptic 2.2.9`(纯 Rust,主依赖 `regex`/`char_index`/`if_chain`/`nohash-hasher`,无 C 编译)。
 - `markdown.rs`:`Renderer` 加 `code_lang`(fenced info 串),`Tag::CodeBlock(kind)` 抓 `CodeBlockKind::Fenced(info)`。
   `flush_code` 改走 `highlight_code(body, lang)`——`lang_to_ext` 把 `rust`/`py`/`c++`/`bash,ignore`/`TypeScript` 等
