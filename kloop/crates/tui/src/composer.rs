@@ -32,9 +32,19 @@ const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// A large paste held out of the visible text: its placeholder shows in the
 /// composer, and submit expands the placeholder back to `content`.
+#[derive(Clone)]
 struct Paste {
     placeholder: String,
     content: String,
+}
+
+/// One recallable history entry: the compact display text plus the pastes its
+/// placeholders expand to. Recall restores both, so re-submitting a recalled
+/// entry re-expands the paste instead of sending the literal `[Pasted …]`.
+#[derive(Clone)]
+struct HistoryEntry {
+    text: String,
+    pastes: Vec<Paste>,
 }
 
 /// The composer's rendered layout for one width: the visible rows (already
@@ -57,11 +67,13 @@ pub struct Composer {
     text: String,
     cursor: usize,
     /// Submitted entries, oldest first, for Up/Down recall.
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
     /// Which history entry is being viewed (None = editing the live draft).
     hist: Option<usize>,
-    /// The live draft saved while browsing history, restored on the way back.
+    /// The live draft saved while browsing history, restored on the way back
+    /// (with its own pastes, so a drafted-then-shelved paste survives a browse).
     draft: String,
+    draft_pastes: Vec<Paste>,
     /// Stashed large pastes, expanded into the text at submit.
     pastes: Vec<Paste>,
     /// Attached images (built by the event loop from pasted paths) and their
@@ -81,6 +93,7 @@ impl Composer {
             history: Vec::new(),
             hist: None,
             draft: String::new(),
+            draft_pastes: Vec::new(),
             pastes: Vec::new(),
             images: Vec::new(),
             labels: Vec::new(),
@@ -256,6 +269,7 @@ impl Composer {
         let idx = match self.hist {
             None => {
                 self.draft = self.text.clone();
+                self.draft_pastes = self.pastes.clone();
                 self.history.len() - 1
             }
             Some(0) => return,
@@ -269,9 +283,10 @@ impl Composer {
             None => {}
             Some(i) if i + 1 < self.history.len() => self.load_history(i + 1),
             Some(_) => {
-                // Past the newest entry: back to the live draft.
+                // Past the newest entry: back to the live draft (and its pastes).
                 self.hist = None;
                 self.text = std::mem::take(&mut self.draft);
+                self.pastes = std::mem::take(&mut self.draft_pastes);
                 self.cursor = self.char_count();
                 self.goal_col = None;
             }
@@ -280,7 +295,9 @@ impl Composer {
 
     fn load_history(&mut self, idx: usize) {
         self.hist = Some(idx);
-        self.text = self.history[idx].clone();
+        self.text = self.history[idx].text.clone();
+        // Restore the entry's pastes so a re-submit re-expands its placeholders.
+        self.pastes = self.history[idx].pastes.clone();
         self.cursor = self.char_count();
         self.goal_col = None;
     }
@@ -321,18 +338,25 @@ impl Composer {
     /// of [`submit`] and [`submit_text`].
     fn take_text(&mut self) -> String {
         let display = std::mem::take(&mut self.text);
+        let entry_pastes = std::mem::take(&mut self.pastes);
         let mut text = display.clone();
-        for p in self.pastes.drain(..) {
+        for p in &entry_pastes {
             text = text.replace(&p.placeholder, &p.content);
         }
         // History keeps the compact display form (placeholders), like the user
-        // saw it; a blank line (image-only submit) is not worth recalling.
-        if !display.trim().is_empty() && self.history.last() != Some(&display) {
-            self.history.push(display);
+        // saw it, plus the pastes it expands to — so recalling and re-submitting
+        // re-expands rather than sending the literal placeholder. A blank line
+        // (image-only submit) is not worth recalling.
+        if !display.trim().is_empty() && self.history.last().map(|e| &e.text) != Some(&display) {
+            self.history.push(HistoryEntry {
+                text: display,
+                pastes: entry_pastes,
+            });
         }
         self.cursor = 0;
         self.hist = None;
         self.draft.clear();
+        self.draft_pastes.clear();
         self.goal_col = None;
         text
     }
@@ -606,6 +630,42 @@ mod tests {
         // History keeps the compact form.
         c.up();
         assert_eq!(c.text(), "see: [Pasted #1: 500 chars]");
+    }
+
+    /// Recalling a history entry that carried a large paste and re-submitting it
+    /// re-expands the paste — the model gets the pasted content, not the literal
+    /// `[Pasted …]` placeholder. Regression: submit dropped the paste mapping, so
+    /// a recalled entry re-sent the placeholder text verbatim.
+    #[test]
+    fn recalled_paste_re_expands_on_resubmit() {
+        let mut c = typed("see: ");
+        let big = "x".repeat(500);
+        c.paste(&big);
+        assert_eq!(c.submit().unwrap().text, format!("see: {big}"));
+        // Recall the entry (shows the compact placeholder) and re-submit it.
+        c.up();
+        assert_eq!(c.text(), "see: [Pasted #1: 500 chars]");
+        let sub = c.submit().unwrap();
+        assert_eq!(
+            sub.text,
+            format!("see: {big}"),
+            "resend must re-expand, not send the placeholder"
+        );
+    }
+
+    /// A large paste shelved into the draft (by browsing history away and back)
+    /// survives with its content, so submitting the restored draft still expands.
+    #[test]
+    fn drafted_paste_survives_a_history_browse() {
+        let mut c = typed("first");
+        c.submit(); // seed one history entry
+        let big = "y".repeat(500);
+        c.paste(&big); // draft now holds a paste placeholder
+        c.up(); // browse to "first" (draft with the paste is stashed)
+        assert_eq!(c.text(), "first");
+        c.down(); // back to the draft
+        let sub = c.submit().unwrap();
+        assert_eq!(sub.text, big, "the shelved draft paste still expands");
     }
 
     #[test]
