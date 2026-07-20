@@ -134,6 +134,17 @@ reverse request `approval/request {threadId, turnId, itemId, kind:"command"|"fil
 
 fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-start/turn-start/item 事件序列/审批往返/interrupt/坏 JSON 不崩);`--mock app-server` 管道冒烟;真 key 冒烟(单 thread 发消息→item 流→工具→审批→completed)。
 
+### 3.8 切片 1 开工备注(承 slice 0,拍板见对话 2026-07-20)
+
+**旧 wire 连根删,不并存不兼容**——slice 0 为把现有测试当回归网,让 server/headless 的 `emit` 把 `Event` 翻回旧通知(`text/delta`/`tool/started{callId,name,summary}`/`tool/completed`/`agent/*`/`todo/updated`/`note`/`thread/worktree`,无 `jsonrpc` 字段的旧信封)。这些是**临时脚手架**,slice 1 全部删掉:
+
+1. **server `ThreadUi::emit`**:整段"翻回旧通知"删掉,改成把 `Event` 序列化成新 wire(标准 JSON-RPC 2.0 信封 + §3.4 的 item 事件投影)。`handle_request` 方法名接线随之重写。
+2. **headless `--json`(`cli/src/headless.rs` `JsonUi`)一起换到新 item 词汇**——它现在是"复用 server 旧形状",旧 wire 一删就别让旧形状残留在这条路径上(保持"一套词汇,两前端")。
+3. **`todo_write` 去双发**:现在 core 对 todo_write 既发 `ItemStarted/Completed{ToolCall}` 又发 `ItemCompleted{Todo}`,导致每个前端都写 `if name=="todo_write" { skip }`(TUI `apply_core`、`StdoutUi`;server/headless 则两个都发)。slice 1 让 **core 只发 `Todo` item、不发 todo_write 的 ToolCall**,把各前端的 skip 特判全删掉。
+4. **item id turn-unique**:slice 0 的 assistant/reasoning id 是 per-round 的 `msg-N`/`reasoning-N`(会跨 round 复位),slice 1 改成 turn 内唯一(见 §五.7)。
+5. **turn 括号是否走 emit(开放设计点)**:slice 0 的 TurnStarted/Usage/TurnEnded 由各前端 worker 在 `run_turn` 前后自造、不走 `emit` 缝(命令路径不跑 run_turn 也要括号,故 worker 自造更稳)。slice 1 定新 wire 时再判要不要让 core 统一发这三个走 emit、把"各前端自造"收敛掉——留意命令路径的括号来源。
+6. **`as_note` / `tool_summary` 去留**:新 wire 送完整 `Item`(含全 input),`summary` 字段大概率不再上 wire;但 `Event::as_note()`+`tool_summary()` 仍是 plain/headless-text 前端的 note 降级所需,保留(它们不是 wire 包袱,是行内 UI 的真实需求)。
+
 ## 四、切片规划(0 → N)
 
 | 切片 | 内容 | 验证 |
