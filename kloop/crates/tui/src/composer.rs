@@ -298,6 +298,28 @@ impl Composer {
         if self.is_blank() {
             return None;
         }
+        let text = self.take_text();
+        let images = std::mem::take(&mut self.images);
+        self.labels.clear();
+        Some(Submission { text, images })
+    }
+
+    /// Take only the text (expanding pastes, recording history, clearing the
+    /// input) and LEAVE attached images on the composer. Used while a turn is
+    /// running: the text steers the turn, but a steer has no image channel, so
+    /// images wait for the next fresh turn instead of being stranded. Returns
+    /// None when there is no text to steer (e.g. only an image is attached).
+    pub fn submit_text(&mut self) -> Option<String> {
+        if self.text.trim().is_empty() {
+            return None;
+        }
+        Some(self.take_text())
+    }
+
+    /// Expand pastes into the text, record the compact display form to history,
+    /// and clear the text line + cursor state (but not images). The shared core
+    /// of [`submit`] and [`submit_text`].
+    fn take_text(&mut self) -> String {
         let display = std::mem::take(&mut self.text);
         let mut text = display.clone();
         for p in self.pastes.drain(..) {
@@ -308,13 +330,11 @@ impl Composer {
         if !display.trim().is_empty() && self.history.last() != Some(&display) {
             self.history.push(display);
         }
-        let images = std::mem::take(&mut self.images);
-        self.labels.clear();
         self.cursor = 0;
         self.hist = None;
         self.draft.clear();
         self.goal_col = None;
-        Some(Submission { text, images })
+        text
     }
 
     /// Clear the composer (Esc when idle) without touching history.
@@ -613,6 +633,46 @@ mod tests {
         assert_eq!(sub.text, "");
         assert_eq!(sub.images, vec![block]);
         assert!(c.attachments().is_empty(), "cleared after submit");
+    }
+
+    /// `submit_text` (the steering path) takes only the text and leaves the
+    /// image attached, so it rides the next fresh turn instead of being dropped.
+    #[test]
+    fn submit_text_steers_text_and_keeps_the_image() {
+        let mut c = Composer::new();
+        let block = ContentBlock::Image {
+            source: kloop_protocol::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
+        };
+        c.attach_image("shot.png".into(), block.clone());
+        for ch in "keep going".chars() {
+            c.insert_char(ch);
+        }
+        assert_eq!(c.submit_text().as_deref(), Some("keep going"));
+        assert_eq!(c.text(), "");
+        assert_eq!(c.attachments(), &["shot.png".to_string()], "image kept");
+        // A later real submit still carries the image.
+        assert_eq!(c.submit().unwrap().images, vec![block]);
+    }
+
+    /// An image-only steer has no text to send, so `submit_text` is a no-op that
+    /// keeps the image attached (rather than steering an empty string).
+    #[test]
+    fn submit_text_is_none_for_image_only() {
+        let mut c = Composer::new();
+        c.attach_image(
+            "a.png".into(),
+            ContentBlock::Image {
+                source: kloop_protocol::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            },
+        );
+        assert!(c.submit_text().is_none());
+        assert_eq!(c.attachments(), &["a.png".to_string()], "image kept");
     }
 
     #[test]

@@ -754,6 +754,21 @@ impl App {
             self.running = true;
             return Command::Slash(display);
         }
+        if self.running {
+            // Steering: only the text rides the running turn (absorbed at its
+            // next round boundary). Attached images stay on the composer for the
+            // next FRESH turn — a steer has no image channel, so taking them here
+            // (and showing a `[image: …]` cell) would drop them silently. An
+            // image-only Enter has nothing to steer, so it is a no-op that leaves
+            // the image attached. No new turn / todo reset.
+            return match self.composer.submit_text() {
+                Some(text) => {
+                    self.cells.push(Cell::User(display));
+                    Command::Steer(text)
+                }
+                None => Command::None,
+            };
+        }
         let labels = self.composer.attachments().to_vec();
         let sub = self.composer.submit().expect("checked not blank");
         self.submit_images = sub.images;
@@ -763,11 +778,6 @@ impl App {
         // Each attached image replays as a placeholder line, like a resumed one.
         for label in &labels {
             self.cells.push(Cell::User(format!("[image: {label}]")));
-        }
-        if self.running {
-            // Steering: the running turn absorbs the text at its next round
-            // boundary (images ride a fresh turn only). No new turn / todo reset.
-            return Command::Steer(sub.text);
         }
         self.todo_cell = None;
         self.running = true;
@@ -1382,6 +1392,49 @@ mod tests {
         assert_eq!(app.composer.text(), "");
         assert_eq!(app.todo_cell, Some(0), "a steer keeps the live todo block");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
+    }
+
+    /// Steering with an image attached: only the text steers the running turn;
+    /// the image is NOT sent and NOT shown as an `[image: …]` cell, but stays on
+    /// the composer so the next fresh turn carries it. Regression — the image
+    /// used to be stranded in submit_images (never delivered) while a misleading
+    /// placeholder cell claimed it rode the turn.
+    #[test]
+    fn steering_keeps_the_image_for_the_next_fresh_turn() {
+        let block = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
+        };
+        let mut app = App::new("s".into());
+        app.running = true;
+        app.attach_image("shot.png".into(), block.clone());
+        type_str(&mut app, "keep going");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Command::Steer("keep going".into())
+        );
+        // No [image:] cell, and the steer carries no image.
+        assert_eq!(app.cells, vec![Cell::User("keep going".into())]);
+        assert!(app.take_submit_images().is_empty(), "steer sends no image");
+        assert_eq!(
+            app.composer.attachments(),
+            &["shot.png".to_string()],
+            "image kept for a fresh turn"
+        );
+
+        // The turn ends; a fresh Enter now delivers the still-attached image.
+        app.running = false;
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Command::Submit(String::new())
+        );
+        assert_eq!(
+            app.take_submit_images(),
+            vec![block],
+            "the fresh turn carries the image"
+        );
     }
 
     /// An idle slash line routes to the worker as Command::Slash and marks the
