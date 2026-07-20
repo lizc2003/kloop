@@ -46,6 +46,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::Ui;
 use crate::config::Config;
+use crate::event::Event;
+use crate::event::Item;
+use crate::event::ItemStatus;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 use kloop_protocol::ToolResultContent;
@@ -574,9 +577,16 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 }
 
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
-    let summary: String = input.to_string().chars().take(120).collect();
-    ctx.ui
-        .tool_start(&ctx.cfg.agent_label, &id, &name, &summary, &input);
+    ctx.ui.emit(&Event::ItemStarted {
+        id: id.clone(),
+        item: Item::ToolCall {
+            agent: ctx.cfg.agent_label.clone(),
+            name: name.clone(),
+            input: input.clone(),
+            status: ItemStatus::InProgress,
+            output: None,
+        },
+    });
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -673,8 +683,20 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     // output would otherwise be cloned onto the event channel wholesale. The UI
     // truncates further for display.
     let output: String = content.as_text().chars().take(4000).collect();
-    ctx.ui
-        .tool_end(&ctx.cfg.agent_label, tool_use_id, !is_error, &output);
+    ctx.ui.emit(&Event::ItemCompleted {
+        id: tool_use_id.clone(),
+        item: Item::ToolCall {
+            agent: ctx.cfg.agent_label.clone(),
+            name: name.clone(),
+            input: input.clone(),
+            status: if *is_error {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Completed
+            },
+            output: (!output.is_empty()).then_some(output),
+        },
+    });
     result
 }
 
@@ -782,8 +804,7 @@ pub(crate) mod testutil {
 
     pub(crate) struct SilentUi;
     impl Ui for SilentUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, _: &str) {}
+        fn emit(&self, _: &Event) {}
     }
 
     pub(crate) fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
@@ -1369,8 +1390,7 @@ mod tests {
 
         struct NullUi;
         impl Ui for NullUi {
-            fn text_delta(&self, _: &str) {}
-            fn note(&self, _: &str) {}
+            fn emit(&self, _: &Event) {}
         }
 
         let cancel = CancellationToken::new();

@@ -1,4 +1,6 @@
 use super::*;
+use crate::event::Delta;
+use crate::event::Item;
 use crate::inbox::InboxItem;
 use crate::inbox::STEERING_PREFIX;
 use kloop_protocol::Role;
@@ -7,8 +9,7 @@ use serde_json::json;
 
 struct NullUi;
 impl Ui for NullUi {
-    fn text_delta(&self, _: &str) {}
-    fn note(&self, _: &str) {}
+    fn emit(&self, _: &Event) {}
 }
 
 fn tool_use(id: &str, cmd: &str) -> ContentBlock {
@@ -432,9 +433,10 @@ async fn fallback_model_takes_over_after_retries() {
     use kloop_provider::MockTurn;
     struct NoteUi(std::sync::Mutex<Vec<String>>);
     impl Ui for NoteUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, s: &str) {
-            self.0.lock().unwrap().push(s.to_string());
+        fn emit(&self, ev: &Event) {
+            if let Event::Note(s) = ev {
+                self.0.lock().unwrap().push(s.to_string());
+            }
         }
     }
 
@@ -1254,13 +1256,19 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
         text: std::sync::Mutex<String>,
     }
     impl Ui for SplitUi {
-        fn text_delta(&self, s: &str) {
-            self.text.lock().unwrap().push_str(s);
+        fn emit(&self, ev: &Event) {
+            match ev {
+                Event::ItemDelta {
+                    delta: Delta::Text(s),
+                    ..
+                } => self.text.lock().unwrap().push_str(s),
+                Event::ItemDelta {
+                    delta: Delta::Reasoning(s),
+                    ..
+                } => self.thinking.lock().unwrap().push_str(s),
+                _ => {}
+            }
         }
-        fn thinking_delta(&self, s: &str) {
-            self.thinking.lock().unwrap().push_str(s);
-        }
-        fn note(&self, _: &str) {}
     }
 
     let blocks = vec![
@@ -1348,10 +1356,15 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
         fired: AtomicBool,
     }
     impl Ui for SteerOnToolUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, _: &str) {}
-        fn tool_start(&self, _: &str, _: &str, _: &str, _: &str, _: &serde_json::Value) {
-            if !self.fired.swap(true, Ordering::SeqCst) {
+        fn emit(&self, ev: &Event) {
+            if matches!(
+                ev,
+                Event::ItemStarted {
+                    item: Item::ToolCall { .. },
+                    ..
+                }
+            ) && !self.fired.swap(true, Ordering::SeqCst)
+            {
                 self.inbox
                     .push(InboxItem::Steer("also check the logs".into()));
             }
@@ -1407,12 +1420,18 @@ async fn late_steering_keeps_the_turn_going() {
         fired: AtomicBool,
     }
     impl Ui for SteerOnTextUi {
-        fn text_delta(&self, _: &str) {
-            if !self.fired.swap(true, Ordering::SeqCst) {
+        fn emit(&self, ev: &Event) {
+            if matches!(
+                ev,
+                Event::ItemDelta {
+                    delta: Delta::Text(_),
+                    ..
+                }
+            ) && !self.fired.swap(true, Ordering::SeqCst)
+            {
                 self.inbox.push(InboxItem::Steer("wait, also do Y".into()));
             }
         }
-        fn note(&self, _: &str) {}
     }
 
     let provider = Provider::mock_scripted(vec![
@@ -1458,11 +1477,15 @@ async fn subagent_does_not_drain_parent_steering() {
         fired: AtomicBool,
     }
     impl Ui for SteerParentUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, _: &str) {}
-        fn tool_start(&self, agent: &str, _: &str, _: &str, _: &str, _: &serde_json::Value) {
-            if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
-                self.inbox.push(InboxItem::Steer("parent steer".into()));
+        fn emit(&self, ev: &Event) {
+            if let Event::ItemStarted {
+                item: Item::ToolCall { agent, .. },
+                ..
+            } = ev
+            {
+                if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
+                    self.inbox.push(InboxItem::Steer("parent steer".into()));
+                }
             }
         }
     }

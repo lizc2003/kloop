@@ -16,6 +16,9 @@ use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
 use crate::agent_type::AgentType;
 use crate::config::Config;
+use crate::event::Event;
+use crate::event::Item;
+use crate::event::ItemStatus;
 use crate::history::History;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
@@ -129,6 +132,36 @@ fn next_agent_label() -> String {
     format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+/// A sub-agent began working on `task`; its item id is its label. Shared with
+/// the codemode program runner, whose background agent has the same lifecycle.
+pub(super) fn emit_agent_start(ui: &Arc<dyn crate::agent::Ui>, label: &str, task: &str) {
+    ui.emit(&Event::ItemStarted {
+        id: label.to_string(),
+        item: Item::SubAgent {
+            label: label.to_string(),
+            task: task.to_string(),
+            status: ItemStatus::InProgress,
+        },
+    });
+}
+
+/// A sub-agent finished. The completed item drops the task text — no front-end
+/// reads it at completion (a UI resolves the row it opened by label).
+pub(super) fn emit_agent_end(ui: &Arc<dyn crate::agent::Ui>, label: &str, ok: bool) {
+    ui.emit(&Event::ItemCompleted {
+        id: label.to_string(),
+        item: Item::SubAgent {
+            label: label.to_string(),
+            task: String::new(),
+            status: if ok {
+                ItemStatus::Completed
+            } else {
+                ItemStatus::Failed
+            },
+        },
+    });
+}
+
 /// Run a sub-agent synchronously and map its outcome to a tool result. The
 /// sub-agent runs as its OWN tokio task — besides matching the semantics, this
 /// breaks the recursion cycle (execute_tool -> run_turn -> dispatch_tools ->
@@ -149,7 +182,7 @@ async fn run_sub_agent_sync(
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
-    ui.agent_start(&agent, &preview);
+    emit_agent_start(&ui, &agent, &preview);
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -166,7 +199,7 @@ async fn run_sub_agent_sync(
             if let Some(wt) = worktree {
                 worktree::finish(wt).await;
             }
-            ui.agent_end(&agent, false);
+            emit_agent_end(&ui, &agent, false);
             return Err(anyhow!("{who}: sub-agent panicked: {e}"));
         }
     };
@@ -189,7 +222,7 @@ async fn run_sub_agent_sync(
             }
         }
     }
-    ui.agent_end(&agent, result.is_ok());
+    emit_agent_end(&ui, &agent, result.is_ok());
     result
 }
 
@@ -262,7 +295,7 @@ async fn spawn_background(
     let background_tasks = ctx.cfg.background_tasks.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
-    ui.agent_start(&agent, preview);
+    emit_agent_start(&ui, &agent, preview);
     tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -292,7 +325,8 @@ async fn spawn_background(
                 // full deadline.
                 None => parent_inbox.notify_activity(),
             }
-            ui.agent_end(
+            emit_agent_end(
+                &ui,
                 &label,
                 matches!(status, TaskStatus::Completed | TaskStatus::MaxRounds),
             );
@@ -681,13 +715,21 @@ mod tests {
     /// Records the sub-agent lifecycle notifications.
     struct RecUi(std::sync::Mutex<Vec<String>>);
     impl Ui for RecUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, _: &str) {}
-        fn agent_start(&self, agent: &str, task: &str) {
-            self.0.lock().unwrap().push(format!("start {agent} {task}"));
-        }
-        fn agent_end(&self, agent: &str, ok: bool) {
-            self.0.lock().unwrap().push(format!("end {agent} {ok}"));
+        fn emit(&self, ev: &Event) {
+            match ev {
+                Event::ItemStarted {
+                    item: Item::SubAgent { label, task, .. },
+                    ..
+                } => self.0.lock().unwrap().push(format!("start {label} {task}")),
+                Event::ItemCompleted {
+                    item: Item::SubAgent { label, status, .. },
+                    ..
+                } => {
+                    let ok = *status == ItemStatus::Completed;
+                    self.0.lock().unwrap().push(format!("end {label} {ok}"));
+                }
+                _ => {}
+            }
         }
     }
 

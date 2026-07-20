@@ -79,8 +79,7 @@ pub(crate) async fn expand_slash_injections(
 /// the permission prompt is the only surface, and it goes through the approver.
 struct SilentUi;
 impl Ui for SilentUi {
-    fn text_delta(&self, _s: &str) {}
-    fn note(&self, _s: &str) {}
+    fn emit(&self, _ev: &crate::event::Event) {}
 }
 
 /// Run `!cmd` (inline output in place) then append `@file` contents. `@file`

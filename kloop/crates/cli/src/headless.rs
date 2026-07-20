@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::event::tool_summary;
+use kloop_core::event::Delta;
+use kloop_core::event::Event;
+use kloop_core::event::Item;
+use kloop_core::event::ItemStatus;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
@@ -97,7 +102,7 @@ struct JsonUi<W: Write + Send> {
 }
 
 impl<W: Write + Send> JsonUi<W> {
-    fn emit(&self, method: &str, mut params: Value) {
+    fn notify(&self, method: &str, mut params: Value) {
         params["threadId"] = Value::String(self.thread_id.clone());
         let line = json!({"method": method, "params": params});
         if let Ok(mut w) = self.out.lock() {
@@ -108,44 +113,67 @@ impl<W: Write + Send> JsonUi<W> {
 }
 
 impl<W: Write + Send + 'static> Ui for JsonUi<W> {
-    fn text_delta(&self, s: &str) {
-        self.emit("text/delta", json!({"text": s}));
-    }
-
-    fn note(&self, s: &str) {
-        self.emit("note", json!({"text": s}));
-    }
-
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, _input: &Value) {
-        let mut params = json!({"callId": id, "name": name, "summary": summary});
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
+    /// Project the core [`Event`] stream onto the NDJSON wire, reusing the
+    /// server's method names and param shapes verbatim. Message/reasoning items
+    /// exist only as `text/delta`; a mode change falls through to a note, as it
+    /// did before plan 39; the turn bracket is emitted by `run_headless`.
+    fn emit(&self, ev: &Event) {
+        match ev {
+            Event::ItemDelta {
+                delta: Delta::Text(t),
+                ..
+            } => self.notify("text/delta", json!({"text": t})),
+            Event::ItemStarted {
+                id,
+                item: Item::ToolCall {
+                    agent, name, input, ..
+                },
+            } => {
+                let mut params =
+                    json!({"callId": id, "name": name, "summary": tool_summary(input)});
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("tool/started", params);
+            }
+            Event::ItemCompleted {
+                id,
+                item: Item::ToolCall { agent, status, .. },
+            } => {
+                let mut params = json!({"callId": id, "ok": *status == ItemStatus::Completed});
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("tool/completed", params);
+            }
+            Event::ItemStarted {
+                item: Item::SubAgent { label, task, .. },
+                ..
+            } => self.notify("agent/started", json!({"agent": label, "task": task})),
+            Event::ItemCompleted {
+                item: Item::SubAgent { label, status, .. },
+                ..
+            } => self.notify(
+                "agent/completed",
+                json!({"agent": label, "ok": *status == ItemStatus::Completed}),
+            ),
+            Event::ItemCompleted {
+                item: Item::Todo { agent, items },
+                ..
+            } => {
+                let mut params = json!({"todos": items});
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("todo/updated", params);
+            }
+            Event::Note(_) | Event::CwdChanged { .. } | Event::ModeChanged(_) => {
+                if let Some(text) = ev.as_note() {
+                    self.notify("note", json!({"text": text}));
+                }
+            }
+            _ => {}
         }
-        self.emit("tool/started", params);
-    }
-
-    fn tool_end(&self, agent: &str, id: &str, ok: bool, _output: &str) {
-        let mut params = json!({"callId": id, "ok": ok});
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
-        }
-        self.emit("tool/completed", params);
-    }
-
-    fn agent_start(&self, agent: &str, task: &str) {
-        self.emit("agent/started", json!({"agent": agent, "task": task}));
-    }
-
-    fn agent_end(&self, agent: &str, ok: bool) {
-        self.emit("agent/completed", json!({"agent": agent, "ok": ok}));
-    }
-
-    fn todo_update(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
-        let mut params = json!({"todos": todos});
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
-        }
-        self.emit("todo/updated", params);
     }
 }
 
@@ -156,10 +184,12 @@ impl<W: Write + Send + 'static> Ui for JsonUi<W> {
 struct HeadlessTextUi;
 
 impl Ui for HeadlessTextUi {
-    fn text_delta(&self, _s: &str) {}
-
-    fn note(&self, s: &str) {
-        eprintln!("\x1b[2m[{s}]\x1b[0m");
+    fn emit(&self, ev: &Event) {
+        // Streamed assistant text is suppressed (the final answer prints once to
+        // stdout); every event with a note form goes to stderr as dim context.
+        if let Some(note) = ev.as_note() {
+            eprintln!("\x1b[2m[{note}]\x1b[0m");
+        }
     }
 }
 
@@ -190,10 +220,10 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             thread_id: session_id,
             out,
         });
-        ui.emit("turn/started", json!({}));
+        ui.notify("turn/started", json!({}));
         let dyn_ui: Arc<dyn Ui> = ui.clone();
         let outcome = run_turn(&cfg, &mut history, &dyn_ui, &cancel, 0).await;
-        ui.emit("turn/completed", turn_completed_params(&outcome.reason));
+        ui.notify("turn/completed", turn_completed_params(&outcome.reason));
         exit_code(&outcome.reason)
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
@@ -258,29 +288,82 @@ mod tests {
             thread_id: "t".into(),
             out: buf.clone(),
         };
-        ui.emit("turn/started", json!({}));
-        ui.text_delta("hi");
-        ui.note("saved");
-        ui.tool_start("", "c1", "bash", "ls", &json!({"command": "ls"}));
-        ui.tool_start("agent-1", "c2", "grep", "x", &json!({"pattern": "x"}));
-        ui.tool_end("", "c1", true, "ok");
-        ui.agent_start("agent-1", "do x");
-        ui.agent_end("agent-1", false);
-        ui.emit(
+        let tool_call = |agent: &str, name: &str, input: Value, status, output| Item::ToolCall {
+            agent: agent.into(),
+            name: name.into(),
+            input,
+            status,
+            output,
+        };
+        ui.notify("turn/started", json!({}));
+        ui.emit(&Event::ItemDelta {
+            id: "m0".into(),
+            delta: Delta::Text("hi".into()),
+        });
+        ui.emit(&Event::Note("saved".into()));
+        ui.emit(&Event::ItemStarted {
+            id: "c1".into(),
+            item: tool_call(
+                "",
+                "bash",
+                json!({"command": "ls"}),
+                ItemStatus::InProgress,
+                None,
+            ),
+        });
+        ui.emit(&Event::ItemStarted {
+            id: "c2".into(),
+            item: tool_call(
+                "agent-1",
+                "grep",
+                json!({"pattern": "x"}),
+                ItemStatus::InProgress,
+                None,
+            ),
+        });
+        ui.emit(&Event::ItemCompleted {
+            id: "c1".into(),
+            item: tool_call(
+                "",
+                "bash",
+                json!({"command": "ls"}),
+                ItemStatus::Completed,
+                Some("ok".into()),
+            ),
+        });
+        ui.emit(&Event::ItemStarted {
+            id: "agent-1".into(),
+            item: Item::SubAgent {
+                label: "agent-1".into(),
+                task: "do x".into(),
+                status: ItemStatus::InProgress,
+            },
+        });
+        ui.emit(&Event::ItemCompleted {
+            id: "agent-1".into(),
+            item: Item::SubAgent {
+                label: "agent-1".into(),
+                task: String::new(),
+                status: ItemStatus::Failed,
+            },
+        });
+        ui.notify(
             "turn/completed",
             turn_completed_params(&EndReason::Completed),
         );
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = out.lines().collect();
+        // The tool `summary` is the input JSON truncated — exactly what the wire
+        // always carried; the pre-plan-39 test passed a shorter fake value.
         assert_eq!(
             lines,
             vec![
                 r#"{"method":"turn/started","params":{"threadId":"t"}}"#,
                 r#"{"method":"text/delta","params":{"text":"hi","threadId":"t"}}"#,
                 r#"{"method":"note","params":{"text":"saved","threadId":"t"}}"#,
-                r#"{"method":"tool/started","params":{"callId":"c1","name":"bash","summary":"ls","threadId":"t"}}"#,
-                r#"{"method":"tool/started","params":{"agent":"agent-1","callId":"c2","name":"grep","summary":"x","threadId":"t"}}"#,
+                r#"{"method":"tool/started","params":{"callId":"c1","name":"bash","summary":"{\"command\":\"ls\"}","threadId":"t"}}"#,
+                r#"{"method":"tool/started","params":{"agent":"agent-1","callId":"c2","name":"grep","summary":"{\"pattern\":\"x\"}","threadId":"t"}}"#,
                 r#"{"method":"tool/completed","params":{"callId":"c1","ok":true,"threadId":"t"}}"#,
                 r#"{"method":"agent/started","params":{"agent":"agent-1","task":"do x","threadId":"t"}}"#,
                 r#"{"method":"agent/completed","params":{"agent":"agent-1","ok":false,"threadId":"t"}}"#,

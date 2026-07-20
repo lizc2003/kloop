@@ -189,7 +189,7 @@ fn spawn_background_program(
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
     let bridge = Arc::new(CoreBridge::new(bg_ctx, limits, Some(journal.clone())));
-    ui.agent_start(&label, &preview);
+    super::task::emit_agent_start(&ui, &label, &preview);
     tokio::spawn({
         let label = label.clone();
         let ui = ui.clone();
@@ -208,7 +208,7 @@ fn spawn_background_program(
                 // `wait` so it re-evaluates instead of blocking its full deadline.
                 None => parent_inbox.notify_activity(),
             }
-            ui.agent_end(&label, matches!(status, TaskStatus::Completed));
+            super::task::emit_agent_end(&ui, &label, matches!(status, TaskStatus::Completed));
         }
     });
     Ok(format!(
@@ -392,7 +392,7 @@ impl HostBridge for CoreBridge {
     fn log(&self, message: String) {
         // Live progress to the user, through the same note channel every
         // frontend already renders (plain line / TUI cell / server note).
-        self.ctx.ui.note(&message);
+        self.ctx.ui.emit(&crate::event::Event::Note(message));
     }
 }
 

@@ -1,33 +1,33 @@
 //! The bridge from the agent's `Ui`/`Approver` seams to the TUI event loop.
-//! Both traits are implemented by [`ChannelUi`], which forwards everything as
-//! [`AgentEvent`]s over an unbounded channel; the UI loop is the sole consumer.
+//! [`ChannelUi`] implements both: the core [`Event`] stream is wrapped in
+//! [`AgentEvent::Core`] and forwarded over an unbounded channel, and an approval
+//! travels as [`AgentEvent::Confirm`] with a oneshot reply. The UI loop is the
+//! sole consumer; the worker also constructs `Core` events for the turn bracket
+//! (`TurnStarted`/`Usage`/`TurnEnded`) around its `run_turn` call.
 
 use std::pin::Pin;
 
-use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::event::Event;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
-use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
-use kloop_core::tools::TodoItem;
 use kloop_protocol::Message;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 /// Everything the agent side can tell the UI loop. Rendering state is derived
 /// exclusively from this stream (plus key events), which is what makes the
-/// transcript logic unit-testable without a terminal.
+/// transcript logic unit-testable without a terminal. Agent output rides
+/// [`AgentEvent::Core`]; the rest are UI-control events that never leave the TUI.
 #[derive(Debug)]
 pub enum AgentEvent {
-    TextDelta(String),
-    ThinkingDelta(String),
-    Note(String),
+    /// A core [`Event`] — from the `Ui::emit` seam during a turn, or constructed
+    /// by the worker for the turn bracket (`TurnStarted`/`Usage`/`TurnEnded`).
+    Core(Event),
     /// Output of a slash command (`/help`, `/cost`, …). Rendered as a wrapped
-    /// system block, not a one-line note — emitted by the worker directly, not
-    /// through the `Ui` seam.
+    /// system block, not a one-line note — emitted by the worker directly.
     System(String),
     /// `/clear` emptied History; the loop resets its transcript view to match.
     ClearTranscript,
@@ -44,54 +44,12 @@ pub enum AgentEvent {
         session_id: String,
         messages: Vec<Message>,
     },
-    /// `agent` is "" for the main agent's own calls, "agent-N" for calls a
-    /// sub-agent makes — parallel sub-agents interleave on this stream.
-    ToolStart {
-        agent: String,
-        id: String,
-        name: String,
-        /// The full tool input as a JSON string; the renderer formats a
-        /// human-readable row from it (`toolrow`), so it must not be truncated.
-        input: String,
-    },
-    ToolEnd {
-        agent: String,
-        id: String,
-        ok: bool,
-        /// The tool result flattened to text (bounded in core), for the preview
-        /// the renderer shows under the call row.
-        output: String,
-    },
-    /// A task call spawned a sub-agent; ends exactly once per start.
-    AgentStart {
-        agent: String,
-        task: String,
-    },
-    AgentEnd {
-        agent: String,
-        ok: bool,
-    },
-    /// The model rewrote its task list (todo_write, full replacement). Only
-    /// the main agent's updates reach the UI loop; a sub-agent's planning
-    /// stays internal, like its text.
-    TodoUpdate {
-        todos: Vec<TodoItem>,
-    },
     /// A permission prompt. The decision travels back over `reply`; dropping
     /// the sender answers Deny (the agent side treats a closed channel as no).
     Confirm {
         req: ConfirmRequest,
         reply: oneshot::Sender<Decision>,
     },
-    /// The permission mode changed on the agent side (exit_plan_mode was
-    /// approved): refresh the status-bar badge so it never lies.
-    ModeChanged(Mode),
-    /// Context size refresh (plan 38 slice 5): the worker reports
-    /// `History::estimated_tokens` after each turn so the footer's context gauge
-    /// stays current. The window and model are static (seeded at startup), so
-    /// only the used-token estimate travels here.
-    Usage(u64),
-    TurnEnded(EndReason),
 }
 
 /// `Ui` + `Approver` implementation that lives on the agent task and speaks
@@ -112,64 +70,10 @@ impl ChannelUi {
 }
 
 impl Ui for ChannelUi {
-    fn text_delta(&self, s: &str) {
-        self.send(AgentEvent::TextDelta(s.to_string()));
-    }
-
-    fn thinking_delta(&self, s: &str) {
-        self.send(AgentEvent::ThinkingDelta(s.to_string()));
-    }
-
-    fn note(&self, s: &str) {
-        self.send(AgentEvent::Note(s.to_string()));
-    }
-
-    fn tool_start(&self, agent: &str, id: &str, name: &str, _summary: &str, input: &Value) {
-        // The TUI formats its own row from the structured input, so it forwards
-        // the full input JSON, not the truncated one-line `summary`.
-        self.send(AgentEvent::ToolStart {
-            agent: agent.to_string(),
-            id: id.to_string(),
-            name: name.to_string(),
-            input: input.to_string(),
-        });
-    }
-
-    fn tool_end(&self, agent: &str, id: &str, ok: bool, output: &str) {
-        self.send(AgentEvent::ToolEnd {
-            agent: agent.to_string(),
-            id: id.to_string(),
-            ok,
-            output: output.to_string(),
-        });
-    }
-
-    fn agent_start(&self, agent: &str, task: &str) {
-        self.send(AgentEvent::AgentStart {
-            agent: agent.to_string(),
-            task: task.to_string(),
-        });
-    }
-
-    fn agent_end(&self, agent: &str, ok: bool) {
-        self.send(AgentEvent::AgentEnd {
-            agent: agent.to_string(),
-            ok,
-        });
-    }
-
-    fn todo_update(&self, agent: &str, todos: &[TodoItem]) {
-        // A sub-agent's planning stays internal (lesson 3): only the main
-        // agent's list surfaces as a transcript block.
-        if agent.is_empty() {
-            self.send(AgentEvent::TodoUpdate {
-                todos: todos.to_vec(),
-            });
-        }
-    }
-
-    fn mode_changed(&self, mode: Mode) {
-        self.send(AgentEvent::ModeChanged(mode));
+    fn emit(&self, ev: &Event) {
+        // The channel carries owned events; the render state machine (App) is
+        // the single place that projects them (e.g. dropping a sub-agent's todo).
+        self.send(AgentEvent::Core(ev.clone()));
     }
 }
 
@@ -192,73 +96,30 @@ impl Approver for ChannelUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kloop_core::event::Delta;
 
-    /// The Ui trait methods map 1:1 onto channel events, in call order.
+    /// Each `Ui::emit` becomes one `AgentEvent::Core`, in call order.
     #[tokio::test]
-    async fn ui_calls_become_ordered_events() {
+    async fn emit_wraps_core_events_in_order() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ui = ChannelUi::new(tx);
 
-        ui.text_delta("hel");
-        ui.text_delta("lo");
-        ui.tool_start(
-            "",
-            "t1",
-            "bash",
-            "ignored",
-            &serde_json::json!({"command": "ls"}),
-        );
-        ui.note("retrying");
-        ui.tool_end("", "t1", true, "file.txt");
-        ui.agent_start("agent-1", "look things up");
-        ui.tool_start(
-            "agent-1",
-            "t2",
-            "grep",
-            "ignored",
-            &serde_json::json!({"pattern": "x"}),
-        );
-        ui.tool_end("agent-1", "t2", true, "3 matches");
-        ui.agent_end("agent-1", true);
-
-        let mut got = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            got.push(format!("{e:?}"));
-        }
-        assert_eq!(
-            got,
-            vec![
-                r#"TextDelta("hel")"#,
-                r#"TextDelta("lo")"#,
-                r#"ToolStart { agent: "", id: "t1", name: "bash", input: "{\"command\":\"ls\"}" }"#,
-                r#"Note("retrying")"#,
-                r#"ToolEnd { agent: "", id: "t1", ok: true, output: "file.txt" }"#,
-                r#"AgentStart { agent: "agent-1", task: "look things up" }"#,
-                r#"ToolStart { agent: "agent-1", id: "t2", name: "grep", input: "{\"pattern\":\"x\"}" }"#,
-                r#"ToolEnd { agent: "agent-1", id: "t2", ok: true, output: "3 matches" }"#,
-                r#"AgentEnd { agent: "agent-1", ok: true }"#,
-            ]
-        );
-    }
-
-    /// The main agent's todo_update becomes a TodoUpdate event; a sub-agent's
-    /// is dropped (its planning stays internal, like its text).
-    #[tokio::test]
-    async fn todo_update_forwards_main_agent_only() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let ui = ChannelUi::new(tx);
-        let items = vec![TodoItem {
-            content: "Do it".into(),
-            active_form: "Doing it".into(),
-            status: kloop_core::tools::TodoStatus::InProgress,
-        }];
-
-        ui.todo_update("agent-1", &items); // sub-agent: dropped
-        ui.todo_update("", &items); // main agent: forwarded
+        ui.emit(&Event::ItemDelta {
+            id: "m0".into(),
+            delta: Delta::Text("hi".into()),
+        });
+        ui.emit(&Event::Note("retrying".into()));
 
         let got: Vec<AgentEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(got.len(), 1, "only the main agent's update is forwarded");
-        assert!(matches!(&got[0], AgentEvent::TodoUpdate { todos } if todos == &items));
+        assert_eq!(got.len(), 2);
+        assert!(matches!(
+            &got[0],
+            AgentEvent::Core(Event::ItemDelta { delta: Delta::Text(t), .. }) if t == "hi"
+        ));
+        assert!(matches!(
+            &got[1],
+            AgentEvent::Core(Event::Note(n)) if n == "retrying"
+        ));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compact;
 use crate::config::Config;
+use crate::event::Event;
 use crate::history::History;
 use crate::inbox::Inbox;
 use crate::tools::all_tool_defs;
@@ -20,88 +21,15 @@ use sampling::sample_with_retry;
 use sampling::SampleOk;
 use sampling::Sampled;
 
+/// The single output seam: core emits an [`Event`](crate::event::Event) stream
+/// and each front-end projects it (the TUI into cells, the server/headless into
+/// wire notifications, the plain REPL into stdout). A front-end that renders
+/// only text and notes matches those and routes the rest through
+/// [`Event::as_note`](crate::event::Event::as_note) — the old wide-trait default
+/// downgrade, now in one place. `Approver::confirm` is a separate seam: an
+/// approval is a request awaiting an answer, not a produced event.
 pub trait Ui: Send + Sync {
-    fn text_delta(&self, s: &str);
-    /// Streaming reasoning text. Display-only and often empty on the wire
-    /// (Anthropic display=omitted sends blocks with no text), so the default
-    /// drops it and only UIs that render thinking opt in.
-    fn thinking_delta(&self, s: &str) {
-        let _ = s;
-    }
-    fn note(&self, s: &str);
-    /// Tool-call lifecycle, for UIs that render per-call status rows. `agent`
-    /// is "" for the main agent's calls and the sub-agent's label ("agent-N")
-    /// for calls made inside a task — parallel sub-agents interleave on this
-    /// stream and the label is what tells them apart. The defaults collapse
-    /// to the plain note stream so line-based UIs need not care about call ids.
-    /// `summary` is a short one-line preview (the input JSON truncated); `input`
-    /// is the full tool input, for UIs that format a human-readable row per tool
-    /// type (the TUI). The default note-based path only needs `summary`.
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, input: &Value) {
-        let _ = (id, input);
-        if agent.is_empty() {
-            self.note(&format!("{name} {summary}"));
-        } else {
-            self.note(&format!("{agent} · {name} {summary}"));
-        }
-    }
-    /// `output` is the tool result flattened to text (bounded for transport), so
-    /// a UI can preview it under the call row; the default drops it.
-    fn tool_end(&self, agent: &str, id: &str, ok: bool, output: &str) {
-        let _ = (agent, id, ok, output);
-    }
-    /// Sub-agent lifecycle: a task call spawned `agent` to work on `task`
-    /// (first line of the prompt, truncated). Ends exactly once per start.
-    fn agent_start(&self, agent: &str, task: &str) {
-        self.note(&format!("{agent} started: {task}"));
-    }
-    fn agent_end(&self, agent: &str, ok: bool) {
-        self.note(&format!(
-            "{agent} {}",
-            if ok { "finished" } else { "failed" }
-        ));
-    }
-    /// The model rewrote its task list via todo_write (full replacement).
-    /// `agent` is "" for the main agent, "agent-N" for a sub-agent. The
-    /// default collapses to a one-line note; UIs that render a checklist opt
-    /// in. See [`crate::tools::TodoItem`].
-    fn todo_update(&self, agent: &str, todos: &[crate::tools::TodoItem]) {
-        use crate::tools::TodoStatus;
-        let done = todos
-            .iter()
-            .filter(|t| t.status == TodoStatus::Completed)
-            .count();
-        let prefix = if agent.is_empty() {
-            String::new()
-        } else {
-            format!("{agent} · ")
-        };
-        match todos.iter().find(|t| t.status == TodoStatus::InProgress) {
-            Some(current) => self.note(&format!(
-                "{prefix}todos {done}/{} · now: {}",
-                todos.len(),
-                current.active_form
-            )),
-            None => self.note(&format!("{prefix}todos {done}/{} done", todos.len())),
-        }
-    }
-    /// The session's working directory changed — it entered or left a worktree
-    /// (plan 35 slice 2). `branch` is the tree's branch when entering, None
-    /// when back in the main checkout. The default collapses to a note; a
-    /// client that tracks the session cwd (the server) opts in with a
-    /// structured notification so an IDE can follow the switch.
-    fn cwd_changed(&self, cwd: &str, branch: Option<&str>) {
-        match branch {
-            Some(b) => self.note(&format!("working directory → {cwd} (branch {b})")),
-            None => self.note(&format!("working directory → {cwd}")),
-        }
-    }
-    /// The permission mode changed — the model left plan mode via
-    /// `exit_plan_mode` (plan 37). The default collapses to a note; the TUI
-    /// opts in to refresh its status-bar badge without a stale display.
-    fn mode_changed(&self, mode: crate::permissions::Mode) {
-        self.note(&format!("permission mode → {}", mode.label()));
-    }
+    fn emit(&self, ev: &Event);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,12 +190,14 @@ async fn turn_rounds(
                     window,
                 )
             {
-                ui.note("predicted context overflow; compacting history");
+                ui.emit(&Event::Note(
+                    "predicted context overflow; compacting history".into(),
+                ));
                 match compact::run_compaction(cfg, &active_model, history, cancel).await {
-                    Ok(stats) => ui.note(&format!(
+                    Ok(stats) => ui.emit(&Event::Note(format!(
                         "history compacted: {} summarized, {} kept verbatim",
                         stats.summarized, stats.kept
-                    )),
+                    ))),
                     Err(e) => {
                         if cancel.is_cancelled() {
                             return TurnOutcome {
@@ -278,7 +208,7 @@ async fn turn_rounds(
                         }
                         // Predictive failure is not fatal: fall through and let
                         // the request itself succeed or overflow reactively.
-                        ui.note(&format!("predictive compaction failed: {e:#}"));
+                        ui.emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
                     }
                 }
             }
@@ -313,13 +243,15 @@ async fn turn_rounds(
                     };
                 }
                 overflow_compact_attempted = true;
-                ui.note("context window exceeded; compacting and retrying");
+                ui.emit(&Event::Note(
+                    "context window exceeded; compacting and retrying".into(),
+                ));
                 match compact::run_compaction(cfg, &active_model, history, cancel).await {
                     Ok(stats) => {
-                        ui.note(&format!(
+                        ui.emit(&Event::Note(format!(
                             "history compacted: {} summarized, {} kept verbatim",
                             stats.summarized, stats.kept
-                        ));
+                        )));
                         continue;
                     }
                     Err(e) => {
@@ -347,9 +279,9 @@ async fn turn_rounds(
                 // fallback (once) instead of surfacing the error.
                 if let Some(fallback) = &cfg.fallback_model {
                     if *fallback != active_model {
-                        ui.note(&format!(
+                        ui.emit(&Event::Note(format!(
                             "sampling failed on {active_model}; switching to fallback model {fallback}: {e}"
-                        ));
+                        )));
                         active_model = fallback.clone();
                         continue;
                     }
@@ -401,9 +333,9 @@ async fn turn_rounds(
                 // answer that overran the output limit would reach the parent
                 // as just its tail — the front would be lost.
                 truncated_prefix.push_str(&round_text);
-                ui.note(&format!(
+                ui.emit(&Event::Note(format!(
                     "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
-                ));
+                )));
                 history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
                 continue;
             }

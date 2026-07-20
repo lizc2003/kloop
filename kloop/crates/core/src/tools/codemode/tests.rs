@@ -4,6 +4,9 @@ use std::sync::Mutex;
 use serde_json::json;
 
 use crate::agent::Ui;
+use crate::event::Event;
+use crate::event::Item;
+use crate::event::ItemStatus;
 use crate::permissions::Mode;
 use crate::permissions::PermissionRules;
 use crate::permissions::Permissions;
@@ -32,22 +35,22 @@ impl RecordUi {
     }
 }
 impl Ui for RecordUi {
-    fn text_delta(&self, _: &str) {}
-    fn note(&self, s: &str) {
-        self.0.lock().unwrap().push(format!("note: {s}"));
-    }
-    fn tool_start(
-        &self,
-        _agent: &str,
-        _id: &str,
-        name: &str,
-        _summary: &str,
-        _input: &serde_json::Value,
-    ) {
-        self.0.lock().unwrap().push(format!("tool_start: {name}"));
-    }
-    fn tool_end(&self, _agent: &str, _id: &str, ok: bool, _output: &str) {
-        self.0.lock().unwrap().push(format!("tool_end: {ok}"));
+    fn emit(&self, ev: &Event) {
+        match ev {
+            Event::Note(s) => self.0.lock().unwrap().push(format!("note: {s}")),
+            Event::ItemStarted {
+                item: Item::ToolCall { name, .. },
+                ..
+            } => self.0.lock().unwrap().push(format!("tool_start: {name}")),
+            Event::ItemCompleted {
+                item: Item::ToolCall { status, .. },
+                ..
+            } => {
+                let ok = *status == ItemStatus::Completed;
+                self.0.lock().unwrap().push(format!("tool_end: {ok}"));
+            }
+            _ => {}
+        }
     }
 }
 

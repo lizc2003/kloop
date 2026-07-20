@@ -276,18 +276,18 @@ impl Hooks {
                             reason: block_reason(&stderr, &stdout),
                         };
                     }
-                    ui.note(&format!(
+                    ui.emit(&crate::event::Event::Note(format!(
                         "{} hook {:?} exited with {code}; proceeding (only exit {BLOCK_EXIT_CODE} blocks pre_*/subagent_start events)",
                         event.name(),
                         def.command
-                    ));
+                    )));
                 }
                 HookRun::Failed(why) => {
-                    ui.note(&format!(
+                    ui.emit(&crate::event::Event::Note(format!(
                         "{} hook {:?} {why}; proceeding as allowed",
                         event.name(),
                         def.command
-                    ));
+                    )));
                 }
             }
         }
@@ -370,9 +370,10 @@ mod tests {
 
     struct NoteUi(std::sync::Mutex<Vec<String>>);
     impl Ui for NoteUi {
-        fn text_delta(&self, _: &str) {}
-        fn note(&self, s: &str) {
-            self.0.lock().unwrap().push(s.to_string());
+        fn emit(&self, ev: &crate::event::Event) {
+            if let crate::event::Event::Note(s) = ev {
+                self.0.lock().unwrap().push(s.to_string());
+            }
         }
     }
 

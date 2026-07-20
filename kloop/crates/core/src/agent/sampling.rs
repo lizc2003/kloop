@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use super::injected_context;
 use super::Ui;
 use crate::config::Config;
+use crate::event::Delta;
+use crate::event::Event;
+use crate::event::Item;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::OverflowError;
@@ -86,10 +89,10 @@ pub(super) async fn sample_with_retry(
                     .map(|d| u64::from(d.subsec_nanos()) % 250)
                     .unwrap_or(0);
                 let delay = Duration::from_millis((250 << attempt) + jitter);
-                ui.note(&format!(
+                ui.emit(&Event::Note(format!(
                     "sampling failed (attempt {}/{MAX_ATTEMPTS}), retrying in {delay:?}: {e}",
                     attempt + 1
-                ));
+                )));
                 tokio::select! {
                     _ = cancel.cancelled() => return Sampled::Cancelled,
                     _ = tokio::time::sleep(delay) => {}
@@ -115,6 +118,14 @@ async fn sample_once(
     let system = cfg.effective_system();
     let mut rx = cfg.provider.stream(model, &system, messages, tools);
     let mut blocks = Vec::new();
+    // Open assistant/reasoning items, one of each at a time: a delta opens the
+    // item (front-ends see `ItemStarted`), later deltas stream into it, and its
+    // `BlockDone` finalizes it. A sub-agent (`stream_text` false) emits no
+    // message items — its text is internal. Ids are turn-local; slice 1 makes
+    // them turn-unique. See [`crate::event`].
+    let mut text_item: Option<String> = None;
+    let mut think_item: Option<String> = None;
+    let mut item_seq = 0u64;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Err(SampleError::Cancelled),
@@ -128,19 +139,70 @@ async fn sample_once(
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
                     if stream_text {
-                        ui.text_delta(&t);
+                        let id = open_item(&mut text_item, &mut item_seq, "msg", ui, || {
+                            Item::AssistantMessage { text: String::new() }
+                        });
+                        ui.emit(&Event::ItemDelta { id, delta: Delta::Text(t) });
                     }
                 }
                 Some(Ok(StreamEvent::ThinkingDelta(t))) => {
                     if stream_text {
-                        ui.thinking_delta(&t);
+                        let id = open_item(&mut think_item, &mut item_seq, "reasoning", ui, || {
+                            Item::Reasoning { text: String::new() }
+                        });
+                        ui.emit(&Event::ItemDelta { id, delta: Delta::Reasoning(t) });
                     }
                 }
-                Some(Ok(StreamEvent::BlockDone(b))) => blocks.push(b),
+                Some(Ok(StreamEvent::BlockDone(b))) => {
+                    if stream_text {
+                        match &b {
+                            ContentBlock::Text { text } => {
+                                if let Some(id) = text_item.take() {
+                                    ui.emit(&Event::ItemCompleted {
+                                        id,
+                                        item: Item::AssistantMessage { text: text.clone() },
+                                    });
+                                }
+                            }
+                            ContentBlock::Thinking { thinking, .. } => {
+                                if let Some(id) = think_item.take() {
+                                    ui.emit(&Event::ItemCompleted {
+                                        id,
+                                        item: Item::Reasoning { text: thinking.clone() },
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    blocks.push(b);
+                }
                 Some(Ok(StreamEvent::Done { usage, stop_reason })) => {
                     return Ok(SampleOk { blocks, usage, stop_reason })
                 }
             }
         }
     }
+}
+
+/// Return the open item's id, opening it (assigning an id and emitting
+/// `ItemStarted`) on first use. `make` builds the empty starting item.
+fn open_item(
+    slot: &mut Option<String>,
+    seq: &mut u64,
+    prefix: &str,
+    ui: &Arc<dyn Ui>,
+    make: impl FnOnce() -> Item,
+) -> String {
+    if let Some(id) = slot {
+        return id.clone();
+    }
+    let id = format!("{prefix}-{seq}");
+    *seq += 1;
+    ui.emit(&Event::ItemStarted {
+        id: id.clone(),
+        item: make(),
+    });
+    *slot = Some(id.clone());
+    id
 }

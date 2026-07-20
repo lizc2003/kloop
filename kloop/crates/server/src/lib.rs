@@ -37,6 +37,11 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::commands;
+use kloop_core::event::tool_summary;
+use kloop_core::event::Delta;
+use kloop_core::event::Event;
+use kloop_core::event::Item;
+use kloop_core::event::ItemStatus;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
@@ -377,8 +382,11 @@ impl Server {
             srv_seq: self.srv_seq.clone(),
         });
         let note_ui = ui.clone();
-        let mut cfg = (self.factory)(ui.clone(), Arc::new(move |s: &str| note_ui.note(s)))
-            .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
+        let mut cfg = (self.factory)(
+            ui.clone(),
+            Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
+        )
+        .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
         cfg.session_id = thread_id.clone();
@@ -478,7 +486,7 @@ async fn thread_worker(
     // its active worktree if the model never exited (dirty kept on its branch,
     // clean removed), so trees don't leak past the session.
     if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
-        ui.note(note.trim());
+        ui.emit(&Event::Note(note.trim().to_string()));
     }
 }
 
@@ -512,57 +520,82 @@ impl ThreadUi {
 }
 
 impl Ui for ThreadUi {
-    fn text_delta(&self, s: &str) {
-        self.notify("text/delta", json!({"text": s}));
-    }
-
-    fn note(&self, s: &str) {
-        self.notify("note", json!({"text": s}));
-    }
-
-    fn tool_start(&self, agent: &str, id: &str, name: &str, summary: &str, _input: &Value) {
-        let mut params = json!({"callId": id, "name": name, "summary": summary});
-        // Only sub-agent calls carry the field; the main agent's stay as
-        // before so existing clients see an unchanged shape.
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
+    /// Project the core [`Event`] stream onto the (unchanged) app-server wire.
+    /// Message/reasoning items exist only as `text/delta`; the turn bracket
+    /// (`turn/started`/`turn/completed`) is emitted by the worker, not here.
+    fn emit(&self, ev: &Event) {
+        match ev {
+            Event::ItemDelta {
+                delta: Delta::Text(t),
+                ..
+            } => self.notify("text/delta", json!({"text": t})),
+            Event::ItemStarted {
+                id,
+                item: Item::ToolCall {
+                    agent, name, input, ..
+                },
+            } => {
+                let mut params =
+                    json!({"callId": id, "name": name, "summary": tool_summary(input)});
+                // Only sub-agent calls carry the field; the main agent's stay as
+                // before so existing clients see an unchanged shape.
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("tool/started", params);
+            }
+            Event::ItemCompleted {
+                id,
+                item: Item::ToolCall { agent, status, .. },
+            } => {
+                let mut params = json!({"callId": id, "ok": *status == ItemStatus::Completed});
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("tool/completed", params);
+            }
+            Event::ItemStarted {
+                item: Item::SubAgent { label, task, .. },
+                ..
+            } => self.notify("agent/started", json!({"agent": label, "task": task})),
+            Event::ItemCompleted {
+                item: Item::SubAgent { label, status, .. },
+                ..
+            } => self.notify(
+                "agent/completed",
+                json!({"agent": label, "ok": *status == ItemStatus::Completed}),
+            ),
+            Event::ItemCompleted {
+                item: Item::Todo { agent, items },
+                ..
+            } => {
+                let mut params = json!({"todos": items});
+                // A sub-agent's list carries the agent field, like tool notifications.
+                if !agent.is_empty() {
+                    params["agent"] = Value::String(agent.clone());
+                }
+                self.notify("todo/updated", params);
+            }
+            Event::CwdChanged { cwd, branch } => {
+                // The thread entered (branch = Some) or left (None) a worktree; a
+                // client tracking the session cwd follows the switch. `active`
+                // mirrors branch presence for a one-field check.
+                self.notify(
+                    "thread/worktree",
+                    json!({"cwd": cwd, "branch": branch, "active": branch.is_some()}),
+                );
+            }
+            Event::Note(_) | Event::ModeChanged(_) => {
+                // A mode change had no dedicated wire before plan 39 — it fell
+                // through to a note, so keep that shape.
+                if let Some(text) = ev.as_note() {
+                    self.notify("note", json!({"text": text}));
+                }
+            }
+            // Reasoning/message start-and-complete, the turn bracket, and usage
+            // have no wire on the legacy protocol (slice 1 adds item events).
+            _ => {}
         }
-        self.notify("tool/started", params);
-    }
-
-    fn tool_end(&self, agent: &str, id: &str, ok: bool, _output: &str) {
-        let mut params = json!({"callId": id, "ok": ok});
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
-        }
-        self.notify("tool/completed", params);
-    }
-
-    fn agent_start(&self, agent: &str, task: &str) {
-        self.notify("agent/started", json!({"agent": agent, "task": task}));
-    }
-
-    fn agent_end(&self, agent: &str, ok: bool) {
-        self.notify("agent/completed", json!({"agent": agent, "ok": ok}));
-    }
-
-    fn todo_update(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
-        let mut params = json!({"todos": todos});
-        // A sub-agent's list carries the agent field, like tool notifications.
-        if !agent.is_empty() {
-            params["agent"] = Value::String(agent.to_string());
-        }
-        self.notify("todo/updated", params);
-    }
-
-    fn cwd_changed(&self, cwd: &str, branch: Option<&str>) {
-        // The thread entered (branch = Some) or left (None) a worktree; a client
-        // tracking the session cwd follows the switch. `active` mirrors branch
-        // presence for a one-field check.
-        self.notify(
-            "thread/worktree",
-            json!({"cwd": cwd, "branch": branch, "active": branch.is_some()}),
-        );
     }
 }
 

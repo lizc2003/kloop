@@ -5,9 +5,13 @@
 use std::io::Write as _;
 
 use kloop_core::agent::Ui;
+use kloop_core::event::Delta;
+use kloop_core::event::Event;
+use kloop_core::event::Item;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::tools::TodoStatus;
 
 use crate::startup::PERMISSIONS_CONFIG;
 
@@ -81,43 +85,9 @@ impl Approver for CliApprover {
 
 pub(crate) struct StdoutUi;
 
-impl Ui for StdoutUi {
-    fn text_delta(&self, s: &str) {
-        print!("{s}");
-        let _ = std::io::stdout().flush();
-    }
-
-    fn thinking_delta(&self, s: &str) {
-        // Dim gray, inline with the stream: reasoning is context, not answer.
-        print!("\x1b[2m{s}\x1b[0m");
-        let _ = std::io::stdout().flush();
-    }
-
-    fn note(&self, s: &str) {
-        eprintln!("\x1b[2m[{s}]\x1b[0m");
-    }
-
-    fn tool_start(
-        &self,
-        agent: &str,
-        _id: &str,
-        name: &str,
-        summary: &str,
-        _input: &serde_json::Value,
-    ) {
-        // todo_write is rendered as a checklist by todo_update, not a note.
-        if name == "todo_write" {
-            return;
-        }
-        if agent.is_empty() {
-            self.note(&format!("{name} {summary}"));
-        } else {
-            self.note(&format!("{agent} · {name} {summary}"));
-        }
-    }
-
-    fn todo_update(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
-        use kloop_core::tools::TodoStatus;
+impl StdoutUi {
+    /// The checklist a todo update renders (its own block, not a one-line note).
+    fn todo_checklist(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
         let prefix = if agent.is_empty() {
             String::new()
         } else {
@@ -131,6 +101,44 @@ impl Ui for StdoutUi {
                 TodoStatus::Pending => ("○", &todo.content),
             };
             eprintln!("\x1b[2m  {mark} {text}\x1b[0m");
+        }
+    }
+}
+
+impl Ui for StdoutUi {
+    fn emit(&self, ev: &Event) {
+        match ev {
+            Event::ItemDelta {
+                delta: Delta::Text(s),
+                ..
+            } => {
+                print!("{s}");
+                let _ = std::io::stdout().flush();
+            }
+            Event::ItemDelta {
+                delta: Delta::Reasoning(s),
+                ..
+            } => {
+                // Dim gray, inline with the stream: reasoning is context, not answer.
+                print!("\x1b[2m{s}\x1b[0m");
+                let _ = std::io::stdout().flush();
+            }
+            // todo_write renders as the checklist below, never as a generic note.
+            Event::ItemStarted {
+                item: Item::ToolCall { name, .. },
+                ..
+            } if name == "todo_write" => {}
+            Event::ItemCompleted {
+                item: Item::Todo { agent, items },
+                ..
+            } => self.todo_checklist(agent, items),
+            // Tool starts, sub-agent lifecycle, cwd/mode changes, and notes all
+            // reduce to the one-line dim note they showed before plan 39.
+            other => {
+                if let Some(note) = other.as_note() {
+                    eprintln!("\x1b[2m[{note}]\x1b[0m");
+                }
+            }
         }
     }
 }

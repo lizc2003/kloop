@@ -709,10 +709,10 @@ prompts serialize (the TUI already queues; the plain REPL takes a mutex so
 one prompt owns the terminal at a time).
 
 Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
-its cloned Config, and the `Ui` trait carries it end to end:
-`tool_start`/`tool_end` take an `agent` parameter ("" = main agent), and
-`agent_start`/`agent_end` bracket the sub-agent's life. Presentation per
-frontend:
+its cloned Config, and core's `Event` stream (plan 39) carries it end to end:
+an `Item::ToolCall` names the `agent` that made the call ("" = main agent), and
+an `Item::SubAgent` (started → completed) brackets the sub-agent's life.
+Presentation per frontend:
 
 - **TUI**: one live row per sub-agent (`… agent-1 <task> — 3 tools · bash
   {...}`) that folds its tool calls into a counter plus a latest-call

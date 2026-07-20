@@ -51,7 +51,7 @@ pub(super) async fn exit_plan_mode_tool(input: &Value, ctx: &ToolCtx) -> Result<
     match perms.confirm_exit_plan(plan, ctx.depth).await {
         PlanExitOutcome::Approved(mode) => {
             // Keep a cwd/mode-tracking client (the TUI status bar) honest.
-            ctx.ui.mode_changed(mode);
+            ctx.ui.emit(&crate::event::Event::ModeChanged(mode));
             Ok(format!(
                 "The user approved the plan. Plan mode is off (now {}); go ahead and implement it.",
                 mode.label()

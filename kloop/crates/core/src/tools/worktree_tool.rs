@@ -62,8 +62,10 @@ pub(super) async fn enter_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<
         .map_err(|e| anyhow!("enter_worktree: {e:#}"))?;
     // Tell a cwd-tracking client (the server) the session moved into the tree.
     if let Some(a) = ctx.cfg.active_worktree.read().unwrap().as_ref() {
-        ctx.ui
-            .cwd_changed(&a.cwd.display().to_string(), Some(&a.branch));
+        ctx.ui.emit(&crate::event::Event::CwdChanged {
+            cwd: a.cwd.display().to_string(),
+            branch: Some(a.branch.clone()),
+        });
     }
     Ok(msg)
 }
@@ -75,7 +77,10 @@ pub(super) async fn exit_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<S
         .await
         .map_err(|e| anyhow!("exit_worktree: {e:#}"))?;
     // Back in the main checkout (slot cleared) — announce the cwd is `cfg.cwd`.
-    ctx.ui.cwd_changed(&ctx.cfg.cwd.display().to_string(), None);
+    ctx.ui.emit(&crate::event::Event::CwdChanged {
+        cwd: ctx.cfg.cwd.display().to_string(),
+        branch: None,
+    });
     Ok(msg)
 }
 

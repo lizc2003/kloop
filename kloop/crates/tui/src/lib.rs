@@ -40,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+// Aliased: `Event` alone is crossterm's terminal event in this module.
+use kloop_core::event::Event as CoreEvent;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
@@ -115,7 +117,7 @@ pub async fn run(
     let note_ui = channel_ui.clone();
     let cfg = Arc::new(make_config(
         channel_ui.clone(),
-        Arc::new(move |s: &str| note_ui.note(s)),
+        Arc::new(move |s: &str| note_ui.emit(&CoreEvent::Note(s.to_string()))),
     )?);
     // `--worktree`: enter an isolated tree for the whole session before any
     // turn runs (plan 35 slice 2). Fail-closed — the user asked for isolation,
@@ -123,7 +125,7 @@ pub async fn run(
     // The note buffers in the event channel and shows once the UI loop starts.
     if let Some(name) = &worktree {
         match kloop_core::worktree::enter(&cfg, name).await {
-            Ok(msg) => channel_ui.note(&msg),
+            Ok(msg) => channel_ui.emit(&CoreEvent::Note(msg)),
             Err(e) => return Err(e),
         }
     }
@@ -290,8 +292,13 @@ async fn agent_worker(
                 };
                 history.record(msg);
                 let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
-                let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
-                if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
+                    history.estimated_tokens(),
+                )));
+                if events
+                    .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -301,7 +308,7 @@ async fn agent_worker(
                 // busy state the UI loop set when it dispatched the wake.
                 if cfg.inbox.is_empty() {
                     if events
-                        .send(AgentEvent::TurnEnded(EndReason::Completed))
+                        .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
                         .is_err()
                     {
                         return;
@@ -309,8 +316,13 @@ async fn agent_worker(
                     continue;
                 }
                 let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
-                if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
+                    history.estimated_tokens(),
+                )));
+                if events
+                    .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -337,15 +349,20 @@ async fn agent_worker(
                 if let Some(prompt) = result.run_turn {
                     history.record(Message::user_text(prompt));
                     let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                    let _ = events.send(AgentEvent::Usage(history.estimated_tokens()));
-                    if events.send(AgentEvent::TurnEnded(outcome.reason)).is_err() {
+                    let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
+                        history.estimated_tokens(),
+                    )));
+                    if events
+                        .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
+                        .is_err()
+                    {
                         return;
                     }
                     continue;
                 }
                 // TurnEnded clears the busy state the key handler set on submit.
                 if events
-                    .send(AgentEvent::TurnEnded(EndReason::Completed))
+                    .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
                     .is_err()
                 {
                     return;
@@ -687,7 +704,7 @@ async fn ui_loop(
                             // an image, or note why there was none.
                             match clipboard::clipboard_image() {
                                 Ok((label, block)) => app.attach_image(label, block),
-                                Err(e) => app.apply(AgentEvent::Note(e)),
+                                Err(e) => app.apply(AgentEvent::Core(CoreEvent::Note(e))),
                             }
                         }
                         Command::SearchFiles(query) => {

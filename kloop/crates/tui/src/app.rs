@@ -9,6 +9,10 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
+use kloop_core::event::Delta;
+use kloop_core::event::Event;
+use kloop_core::event::Item;
+use kloop_core::event::ItemStatus;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
@@ -184,7 +188,7 @@ pub struct App {
     pub fork_picker: Option<ForkPicker>,
     /// The current permission mode, shown in the status bar. A display mirror of
     /// the shared gate: shift+Tab updates it here and via `Command::SetMode`; an
-    /// `exit_plan_mode` approval refreshes it via `AgentEvent::ModeChanged`. The
+    /// `exit_plan_mode` approval refreshes it via `Event::ModeChanged`. The
     /// loop seeds it from the real gate before the first draw.
     pub mode: Mode,
     /// Ctrl+C is a two-tap quit (CC parity): the first press arms this and shows
@@ -250,148 +254,8 @@ impl App {
 
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::TextDelta(t) => {
-                self.thinking_open = false;
-                if self.assistant_open {
-                    if let Some(Cell::Assistant(text)) = self.cells.last_mut() {
-                        text.push_str(&t);
-                        return;
-                    }
-                }
-                self.cells.push(Cell::Assistant(t));
-                self.assistant_open = true;
-            }
-            AgentEvent::ThinkingDelta(t) => {
-                self.assistant_open = false;
-                if self.thinking_open {
-                    if let Some(Cell::Thinking { text, .. }) = self.cells.last_mut() {
-                        text.push_str(&t);
-                        return;
-                    }
-                }
-                self.cells.push(Cell::Thinking {
-                    text: t,
-                    seconds: None,
-                });
-                self.thinking_open = true;
-            }
-            AgentEvent::Note(n) => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = Some(n.clone());
-                self.cells.push(Cell::Note(n));
-            }
-            AgentEvent::ToolStart {
-                agent,
-                id,
-                name,
-                input,
-            } => {
-                // A one-line "verb detail" preview used by the note stream and
-                // the folded sub-agent row (the full cell is formatted at render).
-                let preview = crate::toolrow::tool_preview(&name, &input);
-                if !agent.is_empty() {
-                    // A sub-agent's call folds into its Agent row: bump the
-                    // counter, refresh the preview. No per-call cell, so
-                    // parallel agents cannot interleave.
-                    self.last_note = Some(format!("{agent} · {preview}"));
-                    if let Some(Cell::Agent {
-                        tools, last_tool, ..
-                    }) = self.agent_cell(&agent)
-                    {
-                        *tools += 1;
-                        *last_tool = preview;
-                    }
-                    return;
-                }
-                self.assistant_open = false;
-                self.thinking_open = false;
-                // todo_write renders as a Todo block via TodoUpdate, not a
-                // generic tool row (cc renders the checklist in its place).
-                if name == "todo_write" {
-                    return;
-                }
-                self.last_note = Some(preview);
-                self.tool_cells.insert(id, self.cells.len());
-                self.cells.push(Cell::Tool {
-                    name,
-                    input,
-                    status: ToolStatus::Running,
-                    output: None,
-                });
-            }
-            AgentEvent::ToolEnd {
-                agent,
-                id,
-                ok,
-                output,
-            } => {
-                // Sub-agent calls have no cell of their own; their agent's
-                // row is resolved by AgentEnd.
-                if !agent.is_empty() {
-                    return;
-                }
-                if let Some(&i) = self.tool_cells.get(&id) {
-                    if let Some(Cell::Tool {
-                        status,
-                        output: out,
-                        ..
-                    }) = self.cells.get_mut(i)
-                    {
-                        *status = if ok {
-                            ToolStatus::Ok
-                        } else {
-                            ToolStatus::Failed
-                        };
-                        // Keep the preview for the transcript; empty output
-                        // leaves the row a single line.
-                        if !output.is_empty() {
-                            *out = Some(output);
-                        }
-                    }
-                }
-            }
-            AgentEvent::AgentStart { agent, task } => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = Some(format!("{agent} started: {task}"));
-                self.agent_cells.insert(agent.clone(), self.cells.len());
-                self.cells.push(Cell::Agent {
-                    agent,
-                    task,
-                    status: ToolStatus::Running,
-                    tools: 0,
-                    last_tool: String::new(),
-                });
-            }
-            AgentEvent::AgentEnd { agent, ok } => {
-                if let Some(Cell::Agent { status, .. }) = self.agent_cell(&agent) {
-                    *status = if ok {
-                        ToolStatus::Ok
-                    } else {
-                        ToolStatus::Failed
-                    };
-                }
-            }
-            AgentEvent::TodoUpdate { todos } => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                let done = todos
-                    .iter()
-                    .filter(|t| t.status == TodoStatus::Completed)
-                    .count();
-                self.last_note = Some(format!("todos {done}/{}", todos.len()));
-                // Update this turn's block in place; start one if there is none.
-                match self.todo_cell {
-                    Some(i) if matches!(self.cells.get(i), Some(Cell::Todo(_))) => {
-                        self.cells[i] = Cell::Todo(todos);
-                    }
-                    _ => {
-                        self.todo_cell = Some(self.cells.len());
-                        self.cells.push(Cell::Todo(todos));
-                    }
-                }
-            }
+            // Agent output — the single core Event stream (plan 39).
+            AgentEvent::Core(ev) => self.apply_core(ev),
             AgentEvent::System(text) => {
                 self.assistant_open = false;
                 self.thinking_open = false;
@@ -452,17 +316,221 @@ impl App {
             AgentEvent::Confirm { req, reply } => {
                 self.confirms.push_back(PendingConfirm { req, reply });
             }
-            AgentEvent::ModeChanged(mode) => {
+        }
+    }
+
+    /// Project one core [`Event`] onto the transcript. Message and reasoning
+    /// items are driven by their deltas (their start/complete events only bound
+    /// the stream — the sealing is done by the next event clearing the open
+    /// flag, exactly as before plan 39); tool calls and sub-agents map to their
+    /// status rows; a sub-agent's todo update stays internal.
+    fn apply_core(&mut self, ev: Event) {
+        match ev {
+            Event::ItemDelta {
+                delta: Delta::Text(t),
+                ..
+            } => {
+                self.thinking_open = false;
+                if self.assistant_open {
+                    if let Some(Cell::Assistant(text)) = self.cells.last_mut() {
+                        text.push_str(&t);
+                        return;
+                    }
+                }
+                self.cells.push(Cell::Assistant(t));
+                self.assistant_open = true;
+            }
+            Event::ItemDelta {
+                delta: Delta::Reasoning(t),
+                ..
+            } => {
+                self.assistant_open = false;
+                if self.thinking_open {
+                    if let Some(Cell::Thinking { text, .. }) = self.cells.last_mut() {
+                        text.push_str(&t);
+                        return;
+                    }
+                }
+                self.cells.push(Cell::Thinking {
+                    text: t,
+                    seconds: None,
+                });
+                self.thinking_open = true;
+            }
+            // Program output has no dedicated cell; the message/reasoning
+            // start/complete events only bracket the delta stream.
+            Event::ItemDelta {
+                delta: Delta::Output(_),
+                ..
+            }
+            | Event::ItemStarted {
+                item: Item::AssistantMessage { .. } | Item::Reasoning { .. } | Item::Todo { .. },
+                ..
+            }
+            | Event::ItemCompleted {
+                item: Item::AssistantMessage { .. } | Item::Reasoning { .. },
+                ..
+            }
+            | Event::TurnStarted => {}
+            Event::ItemStarted {
+                id,
+                item: Item::ToolCall {
+                    agent, name, input, ..
+                },
+            } => {
+                let input = input.to_string();
+                // A one-line "verb detail" preview used by the note stream and
+                // the folded sub-agent row (the full cell is formatted at render).
+                let preview = crate::toolrow::tool_preview(&name, &input);
+                if !agent.is_empty() {
+                    // A sub-agent's call folds into its Agent row: bump the
+                    // counter, refresh the preview. No per-call cell, so
+                    // parallel agents cannot interleave.
+                    self.last_note = Some(format!("{agent} · {preview}"));
+                    if let Some(Cell::Agent {
+                        tools, last_tool, ..
+                    }) = self.agent_cell(&agent)
+                    {
+                        *tools += 1;
+                        *last_tool = preview;
+                    }
+                    return;
+                }
+                self.assistant_open = false;
+                self.thinking_open = false;
+                // todo_write renders as a Todo block via ItemCompleted{Todo}, not
+                // a generic tool row (cc renders the checklist in its place).
+                if name == "todo_write" {
+                    return;
+                }
+                self.last_note = Some(preview);
+                self.tool_cells.insert(id, self.cells.len());
+                self.cells.push(Cell::Tool {
+                    name,
+                    input,
+                    status: ToolStatus::Running,
+                    output: None,
+                });
+            }
+            Event::ItemCompleted {
+                id,
+                item:
+                    Item::ToolCall {
+                        agent,
+                        status,
+                        output,
+                        ..
+                    },
+            } => {
+                // Sub-agent calls have no cell of their own; their agent's
+                // row is resolved by its own completion.
+                if !agent.is_empty() {
+                    return;
+                }
+                if let Some(&i) = self.tool_cells.get(&id) {
+                    if let Some(Cell::Tool {
+                        status: cell_status,
+                        output: out,
+                        ..
+                    }) = self.cells.get_mut(i)
+                    {
+                        *cell_status = if status == ItemStatus::Completed {
+                            ToolStatus::Ok
+                        } else {
+                            ToolStatus::Failed
+                        };
+                        // Keep the preview for the transcript; empty output
+                        // leaves the row a single line.
+                        if let Some(text) = output {
+                            *out = Some(text);
+                        }
+                    }
+                }
+            }
+            Event::ItemStarted {
+                item: Item::SubAgent { label, task, .. },
+                ..
+            } => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = Some(format!("{label} started: {task}"));
+                self.agent_cells.insert(label.clone(), self.cells.len());
+                self.cells.push(Cell::Agent {
+                    agent: label,
+                    task,
+                    status: ToolStatus::Running,
+                    tools: 0,
+                    last_tool: String::new(),
+                });
+            }
+            Event::ItemCompleted {
+                item: Item::SubAgent { label, status, .. },
+                ..
+            } => {
+                if let Some(Cell::Agent { status: cell, .. }) = self.agent_cell(&label) {
+                    *cell = if status == ItemStatus::Completed {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Failed
+                    };
+                }
+            }
+            Event::ItemCompleted {
+                item: Item::Todo { agent, items },
+                ..
+            } => {
+                // A sub-agent's planning stays internal (lesson 3): only the main
+                // agent's list surfaces as a transcript block.
+                if !agent.is_empty() {
+                    return;
+                }
+                self.assistant_open = false;
+                self.thinking_open = false;
+                let done = items
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::Completed)
+                    .count();
+                self.last_note = Some(format!("todos {done}/{}", items.len()));
+                // Update this turn's block in place; start one if there is none.
+                match self.todo_cell {
+                    Some(i) if matches!(self.cells.get(i), Some(Cell::Todo(_))) => {
+                        self.cells[i] = Cell::Todo(items);
+                    }
+                    _ => {
+                        self.todo_cell = Some(self.cells.len());
+                        self.cells.push(Cell::Todo(items));
+                    }
+                }
+            }
+            Event::Note(n) => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = Some(n.clone());
+                self.cells.push(Cell::Note(n));
+            }
+            Event::CwdChanged { cwd, branch } => {
+                // The TUI showed the cwd switch as a plain note before plan 39
+                // (it never implemented the structured seam); keep that.
+                let note = match branch {
+                    Some(b) => format!("working directory → {cwd} (branch {b})"),
+                    None => format!("working directory → {cwd}"),
+                };
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = Some(note.clone());
+                self.cells.push(Cell::Note(note));
+            }
+            Event::ModeChanged(mode) => {
                 // exit_plan_mode flipped the gate on the agent side; keep the
                 // status-bar badge in step.
                 self.mode = mode;
             }
-            AgentEvent::Usage(used) => {
+            Event::Usage(used) => {
                 // The worker's post-turn context estimate; the footer gauge reads
                 // it against the (static) window.
                 self.context_used = used;
             }
-            AgentEvent::TurnEnded(reason) => {
+            Event::TurnEnded(reason) => {
                 self.running = false;
                 self.assistant_open = false;
                 self.thinking_open = false;
@@ -472,7 +540,7 @@ impl App {
                 self.confirms.clear();
                 self.confirm_scroll = 0;
                 // An interrupted turn drops task futures mid-await, so a
-                // sub-agent's AgentEnd may never arrive: no row may outlive
+                // sub-agent's completion may never arrive: no row may outlive
                 // its turn still spinning.
                 for cell in &mut self.cells {
                     if let Cell::Agent { status, .. } = cell {
@@ -972,6 +1040,93 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
 mod tests {
     use super::*;
 
+    // Constructors for the core events the tests drive through `apply` — since
+    // plan 39 the worker wraps every `Ui::emit` in `AgentEvent::Core`. The `id`
+    // for message/reasoning items is irrelevant to the App (deltas drive the
+    // cells), so a fixed one is fine.
+    fn text_delta(s: &str) -> AgentEvent {
+        AgentEvent::Core(Event::ItemDelta {
+            id: "m".into(),
+            delta: Delta::Text(s.into()),
+        })
+    }
+    fn thinking_delta(s: &str) -> AgentEvent {
+        AgentEvent::Core(Event::ItemDelta {
+            id: "r".into(),
+            delta: Delta::Reasoning(s.into()),
+        })
+    }
+    fn tool_start(agent: &str, id: &str, name: &str, input: &str) -> AgentEvent {
+        AgentEvent::Core(Event::ItemStarted {
+            id: id.into(),
+            item: Item::ToolCall {
+                agent: agent.into(),
+                name: name.into(),
+                input: serde_json::from_str(input).unwrap(),
+                status: ItemStatus::InProgress,
+                output: None,
+            },
+        })
+    }
+    fn tool_end(agent: &str, id: &str, ok: bool, output: &str) -> AgentEvent {
+        AgentEvent::Core(Event::ItemCompleted {
+            id: id.into(),
+            item: Item::ToolCall {
+                agent: agent.into(),
+                name: String::new(),
+                input: serde_json::Value::Null,
+                status: if ok {
+                    ItemStatus::Completed
+                } else {
+                    ItemStatus::Failed
+                },
+                output: (!output.is_empty()).then(|| output.to_string()),
+            },
+        })
+    }
+    fn agent_start(agent: &str, task: &str) -> AgentEvent {
+        AgentEvent::Core(Event::ItemStarted {
+            id: agent.into(),
+            item: Item::SubAgent {
+                label: agent.into(),
+                task: task.into(),
+                status: ItemStatus::InProgress,
+            },
+        })
+    }
+    fn agent_end(agent: &str, ok: bool) -> AgentEvent {
+        AgentEvent::Core(Event::ItemCompleted {
+            id: agent.into(),
+            item: Item::SubAgent {
+                label: agent.into(),
+                task: String::new(),
+                status: if ok {
+                    ItemStatus::Completed
+                } else {
+                    ItemStatus::Failed
+                },
+            },
+        })
+    }
+    fn todo_update(todos: Vec<TodoItem>) -> AgentEvent {
+        AgentEvent::Core(Event::ItemCompleted {
+            id: "todos".into(),
+            item: Item::Todo {
+                agent: String::new(),
+                items: todos,
+            },
+        })
+    }
+    fn usage(u: u64) -> AgentEvent {
+        AgentEvent::Core(Event::Usage(u))
+    }
+    fn turn_ended(reason: EndReason) -> AgentEvent {
+        AgentEvent::Core(Event::TurnEnded(reason))
+    }
+    fn mode_changed(mode: Mode) -> AgentEvent {
+        AgentEvent::Core(Event::ModeChanged(mode))
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1011,28 +1166,18 @@ mod tests {
 
         // The agent side leaving plan mode syncs the badge with no keypress.
         app.mode = Mode::Plan;
-        app.apply(AgentEvent::ModeChanged(Mode::AcceptEdits));
+        app.apply(mode_changed(Mode::AcceptEdits));
         assert_eq!(app.mode, Mode::AcceptEdits);
     }
 
     #[test]
     fn deltas_accumulate_until_a_tool_row_splits_them() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::TextDelta("hel".into()));
-        app.apply(AgentEvent::TextDelta("lo".into()));
-        app.apply(AgentEvent::ToolStart {
-            agent: String::new(),
-            id: "t1".into(),
-            name: "bash".into(),
-            input: "{}".into(),
-        });
-        app.apply(AgentEvent::TextDelta("world".into()));
-        app.apply(AgentEvent::ToolEnd {
-            agent: String::new(),
-            id: "t1".into(),
-            ok: false,
-            output: String::new(),
-        });
+        app.apply(text_delta("hel"));
+        app.apply(text_delta("lo"));
+        app.apply(tool_start("", "t1", "bash", "{}"));
+        app.apply(text_delta("world"));
+        app.apply(tool_end("", "t1", false, ""));
 
         assert_eq!(
             app.cells,
@@ -1055,47 +1200,25 @@ mod tests {
     #[test]
     fn subagent_events_fold_into_one_row_per_agent() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::AgentStart {
-            agent: "agent-1".into(),
-            task: "find the bug".into(),
-        });
-        app.apply(AgentEvent::AgentStart {
-            agent: "agent-2".into(),
-            task: "write the docs".into(),
-        });
+        app.apply(agent_start("agent-1", "find the bug"));
+        app.apply(agent_start("agent-2", "write the docs"));
         // Interleaved tool activity from both agents plus the main agent.
-        app.apply(AgentEvent::ToolStart {
-            agent: "agent-1".into(),
-            id: "t1".into(),
-            name: "grep".into(),
-            input: "{\"pattern\":\"bug\"}".into(),
-        });
-        app.apply(AgentEvent::ToolStart {
-            agent: "agent-2".into(),
-            id: "t2".into(),
-            name: "read_file".into(),
-            input: "{\"path\":\"README\"}".into(),
-        });
-        app.apply(AgentEvent::ToolEnd {
-            agent: "agent-1".into(),
-            id: "t1".into(),
-            ok: true,
-            output: String::new(),
-        });
-        app.apply(AgentEvent::ToolStart {
-            agent: "agent-1".into(),
-            id: "t3".into(),
-            name: "bash".into(),
-            input: "{\"command\":\"cargo test\"}".into(),
-        });
-        app.apply(AgentEvent::AgentEnd {
-            agent: "agent-1".into(),
-            ok: true,
-        });
-        app.apply(AgentEvent::AgentEnd {
-            agent: "agent-2".into(),
-            ok: false,
-        });
+        app.apply(tool_start("agent-1", "t1", "grep", "{\"pattern\":\"bug\"}"));
+        app.apply(tool_start(
+            "agent-2",
+            "t2",
+            "read_file",
+            "{\"path\":\"README\"}",
+        ));
+        app.apply(tool_end("agent-1", "t1", true, ""));
+        app.apply(tool_start(
+            "agent-1",
+            "t3",
+            "bash",
+            "{\"command\":\"cargo test\"}",
+        ));
+        app.apply(agent_end("agent-1", true));
+        app.apply(agent_end("agent-2", false));
 
         assert_eq!(
             app.cells,
@@ -1126,21 +1249,13 @@ mod tests {
     fn drain_committed_rebases_index_maps() {
         let mut app = App::new("s".into());
         // Two tool cells and a live todo scattered through the tail.
-        app.apply(AgentEvent::ToolStart {
-            agent: String::new(),
-            id: "t1".into(),
-            name: "bash".into(),
-            input: "{}".into(),
-        });
-        app.apply(AgentEvent::TodoUpdate {
-            todos: vec![todo("Do", "Doing", TodoStatus::InProgress)],
-        });
-        app.apply(AgentEvent::ToolStart {
-            agent: String::new(),
-            id: "t2".into(),
-            name: "grep".into(),
-            input: "{}".into(),
-        });
+        app.apply(tool_start("", "t1", "bash", "{}"));
+        app.apply(todo_update(vec![todo(
+            "Do",
+            "Doing",
+            TodoStatus::InProgress,
+        )]));
+        app.apply(tool_start("", "t2", "grep", "{}"));
         // cells: [Tool t1 (0), Todo (1), Tool t2 (2)]
         assert_eq!(app.cells.len(), 3);
 
@@ -1152,18 +1267,8 @@ mod tests {
         assert_eq!(app.todo_cell, None, "committed todo cell dropped");
 
         // A late ToolEnd for the now-frozen t1 is a harmless no-op; t2 resolves.
-        app.apply(AgentEvent::ToolEnd {
-            agent: String::new(),
-            id: "t1".into(),
-            ok: true,
-            output: String::new(),
-        });
-        app.apply(AgentEvent::ToolEnd {
-            agent: String::new(),
-            id: "t2".into(),
-            ok: true,
-            output: String::new(),
-        });
+        app.apply(tool_end("", "t1", true, ""));
+        app.apply(tool_end("", "t2", true, ""));
         assert_eq!(
             app.cells,
             vec![Cell::Tool {
@@ -1181,11 +1286,8 @@ mod tests {
     fn turn_end_fails_agents_left_running() {
         let mut app = App::new("s".into());
         app.running = true;
-        app.apply(AgentEvent::AgentStart {
-            agent: "agent-1".into(),
-            task: "long job".into(),
-        });
-        app.apply(AgentEvent::TurnEnded(EndReason::Aborted));
+        app.apply(agent_start("agent-1", "long job"));
+        app.apply(turn_ended(EndReason::Aborted));
         assert_eq!(
             app.cells[0],
             Cell::Agent {
@@ -1203,11 +1305,11 @@ mod tests {
     #[test]
     fn thinking_deltas_get_their_own_cell() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::ThinkingDelta("let me".into()));
-        app.apply(AgentEvent::ThinkingDelta(" see".into()));
-        app.apply(AgentEvent::TextDelta("answer".into()));
-        app.apply(AgentEvent::ThinkingDelta("more thought".into()));
-        app.apply(AgentEvent::TextDelta("!".into()));
+        app.apply(thinking_delta("let me"));
+        app.apply(thinking_delta(" see"));
+        app.apply(text_delta("answer"));
+        app.apply(thinking_delta("more thought"));
+        app.apply(text_delta("!"));
 
         assert_eq!(
             app.cells,
@@ -1240,12 +1342,7 @@ mod tests {
     #[test]
     fn todo_write_renders_as_a_single_updating_block() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::ToolStart {
-            agent: String::new(),
-            id: "t1".into(),
-            name: "todo_write".into(),
-            input: "{\"todos\":[...]}".into(),
-        });
+        app.apply(tool_start("", "t1", "todo_write", "{\"todos\":[]}"));
         // No tool row appeared for the suppressed call.
         assert!(app.cells.is_empty());
 
@@ -1253,9 +1350,7 @@ mod tests {
             todo("Parse", "Parsing", TodoStatus::InProgress),
             todo("Test", "Testing", TodoStatus::Pending),
         ];
-        app.apply(AgentEvent::TodoUpdate {
-            todos: first.clone(),
-        });
+        app.apply(todo_update(first.clone()));
         assert_eq!(app.cells, vec![Cell::Todo(first)]);
 
         // A second update within the turn replaces the same cell in place.
@@ -1263,19 +1358,12 @@ mod tests {
             todo("Parse", "Parsing", TodoStatus::Completed),
             todo("Test", "Testing", TodoStatus::InProgress),
         ];
-        app.apply(AgentEvent::TodoUpdate {
-            todos: second.clone(),
-        });
+        app.apply(todo_update(second.clone()));
         assert_eq!(app.cells, vec![Cell::Todo(second)], "updated in place");
         assert_eq!(app.last_note.as_deref(), Some("todos 1/2"));
 
         // The suppressed ToolEnd is a no-op (no tool cell was tracked).
-        app.apply(AgentEvent::ToolEnd {
-            agent: String::new(),
-            id: "t1".into(),
-            ok: true,
-            output: String::new(),
-        });
+        app.apply(tool_end("", "t1", true, ""));
         assert_eq!(app.cells.len(), 1);
     }
 
@@ -1285,10 +1373,8 @@ mod tests {
     fn new_turn_starts_a_fresh_todo_block() {
         let mut app = App::new("s".into());
         let plan = vec![todo("Step", "Doing step", TodoStatus::InProgress)];
-        app.apply(AgentEvent::TodoUpdate {
-            todos: plan.clone(),
-        });
-        app.apply(AgentEvent::TurnEnded(EndReason::Completed));
+        app.apply(todo_update(plan.clone()));
+        app.apply(turn_ended(EndReason::Completed));
 
         // Submit a new turn, then the model writes todos again.
         for c in "next".chars() {
@@ -1296,9 +1382,7 @@ mod tests {
         }
         app.on_key(key(KeyCode::Enter));
         let plan2 = vec![todo("Other", "Doing other", TodoStatus::Pending)];
-        app.apply(AgentEvent::TodoUpdate {
-            todos: plan2.clone(),
-        });
+        app.apply(todo_update(plan2.clone()));
 
         assert_eq!(
             app.cells,
@@ -1902,7 +1986,7 @@ mod tests {
             },
             reply,
         });
-        app.apply(AgentEvent::TurnEnded(EndReason::Aborted));
+        app.apply(turn_ended(EndReason::Aborted));
 
         assert!(!app.running);
         assert!(app.confirms.is_empty());
@@ -1910,9 +1994,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(app.cells, vec![Cell::Note("interrupted".into())]);
 
-        app.apply(AgentEvent::TurnEnded(EndReason::Error("boom".into())));
+        app.apply(turn_ended(EndReason::Error("boom".into())));
         assert_eq!(app.cells[1], Cell::Note("error: boom".into()));
-        app.apply(AgentEvent::TurnEnded(EndReason::Completed));
+        app.apply(turn_ended(EndReason::Completed));
         assert_eq!(app.cells.len(), 2, "completed turns add no note");
     }
 
@@ -2055,7 +2139,7 @@ mod tests {
     fn usage_event_updates_context_estimate() {
         let mut app = App::new("s".into()).with_context("m".into(), Some(1000), 100);
         assert_eq!(app.context_used, 100);
-        app.apply(AgentEvent::Usage(250));
+        app.apply(usage(250));
         assert_eq!(app.context_used, 250);
         assert_eq!(app.context_window, Some(1000));
         assert_eq!(app.model, "m");
@@ -2066,15 +2150,15 @@ mod tests {
     #[test]
     fn thinking_streams_then_seals_with_elapsed() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::ThinkingDelta("pon".into()));
-        app.apply(AgentEvent::ThinkingDelta("dering".into()));
+        app.apply(thinking_delta("pon"));
+        app.apply(thinking_delta("dering"));
         assert!(
             app.streaming_thinking(),
             "the open block is the streaming last cell"
         );
 
         // A text delta closes the block; the loop seals it with its elapsed.
-        app.apply(AgentEvent::TextDelta("answer".into()));
+        app.apply(text_delta("answer"));
         assert!(!app.streaming_thinking());
         app.seal_thinking(9);
         assert_eq!(

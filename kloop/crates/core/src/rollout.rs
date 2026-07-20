@@ -965,8 +965,7 @@ mod tests {
 
         struct NullUi;
         impl Ui for NullUi {
-            fn text_delta(&self, _: &str) {}
-            fn note(&self, _: &str) {}
+            fn emit(&self, _: &crate::event::Event) {}
         }
         let cfg_with = |provider: Provider, dir: &Path| {
             Arc::new(Config {
