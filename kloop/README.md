@@ -300,8 +300,10 @@ inline `code` and fenced code blocks over a dim background, ordered and unordere
 lists with a hanging indent, block quotes with a `│` bar, and GitHub-style tables
 drawn with box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single
 newline inside a paragraph reflows to a space (CommonMark soft break), so answers
-re-wrap to the terminal width. Code-block syntax highlighting (`synoptic`) is
-deliberately deferred to a later slice — the source shows raw for now. While a
+re-wrap to the terminal width. Fenced code blocks that name a supported language
+are **syntax-highlighted** (plan 38 slice 7, `synoptic`): a tight theme-safe
+palette over the dim background — keywords magenta, strings green, comments dim,
+numbers/types/functions cyan, everything else plain (no yellow/blue). While a
 message is still streaming, only the part up to the last **stable boundary** (a
 blank line, or a closed code fence) is rendered as markdown; the forming tail
 shows raw, so a half-written table or fence never reflows mid-stream, and it

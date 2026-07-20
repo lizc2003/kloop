@@ -2,9 +2,10 @@
 //!
 //! `pulldown-cmark` drives a small block/inline walker that emits styled
 //! [`Line`]s: headings, emphasis, inline code, ordered/unordered lists, block
-//! quotes, box-drawing tables, and dim-background code blocks. Syntax
-//! highlighting (syntect) is deliberately deferred to a later slice — code
-//! blocks show the raw source over a dim background for now (plan 38 关键决定 2).
+//! quotes, box-drawing tables, and dim-background code blocks. Fenced code
+//! blocks that name a supported language are syntax-highlighted with `synoptic`
+//! (plan 38 slice 7, 关键决定 2): a tight styles.md-safe palette over the code
+//! background — see [`token_style`].
 //!
 //! Streaming uses a claw-style safe-boundary buffer ([`find_stream_safe_boundary`]):
 //! only the part of the stream that ends on a stable boundary (a blank line, or a
@@ -13,6 +14,7 @@
 //! stabilizes (or the message finalizes) it renders as markdown too.
 
 use pulldown_cmark::Alignment;
+use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
 use pulldown_cmark::HeadingLevel;
 use pulldown_cmark::Options;
@@ -29,9 +31,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::render::wrap;
 
 /// Dim-grey background behind code (inline spans and fenced blocks). A neutral
-/// backdrop reads as "code" without committing a foreground hue that could wash
-/// out on an off-theme terminal (styles.md caution); the semantic colour system
-/// lands in slice 6.
+/// backdrop reads as "code"; fenced blocks additionally carry per-token
+/// foregrounds from a styles.md-safe palette (slice 7, [`token_style`]).
 const CODE_BG: Color = Color::Indexed(236);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -111,6 +112,10 @@ struct Renderer {
     /// The fenced code block currently open (raw text accumulates here, not as
     /// inline styled chars).
     code: Option<String>,
+    /// The open code block's info string (its language, e.g. `rust`), used to
+    /// pick a syntax highlighter at flush (plan 38 slice 7). None for an
+    /// indented block or a bare fence.
+    code_lang: Option<String>,
     /// The table currently open.
     table: Option<TableAcc>,
 }
@@ -138,6 +143,7 @@ impl Renderer {
             quote_depth: 0,
             blocks_emitted: false,
             code: None,
+            code_lang: None,
             table: None,
         }
     }
@@ -225,10 +231,14 @@ impl Renderer {
                 self.prefix.push(Span::styled("│ ".to_string(), DIM));
                 self.quote_depth += 1;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_para();
                 self.block_sep();
                 self.code = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => Some(info.to_string()),
+                    CodeBlockKind::Indented => None,
+                };
             }
             Tag::List(first) => {
                 self.flush_para();
@@ -383,29 +393,34 @@ impl Renderer {
         self.blocks_emitted = true;
     }
 
-    /// Emit the open code block: raw source over a dim background, hard-wrapped
-    /// to the content width and padded to a clean rectangle.
+    /// Emit the open code block: syntax-highlighted source (plan 38 slice 7)
+    /// over a dim background, hard-wrapped to the content width and padded to a
+    /// clean rectangle. Highlighting runs per source line via `synoptic` when the
+    /// fence names a supported language; otherwise the source shows plain.
     fn flush_code(&mut self) {
         let buf = self.code.take().unwrap_or_default();
+        let lang = self.code_lang.take();
         let body = buf.strip_suffix('\n').unwrap_or(&buf);
         if body.is_empty() {
             return;
         }
         self.block_sep();
         let avail = self.content_width();
-        let frags: Vec<String> = body.split('\n').flat_map(|l| wrap(l, avail)).collect();
+        // One styled `Chars` per source line, then hard-wrap each to width
+        // (code never reflows on spaces), preserving per-token styles.
+        let frags: Vec<Chars> = highlight_code(body, lang.as_deref())
+            .into_iter()
+            .flat_map(|line| hard_wrap_chars(&line, avail))
+            .collect();
         let block_w = frags
             .iter()
-            .map(|f| display_width(f))
+            .map(chars_width)
             .max()
             .unwrap_or(0)
             .clamp(1, avail);
         for frag in frags {
-            let padded = pad_to(&frag, block_w);
-            self.out.push(prefixed(
-                &self.prefix,
-                vec![Span::styled(padded, Style::new().bg(CODE_BG))],
-            ));
+            let padded = pad_chars(frag, block_w);
+            self.out.push(prefixed(&self.prefix, coalesce(padded)));
         }
         self.blocks_emitted = true;
     }
@@ -617,15 +632,125 @@ fn split_words(chars: &Chars) -> Vec<Chars> {
     words
 }
 
-/// Pad a string with trailing spaces to `width` display columns (no-op if already
-/// at/over width).
-fn pad_to(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(width - w))
+/// Pad styled chars with trailing code-background spaces to `width` columns, so
+/// the code block renders as a clean filled rectangle (no-op if already wide).
+fn pad_chars(mut chars: Chars, width: usize) -> Chars {
+    let w = chars_width(&chars);
+    if w < width {
+        let space = Style::new().bg(CODE_BG);
+        chars.extend(std::iter::repeat_n((' ', space), width - w));
     }
+    chars
+}
+
+/// Hard-wrap one source line of styled chars at `width` columns (CJK-aware),
+/// breaking purely at the column boundary — code does not reflow on spaces.
+/// Always yields at least one (possibly empty) line so a blank line keeps its row.
+fn hard_wrap_chars(chars: &Chars, width: usize) -> Vec<Chars> {
+    let width = width.max(1);
+    let mut lines: Vec<Chars> = Vec::new();
+    let mut line: Chars = Vec::new();
+    let mut cols = 0usize;
+    for &(c, st) in chars {
+        let cw = c.width().unwrap_or(0);
+        if cols + cw > width && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            cols = 0;
+        }
+        line.push((c, st));
+        cols += cw;
+    }
+    lines.push(line);
+    lines
+}
+
+/// Syntax-highlight a code block body into one styled `Chars` per source line.
+/// Each char carries the code background plus its token colour; with no
+/// supported language (or a bare fence) every char is plain over the background.
+fn highlight_code(body: &str, lang: Option<&str>) -> Vec<Chars> {
+    let base = Style::new().bg(CODE_BG);
+    let lines: Vec<String> = body.split('\n').map(str::to_string).collect();
+    let highlighter = lang.and_then(lang_to_ext).map(|ext| {
+        let mut h = synoptic::from_extension(ext, 4).expect("from_extension is total");
+        h.run(&lines);
+        h
+    });
+    lines
+        .iter()
+        .enumerate()
+        .map(|(y, raw)| match &highlighter {
+            Some(h) => h
+                .line(y, raw)
+                .into_iter()
+                .flat_map(|tok| {
+                    let (text, style) = match tok {
+                        synoptic::TokOpt::Some(t, kind) => (t, base.patch(token_style(&kind))),
+                        synoptic::TokOpt::None(t) => (t, base),
+                    };
+                    text.chars().map(move |c| (c, style)).collect::<Chars>()
+                })
+                .collect(),
+            None => raw.chars().map(|c| (c, base)).collect(),
+        })
+        .collect()
+}
+
+/// Map a synoptic token kind to a styles.md-safe style patched over the code
+/// background (plan 38 slice 7). The palette is tight on purpose — cyan for
+/// structure, green for strings, magenta for keywords, dim for comments — no
+/// yellow/blue/black/white foregrounds that theme unreliably. Magenta does
+/// double duty as the brand accent, but inside the dim code rectangle it reads
+/// as a keyword, not chrome.
+fn token_style(kind: &str) -> Style {
+    match kind {
+        "keyword" | "boolean" => Style::new().fg(Color::Magenta),
+        "string" => Style::new().fg(Color::Green),
+        "comment" => DIM,
+        "digit" | "function" | "struct" | "namespace" | "tag" | "attribute" | "operator"
+        | "type" | "key" | "header" | "heading" => Style::new().fg(Color::Cyan),
+        _ => Style::default(),
+    }
+}
+
+/// Normalize a fence info string (`rust`, `py`, `c++`, `bash,ignore`) to an
+/// extension `synoptic::from_extension` recognizes, or `None` to skip
+/// highlighting for unknown / bare-fence blocks.
+fn lang_to_ext(lang: &str) -> Option<&'static str> {
+    let first = lang
+        .trim()
+        .split([',', ' ', '\t'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    Some(match first.as_str() {
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "javascript" | "js" | "node" | "jsx" | "mjs" => "js",
+        "typescript" | "ts" | "tsx" => "ts",
+        "bash" | "sh" | "shell" | "zsh" | "console" => "sh",
+        "c" | "h" => "c",
+        "cpp" | "c++" | "cxx" | "cc" | "hpp" => "cpp",
+        "csharp" | "cs" => "cs",
+        "go" | "golang" => "go",
+        "java" => "java",
+        "kotlin" | "kt" => "kt",
+        "ruby" | "rb" => "rb",
+        "php" => "php",
+        "swift" => "swift",
+        "scala" => "scala",
+        "lua" => "lua",
+        "haskell" | "hs" => "hs",
+        "json" => "json",
+        "yaml" | "yml" => "yml",
+        "toml" => "toml",
+        "css" => "css",
+        "html" | "htm" | "xhtml" => "html",
+        "xml" => "xml",
+        "sql" => "sql",
+        "markdown" | "md" => "md",
+        "diff" | "patch" => "diff",
+        _ => return None,
+    })
 }
 
 fn widest_col(colw: &[usize]) -> Option<usize> {
@@ -969,6 +1094,67 @@ mod tests {
         assert_eq!(texts(&lines), vec!["let x = 1;"]);
         // Padded to a rectangle over the code background.
         assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG));
+    }
+
+    /// A fenced block with a supported language is syntax-highlighted over the
+    /// code background (plan 38 slice 7): keyword magenta, string green, comment
+    /// dim, and every cell keeps the code background.
+    #[test]
+    fn code_block_syntax_highlights_by_language() {
+        let lines = markdown_lines("```rust\nlet s = \"hi\"; // note\n```", 40);
+        let spans = &lines[0].spans;
+        let find = |needle: &str| {
+            spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .unwrap_or_else(|| panic!("span with {needle:?}: {spans:?}"))
+        };
+        assert_eq!(find("let").style.fg, Some(Color::Magenta));
+        assert_eq!(find("hi").style.fg, Some(Color::Green));
+        assert!(find("note").style.add_modifier.contains(Modifier::DIM));
+        // The whole rectangle still sits on the code background, no yellow.
+        assert!(spans.iter().all(|s| s.style.bg == Some(CODE_BG)));
+        assert!(spans.iter().all(|s| s.style.fg != Some(Color::Yellow)));
+    }
+
+    /// A bare fence (no language) or an unknown language is not highlighted —
+    /// every span is plain over the background.
+    #[test]
+    fn code_block_without_language_is_plain() {
+        for md in ["```\nlet x = 1;\n```", "```nope\nlet x = 1;\n```"] {
+            let lines = markdown_lines(md, 40);
+            assert!(
+                lines[0].spans.iter().all(|s| s.style.fg.is_none()),
+                "unhighlighted: {md}"
+            );
+            assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG));
+        }
+    }
+
+    #[test]
+    fn lang_to_ext_normalizes_names_and_rejects_unknown() {
+        assert_eq!(lang_to_ext("rust"), Some("rs"));
+        assert_eq!(lang_to_ext("python"), Some("py"));
+        assert_eq!(lang_to_ext("c++"), Some("cpp"));
+        // Info strings carry attributes after the language name.
+        assert_eq!(lang_to_ext("bash,ignore"), Some("sh"));
+        assert_eq!(lang_to_ext("TypeScript"), Some("ts"));
+        assert_eq!(lang_to_ext("brainfuck"), None);
+        assert_eq!(lang_to_ext(""), None);
+    }
+
+    #[test]
+    fn token_style_uses_the_safe_palette() {
+        assert_eq!(token_style("keyword").fg, Some(Color::Magenta));
+        assert_eq!(token_style("string").fg, Some(Color::Green));
+        assert_eq!(token_style("digit").fg, Some(Color::Cyan));
+        assert!(token_style("comment").add_modifier.contains(Modifier::DIM));
+        assert_eq!(token_style("whatever"), Style::default());
+        // No banned foregrounds anywhere in the map.
+        for kind in ["keyword", "string", "digit", "function", "comment", "type"] {
+            let fg = token_style(kind).fg;
+            assert!(fg != Some(Color::Yellow) && fg != Some(Color::Blue));
+        }
     }
 
     /// A code fence containing a nested triple-backtick example is upgraded to a

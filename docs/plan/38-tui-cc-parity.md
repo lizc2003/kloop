@@ -282,6 +282,31 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 - 教训沉淀:HANDOFF 教训 45(品牌色语义切法 magenta=agent/cyan=user·status;会话头 git/env 副作用留 run()、
   渲染纯;diff 统计只加 TUI 层不动 core 线格式)。
 
+### 切片 7 — 代码块语法高亮(synoptic) ✅ 完成(2026-07-17)
+
+切片 6 拆出的独立高亮小片(关键决定 2 定库 `synoptic`)。markdown fenced 代码块按语言
+`synoptic::from_extension` 逐行 tokenize,token kind → styles.md 安全配色叠在 `CODE_BG` 上。
+
+**完成记录(2026-07-17,提交 <PENDING>)**:
+- 依赖:`synoptic 2.2.9`(纯 Rust,主依赖 `regex`/`char_index`/`if_chain`/`nohash-hasher`,无 C 编译)。
+- `markdown.rs`:`Renderer` 加 `code_lang`(fenced info 串),`Tag::CodeBlock(kind)` 抓 `CodeBlockKind::Fenced(info)`。
+  `flush_code` 改走 `highlight_code(body, lang)`——`lang_to_ext` 把 `rust`/`py`/`c++`/`bash,ignore`/`TypeScript` 等
+  归一到 `from_extension` 的扩展名(未知/裸围栏→None 不高亮,退化为原暗底纯文本),`h.run(&lines)` 后逐行 `h.line(y,raw)`
+  拿 `TokOpt::Some(text,kind)`/`None(text)`,一 token 一段 char 携 `base=bg(CODE_BG)` patch `token_style(kind)`。
+  新 `hard_wrap_chars`(styled char 硬折,code 不按词 reflow)+ `pad_chars`(补 bg 空格成矩形),`coalesce` 合 span。
+- **`token_style` 配色**(styles.md 安全,避 yellow/blue/black/white):keyword/boolean→magenta、string→green、
+  comment→dim、digit/function/struct/namespace/tag/attribute/operator/type/key/header→cyan、其余→default。
+  magenta 在代码块内是"关键字"(暗底矩形里与 UI chrome 语境隔离),精度是正则级(聊天够用,非编辑器级)。
+- **流式无缝**:未闭合围栏在 `assistant_stream_lines` 的 forming 尾走裸文本,闭合后走 `markdown_lines` 才高亮——
+  安全边界缓冲(切片 1)天然只对已闭合围栏高亮,无半块撕裂。diff 高亮**有意不做**:审批弹层里 +/- 整行 green/red
+  是 diff 的首要信号,叠语法 fg 会打架;且需把语言穿进 core preview 线格式(不值当)。
+- **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 121 测试,新增 rust 块 keyword magenta/string
+  green/comment dim + 全 bg + 无 yellow、裸围栏/未知语言不高亮、`lang_to_ext` 归一+拒未知、`token_style` 安全色板)。
+  真 key **双轨** PTY+pyte:让模型回 ```rust 块,anthropic + openai 均 5/5(代码落 CODE_BG(pyte `303030`)、
+  `fn`/`let` magenta、`"hello"` green、无 yellow)。
+- 教训沉淀:HANDOFF 教训 46(synoptic 逐行 tokenize→styled Chars 的接线;紧配色板下 magenta 双用靠语境隔离;
+  diff 语法高亮为何不叠加在 +/- fg 方案上)。
+
 ## 不做(裁剪,记为可能性)
 
 终端色探测(需 fork crossterm)、resize scrollback reflow、OSC8 超链接、Zellij raw、
@@ -306,4 +331,5 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
   品牌的槽,主题安全,与关键决定 5 一致;不取橙,橙是自定义色异色主题对比无保证)。语义切法:magenta =
   kloop 在场(会话头/spinner/mode 徽标),cyan = 用户·状态·选中(`›`/`>`/工具标记/审批条/菜单选中)。
   ~~gutter 提示符 `›`、mode 行~~ 已对真 key 双轨调过。
-- **切片 7(独立高亮小片)**:synoptic 代码块 + diff 语法高亮(库已定,切片 6 拆出未做)。
+- ~~**切片 7(独立高亮小片)**:synoptic 代码块 + diff 语法高亮~~(✅ 2026-07-17 完成代码块高亮;
+  diff 语法高亮有意不做——+/- 整行色是审批首要信号、叠语法 fg 会打架,见切片 7 完成记录)。
