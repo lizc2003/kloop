@@ -493,8 +493,14 @@ impl Permissions {
             return Ok(());
         }
 
-        // 6. Bypass mode.
-        if self.mode() == Mode::Bypass {
+        // 6. Bypass mode — auto-run, but NOT an opaque bash script. Bypass
+        // waives the rule/ask layers, not the safety promise: an unparseable
+        // command (subshell, redirect, substitution…) could hide an `rm -rf`
+        // the destructive check never got to see, so it falls through to the
+        // user like everywhere else opaque scripts are refused an auto-verdict
+        // (deny/allow/cache all skip Opaque; the sandbox layer above may still
+        // auto-allow it because the sandbox *contains* it — this layer can't).
+        if self.mode() == Mode::Bypass && !matches!(call.bash, Some(BashAnalysis::Opaque)) {
             return Ok(());
         }
 
@@ -1176,6 +1182,37 @@ mod tests {
 
         // second time: deny (script exhausted) → the call is refused
         assert!(!ok(&p, "bash", bash("rm -rf build")).await);
+    }
+
+    /// An opaque bash script (here a redirect) can't be vetted by the deny or
+    /// destructive-safety layers, so bypass mode must NOT auto-run it: it falls
+    /// through to the user like every other opaque call. A parseable command in
+    /// the same mode still auto-runs. Regression — a one-token redirect used to
+    /// slip `rm -rf …` past the deny rule, the destructive check, AND the bypass
+    /// short-circuit, running unprompted.
+    #[tokio::test]
+    async fn opaque_bash_is_not_auto_run_in_bypass() {
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash(rm *)"], &[]),
+            approver.clone(),
+        );
+        // Redirect → Opaque: escapes deny + destructive, so it must still reach
+        // the user (here denied) rather than silently run.
+        assert!(!ok(&p, "bash", bash("rm -rf build > /dev/null")).await);
+        assert_eq!(
+            approver.ask_count(),
+            1,
+            "opaque bash must reach the user in bypass, not auto-run"
+        );
+        // A parseable, non-destructive command still auto-runs with no prompt.
+        assert!(ok(&p, "bash", bash("ls -la")).await);
+        assert_eq!(
+            approver.ask_count(),
+            1,
+            "parseable bash still auto-runs in bypass"
+        );
     }
 
     #[tokio::test]
