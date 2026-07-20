@@ -259,7 +259,7 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 对比无保证)。**synoptic 语法高亮拆成独立小片(切片 7)**,本片 diff 升级不含高亮(避免高亮反复
 改 diff、每块能独立验收)。
 
-**完成记录(2026-07-17,提交 3ad6195)**:
+**完成记录(2026-07-17,提交 df6bcf9)**:
 - **品牌语义切法**:magenta = kloop 自身在场(会话头框+标题、running spinner、footer mode 徽标);
   cyan = 用户/状态/选中(composer `›`、user `>`、running 工具/子 agent 标记 `●`/`…`、todo 进行中 `▶`、
   审批 y/a/p/n 动作条、菜单选中);green/red = 成功·新增 / 错误·删除;dim = 次要(todo pending `○`)。
