@@ -53,6 +53,7 @@ use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
 use crate::app::App;
+use crate::app::Cell;
 use crate::app::Command;
 use crate::events::AgentEvent;
 use crate::events::ChannelUi;
@@ -151,6 +152,18 @@ pub async fn run(
             history.estimated_tokens(),
         );
     app.cells = app::cells_from_history(history.messages());
+    // The opening session banner (plan 38 slice 6): the first cell, so it leads
+    // the transcript and scrolls into scrollback. Built here with the git/env
+    // reads done, keeping the renderer pure. On resume it still opens the replay.
+    app.cells.insert(
+        0,
+        Cell::SessionHeader {
+            model: cfg.model.clone(),
+            cwd: display_cwd(&cfg.cwd),
+            branch: git_branch(&cfg.cwd),
+            mode: permissions.mode().label().to_string(),
+        },
+    );
     let cwd = cfg.cwd.clone();
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
@@ -184,6 +197,38 @@ pub async fn run(
         eprintln!("{}", note.trim());
     }
     result
+}
+
+/// The cwd for the session banner, with `$HOME` contracted to `~` (the common
+/// case) so the header stays short.
+fn display_cwd(cwd: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(rest) = cwd.strip_prefix(home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    cwd.display().to_string()
+}
+
+/// The current git branch for the session banner, or `None` when the cwd is not
+/// a repository (or git is unavailable). Best-effort and one-shot at startup —
+/// a display nicety, not a correctness path, so failure just omits the row.
+fn git_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
 }
 
 /// The slash-menu catalog: the built-in commands, then the loaded skills and

@@ -26,6 +26,12 @@ use crate::menu;
 use crate::menu::Popup;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// kloop's brand accent (plan 38 slice 6): styles.md reserves ANSI `magenta`
+/// for the agent's own presence — the session banner, the working spinner, the
+/// mode badge. Everything else follows styles.md: cyan for input/selection/
+/// status, green for success/additions, red for errors/deletions, dim for
+/// secondary; no yellow/black/white/blue foregrounds.
+const BRAND: Color = Color::Magenta;
 
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
@@ -105,10 +111,11 @@ fn thinking_line(sealed_secs: Option<u64>, live_secs: Option<u64>, width: usize)
     ))
 }
 
-/// The status glyph and colour shared by tool rows and sub-agent rows.
+/// The status glyph and colour shared by tool rows and sub-agent rows. Running
+/// is a cyan status indicator (styles.md), success green, failure red.
 fn status_mark(status: &ToolStatus) -> (&'static str, Color) {
     match status {
-        ToolStatus::Running => ("…", Color::Yellow),
+        ToolStatus::Running => ("…", Color::Cyan),
         ToolStatus::Ok => ("✓", Color::Green),
         ToolStatus::Failed => ("✗", Color::Red),
     }
@@ -191,18 +198,22 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             for item in items {
                 // in_progress shows its activeForm (what's happening now);
                 // the others show the plain content.
-                let (mark, color, text, style) = match item.status {
-                    TodoStatus::Completed => ("✓", Color::Green, &item.content, DIM),
+                // Done green, in-progress cyan (an active status indicator),
+                // pending dim — no yellow/dark-gray foregrounds (styles.md).
+                let (mark, mark_style, text, style) = match item.status {
+                    TodoStatus::Completed => {
+                        ("✓", Style::new().fg(Color::Green), &item.content, DIM)
+                    }
                     TodoStatus::InProgress => (
                         "▶",
-                        Color::Yellow,
+                        Style::new().fg(Color::Cyan),
                         &item.active_form,
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
-                    TodoStatus::Pending => ("○", Color::DarkGray, &item.content, DIM),
+                    TodoStatus::Pending => ("○", DIM, &item.content, DIM),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {mark} "), Style::new().fg(color)),
+                    Span::styled(format!("  {mark} "), mark_style),
                     Span::styled(truncate(text, width.saturating_sub(4)), style),
                 ]));
             }
@@ -220,8 +231,96 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 lines.push(Line::from(Span::styled(l, DIM)));
             }
         }
+        Cell::SessionHeader {
+            model,
+            cwd,
+            branch,
+            mode,
+        } => {
+            lines.extend(session_header_lines(
+                model,
+                cwd,
+                branch.as_deref(),
+                mode,
+                width,
+            ));
+        }
     }
     lines
+}
+
+/// The opening session banner (plan 38 slice 6): a rounded box (`╭─╮ │ ╰─╯`) in
+/// the brand colour, titled `>_ kloop`, listing the model, cwd, branch (omitted
+/// off a repo), and starting mode as dim-label / default-value rows. The box
+/// width fits the content, capped so it never spans an ultra-wide terminal.
+fn session_header_lines(
+    model: &str,
+    cwd: &str,
+    branch: Option<&str>,
+    mode: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    const MAX_W: usize = 72;
+    const LABEL_W: usize = 8; // "branch" + padding, the widest label
+    let mut fields: Vec<(&str, &str)> = vec![("model", model), ("cwd", cwd)];
+    if let Some(b) = branch {
+        fields.push(("branch", b));
+    }
+    fields.push(("mode", mode));
+
+    // Inner width = the widest of the title and the label+value rows, capped to
+    // the terminal (minus the two border columns) and MAX_W.
+    let title = ">_ kloop";
+    let content_w = fields
+        .iter()
+        .map(|(_, v)| LABEL_W + display_width(v))
+        .chain(std::iter::once(display_width(title)))
+        .max()
+        .unwrap_or(0);
+    let cap = width.saturating_sub(2).clamp(1, MAX_W);
+    let inner = content_w.min(cap);
+
+    let brand = Style::new().fg(BRAND);
+    let mut lines = Vec::new();
+    // Top border.
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(inner + 2)),
+        brand,
+    )));
+    // Title row (bold brand), one space of padding inside the border.
+    lines.push(boxed_row(
+        vec![Span::styled(
+            truncate(title, inner),
+            brand.add_modifier(Modifier::BOLD),
+        )],
+        inner,
+        brand,
+    ));
+    // Field rows: dim label column, default-weight value.
+    for (label, value) in fields {
+        let label_span = Span::styled(format!("{label:<LABEL_W$}"), DIM);
+        let value_span = Span::raw(truncate(value, inner.saturating_sub(LABEL_W).max(1)));
+        lines.push(boxed_row(vec![label_span, value_span], inner, brand));
+    }
+    // Bottom border.
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner + 2)),
+        brand,
+    )));
+    lines
+}
+
+/// One `│ …content… │` row of the session banner: the brand verticals with a
+/// space of padding, the content spans padded on the right to `inner` columns.
+fn boxed_row(content: Vec<Span<'static>>, inner: usize, brand: Style) -> Line<'static> {
+    let used: usize = content.iter().map(|s| display_width(&s.content)).sum();
+    let mut spans = vec![Span::styled("│ ".to_string(), brand)];
+    spans.extend(content);
+    if used < inner {
+        spans.push(Span::raw(" ".repeat(inner - used)));
+    }
+    spans.push(Span::styled(" │".to_string(), brand));
+    Line::from(spans)
 }
 
 /// The uncommitted tail as flat display lines (each cell via [`cell_lines`]),
@@ -333,10 +432,8 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
         return None;
     }
     let glyph = crate::anim::spinner_glyph(hud.phase, hud.reduced_motion);
-    let mut spans = vec![Span::styled(
-        format!("{glyph} "),
-        Style::new().fg(Color::Cyan),
-    )];
+    // The working spinner is kloop's brand presence (CC's brand-coloured spinner).
+    let mut spans = vec![Span::styled(format!("{glyph} "), Style::new().fg(BRAND))];
     spans.extend(crate::anim::shimmer_spans(
         "Working",
         hud.phase,
@@ -370,26 +467,38 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
             DIM,
         ));
     }
-    let mode = format!("[{}]  ", app.mode.label());
-    let left = if app.running {
-        format!("{mode}esc to interrupt · Ctrl+C to exit")
+    // The mode badge carries the brand accent (CC's brand-coloured mode line);
+    // the hints stay dim so only the badge draws the eye.
+    let badge = format!("[{}]  ", app.mode.label());
+    let hints = if app.running {
+        "esc to interrupt · Ctrl+C to exit".to_string()
     } else {
-        format!("{mode}shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit")
+        "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
     };
     // Right-aligned system status; dropped if the row is too narrow to fit it
-    // after the hints (the hints matter more).
+    // after the badge + hints (those matter more).
     let right = system_status(app);
-    let lw = display_width(&left);
+    let lw = display_width(&badge) + display_width(&hints);
     let rw = display_width(&right);
+    let badge_span = Span::styled(badge.clone(), Style::new().fg(BRAND));
     if !right.is_empty() && lw + 3 + rw <= width {
         let pad = width - lw - rw;
         Line::from(vec![
-            Span::styled(left, DIM),
+            badge_span,
+            Span::styled(hints, DIM),
             Span::styled(" ".repeat(pad), DIM),
             Span::styled(right, DIM),
         ])
+    } else if display_width(&badge) < width {
+        Line::from(vec![
+            badge_span,
+            Span::styled(truncate(&hints, width - display_width(&badge)), DIM),
+        ])
     } else {
-        Line::from(Span::styled(truncate(&left, width), DIM))
+        Line::from(Span::styled(
+            truncate(&badge, width),
+            Style::new().fg(BRAND),
+        ))
     }
 }
 
@@ -655,9 +764,36 @@ fn confirm_body_lines(
         .collect();
     if let Some(preview) = &req.preview {
         lines.push(Line::default());
+        // A GitHub-style `+N -M` summary above the diff body (plan 38 slice 6).
+        if let Some(stats) = diff_stats_line(preview) {
+            lines.push(stats);
+        }
         lines.extend(diff_preview_lines(preview, inner_w));
     }
     lines
+}
+
+/// The `+N -M` change summary for a diff preview: additions green, deletions
+/// red. `None` when the preview has no +/- lines (e.g. an oversized-overwrite
+/// note), so no summary row is shown.
+fn diff_stats_line(preview: &str) -> Option<Line<'static>> {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in preview.lines() {
+        match line.chars().next() {
+            Some('+') => added += 1,
+            Some('-') => removed += 1,
+            _ => {}
+        }
+    }
+    if added == 0 && removed == 0 {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::styled(format!("+{added}"), Style::new().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("-{removed}"), Style::new().fg(Color::Red)),
+    ]))
 }
 
 /// The pinned action line(s): the yellow y/a/p/n key hints.
@@ -672,9 +808,10 @@ fn confirm_option_lines(
         ),
         None => "y allow once · n deny".to_string(),
     };
+    // Cyan action bar — an input tip prompting the choice (styles.md), not yellow.
     wrap(&options, inner_w)
         .into_iter()
-        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Cyan))))
         .collect()
 }
 
@@ -797,9 +934,16 @@ mod tests {
             preview: Some("+1  hello\n+2  world".into()),
         };
         let body: Vec<String> = confirm_body_lines(&req, 40).iter().map(line_text).collect();
+        // A `+N -M` stats summary (plan 38 slice 6) precedes the diff body.
         assert_eq!(
             body,
-            vec!["write_file: notes.txt", "", "+1  hello", "+2  world"]
+            vec![
+                "write_file: notes.txt",
+                "",
+                "+2 -0",
+                "+1  hello",
+                "+2  world"
+            ]
         );
 
         let opts = confirm_option_lines(&req, 40);
@@ -807,8 +951,8 @@ mod tests {
             opts.iter().map(line_text).collect::<Vec<_>>(),
             vec!["y allow once · n deny"]
         );
-        // Options are yellow so they read as the action bar.
-        assert_eq!(opts[0].spans[0].style, Style::new().fg(Color::Yellow));
+        // Options are cyan (an input-tip action bar, styles.md), not yellow.
+        assert_eq!(opts[0].spans[0].style, Style::new().fg(Color::Cyan));
     }
 
     /// End-to-end through a real ratatui frame (TestBackend, no TTY): a diff
@@ -982,6 +1126,129 @@ mod tests {
         assert!(menu_row < prompt_row, "menu above composer:\n{screen}");
     }
 
+    /// The session banner (plan 38 slice 6): a rounded brand-coloured box titled
+    /// `>_ kloop`, one dim-label row per field, branch present when on a repo.
+    #[test]
+    fn session_header_renders_a_branded_box_with_fields() {
+        let lines = session_header_lines(
+            "claude-sonnet-4-6",
+            "~/work/kloop",
+            Some("main"),
+            "manual",
+            80,
+        );
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts[0].starts_with('╭') && texts[0].ends_with('╮'),
+            "{texts:?}"
+        );
+        assert!(
+            texts.last().unwrap().starts_with('╰') && texts.last().unwrap().ends_with('╯'),
+            "{texts:?}"
+        );
+        assert!(texts[1].contains(">_ kloop"), "{texts:?}");
+        let has = |k: &str, v: &str| texts.iter().any(|t| t.contains(k) && t.contains(v));
+        assert!(has("model", "claude-sonnet-4-6"), "{texts:?}");
+        assert!(has("cwd", "~/work/kloop"), "{texts:?}");
+        assert!(has("branch", "main"), "{texts:?}");
+        assert!(has("mode", "manual"), "{texts:?}");
+        // The border and title carry the brand accent, the title is bold.
+        assert_eq!(lines[0].spans[0].style.fg, Some(BRAND));
+        assert!(lines[1].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    /// Off a git repo the branch row is omitted (the header is built with
+    /// `branch = None`); the other rows still render.
+    #[test]
+    fn session_header_omits_branch_off_a_repo() {
+        let texts: Vec<String> = session_header_lines("m", "/tmp/x", None, "plan", 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(!texts.iter().any(|t| t.contains("branch")), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("cwd") && t.contains("/tmp/x")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("plan")), "{texts:?}");
+    }
+
+    /// The `+N -M` diff summary counts `+`/`-` lines (green/red) and is absent
+    /// when the preview has no diff lines (e.g. an oversized-overwrite note).
+    #[test]
+    fn diff_stats_counts_additions_and_deletions() {
+        let line = diff_stats_line(" 1  ctx\n-2  old\n+2  new\n+3  more").unwrap();
+        let spans: Vec<(String, Option<Color>)> = line
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg))
+            .collect();
+        assert_eq!(spans[0], ("+2".to_string(), Some(Color::Green)));
+        assert_eq!(spans[2], ("-1".to_string(), Some(Color::Red)));
+        assert!(diff_stats_line("(overwriting existing file, 999 bytes)").is_none());
+    }
+
+    /// The todo palette (plan 38 slice 6): completed green, in-progress cyan, and
+    /// pending dim — no yellow or dark-gray foregrounds (styles.md).
+    #[test]
+    fn todo_marks_use_the_status_palette() {
+        use kloop_core::tools::TodoItem;
+        let item = |status| TodoItem {
+            content: "c".into(),
+            active_form: "a".into(),
+            status,
+        };
+        let cells = vec![Cell::Todo(vec![
+            item(TodoStatus::Completed),
+            item(TodoStatus::InProgress),
+            item(TodoStatus::Pending),
+        ])];
+        let lines = transcript_lines(&cells, 40);
+        // lines[0] is the "todos" header; [1..4] the marks.
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[2].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(lines[3].spans[0].style.fg, None); // pending: dim, no fg
+        assert!(lines[3].spans[0].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// End-to-end (TestBackend): the session banner inserted as the first cell
+    /// renders its box and fields into the viewport.
+    #[test]
+    fn draw_shows_the_session_header() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new("s".into());
+        app.cells.insert(
+            0,
+            Cell::SessionHeader {
+                model: "sonnet-5".into(),
+                cwd: "~/work/kloop".into(),
+                branch: Some("main".into()),
+                mode: "manual".into(),
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains(">_ kloop"), "{screen}");
+        assert!(screen.contains("sonnet-5"), "{screen}");
+        assert!(screen.contains("main"), "{screen}");
+        assert!(screen.contains('╭') && screen.contains('╯'), "{screen}");
+    }
+
     #[test]
     fn diff_preview_colors_lines_by_sign() {
         let lines = diff_preview_lines(" 1  ctx\n-2  old\n+2  new\n⋮", 40);
@@ -1010,6 +1277,10 @@ mod tests {
         // Idle: footer has the badge + hints; no activity line.
         assert!(line_text(&footer_line(&app, 80)).starts_with("[manual]  "));
         assert!(line_text(&footer_line(&app, 80)).contains("shift+Tab"));
+        // The badge carries the brand accent; the hints stay dim.
+        let footer = footer_line(&app, 80);
+        assert_eq!(footer.spans[0].style.fg, Some(BRAND));
+        assert_eq!(footer.spans[1].style, DIM);
         assert!(activity_line(&app, &hud).is_none());
         assert!(!has_activity_line(&app));
 

@@ -274,14 +274,25 @@ the input — while every finalized cell scrolls up into the terminal's **native
 scrollback**, so the mouse wheel, text selection, and Cmd+F reach history
 directly (the UI keeps no scroll of its own). Tool calls render as
 human-readable rows (plan 38 slice 2, `crates/tui/src/toolrow.rs`): a
-status-marked verb and its key argument — `● Bash $ ls -la` (running, yellow),
+status-marked verb and its key argument — `● Bash $ ls -la` (running, cyan),
 `✓ Read src/main.rs`, `✓ Grep TODO in src`, `✗ Write notes.txt` (failed, red),
 an MCP `server__tool` verbatim — over a few lines of the result indented under a
 `└` gutter (double-limited by lines and chars, control chars sanitized, the rest
 left in history/offload). `edit_file` shows a one-line `- old` / `+ new` diff
 from its input instead. Permission prompts appear as a centered y/a/p/n popup
-over the viewport; prompts from a concurrent tool batch queue and are answered
-in order.
+over the viewport, its diff carrying a GitHub-style `+N -M` summary (green/red)
+above the line-numbered body (plan 38 slice 6); prompts from a concurrent tool
+batch queue and are answered in order.
+
+The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
+box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
+scrolls into scrollback as the conversation grows. Colour follows a fixed
+theme-safe palette (styles.md rules): ANSI **magenta** is kloop's brand accent
+(the banner, the working spinner, the mode badge), **cyan** marks input/
+selection/status (the `›` prompt, running tool marks, the approval action bar),
+**green**/**red** are success/additions and errors/deletions, and secondary text
+is dim — no yellow, dark-gray, blue, or white foregrounds, which theme
+unreliably across terminals.
 
 Assistant messages render as **markdown** (plan 38 slice 1, `crates/tui/src/markdown.rs`
 via `pulldown-cmark`): headings and `**bold**`/`*italic*`/`~~strike~~` weight,
@@ -289,7 +300,7 @@ inline `code` and fenced code blocks over a dim background, ordered and unordere
 lists with a hanging indent, block quotes with a `│` bar, and GitHub-style tables
 drawn with box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single
 newline inside a paragraph reflows to a space (CommonMark soft break), so answers
-re-wrap to the terminal width. Code-block syntax highlighting (syntect) is
+re-wrap to the terminal width. Code-block syntax highlighting (`synoptic`) is
 deliberately deferred to a later slice — the source shows raw for now. While a
 message is still streaming, only the part up to the last **stable boundary** (a
 blank line, or a closed code fence) is rendered as markdown; the forming tail

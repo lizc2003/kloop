@@ -74,7 +74,8 @@ fn header_line(name: &str, input: &str, status: ToolStatus, width: usize) -> Lin
 
 fn tool_mark(status: ToolStatus) -> (&'static str, Color) {
     match status {
-        ToolStatus::Running => ("●", Color::Yellow),
+        // Running is a cyan status indicator (styles.md), not yellow.
+        ToolStatus::Running => ("●", Color::Cyan),
         ToolStatus::Ok => ("✓", Color::Green),
         ToolStatus::Failed => ("✗", Color::Red),
     }
@@ -284,8 +285,8 @@ mod tests {
             40,
         );
         assert_eq!(texts(&lines), vec!["● Bash $ ls -la"]);
-        // Running mark is yellow, verb bold.
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Yellow));
+        // Running mark is cyan (status indicator), verb bold.
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
         assert!(lines[0].spans[1]
             .style
             .add_modifier

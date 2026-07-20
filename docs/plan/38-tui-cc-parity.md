@@ -242,7 +242,7 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 - 未做(记为可能性):thinking 动词与 spinner 动词同源池(现固定 "Working"/"Thinking",没做 CC 式随机动词)、footer 双行独立布局(现复用 composer+footer 两行结构,系统状态挤右侧)、`last_note` 进 HUD(字段留着未用)、context gauge 精确到 token 数(现只显 %)。
 - 教训沉淀:HANDOFF 教训 44(pure App 无时钟→计时在 loop + Hud 喂参;tokio select 卫词即 FrameRequester,不必自研;shimmer 用亮度不押色相主题安全)。
 
-### 切片 6 — 会话头 + 配色体系 + diff 升级
+### 切片 6 — 会话头 + 配色体系 + diff 升级 ✅ 完成(2026-07-17)
 
 开场 `SessionHeader` cell(圆角框 `╭─╮`:`>_ kloop`、model、cwd、branch、mode);`styles.md`
 色规全面落地(cyan=输入/选中/状态,green=成功/新增,red=错误/删除,magenta=品牌,标题 bold,
@@ -253,6 +253,34 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
 配色叠在 `CODE_BG` 上;可与本片一起做,或拆成独立高亮小片(实现未开工,只定了库)。
 
 - 验收:开场头美观、全局配色一致、diff 可读。
+
+**开工时定拍板(2026-07-17,问用户)**:**品牌强调色 = magenta**(styles.md 明确留给品牌的槽,
+主题安全,与关键决定 5「不用自定义色/不做终端色探测」一致;不取橙色——橙是自定义色、异色主题下
+对比无保证)。**synoptic 语法高亮拆成独立小片(切片 7)**,本片 diff 升级不含高亮(避免高亮反复
+改 diff、每块能独立验收)。
+
+**完成记录(2026-07-17,提交 3ad6195)**:
+- **品牌语义切法**:magenta = kloop 自身在场(会话头框+标题、running spinner、footer mode 徽标);
+  cyan = 用户/状态/选中(composer `›`、user `>`、running 工具/子 agent 标记 `●`/`…`、todo 进行中 `▶`、
+  审批 y/a/p/n 动作条、菜单选中);green/red = 成功·新增 / 错误·删除;dim = 次要(todo pending `○`)。
+  **消掉所有 yellow/DarkGray 前景**(status_mark/tool_mark 的 running、todo InProgress/Pending、confirm
+  option bar),新增 `render.rs` `const BRAND = Color::Magenta`。
+- **会话头 `Cell::SessionHeader{model,cwd,branch,mode}`**(app.rs 新变体)+ `render::session_header_lines`
+  (纯:圆角框 `╭─╮│╰╯`、标题 `>_ kloop` bold brand、dim label 列 + default 值、按内容自适应宽 `MAX_W=72`、
+  off-repo 省 branch 行)。**在 `lib.rs run()` 构造**(git/env 副作用留在这、渲染保持纯):`display_cwd`
+  把 `$HOME` 缩成 `~`、`git_branch` best-effort `rev-parse --abbrev-ref HEAD`(非仓库/失败即省行)、mode 取
+  `permissions.mode().label()`;`insert(0, header)` 作首 cell(resume 也领起回放),随转录溢出落 scrollback。
+- **diff `+N -M` 统计**:`render::diff_stats_line` 数 preview 里 `+`/`-` 开头行(green/red),插在 confirm
+  popup 描述与 diff 体之间;无 diff 行(如「overwriting existing file」提示)则不出统计行。**只在 TUI 渲染层
+  加,不动 core `diff.rs` 线格式**(plain/server 共用的 preview 字节不变,避免 core/permissions 测试大改)。
+- **验收**:fmt + clippy(`-D warnings`)+ 全 workspace test 绿(tui 117 测试,新增 session_header 结构/brand
+  色/off-repo 省 branch、draw 端到端会话头、diff_stats 计数+green/red+无 diff 行返 None、todo 色板、footer 徽标
+  brand;更新 confirm body 含统计行、option bar 改 cyan、tool_mark running 改 cyan)。真 key **双轨** PTY+pyte
+  各 3 场景:①启动会话头(magenta 框/标题/徽标、cyan `›`、无 yellow)②bypass 真 turn(magenta spinner、`✓ Bash`
+  green、`└ pineapple` 预览、无 yellow)③manual 编辑审批弹层(`+1 -1` green/red 统计 + 行号 diff + cyan 动作条,
+  答 n 拒)。
+- 教训沉淀:HANDOFF 教训 45(品牌色语义切法 magenta=agent/cyan=user·status;会话头 git/env 副作用留 run()、
+  渲染纯;diff 统计只加 TUI 层不动 core 线格式)。
 
 ## 不做(裁剪,记为可能性)
 
@@ -274,5 +302,8 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
 - ~~关键决定 2:syntect 代码高亮引入 vs 后置~~(✅ 切片 1 拍板**后置**:代码块先做暗底,高亮留独立小片)。
   ~~高亮用哪个库~~(✅ 2026-07-17 定 **synoptic** 替 syntect,轻量纯 Rust;理由见关键决定 2)。
 - ~~切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)~~(✅ 定:bullet `●`(running,黄)/`✓`/`✗`,结果 gutter `└ `/`    `;对着真 key 调过,对齐、消毒制表符)。
-- **品牌强调色**定 magenta/cyan(styles.md 建议)还是**橙**(靠拢 CC 截图);gutter 提示符
-  `›`、mode 行 `⏵⏵`、thinking `∗` 等具体字形对着真 key 调。
+- ~~**品牌强调色**定 magenta/cyan 还是**橙**~~(✅ 2026-07-17 切片 6 拍板 **magenta**:styles.md 留给
+  品牌的槽,主题安全,与关键决定 5 一致;不取橙,橙是自定义色异色主题对比无保证)。语义切法:magenta =
+  kloop 在场(会话头/spinner/mode 徽标),cyan = 用户·状态·选中(`›`/`>`/工具标记/审批条/菜单选中)。
+  ~~gutter 提示符 `›`、mode 行~~ 已对真 key 双轨调过。
+- **切片 7(独立高亮小片)**:synoptic 代码块 + diff 语法高亮(库已定,切片 6 拆出未做)。

@@ -79,6 +79,17 @@ pub enum Cell {
     /// Output of a slash command — a wrapped, dim multi-line block (unlike a
     /// Note, which collapses to one truncated line).
     System(String),
+    /// The opening session banner (plan 38 slice 6): a rounded box with the
+    /// brand title plus the model, cwd, branch, and starting mode. Built once in
+    /// `run` with display-ready strings (the git/env reads happen there, keeping
+    /// the renderer pure) and prepended to the transcript, so it is the first
+    /// thing that scrolls into scrollback.
+    SessionHeader {
+        model: String,
+        cwd: String,
+        branch: Option<String>,
+        mode: String,
+    },
 }
 
 /// A permission prompt currently waiting for a keypress. Prompts queue:
