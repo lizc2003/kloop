@@ -176,7 +176,23 @@ pub async fn run(
         pending_images,
     ));
 
-    let mut terminal = setup_terminal()?;
+    // Setup can fail AFTER raw mode is enabled (e.g. the inline viewport's CPR
+    // probe times out on a PTY that never answers, or an intermediate write
+    // fails). A bare `?` here would return without restoring the terminal or
+    // tearing down a `--worktree` tree — leaving the shell in raw mode and
+    // leaking the worktree on disk (there is no Drop-based cleanup). So on
+    // failure run the same teardown the normal exit does, then propagate.
+    let mut terminal = match setup_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            restore_terminal();
+            worker.abort();
+            if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
+                eprintln!("{}", note.trim());
+            }
+            return Err(e);
+        }
+    };
     let result = ui_loop(
         &mut terminal,
         event_rx,
