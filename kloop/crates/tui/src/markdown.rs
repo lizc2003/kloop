@@ -35,6 +35,9 @@ use crate::render::wrap;
 /// foregrounds from a styles.md-safe palette (slice 7, [`token_style`]).
 const CODE_BG: Color = Color::Indexed(236);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// Tab stop for code blocks — passed to synoptic (which expands tabs) and used
+/// to expand tabs in the unhighlighted path, so both keep indentation.
+const TAB_WIDTH: usize = 4;
 
 /// One character carrying the inline style it was emitted with. The inline
 /// builder accumulates these, then wraps them into [`Line`]s at width.
@@ -671,7 +674,7 @@ fn highlight_code(body: &str, lang: Option<&str>) -> Vec<Chars> {
     let base = Style::new().bg(CODE_BG);
     let lines: Vec<String> = body.split('\n').map(str::to_string).collect();
     let highlighter = lang.and_then(lang_to_ext).map(|ext| {
-        let mut h = synoptic::from_extension(ext, 4).expect("from_extension is total");
+        let mut h = synoptic::from_extension(ext, TAB_WIDTH).expect("from_extension is total");
         h.run(&lines);
         h
     });
@@ -690,7 +693,15 @@ fn highlight_code(body: &str, lang: Option<&str>) -> Vec<Chars> {
                     text.chars().map(move |c| (c, style)).collect::<Chars>()
                 })
                 .collect(),
-            None => raw.chars().map(|c| (c, base)).collect(),
+            // No highlighter: expand tabs to spaces to match synoptic's tab
+            // handling (a raw '\t' is zero-width, so ratatui drops it and the
+            // indentation vanishes — an unhighlighted block would otherwise lose
+            // the indent a highlighted one keeps). Same reason toolrow sanitizes.
+            None => raw
+                .replace('\t', &" ".repeat(TAB_WIDTH))
+                .chars()
+                .map(|c| (c, base))
+                .collect(),
         })
         .collect()
 }
@@ -1129,6 +1140,20 @@ mod tests {
             );
             assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG));
         }
+    }
+
+    /// An unhighlighted (unknown-language / bare) code block expands tabs to
+    /// spaces so its indentation survives — a raw '\t' is zero-width and would
+    /// otherwise be dropped, unlike a highlighted block where synoptic expands
+    /// tabs. Both keep the indent, consistently.
+    #[test]
+    fn unhighlighted_code_block_expands_tabs() {
+        let lines = markdown_lines("```makefile\n\tall:\n```", 40);
+        assert!(
+            texts(&lines)[0].starts_with("    all:"),
+            "tab expanded to 4 spaces: {:?}",
+            texts(&lines)
+        );
     }
 
     #[test]
