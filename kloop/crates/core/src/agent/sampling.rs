@@ -56,6 +56,7 @@ pub(super) async fn sample_with_retry(
     cancel: &CancellationToken,
     stream_text: bool,
     depth: u8,
+    item_seq: &mut u64,
 ) -> Sampled {
     // Project instructions, the (depth-0) skills catalog, and the deferred-tools
     // notice ride every request as a synthetic first user message. Never
@@ -72,7 +73,21 @@ pub(super) async fn sample_with_retry(
         None => messages,
     };
     for attempt in 0..MAX_ATTEMPTS {
-        match sample_once(cfg, model, messages, tools, ui, cancel, stream_text).await {
+        // Reborrow: a retry within this turn keeps counting up from the same
+        // sequence, so a message that only lands on the second attempt still
+        // gets a fresh id.
+        match sample_once(
+            cfg,
+            model,
+            messages,
+            tools,
+            ui,
+            cancel,
+            stream_text,
+            &mut *item_seq,
+        )
+        .await
+        {
             Ok(ok) => return Sampled::Ok(ok),
             Err(SampleError::Cancelled) => return Sampled::Cancelled,
             // Retrying an oversized request verbatim can never succeed; hand
@@ -112,6 +127,7 @@ async fn sample_once(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
+    item_seq: &mut u64,
 ) -> Result<SampleOk, SampleError> {
     // effective_system: working-directory line rewritten to the active
     // worktree when the session entered one (plan 35 slice 2).
@@ -121,11 +137,11 @@ async fn sample_once(
     // Open assistant/reasoning items, one of each at a time: a delta opens the
     // item (front-ends see `ItemStarted`), later deltas stream into it, and its
     // `BlockDone` finalizes it. A sub-agent (`stream_text` false) emits no
-    // message items — its text is internal. Ids are turn-local; slice 1 makes
-    // them turn-unique. See [`crate::event`].
+    // message items — its text is internal. `item_seq` is owned by the turn
+    // (threaded from `turn_rounds`), so ids are turn-unique, not per-round. See
+    // [`crate::event`].
     let mut text_item: Option<String> = None;
     let mut think_item: Option<String> = None;
-    let mut item_seq = 0u64;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Err(SampleError::Cancelled),
@@ -139,7 +155,7 @@ async fn sample_once(
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
                     if stream_text {
-                        let id = open_item(&mut text_item, &mut item_seq, "msg", ui, || {
+                        let id = open_item(&mut text_item, item_seq, "msg", ui, || {
                             Item::AssistantMessage { text: String::new() }
                         });
                         ui.emit(&Event::ItemDelta { id, delta: Delta::Text(t) });
@@ -147,7 +163,7 @@ async fn sample_once(
                 }
                 Some(Ok(StreamEvent::ThinkingDelta(t))) => {
                     if stream_text {
-                        let id = open_item(&mut think_item, &mut item_seq, "reasoning", ui, || {
+                        let id = open_item(&mut think_item, item_seq, "reasoning", ui, || {
                             Item::Reasoning { text: String::new() }
                         });
                         ui.emit(&Event::ItemDelta { id, delta: Delta::Reasoning(t) });

@@ -678,7 +678,7 @@ pub(crate) fn config_from_env(
         active_worktree: Arc::new(std::sync::RwLock::new(None)),
         // Worktree mode (enter/exit tools) is on everywhere but --mock (which is
         // hermetic, no git). Server threads support it too — each thread gets
-        // its own active-worktree slot and a `thread/worktree` notification on
+        // its own active-worktree slot and a `thread/cwd/updated` notification on
         // switch. (The `--worktree` startup flag is still single-session only;
         // main.rs rejects it with --serve.)
         worktree_enabled: !args.mock,

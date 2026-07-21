@@ -150,7 +150,7 @@ fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-s
 | 切片 | 内容 | 验证 |
 |---|---|---|
 | **0 ✅** | core 事件模型重构(§二) | 现有测试全绿=无回归 |
-| **1** | 原生 wire v1 + 握手 + 主链 + 统一审批 + `app-server` 入口(§三) | 契约测试 + 真 key 冒烟 |
+| **1 ✅** | 原生 wire v1 + 握手 + 主链 + 统一审批 + `app-server` 入口(§三) | 契约测试 + `--mock` 冒烟 + 真 key anthropic 轨冒烟 |
 | **2** | **app 分支适配主链**:`桌面前端仓库` 开分支,改 `worker.rs`(换协议)+ 前端 `chatIngest`(消费新事件)+ 指向 kloop 引擎 | **真 app 端到端**:发消息→流式→工具→审批→结果 |
 | **3** | 会话管理:`thread/resume|list|read|fork|rollback|compact/start|name/set|goal/*|archive|search` + app 适配 | 契约 + app 会话列表/恢复/fork |
 | **4** | config/model/skills/mcp 只读 + 降级兜底:`model/list`/`config/read|write`/`mcpServerStatus/list`/`skills/list` + app 适配 | app 模型选择器/设置面板不卡 |
@@ -189,3 +189,15 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 - **三前端投影 `Event`**:TUI `App::apply_core`(`AgentEvent::Core(Event)` 分派,cells 逻辑不变;子 agent todo 过滤从 ChannelUi 下移到 App)、server `ThreadUi::emit` + headless `JsonUi::emit`(翻回旧 wire **字节不变**)、plain `StdoutUi::emit`(text/reasoning 打印 + todo 清单 + `as_note` 兜底)。turn 括号(TurnStarted/Usage/TurnEnded)由各前端 worker 自造,不走 emit 缝。
 - **验证**:fmt + clippy(-D warnings)+ 全工作区 test 全绿(core 359 / tui 126 / server 16 / cli headless 等);`cargo run -p kloop -- --mock` 与 `--mock --serve` 活体冒烟——plain 输出、server 通知 wire 逐字节与旧版一致。**唯一测试改动**:旧 `--json` 契约测试里手写的假 `summary`("ls")改成真实值(完整 input JSON 截断,真实 `run_one` 一直如此)。教训见 HANDOFF #37。
 - 提交:本次(plan 39 切片 0,见 git log)。
+
+### 切片 1 ✅(2026-07-21,提交见下)
+
+原生 wire v1 落地——旧自创协议连根删,server/headless 重写到标准 JSON-RPC 2.0 + 握手 + item 事件投影 + 统一审批 + `app-server` 入口。开工前拍板(对话):审批 decision 用 `accept/acceptForSession/acceptAlways/decline` 四档(对齐内部 `Decision`,不丢 `AllowAlways` 持久化能力;`cancel`/未知/丢失都按 `decline`,中断整 turn 走 `turn/interrupt`)。
+
+- **core 收尾两处 slice-0 挂账(§3.8)**:① `todo_write` 去双发——`run_one` 对 `todo_write` **不发 `ToolCall` 三态**(`tool_row = name != "todo_write"` 守卫两处 emit),只留 `todo.rs` 的 `Todo` item;各前端 skip 特判全删(TUI `apply_core`、`StdoutUi`、server/headless 天然随投影收敛)。② item id turn-unique——`item_seq` 从 `sample_once` 局部上移到 `turn_rounds` 拥有,穿过 `sample_with_retry`(`&mut *item_seq` reborrow)进 `sample_once`,`msg-N`/`reasoning-N` turn 内单调不跨 round 复位(`--mock` 冒烟见 msg-0..msg-5)。
+- **`crates/server/src/wire.rs` 重写**:所有信封加 `"jsonrpc":"2.0"`;新增**共享投影** `project_event(ev, turn_id) -> Option<(method, params)>`(`item/started|delta|completed` 的 `item` 序列化成 camelCase `type` tag + `id`/`status`/字段,tool 双发都带全 `input`、`output`/`agent` present 才出;`Usage`→`thread/tokenUsage/updated`、`CwdChanged`→`thread/cwd/updated`、`Note`/`ModeChanged`→`note`;turn 括号返 `None` 由 worker 造)+ `turn_started_params`/`turn_completed_params`(`{turn:{id,status,error?}}`)。`PROTOCOL_VERSION="1.0"`。
+- **`crates/server/src/lib.rs`**:`initialize` 握手(版本不匹配 `INVALID_PARAMS` 硬报错、`initialized` 门 gate 其余方法)+ 结构化 `capabilities{streaming,subagents,mcp,images,approvals}`;`turn/start` 分配数字 turn id(每 thread `turn_seq` 从 1)、published 进 thread 共享 `turn` 槽给 `turn/steer` 读、返 `{turn:{id}}`;`parse_input` 收 string 或 content-part 数组(text 拼、image 走 `user_with_blocks`);worker 抽 `run_turn_or_command`、bracket 由 worker 造(`turn/started`→…→`Usage` emit→`turn/completed`);`ThreadUi::emit` 收敛成一句 `project_event`;审批 reverse request 数字 id + `kind`(`preview.is_some()` 判 fileChange/command)+ 四档 decision 映 `Decision`。thread/start|resume|fork 返 `{thread:{id}}`。
+- **`crates/cli/src/headless.rs`**:`JsonUi::emit` 换 `kloop_server::project_event`(turn id 恒 1)、bracket 用 re-export 的 `turn_started_params`/`turn_completed_params` + `Usage` emit;"一套词汇两前端"从"复用旧形状"升级成"复用同一 `project_event`"。
+- **`crates/cli`**:`kloop app-server` 位置子命令(main 早分支把首 token `app-server` 改写成 `--serve`,复用全部 flag 处理;`app-server --mock` 可跑)+ `--serve` 别名保留;help/README 同步。
+- **验证**:fmt + clippy(-D warnings)+ 全工作区 test 全绿(server 契约 17 + wire 单测 6 重写:握手 gate/版本不匹配/item 事件序列/统一审批四档/steer 回 turnId/interrupt/坏 JSON 不崩/fork/resume/slash);`cargo run -p kloop -- app-server --mock` 同步驱动冒烟——握手回 capabilities、thread/start 回 `{thread:{id}}`、整 demo turn 的 item 流(turn-unique msg-N、todo 单 item 无 tool 行、toolCall 全 input+output、subAgent 生命周期、tokenUsage、`turn/completed{status}`)全对。**真 key anthropic 轨冒烟已过**(Python 同步客户端驱动真 `app-server`,经代理真采样):① 默认沙箱下真 turn——握手/`{thread:{id}}`/`{turn:{id:1}}`/toolCall(bash)全 input+output/assistantMessage turn-unique `msg-0` delta+封口/`thread/tokenUsage/updated`/`turn/completed{completed}`,模型真写文件内容正确;顺带证 sandbox auto-allow 联动仍生效(写 cwd 内文件的 bash 被沙箱兜住、审批 0 次)。② `KLOOP_SANDBOX=off` 下 write_file 两次跑 **审批 reverse request 双路径**——`approval/request{kind:"fileChange",preview:"(new file)\n+1  …",rememberRules:["write_file(*)"]}`,回 `accept`→`completed`+文件写入、回 `decline`→`failed`+is_error tool_result+文件不存在,turn 续跑 `completed`。
+- 提交:本次(plan 39 切片 1,见 git log)。

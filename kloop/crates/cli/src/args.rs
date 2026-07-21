@@ -228,13 +228,14 @@ pub(crate) fn help_text() -> &'static str {
      USAGE:\n\
      \x20   kloop [OPTIONS]              start the interactive TUI (default)\n\
      \x20   kloop --headless [OPTS] [PROMPT]  run one turn headless, then exit\n\
-     \x20   kloop --serve                multi-session JSON-RPC server on stdio\n\
+     \x20   kloop app-server             native agent protocol server on stdio\n\
      \x20   kloop mcp login <name>       OAuth login to a remote MCP server\n\
      \n\
      MODES:\n\
      \x20       --headless        run one turn without a REPL/TUI, then exit\n\
      \x20       --plain           line-based REPL instead of the TUI\n\
-     \x20       --serve           JSON-RPC server over stdio\n\
+     \x20       --serve           native agent protocol server over stdio\n\
+     \x20                         (also as the `app-server` subcommand)\n\
      \x20       --mock            keyless scripted demo (hermetic)\n\
      \n\
      HEADLESS (--headless only):\n\

@@ -25,11 +25,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::event::tool_summary;
-use kloop_core::event::Delta;
 use kloop_core::event::Event;
-use kloop_core::event::Item;
-use kloop_core::event::ItemStatus;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
@@ -66,16 +62,8 @@ pub(crate) fn exit_code(reason: &EndReason) -> i32 {
     }
 }
 
-/// The `turn/completed` notification params for a turn's end reason, matching
-/// the server's `turn_completed_params` shape verbatim (one wire, two uses).
-fn turn_completed_params(reason: &EndReason) -> Value {
-    match reason {
-        EndReason::Completed => json!({"reason": "completed"}),
-        EndReason::MaxRounds => json!({"reason": "maxRounds"}),
-        EndReason::Aborted => json!({"reason": "aborted"}),
-        EndReason::Error(e) => json!({"reason": "error", "message": e}),
-    }
-}
+/// Headless runs exactly one turn, so its item events all carry turn id 1.
+const HEADLESS_TURN_ID: u64 = 1;
 
 /// Headless permission answer: always deny. There is nobody at the keyboard, so
 /// an ask that reaches this layer is refused (the safe default). Bypass/allow
@@ -113,66 +101,13 @@ impl<W: Write + Send> JsonUi<W> {
 }
 
 impl<W: Write + Send + 'static> Ui for JsonUi<W> {
-    /// Project the core [`Event`] stream onto the NDJSON wire, reusing the
-    /// server's method names and param shapes verbatim. Message/reasoning items
-    /// exist only as `text/delta`; a mode change falls through to a note, as it
-    /// did before plan 39; the turn bracket is emitted by `run_headless`.
+    /// Project the core [`Event`] stream onto the NDJSON wire via the shared
+    /// [`kloop_server::project_event`], so the headless `--json` stream and the
+    /// server speak one item vocabulary. The turn bracket is emitted by
+    /// `run_headless` (headless is one turn, id [`HEADLESS_TURN_ID`]).
     fn emit(&self, ev: &Event) {
-        match ev {
-            Event::ItemDelta {
-                delta: Delta::Text(t),
-                ..
-            } => self.notify("text/delta", json!({"text": t})),
-            Event::ItemStarted {
-                id,
-                item: Item::ToolCall {
-                    agent, name, input, ..
-                },
-            } => {
-                let mut params =
-                    json!({"callId": id, "name": name, "summary": tool_summary(input)});
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("tool/started", params);
-            }
-            Event::ItemCompleted {
-                id,
-                item: Item::ToolCall { agent, status, .. },
-            } => {
-                let mut params = json!({"callId": id, "ok": *status == ItemStatus::Completed});
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("tool/completed", params);
-            }
-            Event::ItemStarted {
-                item: Item::SubAgent { label, task, .. },
-                ..
-            } => self.notify("agent/started", json!({"agent": label, "task": task})),
-            Event::ItemCompleted {
-                item: Item::SubAgent { label, status, .. },
-                ..
-            } => self.notify(
-                "agent/completed",
-                json!({"agent": label, "ok": *status == ItemStatus::Completed}),
-            ),
-            Event::ItemCompleted {
-                item: Item::Todo { agent, items },
-                ..
-            } => {
-                let mut params = json!({"todos": items});
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("todo/updated", params);
-            }
-            Event::Note(_) | Event::CwdChanged { .. } | Event::ModeChanged(_) => {
-                if let Some(text) = ev.as_note() {
-                    self.notify("note", json!({"text": text}));
-                }
-            }
-            _ => {}
+        if let Some((method, params)) = kloop_server::project_event(ev, HEADLESS_TURN_ID) {
+            self.notify(method, params);
         }
     }
 }
@@ -220,10 +155,18 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             thread_id: session_id,
             out,
         });
-        ui.notify("turn/started", json!({}));
+        ui.notify(
+            "turn/started",
+            kloop_server::turn_started_params(HEADLESS_TURN_ID),
+        );
         let dyn_ui: Arc<dyn Ui> = ui.clone();
         let outcome = run_turn(&cfg, &mut history, &dyn_ui, &cancel, 0).await;
-        ui.notify("turn/completed", turn_completed_params(&outcome.reason));
+        // Report the post-turn context size, then close the bracket (server parity).
+        ui.emit(&Event::Usage(history.estimated_tokens()));
+        ui.notify(
+            "turn/completed",
+            kloop_server::turn_completed_params(HEADLESS_TURN_ID, &outcome.reason),
+        );
         exit_code(&outcome.reason)
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
@@ -278,96 +221,53 @@ mod tests {
         assert_eq!(DenyApprover.confirm(req).await, Decision::Deny);
     }
 
-    /// The `--json` events must be byte-for-byte the server's notification
-    /// shapes (sorted keys, injected `threadId`) so one client vocabulary
-    /// serves both front-ends.
+    /// The `--json` stream is the item vocabulary the server projects (shared
+    /// `kloop_server::project_event`), with `threadId` injected. The exact item
+    /// shapes are locked in the server's wire unit tests; here we check the
+    /// front-end wiring: the projection is used and `threadId` rides every line.
     #[test]
-    fn json_ui_matches_server_wire_shapes() {
+    fn json_ui_projects_the_item_vocabulary_with_thread_id() {
+        use kloop_core::event::Delta;
+        use kloop_core::event::Item;
+        use kloop_core::event::ItemStatus;
+
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let ui = JsonUi {
             thread_id: "t".into(),
             out: buf.clone(),
         };
-        let tool_call = |agent: &str, name: &str, input: Value, status, output| Item::ToolCall {
-            agent: agent.into(),
-            name: name.into(),
-            input,
-            status,
-            output,
-        };
-        ui.notify("turn/started", json!({}));
+        ui.notify(
+            "turn/started",
+            kloop_server::turn_started_params(HEADLESS_TURN_ID),
+        );
         ui.emit(&Event::ItemDelta {
-            id: "m0".into(),
+            id: "msg-0".into(),
             delta: Delta::Text("hi".into()),
         });
-        ui.emit(&Event::Note("saved".into()));
-        ui.emit(&Event::ItemStarted {
-            id: "c1".into(),
-            item: tool_call(
-                "",
-                "bash",
-                json!({"command": "ls"}),
-                ItemStatus::InProgress,
-                None,
-            ),
-        });
-        ui.emit(&Event::ItemStarted {
-            id: "c2".into(),
-            item: tool_call(
-                "agent-1",
-                "grep",
-                json!({"pattern": "x"}),
-                ItemStatus::InProgress,
-                None,
-            ),
-        });
         ui.emit(&Event::ItemCompleted {
             id: "c1".into(),
-            item: tool_call(
-                "",
-                "bash",
-                json!({"command": "ls"}),
-                ItemStatus::Completed,
-                Some("ok".into()),
-            ),
-        });
-        ui.emit(&Event::ItemStarted {
-            id: "agent-1".into(),
-            item: Item::SubAgent {
-                label: "agent-1".into(),
-                task: "do x".into(),
-                status: ItemStatus::InProgress,
-            },
-        });
-        ui.emit(&Event::ItemCompleted {
-            id: "agent-1".into(),
-            item: Item::SubAgent {
-                label: "agent-1".into(),
-                task: String::new(),
-                status: ItemStatus::Failed,
+            item: Item::ToolCall {
+                agent: String::new(),
+                name: "bash".into(),
+                input: json!({"command": "ls"}),
+                status: ItemStatus::Completed,
+                output: Some("ok".into()),
             },
         });
         ui.notify(
             "turn/completed",
-            turn_completed_params(&EndReason::Completed),
+            kloop_server::turn_completed_params(HEADLESS_TURN_ID, &EndReason::Completed),
         );
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = out.lines().collect();
-        // The tool `summary` is the input JSON truncated — exactly what the wire
-        // always carried; the pre-plan-39 test passed a shorter fake value.
         assert_eq!(
             lines,
             vec![
-                r#"{"method":"turn/started","params":{"threadId":"t"}}"#,
-                r#"{"method":"text/delta","params":{"text":"hi","threadId":"t"}}"#,
-                r#"{"method":"note","params":{"text":"saved","threadId":"t"}}"#,
-                r#"{"method":"tool/started","params":{"callId":"c1","name":"bash","summary":"{\"command\":\"ls\"}","threadId":"t"}}"#,
-                r#"{"method":"tool/started","params":{"agent":"agent-1","callId":"c2","name":"grep","summary":"{\"pattern\":\"x\"}","threadId":"t"}}"#,
-                r#"{"method":"tool/completed","params":{"callId":"c1","ok":true,"threadId":"t"}}"#,
-                r#"{"method":"agent/started","params":{"agent":"agent-1","task":"do x","threadId":"t"}}"#,
-                r#"{"method":"agent/completed","params":{"agent":"agent-1","ok":false,"threadId":"t"}}"#,
-                r#"{"method":"turn/completed","params":{"reason":"completed","threadId":"t"}}"#,
+                r#"{"method":"turn/started","params":{"threadId":"t","turn":{"id":1}}}"#,
+                r#"{"method":"item/delta","params":{"channel":"text","itemId":"msg-0","text":"hi","threadId":"t","turnId":1}}"#,
+                r#"{"method":"item/completed","params":{"item":{"id":"c1","input":{"command":"ls"},"name":"bash","output":"ok","status":"completed","type":"toolCall"},"threadId":"t","turnId":1}}"#,
+                r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":1,"status":"completed"}}}"#,
             ]
         );
     }
@@ -458,18 +358,30 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         let methods: Vec<&str> = events.iter().filter_map(|e| e["method"].as_str()).collect();
+        // The assistant message is a full item lifecycle: started, deltas, then
+        // completed (with the finalized text), unlike the old bare text/delta.
         assert_eq!(
             methods,
-            vec!["turn/started", "text/delta", "turn/completed"]
+            vec![
+                "turn/started",
+                "item/started",
+                "item/delta",
+                "item/completed",
+                "thread/tokenUsage/updated",
+                "turn/completed",
+            ]
         );
         // Every event is thread-tagged with the session id (server parity).
         assert!(events.iter().all(|e| e["params"]["threadId"] == "hl"));
         let deltas: String = events
             .iter()
-            .filter(|e| e["method"] == "text/delta")
+            .filter(|e| e["method"] == "item/delta")
             .map(|e| e["params"]["text"].as_str().unwrap())
             .collect();
         assert_eq!(deltas, "hello there");
-        assert_eq!(events.last().unwrap()["params"]["reason"], "completed");
+        assert_eq!(
+            events.last().unwrap()["params"]["turn"]["status"],
+            "completed"
+        );
     }
 }

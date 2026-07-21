@@ -123,11 +123,6 @@ impl Ui for StdoutUi {
                 print!("\x1b[2m{s}\x1b[0m");
                 let _ = std::io::stdout().flush();
             }
-            // todo_write renders as the checklist below, never as a generic note.
-            Event::ItemStarted {
-                item: Item::ToolCall { name, .. },
-                ..
-            } if name == "todo_write" => {}
             Event::ItemCompleted {
                 item: Item::Todo { agent, items },
                 ..

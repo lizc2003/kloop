@@ -1,15 +1,23 @@
-//! Multi-session JSON-RPC server over stdio, after codex's app-server
-//! shape: `thread/*` and `turn/*` methods in, per-thread notifications out,
-//! approvals as server→client requests answered by id.
+//! Multi-session server for kloop's native agent protocol (plan 39): standard
+//! JSON-RPC 2.0 over stdio, `thread/*` and `turn/*` methods in, per-thread item
+//! events out, approvals as server→client reverse requests answered by id. An
+//! `initialize` handshake with version negotiation gates every other method.
 //!
-//! Every thread is its own tokio task owning a History (same worker shape as
-//! the TUI) plus its own `Permissions` via the per-thread Config the factory
-//! builds — session approval caches never leak across threads. All output
-//! funnels through one writer task, one JSON object per line.
+//! The wire vocabulary lives in [`wire`]; the core [`Event`] stream projects
+//! onto it through [`wire::project_event`], shared with the headless `--json`
+//! front-end so both speak one vocabulary. Every thread is its own tokio task
+//! owning a History (same worker shape as the TUI) plus its own `Permissions`
+//! via the per-thread Config the factory builds — session approval caches never
+//! leak across threads. All output funnels through one writer task, one JSON
+//! object per line.
 
 mod wire;
 
+pub use wire::project_event;
+pub use wire::turn_completed_params;
+pub use wire::turn_started_params;
 pub use wire::RequestId;
+pub use wire::PROTOCOL_VERSION;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,11 +45,7 @@ use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::commands;
-use kloop_core::event::tool_summary;
-use kloop_core::event::Delta;
 use kloop_core::event::Event;
-use kloop_core::event::Item;
-use kloop_core::event::ItemStatus;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
@@ -51,6 +55,7 @@ use kloop_core::permissions::Decision;
 use kloop_core::rollout;
 use kloop_core::rollout::Rollout;
 use kloop_core::Config;
+use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
 use wire::Incoming;
@@ -96,6 +101,7 @@ where
         srv_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
+        initialized: false,
     };
     let mut lines = BufReader::new(input).lines();
     while let Some(line) = lines.next_line().await? {
@@ -129,7 +135,14 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 }
 
 struct Turn {
-    input: String,
+    /// The turn's user text (a slash command line runs the command instead of
+    /// sampling; images force the model path).
+    text: String,
+    /// Trailing content blocks from a structured `input` (images).
+    images: Vec<ContentBlock>,
+    /// The turn's id, allocated by `turn/start` and echoed in `turn/started`,
+    /// `turn/completed`, and every item event of the turn.
+    id: u64,
     cancel: CancellationToken,
 }
 
@@ -142,6 +155,11 @@ struct ThreadHandle {
     /// delivered as a user message at the next round boundary — during a
     /// running turn, or at the start of the next `turn/start` if idle.
     inbox: Arc<Inbox>,
+    /// Allocates monotonic turn ids for this thread (from 1).
+    turn_seq: Arc<AtomicU64>,
+    /// The currently-running turn's id (shared with the thread's `ThreadUi` so
+    /// item events can tag it); `None` between turns.
+    turn: Arc<Mutex<Option<u64>>>,
 }
 
 type PendingApprovals = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Decision>>>>;
@@ -153,6 +171,10 @@ struct Server {
     srv_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
+    /// Set once the client's `initialize` handshake succeeds. Every other
+    /// method is rejected until then, so a version mismatch surfaces
+    /// immediately instead of as mysterious downstream failures.
+    initialized: bool,
 }
 
 impl Server {
@@ -186,7 +208,17 @@ impl Server {
     }
 
     fn handle_request(&mut self, id: RequestId, method: &str, params: Value) {
+        // The handshake gates everything else: a client that skips `initialize`
+        // (or asks for a version we don't speak) is told so at once.
+        if method != "initialize" && !self.initialized {
+            return self.send(Outgoing::Error {
+                id: Some(id),
+                code: wire::SERVER_ERROR,
+                message: "not initialized; send `initialize` first".into(),
+            });
+        }
         let result = match method {
+            "initialize" => self.initialize(&params),
             "thread/start" => self.thread_start(),
             "thread/resume" => self.thread_resume(&params),
             "thread/fork" => self.thread_fork(&params),
@@ -206,6 +238,34 @@ impl Server {
         }
     }
 
+    /// The `initialize` handshake: exchange info + capabilities and negotiate
+    /// the protocol version. A version we don't speak is a hard error — no
+    /// silent downgrade. Succeeding flips `initialized` so real work can begin.
+    fn initialize(&mut self, params: &Value) -> MethodResult {
+        let version = params["protocolVersion"].as_str().unwrap_or("");
+        if version != wire::PROTOCOL_VERSION {
+            return Err((
+                wire::INVALID_PARAMS,
+                format!(
+                    "unsupported protocolVersion '{version}'; this engine speaks '{}'",
+                    wire::PROTOCOL_VERSION
+                ),
+            ));
+        }
+        self.initialized = true;
+        Ok(json!({
+            "serverInfo": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
+            "protocolVersion": wire::PROTOCOL_VERSION,
+            "capabilities": {
+                "streaming": true,
+                "subagents": true,
+                "mcp": true,
+                "images": true,
+                "approvals": true,
+            },
+        }))
+    }
+
     fn handle_approval_response(&mut self, id: RequestId, result: Value) {
         let Some(reply) = self.pending.lock().unwrap().remove(&id) else {
             return self.send(Outgoing::Error {
@@ -215,10 +275,11 @@ impl Server {
             });
         };
         let decision = match result["decision"].as_str() {
-            Some("allow") => Decision::Allow,
-            Some("allowSession") => Decision::AllowSession,
-            Some("allowAlways") => Decision::AllowAlways,
-            // "deny", anything unrecognized, or missing: the safe answer.
+            Some("accept") => Decision::Allow,
+            Some("acceptForSession") => Decision::AllowSession,
+            Some("acceptAlways") => Decision::AllowAlways,
+            // "decline", "cancel", anything unrecognized, or missing: the safe
+            // answer (a client that wants to stop the turn sends turn/interrupt).
             _ => Decision::Deny,
         };
         let _ = reply.send(decision);
@@ -238,7 +299,7 @@ impl Server {
         let mut history = History::new(self.paths.offload_dir.clone());
         history.attach_rollout(Rollout::new(path));
         self.spawn_thread(thread_id.clone(), history)?;
-        Ok(json!({"threadId": thread_id}))
+        Ok(json!({"thread": {"id": thread_id}}))
     }
 
     fn thread_resume(&mut self, params: &Value) -> MethodResult {
@@ -258,7 +319,7 @@ impl Server {
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
         self.spawn_thread(thread_id.to_string(), history)?;
-        Ok(json!({"threadId": thread_id, "messageCount": count}))
+        Ok(json!({"thread": {"id": thread_id}, "messageCount": count}))
     }
 
     /// Fork a session at a cut point into a fresh thread, then spawn it live
@@ -288,7 +349,7 @@ impl Server {
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
         self.spawn_thread(new_id.clone(), history)?;
-        Ok(json!({"threadId": new_id, "messageCount": count}))
+        Ok(json!({"thread": {"id": new_id}, "messageCount": count}))
     }
 
     fn thread_list(&self) -> MethodResult {
@@ -312,7 +373,7 @@ impl Server {
 
     fn turn_start(&mut self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "threadId")?;
-        let input = str_param(params, "input")?;
+        let (text, images) = parse_input(params)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             (
                 wire::SERVER_ERROR,
@@ -325,20 +386,27 @@ impl Server {
                 format!("a turn is already running on thread '{thread_id}'"),
             ));
         }
+        // Allocate the turn id and publish it before the worker picks up the
+        // turn, so a `turn/steer` racing in sees the running turn's id.
+        let turn_id = handle.turn_seq.fetch_add(1, Ordering::SeqCst);
+        *handle.turn.lock().unwrap() = Some(turn_id);
         let cancel = CancellationToken::new();
         *handle.current_cancel.lock().unwrap() = Some(cancel.clone());
         if handle
             .turn_tx
             .send(Turn {
-                input: input.to_string(),
+                text,
+                images,
+                id: turn_id,
                 cancel,
             })
             .is_err()
         {
             handle.running.store(false, Ordering::SeqCst);
+            *handle.turn.lock().unwrap() = None;
             return Err((wire::SERVER_ERROR, "thread worker is gone".into()));
         }
-        Ok(json!({}))
+        Ok(json!({"turn": {"id": turn_id}}))
     }
 
     /// Enqueue steering text typed while a turn runs (or between turns). Unlike
@@ -347,17 +415,20 @@ impl Server {
     /// pushed during a running turn folds into it, and one pushed while idle is
     /// delivered at the top of the next `turn/start`. There is no autowake in
     /// client-driven server mode, so an idle steer waits for that next turn.
+    /// Returns the running turn's id, or null when idle. (`expectedTurnId`, if
+    /// the client sends it, is accepted and ignored for now.)
     fn turn_steer(&mut self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "threadId")?;
-        let input = str_param(params, "input")?;
+        let (text, _images) = parse_input(params)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             (
                 wire::SERVER_ERROR,
                 format!("no active thread '{thread_id}'"),
             )
         })?;
-        handle.inbox.push(InboxItem::Steer(input.to_string()));
-        Ok(json!({}))
+        handle.inbox.push(InboxItem::Steer(text));
+        let turn_id = *handle.turn.lock().unwrap();
+        Ok(json!({"turnId": turn_id}))
     }
 
     fn turn_interrupt(&mut self, params: &Value) -> MethodResult {
@@ -375,11 +446,15 @@ impl Server {
     }
 
     fn spawn_thread(&mut self, thread_id: String, history: History) -> Result<(), (i64, String)> {
+        // The running turn's id, shared between the ThreadUi (which tags item
+        // events with it) and the handle (which `turn/steer` reads).
+        let turn = Arc::new(Mutex::new(None));
         let ui = Arc::new(ThreadUi {
             thread_id: thread_id.clone(),
             out: self.out.clone(),
             pending: self.pending.clone(),
             srv_seq: self.srv_seq.clone(),
+            turn: turn.clone(),
         });
         let note_ui = ui.clone();
         let mut cfg = (self.factory)(
@@ -403,6 +478,8 @@ impl Server {
                 running,
                 current_cancel: Arc::new(Mutex::new(None)),
                 inbox,
+                turn_seq: Arc::new(AtomicU64::new(1)),
+                turn,
             },
         );
         Ok(())
@@ -420,6 +497,36 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i64, String)>
     })
 }
 
+/// Parse a `turn/start` (or `turn/steer`) `input` into its user text and any
+/// trailing content blocks (images). The structured form is an array of
+/// content parts — `{type:"text",text}` and `{type:"image",source:{…}}`, the
+/// canonical block shapes — and text parts join with newlines. A bare string is
+/// accepted too as a single text part, for a client that only sends text.
+fn parse_input(params: &Value) -> Result<(String, Vec<ContentBlock>), (i64, String)> {
+    let input = &params["input"];
+    if let Some(s) = input.as_str() {
+        return Ok((s.to_string(), Vec::new()));
+    }
+    let Some(parts) = input.as_array() else {
+        return Err((
+            wire::INVALID_PARAMS,
+            "missing 'input' (a string or an array of content parts)".into(),
+        ));
+    };
+    let mut text_parts = Vec::new();
+    let mut images = Vec::new();
+    for part in parts {
+        let block: ContentBlock = serde_json::from_value(part.clone())
+            .map_err(|e| (wire::INVALID_PARAMS, format!("bad input part: {e}")))?;
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text),
+            // Non-text blocks (images) ride along as trailing content.
+            other => images.push(other),
+        }
+    }
+    Ok((text_parts.join("\n"), images))
+}
+
 /// Owns this thread's History for its whole life; turns run strictly one at
 /// a time (turn/start enforces single-flight via the running flag).
 async fn thread_worker(
@@ -430,57 +537,20 @@ async fn thread_worker(
     running: Arc<AtomicBool>,
 ) {
     while let Some(turn) = turns.recv().await {
-        ui.notify("turn/started", json!({}));
-        // A slash command reads/rewrites History like a turn (hence the
-        // single-flight running flag and the turn/started..turn/completed
-        // bracket the client already waits on) but is not a model turn: no
-        // user message is recorded and nothing is sampled. Its output comes
-        // back as a `system` notification instead of `text/delta`; `/clear`
-        // also emits `thread/cleared` so the client resets its transcript.
-        if commands::is_command(&turn.input) {
-            let result = commands::run(&turn.input, &mut history, &cfg, &turn.cancel).await;
-            // `/exit` is a client-side concept: quitting one thread must never
-            // stop a multi-session server. Relay a note instead of acting on it,
-            // and close the turn bracket like any other command.
-            if result.quit {
-                running.store(false, Ordering::SeqCst);
-                ui.notify(
-                    "system",
-                    json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
-                );
-                ui.notify("turn/completed", json!({"reason": "completed"}));
-                continue;
-            }
-            // Clear first, then show the output on the now-blank transcript —
-            // matching the TUI order (crates/tui/src/lib.rs). Reversed, a
-            // client that resets its transcript on `thread/cleared` would wipe
-            // the command output it just received.
-            if result.cleared {
-                ui.notify("thread/cleared", json!({}));
-            }
-            if !result.output.is_empty() {
-                ui.notify("system", json!({"text": result.output}));
-            }
-            // A skill invoked as `/name` expands to a prompt: record it and run
-            // a turn (streaming via the same notifications as a normal turn)
-            // rather than ending here.
-            if let Some(prompt) = result.run_turn {
-                history.record(Message::user_text(prompt));
-                let dyn_ui: Arc<dyn Ui> = ui.clone();
-                let outcome = run_turn(&cfg, &mut history, &dyn_ui, &turn.cancel, 0).await;
-                running.store(false, Ordering::SeqCst);
-                ui.notify("turn/completed", turn_completed_params(&outcome.reason));
-                continue;
-            }
-            running.store(false, Ordering::SeqCst);
-            ui.notify("turn/completed", json!({"reason": "completed"}));
-            continue;
-        }
-        history.record(Message::user_text(turn.input));
-        let dyn_ui: Arc<dyn Ui> = ui.clone();
-        let outcome = run_turn(&cfg, &mut history, &dyn_ui, &turn.cancel, 0).await;
+        // The turn id (allocated by turn/start) tags the bracket and every item
+        // event of the turn; it is already published on the shared `turn` slot
+        // for `turn/steer` to read.
+        ui.notify("turn/started", wire::turn_started_params(turn.id));
+        let reason = run_turn_or_command(&cfg, &mut history, &ui, &turn).await;
+        // Report the post-turn context size, then close the bracket. Usage
+        // routes through `emit` so it projects like any other event.
+        ui.emit(&Event::Usage(history.estimated_tokens()));
+        ui.notify(
+            "turn/completed",
+            wire::turn_completed_params(turn.id, &reason),
+        );
         running.store(false, Ordering::SeqCst);
-        ui.notify("turn/completed", turn_completed_params(&outcome.reason));
+        *ui.turn.lock().unwrap() = None;
     }
     // The thread is ending (turn channel closed on server shutdown): tear down
     // its active worktree if the model never exited (dirty kept on its branch,
@@ -490,15 +560,60 @@ async fn thread_worker(
     }
 }
 
-/// The `turn/completed` notification params for a turn's end reason. Shared by
-/// the normal-turn path and a `/name`-invoked skill turn.
-fn turn_completed_params(reason: &EndReason) -> Value {
-    match reason {
-        EndReason::Completed => json!({"reason": "completed"}),
-        EndReason::MaxRounds => json!({"reason": "maxRounds"}),
-        EndReason::Aborted => json!({"reason": "aborted"}),
-        EndReason::Error(e) => json!({"reason": "error", "message": e}),
+/// Run one turn's work and return its end reason, without touching the turn
+/// bracket (the caller owns that). A slash command line reads/rewrites History
+/// like a turn but is not a model turn: no user message is recorded and nothing
+/// is sampled — its output comes back as a `system` notification, and `/clear`
+/// also emits `thread/cleared` so the client resets its transcript. Images (or
+/// any non-command text) take the model path.
+async fn run_turn_or_command(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<ThreadUi>,
+    turn: &Turn,
+) -> EndReason {
+    if turn.images.is_empty() && commands::is_command(&turn.text) {
+        let result = commands::run(&turn.text, history, cfg, &turn.cancel).await;
+        // `/exit` is a client-side concept: quitting one thread must never stop
+        // a multi-session server. Relay a note instead of acting on it.
+        if result.quit {
+            ui.notify(
+                "system",
+                json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
+            );
+            return EndReason::Completed;
+        }
+        // Clear first, then show the output on the now-blank transcript —
+        // matching the TUI order (crates/tui/src/lib.rs). Reversed, a client
+        // that resets its transcript on `thread/cleared` would wipe the command
+        // output it just received.
+        if result.cleared {
+            ui.notify("thread/cleared", json!({}));
+        }
+        if !result.output.is_empty() {
+            ui.notify("system", json!({"text": result.output}));
+        }
+        // A skill invoked as `/name` expands to a prompt: record it and run a
+        // turn (streaming via the same notifications as a normal turn).
+        if let Some(prompt) = result.run_turn {
+            history.record(Message::user_text(prompt));
+            let dyn_ui: Arc<dyn Ui> = ui.clone();
+            return run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
+                .await
+                .reason;
+        }
+        return EndReason::Completed;
     }
+    let msg = if turn.images.is_empty() {
+        Message::user_text(turn.text.clone())
+    } else {
+        Message::user_with_blocks(turn.text.clone(), turn.images.clone())
+    };
+    history.record(msg);
+    let dyn_ui: Arc<dyn Ui> = ui.clone();
+    run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
+        .await
+        .reason
 }
 
 /// Per-thread `Ui` + `Approver`: events become thread-tagged notifications,
@@ -508,6 +623,8 @@ struct ThreadUi {
     out: mpsc::UnboundedSender<Value>,
     pending: PendingApprovals,
     srv_seq: Arc<AtomicU64>,
+    /// The running turn's id (shared with the handle), used to tag item events.
+    turn: Arc<Mutex<Option<u64>>>,
 }
 
 impl ThreadUi {
@@ -517,84 +634,19 @@ impl ThreadUi {
             .out
             .send(Outgoing::Notification { method, params }.to_json());
     }
+
+    fn turn_id(&self) -> u64 {
+        self.turn.lock().unwrap().unwrap_or(0)
+    }
 }
 
 impl Ui for ThreadUi {
-    /// Project the core [`Event`] stream onto the (unchanged) app-server wire.
-    /// Message/reasoning items exist only as `text/delta`; the turn bracket
-    /// (`turn/started`/`turn/completed`) is emitted by the worker, not here.
+    /// Project the core [`Event`] stream onto the native wire via the shared
+    /// [`wire::project_event`]. The turn bracket (`turn/started`/`turn/completed`)
+    /// is constructed by the worker, which owns the turn id.
     fn emit(&self, ev: &Event) {
-        match ev {
-            Event::ItemDelta {
-                delta: Delta::Text(t),
-                ..
-            } => self.notify("text/delta", json!({"text": t})),
-            Event::ItemStarted {
-                id,
-                item: Item::ToolCall {
-                    agent, name, input, ..
-                },
-            } => {
-                let mut params =
-                    json!({"callId": id, "name": name, "summary": tool_summary(input)});
-                // Only sub-agent calls carry the field; the main agent's stay as
-                // before so existing clients see an unchanged shape.
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("tool/started", params);
-            }
-            Event::ItemCompleted {
-                id,
-                item: Item::ToolCall { agent, status, .. },
-            } => {
-                let mut params = json!({"callId": id, "ok": *status == ItemStatus::Completed});
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("tool/completed", params);
-            }
-            Event::ItemStarted {
-                item: Item::SubAgent { label, task, .. },
-                ..
-            } => self.notify("agent/started", json!({"agent": label, "task": task})),
-            Event::ItemCompleted {
-                item: Item::SubAgent { label, status, .. },
-                ..
-            } => self.notify(
-                "agent/completed",
-                json!({"agent": label, "ok": *status == ItemStatus::Completed}),
-            ),
-            Event::ItemCompleted {
-                item: Item::Todo { agent, items },
-                ..
-            } => {
-                let mut params = json!({"todos": items});
-                // A sub-agent's list carries the agent field, like tool notifications.
-                if !agent.is_empty() {
-                    params["agent"] = Value::String(agent.clone());
-                }
-                self.notify("todo/updated", params);
-            }
-            Event::CwdChanged { cwd, branch } => {
-                // The thread entered (branch = Some) or left (None) a worktree; a
-                // client tracking the session cwd follows the switch. `active`
-                // mirrors branch presence for a one-field check.
-                self.notify(
-                    "thread/worktree",
-                    json!({"cwd": cwd, "branch": branch, "active": branch.is_some()}),
-                );
-            }
-            Event::Note(_) | Event::ModeChanged(_) => {
-                // A mode change had no dedicated wire before plan 39 — it fell
-                // through to a note, so keep that shape.
-                if let Some(text) = ev.as_note() {
-                    self.notify("note", json!({"text": text}));
-                }
-            }
-            // Reasoning/message start-and-complete, the turn bracket, and usage
-            // have no wire on the legacy protocol (slice 1 adds item events).
-            _ => {}
+        if let Some((method, params)) = wire::project_event(ev, self.turn_id()) {
+            self.notify(method, params);
         }
     }
 }
@@ -604,13 +656,23 @@ impl Approver for ThreadUi {
         &self,
         req: ConfirmRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
-        let id = RequestId::Str(format!(
-            "srv-{}",
-            self.srv_seq.fetch_add(1, Ordering::SeqCst)
-        ));
+        // Server reverse-request ids live in the server's own integer counter
+        // space (§ wire): a no-method response always answers one of ours.
+        let id = RequestId::Num(self.srv_seq.fetch_add(1, Ordering::SeqCst) as i64);
         let (reply, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), reply);
-        let mut params = json!({"description": req.description});
+        // A file change carries a diff preview; nothing else does — so the
+        // preview's presence is exactly the command/fileChange discriminant.
+        let kind = if req.preview.is_some() {
+            "fileChange"
+        } else {
+            "command"
+        };
+        let mut params = json!({
+            "turnId": self.turn_id(),
+            "kind": kind,
+            "description": req.description,
+        });
         if let Some(rules) = &req.remember_rules {
             params["rememberRules"] = json!(rules);
         }

@@ -179,7 +179,7 @@ pub struct ActiveWorktree {
     wt: Worktree,
     pub cwd: PathBuf,
     /// The tree's branch (`kloop/worktree/<name>`), surfaced to a client that
-    /// tracks the session cwd (the server's `thread/worktree` notification).
+    /// tracks the session cwd (the server's `thread/cwd/updated` notification).
     pub branch: String,
     pub permissions: Arc<Permissions>,
     pub sandbox: Option<Arc<SandboxPolicy>>,

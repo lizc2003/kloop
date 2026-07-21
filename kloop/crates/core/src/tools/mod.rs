@@ -577,16 +577,22 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 }
 
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
-    ctx.ui.emit(&Event::ItemStarted {
-        id: id.clone(),
-        item: Item::ToolCall {
-            agent: ctx.cfg.agent_label.clone(),
-            name: name.clone(),
-            input: input.clone(),
-            status: ItemStatus::InProgress,
-            output: None,
-        },
-    });
+    // todo_write surfaces only as its `Todo` item (emitted from the tool itself),
+    // never as a generic tool row: cc renders the checklist in the call's place.
+    // Suppressing the ToolCall events here means no front-end needs a skip.
+    let tool_row = name != "todo_write";
+    if tool_row {
+        ctx.ui.emit(&Event::ItemStarted {
+            id: id.clone(),
+            item: Item::ToolCall {
+                agent: ctx.cfg.agent_label.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                status: ItemStatus::InProgress,
+                output: None,
+            },
+        });
+    }
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -683,20 +689,22 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     // output would otherwise be cloned onto the event channel wholesale. The UI
     // truncates further for display.
     let output: String = content.as_text().chars().take(4000).collect();
-    ctx.ui.emit(&Event::ItemCompleted {
-        id: tool_use_id.clone(),
-        item: Item::ToolCall {
-            agent: ctx.cfg.agent_label.clone(),
-            name: name.clone(),
-            input: input.clone(),
-            status: if *is_error {
-                ItemStatus::Failed
-            } else {
-                ItemStatus::Completed
+    if tool_row {
+        ctx.ui.emit(&Event::ItemCompleted {
+            id: tool_use_id.clone(),
+            item: Item::ToolCall {
+                agent: ctx.cfg.agent_label.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                status: if *is_error {
+                    ItemStatus::Failed
+                } else {
+                    ItemStatus::Completed
+                },
+                output: (!output.is_empty()).then_some(output),
             },
-            output: (!output.is_empty()).then_some(output),
-        },
-    });
+        });
+    }
     result
 }
 

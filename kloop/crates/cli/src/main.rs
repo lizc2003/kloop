@@ -72,11 +72,17 @@ async fn mcp_subcommand(args: &[String]) -> Result<ExitCode> {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
     // `kloop mcp …` is the one subcommand (OAuth login); everything else is
     // flag-shaped and goes through the flag parser.
     if raw.first().map(String::as_str) == Some("mcp") {
         return mcp_subcommand(&raw[1..]).await;
+    }
+    // `kloop app-server` is the positional entry the Tauri app launches for the
+    // native agent protocol (plan 39): it is exactly `--serve`, so normalize it
+    // and let the flag parser handle the rest (`app-server --mock`, etc.).
+    if raw.first().map(String::as_str) == Some("app-server") {
+        raw[0] = "--serve".into();
     }
     let args = parse_args(&raw)?;
     if args.help {

@@ -398,11 +398,6 @@ impl App {
                 }
                 self.assistant_open = false;
                 self.thinking_open = false;
-                // todo_write renders as a Todo block via ItemCompleted{Todo}, not
-                // a generic tool row (cc renders the checklist in its place).
-                if name == "todo_write" {
-                    return;
-                }
                 self.last_note = Some(preview);
                 self.tool_cells.insert(id, self.cells.len());
                 self.cells.push(Cell::Tool {
@@ -1337,15 +1332,11 @@ mod tests {
     }
 
     /// A todo_write call renders as a single Todo block, not a generic tool
-    /// row: its ToolStart is suppressed and TodoUpdate owns the cell, updated
-    /// in place as the list evolves within a turn.
+    /// row: core emits no ToolCall for it (only the `Todo` item), so the
+    /// TodoUpdate owns the cell, updated in place as the list evolves in a turn.
     #[test]
     fn todo_write_renders_as_a_single_updating_block() {
         let mut app = App::new("s".into());
-        app.apply(tool_start("", "t1", "todo_write", "{\"todos\":[]}"));
-        // No tool row appeared for the suppressed call.
-        assert!(app.cells.is_empty());
-
         let first = vec![
             todo("Parse", "Parsing", TodoStatus::InProgress),
             todo("Test", "Testing", TodoStatus::Pending),
@@ -1361,10 +1352,6 @@ mod tests {
         app.apply(todo_update(second.clone()));
         assert_eq!(app.cells, vec![Cell::Todo(second)], "updated in place");
         assert_eq!(app.last_note.as_deref(), Some("todos 1/2"));
-
-        // The suppressed ToolEnd is a no-op (no tool cell was tracked).
-        app.apply(tool_end("", "t1", true, ""));
-        assert_eq!(app.cells.len(), 1);
     }
 
     /// A new user turn starts a fresh Todo block; the previous turn's stays in

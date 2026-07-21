@@ -174,6 +174,9 @@ async fn turn_rounds(
     // Cut-off text from truncated rounds, prepended to the final answer so a
     // truncated-then-continued turn returns the whole deliverable.
     let mut truncated_prefix = String::new();
+    // Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
+    // `reasoning-N`): owned here so ids don't reset each round.
+    let mut item_seq = 0u64;
     for round in 0..cfg.max_rounds {
         // Step-boundary steering: deliver anything the user typed during the
         // previous round (tool execution / sampling) as a user message before
@@ -227,6 +230,7 @@ async fn turn_rounds(
             cancel,
             stream_text,
             depth,
+            &mut item_seq,
         )
         .await
         {

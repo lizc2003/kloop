@@ -380,40 +380,65 @@ tool status rows re-derived from the recorded tool_use/tool_result pairs); a
 long history scrolls straight into native scrollback, so a resumed session
 starts with its recent conversation visible instead of a blank screen.
 
-## Server mode (Phase 2, fifth slice)
+## Native agent protocol (plan 39)
 
-`kloop --serve` speaks a JSON-RPC-shaped protocol over stdio (after codex's
-app-server: JSON-RPC 2.0 envelopes minus the `"jsonrpc"` field, one object
-per line) so IDEs and automation can drive multiple sessions concurrently.
+`kloop app-server` (alias `kloop --serve`) speaks kloop's native agent protocol
+over stdio — **standard JSON-RPC 2.0** (every envelope carries `"jsonrpc":"2.0"`,
+one object per line) — so IDEs and automation can drive multiple sessions
+concurrently. The core emits a single [`Event`](crates/core/src/event.rs)
+stream that every front-end projects; the server (and the headless `--json`
+stream) project it onto the wire below via one shared `project_event`, so both
+speak one item vocabulary by construction.
 
-Methods: `thread/start`, `thread/resume {threadId}`,
-`thread/fork {threadId, cut?}`, `thread/list`, `turn/start {threadId, input}`,
-`turn/steer {threadId, input}`, `turn/interrupt {threadId}`. Every thread is
-its own tokio task owning a History (persisted to the same
-`.kloop/sessions/` files the interactive frontends use — sessions are
-interchangeable between the TUI and the server) and its own permission gate,
-so approval session caches never leak across threads.
+**Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
+`{serverInfo, protocolVersion, capabilities}` negotiates the version (from
+`"1.0"`; a version the engine doesn't speak is a hard error, not a silent
+downgrade) and gates every other method until it succeeds. Capabilities are
+structured: `{streaming, subagents, mcp, images, approvals}`.
 
-Notifications stream per thread: `turn/started`, `text/delta`, `note`,
-`tool/started`, `tool/completed`, `turn/completed {reason}`. A `turn/start`
-whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an
-inert `/exit`) runs the command instead of the model: its output comes back as a `system`
-notification (not `text/delta`), `/clear` also emits `thread/cleared` so the
-client resets its transcript, and the turn/started..turn/completed bracket is
-unchanged. Approvals are
-server→client requests in an own `srv-{n}` id namespace; the client answers
-`{"decision": "allow" | "allowSession" | "allowAlways" | "deny"}`, and a
-dropped/never-answered reply denies (interrupt the turn to unblock).
+**Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`,
+`thread/resume {threadId}`, `thread/fork {threadId, cut?}`, `thread/list`,
+`turn/start {threadId, input}` → `{turn:{id}}`,
+`turn/steer {threadId, input}` → `{turnId}`, `turn/interrupt {threadId}`.
+`input` is a string or an array of content parts (`{type:"text",text}` /
+`{type:"image",source:{…}}`). Every thread is its own tokio task owning a
+History (persisted to the same `.kloop/sessions/` files the interactive
+frontends use — sessions are interchangeable) and its own permission gate, so
+approval session caches never leak across threads.
+
+**Events** stream per thread, tagged with `threadId` (and `turnId` for
+turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
+`item/started` / `item/delta {itemId, channel, text}` (channel ∈
+`text`/`reasoning`/`output`) / `item/completed`, where `item.type` ∈
+`assistantMessage` / `reasoning` / `toolCall` / `subAgent` / `todo` (a tool
+call carries its full `input`, and `output` + `agent` label when present; a
+`todo_write` surfaces only as a `todo` item, never a tool row); plus
+`thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
+`thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
+`/compact`, `/clear`, and an inert `/exit`) runs the command instead of the
+model: its output comes back as a `system` notification, `/clear` also emits
+`thread/cleared`, and the turn bracket is unchanged.
+
+**Approvals** are one reverse request — `approval/request {threadId, turnId,
+kind:"command"|"fileChange", description, preview?, rememberRules?}` (server
+ids are integers in the server's own counter space) — answered
+`{"decision": "accept" | "acceptForSession" | "acceptAlways" | "decline"}`. A
+dropped/never-answered reply, `cancel`, or anything unrecognized declines
+(interrupt the turn to unblock).
 
 ```jsonc
-→ {"id":1,"method":"thread/start","params":{}}
-← {"id":1,"result":{"threadId":"20260709-135146"}}
-→ {"id":2,"method":"turn/start","params":{"threadId":"20260709-135146","input":"create s2.txt"}}
-← {"method":"turn/started","params":{"threadId":"20260709-135146"}}
-← {"id":"srv-1","method":"approval/request","params":{"threadId":"…","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+1  hello"}}
-→ {"id":"srv-1","result":{"decision":"allow"}}
-← {"method":"tool/completed","params":{"threadId":"…","callId":"…","ok":true}}
-← {"method":"turn/completed","params":{"threadId":"…","reason":"completed"}}
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true}}}
+→ {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
+← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
+→ {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
+← {"jsonrpc":"2.0","id":3,"result":{"turn":{"id":1}}}
+← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","turn":{"id":1}}}
+← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"threadId":"…","turnId":1,"kind":"fileChange","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+1  hello"}}
+→ {"jsonrpc":"2.0","id":1,"result":{"decision":"accept"}}
+← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
+← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","turn":{"id":1,"status":"completed"}}}
 ```
 
 ## MCP client (Phase 2, sixth slice)
@@ -720,9 +745,9 @@ Presentation per frontend:
   `✓ agent-1 <task> (3 tool uses)` when it ends. A row still Running when
   the turn dies (interrupt drops the task future) is patched to failed.
 - **plain**: dim notes, `agent-1 · bash {...}` per call.
-- **server**: `agent/started` / `agent/completed` notifications; sub-agent
-  `tool/started`/`tool/completed` carry an `"agent"` field (main-agent
-  calls keep the old shape exactly).
+- **server**: a `subAgent` item brackets the sub-agent (`item/started` →
+  `item/completed`); its own `toolCall` items carry an `"agent"` field
+  (main-agent calls omit it).
 
 ### Custom agent types
 
@@ -880,13 +905,13 @@ sub-agent's planning never touches the parent's. It has no external side
 effect, so the permission gate auto-allows it (read-only self-verdict); it
 runs serially (full-table replace has ordering).
 
-Rendering: `todo_write` never shows as a generic tool row — it renders as a
-checklist. The TUI keeps one `Cell::Todo` per turn, updated in place as the
-list evolves (a new user turn starts a fresh block); the plain REPL prints
-the marked list; server mode emits a `todo/updated` notification with the
-full list (a sub-agent's carries an `agent` field, like tool notifications).
-A sub-agent's list stays internal to the TUI transcript (lesson 3), the way
-its text does. Not done (deliberate): dependency graphs, cross-session todo
+Rendering: `todo_write` never shows as a generic tool row — core emits only a
+`todo` item for it (no `toolCall`), which renders as a checklist. The TUI keeps
+one `Cell::Todo` per turn, updated in place as the list evolves (a new user turn
+starts a fresh block); the plain REPL prints the marked list; the native
+protocol server emits a `todo` item (`item/completed`) with the full list (a
+sub-agent's carries an `agent` field). A sub-agent's list stays internal to the
+TUI transcript (lesson 3), the way its text does. Not done (deliberate): dependency graphs, cross-session todo
 stores, rollout persistence of the list.
 
 ## Steering — mid-turn injection (Phase 2, fifteenth slice)
@@ -1363,8 +1388,8 @@ kloop --headless "summarize what CHANGELOG.md says" > summary.txt
 # then stdin)
 git diff | kloop --headless "review this diff"
 
-# machine-readable event stream (reuses server mode's notification wire)
-kloop --headless --json "fix the failing test" | jq -c 'select(.method=="tool/started")'
+# machine-readable event stream (reuses the native protocol's item events)
+kloop --headless --json "fix the failing test" | jq -c 'select(.method=="item/started")'
 
 # runaway guardrail for scripts; resume a session and run headless on it
 kloop --headless --max-rounds 8 "keep going"
@@ -1380,10 +1405,10 @@ kloop --mock --headless --json
 - **Two output contracts.** Default (human): the final answer prints once to
   **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
-  stdout — `turn/started`, `text/delta`, `tool/started|completed`,
-  `agent/started|completed`, `todo/updated`, `note`, `turn/completed` — the
-  **exact same method+params shapes server mode emits**, `threadId` and all. One
-  event vocabulary, two front-ends.
+  stdout — `turn/started`, `item/started|delta|completed`,
+  `thread/tokenUsage/updated`, `note`, `turn/completed` — the **exact same
+  item vocabulary the native protocol server emits** (via one shared
+  `project_event`), `threadId` and all. One event vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
   deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `KLOOP_ALLOW`
@@ -1442,9 +1467,9 @@ cargo run -- --plain
 # attach local images to the first user turn (repeatable) — see Image input
 cargo run -- --image screenshot.png
 
-# multi-session JSON-RPC server on stdio (see Server mode)
-cargo run -- --serve
-cargo run -- --mock --serve   # keyless: scripted provider behind the protocol
+# native agent protocol server on stdio (see Native agent protocol)
+cargo run -- app-server            # alias: cargo run -- --serve
+cargo run -- app-server --mock     # keyless: scripted provider behind the protocol
 
 # sessions (-c = --continue, -r = --resume, mirroring cc)
 cargo run -- --list-sessions   # what's on disk, most recent first
@@ -1659,9 +1684,9 @@ crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
   src/render.rs     pure cell→line rendering, wrap/truncate, confirm popup
   src/lib.rs        terminal lifecycle, agent worker task, event loop
 
-crates/server/      kloop-server — multi-session JSON-RPC frontend
-  src/wire.rs       envelopes (request/response/notification/server request)
-  src/lib.rs        serve loop, per-thread workers, approval routing
+crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.0)
+  src/wire.rs       envelopes + Event→notification projection (project_event)
+  src/lib.rs        serve loop, handshake, per-thread workers, approval routing
 
 crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAuth (protocol + reqwest)
   src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
@@ -1678,7 +1703,7 @@ crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rq
 
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
-                    --serve), env config, StdoutUi, CliApprover (y/a/p/n
+                    app-server/--serve), env config, StdoutUi, CliApprover (y/a/p/n
                     prompt), .kloop/config.toml rule load/persist, --mock
   src/web.rs        [web] config + ToolSource adapter over kloop-web
                     demo, session selection (--continue, --resume,
