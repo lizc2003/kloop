@@ -118,59 +118,60 @@ async fn main() -> Result<ExitCode> {
         }
         sources
     };
-    // Project context (instruction files, env block, git snapshot) is
-    // gathered once per process and shared into every Config the same way.
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
-    let project = if args.mock {
-        context::mock(&cwd)
-    } else {
-        context::gather(&cwd)
-    };
-    for warning in &project.warnings {
-        eprintln!("\x1b[2m[{warning}]\x1b[0m");
-    }
-    // The sandbox policy is process-stable (cwd + config), so it is built
-    // once and shared into every Config — server threads included.
-    let sandbox = build_sandbox(&args, &cwd, |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"))?;
-    // Agent types are likewise config-derived and process-stable; --mock stays
-    // hermetic (no config reads).
-    let agent_types = Arc::new(if args.mock {
-        Vec::new()
-    } else {
-        load_agent_types(Path::new(PERMISSIONS_CONFIG))?
-    });
-    // Skills are process-stable (discovered from disk once); --mock stays
-    // hermetic. Parse-skip warnings surface at startup like the others.
-    let skills = Arc::new(if args.mock {
-        Vec::new()
-    } else {
-        let (skills, warnings) = load_skills(&cwd);
-        for warning in &warnings {
-            eprintln!("\x1b[2m[{warning}]\x1b[0m");
-        }
-        skills
-    });
     if args.serve {
         if !args.images.is_empty() {
             eprintln!(
                 "\x1b[2m[--image ignored with --serve; send images via the RPC client]\x1b[0m"
             );
         }
-        // Multi-session JSON-RPC server on stdio; each thread gets its own
-        // Config (and thus its own permission gate + session cache).
+        // Multi-session JSON-RPC server on stdio. Process-wide transports stay
+        // shared, while each thread rebuilds every cwd-bound piece from its
+        // canonical thread/start cwd.
         let factory: kloop_server::ConfigFactory = {
             let args = args.clone();
-            Arc::new(move |approver, notify| {
-                config_from_env(
+            Arc::new(move |options, approver, notify| {
+                let config_path = options.cwd.join(PERMISSIONS_CONFIG);
+                let project = if args.mock {
+                    context::mock(&options.cwd)
+                } else {
+                    context::gather(&options.cwd)
+                };
+                for warning in &project.warnings {
+                    notify(warning);
+                }
+                let sandbox =
+                    build_sandbox(&args, &options.cwd, &config_path, |warning| notify(warning))?;
+                let agent_types = Arc::new(if args.mock {
+                    Vec::new()
+                } else {
+                    load_agent_types(&config_path)?
+                });
+                let skills = Arc::new(if args.mock {
+                    Vec::new()
+                } else {
+                    let (skills, warnings) = load_skills(&options.cwd);
+                    for warning in &warnings {
+                        notify(warning);
+                    }
+                    skills
+                });
+                let mut cfg = config_from_env(
                     &args,
                     approver,
                     notify,
                     &tool_sources,
                     &project,
-                    sandbox.clone(),
-                    agent_types.clone(),
-                    skills.clone(),
-                )
+                    sandbox,
+                    agent_types,
+                    skills,
+                    &options.cwd,
+                    &config_path,
+                )?;
+                if let Some(model) = options.model {
+                    cfg.model = model;
+                }
+                Ok(cfg)
             })
         };
         kloop_server::serve_stdio(
@@ -183,6 +184,34 @@ async fn main() -> Result<ExitCode> {
         .await?;
         return Ok(ExitCode::SUCCESS);
     }
+
+    // Single-session frontends build their cwd-bound state once. Server mode
+    // returned above and performs the same work independently per thread.
+    let project = if args.mock {
+        context::mock(&cwd)
+    } else {
+        context::gather(&cwd)
+    };
+    for warning in &project.warnings {
+        eprintln!("\x1b[2m[{warning}]\x1b[0m");
+    }
+    let sandbox = build_sandbox(&args, &cwd, Path::new(PERMISSIONS_CONFIG), |s: &str| {
+        eprintln!("\x1b[2m[{s}]\x1b[0m")
+    })?;
+    let agent_types = Arc::new(if args.mock {
+        Vec::new()
+    } else {
+        load_agent_types(Path::new(PERMISSIONS_CONFIG))?
+    });
+    let skills = Arc::new(if args.mock {
+        Vec::new()
+    } else {
+        let (skills, warnings) = load_skills(&cwd);
+        for warning in &warnings {
+            eprintln!("\x1b[2m[{warning}]\x1b[0m");
+        }
+        skills
+    });
     let (history, session_id) = open_history(
         PathBuf::from(".kloop/offload"),
         &args.session,
@@ -221,6 +250,8 @@ async fn main() -> Result<ExitCode> {
             sandbox,
             agent_types,
             skills,
+            &cwd,
+            Path::new(PERMISSIONS_CONFIG),
         )?;
         cfg.session_id = session_id.clone();
         // The headless runaway guardrail overrides the default round cap.
@@ -287,6 +318,8 @@ async fn main() -> Result<ExitCode> {
                 sandbox.clone(),
                 agent_types.clone(),
                 skills.clone(),
+                &cwd,
+                Path::new(PERMISSIONS_CONFIG),
             )?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
@@ -342,6 +375,7 @@ async fn plain_main(
     pending_images: Vec<ContentBlock>,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
     let mut cfg = config_from_env(
         &args,
         Arc::new(CliApprover::default()),
@@ -351,6 +385,8 @@ async fn plain_main(
         sandbox,
         agent_types,
         skills,
+        &cwd,
+        Path::new(PERMISSIONS_CONFIG),
     )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);

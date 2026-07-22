@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::json;
@@ -26,6 +27,7 @@ use kloop_provider::Provider;
 use kloop_server::serve;
 use kloop_server::ConfigFactory;
 use kloop_server::ServerPaths;
+use kloop_server::ThreadStartOptions;
 use kloop_server::PROTOCOL_VERSION;
 
 struct TestClient {
@@ -162,7 +164,7 @@ fn text(t: &str) -> ContentBlock {
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
 fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
-    Arc::new(move |approver, _notify| {
+    Arc::new(move |options, approver, _notify| {
         let permissions = if gated {
             Permissions::new(
                 Mode::Manual,
@@ -176,11 +178,11 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
         };
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
-            model: "mock".into(),
+            model: options.model.unwrap_or_else(|| "mock".into()),
             system: "test".into(),
             project_instructions: None,
             max_rounds: 10,
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd: options.cwd,
             offload_dir: offload.clone(),
             // Siblings under the same test root (test_dirs), matching the
             // ServerPaths the server lists/creates threads from.
@@ -206,6 +208,18 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
             worktree_enabled: false,
         })
+    })
+}
+
+fn recording_factory(
+    turns: Vec<Vec<ContentBlock>>,
+    offload: PathBuf,
+    seen: Arc<Mutex<Vec<ThreadStartOptions>>>,
+) -> ConfigFactory {
+    let inner = factory(turns, offload, false);
+    Arc::new(move |options, approver, notify| {
+        seen.lock().unwrap().push(options.clone());
+        inner(options, approver, notify)
     })
 }
 
@@ -247,7 +261,7 @@ fn worktree_factory(
     offload: PathBuf,
     cwd: PathBuf,
 ) -> ConfigFactory {
-    Arc::new(move |_approver, _notify| {
+    Arc::new(move |_options, _approver, _notify| {
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
             model: "mock".into(),
@@ -328,6 +342,72 @@ async fn handshake_gates_and_negotiates() {
     let resp = client.recv().await;
     assert_eq!(resp["id"], id);
     assert!(resp["result"]["thread"]["id"].is_string());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn thread_start_resolves_per_thread_cwd_and_model() {
+    let dirs = test_dirs("thread-options");
+    let project_a = dirs.root.join("a");
+    let project_b = dirs.root.join("b");
+    std::fs::create_dir_all(&project_a).unwrap();
+    std::fs::create_dir_all(&project_b).unwrap();
+    let project_a = std::fs::canonicalize(project_a).unwrap();
+    let project_b = std::fs::canonicalize(project_b).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut client = start_server(
+        recording_factory(vec![vec![text("ok")]], dirs.offload.clone(), seen.clone()),
+        &dirs,
+    );
+    client.initialize().await;
+
+    for (cwd, model) in [(&project_a, Some("model-a")), (&project_b, Some("model-b"))] {
+        let id = client
+            .request("thread/start", json!({"cwd": cwd, "model": model}))
+            .await;
+        let response = client.recv().await;
+        assert_eq!(response["id"], id);
+        assert!(response["result"]["thread"]["id"].is_string());
+    }
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            ThreadStartOptions {
+                cwd: project_a,
+                model: Some("model-a".into()),
+            },
+            ThreadStartOptions {
+                cwd: project_b,
+                model: Some("model-b".into()),
+            },
+        ]
+    );
+
+    for params in [
+        json!({"cwd": ""}),
+        json!({"cwd": dirs.root.join("missing")}),
+        json!({"cwd": dirs.root.join("sessions").join("not-a-dir")}),
+        json!({"cwd": 3}),
+        json!({"model": ""}),
+        json!({"model": 3}),
+    ] {
+        if let Some(path) = params.get("cwd").and_then(Value::as_str) {
+            if path.ends_with("not-a-dir") {
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(path, "x").unwrap();
+            }
+        }
+        let id = client.request("thread/start", params).await;
+        let response = client.recv().await;
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 2);
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

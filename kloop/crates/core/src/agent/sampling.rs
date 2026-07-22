@@ -42,6 +42,8 @@ enum SampleError {
     Cancelled,
     Overflow,
     Retryable(String),
+    /// Retrying after visible deltas would duplicate user-visible output.
+    AfterOutput(String),
 }
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -93,6 +95,7 @@ pub(super) async fn sample_with_retry(
             // Retrying an oversized request verbatim can never succeed; hand
             // it straight to the reactive compaction path.
             Err(SampleError::Overflow) => return Sampled::Overflow,
+            Err(SampleError::AfterOutput(e)) => return Sampled::Failed(e),
             Err(SampleError::Retryable(e)) => {
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Sampled::Failed(e);
@@ -142,19 +145,59 @@ async fn sample_once(
     // [`crate::event`].
     let mut text_item: Option<String> = None;
     let mut think_item: Option<String> = None;
+    let mut text_accum = String::new();
+    let mut think_accum = String::new();
+    let mut visible_output = false;
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return Err(SampleError::Cancelled),
+            _ = cancel.cancelled() => {
+                complete_open_items(
+                    ui,
+                    &mut text_item,
+                    &mut think_item,
+                    &text_accum,
+                    &think_accum,
+                );
+                return Err(SampleError::Cancelled);
+            },
             event = rx.recv() => match event {
-                None => return Err(SampleError::Retryable("stream closed early".into())),
+                None => {
+                    complete_open_items(
+                        ui,
+                        &mut text_item,
+                        &mut think_item,
+                        &text_accum,
+                        &think_accum,
+                    );
+                    let message = "stream closed early".to_string();
+                    return Err(if visible_output {
+                        SampleError::AfterOutput(message)
+                    } else {
+                        SampleError::Retryable(message)
+                    });
+                }
                 Some(Err(e)) => {
-                    if e.downcast_ref::<OverflowError>().is_some() {
-                        return Err(SampleError::Overflow);
-                    }
-                    return Err(SampleError::Retryable(format!("{e:#}")));
+                    let overflow = e.downcast_ref::<OverflowError>().is_some();
+                    let message = format!("{e:#}");
+                    complete_open_items(
+                        ui,
+                        &mut text_item,
+                        &mut think_item,
+                        &text_accum,
+                        &think_accum,
+                    );
+                    return Err(if visible_output {
+                        SampleError::AfterOutput(message)
+                    } else if overflow {
+                        SampleError::Overflow
+                    } else {
+                        SampleError::Retryable(message)
+                    });
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
                     if stream_text {
+                        visible_output = true;
+                        text_accum.push_str(&t);
                         let id = open_item(&mut text_item, item_seq, "msg", ui, || {
                             Item::AssistantMessage { text: String::new() }
                         });
@@ -163,6 +206,8 @@ async fn sample_once(
                 }
                 Some(Ok(StreamEvent::ThinkingDelta(t))) => {
                     if stream_text {
+                        visible_output = true;
+                        think_accum.push_str(&t);
                         let id = open_item(&mut think_item, item_seq, "reasoning", ui, || {
                             Item::Reasoning { text: String::new() }
                         });
@@ -179,6 +224,7 @@ async fn sample_once(
                                         item: Item::AssistantMessage { text: text.clone() },
                                     });
                                 }
+                                text_accum.clear();
                             }
                             ContentBlock::Thinking { thinking, .. } => {
                                 if let Some(id) = think_item.take() {
@@ -187,6 +233,7 @@ async fn sample_once(
                                         item: Item::Reasoning { text: thinking.clone() },
                                     });
                                 }
+                                think_accum.clear();
                             }
                             _ => {}
                         }
@@ -194,10 +241,42 @@ async fn sample_once(
                     blocks.push(b);
                 }
                 Some(Ok(StreamEvent::Done { usage, stop_reason })) => {
-                    return Ok(SampleOk { blocks, usage, stop_reason })
+                    complete_open_items(
+                        ui,
+                        &mut text_item,
+                        &mut think_item,
+                        &text_accum,
+                        &think_accum,
+                    );
+                    return Ok(SampleOk { blocks, usage, stop_reason });
                 }
             }
         }
+    }
+}
+
+fn complete_open_items(
+    ui: &Arc<dyn Ui>,
+    text_item: &mut Option<String>,
+    think_item: &mut Option<String>,
+    text: &str,
+    thinking: &str,
+) {
+    if let Some(id) = text_item.take() {
+        ui.emit(&Event::ItemCompleted {
+            id,
+            item: Item::AssistantMessage {
+                text: text.to_string(),
+            },
+        });
+    }
+    if let Some(id) = think_item.take() {
+        ui.emit(&Event::ItemCompleted {
+            id,
+            item: Item::Reasoning {
+                text: thinking.to_string(),
+            },
+        });
     }
 }
 

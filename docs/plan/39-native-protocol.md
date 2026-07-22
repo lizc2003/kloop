@@ -17,7 +17,7 @@
 3. **领域模型 thread / turn / item 三层**,但 **turn + item 下沉进 core 成原生事件流**,thread 留会话管理层。**取消"回调→事件→wire"两跳,收敛成"core item 事件流 → 各前端投影"一跳**,server 退化成纯序列化薄壳。
 4. **事件去碎片化**:started / delta / completed 三态,delta 收敛成单个 `item/delta {itemId, channel, text}`(channel ∈ text/reasoning/output),不再每种内容一个顶层方法。
 5. **方法面精简,引擎只管 agent**:thread 生命周期、turn、审批、config/model 只读、mcp 状态。git / 文件读写 / 历史扫描 / 删除 / login 交前端本地做(app 现在本来就这样)。codex 那近百方法门面(fs/process/realtime/windowsSandbox/attestation)不做。
-6. **审批单套 decision**:reverse request,`accept / acceptForSession / decline / cancel` 一套。保留 codex 的健壮性约定——**对未知 reverse 方法 auto-answer**,引擎发啥都挂不死前端。
+6. **审批单套 decision**:reverse request,`accept / acceptForSession / acceptAlways / decline` 四档。保留健壮性约定——**对未知 reverse 方法 auto-answer**,引擎发啥都挂不死前端;旧 `cancel` 只在 app 兼容边界 fail-closed 映成 `decline`。
 
 ## 二、切片 0 — core 事件模型重构(地基,纯重构无 wire 变化)
 
@@ -102,9 +102,9 @@ fmt/clippy/test 全绿(现有 TUI/plain/server 行为不变即证明重构无回
 | `thread/start` | `{cwd?, model?, …}` | `{thread:{id}}` |
 | `turn/start` | `{threadId, input:[{type:"text",text}|{type:"image",…}], clientTurnId?}` | `{turn:{id}}` |
 | `turn/steer` | `{threadId, expectedTurnId, input:[…]}` | `{turnId}` |
-| `turn/interrupt` | `{threadId, turnId}` | `{}` |
+| `turn/interrupt` | `{threadId}` | `{}` |
 
-其余方法先返回**降级空响应**(不卡),切片 3/4 再实现。
+切片 1 以外的方法不伪装兼容:未知方法显式报 JSON-RPC `METHOD_NOT_FOUND`;切片 2 的 app capability gate 保证主界面不调用这些延期面,切片 3/4 再逐项实现。
 
 ### 3.4 事件投影(core `Event` → wire notification,全带 `threadId`)
 
@@ -124,7 +124,7 @@ fmt/clippy/test 全绿(现有 TUI/plain/server 行为不变即证明重构无回
 
 ### 3.5 审批(统一单方法 + kind 判别 —— 待你拍板,见五)
 
-reverse request `approval/request {threadId, turnId, itemId, kind:"command"|"fileChange", description, command?, changes?, rememberRules?}` → `{decision: accept|acceptForSession|decline|cancel}`。丢失/EOF = decline。比 codex 的 command/fileChange 两方法更简(去碎片化)。
+reverse request `approval/request {threadId, turnId, itemId, kind:"command"|"fileChange", description, preview?, rememberRules?}` → `{decision: accept|acceptForSession|acceptAlways|decline}`。丢失/EOF = decline;app 旧 `cancel` 兼容值也只会 fail-closed 映成 decline。
 
 ### 3.6 入口
 
@@ -151,7 +151,7 @@ fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-s
 |---|---|---|
 | **0 ✅** | core 事件模型重构(§二) | 现有测试全绿=无回归 |
 | **1 ✅** | 原生 wire v1 + 握手 + 主链 + 统一审批 + `app-server` 入口(§三) | 契约测试 + `--mock` 冒烟 + 真 key anthropic 轨冒烟 |
-| **2** | **app 分支适配主链**:`桌面前端仓库` 开分支,改 `worker.rs`(换协议)+ 前端 `chatIngest`(消费新事件)+ 指向 kloop 引擎 | **真 app 端到端**:发消息→流式→工具→审批→结果 |
+| **2 ✅** | **app `kloop` 分支适配主链**:`worker.rs` 换原生 v1 + 独立 `kloop/` 前端 adapter + capability gate + SSO 绕过 | 真 app Eval Mode + 真协议 E2E:首/二轮、工具、审批、图片、双 cwd |
 | **3** | 会话管理:`thread/resume|list|read|fork|rollback|compact/start|name/set|goal/*|archive|search` + app 适配 | 契约 + app 会话列表/恢复/fork |
 | **4** | config/model/skills/mcp 只读 + 降级兜底:`model/list`/`config/read|write`/`mcpServerStatus/list`/`skills/list` + app 适配 | app 模型选择器/设置面板不卡 |
 | **5** | 打磨:reasoning delta 细分、`turn/diff/updated`、`turn/plan/updated`、review mode、边角 item 变体 | 真 app 各面板 |
@@ -161,7 +161,7 @@ fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-s
 1. **协议版本从 `1.0` 起** —— 我定,除非你要别的。
 2. **审批统一成单方法 `approval/request` + `kind` 判别**(而非 codex 的 command/fileChange 两方法) —— 提议统一(更简),你拍。
 3. **旧 `--serve` 自创协议**:切片 1 直接替换,不并存 —— 你之前默认同意。
-4. **app 分支名**(建议 `kloop-engine`) —— 开工切片 2 时定。
+4. ✅(切片 2 定)**app 分支名**:`桌面前端仓库` 使用专用 `kloop` 分支;保留其既有 `codex` gitlink 修改且绝不提交。
 5. ✅(切片 0 定)**`Ui` 收敛成单 `emit(&Event)`**,`Approver::confirm` 保留;旧默认降级集中进 `Event::as_note()`。
 6. ✅(切片 0 定)**Reasoning 不拆 summary/content**:`Item::Reasoning{text}` 单字段;signature 是 protocol/provider 传输细节,不进 UI 事件。
 7. ✅(切片 0 定)**item id**:tool 用 tool_use id、子 agent 用 label、todo 用 `todos`/`todos-{agent}` 固定槽、assistant/reasoning delta 驱动用 turn-local `msg-N`/`reasoning-N`(切片 1 再改 turn-unique)。
@@ -201,3 +201,16 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 - **`crates/cli`**:`kloop app-server` 位置子命令(main 早分支把首 token `app-server` 改写成 `--serve`,复用全部 flag 处理;`app-server --mock` 可跑)+ `--serve` 别名保留;help/README 同步。
 - **验证**:fmt + clippy(-D warnings)+ 全工作区 test 全绿(server 契约 17 + wire 单测 6 重写:握手 gate/版本不匹配/item 事件序列/统一审批四档/steer 回 turnId/interrupt/坏 JSON 不崩/fork/resume/slash);`cargo run -p kloop -- app-server --mock` 同步驱动冒烟——握手回 capabilities、thread/start 回 `{thread:{id}}`、整 demo turn 的 item 流(turn-unique msg-N、todo 单 item 无 tool 行、toolCall 全 input+output、subAgent 生命周期、tokenUsage、`turn/completed{status}`)全对。**真 key anthropic 轨冒烟已过**(Python 同步客户端驱动真 `app-server`,经代理真采样):① 默认沙箱下真 turn——握手/`{thread:{id}}`/`{turn:{id:1}}`/toolCall(bash)全 input+output/assistantMessage turn-unique `msg-0` delta+封口/`thread/tokenUsage/updated`/`turn/completed{completed}`,模型真写文件内容正确;顺带证 sandbox auto-allow 联动仍生效(写 cwd 内文件的 bash 被沙箱兜住、审批 0 次)。② `KLOOP_SANDBOX=off` 下 write_file 两次跑 **审批 reverse request 双路径**——`approval/request{kind:"fileChange",preview:"(new file)\n+1  …",rememberRules:["write_file(*)"]}`,回 `accept`→`completed`+文件写入、回 `decline`→`failed`+is_error tool_result+文件不存在,turn 续跑 `completed`。
 - 提交:本次(plan 39 切片 1,见 git log)。
+
+### 切片 2 ✅(2026-07-22,app `f660aca1` + kloop 本提交)
+
+真实 Codex Desktop 已改为 kloop v1 客户端,主链不再经过旧 Codex wire；延期能力在 UI、TypeScript API 和 Rust 启动热路径三层 fail-closed,不伪装兼容。
+
+- **kloop 每线程配置**:`thread/start` 新增 `ThreadStartOptions{cwd,model}`；cwd 缺省 server 启动目录,显式相对路径按该目录解析后 canonicalize,空/坏类型/不存在/非目录均 `INVALID_PARAMS`；CLI 不改进程 cwd,而是按 thread cwd 重建 project instructions、skills、permissions、sandbox、hooks/agent types/program limits,provider 与已连接 MCP `tool_sources` 仍进程共享；model 在默认 provider/env 配好后作 thread 级 override。`resume/fork` 本切片仍用默认 options。
+- **Tauri transport**(`桌面前端仓库` 专用 `kloop` 分支):子进程只起 `<ENGINE_BIN> app-server`；所有 request/reverse-response 都是标准 JSON-RPC 2.0；initialize 硬校验 name/version/protocol/capabilities；首轮只发 `thread/start{cwd}` + native `turn/start{threadId,input}`，第二轮不再 `thread/read`；Rust 保留数字 turn id,仅 TS store 边界转字符串；图片 data URL 转 canonical base64 image block；reader 只 surface `approval/request`,未知 reverse request 自动 `{}` 回包；四档 decision 全接通,旧 `cancel` 只在 Rust 边界映 `decline`。
+- **独立前端 adapter/UI**:新增 `src/kloop/{dto,chatIngest,normalize,capabilities}.ts`,消费五类 item + text/reasoning/output delta + token total + string error；wire item id 是 turn-local,进入 session-wide timeline 前统一 scope 成 `<turnId>:<itemId>`,避免第二轮 `msg-0` 覆盖首轮；`system`/`note`/`thread/cleared` 明确路由；subAgent completed 省略 task 时保留 started 字段。新增通用 ToolCallCard,恢复 ReasoningCard,todo 复用 PlanCard,native subAgent 只读,approval 卡直显 description/preview/rememberRules 与四档决定。
+- **明确降级**:app `KLOOP_APP_CAPABILITIES` 关闭 history/model/config/skills/MCP/goal/plan/review/compact/dynamic tools/automation/artifact/account/legacy extensions；搜索、fork、rollback、标题/侧栏会话菜单、side chat、handoff、composer model/reasoning/plan/goal/review/compact 等入口隐藏,`api/thread|git|skills|mcp` 再做 invoke 边界 guard；Rust setup 不启动 history watcher/automation scheduler。按用户明确授权,kloop 分支 `App.vue` 跳过 Codex SSO、LoginDialog、AccessGuard 和 skill-env 前置,直接启动 kloop app-server；正式 provider 凭证来自启动环境/`.kloop`。
+- **事件生命周期补洞**:审查发现采样流已发 delta 后若断流,旧重试会遗留半截 item 并产生第二份回答。`sample_once` 现累积可见文本、错误/取消/异常 Done 时补 `ItemCompleted`；一旦已有可见输出,错误不自动重试(避免重复),未输出的瞬时错误仍保留三次 retry。Mock 新增 `PartialError` 锁定 started→delta→completed 且只请求一次。
+- **验证(kloop)**:`cargo fmt --all --check`、`cargo clippy --workspace -- -D warnings`、`cargo test` 全绿；`target/debug/kloop app-server --mock` 同步 JSON-RPC 客户端握手/thread/完整 item 流冒烟通过；真 key 原生协议脚本同一 thread 连跑首轮/第二轮、bash tool、write_file `approval/request→decline`、base64 PNG,再开第二 thread 真实写 A/B 两个临时目录,确认 cwd/文件落点不串。
+- **验证(app)**:43 个 native/eval 定向 Bun 测试全绿；`bun run typecheck`、`bun run build:test` 通过；Rust worker 48 + 单线程全量 225 tests 全绿；真实 `bun run eval` 以 `ENGINE_BIN=target/debug/kloop` 启动完整 Tauri App,case `39-02` 得 `completed`(threadId/数字 turnId 边界/8 events),证 SSO 绕过 + worker + WebView event bridge + completion 全链；approval case `39-03` 正确得 `needs_interaction`,error=`approval required: approval/request`。app 全量 Bun 仍是仓库既有红基线(604 pass / 151 fail / 17 errors),workspace fmt 仍有既有未格式化文件,clippy `-D warnings` 仍有既有 22 errors；本次定向网、build 和 changed worker rustfmt 均过,未冒充全绿。
+- **app 提交**:`桌面前端仓库` branch `kloop`,commit `f660aca1`;既有 `codex` gitlink 修改保持未 stage/未提交。kloop 提交:本提交。

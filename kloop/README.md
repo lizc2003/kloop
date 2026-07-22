@@ -404,7 +404,15 @@ structured: `{streaming, subagents, mcp, images, approvals}`.
 `{type:"image",source:{…}}`). Every thread is its own tokio task owning a
 History (persisted to the same `.kloop/sessions/` files the interactive
 frontends use — sessions are interchangeable) and its own permission gate, so
-approval session caches never leak across threads.
+approval session caches never leak across threads. `thread/start.cwd` defaults
+to the app-server launch directory; an explicit relative path is resolved from
+that directory, canonicalized, and rejected unless it is an accessible
+directory. The CLI builds project instructions, skills, permissions, sandbox,
+hooks, agent types, and program limits from that thread cwd without ever
+changing the process cwd. `thread/start.model`, when present, overrides the
+provider/env default only for that thread. Provider state and already-connected
+MCP tool sources remain process-shared; session/offload roots remain the
+app-server's `ServerPaths`, not the thread project directory.
 
 **Events** stream per thread, tagged with `threadId` (and `turnId` for
 turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
@@ -440,6 +448,26 @@ dropped/never-answered reply, `cancel`, or anything unrecognized declines
 ← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
 ← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","turn":{"id":1,"status":"completed"}}}
 ```
+
+### Codex Desktop adapter (plan 39 slice 2)
+
+The `桌面前端仓库` repository's dedicated `kloop` branch launches this
+server through `ENGINE_BIN` and consumes v1 directly (it does not emulate
+the old Codex app-server wire):
+
+```sh
+cargo build -p kloop
+cd /path/to/桌面前端仓库/app
+ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
+```
+
+That branch gets provider credentials from the launch environment and normal
+`.kloop` configuration, so it deliberately skips Codex SSO/LoginDialog/
+AccessGuard. Slice 2 keeps live text/image turns, Stop, generic tool cards, and
+all four approval decisions. History/resume/fork/search, model/config/skills/MCP
+management, goal/plan/review/compact, automation/artifacts, and account panels
+are capability-gated until later protocol slices rather than issuing legacy
+RPCs. A server restart therefore requires a new conversation in slice 2.
 
 ## MCP client (Phase 2, sixth slice)
 

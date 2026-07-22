@@ -196,6 +196,8 @@ fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
 /// popup + transcript note.
 fn build_permissions(
     args: &CliArgs,
+    cwd: &Path,
+    config_path: &Path,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
 ) -> Result<Permissions> {
@@ -206,21 +208,33 @@ fn build_permissions(
         return Ok(Permissions::allow_all());
     }
     let mode = args.permission_mode;
-    let config_path = PathBuf::from(PERMISSIONS_CONFIG);
+    let config_path = config_path.to_path_buf();
     let rules = load_permission_rules(&config_path)?;
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let persist_path = config_path.clone();
     let persist =
         Arc::new(
-            move |rules: &[String]| match persist_allow_rules(&config_path, rules) {
+            move |rules: &[String]| match persist_allow_rules(&persist_path, rules) {
                 Ok(()) => notify(&format!(
-                    "saved to {PERMISSIONS_CONFIG}: {}",
+                    "saved to {}: {}",
+                    persist_path.display(),
                     rules.join(", ")
                 )),
                 Err(e) => notify(&format!("failed to save allow rule: {e:#}")),
             },
         );
-    Permissions::new(mode, &rules, cwd, Some(approver), Some(persist))
-        .context("invalid permission rules (config.toml / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK)")
+    Permissions::new(
+        mode,
+        &rules,
+        cwd.to_path_buf(),
+        Some(approver),
+        Some(persist),
+    )
+    .with_context(|| {
+        format!(
+            "invalid permission rules ({}) / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK",
+            config_path.display()
+        )
+    })
 }
 
 /// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
@@ -551,6 +565,7 @@ fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> 
 pub(crate) fn build_sandbox(
     args: &CliArgs,
     cwd: &Path,
+    config_path: &Path,
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
     // --mock stays hermetic; KLOOP_SANDBOX=off is the env escape hatch.
@@ -562,7 +577,7 @@ pub(crate) fn build_sandbox(
     {
         return Ok(None);
     }
-    let settings = load_sandbox_settings(Path::new(PERMISSIONS_CONFIG))?;
+    let settings = load_sandbox_settings(config_path)?;
     if !settings.enabled {
         return Ok(None);
     }
@@ -616,26 +631,28 @@ pub(crate) fn config_from_env(
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     agent_types: Arc<Vec<AgentType>>,
     skills: Arc<Vec<Skill>>,
+    cwd: &Path,
+    config_path: &Path,
 ) -> Result<Config> {
-    let permissions = Arc::new(build_permissions(args, approver, notify)?);
+    let permissions = Arc::new(build_permissions(args, cwd, config_path, approver, notify)?);
     // --mock stays hermetic: no config reads, no hook child processes.
     let hooks = if args.mock {
         Hooks::none()
     } else {
         Hooks {
-            defs: load_hooks(Path::new(PERMISSIONS_CONFIG))?,
+            defs: load_hooks(config_path)?,
         }
     };
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
     // The main agent's cwd anchor is the process cwd (same value build_permissions
     // reads); a worktree sub-agent later rewires its own clone off this.
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let cwd = cwd.to_path_buf();
     // Code-mode resource limits: default unless [codemode]/KLOOP_PROGRAM_* set.
     let program_limits = if args.mock {
         kloop_core::ProgramLimits::default()
     } else {
-        load_program_limits(Path::new(PERMISSIONS_CONFIG))?
+        load_program_limits(config_path)?
     };
     // KLOOP_CONTEXT_WINDOW: token budget for compaction ("off" disables).
     let context_window = match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {

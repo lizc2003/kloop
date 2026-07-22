@@ -47,6 +47,8 @@ pub enum MockTurn {
     Blocks(Vec<ContentBlock>),
     /// Blocks delivered, but the stream reports the output limit was hit.
     Truncated(Vec<ContentBlock>),
+    /// Content deltas arrive, then the stream fails before any block completes.
+    PartialError(Vec<ContentBlock>, String),
     /// The request is rejected for exceeding the context window.
     Overflow,
     /// A transient provider failure (retryable).
@@ -185,6 +187,20 @@ impl Provider {
                     let (blocks, stop_reason) = match turn {
                         MockTurn::Blocks(blocks) => (blocks, None),
                         MockTurn::Truncated(blocks) => (blocks, Some("max_tokens".to_string())),
+                        MockTurn::PartialError(blocks, message) => {
+                            for block in blocks {
+                                let event = match block {
+                                    ContentBlock::Text { text } => StreamEvent::TextDelta(text),
+                                    ContentBlock::Thinking { thinking, .. } => {
+                                        StreamEvent::ThinkingDelta(thinking)
+                                    }
+                                    _ => continue,
+                                };
+                                let _ = tx.send(Ok(event)).await;
+                            }
+                            let _ = tx.send(Err(anyhow::anyhow!(message))).await;
+                            return;
+                        }
                         MockTurn::Overflow => {
                             let _ = tx.send(Err(anyhow::Error::new(OverflowError))).await;
                             return;

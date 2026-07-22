@@ -489,6 +489,64 @@ async fn retry_recovers_from_transient_errors() {
     assert_eq!(outcome.final_text, "made it");
 }
 
+/// Once text is visible, a broken stream is closed in place and not retried:
+/// retrying would duplicate a partial answer in every event-driven front-end.
+#[tokio::test]
+async fn partial_stream_error_completes_open_item_without_retry() {
+    use kloop_provider::MockTurn;
+
+    struct EventUi(std::sync::Mutex<Vec<Event>>);
+    impl Ui for EventUi {
+        fn emit(&self, ev: &Event) {
+            self.0.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::PartialError(text("half answer"), "stream dropped".into()),
+        MockTurn::Blocks(text("must not retry")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "partial-stream");
+    let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
+    let ui: Arc<dyn Ui> = event_ui.clone();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hello"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(&outcome.reason, EndReason::Error(e) if e.contains("stream dropped")),
+        "expected the visible stream error, got {:?}",
+        outcome.reason
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "visible output must not be retried"
+    );
+    assert_eq!(
+        *event_ui.0.lock().unwrap(),
+        vec![
+            Event::ItemStarted {
+                id: "msg-0".into(),
+                item: Item::AssistantMessage {
+                    text: String::new(),
+                },
+            },
+            Event::ItemDelta {
+                id: "msg-0".into(),
+                delta: Delta::Text("half answer".into()),
+            },
+            Event::ItemCompleted {
+                id: "msg-0".into(),
+                item: Item::AssistantMessage {
+                    text: "half answer".into(),
+                },
+            },
+        ]
+    );
+}
+
 /// Three failures with no fallback exhaust the retry budget and surface
 /// the error.
 #[tokio::test]

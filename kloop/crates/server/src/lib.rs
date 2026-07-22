@@ -20,6 +20,7 @@ pub use wire::RequestId;
 pub use wire::PROTOCOL_VERSION;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
@@ -65,10 +66,20 @@ use wire::Outgoing;
 /// messages etc.); the server routes these into `note` notifications.
 pub type NoteFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Builds one Config per thread. Called with that thread's approver (routes
-/// to `approval/request`) and note sink, so permission gates and their
-/// session caches stay per-thread.
-pub type ConfigFactory = Arc<dyn Fn(Arc<dyn Approver>, NoteFn) -> Result<Config> + Send + Sync>;
+/// Runtime choices fixed when one thread is created. The cwd is always
+/// canonicalized by the server before the factory sees it, so every cwd-relative
+/// subsystem (permissions, sandbox, project context, skills) can share one anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadStartOptions {
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+}
+
+/// Builds one Config per thread. Called with the thread's resolved runtime
+/// choices, approver (routes to `approval/request`), and note sink, so cwd-bound
+/// policy and approval caches stay per-thread.
+pub type ConfigFactory =
+    Arc<dyn Fn(ThreadStartOptions, Arc<dyn Approver>, NoteFn) -> Result<Config> + Send + Sync>;
 
 pub struct ServerPaths {
     pub sessions_dir: PathBuf,
@@ -94,6 +105,9 @@ where
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(write_loop(output, out_rx));
 
+    let default_cwd =
+        std::fs::canonicalize(std::env::current_dir().context("cannot determine server cwd")?)
+            .context("cannot canonicalize server cwd")?;
     let mut server = Server {
         out: out_tx,
         threads: HashMap::new(),
@@ -101,6 +115,7 @@ where
         srv_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
+        default_cwd,
         initialized: false,
     };
     let mut lines = BufReader::new(input).lines();
@@ -171,6 +186,9 @@ struct Server {
     srv_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
+    /// Canonical process cwd used when a thread omits `cwd` (and by the slice-1
+    /// resume/fork methods until persisted thread runtime metadata lands).
+    default_cwd: PathBuf,
     /// Set once the client's `initialize` handshake succeeds. Every other
     /// method is rejected until then, so a version mismatch surfaces
     /// immediately instead of as mysterious downstream failures.
@@ -219,7 +237,7 @@ impl Server {
         }
         let result = match method {
             "initialize" => self.initialize(&params),
-            "thread/start" => self.thread_start(),
+            "thread/start" => self.thread_start(&params),
             "thread/resume" => self.thread_resume(&params),
             "thread/fork" => self.thread_fork(&params),
             "thread/list" => self.thread_list(),
@@ -285,7 +303,8 @@ impl Server {
         let _ = reply.send(decision);
     }
 
-    fn thread_start(&mut self) -> MethodResult {
+    fn thread_start(&mut self, params: &Value) -> MethodResult {
+        let options = parse_thread_start_options(params, &self.default_cwd)?;
         let thread_id = rollout::new_session_id(&self.paths.sessions_dir);
         let path = rollout::session_path(&self.paths.sessions_dir, &thread_id);
         // Claim the id on disk right away: rollout files are otherwise created
@@ -298,7 +317,7 @@ impl Server {
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot create session: {e}")))?;
         let mut history = History::new(self.paths.offload_dir.clone());
         history.attach_rollout(Rollout::new(path));
-        self.spawn_thread(thread_id.clone(), history)?;
+        self.spawn_thread(thread_id.clone(), history, options)?;
         Ok(json!({"thread": {"id": thread_id}}))
     }
 
@@ -318,7 +337,14 @@ impl Server {
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(thread_id.to_string(), history)?;
+        self.spawn_thread(
+            thread_id.to_string(),
+            history,
+            ThreadStartOptions {
+                cwd: self.default_cwd.clone(),
+                model: None,
+            },
+        )?;
         Ok(json!({"thread": {"id": thread_id}, "messageCount": count}))
     }
 
@@ -348,7 +374,14 @@ impl Server {
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume fork: {e}")))?;
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(new_id.clone(), history)?;
+        self.spawn_thread(
+            new_id.clone(),
+            history,
+            ThreadStartOptions {
+                cwd: self.default_cwd.clone(),
+                model: None,
+            },
+        )?;
         Ok(json!({"thread": {"id": new_id}, "messageCount": count}))
     }
 
@@ -445,7 +478,12 @@ impl Server {
         Ok(json!({}))
     }
 
-    fn spawn_thread(&mut self, thread_id: String, history: History) -> Result<(), (i64, String)> {
+    fn spawn_thread(
+        &mut self,
+        thread_id: String,
+        history: History,
+        options: ThreadStartOptions,
+    ) -> Result<(), (i64, String)> {
         // The running turn's id, shared between the ThreadUi (which tags item
         // events with it) and the handle (which `turn/steer` reads).
         let turn = Arc::new(Mutex::new(None));
@@ -458,6 +496,7 @@ impl Server {
         });
         let note_ui = ui.clone();
         let mut cfg = (self.factory)(
+            options,
             ui.clone(),
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
         )
@@ -487,6 +526,50 @@ impl Server {
 }
 
 type MethodResult = Result<Value, (i64, String)>;
+
+fn parse_thread_start_options(
+    params: &Value,
+    default_cwd: &Path,
+) -> Result<ThreadStartOptions, (i64, String)> {
+    let cwd = match params.get("cwd") {
+        None | Some(Value::Null) => default_cwd.to_path_buf(),
+        Some(Value::String(raw)) if !raw.trim().is_empty() => {
+            let path = PathBuf::from(raw);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                default_cwd.join(path)
+            };
+            std::fs::canonicalize(&path).map_err(|e| {
+                (
+                    wire::INVALID_PARAMS,
+                    format!("cannot resolve cwd '{}': {e}", path.display()),
+                )
+            })?
+        }
+        Some(Value::String(_)) => {
+            return Err((wire::INVALID_PARAMS, "'cwd' must not be empty".into()))
+        }
+        Some(_) => return Err((wire::INVALID_PARAMS, "'cwd' must be a string".into())),
+    };
+    if !cwd.is_dir() {
+        return Err((
+            wire::INVALID_PARAMS,
+            format!("cwd '{}' is not a directory", cwd.display()),
+        ));
+    }
+
+    let model = match params.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
+        Some(Value::String(_)) => {
+            return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()))
+        }
+        Some(_) => return Err((wire::INVALID_PARAMS, "'model' must be a string".into())),
+    };
+
+    Ok(ThreadStartOptions { cwd, model })
+}
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
     params[key].as_str().ok_or_else(|| {
