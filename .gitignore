@@ -9,3 +9,6 @@ kloop/.kloop/
 # keep only our own guide
 refs/*
 !refs/README.md
+
+# Claude Code local state
+.claude/
