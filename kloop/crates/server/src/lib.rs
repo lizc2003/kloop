@@ -31,6 +31,7 @@ use std::sync::Mutex;
 
 use anyhow::Context as _;
 use anyhow::Result;
+use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
@@ -84,27 +85,183 @@ pub struct ThreadStartOptions {
 pub type ConfigFactory =
     Arc<dyn Fn(ThreadStartOptions, Arc<dyn Approver>, NoteFn) -> Result<Config> + Send + Sync>;
 
+/// One model the engine can start a new thread with. Slice 4 deliberately
+/// reports only models the process can name locally; it never fabricates a
+/// provider-wide remote catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: String,
+    pub provider: String,
+    pub is_default: bool,
+}
+
+/// Non-sensitive effective configuration shown to a local protocol client.
+/// Provider credentials, MCP headers/env, hook commands, and permission-rule
+/// bodies are intentionally absent from this allowlist DTO.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSnapshot {
+    pub cwd: String,
+    pub model: Option<String>,
+    pub permission_mode: String,
+    pub context_window: Option<u64>,
+    pub defer_threshold: usize,
+    pub sandbox: SandboxConfigInfo,
+    pub worktree_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxConfigInfo {
+    pub enabled: bool,
+    pub allow_network: bool,
+    pub auto_allow: bool,
+    pub escalate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillScope {
+    Project,
+    User,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillContext {
+    Inline,
+    Fork,
+}
+
+/// Metadata only: a skill body and its allowed-tools list stay private until
+/// the normal skill invocation path loads them into a model turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub scope: SkillScope,
+    pub context: SkillContext,
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsSnapshot {
+    pub cwd: String,
+    pub skills: Vec<SkillInfo>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpServerState {
+    Connected,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// Startup discovery status, not a live health probe. Request handling returns
+/// this immutable snapshot and never reconnects or performs network IO.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatus {
+    pub name: String,
+    pub transport: McpTransportKind,
+    pub state: McpServerState,
+    pub tools: Vec<McpToolInfo>,
+    pub message: Option<String>,
+}
+
+pub type ConfigReader = Arc<dyn Fn(&Path) -> Result<ConfigSnapshot> + Send + Sync>;
+pub type SkillsReader = Arc<dyn Fn(&Path) -> Result<SkillsSnapshot> + Send + Sync>;
+
 pub struct ServerPaths {
     pub sessions_dir: PathBuf,
     pub offload_dir: PathBuf,
 }
 
-pub async fn serve_stdio(factory: ConfigFactory, paths: ServerPaths) -> Result<()> {
-    serve(tokio::io::stdin(), tokio::io::stdout(), factory, paths).await
+/// Everything the protocol server needs. The CLI owns filesystem/env/network
+/// assembly and injects immutable metadata plus cwd-scoped read callbacks; the
+/// server stays a transport/validation layer and never depends on the CLI.
+pub struct ServerConfig {
+    pub factory: ConfigFactory,
+    pub paths: ServerPaths,
+    pub models: Vec<ModelInfo>,
+    pub mcp_servers: Vec<McpServerStatus>,
+    pub config_reader: ConfigReader,
+    pub skills_reader: SkillsReader,
+}
+
+impl ServerConfig {
+    pub fn new(factory: ConfigFactory, paths: ServerPaths) -> Self {
+        Self {
+            factory,
+            paths,
+            models: Vec::new(),
+            mcp_servers: Vec::new(),
+            config_reader: Arc::new(|cwd| {
+                Ok(ConfigSnapshot {
+                    cwd: cwd.to_string_lossy().to_string(),
+                    model: None,
+                    permission_mode: "manual".into(),
+                    context_window: None,
+                    defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
+                    sandbox: SandboxConfigInfo {
+                        enabled: false,
+                        allow_network: false,
+                        auto_allow: false,
+                        escalate: false,
+                    },
+                    worktree_enabled: false,
+                })
+            }),
+            skills_reader: Arc::new(|cwd| {
+                Ok(SkillsSnapshot {
+                    cwd: cwd.to_string_lossy().to_string(),
+                    skills: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            }),
+        }
+    }
+}
+
+pub async fn serve_stdio(config: ServerConfig) -> Result<()> {
+    serve(tokio::io::stdin(), tokio::io::stdout(), config).await
 }
 
 /// Run the server until the input stream closes. Generic over the byte
 /// streams so contract tests can drive it over in-memory duplex pipes.
-pub async fn serve<R, W>(
-    input: R,
-    output: W,
-    factory: ConfigFactory,
-    paths: ServerPaths,
-) -> Result<()>
+pub async fn serve<R, W>(input: R, output: W, config: ServerConfig) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    let ServerConfig {
+        factory,
+        paths,
+        models,
+        mcp_servers,
+        config_reader,
+        skills_reader,
+    } = config;
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(write_loop(output, out_rx));
 
@@ -118,6 +275,10 @@ where
         srv_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
+        models,
+        mcp_servers,
+        config_reader,
+        skills_reader,
         default_cwd,
         initialized: false,
     };
@@ -178,6 +339,10 @@ struct ThreadHandle {
     /// The currently-running turn's id (shared with the thread's `ThreadUi` so
     /// item events can tag it); `None` between turns.
     turn: Arc<Mutex<Option<u64>>>,
+    /// Canonical base cwd and pinned model for read-only config/skills queries.
+    /// These are the persisted thread runtime, not a transient active worktree.
+    cwd: PathBuf,
+    model: String,
 }
 
 type PendingApprovals = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Decision>>>>;
@@ -189,8 +354,13 @@ struct Server {
     srv_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
-    /// Canonical process cwd used when a thread omits `cwd` (and by the slice-1
-    /// resume/fork methods until persisted thread runtime metadata lands).
+    /// Immutable process-level catalogs/snapshots assembled by the CLI.
+    models: Vec<ModelInfo>,
+    mcp_servers: Vec<McpServerStatus>,
+    /// Fresh cwd-scoped disk reads. These callbacks return allowlist DTOs only.
+    config_reader: ConfigReader,
+    skills_reader: SkillsReader,
+    /// Canonical process cwd used when a read method or thread/start omits cwd.
     default_cwd: PathBuf,
     /// Set once the client's `initialize` handshake succeeds. Every other
     /// method is rejected until then, so a version mismatch surfaces
@@ -245,6 +415,10 @@ impl Server {
             "thread/fork" => self.thread_fork(&params),
             "thread/list" => self.thread_list(&params),
             "thread/read" => self.thread_read(&params),
+            "model/list" => self.model_list(&params),
+            "config/read" => self.config_read(&params),
+            "skills/list" => self.skills_list(&params),
+            "mcpServerStatus/list" => self.mcp_server_status_list(&params),
             "turn/start" => self.turn_start(&params),
             "turn/steer" => self.turn_steer(&params),
             "turn/interrupt" => self.turn_interrupt(&params),
@@ -284,6 +458,10 @@ impl Server {
                 "mcp": true,
                 "images": true,
                 "approvals": true,
+                "models": {"list": true},
+                "config": {"read": true},
+                "skills": {"list": true},
+                "mcpServers": {"status": true},
                 "threads": {
                     "list": true,
                     "read": true,
@@ -510,6 +688,89 @@ impl Server {
         }))
     }
 
+    fn model_list(&self, params: &Value) -> MethodResult {
+        ensure_empty_params(params, "model/list")?;
+        Ok(json!({"models": &self.models}))
+    }
+
+    fn config_read(&self, params: &Value) -> MethodResult {
+        ensure_known_params(params, "config/read", &["threadId", "cwd"])?;
+        let (cwd, pinned_model) = self.read_scope(params)?;
+        let mut snapshot = (self.config_reader)(&cwd)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read config: {e:#}")))?;
+        // The callback reports the process default; a thread-scoped query must
+        // reflect that thread's model pinned in its rollout/runtime instead.
+        snapshot.cwd = cwd.to_string_lossy().to_string();
+        if let Some(model) = pinned_model {
+            snapshot.model = Some(model);
+        }
+        Ok(json!({"config": snapshot}))
+    }
+
+    fn skills_list(&self, params: &Value) -> MethodResult {
+        ensure_known_params(params, "skills/list", &["threadId", "cwd", "forceReload"])?;
+        match params.get("forceReload") {
+            None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+            Some(_) => {
+                return Err((
+                    wire::INVALID_PARAMS,
+                    "'forceReload' must be a boolean".into(),
+                ))
+            }
+        }
+        let (cwd, _) = self.read_scope(params)?;
+        // Discovery is deliberately uncached today, so forceReload and a normal
+        // call are both one fresh bounded filesystem scan.
+        let mut snapshot = (self.skills_reader)(&cwd)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot list skills: {e:#}")))?;
+        snapshot.cwd = cwd.to_string_lossy().to_string();
+        Ok(json!(snapshot))
+    }
+
+    fn mcp_server_status_list(&self, params: &Value) -> MethodResult {
+        ensure_empty_params(params, "mcpServerStatus/list")?;
+        Ok(json!({"servers": &self.mcp_servers}))
+    }
+
+    /// Resolve the cwd selected by `{threadId? | cwd?}`. With no selector, use
+    /// the server's canonical startup cwd. A dormant thread reads its persisted
+    /// runtime; legacy sessions without runtime metadata fail closed.
+    fn read_scope(&self, params: &Value) -> Result<(PathBuf, Option<String>), (i64, String)> {
+        object_params(params, "read method")?;
+        let thread_id = params.get("threadId").filter(|value| !value.is_null());
+        let cwd = params.get("cwd").filter(|value| !value.is_null());
+        if thread_id.is_some() && cwd.is_some() {
+            return Err((
+                wire::INVALID_PARAMS,
+                "supply at most one of 'threadId' or 'cwd'".into(),
+            ));
+        }
+        if let Some(value) = thread_id {
+            let thread_id = value.as_str().ok_or((
+                wire::INVALID_PARAMS,
+                "'threadId' must be a string".to_string(),
+            ))?;
+            if thread_id.trim().is_empty() {
+                return Err((wire::INVALID_PARAMS, "'threadId' must not be empty".into()));
+            }
+            if let Some(handle) = self.threads.get(thread_id) {
+                return Ok((handle.cwd.clone(), Some(handle.model.clone())));
+            }
+            let path = rollout::session_path(&self.paths.sessions_dir, thread_id);
+            if !path.exists() {
+                return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
+            }
+            let snapshot = rollout::load_session_snapshot(&path)
+                .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
+            let runtime = snapshot.runtime.ok_or((
+                wire::SERVER_ERROR,
+                format!("session '{thread_id}' has no runtime metadata"),
+            ))?;
+            let options = options_from_runtime(&runtime)?;
+            return Ok((options.cwd, options.model));
+        }
+        Ok((resolve_cwd(cwd, &self.default_cwd)?, None))
+    }
     fn turn_start(&mut self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "threadId")?;
         let (text, images) = parse_input(params)?;
@@ -620,6 +881,8 @@ impl Server {
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
         cfg.session_id = thread_id.clone();
+        let handle_cwd = cfg.cwd.clone();
+        let handle_model = cfg.model.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(cfg);
@@ -635,6 +898,8 @@ impl Server {
                 inbox,
                 turn_seq: Arc::new(AtomicU64::new(1)),
                 turn,
+                cwd: handle_cwd,
+                model: handle_model,
             },
         );
         Ok(())
@@ -642,6 +907,76 @@ impl Server {
 }
 
 type MethodResult = Result<Value, (i64, String)>;
+
+fn object_params(params: &Value, method: &str) -> Result<(), (i64, String)> {
+    match params {
+        Value::Null | Value::Object(_) => Ok(()),
+        _ => Err((
+            wire::INVALID_PARAMS,
+            format!("{method} params must be an object"),
+        )),
+    }
+}
+
+fn ensure_known_params(
+    params: &Value,
+    method: &str,
+    allowed: &[&str],
+) -> Result<(), (i64, String)> {
+    object_params(params, method)?;
+    let Some(params) = params.as_object() else {
+        return Ok(());
+    };
+    if let Some(key) = params.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err((
+            wire::INVALID_PARAMS,
+            format!("{method} does not accept parameter '{key}'"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_empty_params(params: &Value, method: &str) -> Result<(), (i64, String)> {
+    object_params(params, method)?;
+    if params.as_object().is_some_and(|params| !params.is_empty()) {
+        return Err((
+            wire::INVALID_PARAMS,
+            format!("{method} does not accept parameters"),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_cwd(value: Option<&Value>, default_cwd: &Path) -> Result<PathBuf, (i64, String)> {
+    let cwd = match value {
+        None | Some(Value::Null) => default_cwd.to_path_buf(),
+        Some(Value::String(raw)) if !raw.trim().is_empty() => {
+            let path = PathBuf::from(raw);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                default_cwd.join(path)
+            };
+            std::fs::canonicalize(&path).map_err(|e| {
+                (
+                    wire::INVALID_PARAMS,
+                    format!("cannot resolve cwd '{}': {e}", path.display()),
+                )
+            })?
+        }
+        Some(Value::String(_)) => {
+            return Err((wire::INVALID_PARAMS, "'cwd' must not be empty".into()))
+        }
+        Some(_) => return Err((wire::INVALID_PARAMS, "'cwd' must be a string".into())),
+    };
+    if !cwd.is_dir() {
+        return Err((
+            wire::INVALID_PARAMS,
+            format!("cwd '{}' is not a directory", cwd.display()),
+        ));
+    }
+    Ok(cwd)
+}
 
 fn runtime_from_options(options: &ThreadStartOptions) -> SessionRuntime {
     SessionRuntime {
@@ -713,33 +1048,7 @@ fn parse_thread_start_options(
     params: &Value,
     default_cwd: &Path,
 ) -> Result<ThreadStartOptions, (i64, String)> {
-    let cwd = match params.get("cwd") {
-        None | Some(Value::Null) => default_cwd.to_path_buf(),
-        Some(Value::String(raw)) if !raw.trim().is_empty() => {
-            let path = PathBuf::from(raw);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                default_cwd.join(path)
-            };
-            std::fs::canonicalize(&path).map_err(|e| {
-                (
-                    wire::INVALID_PARAMS,
-                    format!("cannot resolve cwd '{}': {e}", path.display()),
-                )
-            })?
-        }
-        Some(Value::String(_)) => {
-            return Err((wire::INVALID_PARAMS, "'cwd' must not be empty".into()))
-        }
-        Some(_) => return Err((wire::INVALID_PARAMS, "'cwd' must be a string".into())),
-    };
-    if !cwd.is_dir() {
-        return Err((
-            wire::INVALID_PARAMS,
-            format!("cwd '{}' is not a directory", cwd.display()),
-        ));
-    }
+    let cwd = resolve_cwd(params.get("cwd"), default_cwd)?;
 
     let model = match params.get("model") {
         None | Some(Value::Null) => None,

@@ -28,7 +28,19 @@ use kloop_protocol::Message;
 use kloop_provider::Provider;
 use kloop_server::serve;
 use kloop_server::ConfigFactory;
+use kloop_server::ConfigSnapshot;
+use kloop_server::McpServerState;
+use kloop_server::McpServerStatus;
+use kloop_server::McpToolInfo;
+use kloop_server::McpTransportKind;
+use kloop_server::ModelInfo;
+use kloop_server::SandboxConfigInfo;
+use kloop_server::ServerConfig;
 use kloop_server::ServerPaths;
+use kloop_server::SkillContext;
+use kloop_server::SkillInfo;
+use kloop_server::SkillScope;
+use kloop_server::SkillsSnapshot;
 use kloop_server::ThreadStartOptions;
 use kloop_server::PROTOCOL_VERSION;
 
@@ -126,13 +138,17 @@ impl TestClient {
 }
 
 fn start_server(factory: ConfigFactory, dirs: &TestDirs) -> TestClient {
-    let (writer, server_input) = tokio::io::duplex(1 << 16);
-    let (server_output, reader) = tokio::io::duplex(1 << 16);
     let paths = ServerPaths {
         sessions_dir: dirs.sessions.clone(),
         offload_dir: dirs.offload.clone(),
     };
-    let server = tokio::spawn(serve(server_input, server_output, factory, paths));
+    start_server_with_config(ServerConfig::new(factory, paths))
+}
+
+fn start_server_with_config(config: ServerConfig) -> TestClient {
+    let (writer, server_input) = tokio::io::duplex(1 << 16);
+    let (server_output, reader) = tokio::io::duplex(1 << 16);
+    let server = tokio::spawn(serve(server_input, server_output, config));
     TestClient {
         writer,
         lines: BufReader::new(reader).lines(),
@@ -354,6 +370,10 @@ async fn handshake_gates_and_negotiates() {
     let caps = client.initialize().await;
     assert_eq!(caps["streaming"], true);
     assert_eq!(caps["approvals"], true);
+    assert_eq!(caps["models"], json!({"list": true}));
+    assert_eq!(caps["config"], json!({"read": true}));
+    assert_eq!(caps["skills"], json!({"list": true}));
+    assert_eq!(caps["mcpServers"], json!({"status": true}));
     assert_eq!(
         caps["threads"],
         json!({"list": true, "read": true, "resume": true, "fork": true})
@@ -362,6 +382,261 @@ async fn handshake_gates_and_negotiates() {
     let resp = client.recv().await;
     assert_eq!(resp["id"], id);
     assert!(resp["result"]["thread"]["id"].is_string());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn read_surfaces_are_scoped_safe_and_read_only() {
+    let dirs = test_dirs("read-surfaces");
+    let project = dirs.root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = std::fs::canonicalize(project).unwrap();
+    let project_text = project.to_string_lossy().to_string();
+    let config_reads = Arc::new(Mutex::new(Vec::new()));
+    let skill_reads = Arc::new(Mutex::new(Vec::new()));
+
+    let paths = ServerPaths {
+        sessions_dir: dirs.sessions.clone(),
+        offload_dir: dirs.offload.clone(),
+    };
+    let mut server = ServerConfig::new(
+        factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
+        paths,
+    );
+    server.models = vec![ModelInfo {
+        id: "model-default".into(),
+        display_name: "Model Default".into(),
+        provider: "test".into(),
+        is_default: true,
+    }];
+    server.mcp_servers = vec![
+        McpServerStatus {
+            name: "memory".into(),
+            transport: McpTransportKind::Stdio,
+            state: McpServerState::Connected,
+            tools: vec![McpToolInfo {
+                name: "memory__search".into(),
+                description: "Search memory".into(),
+            }],
+            message: None,
+        },
+        McpServerStatus {
+            name: "remote".into(),
+            transport: McpTransportKind::Http,
+            state: McpServerState::Unavailable,
+            tools: Vec::new(),
+            message: Some("connection or tool discovery failed; see engine log".into()),
+        },
+    ];
+    let config_reads_for_reader = config_reads.clone();
+    server.config_reader = Arc::new(move |cwd| {
+        config_reads_for_reader
+            .lock()
+            .unwrap()
+            .push(cwd.to_path_buf());
+        Ok(ConfigSnapshot {
+            cwd: cwd.to_string_lossy().to_string(),
+            model: Some("model-default".into()),
+            permission_mode: "manual".into(),
+            context_window: Some(200_000),
+            defer_threshold: 30,
+            sandbox: SandboxConfigInfo {
+                enabled: true,
+                allow_network: false,
+                auto_allow: true,
+                escalate: true,
+            },
+            worktree_enabled: true,
+        })
+    });
+    let skill_reads_for_reader = skill_reads.clone();
+    let skill_path = project.join(".kloop/skills/review/SKILL.md");
+    server.skills_reader = Arc::new(move |cwd| {
+        skill_reads_for_reader
+            .lock()
+            .unwrap()
+            .push(cwd.to_path_buf());
+        Ok(SkillsSnapshot {
+            cwd: cwd.to_string_lossy().to_string(),
+            skills: vec![SkillInfo {
+                name: "review".into(),
+                description: "Review changes".into(),
+                path: skill_path.to_string_lossy().to_string(),
+                scope: SkillScope::Project,
+                context: SkillContext::Fork,
+                model: None,
+            }],
+            warnings: vec!["one malformed skill was skipped".into()],
+        })
+    });
+
+    let mut client = start_server_with_config(server);
+    let caps = client.initialize().await;
+    assert_eq!(
+        caps,
+        json!({
+            "approvals": true,
+            "config": {"read": true},
+            "images": true,
+            "mcp": true,
+            "mcpServers": {"status": true},
+            "models": {"list": true},
+            "skills": {"list": true},
+            "streaming": true,
+            "subagents": true,
+            "threads": {"fork": true, "list": true, "read": true, "resume": true},
+        })
+    );
+
+    let id = client.request("model/list", json!({})).await;
+    assert_eq!(
+        client.recv().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"models": [{
+                "id": "model-default",
+                "displayName": "Model Default",
+                "provider": "test",
+                "isDefault": true,
+            }]},
+        })
+    );
+
+    let id = client
+        .request("config/read", json!({"cwd": project_text}))
+        .await;
+    assert_eq!(
+        client.recv().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"config": {
+                "cwd": project_text,
+                "model": "model-default",
+                "permissionMode": "manual",
+                "contextWindow": 200_000,
+                "deferThreshold": 30,
+                "sandbox": {
+                    "enabled": true,
+                    "allowNetwork": false,
+                    "autoAllow": true,
+                    "escalate": true,
+                },
+                "worktreeEnabled": true,
+            }},
+        })
+    );
+
+    let id = client
+        .request(
+            "skills/list",
+            json!({"cwd": project_text, "forceReload": true}),
+        )
+        .await;
+    assert_eq!(
+        client.recv().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "cwd": project_text,
+                "skills": [{
+                    "name": "review",
+                    "description": "Review changes",
+                    "path": project.join(".kloop/skills/review/SKILL.md"),
+                    "scope": "project",
+                    "context": "fork",
+                    "model": null,
+                }],
+                "warnings": ["one malformed skill was skipped"],
+            },
+        })
+    );
+
+    let id = client.request("mcpServerStatus/list", json!({})).await;
+    assert_eq!(
+        client.recv().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"servers": [
+                {
+                    "name": "memory",
+                    "transport": "stdio",
+                    "state": "connected",
+                    "tools": [{"name": "memory__search", "description": "Search memory"}],
+                    "message": null,
+                },
+                {
+                    "name": "remote",
+                    "transport": "http",
+                    "state": "unavailable",
+                    "tools": [],
+                    "message": "connection or tool discovery failed; see engine log",
+                },
+            ]},
+        })
+    );
+
+    let id = client
+        .request(
+            "thread/start",
+            json!({"cwd": project_text, "model": "thread-model"}),
+        )
+        .await;
+    let response = client.recv().await;
+    assert_eq!(response["id"], id);
+    let thread_id = response["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = client
+        .request("config/read", json!({"threadId": thread_id}))
+        .await;
+    let response = client.recv().await;
+    assert_eq!(response["id"], id);
+    assert_eq!(response["result"]["config"]["cwd"], project_text);
+    assert_eq!(response["result"]["config"]["model"], "thread-model");
+
+    // Slice 4 is deliberately read-only. No capability advertises mutation and
+    // the stale plan-table mention of config/write stays METHOD_NOT_FOUND.
+    let id = client.request("config/write", json!({})).await;
+    let response = client.recv().await;
+    assert_eq!(response["id"], id);
+    assert_eq!(response["error"]["code"], -32601);
+
+    assert_eq!(
+        *config_reads.lock().unwrap(),
+        vec![project.clone(), project.clone()]
+    );
+    assert_eq!(*skill_reads.lock().unwrap(), vec![project.clone()]);
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn read_surface_params_fail_closed() {
+    let dirs = test_dirs("read-params");
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+
+    for (method, params) in [
+        ("model/list", json!({"unexpected": true})),
+        ("mcpServerStatus/list", json!([])),
+        ("config/read", json!({"threadId": "x", "cwd": "."})),
+        ("config/read", json!({"threadID": "x"})),
+        ("skills/list", json!({"forceReload": "yes"})),
+        ("skills/list", json!({"cwd": ".", "unexpected": true})),
+    ] {
+        let id = client.request(method, params).await;
+        let response = client.recv().await;
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32602);
+    }
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

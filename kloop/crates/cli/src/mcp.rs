@@ -20,6 +20,10 @@ use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
 use kloop_mcp::McpClient;
 use kloop_protocol::ToolDef;
+use kloop_server::McpServerState;
+use kloop_server::McpServerStatus;
+use kloop_server::McpToolInfo;
+use kloop_server::McpTransportKind;
 
 use crate::mcp_auth::CredentialStore;
 
@@ -64,8 +68,23 @@ pub enum McpTransport {
     },
 }
 
-/// Keys valid only for one transport, so a stdio-only key under a `url` server
-/// (or vice-versa) is a loud error, not a silent no-op.
+impl McpTransport {
+    fn kind(&self) -> McpTransportKind {
+        match self {
+            McpTransport::Stdio { .. } => McpTransportKind::Stdio,
+            McpTransport::Http { .. } => McpTransportKind::Http,
+        }
+    }
+}
+
+/// Runtime tool sources plus the immutable startup-discovery snapshot exposed
+/// by the native protocol. Failed configured servers stay visible in statuses
+/// even though they contribute no ToolSource.
+pub struct McpConnections {
+    pub sources: Vec<Arc<dyn ToolSource>>,
+    pub statuses: Vec<McpServerStatus>,
+}
+
 const STDIO_ONLY_KEYS: &[&str] = &["command", "env"];
 const HTTP_ONLY_KEYS: &[&str] = &[
     "url",
@@ -349,13 +368,12 @@ fn build_source(
 
 /// Spawn + handshake + tool discovery for every configured server. A failing
 /// server degrades to a warning and is skipped — MCP never blocks startup.
-pub async fn connect_servers(
-    servers: Vec<McpServerConfig>,
-    warn: &dyn Fn(&str),
-) -> Vec<Arc<dyn ToolSource>> {
+pub async fn connect_servers(servers: Vec<McpServerConfig>, warn: &dyn Fn(&str)) -> McpConnections {
     let store = Arc::new(CredentialStore::default_path());
     let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+    let mut statuses = Vec::new();
     for server in servers {
+        let transport = server.transport.kind();
         // A remote server with no static bearer takes the OAuth path: use a
         // stored token if the user has logged in; else connect unauthenticated
         // and, if that's rejected, point them at the login command.
@@ -392,26 +410,51 @@ pub async fn connect_servers(
             Ok((client, advertised)) => {
                 let count = advertised.len();
                 let source = build_source(&server, client, advertised, warn);
+                let tools = source
+                    .defs
+                    .iter()
+                    .map(|def| McpToolInfo {
+                        name: def.name.clone(),
+                        description: def.description.clone(),
+                    })
+                    .collect();
                 warn(&format!(
                     "mcp server '{}': connected, {count} tool(s)",
                     server.name
                 ));
+                statuses.push(McpServerStatus {
+                    name: server.name.clone(),
+                    transport,
+                    state: McpServerState::Connected,
+                    tools,
+                    message: None,
+                });
                 sources.push(Arc::new(source));
             }
-            Err(e) => {
+            Err(_) => {
                 let hint = if oauth_capable {
                     format!("; if it needs OAuth, run: kloop mcp login {}", server.name)
                 } else {
                     String::new()
                 };
                 warn(&format!(
-                    "mcp server '{}' unavailable, skipped: {e:#}{hint}",
+                    "mcp server '{}' unavailable, skipped{hint}",
                     server.name
-                ))
+                ));
+                statuses.push(McpServerStatus {
+                    name: server.name,
+                    transport,
+                    state: McpServerState::Unavailable,
+                    tools: Vec::new(),
+                    // Never reflect the raw anyhow chain onto the protocol or
+                    // warning stream: Desktop forwards stderr into the WebView,
+                    // and errors may quote URL credentials, commands, or env.
+                    message: Some("connection or tool discovery failed; see engine log".into()),
+                });
             }
         }
     }
-    sources
+    McpConnections { sources, statuses }
 }
 
 #[cfg(test)]
@@ -585,6 +628,46 @@ oauth_scopes = ["mcp.read", "mcp.write"]
             http_headers_for(&None, &BTreeMap::from([("A".into(), "b".into())])).unwrap(),
             BTreeMap::from([("A".into(), "b".into())])
         );
+    }
+
+    #[tokio::test]
+    async fn failed_connections_remain_visible_without_leaking_details() {
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let warn = |warning: &str| warnings.lock().unwrap().push(warning.to_string());
+        let connections = connect_servers(
+            vec![McpServerConfig {
+                name: "broken".into(),
+                transport: McpTransport::Stdio {
+                    command: vec!["/definitely/missing/kloop-mcp-secret".into()],
+                    env: BTreeMap::from([("TOKEN".into(), "SUPER-SECRET".into())]),
+                },
+                readonly: Vec::new(),
+            }],
+            &warn,
+        )
+        .await;
+
+        assert!(connections.sources.is_empty());
+        assert_eq!(
+            connections.statuses,
+            vec![McpServerStatus {
+                name: "broken".into(),
+                transport: McpTransportKind::Stdio,
+                state: McpServerState::Unavailable,
+                tools: Vec::new(),
+                message: Some("connection or tool discovery failed; see engine log".into()),
+            }]
+        );
+        let wire = serde_json::to_string(&connections.statuses).unwrap();
+        assert!(!wire.contains("SUPER-SECRET"));
+        assert!(!wire.contains("kloop-mcp-secret"));
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(
+            *warnings,
+            vec!["mcp server 'broken' unavailable, skipped".to_string()]
+        );
+        assert!(!warnings[0].contains("SUPER-SECRET"));
+        assert!(!warnings[0].contains("kloop-mcp-secret"));
     }
 
     #[test]

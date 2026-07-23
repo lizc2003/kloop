@@ -37,6 +37,8 @@ use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_server::SkillsReader;
+use kloop_server::SkillsSnapshot;
 
 use crate::args::list_sessions;
 use crate::args::open_history;
@@ -47,6 +49,9 @@ use crate::startup::config_from_env;
 use crate::startup::defer_threshold_from_env;
 use crate::startup::load_agent_types;
 use crate::startup::load_skills;
+use crate::startup::server_config_snapshot;
+use crate::startup::server_model_info;
+use crate::startup::server_skills_snapshot;
 use crate::startup::PERMISSIONS_CONFIG;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
@@ -67,6 +72,20 @@ async fn mcp_subcommand(args: &[String]) -> Result<ExitCode> {
             anyhow::bail!("unknown `kloop mcp` subcommand '{other}' ({USAGE})")
         }
         None => anyhow::bail!("{USAGE}"),
+    }
+}
+
+fn server_skills_reader(args: &CliArgs) -> SkillsReader {
+    if args.mock {
+        Arc::new(|cwd| {
+            Ok(SkillsSnapshot {
+                cwd: cwd.to_string_lossy().to_string(),
+                skills: Vec::new(),
+                warnings: Vec::new(),
+            })
+        })
+    } else {
+        Arc::new(|cwd| Ok(server_skills_snapshot(cwd)))
     }
 }
 
@@ -102,8 +121,8 @@ async fn main() -> Result<ExitCode> {
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
     // --mock stays hermetic: no child processes, no config reads.
-    let tool_sources = if args.mock {
-        Vec::new()
+    let (tool_sources, mcp_statuses) = if args.mock {
+        (Vec::new(), Vec::new())
     } else {
         let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
         // Web tools ride the same ToolSource seam, registered before MCP so
@@ -112,11 +131,12 @@ async fn main() -> Result<ExitCode> {
         let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
         sources.extend(web::build_web_source(&web_cfg, &warn));
         let servers = mcp::load_mcp_servers(Path::new(PERMISSIONS_CONFIG))?;
-        sources.extend(mcp::connect_servers(servers, &warn).await);
+        let mcp = mcp::connect_servers(servers, &warn).await;
+        sources.extend(mcp.sources);
         for warning in tool_merge_warnings(&sources, defer_threshold_from_env()?) {
             warn(&warning);
         }
-        sources
+        (sources, mcp.statuses)
     };
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     if args.serve {
@@ -174,14 +194,19 @@ async fn main() -> Result<ExitCode> {
                 Ok(cfg)
             })
         };
-        kloop_server::serve_stdio(
+        let read_args = args.clone();
+        let mut server = kloop_server::ServerConfig::new(
             factory,
             kloop_server::ServerPaths {
                 sessions_dir,
                 offload_dir: PathBuf::from(".kloop/offload"),
             },
-        )
-        .await?;
+        );
+        server.models = server_model_info(&args).into_iter().collect();
+        server.mcp_servers = mcp_statuses;
+        server.config_reader = Arc::new(move |cwd| server_config_snapshot(&read_args, cwd));
+        server.skills_reader = server_skills_reader(&args);
+        kloop_server::serve_stdio(server).await?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -481,4 +506,35 @@ async fn plain_main(
         println!("{}", note.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_server_skills_reader_is_hermetic() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-mock-server-skills-{}", std::process::id()));
+        let skill_dir = root.join(".kloop/skills/private");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: PRIVATE DESCRIPTION\n---\nPRIVATE BODY",
+        )
+        .unwrap();
+        let args = parse_args(&["--mock".to_string()]).unwrap();
+
+        let snapshot = server_skills_reader(&args)(&root).unwrap();
+
+        assert_eq!(
+            snapshot,
+            SkillsSnapshot {
+                cwd: root.to_string_lossy().to_string(),
+                skills: Vec::new(),
+                warnings: Vec::new(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

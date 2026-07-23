@@ -408,7 +408,8 @@ speak one item vocabulary by construction.
 `"1.0"`; a version the engine doesn't speak is a hard error, not a silent
 downgrade) and gates every other method until it succeeds. Capabilities are
 structured: `{streaming, subagents, mcp, images, approvals, threads:{list,
-read,resume,fork}}`.
+read,resume,fork}, models:{list}, config:{read}, skills:{list},
+mcpServers:{status}}`.
 
 **Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`;
 `thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
@@ -420,13 +421,25 @@ input}` → `{turn:{id}}`, `turn/steer {threadId, input}` → `{turnId}`,
 `turn/interrupt {threadId}`. The optional `cwd` on resume/fork is only the
 one-time migration input for pre-runtime-metadata rollouts; it cannot override
 a pinned session runtime. `input` is a string or an array of content parts
-(`{type:"text",text}` / `{type:"image",source:{…}}`). Every thread is its own
-tokio task owning a History (persisted to the same `.kloop/sessions/` files the
-interactive frontends use — sessions are interchangeable) and its own
-permission gate, so approval session caches never leak across threads.
-to the app-server launch directory; an explicit relative path is resolved from
-that directory, canonicalized, and rejected unless it is an accessible
-directory. The CLI builds project instructions, skills, permissions, sandbox,
+(`{type:"text",text}` / `{type:"image",source:{…}}`).
+
+**Read-only discovery:** `model/list {}` returns only the process's locally
+resolved default model (not a fabricated provider catalog); `config/read
+{cwd? | threadId?}` returns an explicit non-sensitive allowlist;
+`skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without
+bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}`
+returns the immutable startup discovery snapshot (transport, connected /
+unavailable state, sanitized message, and model-visible tool names). Config,
+skill, plugin, and MCP mutation methods are deliberately absent in this slice.
+Read methods reject unknown parameters, accept at most one scope selector, and
+canonicalize cwd before invoking their reader.
+
+Every thread is its own tokio task owning a History (persisted to the same
+`.kloop/sessions/` files the interactive frontends use — sessions are
+interchangeable) and its own permission gate, so approval session caches never
+leak across threads. A missing `thread/start.cwd` defaults to the app-server
+launch directory; an explicit relative path is resolved from that directory,
+canonicalized, and rejected unless it is an accessible directory. The CLI builds project instructions, skills, permissions, sandbox,
 hooks, agent types, and program limits from that thread cwd without ever
 changing the process cwd. `thread/start.model`, when present, overrides the
 provider/env default only for that thread; otherwise the factory-resolved
@@ -459,7 +472,7 @@ dropped/never-answered reply, `cancel`, or anything unrecognized declines
 
 ```jsonc
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"threads":{"list":true,"read":true,"resume":true,"fork":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
 → {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
@@ -471,7 +484,7 @@ dropped/never-answered reply, `cancel`, or anything unrecognized declines
 ← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","turn":{"id":1,"status":"completed"}}}
 ```
 
-### Codex Desktop adapter (plan 39 slice 2)
+### Codex Desktop adapter (plan 39 slices 2–4)
 
 The `桌面前端仓库` repository's dedicated `kloop` branch launches this
 server through `ENGINE_BIN` and consumes v1 directly (it does not emulate
@@ -485,13 +498,22 @@ ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
 
 That branch gets provider credentials from the launch environment and normal
 `.kloop` configuration, so it deliberately skips Codex SSO/LoginDialog/
-AccessGuard. Slice 2 keeps live text/image turns, Stop, generic tool cards, and
-all four approval decisions. The engine now advertises and implements the
-slice-3 history core (`thread/list|read|resume|fork`), but the Desktop history
-UI remains capability-gated until its dedicated adapter lands; search,
-name/archive/rollback/compact/goal, model/config/skills/MCP management,
-plan/review, automation/artifacts, and account panels likewise never issue
-legacy RPCs.
+AccessGuard. Live text/image turns, Stop, generic tool cards, all four approval
+decisions, and native `thread/list|read|resume|fork` history are connected.
+Slice 4 also enables the local model picker, project-scoped skill catalog and
+native `/skill ` invocation, the safe config read adapter, and an immutable MCP
+status panel. The model picker is locked after a thread starts because its model
+is pinned; reasoning controls stay hidden. Connector add/edit/toggle/delete,
+skill/plugin lifecycle operations, generic config writes, personalization
+settings/reset, and all other mutation methods remain fail-closed at both the
+TypeScript and Tauri command boundaries. Personalization controls also disable
+when their legacy settings cannot load, so the safe config projection is never
+presented as editable legacy state. The adapter never receives raw config,
+skill bodies, MCP commands/env/headers, or connection error chains.
+
+Search, name/archive/rollback/compact/goal, plan/review, dynamic tools,
+automation/artifacts, and account-only panels remain capability-gated and never
+issue legacy RPCs.
 
 ## MCP client (Phase 2, sixth slice)
 

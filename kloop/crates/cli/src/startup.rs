@@ -22,11 +22,20 @@ use kloop_core::permissions::Approver;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::skills::Skill;
+use kloop_core::skills::SkillContext as CoreSkillContext;
+use kloop_core::skills::SkillSource;
 use kloop_core::tools::ToolSource;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_provider::Provider;
 use kloop_provider::ThinkingMode;
+use kloop_server::ConfigSnapshot;
+use kloop_server::ModelInfo;
+use kloop_server::SandboxConfigInfo;
+use kloop_server::SkillContext as ServerSkillContext;
+use kloop_server::SkillInfo;
+use kloop_server::SkillScope;
+use kloop_server::SkillsSnapshot;
 
 use crate::args::CliArgs;
 use crate::context;
@@ -346,6 +355,46 @@ pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
     (merge_commands(skills, commands), warnings)
 }
 
+/// Cwd-scoped metadata for the native `skills/list` read surface. User commands
+/// share the runtime registry but are intentionally omitted here: they are
+/// slash shortcuts, not model-invocable skills. Bodies/allowed-tools are also
+/// omitted so listing cannot disclose prompt contents.
+pub(crate) fn server_skills_snapshot(cwd: &Path) -> SkillsSnapshot {
+    let (skills, warnings) = load_skills(cwd);
+    let project_root = cwd.join(".kloop").join("skills");
+    let skills = skills
+        .into_iter()
+        .filter(|skill| skill.source == SkillSource::Skill)
+        .map(|skill| {
+            let scope = if Path::new(&skill.dir).starts_with(&project_root) {
+                SkillScope::Project
+            } else {
+                SkillScope::User
+            };
+            let context = match skill.context {
+                CoreSkillContext::Inline => ServerSkillContext::Inline,
+                CoreSkillContext::Fork => ServerSkillContext::Fork,
+            };
+            SkillInfo {
+                name: skill.name,
+                description: skill.description,
+                path: Path::new(&skill.dir)
+                    .join("SKILL.md")
+                    .to_string_lossy()
+                    .to_string(),
+                scope,
+                context,
+                model: skill.model,
+            }
+        })
+        .collect();
+    SkillsSnapshot {
+        cwd: cwd.to_string_lossy().to_string(),
+        skills,
+        warnings,
+    }
+}
+
 /// Fold discovered commands into the skill registry, with a skill winning on a
 /// name collision — the directory form is the fuller one, so a command only
 /// fills a name no skill already claimed (silently, like project-over-global).
@@ -621,6 +670,100 @@ fn resolve_model(specific: Option<String>, generic: Option<String>) -> Option<St
     specific.or(generic)
 }
 
+/// The one locally configured model exposed by native `model/list`. kloop has
+/// no provider catalog API today, so returning anything beyond this resolved
+/// default would be fabricated. Missing credentials do not stop app-server
+/// startup; the real Config factory still reports them when a thread starts.
+pub(crate) fn server_model_info(args: &CliArgs) -> Option<ModelInfo> {
+    let provider = if args.mock {
+        "mock"
+    } else {
+        match std::env::var("KLOOP_PROVIDER").ok().as_deref() {
+            Some("anthropic") => "anthropic",
+            Some("openai") | Some("openai-compat") => "openai",
+            Some("openai-responses") => "openaiResponses",
+            Some(_) => return None,
+            None if std::env::var_os("ANTHROPIC_API_KEY").is_some() => "anthropic",
+            None if std::env::var_os("OPENAI_API_KEY").is_some() => "openai",
+            // Preserve the primary-track default even before credentials arrive;
+            // thread/start remains the authority that requires the key.
+            None => "anthropic",
+        }
+    };
+    let id = match provider {
+        "mock" => "mock".to_string(),
+        "anthropic" => resolve_model(
+            std::env::var("ANTHROPIC_MODEL").ok(),
+            std::env::var("KLOOP_MODEL").ok(),
+        )
+        .unwrap_or_else(|| "claude-sonnet-5".into()),
+        "openai" | "openaiResponses" => resolve_model(
+            std::env::var("OPENAI_MODEL").ok(),
+            std::env::var("KLOOP_MODEL").ok(),
+        )?,
+        _ => return None,
+    };
+    Some(ModelInfo {
+        display_name: id.clone(),
+        id,
+        provider: provider.into(),
+        is_default: true,
+    })
+}
+
+fn context_window_from_env() -> Result<Option<u64>> {
+    match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
+        Some("off") | Some("0") => Ok(None),
+        Some(raw) => Ok(Some(
+            raw.parse::<u64>()
+                .context("KLOOP_CONTEXT_WINDOW must be a token count or 'off'")?,
+        )),
+        None => Ok(Some(200_000)),
+    }
+}
+
+/// Safe effective-config allowlist for native `config/read`. Parsing may read
+/// the full local TOML, but only these non-sensitive values cross the protocol.
+pub(crate) fn server_config_snapshot(args: &CliArgs, cwd: &Path) -> Result<ConfigSnapshot> {
+    let settings = if args.mock {
+        SandboxSettings {
+            enabled: false,
+            allow_network: false,
+            writable_roots: Vec::new(),
+            auto_allow: false,
+            escalate: false,
+        }
+    } else {
+        load_sandbox_settings(&cwd.join(PERMISSIONS_CONFIG))?
+    };
+    let env_disables_sandbox = matches!(
+        std::env::var("KLOOP_SANDBOX").ok().as_deref(),
+        Some("off") | Some("0") | Some("false")
+    );
+    let sandbox_enabled = !args.mock
+        && settings.enabled
+        && !env_disables_sandbox
+        && kloop_core::sandbox::availability().is_ok();
+    Ok(ConfigSnapshot {
+        cwd: cwd.to_string_lossy().to_string(),
+        model: server_model_info(args).map(|model| model.id),
+        permission_mode: if args.mock {
+            "mock".into()
+        } else {
+            args.permission_mode.label().into()
+        },
+        context_window: context_window_from_env()?,
+        defer_threshold: defer_threshold_from_env()?,
+        sandbox: SandboxConfigInfo {
+            enabled: sandbox_enabled,
+            allow_network: settings.allow_network,
+            auto_allow: settings.auto_allow,
+            escalate: settings.escalate,
+        },
+        worktree_enabled: !args.mock,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn config_from_env(
     args: &CliArgs,
@@ -655,14 +798,7 @@ pub(crate) fn config_from_env(
         load_program_limits(config_path)?
     };
     // KLOOP_CONTEXT_WINDOW: token budget for compaction ("off" disables).
-    let context_window = match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
-        Some("off") | Some("0") => None,
-        Some(raw) => Some(
-            raw.parse::<u64>()
-                .context("KLOOP_CONTEXT_WINDOW must be a token count or 'off'")?,
-        ),
-        None => Some(200_000),
-    };
+    let context_window = context_window_from_env()?;
     let base = Config {
         provider: Arc::new(Provider::mock(vec![])),
         model: "mock".into(),
@@ -859,6 +995,60 @@ mod tests {
         assert_eq!(resolve_model(None, s("shared")), s("shared"));
         // Neither set: None — anthropic then defaults, openai errors.
         assert_eq!(resolve_model(None, None), None);
+    }
+
+    #[test]
+    fn native_model_snapshot_is_local_and_single_default() {
+        let args = crate::args::parse_args(&["--mock".into()]).unwrap();
+        assert_eq!(
+            server_model_info(&args),
+            Some(ModelInfo {
+                id: "mock".into(),
+                display_name: "mock".into(),
+                provider: "mock".into(),
+                is_default: true,
+            })
+        );
+    }
+
+    #[test]
+    fn native_skills_snapshot_omits_commands_and_bodies() {
+        let base = std::env::temp_dir().join(format!("kloop-native-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let skill_dir = base.join(".kloop/skills/review");
+        let command_dir = base.join(".kloop/commands");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir_all(&command_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Review changes\ncontext: fork\n---\nSECRET BODY",
+        )
+        .unwrap();
+        std::fs::write(command_dir.join("deploy.md"), "# Deploy\n\nSECRET COMMAND").unwrap();
+
+        let snapshot = server_skills_snapshot(&base);
+        let review = snapshot
+            .skills
+            .iter()
+            .find(|skill| skill.name == "review")
+            .unwrap();
+        assert_eq!(
+            review,
+            &SkillInfo {
+                name: "review".into(),
+                description: "Review changes".into(),
+                path: skill_dir.join("SKILL.md").to_string_lossy().to_string(),
+                scope: SkillScope::Project,
+                context: ServerSkillContext::Fork,
+                model: None,
+            }
+        );
+        assert!(!snapshot.skills.iter().any(|skill| skill.name == "deploy"));
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("SECRET BODY"));
+        assert!(!wire.contains("SECRET COMMAND"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

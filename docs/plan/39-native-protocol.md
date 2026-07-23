@@ -153,7 +153,7 @@ fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-s
 | **1 ✅** | 原生 wire v1 + 握手 + 主链 + 统一审批 + `app-server` 入口(§三) | 契约测试 + `--mock` 冒烟 + 真 key anthropic 轨冒烟 |
 | **2 ✅** | **app `kloop` 分支适配主链**:`worker.rs` 换原生 v1 + 独立 `kloop/` 前端 adapter + capability gate + SSO 绕过 | 真 app Eval Mode + 真协议 E2E:首/二轮、工具、审批、图片、双 cwd |
 | **3（进行中：3A engine ✅）** | 会话管理:`thread/resume|list|read|fork|rollback|compact/start|name/set|goal/*|archive|search` + app 适配；3A 已完成持久化快照 + `list/read/resume/fork` engine 主干 | 契约 + app 会话列表/恢复/fork |
-| **4** | config/model/skills/mcp 只读 + 降级兜底:`model/list`/`config/read|write`/`mcpServerStatus/list`/`skills/list` + app 适配 | app 模型选择器/设置面板不卡 |
+| **4 ✅** | config/model/skills/MCP 只读:`model/list`/`config/read`/`mcpServerStatus/list`/`skills/list` + app 适配；写入面继续 fail-closed | app 模型选择器/技能调用/MCP 状态 + 真 Tauri E2E |
 | **5** | 打磨:reasoning delta 细分、`turn/diff/updated`、`turn/plan/updated`、review mode、边角 item 变体 | 真 app 各面板 |
 
 ## 五、开工时定 / 问用户的点
@@ -225,3 +225,15 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 - **恢复语义 fail-closed**:`thread/start` 在 ConfigFactory 解析默认 provider/model 后把实际 model 再 pin 进 rollout，后续环境变化不静默换模型。旧 rollout 仍可 `read`，但因没有 runtime，`resume/fork` 必须显式给原 cwd；成功后追加 runtime 完成一次性迁移，绝不猜成 app-server 当前启动目录。
 - **验证**:`cargo fmt --all --check`、`cargo clippy --workspace -- -D warnings`、全工作区 `cargo test` 全绿；`kloop --mock` 六轮 demo 通过；同步 `app-server --mock` 客户端完成 initialize/start/turn/item stream/read/list 并核对 runtime/model/terminal；真 key anthropic 轨以 `claude-sonnet-4-6` 运行“只回复 OK”，响应 `OK`，随后 `thread/read` 恢复两条消息、正确 cwd/model 与 completed terminal。契约测试覆盖分页、runtime 保真、legacy 迁移、fork 边界/running 拒绝、partial error 恢复。
 - **提交**:本次(plan 39 切片 3A engine,见 git log)。
+
+### 切片 4 ✅(2026-07-24,app 提交 `934e325d` + kloop 本提交)
+
+原生协议补齐严格只读的模型、配置、技能与 MCP 状态面；Desktop 只打开对应读取入口，旧配置写入、技能/plugin mutation、MCP mutation 与 personalization 继续三层 fail-closed。
+
+- **engine 只读 RPC**:`model/list` 只列本地实际可解析的默认模型；`config/read` 只返回 cwd/model/permission/context/defer/sandbox/worktree 显式 allowlist；`skills/list` 合并项目与用户 `SKILL.md` metadata(项目同名覆盖用户、不含正文/allowed-tools/commands)；`mcpServerStatus/list` 返回进程启动时 immutable connected/unavailable snapshot + 工具 metadata。initialize 增加 `models.list/config.read/skills.list/mcpServers.status` 四组 capability。
+- **scope 与安全边界**:`config/read`/`skills/list` 支持 canonical cwd 或 live `threadId` scope，thread model 取已 pin runtime；双 selector、坏类型和未知参数全部 `INVALID_PARAMS`，mutation 方法仍 `METHOD_NOT_FOUND`。MCP 响应不含 command/args/env/url/header/token，失败 message 与 stderr 都不反射原始 anyhow 链；`--mock` 的 config/skills reader 全链 hermetic，不读真实 cwd/HOME。
+- **Desktop adapter/UI**:Tauri worker 新增四个 native read command 并在 initialize 硬校验四组 capability；`src/kloop/readSurfaces.ts` 把 native DTO 投影到既有 view model。模型菜单使用 native catalog、仅空 thread 可选且隐藏 reasoning；composer 按当前 cwd 加载 skills，切项目会失效缓存并丢弃陈旧请求，选择后以原生 `/<name> ` 替换 slash query；Connectors 展示 MCP transport/state/tools/safe message，隐藏 add/edit/toggle/delete；PluginCenter 会把不可见 tab 归一化，Slash 菜单渲染与键盘索引共用同一 capability 过滤结果。
+- **mutation fail-closed**:`configuration/skills/mcp` umbrella 保持 false；TS API 在 `invoke` 前拒绝 personalization/skill/plugin/MCP mutation，Rust personalization command 也固定返回 `PERSONALIZATION_FAILED`，不能借 safe `config/read` 伪造旧偏好或触发旧 write/reset。设置加载失败时 instructions/memory/reset 控件全部禁用且错误可见（reset dialog 内也显示），direct mount 也不会产生不可保存的假状态；审查未发现 direct invoke 旁路。
+- **验证(kloop)**:`cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、全工作区 `cargo test` 全绿。同步原生协议 E2E 核对 model/config allowlist/project skill/connected+unavailable MCP、`config/write=-32601` 与 secret projection clean；安全回归另证 mock skills hermetic、未知参数 `-32602`、MCP stderr clean；真 key `/slice4-e2e` 返回 `SLICE4_SKILL_OK`。
+- **验证(app)**:全量 Bun **885 pass / 52 capability skips / 0 fail**(937 tests / 130 files)，`bun run ts:check`、`bun run build:test` 全绿；Rust `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、**227 tests** 全绿。真实完整 Tauri Eval 以 `ENGINE_BIN=target/debug/kloop` 跑 case `39-04` 得 `completed`（threadId/turnId 均存在、error=null）。
+- **提交**:`桌面前端仓库` 专用 `kloop` 分支 `934e325d`；既有 `codex` gitlink 修改保持 unstaged/未提交。kloop 提交:本提交。
