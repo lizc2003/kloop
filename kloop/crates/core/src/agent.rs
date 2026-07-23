@@ -271,12 +271,25 @@ async fn turn_rounds(
                     }
                 }
             }
-            Sampled::Cancelled => {
+            Sampled::Cancelled { partial } => {
+                if !partial.is_empty() {
+                    history.record(Message::assistant(partial));
+                }
                 return TurnOutcome {
                     reason: EndReason::Aborted,
                     final_text: String::new(),
                     rounds: round,
+                };
+            }
+            Sampled::Partial { error, blocks } => {
+                if !blocks.is_empty() {
+                    history.record(Message::assistant(blocks));
                 }
+                return TurnOutcome {
+                    reason: EndReason::Error(error),
+                    final_text: String::new(),
+                    rounds: round,
+                };
             }
             Sampled::Failed(e) => {
                 // Retries exhausted on the primary model: switch to the

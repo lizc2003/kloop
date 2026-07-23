@@ -32,6 +32,39 @@ use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntime {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTerminal {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotTerminal {
+    pub after_message: usize,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub messages: Vec<Message>,
+    pub runtime: Option<SessionRuntime>,
+    pub terminals: Vec<SnapshotTerminal>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct LineMeta {
     id: String,
@@ -52,6 +85,11 @@ struct LineMeta {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RolloutLine {
+    Session {
+        #[serde(flatten)]
+        meta: LineMeta,
+        runtime: SessionRuntime,
+    },
     Message {
         #[serde(flatten)]
         meta: LineMeta,
@@ -63,19 +101,33 @@ enum RolloutLine {
         meta: LineMeta,
         replacement: Vec<Message>,
     },
+    TurnTerminal {
+        #[serde(flatten)]
+        meta: LineMeta,
+        #[serde(flatten)]
+        terminal: TurnTerminal,
+    },
 }
 
 impl RolloutLine {
-    /// The line's metadata, common to both variants.
+    /// The line's metadata, common to every variant.
     fn meta(&self) -> &LineMeta {
-        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = self;
-        meta
+        match self {
+            RolloutLine::Session { meta, .. }
+            | RolloutLine::Message { meta, .. }
+            | RolloutLine::Compacted { meta, .. }
+            | RolloutLine::TurnTerminal { meta, .. } => meta,
+        }
     }
 
     /// Consume the line for its metadata, dropping the payload.
     fn into_meta(self) -> LineMeta {
-        let (RolloutLine::Message { meta, .. } | RolloutLine::Compacted { meta, .. }) = self;
-        meta
+        match self {
+            RolloutLine::Session { meta, .. }
+            | RolloutLine::Message { meta, .. }
+            | RolloutLine::Compacted { meta, .. }
+            | RolloutLine::TurnTerminal { meta, .. } => meta,
+        }
     }
 }
 
@@ -97,6 +149,14 @@ impl Rollout {
     /// A fresh session: the id chain starts at `#1` with no parent.
     pub fn new(path: PathBuf) -> Self {
         Self::with_origin(path, None)
+    }
+
+    /// A fresh session whose runtime choices must survive process restarts.
+    /// The metadata is written before the thread id is returned to a client.
+    pub fn new_with_runtime(path: PathBuf, runtime: SessionRuntime) -> io::Result<Self> {
+        let mut rollout = Self::new(path);
+        rollout.append_runtime(&runtime)?;
+        Ok(rollout)
     }
 
     /// A sub-agent's rollout: like [`Rollout::new`], but the first appended
@@ -129,6 +189,13 @@ impl Rollout {
         &self.path
     }
 
+    pub fn append_runtime(&mut self, runtime: &SessionRuntime) -> io::Result<()> {
+        self.append_line(RolloutLine::Session {
+            meta: self.next_meta(),
+            runtime: runtime.clone(),
+        })
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         self.append_line(RolloutLine::Message {
             meta: self.next_meta(),
@@ -140,6 +207,13 @@ impl Rollout {
         self.append_line(RolloutLine::Compacted {
             meta: self.next_meta(),
             replacement: replacement.to_vec(),
+        })
+    }
+
+    pub fn append_turn_terminal(&mut self, terminal: &TurnTerminal) -> io::Result<()> {
+        self.append_line(RolloutLine::TurnTerminal {
+            meta: self.next_meta(),
+            terminal: terminal.clone(),
         })
     }
 
@@ -188,6 +262,8 @@ fn id_prefix(path: &Path) -> String {
 /// chain state needed to keep appending, and where the intact content ends.
 struct ParsedSession {
     items: Vec<Message>,
+    runtime: Option<SessionRuntime>,
+    terminals: Vec<SnapshotTerminal>,
     last_id: Option<String>,
     max_seq: u64,
     /// Byte offset just past the last intact line; anything after is a
@@ -230,18 +306,33 @@ fn parse_session(raw: &str) -> ParsedSession {
     let (lines, intact_end) = intact_lines(raw);
     let mut parsed = ParsedSession {
         items: Vec::new(),
+        runtime: None,
+        terminals: Vec::new(),
         last_id: None,
         max_seq: 0,
         intact_end,
     };
     for line in lines {
         let meta = match line {
+            RolloutLine::Session { meta, runtime } => {
+                parsed.runtime = Some(runtime);
+                meta
+            }
             RolloutLine::Message { meta, message } => {
                 parsed.items.push(message);
                 meta
             }
             RolloutLine::Compacted { meta, replacement } => {
                 parsed.items = replacement;
+                parsed.terminals.clear();
+                meta
+            }
+            RolloutLine::TurnTerminal { meta, terminal } => {
+                parsed.terminals.push(SnapshotTerminal {
+                    after_message: parsed.items.len(),
+                    status: terminal.status,
+                    error: terminal.error,
+                });
                 meta
             }
         };
@@ -257,6 +348,19 @@ fn parse_session(raw: &str) -> ParsedSession {
 pub fn load_session(path: &Path) -> io::Result<Vec<Message>> {
     let raw = std::fs::read_to_string(path)?;
     Ok(repair_pairing(parse_session(&raw).items))
+}
+
+/// Read the persisted session for a history client. Runtime and terminal records
+/// are display/recovery metadata only; provider replay still consumes only
+/// `messages` through [`load_session`] / [`resume_session`].
+pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
+    let raw = std::fs::read_to_string(path)?;
+    let parsed = parse_session(&raw);
+    Ok(SessionSnapshot {
+        messages: repair_pairing(parsed.items),
+        runtime: parsed.runtime,
+        terminals: parsed.terminals,
+    })
 }
 
 /// Open a session for continuation: replay like [`load_session`], but also
@@ -343,6 +447,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
             }
         };
         let line = match line {
+            RolloutLine::Session { meta, runtime } => RolloutLine::Session {
+                meta: remeta(meta),
+                runtime,
+            },
             RolloutLine::Message { meta, message } => RolloutLine::Message {
                 meta: remeta(meta),
                 message,
@@ -350,6 +458,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
             RolloutLine::Compacted { meta, replacement } => RolloutLine::Compacted {
                 meta: remeta(meta),
                 replacement,
+            },
+            RolloutLine::TurnTerminal { meta, terminal } => RolloutLine::TurnTerminal {
+                meta: remeta(meta),
+                terminal,
             },
         };
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
@@ -379,22 +491,30 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
                     .iter()
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         }
-        RolloutLine::Compacted { .. } => false,
+        RolloutLine::Session { .. }
+        | RolloutLine::Compacted { .. }
+        | RolloutLine::TurnTerminal { .. } => false,
     }
 }
 
 /// Seqs after which the file may be cut: every line whose successor starts
 /// a fresh user turn, plus the last line.
 fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| match lines.get(i + 1) {
+    let mut seen_user_turn = false;
+    let mut legal = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if opens_user_turn(line) {
+            seen_user_turn = true;
+        }
+        let boundary = match lines.get(i + 1) {
             Some(next) => opens_user_turn(next),
             None => true,
-        })
-        .map(|(_, line)| seq_of(line.meta()))
-        .collect()
+        };
+        if seen_user_turn && boundary {
+            legal.push(seq_of(line.meta()));
+        }
+    }
+    legal
 }
 
 /// A turn boundary a live session can rewind to: the cut `seq` plus a preview
@@ -416,12 +536,16 @@ pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
     let raw = std::fs::read_to_string(path)?;
     let (lines, _) = intact_lines(&raw);
     let mut points = Vec::new();
+    let mut seen_user_turn = false;
     for (i, line) in lines.iter().enumerate() {
+        if opens_user_turn(line) {
+            seen_user_turn = true;
+        }
         // The tip has no successor: skip it (a no-op rewind).
         let Some(next) = lines.get(i + 1) else {
             continue;
         };
-        if !opens_user_turn(next) {
+        if !seen_user_turn || !opens_user_turn(next) {
             continue;
         }
         let RolloutLine::Message { message, .. } = next else {
@@ -1375,6 +1499,96 @@ mod tests {
         // Read-only load ignores the tail but leaves the file alone.
         assert_eq!(load_session(&path).unwrap(), vec![good.clone()]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_and_terminals_are_snapshot_only() {
+        let path = temp_file("snapshot");
+        let runtime = SessionRuntime {
+            cwd: "/tmp/project".into(),
+            model: Some("test-model".into()),
+        };
+        let mut rollout = Rollout::new_with_runtime(path.clone(), runtime.clone()).unwrap();
+        rollout
+            .append_message(&Message::user_text("hello"))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "half".into(),
+            }]))
+            .unwrap();
+        rollout
+            .append_turn_terminal(&TurnTerminal {
+                status: "error".into(),
+                error: Some("stream dropped".into()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            load_session(&path).unwrap(),
+            vec![
+                Message::user_text("hello"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "half".into(),
+                }]),
+            ],
+            "runtime and terminal records must never enter provider history"
+        );
+        assert_eq!(
+            load_session_snapshot(&path).unwrap(),
+            SessionSnapshot {
+                messages: vec![
+                    Message::user_text("hello"),
+                    Message::assistant(vec![ContentBlock::Text {
+                        text: "half".into(),
+                    }]),
+                ],
+                runtime: Some(runtime),
+                terminals: vec![SnapshotTerminal {
+                    after_message: 2,
+                    status: "error".into(),
+                    error: Some("stream dropped".into()),
+                }],
+            }
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_copies_runtime_and_terminal_records() {
+        let path = temp_file("snapshot-fork");
+        let dir = path.parent().unwrap().to_path_buf();
+        let runtime = SessionRuntime {
+            cwd: "/tmp/fork-project".into(),
+            model: None,
+        };
+        let mut rollout = Rollout::new_with_runtime(path.clone(), runtime.clone()).unwrap();
+        rollout.append_message(&Message::user_text("q")).unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "a".into(),
+            }]))
+            .unwrap();
+        rollout
+            .append_turn_terminal(&TurnTerminal {
+                status: "completed".into(),
+                error: None,
+            })
+            .unwrap();
+
+        let fork = fork_session(&path, None, &dir).unwrap();
+        let snapshot = load_session_snapshot(&fork).unwrap();
+        assert_eq!(snapshot.runtime, Some(runtime));
+        assert_eq!(
+            snapshot.terminals,
+            vec![SnapshotTerminal {
+                after_message: 2,
+                status: "completed".into(),
+                error: None,
+            }]
+        );
+        assert_eq!(fork_origin(&fork), Some("session#4".into()));
         cleanup(&path);
     }
 

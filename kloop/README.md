@@ -56,9 +56,16 @@ sanctioned rewrite of the append-only history.
 Every session is persisted to `.kloop/sessions/{id}.jsonl`
 (`crates/core/src/rollout.rs`), one JSON line per recorded message, written
 through as the history records — so a killed process loses at most the line
-being written. Compaction appends a `compacted` marker line carrying the full
-replacement history (the codex rollout pattern): the file stays append-only
-and auditable, and replay just swaps in the replacement and keeps reading.
+being written. The same append-only chain also carries recovery-only `session`
+records (the canonical cwd and resolved model) and display-only `turn_terminal`
+records (completed/maxRounds/aborted/error, positioned after a message index);
+neither enters provider replay or token accounting. If a stream fails or is
+cancelled after visible text, that partial assistant block is recorded before
+the terminal, so `thread/read` can reconstruct exactly what the user already
+saw after a restart. Compaction appends a `compacted` marker line carrying the
+full replacement history (the codex rollout pattern): the file stays
+append-only and auditable, replay swaps in the replacement and keeps reading,
+and superseded terminal indices are discarded with the replaced history.
 
 Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
@@ -83,7 +90,11 @@ Resume replays the file, then makes the history legal and consistent again:
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
-<id>` a specific one, `--list-sessions` shows what's on disk.
+<id>` a specific one, `--list-sessions` shows what's on disk. Native-protocol
+sessions additionally restore the exact canonical cwd and resolved model that
+were pinned at `thread/start`; a legacy rollout without this metadata remains
+readable but requires its original `cwd` once on `thread/resume` before it is
+migrated and safely resumable.
 
 ### Fork (and rewind)
 
@@ -115,10 +126,12 @@ codex's `thread/fork` both copy, neither replays across files):
   not persisted, so a fork re-anchors on its first sampled response.
 
 Server mode exposes the same mechanism as `thread/fork {threadId, cut?}`
-(omit `cut` to fork at the end): it copies the prefix, spawns the fork as a
-live thread (like `thread/resume`), and returns `{threadId, messageCount}` so
-the client can `turn/start` on it right away. The source need not be an active
-thread — forking reads the file directly, so a dormant history can be branched.
+(omit `cut` to fork at the end): it copies the prefix, restores the source's
+pinned cwd/model, spawns the fork as a live thread, and returns
+`{thread:{id,cwd,model,resumable}, messageCount}` so the client can
+`turn/start` on it right away. The source may be dormant or active-and-idle;
+a fork is rejected while its turn is running so an in-flight exchange cannot
+be copied before its terminal record closes the prefix.
 
 In the TUI, **Ctrl+R** (when idle) opens a rewind picker: it lists the turn
 boundaries the session can rewind to — each previewed by the user message it
@@ -394,25 +407,34 @@ speak one item vocabulary by construction.
 `{serverInfo, protocolVersion, capabilities}` negotiates the version (from
 `"1.0"`; a version the engine doesn't speak is a hard error, not a silent
 downgrade) and gates every other method until it succeeds. Capabilities are
-structured: `{streaming, subagents, mcp, images, approvals}`.
+structured: `{streaming, subagents, mcp, images, approvals, threads:{list,
+read,resume,fork}}`.
 
-**Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`,
-`thread/resume {threadId}`, `thread/fork {threadId, cut?}`, `thread/list`,
-`turn/start {threadId, input}` → `{turn:{id}}`,
-`turn/steer {threadId, input}` → `{turnId}`, `turn/interrupt {threadId}`.
-`input` is a string or an array of content parts (`{type:"text",text}` /
-`{type:"image",source:{…}}`). Every thread is its own tokio task owning a
-History (persisted to the same `.kloop/sessions/` files the interactive
-frontends use — sessions are interchangeable) and its own permission gate, so
-approval session caches never leak across threads. `thread/start.cwd` defaults
+**Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`;
+`thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
+sub-agent sidechains hidden, `limit` capped at 500); `thread/read {threadId}` →
+`{thread:{id,cwd,model,resumable,forkedFrom,messages,terminals}}`;
+`thread/resume {threadId, cwd?}` and `thread/fork {threadId, cut?, cwd?}` →
+`{thread:{id,cwd,model,resumable}, messageCount}`; `turn/start {threadId,
+input}` → `{turn:{id}}`, `turn/steer {threadId, input}` → `{turnId}`,
+`turn/interrupt {threadId}`. The optional `cwd` on resume/fork is only the
+one-time migration input for pre-runtime-metadata rollouts; it cannot override
+a pinned session runtime. `input` is a string or an array of content parts
+(`{type:"text",text}` / `{type:"image",source:{…}}`). Every thread is its own
+tokio task owning a History (persisted to the same `.kloop/sessions/` files the
+interactive frontends use — sessions are interchangeable) and its own
+permission gate, so approval session caches never leak across threads.
 to the app-server launch directory; an explicit relative path is resolved from
 that directory, canonicalized, and rejected unless it is an accessible
 directory. The CLI builds project instructions, skills, permissions, sandbox,
 hooks, agent types, and program limits from that thread cwd without ever
 changing the process cwd. `thread/start.model`, when present, overrides the
-provider/env default only for that thread. Provider state and already-connected
-MCP tool sources remain process-shared; session/offload roots remain the
-app-server's `ServerPaths`, not the thread project directory.
+provider/env default only for that thread; otherwise the factory-resolved
+default is pinned before `thread/start` returns, so a later server restart or
+environment change cannot silently switch the resumed thread's model. Provider
+state and already-connected MCP tool sources remain process-shared;
+session/offload roots remain the app-server's `ServerPaths`, not the thread
+project directory.
 
 **Events** stream per thread, tagged with `threadId` (and `turnId` for
 turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
@@ -437,7 +459,7 @@ dropped/never-answered reply, `cancel`, or anything unrecognized declines
 
 ```jsonc
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"threads":{"list":true,"read":true,"resume":true,"fork":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
 → {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
@@ -464,10 +486,12 @@ ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
 That branch gets provider credentials from the launch environment and normal
 `.kloop` configuration, so it deliberately skips Codex SSO/LoginDialog/
 AccessGuard. Slice 2 keeps live text/image turns, Stop, generic tool cards, and
-all four approval decisions. History/resume/fork/search, model/config/skills/MCP
-management, goal/plan/review/compact, automation/artifacts, and account panels
-are capability-gated until later protocol slices rather than issuing legacy
-RPCs. A server restart therefore requires a new conversation in slice 2.
+all four approval decisions. The engine now advertises and implements the
+slice-3 history core (`thread/list|read|resume|fork`), but the Desktop history
+UI remains capability-gated until its dedicated adapter lands; search,
+name/archive/rollback/compact/goal, model/config/skills/MCP management,
+plan/review, automation/artifacts, and account panels likewise never issue
+legacy RPCs.
 
 ## MCP client (Phase 2, sixth slice)
 
@@ -1702,8 +1726,8 @@ crates/core/        kloop-core — the agent, network-free
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,
                     instruction-file concatenation under a byte budget
-  src/rollout.rs    session persistence: JSONL append, compacted markers,
-                    replay + orphan repair on resume
+  src/rollout.rs    append-only session persistence: message/compacted +
+                    runtime/turn-terminal records, snapshot reads, resume/fork
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/tui/         kloop-tui — the ratatui frontend; owns the terminal

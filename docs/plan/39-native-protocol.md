@@ -152,7 +152,7 @@ fmt/clippy/test 全绿;duplex 契约测试(握手/版本不匹配报错/thread-s
 | **0 ✅** | core 事件模型重构(§二) | 现有测试全绿=无回归 |
 | **1 ✅** | 原生 wire v1 + 握手 + 主链 + 统一审批 + `app-server` 入口(§三) | 契约测试 + `--mock` 冒烟 + 真 key anthropic 轨冒烟 |
 | **2 ✅** | **app `kloop` 分支适配主链**:`worker.rs` 换原生 v1 + 独立 `kloop/` 前端 adapter + capability gate + SSO 绕过 | 真 app Eval Mode + 真协议 E2E:首/二轮、工具、审批、图片、双 cwd |
-| **3** | 会话管理:`thread/resume|list|read|fork|rollback|compact/start|name/set|goal/*|archive|search` + app 适配 | 契约 + app 会话列表/恢复/fork |
+| **3（进行中：3A engine ✅）** | 会话管理:`thread/resume|list|read|fork|rollback|compact/start|name/set|goal/*|archive|search` + app 适配；3A 已完成持久化快照 + `list/read/resume/fork` engine 主干 | 契约 + app 会话列表/恢复/fork |
 | **4** | config/model/skills/mcp 只读 + 降级兜底:`model/list`/`config/read|write`/`mcpServerStatus/list`/`skills/list` + app 适配 | app 模型选择器/设置面板不卡 |
 | **5** | 打磨:reasoning delta 细分、`turn/diff/updated`、`turn/plan/updated`、review mode、边角 item 变体 | 真 app 各面板 |
 
@@ -214,3 +214,14 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 - **验证(kloop)**:`cargo fmt --all --check`、`cargo clippy --workspace -- -D warnings`、`cargo test` 全绿；`target/debug/kloop app-server --mock` 同步 JSON-RPC 客户端握手/thread/完整 item 流冒烟通过；真 key 原生协议脚本同一 thread 连跑首轮/第二轮、bash tool、write_file `approval/request→decline`、base64 PNG,再开第二 thread 真实写 A/B 两个临时目录,确认 cwd/文件落点不串。
 - **验证(app)**:43 个 native/eval 定向 Bun 测试全绿；真实 `bun run eval` 以 `ENGINE_BIN=target/debug/kloop` 启动完整 Tauri App,case `39-02` 得 `completed`(threadId/数字 turnId 边界/8 events),证 SSO 绕过 + worker + WebView event bridge + completion 全链；approval case `39-03` 正确得 `needs_interaction`,error=`approval required: approval/request`。2026-07-23 将最新 `origin/main@4e00b015` 合入 app `kloop` 分支后,把 main 的旧 Codex/v2 测试按 native capability 契约分流：保留并加强 disabled fallback 断言,仅对明确延期的 history/plan/review/compact/dynamic-tools/automation 行为逐 capability skip,不做全局测试 override、不恢复旧 RPC；最终全量 `bun test` **865 pass / 52 capability skips / 0 fail**(917 tests / 127 files),`bun run typecheck`、`bun run build:test`、Rust `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、单线程全量 **225 tests** 全绿。
 - **app 提交**:`桌面前端仓库` branch `kloop`,native 功能提交 `f660aca1`；合并 `origin/main@4e00b015` 并收齐质量门后的 branch head `80a4cd1e`(merge parents=`f660aca1` + `4e00b015`)；既有 `codex` gitlink 修改保持未 stage/未提交。kloop 提交:本提交。
+
+### 切片 3A engine ✅(2026-07-23,提交见下)
+
+会话管理的 engine 地基落地：append-only rollout 现在既能恢复 provider history，也能恢复 thread 运行时和 UI 需要的 turn 终态；原生 wire 提供 `thread/list|read|resume|fork` 主干。**这只完成切片 3A engine，不代表整个切片 3 完成**——Desktop 会话 UI 接线以及 `rollback|compact/start|name/set|goal/*|archive|search` 仍挂账。
+
+- **rollout 快照扩展**:`session` 行持久化 canonical cwd + 最终解析 model，`turn_terminal` 行持久化 `completed|maxRounds|aborted|error`；`SessionSnapshot` 将 provider 可回放 `messages`、最后生效的 `runtime`、按消息位置锚定的 `terminals` 分开返回，runtime/terminal 不进入 provider replay 或 token accounting。compaction 替换消息后清掉已经失效的 terminal 索引；fork 复制 runtime/terminal 并重写 envelope，cut 只认完整 user exchange 边界。
+- **partial 输出可恢复**:采样在可见 text/reasoning 已流出后遇到错误、取消或异常 Done，会先补齐 `ItemCompleted`，并把可安全回放的 partial assistant block 落进 History；有外部可见副作用后不再 retry/fallback，避免重启前丢半截回答或当前 turn 生成第二份回答。未签名 thinking、image、tool use/result 不从不完整流中伪造回放。
+- **原生会话 RPC**:`initialize.capabilities.threads={list,read,resume,fork}`；`thread/list{limit?,cursor?}` 默认 50、上限 500，隐藏 sidechain，并返回 snippet/runtime/resumable/inProgress/fork lineage；`thread/read` 返回 messages/runtime/terminals；`thread/resume` 与 `thread/fork` 恢复原 cwd/model 并直接建立 live thread。running turn 期间拒绝 fork，避免 terminal 尚未落盘时复制不完整 exchange。
+- **恢复语义 fail-closed**:`thread/start` 在 ConfigFactory 解析默认 provider/model 后把实际 model 再 pin 进 rollout，后续环境变化不静默换模型。旧 rollout 仍可 `read`，但因没有 runtime，`resume/fork` 必须显式给原 cwd；成功后追加 runtime 完成一次性迁移，绝不猜成 app-server 当前启动目录。
+- **验证**:`cargo fmt --all --check`、`cargo clippy --workspace -- -D warnings`、全工作区 `cargo test` 全绿；`kloop --mock` 六轮 demo 通过；同步 `app-server --mock` 客户端完成 initialize/start/turn/item stream/read/list 并核对 runtime/model/terminal；真 key anthropic 轨以 `claude-sonnet-4-6` 运行“只回复 OK”，响应 `OK`，随后 `thread/read` 恢复两条消息、正确 cwd/model 与 completed terminal。契约测试覆盖分页、runtime 保真、legacy 迁移、fork 边界/running 拒绝、partial error 恢复。
+- **提交**:本次(plan 39 切片 3A engine,见 git log)。

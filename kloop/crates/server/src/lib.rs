@@ -55,6 +55,9 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::rollout;
 use kloop_core::rollout::Rollout;
+use kloop_core::rollout::SessionRuntime;
+use kloop_core::rollout::SessionSnapshot;
+use kloop_core::rollout::TurnTerminal;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -240,7 +243,8 @@ impl Server {
             "thread/start" => self.thread_start(&params),
             "thread/resume" => self.thread_resume(&params),
             "thread/fork" => self.thread_fork(&params),
-            "thread/list" => self.thread_list(),
+            "thread/list" => self.thread_list(&params),
+            "thread/read" => self.thread_read(&params),
             "turn/start" => self.turn_start(&params),
             "turn/steer" => self.turn_steer(&params),
             "turn/interrupt" => self.turn_interrupt(&params),
@@ -280,6 +284,12 @@ impl Server {
                 "mcp": true,
                 "images": true,
                 "approvals": true,
+                "threads": {
+                    "list": true,
+                    "read": true,
+                    "resume": true,
+                    "fork": true,
+                },
             },
         }))
     }
@@ -315,8 +325,15 @@ impl Server {
         }
         std::fs::File::create(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot create session: {e}")))?;
+        let rollout =
+            Rollout::new_with_runtime(path, runtime_from_options(&options)).map_err(|e| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot initialize session: {e}"),
+                )
+            })?;
         let mut history = History::new(self.paths.offload_dir.clone());
-        history.attach_rollout(Rollout::new(path));
+        history.attach_rollout(rollout);
         self.spawn_thread(thread_id.clone(), history, options)?;
         Ok(json!({"thread": {"id": thread_id}}))
     }
@@ -333,29 +350,42 @@ impl Server {
         if !path.exists() {
             return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
         }
-        let (messages, rollout) = rollout::resume_session(&path)
+        let snapshot = rollout::load_session_snapshot(&path)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
+        let (options, migrate) = resume_options(&snapshot, params, &self.default_cwd)?;
+        let (messages, mut rollout) = rollout::resume_session(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
+        if migrate {
+            rollout
+                .append_runtime(&runtime_from_options(&options))
+                .map_err(|e| (wire::SERVER_ERROR, format!("cannot migrate session: {e}")))?;
+        }
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(
-            thread_id.to_string(),
-            history,
-            ThreadStartOptions {
-                cwd: self.default_cwd.clone(),
-                model: None,
-            },
-        )?;
-        Ok(json!({"thread": {"id": thread_id}, "messageCount": count}))
+        self.spawn_thread(thread_id.to_string(), history, options.clone())?;
+        Ok(json!({
+            "thread": thread_runtime_json(thread_id, &options),
+            "messageCount": count,
+        }))
     }
 
     /// Fork a session at a cut point into a fresh thread, then spawn it live
     /// (like `thread/resume`) so the client can `turn/start` on it immediately.
-    /// `cut` is optional — omit it to fork at the end. The source need not be an
-    /// active thread; forking reads the file directly, so a client can branch a
-    /// dormant history. `fork_session` copies the prefix and records cross-file
-    /// lineage; an illegal cut comes back as an error listing the legal points.
+    /// `cut` is optional — omit it to fork at the end. A dormant source is read
+    /// directly from disk; an active source is rejected so its in-flight turn
+    /// cannot be copied before the terminal record makes the prefix complete.
     fn thread_fork(&mut self, params: &Value) -> MethodResult {
         let src_id = str_param(params, "threadId")?;
+        if self
+            .threads
+            .get(src_id)
+            .is_some_and(|handle| handle.running.load(Ordering::SeqCst))
+        {
+            return Err((
+                wire::SERVER_ERROR,
+                format!("cannot fork thread '{src_id}' while a turn is running"),
+            ));
+        }
         let cut = match params.get("cut") {
             None | Some(Value::Null) => None,
             Some(v) => Some(v.as_u64().ok_or((
@@ -367,41 +397,117 @@ impl Server {
         if !src.exists() {
             return Err((wire::SERVER_ERROR, format!("no session '{src_id}'")));
         }
+        let source_snapshot = rollout::load_session_snapshot(&src)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read source: {e}")))?;
+        let (options, migrate_fork) = resume_options(&source_snapshot, params, &self.default_cwd)?;
         let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
-        let (messages, rollout) = rollout::resume_session(&new_path)
+        let (messages, mut rollout) = rollout::resume_session(&new_path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume fork: {e}")))?;
+        if migrate_fork {
+            rollout
+                .append_runtime(&runtime_from_options(&options))
+                .map_err(|e| (wire::SERVER_ERROR, format!("cannot migrate fork: {e}")))?;
+        }
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(
-            new_id.clone(),
-            history,
-            ThreadStartOptions {
-                cwd: self.default_cwd.clone(),
-                model: None,
-            },
-        )?;
-        Ok(json!({"thread": {"id": new_id}, "messageCount": count}))
+        self.spawn_thread(new_id.clone(), history, options.clone())?;
+        Ok(json!({
+            "thread": thread_runtime_json(&new_id, &options),
+            "messageCount": count,
+        }))
     }
 
-    fn thread_list(&self) -> MethodResult {
-        let threads: Vec<Value> = rollout::sessions_by_recency(&self.paths.sessions_dir)
-            .iter()
+    fn thread_list(&self, params: &Value) -> MethodResult {
+        let limit = match params.get("limit") {
+            None | Some(Value::Null) => 50,
+            Some(value) => value
+                .as_u64()
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(500) as usize)
+                .ok_or((
+                    wire::INVALID_PARAMS,
+                    "'limit' must be a positive integer".to_string(),
+                ))?,
+        };
+        let offset = match params.get("cursor") {
+            None | Some(Value::Null) => 0,
+            Some(Value::String(cursor)) => cursor.parse::<usize>().map_err(|_| {
+                (
+                    wire::INVALID_PARAMS,
+                    "'cursor' must be a cursor returned by thread/list".to_string(),
+                )
+            })?,
+            Some(_) => {
+                return Err((
+                    wire::INVALID_PARAMS,
+                    "'cursor' must be a string".to_string(),
+                ))
+            }
+        };
+        let paths: Vec<PathBuf> = rollout::sessions_by_recency(&self.paths.sessions_dir)
+            .into_iter()
             // Sub-agent transcripts share the sessions dir but are internal;
             // like cc's sidechains and codex's source filter, keep them out
-            // of the thread list (still resumable by explicit id).
+            // of the thread list (still readable by explicit id).
             .filter(|path| !rollout::is_subagent_session(path))
-            .filter_map(|path| {
-                let messages = rollout::load_session(path).ok()?;
-                Some(json!({
-                    "id": rollout::session_id_of(path),
-                    "messages": messages.len(),
-                    "snippet": rollout::first_user_snippet(&messages),
-                }))
-            })
             .collect();
-        Ok(json!({"threads": threads}))
+        let mut threads = Vec::new();
+        for path in paths.iter().skip(offset).take(limit) {
+            let snapshot = match rollout::load_session_snapshot(path) {
+                Ok(snapshot) => snapshot,
+                Err(_) => continue,
+            };
+            let runtime = snapshot.runtime.as_ref();
+            let thread_id = rollout::session_id_of(path);
+            let in_progress = self
+                .threads
+                .get(&thread_id)
+                .is_some_and(|handle| handle.running.load(Ordering::SeqCst));
+            let updated_at_ms = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            threads.push(json!({
+                "id": thread_id,
+                "messages": snapshot.messages.len(),
+                "snippet": rollout::first_user_snippet(&snapshot.messages),
+                "cwd": runtime.map(|runtime| runtime.cwd.as_str()),
+                "model": runtime.and_then(|runtime| runtime.model.as_deref()),
+                "resumable": runtime.is_some(),
+                "inProgress": in_progress,
+                "forkedFrom": fork_origin_json(path),
+                "updatedAtMs": updated_at_ms,
+            }));
+        }
+        let consumed = offset.saturating_add(limit).min(paths.len());
+        let next_cursor = (consumed < paths.len()).then(|| consumed.to_string());
+        Ok(json!({"threads": threads, "nextCursor": next_cursor}))
+    }
+
+    fn thread_read(&self, params: &Value) -> MethodResult {
+        let thread_id = str_param(params, "threadId")?;
+        let path = rollout::session_path(&self.paths.sessions_dir, thread_id);
+        if !path.exists() {
+            return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
+        }
+        let snapshot = rollout::load_session_snapshot(&path)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
+        Ok(json!({
+            "thread": {
+                "id": thread_id,
+                "cwd": snapshot.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
+                "model": snapshot.runtime.as_ref().and_then(|runtime| runtime.model.as_deref()),
+                "resumable": snapshot.runtime.is_some(),
+                "forkedFrom": fork_origin_json(&path),
+                "messages": snapshot.messages,
+                "terminals": snapshot.terminals,
+            }
+        }))
     }
 
     fn turn_start(&mut self, params: &Value) -> MethodResult {
@@ -481,7 +587,7 @@ impl Server {
     fn spawn_thread(
         &mut self,
         thread_id: String,
-        history: History,
+        mut history: History,
         options: ThreadStartOptions,
     ) -> Result<(), (i64, String)> {
         // The running turn's id, shared between the ThreadUi (which tags item
@@ -495,12 +601,22 @@ impl Server {
             turn: turn.clone(),
         });
         let note_ui = ui.clone();
+        let runtime_cwd = options.cwd.to_string_lossy().to_string();
+        let pin_default_model = options.model.is_none();
         let mut cfg = (self.factory)(
             options,
             ui.clone(),
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
         )
         .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
+        if pin_default_model {
+            history
+                .append_runtime(SessionRuntime {
+                    cwd: runtime_cwd,
+                    model: Some(cfg.model.clone()),
+                })
+                .map_err(|e| (wire::SERVER_ERROR, format!("cannot pin session model: {e}")))?;
+        }
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
         cfg.session_id = thread_id.clone();
@@ -526,6 +642,72 @@ impl Server {
 }
 
 type MethodResult = Result<Value, (i64, String)>;
+
+fn runtime_from_options(options: &ThreadStartOptions) -> SessionRuntime {
+    SessionRuntime {
+        cwd: options.cwd.to_string_lossy().to_string(),
+        model: options.model.clone(),
+    }
+}
+
+fn options_from_runtime(runtime: &SessionRuntime) -> Result<ThreadStartOptions, (i64, String)> {
+    let cwd = std::fs::canonicalize(&runtime.cwd).map_err(|e| {
+        (
+            wire::SERVER_ERROR,
+            format!("cannot restore cwd '{}': {e}", runtime.cwd),
+        )
+    })?;
+    if !cwd.is_dir() {
+        return Err((
+            wire::SERVER_ERROR,
+            format!("restored cwd '{}' is not a directory", cwd.display()),
+        ));
+    }
+    Ok(ThreadStartOptions {
+        cwd,
+        model: runtime.model.clone(),
+    })
+}
+
+fn resume_options(
+    snapshot: &SessionSnapshot,
+    params: &Value,
+    default_cwd: &Path,
+) -> Result<(ThreadStartOptions, bool), (i64, String)> {
+    if let Some(runtime) = &snapshot.runtime {
+        return Ok((options_from_runtime(runtime)?, false));
+    }
+    if params.get("cwd").is_none_or(Value::is_null) {
+        return Err((
+            wire::SERVER_ERROR,
+            "session predates runtime metadata; supply its original 'cwd' to migrate it safely"
+                .into(),
+        ));
+    }
+    Ok((parse_thread_start_options(params, default_cwd)?, true))
+}
+
+fn thread_runtime_json(thread_id: &str, options: &ThreadStartOptions) -> Value {
+    json!({
+        "id": thread_id,
+        "cwd": options.cwd.to_string_lossy(),
+        "model": options.model,
+        "resumable": true,
+    })
+}
+
+fn fork_origin_json(path: &Path) -> Value {
+    let Some(origin) = rollout::fork_origin(path) else {
+        return Value::Null;
+    };
+    let Some((thread_id, cut)) = origin.rsplit_once('#') else {
+        return Value::Null;
+    };
+    json!({
+        "threadId": thread_id,
+        "cut": cut.parse::<u64>().ok(),
+    })
+}
 
 fn parse_thread_start_options(
     params: &Value,
@@ -625,6 +807,7 @@ async fn thread_worker(
         // for `turn/steer` to read.
         ui.notify("turn/started", wire::turn_started_params(turn.id));
         let reason = run_turn_or_command(&cfg, &mut history, &ui, &turn).await;
+        history.record_turn_terminal(turn_terminal(&reason));
         // Report the post-turn context size, then close the bracket. Usage
         // routes through `emit` so it projects like any other event.
         ui.emit(&Event::Usage(history.estimated_tokens()));
@@ -640,6 +823,27 @@ async fn thread_worker(
     // clean removed), so trees don't leak past the session.
     if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
         ui.emit(&Event::Note(note.trim().to_string()));
+    }
+}
+
+fn turn_terminal(reason: &EndReason) -> TurnTerminal {
+    match reason {
+        EndReason::Completed => TurnTerminal {
+            status: "completed".into(),
+            error: None,
+        },
+        EndReason::MaxRounds => TurnTerminal {
+            status: "maxRounds".into(),
+            error: None,
+        },
+        EndReason::Aborted => TurnTerminal {
+            status: "aborted".into(),
+            error: None,
+        },
+        EndReason::Error(error) => TurnTerminal {
+            status: "error".into(),
+            error: Some(error.clone()),
+        },
     }
 }
 

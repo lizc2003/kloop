@@ -34,16 +34,27 @@ pub(super) struct SampleOk {
 pub(super) enum Sampled {
     Ok(SampleOk),
     Overflow,
-    Cancelled,
+    Cancelled {
+        partial: Vec<ContentBlock>,
+    },
     Failed(String),
+    Partial {
+        error: String,
+        blocks: Vec<ContentBlock>,
+    },
 }
 
 enum SampleError {
-    Cancelled,
+    Cancelled {
+        partial: Vec<ContentBlock>,
+    },
     Overflow,
     Retryable(String),
-    /// Retrying after visible deltas would duplicate user-visible output.
-    AfterOutput(String),
+    /// Retrying or falling back after visible deltas would duplicate output.
+    AfterOutput {
+        error: String,
+        partial: Vec<ContentBlock>,
+    },
 }
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -91,11 +102,16 @@ pub(super) async fn sample_with_retry(
         .await
         {
             Ok(ok) => return Sampled::Ok(ok),
-            Err(SampleError::Cancelled) => return Sampled::Cancelled,
+            Err(SampleError::Cancelled { partial }) => return Sampled::Cancelled { partial },
             // Retrying an oversized request verbatim can never succeed; hand
             // it straight to the reactive compaction path.
             Err(SampleError::Overflow) => return Sampled::Overflow,
-            Err(SampleError::AfterOutput(e)) => return Sampled::Failed(e),
+            Err(SampleError::AfterOutput { error, partial }) => {
+                return Sampled::Partial {
+                    error,
+                    blocks: partial,
+                }
+            }
             Err(SampleError::Retryable(e)) => {
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Sampled::Failed(e);
@@ -112,7 +128,7 @@ pub(super) async fn sample_with_retry(
                     attempt + 1
                 )));
                 tokio::select! {
-                    _ = cancel.cancelled() => return Sampled::Cancelled,
+                    _ = cancel.cancelled() => return Sampled::Cancelled { partial: Vec::new() },
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
@@ -158,7 +174,9 @@ async fn sample_once(
                     &text_accum,
                     &think_accum,
                 );
-                return Err(SampleError::Cancelled);
+                return Err(SampleError::Cancelled {
+                    partial: replayable_partial(blocks, &text_accum),
+                });
             },
             event = rx.recv() => match event {
                 None => {
@@ -171,7 +189,10 @@ async fn sample_once(
                     );
                     let message = "stream closed early".to_string();
                     return Err(if visible_output {
-                        SampleError::AfterOutput(message)
+                        SampleError::AfterOutput {
+                            error: message,
+                            partial: replayable_partial(blocks, &text_accum),
+                        }
                     } else {
                         SampleError::Retryable(message)
                     });
@@ -187,7 +208,10 @@ async fn sample_once(
                         &think_accum,
                     );
                     return Err(if visible_output {
-                        SampleError::AfterOutput(message)
+                        SampleError::AfterOutput {
+                            error: message,
+                            partial: replayable_partial(blocks, &text_accum),
+                        }
                     } else if overflow {
                         SampleError::Overflow
                     } else {
@@ -253,6 +277,22 @@ async fn sample_once(
             }
         }
     }
+}
+
+fn replayable_partial(mut blocks: Vec<ContentBlock>, open_text: &str) -> Vec<ContentBlock> {
+    blocks.retain(|block| match block {
+        ContentBlock::Text { .. } | ContentBlock::RedactedThinking { .. } => true,
+        ContentBlock::Thinking { signature, .. } => !signature.is_empty(),
+        ContentBlock::Image { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. } => false,
+    });
+    if !open_text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: open_text.to_string(),
+        });
+    }
+    blocks
 }
 
 fn complete_open_items(

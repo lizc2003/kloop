@@ -506,10 +506,16 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         MockTurn::PartialError(text("half answer"), "stream dropped".into()),
         MockTurn::Blocks(text("must not retry")),
     ]);
-    let cfg = compaction_cfg(provider, 200_000, "partial-stream");
+    let mut cfg = (*compaction_cfg(provider, 200_000, "partial-stream")).clone();
+    cfg.fallback_model = Some("must-not-run-after-visible-output".into());
+    let cfg = Arc::new(cfg);
     let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
     let ui: Arc<dyn Ui> = event_ui.clone();
+    let session = cfg
+        .offload_dir
+        .join(format!("partial-session-{}.jsonl", std::process::id()));
     let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
     history.record(Message::user_text("hello"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -523,6 +529,23 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         seen.lock().unwrap().len(),
         1,
         "visible output must not be retried"
+    );
+    assert_eq!(
+        history.messages(),
+        &[
+            Message::user_text("hello"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "half answer".into(),
+            }]),
+        ],
+        "the completed UI item must be recoverable after restart"
+    );
+    assert_eq!(
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
+        history.messages(),
+        "the partial assistant must survive a fresh rollout read"
     );
     assert_eq!(
         *event_ui.0.lock().unwrap(),
@@ -545,6 +568,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
             },
         ]
     );
+    let _ = std::fs::remove_file(session);
 }
 
 /// Three failures with no fallback exhaust the retry budget and surface

@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::rollout::Rollout;
+use crate::rollout::SessionRuntime;
+use crate::rollout::TurnTerminal;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::ToolResultContent;
@@ -88,6 +90,22 @@ impl History {
         }
         self.persist(|rollout| rollout.append_message(&msg));
         self.items.push(msg);
+    }
+
+    /// Pin a server thread's effective runtime after its Config has resolved
+    /// defaults. Unlike normal message persistence this is recovery-critical:
+    /// failure is returned to the caller instead of silently dropping rollout.
+    pub fn append_runtime(&mut self, runtime: SessionRuntime) -> std::io::Result<()> {
+        self.rollout
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("history has no rollout"))?
+            .append_runtime(&runtime)
+    }
+
+    /// Persist a model turn's display-only terminal state. It never enters
+    /// `items`, so provider replay and token accounting remain unchanged.
+    pub fn record_turn_terminal(&mut self, terminal: TurnTerminal) {
+        self.persist(|rollout| rollout.append_turn_terminal(&terminal));
     }
 
     /// Persistence must never take down the live session: a failed write

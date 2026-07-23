@@ -21,8 +21,10 @@ use tokio::task::JoinHandle;
 use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
+use kloop_core::rollout::Rollout;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::Message;
 use kloop_provider::Provider;
 use kloop_server::serve;
 use kloop_server::ConfigFactory;
@@ -211,6 +213,20 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
     })
 }
 
+fn partial_factory(offload: PathBuf) -> ConfigFactory {
+    use kloop_provider::MockTurn;
+
+    let inner = factory(Vec::new(), offload, false);
+    Arc::new(move |options, approver, notify| {
+        let mut cfg = inner(options, approver, notify)?;
+        cfg.provider = Arc::new(Provider::mock_scripted(vec![MockTurn::PartialError(
+            vec![text("half answer")],
+            "stream dropped".into(),
+        )]));
+        Ok(cfg)
+    })
+}
+
 fn recording_factory(
     turns: Vec<Vec<ContentBlock>>,
     offload: PathBuf,
@@ -338,6 +354,10 @@ async fn handshake_gates_and_negotiates() {
     let caps = client.initialize().await;
     assert_eq!(caps["streaming"], true);
     assert_eq!(caps["approvals"], true);
+    assert_eq!(
+        caps["threads"],
+        json!({"list": true, "read": true, "resume": true, "fork": true})
+    );
     let id = client.request("thread/start", json!({})).await;
     let resp = client.recv().await;
     assert_eq!(resp["id"], id);
@@ -410,6 +430,173 @@ async fn thread_start_resolves_per_thread_cwd_and_model() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 
     client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn thread_read_list_resume_and_fork_preserve_runtime() {
+    let dirs = test_dirs("native-history");
+    let project = dirs.root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = std::fs::canonicalize(project).unwrap();
+    let project_text = project.to_string_lossy().to_string();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let mut client = start_server(
+        recording_factory(
+            vec![vec![text("first answer")]],
+            dirs.offload.clone(),
+            seen.clone(),
+        ),
+        &dirs,
+    );
+    client.initialize().await;
+    let start = client
+        .request("thread/start", json!({"cwd": project, "model": "model-a"}))
+        .await;
+    let response = client.recv().await;
+    assert_eq!(response["id"], start);
+    let thread_id = response["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .request("turn/start", json!({"threadId": thread_id, "input": "q1"}))
+        .await;
+    client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+
+    client
+        .request("thread/read", json!({"threadId": thread_id}))
+        .await;
+    let read = client.recv().await;
+    assert_eq!(read["result"]["thread"]["cwd"], project_text.as_str());
+    assert_eq!(read["result"]["thread"]["model"], "model-a");
+    assert_eq!(read["result"]["thread"]["resumable"], true);
+    assert_eq!(
+        read["result"]["thread"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        read["result"]["thread"]["terminals"][0]["status"],
+        "completed"
+    );
+
+    client.request("thread/list", json!({"limit": 1})).await;
+    let list = client.recv().await;
+    assert_eq!(list["result"]["threads"][0]["id"], thread_id);
+    assert_eq!(list["result"]["threads"][0]["cwd"], project_text.as_str());
+    assert_eq!(list["result"]["threads"][0]["model"], "model-a");
+    assert_eq!(list["result"]["threads"][0]["messages"], 2);
+    client.shutdown().await;
+
+    seen.lock().unwrap().clear();
+    let mut client = start_server(
+        recording_factory(
+            vec![vec![text("after restart")]],
+            dirs.offload.clone(),
+            seen.clone(),
+        ),
+        &dirs,
+    );
+    client.initialize().await;
+    client
+        .request("thread/resume", json!({"threadId": thread_id}))
+        .await;
+    let resumed = client.recv().await;
+    assert_eq!(resumed["result"]["thread"]["cwd"], project_text.as_str());
+    assert_eq!(resumed["result"]["thread"]["model"], "model-a");
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[ThreadStartOptions {
+            cwd: project.clone(),
+            model: Some("model-a".into()),
+        }]
+    );
+
+    client
+        .request("thread/fork", json!({"threadId": thread_id}))
+        .await;
+    let forked = client.recv().await;
+    let fork_id = forked["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(forked["result"]["thread"]["cwd"], project_text.as_str());
+    assert_eq!(forked["result"]["thread"]["model"], "model-a");
+    client
+        .request("thread/read", json!({"threadId": fork_id}))
+        .await;
+    let fork_read = client.recv().await;
+    assert_eq!(
+        fork_read["result"]["thread"]["forkedFrom"]["threadId"],
+        thread_id
+    );
+    assert_eq!(fork_read["result"]["thread"]["cwd"], project_text.as_str());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
+    let dirs = test_dirs("legacy-history");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let thread_id = "legacy";
+    let path = dirs.sessions.join("legacy.jsonl");
+    let mut rollout = Rollout::new(path);
+    rollout
+        .append_message(&Message::user_text("old question"))
+        .unwrap();
+    drop(rollout);
+
+    let mut client = start_server(
+        factory(vec![vec![text("answer")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client.initialize().await;
+    client
+        .request("thread/read", json!({"threadId": thread_id}))
+        .await;
+    let read = client.recv().await;
+    assert_eq!(read["result"]["thread"]["resumable"], false);
+    assert_eq!(
+        read["result"]["thread"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    client
+        .request("thread/resume", json!({"threadId": thread_id}))
+        .await;
+    let error = client.recv().await;
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("supply its original 'cwd'"));
+
+    client
+        .request(
+            "thread/resume",
+            json!({"threadId": thread_id, "cwd": dirs.root}),
+        )
+        .await;
+    let resumed = client.recv().await;
+    assert_eq!(resumed["result"]["thread"]["resumable"], true);
+    client.shutdown().await;
+
+    let snapshot =
+        kloop_core::rollout::load_session_snapshot(&dirs.sessions.join("legacy.jsonl")).unwrap();
+    assert_eq!(
+        snapshot.runtime.unwrap().cwd,
+        std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
+    );
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
@@ -613,6 +800,43 @@ async fn todo_write_surfaces_as_a_todo_item() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+#[tokio::test]
+async fn partial_stream_is_recoverable_with_error_terminal() {
+    let dirs = test_dirs("partial-history");
+    let mut client = start_server(partial_factory(dirs.offload.clone()), &dirs);
+    let thread_id = client.init_and_start().await;
+
+    client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": "answer"}),
+        )
+        .await;
+    let log = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "error");
+
+    client
+        .request("thread/read", json!({"threadId": thread_id}))
+        .await;
+    let read = client.recv().await;
+    let thread = &read["result"]["thread"];
+    assert_eq!(thread["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(thread["messages"][1]["content"][0]["text"], "half answer");
+    assert_eq!(
+        thread["terminals"],
+        json!([{
+            "afterMessage": 2,
+            "status": "error",
+            "error": "stream dropped",
+        }])
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// A task call surfaces the sub-agent lifecycle on the wire: a `subAgent` item
 /// brackets it, and the sub-agent's own tool calls carry an "agent" field while
 /// the main agent's calls stay unadorned.
@@ -715,6 +939,30 @@ async fn approval_declined_then_accepted() {
     assert!(request["params"]["rememberRules"].is_array());
     // The change preview reaches the client (a fresh path is a new file).
     assert_eq!(request["params"]["preview"], "(new file)\n+1  x");
+
+    client.request("thread/list", json!({})).await;
+    let list = client.recv().await;
+    let active = list["result"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == thread_id)
+        .unwrap();
+    assert_eq!(active["inProgress"], true);
+    let files_before = std::fs::read_dir(&dirs.sessions).unwrap().count();
+    client
+        .request("thread/fork", json!({"threadId": thread_id}))
+        .await;
+    let fork_error = client.recv().await;
+    assert!(fork_error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("while a turn is running"));
+    assert_eq!(
+        std::fs::read_dir(&dirs.sessions).unwrap().count(),
+        files_before,
+        "a rejected running fork must not create a rollout"
+    );
 
     client
         .send(json!({"jsonrpc": "2.0", "id": srv_id, "result": {"decision": "decline"}}))
@@ -1107,7 +1355,7 @@ async fn thread_fork_branches_a_session_into_a_live_thread() {
     let fork_path = dirs.sessions.join(format!("{fork_id}.jsonl"));
     assert_eq!(
         kloop_core::rollout::fork_origin(&fork_path),
-        Some(format!("{src}#2"))
+        Some(format!("{src}#5"))
     );
 
     // The fork is live: a turn runs on it and completes.
@@ -1156,7 +1404,7 @@ async fn thread_fork_rejects_an_illegal_cut() {
         .unwrap()
         .to_string();
     assert!(
-        msg.contains("cannot fork") && msg.contains("#2"),
+        msg.contains("cannot fork") && msg.contains("#5"),
         "illegal-cut error must list the legal points: {msg}"
     );
 
