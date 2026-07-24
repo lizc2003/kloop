@@ -26,11 +26,11 @@ use crate::menu;
 use crate::menu::Popup;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
-/// kloop's brand accent: a muted cyan-blue marks the agent's own presence —
+/// kloop's brand accent: a vivid cyan-blue marks the agent's own presence —
 /// the session banner, the working spinner, and the mode badge. Interactive
 /// input/selection/status stays ANSI cyan, green marks success/additions, red
 /// marks errors/deletions, and secondary text is dim.
-const BRAND: Color = Color::Rgb(108, 154, 166);
+const BRAND: Color = Color::Rgb(79, 179, 200);
 
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
@@ -871,8 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn brand_accent_is_muted_cyan_blue() {
-        assert_eq!(BRAND, Color::Rgb(108, 154, 166));
+    fn brand_accent_is_vivid_cyan_blue() {
+        assert_eq!(BRAND, Color::Rgb(79, 179, 200));
         assert_ne!(BRAND, Color::Magenta);
         assert_ne!(BRAND, Color::Cyan);
     }

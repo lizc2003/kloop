@@ -25,3 +25,5 @@
 - README、plan 38 与 HANDOFF 已同步。
 - 验证：`cargo fmt --all --check`、clippy `-D warnings`、全 workspace tests、mock smoke 全绿。
 - 提交：本次（plan 41，见 git log）。
+
+> 后续：同日用户在并排预览中选择更醒目的 `#4fb3c8`，现行颜色见 plan 42。

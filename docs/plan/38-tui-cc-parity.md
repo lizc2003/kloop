@@ -280,7 +280,8 @@ spinner/shimmer 状态行(shimmer 光带 header + 动词 + `(1m05s • Esc to in
   green、`└ pineapple` 预览、无 yellow)③manual 编辑审批弹层(`+1 -1` green/red 统计 + 行号 diff + cyan 动作条,
   答 n 拒)。
 - 品牌色追记(2026-07-24):用户不喜欢原 magenta 的粉红主调;只把 kloop chrome 的 `BRAND` 改为
-  低饱和青蓝 `#6c9aa6`,会话头/working spinner/mode 徽标统一跟随。cyan 仍专用于用户·状态·选中,
+  低饱和青蓝 `#6c9aa6`,会话头/working spinner/mode 徽标统一跟随。当天用户看过并排预览后又选定
+  更醒目的鲜明青蓝 `#4fb3c8`(plan 42),品牌槽覆盖范围不变。cyan 仍专用于用户·状态·选中,
   代码块 keyword 的 magenta 仍是独立语法语义。回归测试锁定 RGB 值及其与 magenta/cyan 的区分。
 - **验收**:品牌色单测 + `cargo fmt --all --check` + clippy(`-D warnings`)+ 全 workspace test +
   `cargo run -p kloop -- --mock` 全绿。提交见 plan 41。
@@ -331,7 +332,7 @@ fmt + clippy(`-D warnings`)+ test 全绿;纯函数单测 + `TestBackend` 端到�
   ~~高亮用哪个库~~(✅ 2026-07-17 定 **synoptic** 替 syntect,轻量纯 Rust;理由见关键决定 2)。
 - ~~切片 2 工具行的具体样式细节(bullet 用 `●` 还是 `⏺`、gutter 符号)~~(✅ 定:bullet `●`(running,黄)/`✓`/`✗`,结果 gutter `└ `/`    `;对着真 key 调过,对齐、消毒制表符)。
 - ~~**品牌强调色**定 magenta/cyan 还是**橙**~~(✅ 2026-07-17 切片 6 初定 magenta;✅ 2026-07-24
-  按用户反馈改为低饱和青蓝 `#6c9aa6`)。语义切法不变:青蓝 = kloop 在场(会话头/spinner/mode
+  按用户反馈先改为低饱和青蓝 `#6c9aa6`,再经并排预览改定鲜明青蓝 `#4fb3c8`)。语义切法不变:青蓝 = kloop 在场(会话头/spinner/mode
   徽标),cyan = 用户·状态·选中(`›`/`>`/工具标记/审批条/菜单选中);代码块 keyword 仍用 magenta。
   ~~gutter 提示符 `›`、mode 行~~ 已对真 key 双轨调过。
 - ~~**切片 7(独立高亮小片)**:synoptic 代码块 + diff 语法高亮~~(✅ 2026-07-17 完成代码块高亮;

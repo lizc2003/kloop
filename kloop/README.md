@@ -306,7 +306,7 @@ batch queue and are answered in order.
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
 scrolls into scrollback as the conversation grows. Colour uses a restrained
-palette: a muted **cyan-blue** RGB accent (`#6c9aa6`) marks kloop itself (the
+palette: a vivid **cyan-blue** RGB accent (`#4fb3c8`) marks kloop itself (the
 banner, working spinner, and mode badge), ANSI **cyan** marks input/selection/
 status (the `›` prompt, running tool marks, and approval action bar),
 **green**/**red** are success/additions and errors/deletions, and secondary text
