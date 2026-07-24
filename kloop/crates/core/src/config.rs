@@ -31,7 +31,11 @@ pub struct Config {
     /// — never recorded to history, so resume rereads fresh files and
     /// compaction cannot swallow it. Sub-agents inherit it with the Config.
     pub project_instructions: Option<String>,
-    pub max_rounds: usize,
+    /// Optional sampling-round guardrail. Interactive/server turns and sub-agents
+    /// leave this unset and run until the model finishes, the user interrupts, or
+    /// an error ends the turn. Headless `--max-rounds` and an explicit task
+    /// `max_rounds` set it for callers that need a runaway bound.
+    pub max_rounds: Option<usize>,
     pub offload_dir: PathBuf,
     /// Directory holding session rollout files (`.kloop/sessions`). A sub-agent
     /// the task tool spawns writes its own session file here, named

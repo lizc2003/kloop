@@ -759,7 +759,7 @@ pub(crate) fn config_from_settings(
         model: "mock".into(),
         system: project.system.clone(),
         project_instructions: project.instructions.clone(),
-        max_rounds: 30,
+        max_rounds: None,
         cwd,
         offload_dir,
         sessions_dir,

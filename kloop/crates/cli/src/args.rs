@@ -69,7 +69,7 @@ pub(crate) struct CliArgs {
     pub(crate) json: bool,
     /// `--max-rounds <n>` (headless only): cap the number of sampling rounds
     /// (one model call + the tool calls it asks for) as a runaway guardrail for
-    /// scripts. Overrides the default `Config.max_rounds`.
+    /// scripts. Interactive and server turns are otherwise unbounded.
     pub(crate) max_rounds: Option<usize>,
     /// The positional prompt for headless mode, if any (may be combined with
     /// piped stdin at run time).

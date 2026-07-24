@@ -821,9 +821,13 @@ prompts serialize (the TUI already queues; the plain REPL takes a mutex so
 one prompt owns the terminal at a time).
 
 Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
-its cloned Config, and core's `Event` stream (plan 39) carries it end to end:
-an `Item::ToolCall` names the `agent` that made the call ("" = main agent), and
-an `Item::SubAgent` (started → completed) brackets the sub-agent's life.
+its cloned Config, and core's `Event` stream (plan 39) carries it end to end.
+**Sampling rounds are unbounded by default**, matching codex's child-thread
+turn loop; `max_rounds` is an optional per-call guardrail for callers that
+explicitly need one. The recursion-depth and background-concurrency limits stay
+separate. An `Item::ToolCall` names the `agent` that made the call ("" = main
+agent), and an `Item::SubAgent` (started → completed) brackets the sub-agent's
+life.
 Presentation per frontend:
 
 - **TUI**: one live row per sub-agent (`… agent-1 <task> — 3 tools · bash
@@ -1502,7 +1506,8 @@ kloop --mock --headless --json
   — these act before the approver, so they still open the gate. (Sandbox
   auto-allow still covers safe bash without asking.)
 - **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
-  or hitting `--max-rounds`.
+  or hitting `--max-rounds`. Without that explicit flag, headless uses the same
+  unbounded turn loop as interactive/server mode.
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 

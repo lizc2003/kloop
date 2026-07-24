@@ -41,7 +41,7 @@ async fn mock_end_to_end_three_rounds() {
         model: "mock".into(),
         system: "test".into(),
         project_instructions: None,
-        max_rounds: 10,
+        max_rounds: Some(10),
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
         sessions_dir: std::env::temp_dir().join("kloop-test-e2e-sessions"),
@@ -215,7 +215,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         model: "mock".into(),
         system: "test".into(),
         project_instructions: None,
-        max_rounds: 10,
+        max_rounds: Some(10),
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
         sessions_dir: std::env::temp_dir().join(format!("kloop-test-{tag}-sessions")),
@@ -606,7 +606,7 @@ async fn endless_tool_calls_hit_max_rounds() {
         vec![tool_use("t4", "echo 4")],
     ]);
     let mut cfg = (*compaction_cfg(provider, 200_000, "maxrounds")).clone();
-    cfg.max_rounds = 3;
+    cfg.max_rounds = Some(3);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -618,6 +618,37 @@ async fn endless_tool_calls_hit_max_rounds() {
     assert_eq!(outcome.rounds, 3);
     // 1 user + 3 * (assistant + tool_results): every round paired.
     assert_eq!(history.messages().len(), 7);
+}
+
+/// With no configured guardrail, the loop continues beyond the former default
+/// of 30 rounds and stops only when the model returns no tool call.
+#[tokio::test]
+async fn no_round_limit_runs_until_completed() {
+    let mut turns = (0..31)
+        .map(|i| {
+            vec![tool_use_named(
+                &format!("t{i}"),
+                "read_file",
+                json!({"path": format!("missing-{i}")}),
+            )]
+        })
+        .collect::<Vec<_>>();
+    turns.push(vec![ContentBlock::Text {
+        text: "finished after a long run".into(),
+    }]);
+    let provider = Provider::mock(turns);
+    let mut cfg = (*compaction_cfg(provider, 200_000, "unbounded")).clone();
+    cfg.max_rounds = None;
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("keep going until done"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.rounds, 32);
+    assert_eq!(outcome.final_text, "finished after a long run");
 }
 
 /// A token cancelled before the turn starts aborts before sampling.

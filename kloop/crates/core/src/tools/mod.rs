@@ -428,7 +428,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
                     "prompt": {"type": "string", "description": "Complete standalone task description"},
                     "agent_type": {"type": "string", "description": "Name of a configured agent type to use (its own system prompt, model, and tools); omit for a general-purpose sub-agent"},
                     "background": {"type": "boolean", "description": "Fire-and-forget: return an agent id immediately and deliver the result as a message when it finishes, instead of blocking (default false)"},
-                    "max_rounds": {"type": "integer", "description": "Round cap for the sub-agent (default and max 15)"},
+                    "max_rounds": {"type": "integer", "minimum": 1, "description": "Optional round cap for the sub-agent; omitted means no round limit"},
                     "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "Where the sub-agent works. \"shared\" (default) uses the current working directory. \"worktree\" gives it a private git worktree on its own branch, so parallel sub-agents can edit the same files without conflicting; unmerged changes are reported back on their branch for you to merge. Requires a git repository."}
                 },
                 "required": ["prompt"]
@@ -830,7 +830,7 @@ pub(crate) mod testutil {
                 model: "mock".into(),
                 system: "test".into(),
                 project_instructions: None,
-                max_rounds: 5,
+                max_rounds: Some(5),
                 cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
                 sessions_dir: std::env::temp_dir().join(format!("kloop-tools-sessions-{tag}")),
@@ -1409,7 +1409,7 @@ mod tests {
                 model: "mock".into(),
                 system: "test".into(),
                 project_instructions: None,
-                max_rounds: 5,
+                max_rounds: Some(5),
                 cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
                 sessions_dir: std::env::temp_dir().join("kloop-test-cancel-sessions"),

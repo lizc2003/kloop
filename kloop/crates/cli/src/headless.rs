@@ -280,7 +280,7 @@ mod tests {
             model: "mock".into(),
             system: "test".into(),
             project_instructions: None,
-            max_rounds: 10,
+            max_rounds: Some(10),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             offload_dir: std::env::temp_dir().join("kloop-headless-offload"),
             sessions_dir: std::env::temp_dir().join("kloop-headless-sessions"),

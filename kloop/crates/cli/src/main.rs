@@ -295,9 +295,9 @@ async fn main() -> Result<ExitCode> {
             Path::new(PROJECT_CONFIG),
         )?;
         cfg.session_id = session_id.clone();
-        // The headless runaway guardrail overrides the default round cap.
+        // An explicit headless runaway guardrail enables the otherwise-absent cap.
         if let Some(max_rounds) = args.max_rounds {
-            cfg.max_rounds = max_rounds;
+            cfg.max_rounds = Some(max_rounds);
         }
         let cfg = Arc::new(cfg);
         // `--worktree`: run this headless turn inside an isolated tree (plan 35
@@ -513,7 +513,13 @@ async fn plain_main(
         println!();
         match outcome.reason {
             EndReason::Completed => {}
-            EndReason::MaxRounds => println!("[stopped: hit max rounds ({})]", cfg.max_rounds),
+            EndReason::MaxRounds => {
+                println!(
+                    "[stopped: hit max rounds ({})]",
+                    cfg.max_rounds
+                        .expect("MaxRounds requires a configured limit")
+                )
+            }
             EndReason::Aborted => {
                 println!("[interrupted — history patched; Ctrl+D or 'exit' to quit]")
             }

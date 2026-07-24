@@ -28,8 +28,6 @@ use crate::skills::Skill;
 use crate::worktree;
 use kloop_protocol::Message;
 
-const SUBAGENT_MAX_ROUNDS: usize = 15;
-
 /// Cap on a background sub-agent's reinjected error text (~900 tokens, codex's
 /// error-branch limit). A successful result is passed through verbatim; only a
 /// failure is truncated, since its noise shouldn't crowd the parent's context.
@@ -44,11 +42,16 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         bail!("task: sub-agents cannot spawn further sub-agents");
     }
     let prompt = str_arg(input, "prompt", "task")?.to_string();
-    let max_rounds = input["max_rounds"]
-        .as_u64()
-        .map_or(SUBAGENT_MAX_ROUNDS, |n| {
-            (n as usize).clamp(1, SUBAGENT_MAX_ROUNDS)
-        });
+    let max_rounds = match input.get("max_rounds") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let n = value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| anyhow!("task: max_rounds must be a positive integer"))?;
+            Some(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+    };
     let background = input["background"].as_bool().unwrap_or(false);
     // A custom agent type overrides the sub-agent's system prompt, model and
     // tool set; an unknown name is an is_error result naming the available
@@ -237,7 +240,7 @@ pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Re
         return Ok(body);
     }
     let agent = next_agent_label();
-    let mut sub = clone_for_subagent(ctx, SUBAGENT_MAX_ROUNDS, agent.clone());
+    let mut sub = clone_for_subagent(ctx, None, agent.clone());
     if let Some(model) = &skill.model {
         sub.model = model.clone();
     }
@@ -413,7 +416,7 @@ fn truncate_error(e: &str) -> String {
 /// todo_write must not touch the parent's list — the Config clone would
 /// otherwise share both Arcs). Callers layer their own overrides on top
 /// (agent_type for `task`, model for a `fork` skill).
-fn clone_for_subagent(ctx: &ToolCtx, max_rounds: usize, agent: String) -> Config {
+fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -> Config {
     Config {
         max_rounds,
         agent_label: agent,
@@ -439,7 +442,7 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: usize, agent: String) -> Config
 /// caller can still rewire it (worktree isolation) before sharing the Arc.
 fn build_sub_config(
     ctx: &ToolCtx,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
     agent: String,
     agent_type: Option<&AgentType>,
 ) -> Config {
@@ -485,6 +488,44 @@ mod tests {
         let (out, is_error) = run_tool("task", json!({"prompt": "recurse"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("cannot spawn"));
+    }
+
+    #[tokio::test]
+    async fn task_rejects_non_positive_round_limit() {
+        let ctx = test_ctx(0, "task-zero-rounds");
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "keep going", "max_rounds": 0}),
+            &ctx,
+        )
+        .await;
+
+        assert!(is_error);
+        assert_eq!(out, "task: max_rounds must be a positive integer");
+    }
+
+    /// Omitting max_rounds must not inherit the parent's guardrail or the old
+    /// sub-agent default of 15: the child runs until it produces a final answer.
+    #[tokio::test]
+    async fn task_without_round_limit_runs_until_completed() {
+        let mut turns = (0..16)
+            .map(|i| {
+                vec![ContentBlock::ToolUse {
+                    id: format!("r{i}"),
+                    name: "read_file".into(),
+                    input: json!({"path": format!("missing-{i}")}),
+                }]
+            })
+            .collect::<Vec<_>>();
+        turns.push(vec![ContentBlock::Text {
+            text: "finished after sixteen tool rounds".into(),
+        }]);
+        let ctx = with_provider(test_ctx(0, "task-unbounded"), Provider::mock(turns));
+
+        let (out, is_error) = run_tool("task", json!({"prompt": "keep going"}), &ctx).await;
+
+        assert!(!is_error, "{out}");
+        assert_eq!(out, "finished after sixteen tool rounds");
     }
 
     /// Point a ctx's cwd at `repo` so an isolated sub-agent branches from it

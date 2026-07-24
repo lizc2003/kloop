@@ -404,7 +404,7 @@ mod tests {
     fn unlock_set_is_shared_into_cloned_configs() {
         let ctx = deferred_ctx("shared");
         let sub = Config {
-            max_rounds: 1,
+            max_rounds: Some(1),
             ..(*ctx.cfg).clone()
         };
         assert!(Arc::ptr_eq(&ctx.cfg.unlocked_tools, &sub.unlocked_tools));

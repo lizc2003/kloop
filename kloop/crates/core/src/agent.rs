@@ -177,7 +177,17 @@ async fn turn_rounds(
     // Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
     // `reasoning-N`): owned here so ids don't reset each round.
     let mut item_seq = 0u64;
-    for round in 0..cfg.max_rounds {
+    let mut rounds = 0;
+    loop {
+        if cfg.max_rounds.is_some_and(|limit| rounds >= limit) {
+            return TurnOutcome {
+                reason: EndReason::MaxRounds,
+                final_text: String::new(),
+                rounds,
+            };
+        }
+        let round = rounds;
+        rounds += 1;
         // Step-boundary steering: deliver anything the user typed during the
         // previous round (tool execution / sampling) as a user message before
         // this round's request. At round 0 the queue is empty (the turn just
@@ -398,11 +408,6 @@ async fn turn_rounds(
                 rounds: round + 1,
             };
         }
-    }
-    TurnOutcome {
-        reason: EndReason::MaxRounds,
-        final_text: String::new(),
-        rounds: cfg.max_rounds,
     }
 }
 

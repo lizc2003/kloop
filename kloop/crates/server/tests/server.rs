@@ -199,7 +199,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             model: options.model.unwrap_or_else(|| "mock".into()),
             system: "test".into(),
             project_instructions: None,
-            max_rounds: 10,
+            max_rounds: Some(10),
             cwd: options.cwd,
             offload_dir: offload.clone(),
             // Siblings under the same test root (test_dirs), matching the
@@ -299,7 +299,7 @@ fn worktree_factory(
             model: "mock".into(),
             system: "test".into(),
             project_instructions: None,
-            max_rounds: 10,
+            max_rounds: Some(10),
             cwd: cwd.clone(),
             offload_dir: offload.clone(),
             sessions_dir: offload.with_file_name("sessions"),
