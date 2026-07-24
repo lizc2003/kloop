@@ -305,13 +305,13 @@ batch queue and are answered in order.
 
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
-scrolls into scrollback as the conversation grows. Colour follows a fixed
-theme-safe palette (styles.md rules): ANSI **magenta** is kloop's brand accent
-(the banner, the working spinner, the mode badge), **cyan** marks input/
-selection/status (the `›` prompt, running tool marks, the approval action bar),
+scrolls into scrollback as the conversation grows. Colour uses a restrained
+palette: a muted **cyan-blue** RGB accent (`#6c9aa6`) marks kloop itself (the
+banner, working spinner, and mode badge), ANSI **cyan** marks input/selection/
+status (the `›` prompt, running tool marks, and approval action bar),
 **green**/**red** are success/additions and errors/deletions, and secondary text
-is dim — no yellow, dark-gray, blue, or white foregrounds, which theme
-unreliably across terminals.
+is dim. The custom brand colour intentionally stays separate from semantic
+cyan, so agent chrome remains recognizable without the previous pink cast.
 
 Assistant messages render as **markdown** (plan 38 slice 1, `crates/tui/src/markdown.rs`
 via `pulldown-cmark`): headings and `**bold**`/`*italic*`/`~~strike~~` weight,
