@@ -126,6 +126,11 @@ panic hook 恢复终端。codex 的 11k 行 `chat_composer.rs` / 3k 行 `bottom_
   结果回报)、60 消息 resume 溢出(尾部对位、composer 钉底、无花屏)。**留真终端人工核一条**:原生 scrollback 回滚
   (pyte 抓不到 DECSTBM scroll-region scrollback,模拟器保真度限制非 bug)。
 - **教训沉淀**:HANDOFF 教训 38(CPR/poll 线程、上游不能动态改 inline 高度、PTY 测法);教训 12 修订(inline 是中等工程非「太重」)。
+- **2026-07-24 更正(plan 43)**:满高 viewport 的 `insert_before` 特例会发单行
+  DECSTBM(`CSI 1;1r`),而规范要求 top < bottom；iTerm2 下可能退化成整屏滚动，
+  使物理屏幕与 Ratatui diff buffer 脱同步。现改为每批 overflow 插入后 clear
+  当前 viewport 并由下一帧完整重画；原生 scrollback 保留，但「不重画 viewport」
+  不再是可移植承诺。
 
 **切片 0 会话后续的交互打磨(同会话用户逐条提,已提交,下会话别重做)**:
 - **底部信息架构**(对齐 CC,提交 cfcd125/bf268d6/383acc3/12310cb/eac0977):布局 `transcript / 上规则 ─ / composer `>` / 下规则 ─ / footer`;**动态活动行**(`render::activity_line`)在**转录区最下方、composer 正上方**(running→`working…` / armed→`press Ctrl+C again to exit` / awaiting→`awaiting your approval` / idle→None)——**这就是切片 5 的 HUD 落点,结构已就位,只差 spinner/shimmer/动词过去式/耗时/token(需 FrameRequester + 计时,pure App 无时钟,得在 ui_loop 引入)**;**稳定 footer**(`render::footer_line`)在最底,`[mode]` 徽标 + 键位,仅 running/idle 两套 hint + 徽标在边界变、不逐事件 churn;去掉了运行态 status 里 churn 的 `last_note`(字段保留给 HUD)。

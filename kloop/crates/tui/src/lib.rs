@@ -502,6 +502,33 @@ fn spawn_input_thread(
     })
 }
 
+/// Insert one overflow batch into native scrollback, then invalidate the inline
+/// viewport. Ratatui's full-height `insert_before` path uses a one-row scrolling
+/// region that some terminals treat as a whole-screen scroll; `clear` resets its
+/// diff buffer so the next draw restores the transcript tail and bottom chrome.
+fn insert_scrollback_blocks<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    blocks: Vec<Vec<Line<'static>>>,
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+{
+    for lines in blocks {
+        let height = lines.len() as u16;
+        if height == 0 {
+            continue;
+        }
+        terminal.insert_before(height, |buf| {
+            let area = buf.area;
+            Paragraph::new(lines).render(area, buf);
+        })?;
+    }
+    // Inline clear starts at the viewport, so committed native scrollback stays
+    // intact while the next draw is forced to repaint every visible cell.
+    terminal.clear()?;
+    Ok(())
+}
+
 /// Freeze the finalized cells that overflow the live region into native
 /// scrollback via `insert_before`, then drop them from the app's tail. Called
 /// before each draw (unless a popup owns the screen), so the viewport only ever
@@ -531,16 +558,7 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
         .iter()
         .map(|c| render::cell_lines(c, width))
         .collect();
-    for lines in blocks {
-        let height = lines.len() as u16;
-        if height == 0 {
-            continue;
-        }
-        terminal.insert_before(height, |buf| {
-            let area = buf.area;
-            Paragraph::new(lines).render(area, buf);
-        })?;
-    }
+    insert_scrollback_blocks(terminal, blocks)?;
     app.drain_committed(n);
     Ok(())
 }
@@ -838,6 +856,74 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scrollback_insert_clears_viewport_without_clearing_history() {
+        const WIDTH: u16 = 24;
+        const HEIGHT: u16 = 6;
+        let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(HEIGHT),
+            },
+        )
+        .unwrap();
+        let initial = vec![
+            Line::from("live tail"),
+            Line::from(""),
+            Line::from("────────────────────────"),
+            Line::from("› draft"),
+            Line::from("────────────────────────"),
+            Line::from("[manual]"),
+        ];
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(initial.clone()), area);
+            })
+            .unwrap();
+
+        insert_scrollback_blocks(
+            &mut terminal,
+            vec![
+                vec![Line::from("committed one"), Line::from("committed two")],
+                vec![Line::from("committed three")],
+            ],
+        )
+        .unwrap();
+
+        terminal.backend().assert_scrollback_lines([
+            "committed one           ",
+            "committed two           ",
+            "committed three         ",
+        ]);
+        // TestBackend's AfterCursor keeps the cursor cell itself; every other
+        // visible cell proves that the inline viewport was cleared. The real
+        // Crossterm ED sequence clears from the cursor inclusively.
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .skip(1)
+            .all(|cell| cell.symbol() == " "));
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(initial), area);
+            })
+            .unwrap();
+        terminal.backend().assert_buffer_lines([
+            "live tail               ",
+            "                        ",
+            "────────────────────────",
+            "› draft                 ",
+            "────────────────────────",
+            "[manual]                ",
+        ]);
     }
 
     #[test]

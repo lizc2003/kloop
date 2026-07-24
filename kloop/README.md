@@ -338,8 +338,11 @@ The UI loop `select!`s those key events against agent events, folds both into
 pure state (`App`, whose `cells` are the uncommitted tail), and renders via
 pure cell→line functions — which is what makes the transcript logic testable
 without a terminal. Before each draw it freezes the finalized cells that
-overflow the viewport into scrollback with `insert_before`. Streaming deltas
-are drained in batches so a burst of tokens redraws once, not per token.
+overflow the viewport into scrollback with `insert_before`, then clears and
+fully redraws the current viewport so terminal scroll-region quirks cannot
+leave Ratatui's diff buffer out of sync; native scrollback remains intact.
+Streaming deltas are drained in batches so a burst of tokens redraws once, not
+per token.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** interrupts the running turn and clears the input line when
