@@ -62,6 +62,9 @@ pub struct WritableRoot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxPolicy {
     pub writable_roots: Vec<WritableRoot>,
+    /// Credential-bearing files that sandboxed model shell commands may never
+    /// read. The parent kloop process loads them before spawning a command.
+    pub denied_read_paths: Vec<PathBuf>,
     pub allow_network: bool,
     /// The sandbox/approval coupling knob (cc's autoAllowBashIfSandboxed,
     /// default on): a bash call this sandbox will contain skips the asking
@@ -116,6 +119,7 @@ impl SandboxPolicy {
                     root,
                 })
                 .collect(),
+            denied_read_paths: Vec::new(),
             allow_network,
             auto_allow: true,
             escalate: true,
@@ -139,6 +143,22 @@ impl SandboxPolicy {
                     read_only_subpaths: protected_subpaths(&p),
                     root: p,
                 });
+            }
+        }
+        policy
+    }
+
+    /// Add a file the model-facing shell must never read. Keep literal and
+    /// canonical spellings: macOS aliases `/tmp` and symlinked paths otherwise
+    /// leave a second name for the same credential file.
+    pub fn with_denied_read_path(&self, path: &Path) -> Self {
+        let mut policy = self.clone();
+        for candidate in [
+            path.to_path_buf(),
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        ] {
+            if !policy.denied_read_paths.contains(&candidate) {
+                policy.denied_read_paths.push(candidate);
             }
         }
         policy
@@ -176,13 +196,27 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
         }
         write_parts.push(format!("(require-all {} )", parts.join(" ")));
     }
+    let mut read_denies = Vec::new();
+    for (i, path) in policy.denied_read_paths.iter().enumerate() {
+        let key = format!("DENIED_READ_{i}");
+        params.push((key.clone(), path.clone()));
+        read_denies.push(format!("(literal (param \"{key}\"))"));
+    }
+    let file_read = if read_denies.is_empty() {
+        "(allow file-read*)".to_string()
+    } else {
+        format!(
+            "(allow file-read*)\n(deny file-read* {})",
+            read_denies.join(" ")
+        )
+    };
     let file_write = format!("(allow file-write*\n{}\n)", write_parts.join("\n"));
-    // Reads are full-disk in this policy shape; network is denied by the base
-    // policy's (deny default) unless allow rules are appended.
+    // Reads are full-disk except explicit credential files; network is denied
+    // by the base policy's (deny default) unless allow rules are appended.
     let mut sections = vec![
         SEATBELT_BASE_POLICY.to_string(),
-        "; kloop dynamic policy: full-disk read, allow-listed writes".to_string(),
-        "(allow file-read*)".to_string(),
+        "; kloop dynamic policy: full-disk read minus credentials, allow-listed writes".to_string(),
+        file_read,
         file_write,
     ];
     if policy.allow_network {
@@ -276,6 +310,7 @@ mod tests {
     fn policy_with(roots: Vec<WritableRoot>, allow_network: bool) -> SandboxPolicy {
         SandboxPolicy {
             writable_roots: roots,
+            denied_read_paths: Vec::new(),
             allow_network,
             auto_allow: true,
             escalate: true,
@@ -295,7 +330,8 @@ mod tests {
             false,
         );
         let (profile, params) = seatbelt_profile(&policy);
-        let expected_dynamic = "; kloop dynamic policy: full-disk read, allow-listed writes\n\
+        let expected_dynamic =
+            "; kloop dynamic policy: full-disk read minus credentials, allow-listed writes\n\
              (allow file-read*)\n\
              (allow file-write*\n\
              (require-all (subpath (param \"WRITABLE_ROOT_0\")) \
@@ -318,6 +354,22 @@ mod tests {
         );
         assert!(profile.starts_with("; verbatim from codex"));
         assert!(profile.contains("(deny default)"));
+    }
+
+    #[test]
+    fn denied_read_paths_are_parameterized_after_full_disk_allow() {
+        let policy = policy_with(Vec::new(), false)
+            .with_denied_read_path(Path::new("/home/u/.kloop/config.toml"));
+        let (profile, params) = seatbelt_profile(&policy);
+        assert!(profile
+            .contains("(allow file-read*)\n(deny file-read* (literal (param \"DENIED_READ_0\")))"));
+        assert_eq!(
+            params,
+            vec![(
+                "DENIED_READ_0".to_string(),
+                PathBuf::from("/home/u/.kloop/config.toml")
+            )]
+        );
     }
 
     #[test]

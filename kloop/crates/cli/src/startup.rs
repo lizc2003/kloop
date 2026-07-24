@@ -1,8 +1,7 @@
-//! Startup wiring: reading `.kloop/config.toml` + `KLOOP_*` env into the
-//! runtime pieces a session needs (permissions, hooks, sandbox policy, agent
-//! types, skills, code-mode limits) and assembling them into a `Config` via
-//! [`config_from_env`] — the one entry `main`/`plain_main`/the server factory
-//! call. Every loader is fail-soft or a hard parse error, never a silent drop.
+//! Startup wiring: reading cwd-scoped `.kloop/config.toml`, process-global
+//! provider settings, and KLOOP_* env into the runtime pieces a session needs
+//! (permissions, hooks, sandbox policy, agent types, skills, code-mode limits).
+//! Every loader is fail-soft or a hard parse error, never a silent drop.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,9 +27,7 @@ use kloop_core::tools::ToolSource;
 use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_provider::Provider;
-use kloop_provider::ThinkingMode;
 use kloop_server::ConfigSnapshot;
-use kloop_server::ModelInfo;
 use kloop_server::SandboxConfigInfo;
 use kloop_server::SkillContext as ServerSkillContext;
 use kloop_server::SkillInfo;
@@ -39,8 +36,9 @@ use kloop_server::SkillsSnapshot;
 
 use crate::args::CliArgs;
 use crate::context;
+use crate::provider_config::ResolvedProviderSettings;
 
-pub(crate) const PERMISSIONS_CONFIG: &str = ".kloop/config.toml";
+pub(crate) const PROJECT_CONFIG: &str = ".kloop/config.toml";
 
 /// Parse `[[hooks]]` tables from `.kloop/config.toml`. A missing file or
 /// missing section is an empty list; a malformed entry is an error (a
@@ -636,7 +634,8 @@ pub(crate) fn build_sandbox(
                 cwd,
                 &settings.writable_roots,
                 settings.allow_network,
-            );
+            )
+            .with_denied_read_path(&crate::provider_config::global_config_path()?);
             policy.auto_allow = settings.auto_allow;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
@@ -662,55 +661,6 @@ pub(crate) fn defer_threshold_from_env() -> Result<usize> {
     }
 }
 
-/// Model resolution so one env file can drive both tracks: a provider-specific
-/// var (`ANTHROPIC_MODEL`/`OPENAI_MODEL`) wins over the shared `KLOOP_MODEL`,
-/// which both providers would otherwise fight over. `None` when neither is set
-/// (anthropic then falls back to its default, openai errors).
-fn resolve_model(specific: Option<String>, generic: Option<String>) -> Option<String> {
-    specific.or(generic)
-}
-
-/// The one locally configured model exposed by native `model/list`. kloop has
-/// no provider catalog API today, so returning anything beyond this resolved
-/// default would be fabricated. Missing credentials do not stop app-server
-/// startup; the real Config factory still reports them when a thread starts.
-pub(crate) fn server_model_info(args: &CliArgs) -> Option<ModelInfo> {
-    let provider = if args.mock {
-        "mock"
-    } else {
-        match std::env::var("KLOOP_PROVIDER").ok().as_deref() {
-            Some("anthropic") => "anthropic",
-            Some("openai") | Some("openai-compat") => "openai",
-            Some("openai-responses") => "openaiResponses",
-            Some(_) => return None,
-            None if std::env::var_os("ANTHROPIC_API_KEY").is_some() => "anthropic",
-            None if std::env::var_os("OPENAI_API_KEY").is_some() => "openai",
-            // Preserve the primary-track default even before credentials arrive;
-            // thread/start remains the authority that requires the key.
-            None => "anthropic",
-        }
-    };
-    let id = match provider {
-        "mock" => "mock".to_string(),
-        "anthropic" => resolve_model(
-            std::env::var("ANTHROPIC_MODEL").ok(),
-            std::env::var("KLOOP_MODEL").ok(),
-        )
-        .unwrap_or_else(|| "claude-sonnet-5".into()),
-        "openai" | "openaiResponses" => resolve_model(
-            std::env::var("OPENAI_MODEL").ok(),
-            std::env::var("KLOOP_MODEL").ok(),
-        )?,
-        _ => return None,
-    };
-    Some(ModelInfo {
-        display_name: id.clone(),
-        id,
-        provider: provider.into(),
-        is_default: true,
-    })
-}
-
 fn context_window_from_env() -> Result<Option<u64>> {
     match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
         Some("off") | Some("0") => Ok(None),
@@ -724,7 +674,11 @@ fn context_window_from_env() -> Result<Option<u64>> {
 
 /// Safe effective-config allowlist for native `config/read`. Parsing may read
 /// the full local TOML, but only these non-sensitive values cross the protocol.
-pub(crate) fn server_config_snapshot(args: &CliArgs, cwd: &Path) -> Result<ConfigSnapshot> {
+pub(crate) fn server_config_snapshot(
+    args: &CliArgs,
+    cwd: &Path,
+    provider: &ResolvedProviderSettings,
+) -> Result<ConfigSnapshot> {
     let settings = if args.mock {
         SandboxSettings {
             enabled: false,
@@ -734,7 +688,7 @@ pub(crate) fn server_config_snapshot(args: &CliArgs, cwd: &Path) -> Result<Confi
             escalate: false,
         }
     } else {
-        load_sandbox_settings(&cwd.join(PERMISSIONS_CONFIG))?
+        load_sandbox_settings(&cwd.join(PROJECT_CONFIG))?
     };
     let env_disables_sandbox = matches!(
         std::env::var("KLOOP_SANDBOX").ok().as_deref(),
@@ -746,7 +700,7 @@ pub(crate) fn server_config_snapshot(args: &CliArgs, cwd: &Path) -> Result<Confi
         && kloop_core::sandbox::availability().is_ok();
     Ok(ConfigSnapshot {
         cwd: cwd.to_string_lossy().to_string(),
-        model: server_model_info(args).map(|model| model.id),
+        model: Some(provider.model().to_string()),
         permission_mode: if args.mock {
             "mock".into()
         } else {
@@ -765,8 +719,9 @@ pub(crate) fn server_config_snapshot(args: &CliArgs, cwd: &Path) -> Result<Confi
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn config_from_env(
+pub(crate) fn config_from_settings(
     args: &CliArgs,
+    provider: &ResolvedProviderSettings,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
@@ -842,92 +797,11 @@ pub(crate) fn config_from_env(
             ..base
         });
     }
-
-    let anthropic = || -> Result<Config> {
-        let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
-        // Prompt caching is a pure cost saving, so it defaults on; the escape
-        // hatch is for diagnosing cache behavior against a live endpoint.
-        let cache = !matches!(
-            std::env::var("KLOOP_CACHE").ok().as_deref(),
-            Some("off") | Some("0") | Some("false")
-        );
-        // No KLOOP_THINKING = no thinking field: current models then run
-        // adaptive on their own. The blocks they send are replayed either way.
-        let thinking = match std::env::var("KLOOP_THINKING").ok().as_deref() {
-            None => ThinkingMode::Unset,
-            Some("off") => ThinkingMode::Off,
-            Some("adaptive") => ThinkingMode::Adaptive,
-            Some(raw) => ThinkingMode::Budget(raw.parse().context(
-                "KLOOP_THINKING must be off | adaptive | <budget tokens for pre-adaptive models>",
-            )?),
-        };
-        Ok(Config {
-            provider: Arc::new(Provider::Anthropic {
-                key,
-                base: std::env::var("ANTHROPIC_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.anthropic.com".into()),
-                cache,
-                thinking,
-            }),
-            model: resolve_model(
-                std::env::var("ANTHROPIC_MODEL").ok(),
-                std::env::var("KLOOP_MODEL").ok(),
-            )
-            .unwrap_or_else(|| "claude-sonnet-5".into()),
-            ..base.clone()
-        })
-    };
-    let openai = |responses: bool| -> Result<Config> {
-        let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
-        let model = resolve_model(
-            std::env::var("OPENAI_MODEL").ok(),
-            std::env::var("KLOOP_MODEL").ok(),
-        )
-        .context("set OPENAI_MODEL or KLOOP_MODEL for the openai providers")?;
-        let base_url =
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let provider = if responses {
-            Provider::OpenAiResponses {
-                key,
-                base: base_url,
-                // Also the reasoning-capture switch: without the field some
-                // backends never emit reasoning items.
-                effort: std::env::var("KLOOP_EFFORT").ok(),
-            }
-        } else {
-            Provider::OpenAiCompat {
-                key,
-                base: base_url,
-            }
-        };
-        Ok(Config {
-            provider: Arc::new(provider),
-            model,
-            ..base.clone()
-        })
-    };
-
-    match std::env::var("KLOOP_PROVIDER").ok().as_deref() {
-        Some("anthropic") => anthropic(),
-        Some("openai") | Some("openai-compat") => openai(false),
-        Some("openai-responses") => openai(true),
-        Some(other) => {
-            bail!("unknown KLOOP_PROVIDER '{other}' (anthropic | openai | openai-responses)")
-        }
-        None => {
-            if let Ok(cfg) = anthropic() {
-                Ok(cfg)
-            } else if let Ok(cfg) = openai(false) {
-                Ok(cfg)
-            } else {
-                bail!(
-                    "no provider configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
-                         (+ KLOOP_MODEL or the per-provider ANTHROPIC_MODEL/OPENAI_MODEL), \
-                         or run with --mock"
-                )
-            }
-        }
-    }
+    Ok(Config {
+        provider: Arc::new(provider.provider()),
+        model: provider.model().to_string(),
+        ..base
+    })
 }
 
 /// Scripted turns for `--mock`, exercising all five bets (plus the todo list)
@@ -982,34 +856,6 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn per_provider_model_wins_over_shared_agent_model() {
-        let s = |x: &str| Some(x.to_string());
-        // Provider-specific (ANTHROPIC_MODEL/OPENAI_MODEL) beats KLOOP_MODEL.
-        assert_eq!(
-            resolve_model(s("claude-sonnet-4-6"), s("shared")),
-            s("claude-sonnet-4-6")
-        );
-        // No provider-specific: fall back to the shared KLOOP_MODEL.
-        assert_eq!(resolve_model(None, s("shared")), s("shared"));
-        // Neither set: None — anthropic then defaults, openai errors.
-        assert_eq!(resolve_model(None, None), None);
-    }
-
-    #[test]
-    fn native_model_snapshot_is_local_and_single_default() {
-        let args = crate::args::parse_args(&["--mock".into()]).unwrap();
-        assert_eq!(
-            server_model_info(&args),
-            Some(ModelInfo {
-                id: "mock".into(),
-                display_name: "mock".into(),
-                provider: "mock".into(),
-                is_default: true,
-            })
-        );
-    }
 
     #[test]
     fn native_skills_snapshot_omits_commands_and_bodies() {

@@ -125,6 +125,7 @@ fn is_overflow_message(text: &str) -> bool {
 pub(crate) async fn send_checked(
     req: reqwest::RequestBuilder,
     label: &str,
+    secret: &str,
 ) -> Result<reqwest::Response> {
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -133,9 +134,27 @@ pub(crate) async fn send_checked(
         if is_overflow_message(&text) {
             return Err(anyhow::Error::new(OverflowError));
         }
+        let text = sanitized_http_error(&text, secret);
         anyhow::bail!("{label} http {status}: {text}");
     }
     Ok(resp)
+}
+
+fn sanitized_http_error(text: &str, secret: &str) -> String {
+    if !secret.is_empty() && secret.len() < 8 {
+        return "[response body redacted]".into();
+    }
+    let redacted = if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "[redacted]")
+    };
+    let mut chars = redacted.chars();
+    let mut bounded: String = chars.by_ref().take(4096).collect();
+    if chars.next().is_some() {
+        bounded.push_str("… [truncated]");
+    }
+    bounded
 }
 
 impl Provider {
@@ -323,5 +342,34 @@ impl Provider {
             }
         }
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitized_http_error;
+
+    #[test]
+    fn http_errors_redact_known_keys_and_bound_untrusted_bodies() {
+        let secret = "SENTINEL-provider-key";
+        let error = sanitized_http_error(
+            &format!("upstream reflected Authorization: Bearer {secret}"),
+            secret,
+        );
+        assert!(!error.contains(secret));
+        assert!(error.contains("[redacted]"));
+
+        let long = "界".repeat(5000);
+        let bounded = sanitized_http_error(&long, secret);
+        assert!(bounded.chars().count() < 4200);
+        assert!(bounded.ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn short_credentials_redact_the_entire_response_body() {
+        assert_eq!(
+            sanitized_http_error("server echoed abc", "abc"),
+            "[response body redacted]"
+        );
     }
 }

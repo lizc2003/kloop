@@ -49,6 +49,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// offload counter).
 static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 
+const MODEL_SHELL_SECRET_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "TAVILY_API_KEY",
+    "BRAVE_API_KEY",
+];
+
+fn scrub_model_shell_env(cmd: &mut tokio::process::Command) {
+    for name in MODEL_SHELL_SECRET_ENV {
+        cmd.env_remove(name);
+    }
+}
+
 /// The process for `sh -lc <command>`, wrapped in the OS sandbox when a
 /// policy applies. The env vars are hints only (codex's CODEX_SANDBOX
 /// shape): scripts get a way to detect the sandbox instead of failing
@@ -75,6 +89,10 @@ fn shell_command(
             cmd
         }
     };
+    // Provider/search credentials belong to the parent process, never to a
+    // model-controlled shell. This also protects the legacy env override path
+    // while daily provider settings live in ~/.kloop/config.toml.
+    scrub_model_shell_env(&mut cmd);
     // Run in the agent's cwd — the process cwd for the main agent (unchanged),
     // its private worktree for a `task {isolation: worktree}` sub-agent.
     cmd.current_dir(cwd);
@@ -534,6 +552,7 @@ async fn read_tail(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::scrub_model_shell_env;
     use crate::tools::testutil::*;
     use serde_json::json;
 
@@ -545,6 +564,21 @@ mod tests {
             .and_then(|rest| rest.split('.').next())
             .unwrap_or_else(|| panic!("no id in: {spawn_message}"))
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn model_shell_environment_scrubs_provider_credentials() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("env");
+        cmd.env("OPENAI_API_KEY", "SENTINEL-OPENAI")
+            .env("ANTHROPIC_API_KEY", "SENTINEL-ANTHROPIC")
+            .env("TAVILY_API_KEY", "SENTINEL-TAVILY")
+            .env("KEEP_ME", "visible");
+        scrub_model_shell_env(&mut cmd);
+        let output = cmd.output().await.unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("SENTINEL"), "{text}");
+        assert!(text.contains("KEEP_ME=visible"), "{text}");
     }
 
     #[tokio::test]
@@ -782,6 +816,7 @@ mod tests {
                     root: root.clone(),
                     read_only_subpaths: vec![root.join(".kloop")],
                 }],
+                denied_read_paths: Vec::new(),
                 allow_network: false,
                 auto_allow: true,
                 // No approver in test_ctx (allow_all), so escalation always
@@ -841,6 +876,7 @@ mod tests {
                     root,
                     read_only_subpaths: vec![],
                 }],
+                denied_read_paths: Vec::new(),
                 allow_network: false,
                 auto_allow: true,
                 escalate: true,
@@ -861,6 +897,41 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("kloop-sbx-out-{tag}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::canonicalize(&dir).unwrap()
+        }
+
+        #[tokio::test]
+        async fn denied_read_path_cannot_be_read_through_a_symlink() {
+            let (ctx, root) = sandbox_ctx("secret-read");
+            let secret_dir = root.join(".kloop");
+            std::fs::create_dir_all(&secret_dir).unwrap();
+            let secret = secret_dir.join("config.toml");
+            std::fs::write(&secret, "SENTINEL-CREDENTIAL").unwrap();
+            let alias = root.join("innocent.txt");
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+            let mut cfg = (*ctx.cfg).clone();
+            let policy = cfg.sandbox.take().unwrap();
+            cfg.sandbox = Some(Arc::new(policy.with_denied_read_path(&secret)));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({"command": format!("cat {}", alias.display())}),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "bash reports non-zero status in content");
+            assert!(!out.contains("SENTINEL-CREDENTIAL"), "{out}");
+            assert!(
+                out.contains("Operation not permitted") || out.contains("Permission denied"),
+                "{out}"
+            );
+
+            let _ = std::fs::remove_file(alias);
+            let _ = std::fs::remove_dir_all(root);
         }
 
         #[tokio::test]

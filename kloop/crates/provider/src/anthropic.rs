@@ -116,7 +116,7 @@ pub(super) async fn stream(
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .json(body);
-    let resp = crate::send_checked(req, "anthropic").await?;
+    let resp = crate::send_checked(req, "anthropic", key).await?;
 
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();

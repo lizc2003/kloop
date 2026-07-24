@@ -176,17 +176,23 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-deny rules → plan-mode read-only gate → safety checks → ask rules →
-sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
+deny rules → sensitive-read hard block → plan-mode read-only gate → safety checks →
+ask rules → sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
 allow rules → session cache → ask the user
 ```
 
 Two invariants carried over from claude-code: **deny always beats allow**,
-and **safety checks are immune to bypass mode**. The sandbox auto-allow
-layer is the sandbox/approval coupling — see OS sandbox below: a bash call
-the OS sandbox will contain skips everything beneath this layer, while deny
-rules, safety checks and explicit ask rules keep their say (the ask-rule
-half is deliberately stricter than cc's autoAllowBashIfSandboxed).
+and **safety checks are immune to bypass mode**. Credential-bearing/read-sensitive
+paths (`.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
+boundary: `read_file` refuses them, grep/glob filter them before reading, and
+Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
+macOS sandbox also denies reads of `~/.kloop/config.toml`, including through a
+symlink, and provider/search key env vars are removed from model shell children.
+The sandbox auto-allow layer is the sandbox/approval coupling — see OS sandbox
+below: a bash call the OS sandbox will contain skips everything beneath this
+layer, while deny rules, sensitive reads, safety checks and explicit ask rules
+keep their say (the ask-rule half is deliberately stricter than cc's
+autoAllowBashIfSandboxed).
 
 **Bash decisions run on a real parse tree** (`crates/core/src/shell.rs`,
 tree-sitter-bash): a script qualifies only when every node is a plain
@@ -496,10 +502,12 @@ cd /path/to/桌面前端仓库/app
 ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
 ```
 
-That branch gets provider credentials from the launch environment and normal
-`.kloop` configuration, so it deliberately skips Codex SSO/LoginDialog/
-AccessGuard. Live text/image turns, Stop, generic tool cards, all four approval
-decisions, and native `thread/list|read|resume|fork` history are connected.
+That branch gets provider credentials from the process-global
+`~/.kloop/config.toml` (environment variables are optional overrides), so it
+deliberately skips Codex SSO/LoginDialog/AccessGuard. The cwd-scoped
+`.kloop/config.toml` remains project policy only. Live text/image turns, Stop,
+generic tool cards, all four approval decisions, and native
+`thread/list|read|resume|fork` history are connected.
 Slice 4 also enables the local model picker, project-scoped skill catalog and
 native `/skill ` invocation, the safe config read adapter, and an immutable MCP
 status panel. The model picker is locked after a thread starts because its model
@@ -520,8 +528,8 @@ issue legacy RPCs.
 kloop connects to external MCP tool servers over one of two transports: a
 local child process over **stdio** (JSON-RPC 2.0, newline-delimited JSON — one
 object per line) or a remote endpoint over **streamable HTTP** (plan 34).
-Declare servers in `.kloop/config.toml`; `command` selects stdio, `url`
-selects HTTP (exactly one, or it's a config error):
+Declare servers in the cwd-scoped project `.kloop/config.toml`; `command`
+selects stdio, `url` selects HTTP (exactly one, or it's a config error):
 
 ```toml
 [mcp.servers.fs]                                   # stdio: local child process
@@ -1508,32 +1516,38 @@ cargo run -- --help
 # keyless demo: scripted Mock provider exercises all five bets (plain output)
 cargo run -- --mock
 
-# Anthropic (default model claude-sonnet-5; override with ANTHROPIC_MODEL, or
-# the shared KLOOP_MODEL)
-ANTHROPIC_API_KEY=... cargo run
-# prompt caching is on by default (cache_control breakpoints on the last
-# tool, the system block, and the last message block — the tool set outlives
-# the volatile system prompt, so a restart still reads the tools prefix);
-# KLOOP_CACHE=off disables it for diagnosing cache behavior
-# thinking blocks stream dim in the UI and are replayed verbatim (signature
-# included). No KLOOP_THINKING = no thinking field sent (current models then
-# run adaptive on their own); KLOOP_THINKING=off|adaptive|<budget tokens>
-# forces a mode (the budget form is for pre-adaptive models and raises
-# max_tokens by the budget)
+# Daily provider/model configuration is process-global. Create this file with
+# mode 0600 (and preferably chmod 700 ~/.kloop):
+#
+#   model = "gpt-5.6-sol"
+#   model_provider = "gw_router"
+#   model_reasoning_effort = "xhigh"
+#
+#   [model_providers.gw_router]
+#   name = "gateway"             # optional display name
+#   wire_api = "responses"         # responses | chat | anthropic
+#   base_url = "https://example/v1"
+#   http_headers = { Authorization = "Bearer ..." }
+#   model = "gpt-5.6-sol"          # optional profile-specific default
+#
+# Custom profile names require wire_api. Built-in names anthropic, openai /
+# openai-compat, and openai-responses infer it. Anthropic profiles use exactly
+# one x-api-key header; chat/responses profiles use Bearer Authorization.
+# kloop appends /v1/messages, /chat/completions, or /responses to the base.
+chmod 600 ~/.kloop/config.toml
+cargo run
 
-# any OpenAI-compatible endpoint (OPENAI_MODEL, or the shared KLOOP_MODEL,
-# required)
-OPENAI_API_KEY=... OPENAI_MODEL=gpt-5.2 cargo run
-# OPENAI_BASE_URL defaults to https://api.openai.com/v1
-# Per-provider model vars let one env file drive both tracks: ANTHROPIC_MODEL /
-# OPENAI_MODEL each win over the shared KLOOP_MODEL, so switching KLOOP_PROVIDER
-# auto-picks the matching model instead of both fighting over KLOOP_MODEL
-# KLOOP_PROVIDER=anthropic|openai|openai-responses forces a provider when
-# both keys are set; openai-responses speaks the /responses wire (stateless
-# store:false, reasoning replayed via encrypted_content) with the same
-# OPENAI_* variables. KLOOP_EFFORT=minimal|low|medium|high sends the
-# reasoning request field (summary=auto) — some backends emit no reasoning
-# items at all without it, so this is also the reasoning-capture switch
+# Environment variables remain compatibility/CI overrides rather than the
+# daily source of truth. Provider selection: KLOOP_PROVIDER > model_provider >
+# key auto-detection. Key/base env wins over the selected profile. Model order:
+# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > profile model > top-level model.
+# Explicitly selected, incomplete profiles fail; kloop never switches rails.
+#
+# ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL (base excludes /v1) select Messages;
+# OPENAI_API_KEY / OPENAI_BASE_URL (base normally includes /v1) select either
+# chat or Responses according to KLOOP_PROVIDER. KLOOP_CACHE and KLOOP_THINKING
+# override Anthropic cache/thinking; KLOOP_EFFORT overrides Responses effort.
+# Provider/search keys are stripped from model-controlled shell environments.
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
@@ -1553,12 +1567,12 @@ cargo run -- -r <id>           # continue a specific session
 cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
 cargo run -- --fork <id>       # branch off a session at its end
 
-# MCP servers come from .kloop/config.toml — see MCP client above
+# MCP servers come from the cwd-scoped project .kloop/config.toml — see MCP client above
 # KLOOP_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
 # (default 30 total tools; lower it to exercise deferral with a small server,
 # raise it to effectively disable)
 
-# permissions (rules also live in .kloop/config.toml — see Permissions)
+# permissions (rules also live in the cwd-scoped project .kloop/config.toml)
 KLOOP_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
 KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes

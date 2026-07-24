@@ -261,8 +261,8 @@ pub(crate) fn help_text() -> &'static str {
      OTHER:\n\
      \x20   -h, --help            show this help and exit\n\
      \n\
-     Configuration is via .kloop/config.toml and KLOOP_* / ANTHROPIC_* /\n\
-     OPENAI_* environment variables; see the README.\n"
+     Provider/model credentials: ~/.kloop/config.toml (KLOOP_* / provider env may override).\n\
+     Project permissions/MCP/hooks/sandbox: .kloop/config.toml; see the README.\n"
 }
 
 fn session_line(path: &Path) -> String {

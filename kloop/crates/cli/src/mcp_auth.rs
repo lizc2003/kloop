@@ -25,7 +25,7 @@ use kloop_mcp::oauth::OAuthToken;
 
 use crate::mcp::load_mcp_servers;
 use crate::mcp::McpTransport;
-use crate::startup::PERMISSIONS_CONFIG;
+use crate::startup::PROJECT_CONFIG;
 
 /// Where OAuth tokens live: alongside the config, one file for all servers.
 const OAUTH_STORE_PATH: &str = ".kloop/mcp-oauth.json";
@@ -180,11 +180,11 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 /// `kloop mcp login <name>`: resolve the server's OAuth config, run the
 /// interactive flow (browser + loopback callback), and persist the token.
 pub async fn run_login(server_name: &str) -> Result<()> {
-    let servers = load_mcp_servers(Path::new(PERMISSIONS_CONFIG))?;
+    let servers = load_mcp_servers(Path::new(PROJECT_CONFIG))?;
     let server = servers
         .iter()
         .find(|s| s.name == server_name)
-        .with_context(|| format!("no [mcp.servers.{server_name}] in {PERMISSIONS_CONFIG}"))?;
+        .with_context(|| format!("no [mcp.servers.{server_name}] in {PROJECT_CONFIG}"))?;
     let (url, client_id, scopes) = match &server.transport {
         McpTransport::Http {
             url,

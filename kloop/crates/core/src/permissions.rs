@@ -1,17 +1,17 @@
 //! permissions — the layered gate run before every tool execution, shaped
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
-//! deny rules → plan-mode read-only gate → safety checks → ask rules →
-//! sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
-//! allow rules → session cache → ask the user.
+//! deny rules → sensitive-read hard block → plan-mode read-only gate →
+//! safety checks → ask rules → sandbox auto-allow → bypass → read-only
+//! self-verdict → acceptEdits → allow rules → session cache → ask the user.
 //!
 //! Two invariants carried over from cc: **deny always beats allow**, and
 //! **safety checks (destructive commands, sensitive paths) are immune to
 //! bypass mode**. A denial becomes an is_error tool_result — the model can
 //! take another approach; the turn does not end.
 //!
-//! Plan mode ([`Mode::Plan`], cc's `plan` permission mode) sits right below
-//! deny: a write/mutating call is refused outright — not even asked — so the
+//! Plan mode ([`Mode::Plan`], cc's `plan` permission mode) sits below deny and
+//! the credential-read hard block: a write/mutating call is refused outright —
 //! agent explores read-only and acts only after the user approves the plan via
 //! `exit_plan_mode`. It is placed above safety on purpose: a destructive
 //! command in plan mode is a flat "no", not a "[destructive] approve?" prompt
@@ -22,15 +22,15 @@
 //! sandbox/approval coupling: a bash call the OS sandbox will contain needs
 //! no human sign-off — containment replaces the parse-level vetting of the
 //! layers below it, opaque scripts included. Everything above it still has
-//! its say: deny rules, safety checks, and — deliberately stricter than cc —
-//! explicit ask rules ("always confirm this" is the user's word, no
+//! its say: deny rules, sensitive reads, safety checks, and — deliberately
+//! stricter than cc — explicit ask rules ("always confirm this" is the user's
 //! automation outranks it). Dispatch feeds the verdict in per call, so an
 //! escaped call (`disable_sandbox: true`) faces the gate like any other.
 //!
 //! Bash content decisions run on the tree-sitter analysis in [`crate::shell`]:
 //! a script the parser cannot fully vouch for is *opaque* — it can never be
 //! auto-approved, never match an allow rule, and never enter the session
-//! cache; it always goes to the user.
+//! cache; outside a contained sandbox it always goes to the user.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -456,7 +456,16 @@ impl Permissions {
             ));
         }
 
-        // 2. Plan mode — read-only exploration only. A mutating call is refused
+        // 2. Sensitive reads — credentials and agent state must never enter the
+        // model context. This is a hard verdict before plan/sandbox/bypass and
+        // cannot be remembered or approved away.
+        if call.sensitive_read {
+            return Err(format!(
+                "{name}: reading this sensitive path is blocked. Do not retry or work around the protection."
+            ));
+        }
+
+        // 3. Plan mode — read-only exploration only. A mutating call is refused
         // outright (deny above still wins; safety/ask below never see one), so
         // the model plans and acts only after the user approves exit_plan_mode.
         // Above safety on purpose: a destructive command here is a flat "no",
@@ -470,7 +479,7 @@ impl Permissions {
             ));
         }
 
-        // 3. Safety checks — bypass-immune, straight to the user.
+        // 4. Safety checks — bypass-immune, straight to the user.
         if let Some(hazard) = call.hazard(name) {
             let remember = hazard
                 .rememberable
@@ -481,19 +490,19 @@ impl Permissions {
                 .await;
         }
 
-        // 4. Explicit ask rules — "always confirm this"; never remembered.
+        // 5. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
             return self.ask_user(name, input, depth, None, None).await;
         }
 
-        // 5. Sandbox auto-allow — the OS sandbox will contain this call, so
+        // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
         if sandbox_auto_allow {
             return Ok(());
         }
 
-        // 6. Bypass mode — auto-run, but NOT an opaque bash script. Bypass
+        // 7. Bypass mode — auto-run, but NOT an opaque bash script. Bypass
         // waives the rule/ask layers, not the safety promise: an unparseable
         // command (subshell, redirect, substitution…) could hide an `rm -rf`
         // the destructive check never got to see, so it falls through to the
@@ -504,12 +513,12 @@ impl Permissions {
             return Ok(());
         }
 
-        // 7. Read-only self-verdict.
+        // 8. Read-only self-verdict.
         if call.is_readonly(name) {
             return Ok(());
         }
 
-        // 8. acceptEdits: file writes inside the working directory.
+        // 9. acceptEdits: file writes inside the working directory.
         if self.mode() == Mode::AcceptEdits
             && matches!(name, "write_file" | "edit_file")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
@@ -517,12 +526,12 @@ impl Permissions {
             return Ok(());
         }
 
-        // 9. Allow rules.
+        // 10. Allow rules.
         if self.matches_allow(name, &call) {
             return Ok(());
         }
 
-        // 10. Session cache.
+        // 11. Session cache.
         let remember = remember_payload(name, &call);
         if let Some(remember) = &remember {
             let session = self.session.lock().unwrap();
@@ -531,7 +540,7 @@ impl Permissions {
             }
         }
 
-        // 11. Ask.
+        // 12. Ask.
         self.ask_user(name, input, depth, None, remember).await
     }
 
@@ -701,6 +710,7 @@ struct Hazard {
 struct CallFacts {
     bash: Option<BashAnalysis>,
     path: Option<PathFacts>,
+    sensitive_read: bool,
 }
 
 struct PathFacts {
@@ -713,11 +723,10 @@ struct PathFacts {
 
 impl CallFacts {
     fn gather(name: &str, input: &Value, cwd: &Path) -> Self {
-        let bash = (name == "bash").then(|| {
-            input["command"]
-                .as_str()
-                .map_or(BashAnalysis::Opaque, analyze_bash)
-        });
+        let bash_command = (name == "bash")
+            .then(|| input["command"].as_str())
+            .flatten();
+        let bash = bash_command.map_or_else(|| None, |command| Some(analyze_bash(command)));
         let path = matches!(name, "write_file" | "edit_file" | "read_file")
             .then(|| {
                 input["path"]
@@ -725,7 +734,19 @@ impl CallFacts {
                     .map(|raw| PathFacts::gather(Path::new(raw), cwd))
             })
             .flatten();
-        CallFacts { bash, path }
+        let sensitive_read = (name == "read_file"
+            && path.as_ref().is_some_and(|path| path.sensitive))
+            || (name == "bash"
+                && bash_command
+                    .zip(bash.as_ref())
+                    .is_some_and(|(command, analysis)| {
+                        bash_reads_sensitive_path(command, analysis, cwd)
+                    }));
+        CallFacts {
+            bash,
+            path,
+            sensitive_read,
+        }
     }
 
     fn hazard(&self, name: &str) -> Option<Hazard> {
@@ -796,12 +817,99 @@ impl CallFacts {
     }
 }
 
+fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path) -> bool {
+    if raw_mentions_sensitive_path(command) {
+        return true;
+    }
+    let BashAnalysis::Commands(commands) = analysis else {
+        return false;
+    };
+    commands.iter().any(|argv| {
+        argv.iter().skip(1).any(|arg| {
+            if arg.starts_with('-') && !arg.contains('/') {
+                return false;
+            }
+            let path = expand_shell_path(arg, cwd);
+            PathFacts::gather(&path, cwd).sensitive
+        }) || recursive_search_covers_sensitive_path(argv, cwd)
+    })
+}
+
+fn raw_mentions_sensitive_path(command: &str) -> bool {
+    let folded = fs_fold(command);
+    let command = folded.as_ref();
+    [
+        "~/.kloop", "/.kloop/", "~/.ssh", "/.ssh/", "~/.gnupg", "/.gnupg/", "~/.aws", "/.aws/",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
+    if raw == "~" {
+        return std::env::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::home_dir() {
+            return home.join(rest);
+        }
+    }
+    lexical_normalize(cwd, Path::new(raw))
+}
+
+fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
+    let Some(command) = argv.first().and_then(|raw| raw.rsplit('/').next()) else {
+        return false;
+    };
+    let recursive = match command {
+        // ripgrep is recursive, but only exposes hidden credential directories
+        // when --hidden / -u is requested.
+        "rg" => argv[1..].iter().any(|arg| {
+            arg == "--hidden"
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg.chars().skip(1).any(|ch| ch == 'u'))
+        }),
+        "grep" => argv[1..]
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-r" | "-R" | "--recursive")),
+        _ => false,
+    };
+    if !recursive {
+        return false;
+    }
+    let roots: Vec<PathBuf> = argv[1..]
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(|arg| expand_shell_path(arg, cwd))
+        .filter(|path| path.is_dir())
+        .collect();
+    let roots = if roots.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        roots
+    };
+    roots.iter().any(|root| {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let local_sensitive = [".kloop", ".ssh", ".gnupg", ".aws"]
+            .iter()
+            .any(|name| root.join(name).exists());
+        let global_config_is_below = std::env::home_dir()
+            .map(|home| home.join(".kloop/config.toml").starts_with(&root))
+            .unwrap_or(false);
+        local_sensitive || global_config_is_below
+    })
+}
+
 impl PathFacts {
     fn gather(raw: &Path, cwd: &Path) -> Self {
         let normalized = lexical_normalize(cwd, raw);
         let relative = normalized.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
-        let sensitive = path_is_sensitive(&normalized);
+        let sensitive = path_is_sensitive(&normalized)
+            || std::fs::canonicalize(&normalized)
+                .ok()
+                .is_some_and(|canonical| path_is_sensitive(&canonical));
         PathFacts {
             normalized,
             relative,
@@ -1253,6 +1361,71 @@ mod tests {
             assert!(!ok(&p, "write_file", file(path)).await, "{path}");
         }
         assert_eq!(approver.ask_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn sensitive_reads_are_hard_blocked_before_sandbox_and_bypass() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow; 8]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        assert!(!ok(&p, "read_file", json!({"path": ".kloop/config.toml"})).await);
+        for command in [
+            "cat ~/.kloop/config.toml",
+            "base64 /work/proj/.kloop/config.toml",
+            "head -n 2 sub/.kloop/config.toml",
+            "rg token ~/.kloop",
+            "python3 -c 'print(open(\"/work/proj/.kloop/config.toml\").read())'",
+        ] {
+            assert!(
+                p.check_call("bash", &bash(command), 0, /*sandbox_auto_allow*/ true)
+                    .await
+                    .is_err(),
+                "sensitive command escaped: {command}"
+            );
+        }
+        assert_eq!(
+            approver.ask_count(),
+            0,
+            "sensitive reads are not approvable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sensitive_reads_follow_symlinks_to_the_canonical_target() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-sensitive-read-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let secret_dir = root.join(".kloop");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("config.toml");
+        std::fs::write(&secret, "SENTINEL").unwrap();
+        let alias = root.join("innocent.toml");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow; 2]);
+        let permissions = Permissions::new(
+            Mode::Bypass,
+            &rules(&[], &[], &[]),
+            root.clone(),
+            Some(approver.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(permissions
+            .check("read_file", &json!({"path": alias}), 0)
+            .await
+            .is_err());
+        assert!(permissions
+            .check_call(
+                "bash",
+                &bash(&format!("cat {}", root.join("innocent.toml").display())),
+                0,
+                true,
+            )
+            .await
+            .is_err());
+        assert_eq!(approver.ask_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ── layer 3: ask rules ──────────────────────────────────────────────

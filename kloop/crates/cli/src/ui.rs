@@ -13,7 +13,7 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::tools::TodoStatus;
 
-use crate::startup::PERMISSIONS_CONFIG;
+use crate::startup::PROJECT_CONFIG;
 
 /// ANSI-color a diff preview for the plain REPL: additions green, deletions
 /// red, everything else (context, hunk gaps, markers) dim.
@@ -49,7 +49,7 @@ impl Approver for CliApprover {
             let _one_at_a_time = self.prompting.lock().await;
             let options = match &req.remember_rules {
                 Some(rules) => format!(
-                    "y = allow once / a = allow for this session / p = allow always (saves {} to {PERMISSIONS_CONFIG}) / n = deny",
+                    "y = allow once / a = allow for this session / p = allow always (saves {} to {PROJECT_CONFIG}) / n = deny",
                     rules.join(", ")
                 ),
                 None => "y = allow once / n = deny".to_string(),

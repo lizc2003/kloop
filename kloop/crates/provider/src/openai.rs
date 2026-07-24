@@ -194,7 +194,7 @@ pub(super) async fn stream(
     tx: &mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<()> {
     let req = crate::http_client().post(url).bearer_auth(key).json(body);
-    let resp = crate::send_checked(req, "openai-compat").await?;
+    let resp = crate::send_checked(req, "openai-compat", key).await?;
 
     let mut parser = SseParser::default();
     let mut byte_stream = resp.bytes_stream();
