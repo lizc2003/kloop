@@ -14,6 +14,7 @@ mod skill;
 mod task;
 mod todo;
 mod tool_search;
+pub mod web;
 mod worktree_tool;
 
 pub use background_tasks::BackgroundTasks;
@@ -54,15 +55,16 @@ use kloop_protocol::ToolDef;
 use kloop_protocol::ToolResultContent;
 
 /// Past this many tools the definitions would crowd the context window, so
-/// source (MCP) tools are deferred behind tool_search instead of being sent.
+/// source tools are deferred behind tool_search instead of being sent.
 /// Default for `Config.defer_threshold` (`KLOOP_DEFER_THRESHOLD` overrides).
 pub const TOOL_DEFER_THRESHOLD: usize = 30;
 
-/// An external provider of tools (an MCP server, in practice). Core only
-/// knows this seam; the wire protocol lives in the `kloop-mcp` crate and the
-/// adapter in the CLI. Implementations expose already-namespaced tool names
-/// (`{server}__{tool}`) so cross-source collisions are config mistakes, not
-/// the common case.
+/// An external provider of tools (Web tools, an MCP server, or another CLI
+/// adapter). Core only knows this seam; transport and network implementations
+/// live outside core. Implementations expose unique tool names; MCP adapters
+/// namespace theirs as `{server}__{tool}` so cross-server collisions are config
+/// mistakes, not the common case.
+///
 /// What a [`ToolSource`] call yields: the flattened `text` a tool_result carries
 /// (the model-facing path) plus an optional `structured` value a code-mode
 /// program receives instead — an MCP tool's raw `CallToolResult` object, so a
@@ -723,8 +725,7 @@ fn execute_tool<'a>(
         if name == "read_file" {
             return fs::read_file_tool(input, ctx).await;
         }
-        // External (source/MCP) tools can also return images — handle them
-        // before the text-returning built-ins so their result can be Text OR
+        // External source tools can also return images — handle them before the text-returning built-ins so their result can be Text OR
         // Blocks. A program still gets the structured form via the sink.
         if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
             let out = source.call(name, input).await?;
@@ -770,8 +771,7 @@ fn execute_tool<'a>(
             "wait" => background_tasks::wait_tool(input, ctx).await,
             "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
-            // Source (MCP) tools were already handled above (they may return
-            // images); anything reaching here is an unknown tool name.
+            // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
             other => Err(anyhow!("unknown tool: {other}")),
         };
         text.map(ToolResultContent::Text)

@@ -782,9 +782,11 @@ notifications, stall detection and Monitor tool are not ported.
 
 ## Web tools (Phase 2, eleventh slice)
 
-`web_fetch` and `web_search`, implemented in the `kloop-web` crate and glued
-into core's `ToolSource` seam by the CLI (exactly like MCP servers — core
-stays network-free, reqwest lives only in provider and web):
+`web_fetch` and `web_search` have their agent-facing contracts (names,
+descriptions, and JSON schemas) in `crates/core/src/tools/web.rs`. Their network
+operations remain implemented in the `kloop-web` crate and are bound to core's
+`ToolSource` seam by the CLI (exactly like MCP servers — core stays
+network-free, reqwest lives only in provider and web):
 
 - **web_fetch** `{url}` — HTTP upgraded to HTTPS, embedded credentials and
   2000-char URLs rejected, SSRF guard (loopback/private/link-local/CGNAT/
@@ -1723,12 +1725,12 @@ every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 
 ## Layout
 
-Cargo workspace, eight crates; the dependency graph is a strict line up to
-core, then two sibling frontends under the cli, with the MCP wire client as
-a protocol-only sibling glued in by the cli and the QuickJS code-mode engine
-as a leaf core depends on
+Cargo workspace, nine crates; the dependency graph is a strict line up to
+core, then two sibling frontends under the cli, with the MCP wire client, Web
+network operations, and the QuickJS code-mode engine kept behind explicit
+seams
 (protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli;
-codemode ← core):
+web ← cli; codemode ← core):
 
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
@@ -1752,6 +1754,8 @@ crates/core/        kloop-core — the agent, network-free
     bash.rs         foreground + background shell execution, the
                     BackgroundShells registry, bash_output/kill_bash
     fs.rs           read/write/edit file, read_offloaded
+    web.rs          web_fetch/web_search agent contracts: names, descriptions,
+                    input schemas (network execution stays in kloop-web)
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware
                     walking, output modes, paging, clipping)
     task.rs         sub-agent spawning
@@ -1783,7 +1787,8 @@ crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAu
   src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
                     tools/list pagination, tools/call, content rendering
 
-crates/web/         kloop-web — web_fetch/web_search (owns reqwest with provider)
+crates/web/         kloop-web — web_fetch/web_search network operations (owns reqwest)
+  src/lib.rs        fetch/search operation API + configured backend discovery
   src/fetch.rs      SSRF guard, redirect policy, caps, body handling
   src/html.rs       minimal HTML→text (no extra dependencies)
   src/search.rs     SearchBackend trait + Tavily/Brave implementations
@@ -1796,7 +1801,8 @@ crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
                     app-server/--serve), env config, StdoutUi, CliApprover (y/a/p/n
                     prompt), .kloop/config.toml rule load/persist, --mock
-  src/web.rs        [web] config + ToolSource adapter over kloop-web
+  src/web.rs        [web] config + ToolSource adapter binding core contracts
+                    to kloop-web network operations
                     demo, session selection (--continue, --resume,
                     --list-sessions)
   src/mcp.rs        [mcp.servers] config, startup connection with

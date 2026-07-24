@@ -1,8 +1,9 @@
 //! Web tools glue: `[web]` config parsing and the `ToolSource` adapter over
-//! `kloop-web` — the same seam MCP servers ride, so core stays network-free.
-//! web_fetch is always on (except --mock); web_search needs the selected
-//! backend's key (TAVILY_API_KEY for the default provider) and degrades to
-//! a warning without one.
+//! `kloop-web`. Core's `tools::web` module owns the agent-facing contracts;
+//! this layer selects network backends and binds execution without adding a
+//! network dependency to core. web_fetch is always on (except --mock);
+//! web_search needs the selected backend's key and degrades to a warning
+//! without one.
 
 use std::future::Future;
 use std::path::Path;
@@ -14,6 +15,9 @@ use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
 
+use kloop_core::tools::web;
+use kloop_core::tools::web::WEB_FETCH;
+use kloop_core::tools::web::WEB_SEARCH;
 use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ToolDef;
@@ -102,7 +106,7 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
     };
     match WebTools::new(search) {
         Ok(tools) => {
-            let defs = tools.defs();
+            let defs = web::tool_defs(tools.search_backend_name());
             Some(Arc::new(WebToolSource { tools, defs }))
         }
         Err(e) => {
@@ -134,7 +138,14 @@ impl ToolSource for WebToolSource {
         tool: &'a str,
         input: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
-        Box::pin(async move { Ok(SourceOutput::text(self.tools.call(tool, input).await?)) })
+        Box::pin(async move {
+            let text = match tool {
+                WEB_FETCH => self.tools.fetch(input).await?,
+                WEB_SEARCH => self.tools.search(input).await?,
+                other => bail!("unknown web tool: {other}"),
+            };
+            Ok(SourceOutput::text(text))
+        })
     }
 }
 

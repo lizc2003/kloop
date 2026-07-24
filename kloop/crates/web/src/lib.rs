@@ -1,7 +1,7 @@
-//! kloop-web — web_fetch / web_search implementations. Depends on protocol
-//! only (plus reqwest); the CLI glues this into core's `ToolSource` seam the
-//! same way it glues MCP, keeping core network-free. Search backends are
-//! pluggable behind [`SearchBackend`]; Brave is the first implementation.
+//! kloop-web — network implementations for web_fetch / web_search. The
+//! agent-facing names and schemas live in `kloop-core::tools::web`; the CLI
+//! glues these operations into core's `ToolSource` seam. Search backends are
+//! pluggable behind [`SearchBackend`].
 
 mod fetch;
 mod html;
@@ -13,10 +13,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use serde_json::json;
 use serde_json::Value;
-
-use kloop_protocol::ToolDef;
 
 pub use search::Brave;
 pub use search::SearchBackend;
@@ -45,59 +42,27 @@ impl WebTools {
         Ok(WebTools { client, search })
     }
 
-    pub fn defs(&self) -> Vec<ToolDef> {
-        let mut defs = vec![ToolDef {
-            name: "web_fetch".into(),
-            description: "Fetch a URL and return its content as plain text (HTML is converted, tags stripped). HTTP is upgraded to HTTPS. Same-host redirects are followed; a cross-host redirect is reported back so you can fetch the new URL explicitly. Refuses private/internal addresses. Long pages are truncated.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Full URL to fetch (http or https)"}
-                },
-                "required": ["url"]
-            }),
-        }];
-        if let Some(search) = &self.search {
-            defs.push(ToolDef {
-                name: "web_search".into(),
-                description: format!(
-                    "Search the web (via {}). Returns the top results as title, URL and snippet; fetch a result with web_fetch for the full page.",
-                    search.name()
-                ),
-                schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The search query"},
-                        "max_results": {"type": "integer", "description": "Number of results (1-10, default 5)"}
-                    },
-                    "required": ["query"]
-                }),
-            });
-        }
-        defs
+    pub fn search_backend_name(&self) -> Option<&'static str> {
+        self.search.as_ref().map(|search| search.name())
     }
 
-    pub async fn call(&self, tool: &str, input: &Value) -> Result<String> {
-        match tool {
-            "web_fetch" => {
-                let url = str_arg(input, "url", "web_fetch")?;
-                fetch::fetch_url(&self.client, url, /*allow_private*/ false).await
-            }
-            "web_search" => {
-                let Some(search) = &self.search else {
-                    bail!("web_search is not enabled (no search backend configured)");
-                };
-                let query = str_arg(input, "query", "web_search")?;
-                let count = input["max_results"]
-                    .as_u64()
-                    .map_or(SEARCH_RESULTS_DEFAULT, |n| {
-                        (n as usize).clamp(1, SEARCH_RESULTS_MAX)
-                    });
-                let hits = search.search(&self.client, query, count).await?;
-                Ok(search::format_hits(&hits))
-            }
-            other => Err(anyhow!("unknown web tool: {other}")),
-        }
+    pub async fn fetch(&self, input: &Value) -> Result<String> {
+        let url = str_arg(input, "url", "web_fetch")?;
+        fetch::fetch_url(&self.client, url, /*allow_private*/ false).await
+    }
+
+    pub async fn search(&self, input: &Value) -> Result<String> {
+        let Some(search) = &self.search else {
+            bail!("web_search is not enabled (no search backend configured)");
+        };
+        let query = str_arg(input, "query", "web_search")?;
+        let count = input["max_results"]
+            .as_u64()
+            .map_or(SEARCH_RESULTS_DEFAULT, |n| {
+                (n as usize).clamp(1, SEARCH_RESULTS_MAX)
+            });
+        let hits = search.search(&self.client, query, count).await?;
+        Ok(search::format_hits(&hits))
     }
 }
 
@@ -126,34 +91,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defs_expose_search_only_with_a_backend() {
+    fn reports_configured_search_backend() {
         let fetch_only = WebTools::new(None).unwrap();
-        let names: Vec<String> = fetch_only.defs().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["web_fetch"]);
+        assert_eq!(fetch_only.search_backend_name(), None);
 
         let with_search = WebTools::new(Some(Box::new(Brave::new("test-key".into())))).unwrap();
-        let defs = with_search.defs();
-        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["web_fetch", "web_search"]);
-        assert!(
-            defs[1].description.contains("brave"),
-            "backend named in description"
-        );
+        assert_eq!(with_search.search_backend_name(), Some("brave"));
     }
 
     #[tokio::test]
     async fn call_validates_arguments() {
         let tools = WebTools::new(None).unwrap();
-        let err = tools.call("web_fetch", &json!({})).await.unwrap_err();
+        let err = tools.fetch(&serde_json::json!({})).await.unwrap_err();
         assert!(format!("{err:#}").contains("missing required string argument 'url'"));
 
         let err = tools
-            .call("web_search", &json!({"query": "x"}))
+            .search(&serde_json::json!({"query": "x"}))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not enabled"));
-
-        let err = tools.call("nope", &json!({})).await.unwrap_err();
-        assert!(format!("{err:#}").contains("unknown web tool"));
     }
 }
