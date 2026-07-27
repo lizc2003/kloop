@@ -86,8 +86,14 @@ impl GrepArgs {
                 Some(p) => crate::tools::resolve_path(cwd, p),
                 None => cwd.to_path_buf(),
             },
-            glob: input["glob"].as_str().map(str::to_string),
-            file_type: input["type"].as_str().map(str::to_string),
+            glob: input["glob"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            file_type: input["type"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             mode,
             case_insensitive: input["-i"].as_bool().unwrap_or(false),
             line_numbers: input["-n"].as_bool().unwrap_or(true),
@@ -718,6 +724,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unknown file type"));
+    }
+
+    #[test]
+    fn empty_grep_filters_are_omitted_without_trimming() {
+        let empty = GrepArgs::parse(
+            &json!({"pattern": "needle", "glob": "", "type": ""}),
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(empty.glob, None);
+        assert_eq!(empty.file_type, None);
+
+        let whitespace = GrepArgs::parse(
+            &json!({"pattern": "needle", "glob": " ", "type": " "}),
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(whitespace.glob.as_deref(), Some(" "));
+        assert_eq!(whitespace.file_type.as_deref(), Some(" "));
+    }
+
+    #[tokio::test]
+    async fn empty_grep_filters_match_omitted_filters() {
+        let t = Tree::new(
+            "empty-filter",
+            &[
+                ("a.rs", "needle\n"),
+                ("b.py", "needle\n"),
+                ("c.txt", "needle\n"),
+            ],
+        );
+        let unfiltered = grep(json!({"pattern": "needle", "path": t.path()}))
+            .await
+            .unwrap();
+        let empty_glob = grep(json!({"pattern": "needle", "path": t.path(), "glob": ""}))
+            .await
+            .unwrap();
+        let empty_type = grep(json!({"pattern": "needle", "path": t.path(), "type": ""}))
+            .await
+            .unwrap();
+
+        assert_eq!(empty_glob, unfiltered);
+        assert_eq!(empty_type, unfiltered);
     }
 
     #[tokio::test]

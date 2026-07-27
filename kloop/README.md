@@ -732,7 +732,9 @@ the approval gate and join concurrent tool batches. Shapes follow cc's
 Grep/Glob:
 
 - **grep**: `pattern` (Rust regex) plus `path`, `glob`, `type` filters;
-  `output_mode` = `files_with_matches` (default, newest-first) | `content`
+  empty JSON strings for `glob`/`type` mean “filter omitted” (whitespace is
+  not trimmed); `output_mode` = `files_with_matches` (default,
+  newest-first) | `content`
   (`path:line:text`, `-n`/`-A`/`-B`/`-C` supported) | `count`; `-i`,
   `multiline`, and `head_limit`/`offset` paging (default 250). Honors
   .gitignore, searches hidden files, never descends into VCS dirs, skips
