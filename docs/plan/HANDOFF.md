@@ -10,6 +10,11 @@
 
 ## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–47 已完成)
 
+> **Plan 48 已立项、尚未执行**:`48-claude-code-2.1.220-tool-parity.md` 将目标固定为
+> Claude Code 2.1.220,先建立 exact-bundle 静态证据、隔离黑盒 fixture 与机器可读 parity
+> matrix,再按 Plan 49–59 分行为簇实现。当前完成状态仍止于 Plan 47;在 Plan 48 基线闭环前不得
+> 宣称“全工具已对齐”或“可替换 Claude Code”。
+
 **结构**:Cargo workspace,九 crate,到 core 为止严格单链,其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
 

@@ -10,6 +10,46 @@ kloop 设计时对比研究过三个代码库。本文件是关于"别人代码"
 | **claude-code(逆向 TS 版)** | `~/work/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
 | **claw-code** | `./claw-code/`(本地拷贝,已删 target/) | **不可作底座**(见结论 3)。仅三样值得抄:① `rust/crates/mock-anthropic-service` + `rusty-claude-cli/tests/output_format_contract.rs` 的 mock 契约测试纪律;② `rust/crates/api/src/providers/openai_compat.rs` 的 tool_calls 流式翻译状态机;③ `rust/crates/runtime/src/compact.rs:129-166` 的压缩边界回退(不切开 tool_use/tool_result 对) |
 
+## Claude Code 2.1.220 工具对齐基线(2026-07-27)
+
+Plan 48 将工具对齐目标钉死在本机精确二进制,不再拿滚动产品文档或旧逆向源码补实现:
+
+- `~/.local/bin/claude` 指向
+  `~/.local/share/claude/versions/2.1.220`;
+- `claude --version` 为 `2.1.220 (Claude Code)`,文件大小 `<redacted>` bytes,
+  SHA-256 为 `<redacted>`;
+- Mach-O 内 bundle 元数据(byte `<redacted>` 附近)记录构建时间
+  `2026-07-24T22:17:45Z` 与 commit
+  `<redacted>`;
+- bundle 中统一工具适配器有 66 个 `$i({` 构造点,公共接口覆盖
+  name/aliases/schema/enabled/concurrency/read-only/open-world/permission/call/render/result mapping;
+  最终工具数组受 feature、平台、入口、权限档、plan/worktree/team/remote、MCP/defer/depth
+  条件过滤,不是静态全量表。
+
+已定位的 2.1.220 静态锚点:别名归一化 byte `<redacted>`;默认工具能力位
+`<redacted>`;Glob `<redacted>`;ToolSearch `<redacted>`;ExitPlanMode `<redacted>`;
+WebFetch `<redacted>`;Agent `<redacted>`;Bash `<redacted>`;Notebook/Edit stale-read 稳定串
+`<redacted>`。这些只是静态入口,没有走完 schema→parser→executor→permission/concurrency→
+output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
+
+本轮也重新固定了三个架构参考的快照:
+
+- `~/work/claude-code` commit `<redacted>`;
+- `refs/codex` commit
+  `bb21ed4b8d8f74567cd6fecb3c7d4fba795bc6e3`;
+- `refs/claw-code` commit `4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d`。
+
+回源交叉核对的收敛点:工具计划/条件注册与执行分发分层;编辑前保存并校验文件读取状态;
+并发能力按调用事实判定而非把所有工具一刀切;worktree 是带创建、持久化、清理决策的会话资源。
+反面教材:claw 的裸 PID 后台 shell 没有输出/回灌生命周期,进程内 Task registry 不是真 agent
+调度,字符串包含打分的 ToolSearch 也不能当目标语义。codex 的持久 exec/write_stdin 可借架构,
+但其静态 parallel flag 不能替代 cc/kloop 的按入参动态并发。
+
+**裁决边界**:三个参考库只解释独立收敛、分歧和移植成本;公开文档只帮助设计 probe。当前
+工具的注册条件、schema、空值/默认、权限层序、截断、后台通知和状态机最终只由精确 2.1.220
+bundle + 隔离黑盒 fixture 裁决。完整矩阵、fixture 方法和 Plan 49–59 拆分见
+`docs/plan/48-claude-code-2.1.220-tool-parity.md`。
+
 ## 调研结论(三轮调研的浓缩)
 
 1. **codex**:地基最硬——分层循环(任务→主循环→provider 故障转移→请求重试→流消费,各一层)、append-only 历史硬规则、多模型工具画像(model_info 按模型切工具形态)、unified exec 持久 shell 会话。弱在:上下文耐力(门控全部基于已测量用量,无 predictive;此缺口 2026-07 已在其 fork 上试补过一轮,见下"预演记录")、恢复语义少、工具默认不并行、shell 万能导致权限粒度粗。
