@@ -6,6 +6,8 @@
 >
 > 调研对象：<https://github.com/Hmbown/CodeWhale>
 >
+> 本地参考库：`refs/codewhale`（独立 Git 克隆，由根 `.gitignore` 排除）
+>
 > 固定快照：`b494236312ef3ac36489c83706a0b11ab73935a1`（2026-07-26）
 >
 > 用途：供后续新会话讨论下一步规划。本文是规划输入，不代表任何候选项已经拍板。
@@ -37,12 +39,12 @@ CodeWhale 最值得 kloop 借鉴的不是功能数量，而是四类控制面机
 
 本轮采用只读源码审计：
 
-- 克隆位置：`/tmp/codewhale-review-20260727`；
+- 克隆位置：`refs/codewhale`（调研后从临时目录移入，保持独立 Git 元数据）；
 - 固定提交：`b494236312ef3ac36489c83706a0b11ab73935a1`；
 - 阅读 Rust workspace、npm runtime SDK、Web、VS Code extension、CI 和测试；
 - 对照 kloop 当前 core/provider/server/rollout/tools/permissions/hooks/context/subagent/MCP/Skills；
 - 没有构建、运行、测试或安装 CodeWhale；
-- 没有修改 CodeWhale、三个参考库或 kloop 产品代码。
+- 没有修改 CodeWhale 源码、其他参考库或 kloop 产品代码。
 
 因此本文区分：
 
@@ -57,11 +59,11 @@ CodeWhale 最值得 kloop 借鉴的不是功能数量，而是四类控制面机
 
 CodeWhale 是入口很宽的本地 agent 平台。workspace 约 19 个 Rust crate，另有 npm SDK、Web、VS Code 和聊天桥。
 
-真正的 live runtime 仍主要位于 `crates/tui`。仓库自己的架构文档也承认 crate 拆分尚未形成唯一真相：
+真正的 live runtime 仍主要位于 `refs/codewhale/crates/tui`。仓库自己的架构文档也承认 crate 拆分尚未形成唯一真相：
 
-- `docs/ARCHITECTURE.md:4-13`
-- `crates/tui/src/core/engine.rs:552-568`
-- `crates/tui/src/core/engine/turn_loop.rs:362-2213`
+- `refs/codewhale/docs/ARCHITECTURE.md:4-13`
+- `refs/codewhale/crates/tui/src/core/engine.rs:552-568`
+- `refs/codewhale/crates/tui/src/core/engine/turn_loop.rs:362-2213`
 
 生产主路径可概括为：
 
@@ -74,9 +76,9 @@ TUI Engine
 
 对应位置：
 
-- `crates/tui/src/runtime_threads.rs:1417-1485`
-- `crates/tui/src/runtime_api.rs:2181-2598`
-- `crates/protocol/src/runtime/mod.rs:6-48`
+- `refs/codewhale/crates/tui/src/runtime_threads.rs:1417-1485`
+- `refs/codewhale/crates/tui/src/runtime_api.rs:2181-2598`
+- `refs/codewhale/crates/protocol/src/runtime/mod.rs:6-48`
 
 其他入口主要是兼容包装：
 
@@ -86,8 +88,8 @@ TUI Engine
 
 关键位置：
 
-- `crates/app-server/src/lib.rs:979-1206`
-- `crates/app-server/src/chat_completions.rs:302-363`
+- `refs/codewhale/crates/app-server/src/lib.rs:979-1206`
+- `refs/codewhale/crates/app-server/src/chat_completions.rs:302-363`
 
 这套结构证明 CodeWhale 有较完整的 runtime 控制面，也暴露了所有权没有完全收敛的问题：核心 loop、provider client、runtime、persistence、MCP 和大量工具仍聚集在 TUI crate。
 
@@ -103,9 +105,9 @@ CodeWhale 的 provider identity 很多，但底层只有三类 wire：
 
 位置：
 
-- `crates/config/src/provider_kind.rs:11-232`
-- `crates/config/src/provider.rs:32-42`
-- `crates/tui/src/client.rs:2080-2141`
+- `refs/codewhale/crates/config/src/provider_kind.rs:11-232`
+- `refs/codewhale/crates/config/src/provider.rs:32-42`
+- `refs/codewhale/crates/tui/src/client.rs:2080-2141`
 
 这一点与 kloop 当前三 adapter 结构一致。kloop 已有成熟 translation，不应重写：
 
@@ -126,11 +128,11 @@ CodeWhale 值得借鉴的是 guard 组合：
 
 位置：
 
-- `crates/tui/src/client/stream_entry.rs:17-163`
-- `crates/tui/src/core/engine/turn_loop.rs:700-1219`
-- `crates/tui/src/client/chat.rs:707-887`
-- `crates/tui/src/client/responses.rs:182-411`
-- `crates/tui/src/client/anthropic.rs:215-277`
+- `refs/codewhale/crates/tui/src/client/stream_entry.rs:17-163`
+- `refs/codewhale/crates/tui/src/core/engine/turn_loop.rs:700-1219`
+- `refs/codewhale/crates/tui/src/client/chat.rs:707-887`
+- `refs/codewhale/crates/tui/src/client/responses.rs:182-411`
+- `refs/codewhale/crates/tui/src/client/anthropic.rs:215-277`
 
 但不能直接复制其终态语义：
 
@@ -163,17 +165,17 @@ CodeWhale 明确区分：
 
 位置：
 
-- `crates/config/src/route/resolver.rs:42-263`
-- `crates/config/src/route/candidate.rs:181-325`
-- `crates/config/src/catalog.rs:603-664`
+- `refs/codewhale/crates/config/src/route/resolver.rs:42-263`
+- `refs/codewhale/crates/config/src/route/candidate.rs:181-325`
+- `refs/codewhale/crates/config/src/catalog.rs:603-664`
 
 好的约束是：不从 prompt 或 model prefix 猜 provider。
 
 但其 live catalog 尚未完整接入生产 route runtime；core 与 TUI 也有重复 provider config schema：
 
-- `crates/tui/src/route_runtime.rs:194-245`
-- `crates/config/src/lib.rs:95-138`
-- `crates/tui/src/config.rs:2728-2940`
+- `refs/codewhale/crates/tui/src/route_runtime.rs:194-245`
+- `refs/codewhale/crates/config/src/lib.rs:95-138`
+- `refs/codewhale/crates/tui/src/config.rs:2728-2940`
 
 kloop 可借鉴 capability metadata，例如：
 
@@ -199,7 +201,7 @@ payload
 extra
 ```
 
-位置：`crates/protocol/src/runtime/mod.rs:6-48`。
+位置：`refs/codewhale/crates/protocol/src/runtime/mod.rs:6-48`。
 
 其 HTTP/SSE runtime 支持：
 
@@ -208,7 +210,7 @@ extra
 - replay/live `seq` 去重；
 - broadcast lag 后回 durable log 补洞。
 
-位置：`crates/tui/src/runtime_api.rs:2181-2325`。
+位置：`refs/codewhale/crates/tui/src/runtime_api.rs:2181-2325`。
 
 kloop 当前 canonical JSON-RPC item protocol 已经更适合作为唯一协议所有权，但 event 没有稳定 replay cursor：
 
@@ -229,12 +231,12 @@ kloop 当前 canonical JSON-RPC item protocol 已经更适合作为唯一协议�
 
 CodeWhale 的 tool registry 会校验 payload kind、mutating 属性、per-tool timeout，并在调度前做无副作用 preparation：
 
-- `crates/tools/src/lib.rs:224-523`
-- `crates/tui/src/core/engine/tool_preparation.rs:26-159`
+- `refs/codewhale/crates/tools/src/lib.rs:224-523`
+- `refs/codewhale/crates/tui/src/core/engine/tool_preparation.rs:26-159`
 
 prepared call 可声明资源，再由 conflict-aware scheduler 决定并发：
 
-- `crates/tui/src/core/engine/dispatch.rs:528-619`
+- `refs/codewhale/crates/tui/src/core/engine/dispatch.rs:528-619`
 
 machine-readable outcome 区分：
 
@@ -245,7 +247,7 @@ machine-readable outcome 区分：
 - `Cancelled`
 - `TimedOut`
 
-位置：`crates/tools/src/outcome.rs:10-110`。
+位置：`refs/codewhale/crates/tools/src/outcome.rs:10-110`。
 
 kloop 当前用 `is_concurrency_safe` 做安全布尔分类，结构简单且已形成稳定主链：
 
@@ -283,8 +285,8 @@ CodeWhale execpolicy 的可借鉴点：
 
 位置：
 
-- `crates/execpolicy/src/lib.rs:75-123,423-745`
-- `crates/execpolicy/src/bash_arity.rs:293-377`
+- `refs/codewhale/crates/execpolicy/src/lib.rs:75-123,423-745`
+- `refs/codewhale/crates/execpolicy/src/bash_arity.rs:293-377`
 
 例如 `git status` 的 flag 可以匹配，但同一宽规则不会误放 `git push`。
 
@@ -297,7 +299,7 @@ updatedInput
 additionalContext
 ```
 
-位置：`crates/tui/src/hooks/executor.rs:283-365`。
+位置：`refs/codewhale/crates/tui/src/hooks/executor.rs:283-365`。
 
 若 hook 修改 input，CodeWhale 会重新 preparation。这个约束值得吸收。
 
@@ -336,8 +338,8 @@ CodeWhale 的 instruction discovery 会：
 
 位置：
 
-- `crates/tui/src/project_context.rs:24-91,1269-1419`
-- `crates/tui/src/project_context_cache.rs:15-124`
+- `refs/codewhale/crates/tui/src/project_context.rs:24-91,1269-1419`
+- `refs/codewhale/crates/tui/src/project_context_cache.rs:15-124`
 
 kloop 已有 instruction layering、import 和 project boundary：
 
@@ -366,8 +368,8 @@ CodeWhale session snapshot 使用 temp + fsync + rename，并有 async persisten
 
 位置：
 
-- `crates/tui/src/session_manager.rs:250-730`
-- `crates/tui/src/tui/persistence_actor.rs:14-332`
+- `refs/codewhale/crates/tui/src/session_manager.rs:250-730`
+- `refs/codewhale/crates/tui/src/tui/persistence_actor.rs:14-332`
 
 kloop 的 append-only rollout 更适合作为 source of truth：
 
@@ -391,11 +393,11 @@ async persistence worker、queued input 和 checkpoint 可后续单独规划，�
 
 CodeWhale 的进程内 subagent 主路径较成熟，但实现集中在约 1.2 万行的单文件：
 
-- `crates/tui/src/tools/subagent/mod.rs`
+- `refs/codewhale/crates/tui/src/tools/subagent/mod.rs`
 
 真实执行模型是同进程 Tokio background task，不是独立进程：
 
-- `crates/tui/src/tools/subagent/mod.rs:5139-5162`
+- `refs/codewhale/crates/tui/src/tools/subagent/mod.rs:5139-5162`
 
 已有能力包括：
 
@@ -444,12 +446,12 @@ CodeWhale Fleet 真正成熟的是：
 
 位置：
 
-- `crates/tui/src/fleet/executor.rs:178-250`
-- `crates/tui/src/fleet/host.rs:570-640`
+- `refs/codewhale/crates/tui/src/fleet/executor.rs:178-250`
+- `refs/codewhale/crates/tui/src/fleet/host.rs:570-640`
 
 但 Docker backend 未接通：
 
-- `crates/tui/src/fleet/executor.rs:565-569`
+- `refs/codewhale/crates/tui/src/fleet/executor.rs:565-569`
 
 host/task concurrency、worker capacity、token/tool/time budget、environment requirement、alert delivery 等多个字段只解析、写 manifest 或出现在局部测试调度器，没有完整进入生产 worker 主循环。
 
@@ -460,15 +462,15 @@ host/task concurrency、worker capacity、token/tool/time budget、environment r
 CodeWhale 实际存在三套并列 MCP 面：
 
 1. TUI 自建异步 MCP client/pool；
-2. `crates/mcp` 同步 stdio 聚合器；
+2. `refs/codewhale/crates/mcp` 同步 stdio 聚合器；
 3. `mcp_server.rs` 将 CodeWhale 暴露为 MCP server。
 
 主路径位置：
 
-- `crates/tui/src/mcp.rs:1191-1215`
-- `crates/tui/src/mcp/oauth.rs`
-- `crates/mcp/src/lib.rs`
-- `crates/tui/src/mcp_server.rs`
+- `refs/codewhale/crates/tui/src/mcp.rs:1191-1215`
+- `refs/codewhale/crates/tui/src/mcp/oauth.rs`
+- `refs/codewhale/crates/mcp/src/lib.rs`
+- `refs/codewhale/crates/tui/src/mcp_server.rs`
 
 值得借鉴：
 
@@ -479,14 +481,14 @@ CodeWhale 实际存在三套并列 MCP 面：
 - OAuth；
 - catalog refresh。
 
-位置：`crates/tui/src/mcp.rs:2012-2286`。
+位置：`refs/codewhale/crates/tui/src/mcp.rs:2012-2286`。
 
 两个重要警示：
 
 1. stale-session 无条件重放 `tools/call`，对非幂等工具可能产生重复副作用：
-   `crates/tui/src/mcp.rs:1474-1490,3555-3581`；
-2. `crates/mcp::ToolFilter` 只过滤 `tools/list`，已知工具名仍可直接 `tools/call`，不能当作授权边界：
-   `crates/mcp/src/lib.rs:322-373,466-474`。
+   `refs/codewhale/crates/tui/src/mcp.rs:1474-1490,3555-3581`；
+2. `refs/codewhale/crates/mcp` 的 `ToolFilter` 只过滤 `tools/list`，已知工具名仍可直接 `tools/call`，不能当作授权边界：
+   `refs/codewhale/crates/mcp/src/lib.rs:322-373,466-474`。
 
 kloop 应坚持：
 
@@ -508,7 +510,7 @@ CodeWhale Skills 的可借鉴点：
 - catalog prompt budget；
 - plugin trust。
 
-位置：`crates/tui/src/skills/mod.rs:58-355,602-973,1091-1244`。
+位置：`refs/codewhale/crates/tui/src/skills/mod.rs:58-355,602-973,1091-1244`。
 
 kloop Skills 基础已扎实，不应整体替换。后续可以独立评估：
 
@@ -527,23 +529,23 @@ CodeWhale loopback Web bootstrap 做得稳健：
 - `no-store`；
 - `nosniff`。
 
-位置：`crates/tui/src/runtime_api/web.rs:23-153`。
+位置：`refs/codewhale/crates/tui/src/runtime_api/web.rs:23-153`。
 
 这适合未来只读本地 Web UI，但远程 runtime 文档明确没有 TLS 和多用户隔离，只适用于可信 LAN/VPN：
 
-- `docs/RUNTIME_API.md:698-716`
+- `refs/codewhale/docs/RUNTIME_API.md:698-716`
 
 VS Code extension 自称 scaffold，当前主要是 runtime attach、health/status 和 terminal launch：
 
-- `extensions/vscode/package.json:1-4`
-- `extensions/vscode/src/runtime.ts:41-150`
+- `refs/codewhale/extensions/vscode/package.json:1-4`
+- `refs/codewhale/extensions/vscode/src/runtime.ts:41-150`
 
 其他未完成或不一致表面：
 
-- remote setup `--apply` 未实现：`crates/tui/src/remote_setup/mod.rs:1-6`；
-- VM/CI lane runtime 为 stub：`crates/lane/src/runtime.rs:1039-1080`；
+- remote setup `--apply` 未实现：`refs/codewhale/crates/tui/src/remote_setup/mod.rs:1-6`；
+- VM/CI lane runtime 为 stub：`refs/codewhale/crates/lane/src/runtime.rs:1039-1080`；
 - npm SDK 暴露 Fleet create/events，但 Rust server 没有对应 route：
-  `npm/runtime-sdk/index.js:31-97`、`crates/tui/src/runtime_api.rs:604-635`。
+  `refs/codewhale/npm/runtime-sdk/index.js:31-97`、`refs/codewhale/crates/tui/src/runtime_api.rs:604-635`。
 
 因此不能根据入口名称把 CodeWhale 评价成已经完成的 Web/IDE/remote/Fleet 全平台 agent。
 
@@ -573,8 +575,8 @@ VS Code extension 自称 scaffold，当前主要是 runtime attach、health/stat
 
 CI 位置：
 
-- `.github/workflows/ci.yml:311-373`
-- `.github/workflows/release.yml:110-165`
+- `refs/codewhale/.github/workflows/ci.yml:311-373`
+- `refs/codewhale/.github/workflows/release.yml:110-165`
 
 可借鉴的是 Wiremock、PTY、TCP、subprocess contract test 的组合，不是测试数量本身。
 
@@ -711,25 +713,37 @@ provider open/read guards
 CodeWhale 快照可能更新，开工前应重新确认目标 commit。优先回看：
 
 - streaming：
-  `crates/tui/src/core/engine/turn_loop.rs`、`crates/tui/src/client/stream_entry.rs`、
-  `chat.rs`、`responses.rs`、`anthropic.rs`；
+  `refs/codewhale/crates/tui/src/core/engine/turn_loop.rs`、
+  `refs/codewhale/crates/tui/src/client/stream_entry.rs`、
+  `refs/codewhale/crates/tui/src/client/chat.rs`、
+  `refs/codewhale/crates/tui/src/client/responses.rs`、
+  `refs/codewhale/crates/tui/src/client/anthropic.rs`；
 - runtime：
-  `crates/tui/src/runtime_api.rs`、`runtime_threads.rs`、
-  `crates/protocol/src/runtime/mod.rs`；
+  `refs/codewhale/crates/tui/src/runtime_api.rs`、
+  `refs/codewhale/crates/tui/src/runtime_threads.rs`、
+  `refs/codewhale/crates/protocol/src/runtime/mod.rs`；
 - tools/permission/hooks：
-  `crates/tools/src/lib.rs`、`outcome.rs`、`crates/execpolicy/src/lib.rs`、
-  `bash_arity.rs`、`crates/tui/src/core/engine/tool_preparation.rs`、
-  `dispatch.rs`、`hooks/executor.rs`；
+  `refs/codewhale/crates/tools/src/lib.rs`、`refs/codewhale/crates/tools/src/outcome.rs`、
+  `refs/codewhale/crates/execpolicy/src/lib.rs`、
+  `refs/codewhale/crates/execpolicy/src/bash_arity.rs`、
+  `refs/codewhale/crates/tui/src/core/engine/tool_preparation.rs`、
+  `refs/codewhale/crates/tui/src/core/engine/dispatch.rs`、
+  `refs/codewhale/crates/tui/src/hooks/executor.rs`；
 - context/persistence：
-  `project_context.rs`、`project_context_cache.rs`、`session_manager.rs`、
-  `tui/persistence_actor.rs`；
+  `refs/codewhale/crates/tui/src/project_context.rs`、
+  `refs/codewhale/crates/tui/src/project_context_cache.rs`、
+  `refs/codewhale/crates/tui/src/session_manager.rs`、
+  `refs/codewhale/crates/tui/src/tui/persistence_actor.rs`；
 - subagent/Fleet：
-  `tools/subagent/mod.rs`、`fleet/executor.rs`、`fleet/host.rs`；
+  `refs/codewhale/crates/tui/src/tools/subagent/mod.rs`、
+  `refs/codewhale/crates/tui/src/fleet/executor.rs`、
+  `refs/codewhale/crates/tui/src/fleet/host.rs`；
 - MCP/Skills：
-  `tui/src/mcp.rs`、`crates/mcp/src/lib.rs`、`tui/src/mcp_server.rs`、
-  `tui/src/skills/mod.rs`；
+  `refs/codewhale/crates/tui/src/mcp.rs`、`refs/codewhale/crates/mcp/src/lib.rs`、
+  `refs/codewhale/crates/tui/src/mcp_server.rs`、`refs/codewhale/crates/tui/src/skills/mod.rs`；
 - product/test：
-  `runtime_api/web.rs`、`extensions/vscode`、`npm/runtime-sdk`、`.github/workflows`。
+  `refs/codewhale/crates/tui/src/runtime_api/web.rs`、`refs/codewhale/extensions/vscode`、
+  `refs/codewhale/npm/runtime-sdk`、`refs/codewhale/.github/workflows`。
 
 kloop 对照入口：
 
@@ -754,16 +768,20 @@ kloop 对照入口：
 - CodeWhale 只提供设计证据，不自动成为 kloop 契约；
 - 当前 CodeWhale commit 以本文固定值为准，若更新必须记录新 commit 和差异；
 - Claude Code 当前行为查精确二进制 fixture 或官方文档，不能用过时本地快照推断；
-- codex、Claude Code、claw-code 只读，不在其上开发或推送；
+- codex、Claude Code、claw-code、CodeWhale 只读，不在其上开发或推送；
 - 先固定 kloop 自己的不变量，再选择实现。
 
 ## 九、本轮完成记录 ✅
 
 - 已完成 CodeWhale 固定提交的只读源码审计和 kloop 机制对照。
+- 固定源码已从临时目录移入 `refs/codewhale`；该独立 Git 克隆由根 `.gitignore` 排除，
+  不随 kloop 提交，也不得在其中开发或推送。
 - 已区分生产主路径、兼容层、局部接线、stub/scaffold 和未完成能力。
 - 已记录近期候选、窄原型、产品后置项与明确不建议项。
 - 未构建或运行 CodeWhale，未修改任何产品行为，未执行真实 API 验收。
-- 验证：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-  `cargo test --workspace`、`cargo run -p kloop -- --mock`、`git diff --check` 全绿。
-- 提交：本次（plan 60，见 git log）。
+- 验证：`git -C refs/codewhale rev-parse HEAD`、remote/clean-worktree/`check-ignore` 校验、
+  文档内 `refs/codewhale` 路径存在性检查、`cargo fmt --all --check`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、
+  `cargo run -p kloop -- --mock`、`git diff --check` 全绿。
+- 初始调研提交：`e2926e8`；参考副本落位与文档更新为本次提交（见 git log）。
 - 下一步未拍板；新会话应从第七节开始讨论。

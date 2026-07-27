@@ -1,6 +1,6 @@
 # refs — 参考资料与调研结论
 
-kloop 设计时对比研究过三个代码库。本文件是关于"别人代码"的全部知识:导读 + 调研结论 + 可移植设计参考。项目自身的状态与教训见 docs/plan/HANDOFF.md。
+kloop 设计时对比研究过四个代码库。本文件是关于"别人代码"的全部知识:导读 + 调研结论 + 可移植设计参考。项目自身的状态与教训见 docs/plan/HANDOFF.md。
 
 ## 导读
 
@@ -8,7 +8,40 @@ kloop 设计时对比研究过三个代码库。本文件是关于"别人代码"
 |---|---|---|
 | **codex** | `refs/codex` | codex 生产级 fork。分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`tools/parallel.rs`;压缩全家桶:`compact*.rs`、`fork_proactive_trim.rs`;会话落盘:`rollout/`;扩展范式:`ext/worktree`;集成测试:`core/tests/suite`(mock SSE + wiremock 范式) |
 | **claude-code(逆向 TS 版)** | `~/work/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
-| **claw-code** | `./claw-code/`(本地拷贝,已删 target/) | **不可作底座**(见结论 3)。仅三样值得抄:① `rust/crates/mock-anthropic-service` + `rusty-claude-cli/tests/output_format_contract.rs` 的 mock 契约测试纪律;② `rust/crates/api/src/providers/openai_compat.rs` 的 tool_calls 流式翻译状态机;③ `rust/crates/runtime/src/compact.rs:129-166` 的压缩边界回退(不切开 tool_use/tool_result 对) |
+| **claw-code** | `./claw-code/`(本地克隆,已删 target/) | **不可作底座**(见结论 3)。仅三样值得抄:① `rust/crates/mock-anthropic-service` + `rusty-claude-cli/tests/output_format_contract.rs` 的 mock 契约测试纪律;② `rust/crates/api/src/providers/openai_compat.rs` 的 tool_calls 流式翻译状态机;③ `rust/crates/runtime/src/compact.rs:129-166` 的压缩边界回退(不切开 tool_use/tool_result 对) |
+| **CodeWhale** | `./codewhale/`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
+
+`./claw-code/` 与 `./codewhale/` 都由根 `.gitignore` 排除，只作为本机只读参考，不随 kloop 提交；不得在其中开发或推送。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
+
+## CodeWhale 固定源码审计(2026-07-27)
+
+本地参考库固定为：
+
+- remote：`https://github.com/Hmbown/CodeWhale.git`；
+- path：`refs/codewhale`；
+- commit：`b494236312ef3ac36489c83706a0b11ab73935a1`（2026-07-26）；
+- 用法：只读回源；若要更新，必须先记录新 commit 并审查差异，不能让滚动 HEAD 悄悄改变既有结论。
+
+源码确认的生产主路径是 `refs/codewhale/crates/tui` 内的 Engine → `RuntimeThreadManager` →
+`/v1/threads/*` HTTP/SSE → durable JSONL events；`/v1/stream`、stdio app-server 和 legacy chat
+completions 主要是兼容包装。CodeWhale 约 36 个 provider identity 最终归入 Chat Completions、
+Responses、Anthropic Messages 三类 wire，真正值得 kloop 吸收的是 guard/replay/边界治理，不是 provider
+名称数量。
+
+近期候选优先级：
+
+1. provider header/chunk-idle/wall/content guard 与 partial-output retry safety；
+2. instruction/import 的 symlink、非普通文件和 `O_NOFOLLOW` 防护；
+3. append-only rollout 的 turn-terminal/compaction/fork boundary `sync_data`；
+4. canonical protocol additive event `seq`，再逐步接 durable replay。
+
+明确不抄：单 JSON snapshot 替换 rollout、巨型 `turn_loop.rs`/subagent 单文件、多套
+Runtime/legacy/app-server 或 MCP 所有权、非幂等 stale-session 自动重放，以及同时铺 Web/IDE/Fleet/
+remote/mobile。CodeWhale 的 subagent 是同进程 Tokio task；共享 token budget 不是严格预留总账，stale
+cleanup 是机会式触发，checkpoint receipt 也不等于 Interrupted worker 已可原地恢复。Fleet 成熟的是
+外进程/SSH、ledger 和 generation fencing，Docker 与多项 budget/scheduling 字段未完整接入生产链。
+
+完整证据位置、kloop 对照入口、测试/CI 边界与下一会话拍板顺序见 Plan 60；本节只作导读，不代替该文档。
 
 ## Claude Code 2.1.220 工具对齐基线(2026-07-27)
 
@@ -45,7 +78,7 @@ output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 调度,字符串包含打分的 ToolSearch 也不能当目标语义。codex 的持久 exec/write_stdin 可借架构,
 但其静态 parallel flag 不能替代 cc/kloop 的按入参动态并发。
 
-**裁决边界**:三个参考库只解释独立收敛、分歧和移植成本;公开文档只帮助设计 probe。当前
+**裁决边界**:上述三个 Claude Code 对齐架构参考库只解释独立收敛、分歧和移植成本;公开文档只帮助设计 probe。当前
 工具的注册条件、schema、空值/默认、权限层序、截断、后台通知和状态机最终只由精确 2.1.220
 bundle + 隔离黑盒 fixture 裁决。
 
