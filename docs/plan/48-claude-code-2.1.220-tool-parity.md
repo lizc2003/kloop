@@ -294,3 +294,38 @@ Plan 48 不做：
 - `cargo run -p kloop -- --mock`
 - `git diff --check`
 - 一次提交。
+
+## 完成记录 ✅（2026-07-27）
+
+- 目标身份已固定并由采集器/校验器双重守卫：`2.1.220 (Claude Code)`、
+  `<redacted>` bytes、SHA-256
+  `<redacted>`；二进制未入仓。
+- hermetic collector 已落地 6 个完整条件 profile 和 38 组 raw/normalized captures。采集环境从
+  白名单构造，使用临时 HOME/config/cwd、本地 fake provider/Web/MCP，禁 telemetry/updater/error
+  reporting，公网代理指向不可用 loopback；clean determinism pair 的 normalized bytes 完全相同。
+- 六个 anchor 已建立纵向黑盒证据：Glob 的输入/排序/100 上限与截断；ToolSearch 的强制 defer、
+  `select:`/关键词/坏输入和 MCP `tools/list_changed` 100→101 刷新；ExitPlanMode 的 outside/headless
+  与独立 PTY approve/reject/cancel；WebFetch parser 与 domain-safety 顺序负证据；Agent 本地子请求/
+  结果生命周期；Bash 前台、失败、timeout、后台完成通知和默认权限拒绝。
+- PTY 驱动固定 30×100 窗口、响应 CPR、保存原始 transcript 与脚本，并在 approve/reject/cancel
+  后清理整个进程组。reject 采用分步按键，避免 Ink 状态更新竞态；无遗留 Claude 进程。
+- `manifest.json` 登记全部 capture 的命令、条件、raw/normalized hash、return code、signal、规则集
+  和 determinism group；normalization 只处理临时根/目标路径/结构化发现的随机 ID、时间、PID 和
+  loopback port，不改工具顺序、schema、权限结论、错误文案或 lifecycle。
+- `static-evidence.jsonl` 共 46 条固定 locator；`tool-matrix.json` 由 byte-deterministic 的
+  `build_matrix.py` 生成 43 行并引用全部 38 fixtures。当前 344 个维度单元为：47
+  `compatible`、43 `intentional-diff`、20 `missing`、215 `unknown`、19 `n/a`、0 `same`。
+  `run_program`、`read_offloaded`、`call_tool` 作为 kloop-only 单列；所有未决项映射 Plan 49–59。
+- WebFetch 的本地成功/redirect/auth/error/large cases 在 2.1.220 domain-safety 层先返回
+  `Unable to verify if domain 127.0.0.1 is safe to fetch.`，local Web stub 请求数严格为 0；因此这些
+  fixture 只裁决权限顺序，executor/redirect/auth/large-body 仍保守标 `unknown`，没有伪造成功面。
+- `verify.py` 已 fail-closed 校验 identity、profile/case/file exact set、hash、raw→normalized 重算、
+  determinism、环境/本地网络、PTY 三分支、ToolSearch/Agent/Bash lifecycle、Web 期望、静态 locator、
+  matrix 证据门和敏感信息；`python3 -B refs/claude-code-2.1.220/verify.py` 全绿。
+- 本轮只新增基线、fixture、matrix、verifier 与文档；没有修改 kloop 工具、权限、TUI 或原生协议
+  产品行为。Plan 49–59 尚未执行，本记录不表示“全工具已对齐”或“可替换 Claude Code”。
+- 验证：`python3 -B refs/claude-code-2.1.220/collect.py identity`、`collect.py list`、完整 38-case
+  `collect.py collect --all`、`verify.py`、`cargo fmt --all --check`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、
+  `cargo run -p kloop -- --mock`、`git diff --check` 全绿。
+- 提交：本次（plan 48，见 git log）。

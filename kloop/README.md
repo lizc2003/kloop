@@ -27,6 +27,19 @@ clock-nanosecond jitter, no `rand` dependency), `CancellationToken`
 interruption, and orphan patching — on interrupt every unanswered `tool_use`
 gets an `is_error` `tool_result` so history stays legal.
 
+## Claude Code 2.1.220 parity baseline
+
+Plan 48 pins the comparison target to one exact Claude Code 2.1.220 binary and
+commits auditable raw/normalized fixtures, static evidence, and a machine-readable
+per-dimension matrix under [`../refs/claude-code-2.1.220/`](../refs/claude-code-2.1.220/).
+The methodology, current counts, replay commands, and Plan 49–59 follow-up map
+are documented in [`../refs/README.md`](../refs/README.md) and
+[`../docs/plan/48-claude-code-2.1.220-tool-parity.md`](../docs/plan/48-claude-code-2.1.220-tool-parity.md).
+
+This baseline is evidence and a roadmap, not a claim that all tools already
+match or that kloop can replace Claude Code. Product-level gaps and unknowns
+remain for Plans 49–59; kloop-only capabilities stay intentionally separate.
+
 ## Compaction (Phase 2, first slice)
 
 Two complementary defenses keep long sessions inside the context window

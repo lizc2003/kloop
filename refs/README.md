@@ -47,8 +47,38 @@ output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 
 **裁决边界**:三个参考库只解释独立收敛、分歧和移植成本;公开文档只帮助设计 probe。当前
 工具的注册条件、schema、空值/默认、权限层序、截断、后台通知和状态机最终只由精确 2.1.220
-bundle + 隔离黑盒 fixture 裁决。完整矩阵、fixture 方法和 Plan 49–59 拆分见
-`docs/plan/48-claude-code-2.1.220-tool-parity.md`。
+bundle + 隔离黑盒 fixture 裁决。
+
+Plan 48 已提交以下可重放基线:
+
+- `refs/claude-code-2.1.220/manifest.json`:6 个完整条件 profile、38 组 raw/normalized
+  capture，包含 clean determinism pair 和独立的 ExitPlanMode PTY approve/reject/cancel；
+- `static-evidence.jsonl`:46 条带 target SHA、bundle offset 或固定 commit locator 的静态证据；
+- `tool-matrix.json`:43 个“逻辑能力 + profile + 可见变体”行，逐项记录 registration→schema→
+  parser→executor→permission→concurrency→output→lifecycle；
+- `collect.py`/`verify.py`:采集前 exact identity guard，隔离 HOME/config/cwd、本地 provider/Web/MCP，
+  受限 normalization、hash/determinism、证据引用、文件集合、环境/网络和敏感信息 fail-closed 校验。
+
+当前矩阵有 47 个 `compatible`、43 个 `intentional-diff`、20 个 `missing`、215 个
+`unknown`、19 个 `n/a` 单元，**没有 `same`**。这不是漏标：`same` 必须同时有对应 CC fixture
+与锁定相同行为的 kloop golden；静态 locator、名字或相似 schema 都不够。WebFetch 本地 URL 在
+2.1.220 的 domain-safety 层先被拒、stub 收到 0 请求，因此只证明权限顺序，重定向/认证/大响应
+executor 仍为 `unknown`。ToolSearch 则已黑盒证明 `ENABLE_TOOL_SEARCH=true` 下首请求 defer、
+`select:` 引入目标 MCP schema，以及 `tools/list_changed` 后 100→101 刷新。
+
+重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
+
+```bash
+python3 -B refs/claude-code-2.1.220/collect.py identity
+python3 -B refs/claude-code-2.1.220/collect.py list
+python3 -B refs/claude-code-2.1.220/collect.py collect --all
+python3 -B refs/claude-code-2.1.220/build_matrix.py
+python3 -B refs/claude-code-2.1.220/verify.py
+```
+
+完整矩阵、fixture 方法和 Plan 49–59 拆分见
+`docs/plan/48-claude-code-2.1.220-tool-parity.md`。基线只完成事实盘点，不表示 kloop 已全工具
+对齐或可替换 Claude Code；产品行为要由 Plan 49–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

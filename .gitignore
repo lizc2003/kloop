@@ -6,9 +6,15 @@ kloop/target/
 kloop/.kloop/
 
 # reference material (local copies of other repos, not ours to version) —
-# keep only our own guide
+# keep only our own guide and the pinned Claude Code parity fixtures
 refs/*
 !refs/README.md
+!refs/claude-code-2.1.220/
+!refs/claude-code-2.1.220/**
+
+# Python fixture tooling
+__pycache__/
+*.pyc
 
 # Claude Code local state
 .claude/
