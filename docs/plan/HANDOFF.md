@@ -15,6 +15,11 @@
 > fixture、43 行机器可读 parity matrix 与 fail-closed verifier。当前矩阵没有任何 `same`；这是
 > 对证据门的保守执行，不是“全工具已对齐”。产品行为仍由 Plan 49–59 分簇实现，在其闭环前不得
 > 宣称 kloop 已可替换 Claude Code。
+>
+> **CodeWhale 调研已完成（2026-07-27）**：`60-codewhale-source-review.md` 固定审计
+> `Hmbown/CodeWhale@b494236312ef3ac36489c83706a0b11ab73935a1`，区分已接通主路径、局部实现与
+> stub，并按 A–D 记录对 kloop 的候选借鉴项。它只是后续规划输入，未修改产品行为；新会话从该文档
+> 第七节讨论，当前首推候选是 provider stream guard。
 
 **结构**:Cargo workspace,九 crate,到 core 为止严格单链,其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
