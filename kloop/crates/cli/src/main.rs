@@ -13,10 +13,10 @@ mod mcp_auth;
 mod provider_config;
 mod startup;
 mod ui;
+mod user_config;
 mod web;
 
 use std::io::Write as _;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent_type::AgentType;
 use kloop_core::history::History;
 use kloop_core::skills::Skill;
 use kloop_core::tools::tool_merge_warnings;
@@ -45,16 +44,13 @@ use crate::args::list_sessions;
 use crate::args::open_history;
 use crate::args::parse_args;
 use crate::args::CliArgs;
-use crate::provider_config::reject_provider_keys_in_project_config;
 use crate::provider_config::ResolvedProviderSettings;
 use crate::startup::build_sandbox;
 use crate::startup::config_from_settings;
-use crate::startup::defer_threshold_from_env;
-use crate::startup::load_agent_types;
 use crate::startup::load_skills;
 use crate::startup::server_config_snapshot;
 use crate::startup::server_skills_snapshot;
-use crate::startup::PROJECT_CONFIG;
+use crate::startup::RuntimeSettings;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
 
@@ -120,28 +116,28 @@ async fn main() -> Result<ExitCode> {
     if args.worktree.is_some() && (args.serve || args.mock) {
         anyhow::bail!("--worktree is not supported with --serve or --mock");
     }
-    // Provider credentials/defaults are process-global. Parse them once before
-    // any UI or server thread starts; --mock remains hermetic.
-    let provider = Arc::new(provider_config::load(args.mock)?);
-    if !args.mock {
-        reject_provider_keys_in_project_config(Path::new(PROJECT_CONFIG))?;
-    }
+    // Parse the one user config once, then resolve every process-global piece
+    // from that snapshot. --mock stays hermetic: UserConfig neither resolves
+    // HOME nor reads config/provider environment variables.
+    let user_config = user_config::UserConfig::load(args.mock)?;
+    let provider = Arc::new(provider_config::load(args.mock, user_config.table())?);
+    let runtime = Arc::new(RuntimeSettings::load(&user_config, args.mock)?);
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
-    // --mock stays hermetic: no child processes, no config reads.
+    // --mock stays hermetic: no child processes or web-key reads.
     let (tool_sources, mcp_statuses) = if args.mock {
         (Vec::new(), Vec::new())
     } else {
         let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
         // Web tools ride the same ToolSource seam, registered before MCP so
         // a colliding MCP tool name loses (and is warned about).
-        let web_cfg = web::load_web_config(Path::new(PROJECT_CONFIG))?;
+        let web_cfg = web::load_web_config(user_config.table())?;
         let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
         sources.extend(web::build_web_source(&web_cfg, &warn));
-        let servers = mcp::load_mcp_servers(Path::new(PROJECT_CONFIG))?;
-        let mcp = mcp::connect_servers(servers, &warn).await;
+        let servers = mcp::load_mcp_servers(user_config.table())?;
+        let mcp = mcp::connect_servers(servers, &warn).await?;
         sources.extend(mcp.sources);
-        for warning in tool_merge_warnings(&sources, defer_threshold_from_env()?) {
+        for warning in tool_merge_warnings(&sources, runtime.defer_threshold()) {
             warn(&warning);
         }
         (sources, mcp.statuses)
@@ -153,17 +149,14 @@ async fn main() -> Result<ExitCode> {
                 "\x1b[2m[--image ignored with --serve; send images via the RPC client]\x1b[0m"
             );
         }
-        // Multi-session JSON-RPC server on stdio. Process-wide transports stay
-        // shared, while each thread rebuilds every cwd-bound piece from its
-        // canonical thread/start cwd.
+        // Multi-session JSON-RPC server on stdio. Process-wide transports and
+        // policy stay shared, while each thread rebuilds cwd-bound context,
+        // skills, permission anchors, and its sandbox workspace root.
         let factory: kloop_server::ConfigFactory = {
             let args = args.clone();
             let provider = provider.clone();
+            let runtime = runtime.clone();
             Arc::new(move |options, approver, notify| {
-                let config_path = options.cwd.join(PROJECT_CONFIG);
-                if !args.mock {
-                    reject_provider_keys_in_project_config(&config_path)?;
-                }
                 let project = if args.mock {
                     context::mock(&options.cwd)
                 } else {
@@ -173,12 +166,7 @@ async fn main() -> Result<ExitCode> {
                     notify(warning);
                 }
                 let sandbox =
-                    build_sandbox(&args, &options.cwd, &config_path, |warning| notify(warning))?;
-                let agent_types = Arc::new(if args.mock {
-                    Vec::new()
-                } else {
-                    load_agent_types(&config_path)?
-                });
+                    build_sandbox(&args, &options.cwd, &runtime, |warning| notify(warning))?;
                 let skills = Arc::new(if args.mock {
                     Vec::new()
                 } else {
@@ -191,15 +179,14 @@ async fn main() -> Result<ExitCode> {
                 let mut cfg = config_from_settings(
                     &args,
                     &provider,
+                    &runtime,
                     approver,
                     notify,
                     &tool_sources,
                     &project,
                     sandbox,
-                    agent_types,
                     skills,
                     &options.cwd,
-                    &config_path,
                 )?;
                 if let Some(model) = options.model {
                     cfg.model = model;
@@ -218,8 +205,10 @@ async fn main() -> Result<ExitCode> {
         server.models = vec![provider.model_info()];
         server.mcp_servers = mcp_statuses;
         let config_provider = provider.clone();
-        server.config_reader =
-            Arc::new(move |cwd| server_config_snapshot(&read_args, cwd, &config_provider));
+        let config_runtime = runtime.clone();
+        server.config_reader = Arc::new(move |cwd| {
+            server_config_snapshot(&read_args, cwd, &config_provider, &config_runtime)
+        });
         server.skills_reader = server_skills_reader(&args);
         kloop_server::serve_stdio(server).await?;
         return Ok(ExitCode::SUCCESS);
@@ -235,14 +224,9 @@ async fn main() -> Result<ExitCode> {
     for warning in &project.warnings {
         eprintln!("\x1b[2m[{warning}]\x1b[0m");
     }
-    let sandbox = build_sandbox(&args, &cwd, Path::new(PROJECT_CONFIG), |s: &str| {
-        eprintln!("\x1b[2m[{s}]\x1b[0m")
+    let sandbox = build_sandbox(&args, &cwd, &runtime, |warning| {
+        eprintln!("\x1b[2m[{warning}]\x1b[0m")
     })?;
-    let agent_types = Arc::new(if args.mock {
-        Vec::new()
-    } else {
-        load_agent_types(Path::new(PROJECT_CONFIG))?
-    });
     let skills = Arc::new(if args.mock {
         Vec::new()
     } else {
@@ -284,15 +268,14 @@ async fn main() -> Result<ExitCode> {
         let mut cfg = config_from_settings(
             &args,
             &provider,
+            &runtime,
             Arc::new(headless::DenyApprover),
             notify,
             &tool_sources,
             &project,
             sandbox,
-            agent_types,
             skills,
             &cwd,
-            Path::new(PROJECT_CONFIG),
         )?;
         cfg.session_id = session_id.clone();
         // An explicit headless runaway guardrail enables the otherwise-absent cap.
@@ -335,12 +318,12 @@ async fn main() -> Result<ExitCode> {
         plain_main(
             args,
             provider,
+            runtime,
             history,
             session_id,
             tool_sources,
             project,
             sandbox,
-            agent_types,
             skills,
             pending_images,
         )
@@ -354,15 +337,14 @@ async fn main() -> Result<ExitCode> {
             let mut cfg = config_from_settings(
                 &args,
                 &provider,
+                &runtime,
                 approver,
                 notify,
                 &tool_sources,
                 &project,
                 sandbox.clone(),
-                agent_types.clone(),
                 skills.clone(),
                 &cwd,
-                Path::new(PROJECT_CONFIG),
             )?;
             cfg.session_id = factory_session_id.clone();
             Ok(cfg)
@@ -409,12 +391,12 @@ fn spawn_ctrl_c(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
 async fn plain_main(
     args: CliArgs,
     provider: Arc<ResolvedProviderSettings>,
+    runtime: Arc<RuntimeSettings>,
     mut history: History,
     session_id: String,
     tool_sources: Vec<Arc<dyn ToolSource>>,
     project: context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
-    agent_types: Arc<Vec<AgentType>>,
     skills: Arc<Vec<Skill>>,
     pending_images: Vec<ContentBlock>,
 ) -> Result<()> {
@@ -423,15 +405,14 @@ async fn plain_main(
     let mut cfg = config_from_settings(
         &args,
         &provider,
+        &runtime,
         Arc::new(CliApprover::default()),
         notify,
         &tool_sources,
         &project,
         sandbox,
-        agent_types,
         skills,
         &cwd,
-        Path::new(PROJECT_CONFIG),
     )?;
     cfg.session_id = session_id.clone();
     let cfg = Arc::new(cfg);

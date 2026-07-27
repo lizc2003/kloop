@@ -261,8 +261,8 @@ pub(crate) fn help_text() -> &'static str {
      OTHER:\n\
      \x20   -h, --help            show this help and exit\n\
      \n\
-     Provider/model credentials: ~/.kloop/config.toml (KLOOP_* / provider env may override).\n\
-     Project permissions/MCP/hooks/sandbox: .kloop/config.toml; see the README.\n"
+     All persistent runtime/provider configuration: ~/.kloop/config.toml (KLOOP_* / provider env may override).\n\
+     Cwd selects the workspace; it is never an automatic config source.\n"
 }
 
 fn session_line(path: &Path) -> String {

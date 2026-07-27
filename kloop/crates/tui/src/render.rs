@@ -802,7 +802,7 @@ fn confirm_option_lines(
 ) -> Vec<Line<'static>> {
     let options = match &req.remember_rules {
         Some(rules) => format!(
-            "y allow once · a allow this session · p always ({}) · n deny",
+            "y allow once · a allow this session · p always, global for all workspaces ({}) · n deny",
             rules.join(", ")
         ),
         None => "y allow once · n deny".to_string(),

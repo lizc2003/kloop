@@ -186,7 +186,8 @@ and **safety checks are immune to bypass mode**. Credential-bearing/read-sensiti
 paths (`.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
 boundary: `read_file` refuses them, grep/glob filter them before reading, and
 Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
-macOS sandbox also denies reads of `~/.kloop/config.toml`, including through a
+macOS sandbox also denies reads of `~/.kloop/config.toml` and
+`~/.kloop/mcp-oauth.json`, including through a
 symlink, and provider/search key env vars are removed from model shell children.
 The sandbox auto-allow layer is the sandbox/approval coupling — see OS sandbox
 below: a bash call the OS sandbox will contain skips everything beneath this
@@ -208,7 +209,7 @@ allow rule or bypass mode would otherwise pass — wrappers (`sudo`, `env`,
 `timeout`, `nice`, `xargs`) are stripped before deny/danger matching so they
 can't smuggle a command past a rule.
 
-**Rules** live in `.kloop/config.toml` and env vars (comma-separated
+**Rules** live in global `~/.kloop/config.toml` and env vars (comma-separated
 `KLOOP_ALLOW` / `KLOOP_DENY` / `KLOOP_ASK` append on top):
 
 ```toml
@@ -233,7 +234,8 @@ working directory never auto-pass in acceptEdits.
 **Asking**: `y` allow once · `a` allow for this session (cached per two-word
 bash prefix — approving `git commit` never covers `git rebase` — or per
 parent directory for file writes) · `p` allow always (appends the suggested
-rule, e.g. `bash(cargo build *)`, to `.kloop/config.toml`) · `n` deny. A
+rule, e.g. `bash(cargo build *)`, to global `~/.kloop/config.toml`, affecting
+all workspaces) · `n` deny. A
 denial is not a turn abort: the model receives an `is_error` `tool_result`
 and is told to take another approach. Sub-agents share the parent's rules
 and cache and prompt through the same seam, tagged `[sub-agent]`.
@@ -507,8 +509,10 @@ ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
 
 That branch gets provider credentials from the process-global
 `~/.kloop/config.toml` (environment variables are optional overrides), so it
-deliberately skips Codex SSO/LoginDialog/AccessGuard. The cwd-scoped
-`.kloop/config.toml` remains project policy only. Live text/image turns, Stop,
+deliberately skips Codex SSO/LoginDialog/AccessGuard. The same immutable
+startup snapshot supplies permissions, MCP, web, hooks, sandbox, agents, and
+codemode; thread cwd only anchors workspace-specific context, skills,
+permissions, and sandbox paths. Live text/image turns, Stop,
 generic tool cards, all four approval decisions, and native
 `thread/list|read|resume|fork` history are connected.
 Slice 4 also enables the local model picker, project-scoped skill catalog and
@@ -531,7 +535,7 @@ issue legacy RPCs.
 kloop connects to external MCP tool servers over one of two transports: a
 local child process over **stdio** (JSON-RPC 2.0, newline-delimited JSON — one
 object per line) or a remote endpoint over **streamable HTTP** (plan 34).
-Declare servers in the cwd-scoped project `.kloop/config.toml`; `command`
+Declare servers in global `~/.kloop/config.toml`; `command`
 selects stdio, `url` selects HTTP (exactly one, or it's a config error):
 
 ```toml
@@ -552,7 +556,7 @@ url = "https://api.githubcopilot.com/mcp/"
 # oauth_scopes = ["repo", "read:user"]             # optional: override discovered scopes
 ```
 
-Secrets never live in the config: `bearer_token_env_var` names an environment
+MCP bearer secrets never live inline in the config: `bearer_token_env_var` names an
 variable that kloop reads at connect time into `Authorization: Bearer <token>`
 (an inline `bearer_token` is refused; a referenced-but-unset var is an error).
 Over HTTP, one POST carries each request, the reply comes back as
@@ -574,7 +578,7 @@ This runs two-step discovery (RFC 9728 → RFC 8414, from the server's `401
 WWW-Authenticate` header), registers a client if none is preconfigured
 (RFC 7591 dynamic client registration), opens your browser to authorize with
 PKCE (S256) + a CSRF `state`, catches the redirect on a loopback listener, and
-saves the token to `.kloop/mcp-oauth.json` (mode `0600`, keyed by
+saves the token to `~/.kloop/mcp-oauth.json` (mode `0600`, keyed by
 `name|hash(url)`, with an **absolute** expiry). Thereafter kloop injects the
 bearer per request and refreshes it proactively before expiry (and once more on
 a 401); a failed refresh clears the token and asks you to log in again. Startup
@@ -639,7 +643,7 @@ tools ship inline and neither tool_search nor call_tool exists.
 External command hooks fire at six points: before/after a turn
 (`pre_turn` / `post_turn`), before/after a tool call (`pre_tool` /
 `post_tool`), and around a sub-agent's turn (`subagent_start` /
-`subagent_stop`). Declare them in `.kloop/config.toml`:
+`subagent_stop`). Declare them in global `~/.kloop/config.toml`:
 
 ```toml
 [[hooks]]
@@ -799,7 +803,7 @@ network-free, reqwest lives only in provider and web):
   with two backends: Tavily (default, `TAVILY_API_KEY`; its free tier needs
   no card) and Brave (`BRAVE_API_KEY`). Without the selected backend's key
   the tool is not registered and startup warns. `[web] search_provider`
-  in `.kloop/config.toml` selects the backend; adding a provider = one
+  in global `~/.kloop/config.toml` selects the backend; adding a provider = one
   trait impl + one match arm.
 
 Both are read-only for concurrency; the permission gate treats them like
@@ -843,7 +847,7 @@ Presentation per frontend:
 ### Custom agent types
 
 A `task` call can target a named specialized agent via the `agent_type`
-parameter. Types are defined in `.kloop/config.toml`:
+parameter. Types are defined in global `~/.kloop/config.toml`:
 
 ```toml
 [agents.researcher]
@@ -925,7 +929,7 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
 - **Writes** are allow-listed: cwd + `/tmp` + `$TMPDIR` + configured extras.
   Inside a writable root, `.git/hooks`, `.git/config` and `.kloop` stay
   read-only (they are privilege-escalation surfaces — hooks and git config
-  run code, `.kloop` holds the permission rules; the rest of `.git` stays
+  run code, and project `.kloop` contains agent instructions/state; the rest of `.git` stays
   writable so `git commit` works sandboxed).
 - **Reads** are full-disk; **network** is off unless configured.
 - **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
@@ -1161,7 +1165,8 @@ never truncates). Both mirror cc's workflow caps (1000 / 4096). Concurrency is
 deliberately **not** paced — a program firing N concurrent `agent()` is the same
 as a model emitting N concurrent `task` calls, which kloop runs uncapped, so
 pacing here would break that precedent; the total ceiling is the guard that
-matters. All five knobs override via `[codemode]` in `.kloop/config.toml`
+matters. All five knobs override via `[codemode]` in global
+`~/.kloop/config.toml`
 (`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_items`) or
 `KLOOP_PROGRAM_*` env (env wins).
 
@@ -1526,8 +1531,15 @@ cargo run -- --help
 # keyless demo: scripted Mock provider exercises all five bets (plain output)
 cargo run -- --mock
 
-# Daily provider/model configuration is process-global. Create this file with
-# mode 0600 (and preferably chmod 700 ~/.kloop):
+# The only automatically discovered TOML config is ~/.kloop/config.toml. It
+# contains provider/model plus permissions, MCP, web, hooks, sandbox, agents,
+# and codemode. A cwd .kloop/config.toml is never read or merged; cwd remains
+# the workspace anchor for project instructions, skills, tools, permissions,
+# and sandbox paths.
+#
+# Daily provider/model configuration lives in that process-global file. The
+# directory must have no group/other access (kloop creates it as 0700), and the
+# file must be mode 0600:
 #
 #   model = "gpt-5.6-sol"
 #   model_provider = "gw_router"
@@ -1544,6 +1556,7 @@ cargo run -- --mock
 # openai-compat, and openai-responses infer it. Anthropic profiles use exactly
 # one x-api-key header; chat/responses profiles use Bearer Authorization.
 # kloop appends /v1/messages, /chat/completions, or /responses to the base.
+chmod 700 ~/.kloop
 chmod 600 ~/.kloop/config.toml
 cargo run
 
@@ -1577,12 +1590,12 @@ cargo run -- -r <id>           # continue a specific session
 cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
 cargo run -- --fork <id>       # branch off a session at its end
 
-# MCP servers come from the cwd-scoped project .kloop/config.toml — see MCP client above
+# MCP servers come from global ~/.kloop/config.toml — see MCP client above
 # KLOOP_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
 # (default 30 total tools; lower it to exercise deferral with a small server,
 # raise it to effectively disable)
 
-# permissions (rules also live in the cwd-scoped project .kloop/config.toml)
+# permissions (persistent rules live in global ~/.kloop/config.toml)
 KLOOP_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
 KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
@@ -1804,12 +1817,12 @@ crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rq
 
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
-                    app-server/--serve), env config, StdoutUi, CliApprover (y/a/p/n
-                    prompt), .kloop/config.toml rule load/persist, --mock
+                    app-server/--serve), StdoutUi, CliApprover, --mock demo,
+                    session selection (--continue, --resume, --list-sessions)
+  src/user_config.rs one global TOML read, strict root schema, private atomic writes
+  src/startup.rs    typed runtime policy snapshot + cwd-bound session wiring
   src/web.rs        [web] config + ToolSource adapter binding core contracts
                     to kloop-web network operations
-                    demo, session selection (--continue, --resume,
-                    --list-sessions)
   src/mcp.rs        [mcp.servers] config, startup connection with
                     degrade-to-warning, {server}__{tool} namespacing,
                     the ToolSource adapter

@@ -55,7 +55,7 @@ pub struct WritableRoot {
     /// not ordinary data. cc's granularity for `.git` (hooks and config run
     /// code; the rest stays writable so `git commit` works in the sandbox —
     /// codex protects all of `.git` and pays for it with escalations), plus
-    /// all of `.kloop` (permission rules live there).
+    /// all of `.kloop` (agent instructions/state live there).
     pub read_only_subpaths: Vec<PathBuf>,
 }
 

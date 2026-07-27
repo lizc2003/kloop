@@ -6,7 +6,6 @@
 //! without one.
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -41,17 +40,10 @@ impl Default for WebConfig {
     }
 }
 
-/// Parse the optional `[web]` table from `.kloop/config.toml`. Missing file
-/// or section = defaults; unknown keys are errors (same discipline as
-/// `[mcp.servers]`).
-pub fn load_web_config(config_path: &Path) -> Result<WebConfig> {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return Ok(WebConfig::default());
-    };
-    let value: toml::Table = raw
-        .parse()
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-    let Some(web) = value.get("web") else {
+/// Parse the optional `[web]` table from the global user config. A missing
+/// section uses defaults; unknown keys and malformed values are errors.
+pub fn load_web_config(root: &toml::Table) -> Result<WebConfig> {
+    let Some(web) = root.get("web") else {
         return Ok(WebConfig::default());
     };
     let web = web.as_table().context("[web] must be a table")?;
@@ -153,33 +145,27 @@ impl ToolSource for WebToolSource {
 mod tests {
     use super::*;
 
-    fn write_config(tag: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-web-cfg-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, content).unwrap();
-        path
+    fn config(content: &str) -> toml::Table {
+        content.parse().unwrap()
     }
 
     #[test]
     fn load_web_config_defaults_and_override() {
         assert_eq!(
-            load_web_config(Path::new("/nonexistent/kloop.toml")).unwrap(),
+            load_web_config(&toml::Table::new()).unwrap(),
             WebConfig::default()
         );
 
-        let path = write_config("nosection", "[permissions]\nallow = []\n");
-        assert_eq!(load_web_config(&path).unwrap(), WebConfig::default());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let root = config("[permissions]\nallow = []\n");
+        assert_eq!(load_web_config(&root).unwrap(), WebConfig::default());
 
-        let path = write_config("override", "[web]\nsearch_provider = \"brave\"\n");
+        let root = config("[web]\nsearch_provider = \"brave\"\n");
         assert_eq!(
-            load_web_config(&path).unwrap(),
+            load_web_config(&root).unwrap(),
             WebConfig {
                 search_provider: "brave".into()
             }
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -187,10 +173,10 @@ mod tests {
         for (tag, bad) in [
             ("unknown", "[web]\nprovider = \"brave\"\n"),
             ("badtype", "[web]\nsearch_provider = 3\n"),
+            ("section", "web = 3\n"),
         ] {
-            let path = write_config(tag, bad);
-            assert!(load_web_config(&path).is_err(), "{tag} should fail");
-            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            let root = config(bad);
+            assert!(load_web_config(&root).is_err(), "{tag} should fail");
         }
     }
 

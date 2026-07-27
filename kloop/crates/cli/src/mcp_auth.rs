@@ -6,7 +6,6 @@
 //! side-effect, so reqwest never enters the CLI.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,10 +24,9 @@ use kloop_mcp::oauth::OAuthToken;
 
 use crate::mcp::load_mcp_servers;
 use crate::mcp::McpTransport;
-use crate::startup::PROJECT_CONFIG;
+use crate::user_config::UserConfig;
 
-/// Where OAuth tokens live: alongside the config, one file for all servers.
-const OAUTH_STORE_PATH: &str = ".kloop/mcp-oauth.json";
+const OAUTH_STORE_LABEL: &str = "~/.kloop/mcp-oauth.json";
 
 /// One stored credential. `resource` doubles as the RFC 8707 audience the
 /// refresh binds to and the server URL the store key is derived from; the token
@@ -65,29 +63,20 @@ impl CredentialStore {
         CredentialStore { path }
     }
 
-    pub fn default_path() -> Self {
-        CredentialStore::new(PathBuf::from(OAUTH_STORE_PATH))
+    pub fn default_path() -> Result<Self> {
+        Ok(CredentialStore::new(crate::user_config::oauth_store_path()?))
     }
 
     fn read(&self) -> Result<StoreFile> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .with_context(|| format!("cannot parse {}", self.path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreFile::default()),
-            Err(e) => Err(e).with_context(|| format!("cannot read {}", self.path.display())),
+        match crate::user_config::read_private_string(&self.path, OAUTH_STORE_LABEL)? {
+            Some(raw) => serde_json::from_str(&raw).context("cannot parse ~/.kloop/mcp-oauth.json"),
+            None => Ok(StoreFile::default()),
         }
     }
 
     fn write(&self, file: &StoreFile) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
         let json = serde_json::to_string_pretty(file)?;
-        std::fs::write(&self.path, json)
-            .with_context(|| format!("cannot write {}", self.path.display()))?;
-        restrict_permissions(&self.path)?;
-        Ok(())
+        crate::user_config::write_private_atomic(&self.path, OAUTH_STORE_LABEL, json.as_bytes())
     }
 
     /// Persist a fresh login, replacing any prior credential for this server.
@@ -106,11 +95,8 @@ impl CredentialStore {
         self.write(&file)
     }
 
-    fn get(&self, name: &str, url: &str) -> Option<StoredCredential> {
-        self.read()
-            .ok()?
-            .credentials
-            .remove(&credential_key(name, url))
+    fn get(&self, name: &str, url: &str) -> Result<Option<StoredCredential>> {
+        Ok(self.read()?.credentials.remove(&credential_key(name, url)))
     }
 
     /// Write back a refreshed token (the [`OAuthSession`] callback). Missing key
@@ -127,8 +113,14 @@ impl CredentialStore {
     /// Build a request-time [`OAuthSession`] for a logged-in server, or `None`
     /// if there's no stored token. The session's refresh callback writes the
     /// rotated token back here.
-    pub fn session_for(self: &Arc<Self>, name: &str, url: &str) -> Option<Arc<OAuthSession>> {
-        let cred = self.get(name, url)?;
+    pub fn session_for(
+        self: &Arc<Self>,
+        name: &str,
+        url: &str,
+    ) -> Result<Option<Arc<OAuthSession>>> {
+        let Some(cred) = self.get(name, url)? else {
+            return Ok(None);
+        };
         let store = Arc::clone(self);
         let name = name.to_string();
         let url = url.to_string();
@@ -139,13 +131,13 @@ impl CredentialStore {
                 );
             }
         });
-        Some(Arc::new(OAuthSession::new(
+        Ok(Some(Arc::new(OAuthSession::new(
             cred.token_endpoint,
             cred.client_id,
             cred.resource,
             cred.token,
             on_update,
-        )))
+        ))))
     }
 }
 
@@ -165,26 +157,15 @@ fn hex16(bytes: &[u8]) -> String {
         .collect::<String>()
 }
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot chmod {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 /// `kloop mcp login <name>`: resolve the server's OAuth config, run the
 /// interactive flow (browser + loopback callback), and persist the token.
 pub async fn run_login(server_name: &str) -> Result<()> {
-    let servers = load_mcp_servers(Path::new(PROJECT_CONFIG))?;
+    let config = UserConfig::load(/*mock_mode=*/ false)?;
+    let servers = load_mcp_servers(config.table())?;
     let server = servers
         .iter()
-        .find(|s| s.name == server_name)
-        .with_context(|| format!("no [mcp.servers.{server_name}] in {PROJECT_CONFIG}"))?;
+        .find(|server| server.name == server_name)
+        .with_context(|| format!("no [mcp.servers.{server_name}] in ~/.kloop/config.toml"))?;
     let (url, client_id, scopes) = match &server.transport {
         McpTransport::Http {
             url,
@@ -215,9 +196,9 @@ pub async fn run_login(server_name: &str) -> Result<()> {
     })
     .await?;
 
-    let store = CredentialStore::default_path();
+    let store = CredentialStore::default_path()?;
     store.save(server_name, outcome)?;
-    println!("\n✓ Logged in to '{server_name}'. Token saved to {OAUTH_STORE_PATH}.");
+    println!("\n✓ Logged in to '{server_name}'. Token saved to {OAUTH_STORE_LABEL}.");
     Ok(())
 }
 
@@ -246,6 +227,11 @@ mod tests {
     fn store_in(tag: &str) -> (CredentialStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kloop-oauth-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let path = dir.join("mcp-oauth.json");
         let _ = std::fs::remove_file(&path);
         (CredentialStore::new(path.clone()), path)
@@ -278,11 +264,17 @@ mod tests {
     fn save_then_get_round_trips_and_url_change_invalidates() {
         let (store, path) = store_in("roundtrip");
         store.save("gh", outcome("at-1", "rt-1")).unwrap();
-        let got = store.get("gh", "https://mcp.example.com/mcp").unwrap();
+        let got = store
+            .get("gh", "https://mcp.example.com/mcp")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.client_id, "client-1");
         assert_eq!(got.token.access_token, "at-1");
         // A different URL for the same name has no entry (token invalidated).
-        assert!(store.get("gh", "https://mcp.example.com/other").is_none());
+        assert!(store
+            .get("gh", "https://mcp.example.com/other")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -299,7 +291,10 @@ mod tests {
         store
             .update_token("gh", "https://mcp.example.com/mcp", &refreshed)
             .unwrap();
-        let got = store.get("gh", "https://mcp.example.com/mcp").unwrap();
+        let got = store
+            .get("gh", "https://mcp.example.com/mcp")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.token, refreshed);
         assert_eq!(got.client_id, "client-1"); // untouched
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -311,11 +306,30 @@ mod tests {
         let store = Arc::new(store);
         assert!(store
             .session_for("gh", "https://mcp.example.com/mcp")
+            .unwrap()
             .is_none());
         store.save("gh", outcome("at-1", "rt-1")).unwrap();
         assert!(store
             .session_for("gh", "https://mcp.example.com/mcp")
+            .unwrap()
             .is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_store_rejects_open_permissions_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (store, path) = store_in("private-boundary");
+        std::fs::write(&path, "{\"version\":1,\"credentials\":{}}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(store.read().is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link = path.with_file_name("linked-oauth.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(CredentialStore::new(link).read().is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

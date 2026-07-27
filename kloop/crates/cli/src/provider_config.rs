@@ -1,12 +1,10 @@
-//! Process-global provider configuration from `~/.kloop/config.toml`.
+//! Process-global provider resolution from the parsed user config.
 //!
-//! The schema intentionally follows the portable core of Codex's config
-//! (`model`, `model_provider`, `model_reasoning_effort`, and named
-//! `model_providers`). Project `.kloop/config.toml` remains cwd-scoped policy;
-//! credentials never flow through its permission-rule persistence path.
+//! [`crate::user_config`] owns the one `~/.kloop/config.toml` read and root
+//! schema. This module validates the provider/model subset and applies the
+//! established environment override precedence.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -18,8 +16,6 @@ use url::Url;
 use kloop_provider::Provider;
 use kloop_provider::ThinkingMode;
 use kloop_server::ModelInfo;
-
-pub(crate) const GLOBAL_CONFIG: &str = ".kloop/config.toml";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rail {
@@ -112,53 +108,35 @@ struct GlobalFile {
     profiles: BTreeMap<String, Profile>,
 }
 
-pub(crate) fn global_config_path() -> Result<PathBuf> {
-    let home =
-        std::env::home_dir().context("cannot determine home directory for ~/.kloop/config.toml")?;
-    Ok(home.join(GLOBAL_CONFIG))
-}
-
-/// Read and resolve the process-global provider once. `--mock` calls this with
-/// `mock=true` and remains hermetic: no HOME, file, or provider env access.
-pub(crate) fn load(mock: bool) -> Result<ResolvedProviderSettings> {
+/// Resolve the process-global provider from the already parsed user config.
+/// `--mock` remains hermetic: no provider environment variables are read.
+pub(crate) fn load(mock: bool, table: &toml::Table) -> Result<ResolvedProviderSettings> {
     if mock {
         return Ok(ResolvedProviderSettings::mock());
     }
-    let path = global_config_path()?;
-    let raw = read_global_file(&path)?;
-    resolve(raw.as_deref(), &|name| std::env::var(name).ok())
+    resolve_table(Some(table), &|name| std::env::var(name).ok())
 }
 
-fn read_global_file(path: &Path) -> Result<Option<String>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => bail!("cannot inspect ~/.kloop/config.toml"),
-    };
-    if metadata.file_type().is_symlink() {
-        bail!("~/.kloop/config.toml must be a regular file, not a symlink");
-    }
-    if !metadata.is_file() {
-        bail!("~/.kloop/config.toml must be a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("~/.kloop/config.toml contains credentials; run: chmod 600 ~/.kloop/config.toml");
-        }
-    }
-    std::fs::read_to_string(path)
-        .map(Some)
-        .map_err(|_| anyhow!("cannot read ~/.kloop/config.toml"))
-}
-
+#[cfg(test)]
 fn resolve(
     raw: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedProviderSettings> {
-    let file = match raw {
-        Some(raw) => parse_global_file(raw)?,
+    let table = raw
+        .map(|raw| {
+            raw.parse::<toml::Table>()
+                .map_err(|_| anyhow!("cannot parse ~/.kloop/config.toml (TOML syntax error)"))
+        })
+        .transpose()?;
+    resolve_table(table.as_ref(), env)
+}
+
+fn resolve_table(
+    table: Option<&toml::Table>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<ResolvedProviderSettings> {
+    let file = match table {
+        Some(table) => parse_global_file(table)?,
         None => GlobalFile {
             model: None,
             model_provider: None,
@@ -267,21 +245,10 @@ fn resolve(
     }
 }
 
-fn parse_global_file(raw: &str) -> Result<GlobalFile> {
-    let table: toml::Table = raw
-        .parse()
-        .map_err(|_| anyhow!("cannot parse ~/.kloop/config.toml (TOML syntax error)"))?;
-    for key in table.keys() {
-        if !matches!(
-            key.as_str(),
-            "model" | "model_provider" | "model_reasoning_effort" | "model_providers"
-        ) {
-            bail!("~/.kloop/config.toml has unknown top-level key '{key}'");
-        }
-    }
-    let model = optional_string(&table, "model", "model")?;
-    let model_provider = optional_string(&table, "model_provider", "model_provider")?;
-    let effort = optional_string(&table, "model_reasoning_effort", "model_reasoning_effort")?;
+fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
+    let model = optional_string(table, "model", "model")?;
+    let model_provider = optional_string(table, "model_provider", "model_provider")?;
+    let effort = optional_string(table, "model_reasoning_effort", "model_reasoning_effort")?;
     let mut profiles = BTreeMap::new();
     if let Some(value) = table.get("model_providers") {
         let providers = value
@@ -536,33 +503,6 @@ fn bearer_from_header(value: &str) -> Option<String> {
     (scheme.eq_ignore_ascii_case("bearer") && !key.trim().is_empty()).then(|| key.trim().into())
 }
 
-/// Fail closed when process-wide provider keys are placed in the cwd-scoped
-/// policy file. Besides preventing accidental commits, this keeps
-/// `persist_allow_rules` from ever rewriting a credential-bearing file.
-pub(crate) fn reject_provider_keys_in_project_config(path: &Path) -> Result<()> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => bail!("cannot read project .kloop/config.toml"),
-    };
-    let table: toml::Table = raw
-        .parse()
-        .map_err(|_| anyhow!("cannot parse project .kloop/config.toml"))?;
-    for key in [
-        "model",
-        "model_provider",
-        "model_reasoning_effort",
-        "model_providers",
-    ] {
-        if table.contains_key(key) {
-            bail!(
-                "project .kloop/config.toml contains provider key '{key}'; move provider settings to ~/.kloop/config.toml"
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,46 +662,5 @@ http_headers = { Authorization = "Bearer key" }
             );
             assert!(resolve(Some(&raw), &env(&[])).is_err(), "accepted {base}");
         }
-    }
-
-    #[test]
-    fn project_config_rejects_provider_keys() {
-        let dir = std::env::temp_dir().join(format!(
-            "kloop-project-provider-config-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
-        reject_provider_keys_in_project_config(&path).unwrap();
-        std::fs::write(&path, "model = \"secret-model\"\n").unwrap();
-        assert!(reject_provider_keys_in_project_config(&path).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn global_file_requires_private_regular_file() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir =
-            std::env::temp_dir().join(format!("kloop-global-provider-mode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "model = \"m\"\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_global_file(&path).is_err());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            read_global_file(&path).unwrap().as_deref(),
-            Some("model = \"m\"\n")
-        );
-
-        let link = dir.join("link.toml");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(read_global_file(&link).is_err());
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

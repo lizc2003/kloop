@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -94,17 +93,20 @@ const HTTP_ONLY_KEYS: &[&str] = &[
     "oauth_scopes",
 ];
 
-/// Parse `[mcp.servers.<name>]` tables from `.kloop/config.toml`. A missing
-/// file or missing section is an empty list; a malformed section is an error
-/// (silent misconfiguration would look like a vanished server).
-pub fn load_mcp_servers(config_path: &Path) -> Result<Vec<McpServerConfig>> {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
+/// Parse `[mcp.servers.<name>]` tables from the global user config. A missing
+/// section is an empty list; malformed or unknown keys are errors because a
+/// silent drop would look like a vanished server.
+pub fn load_mcp_servers(root: &toml::Table) -> Result<Vec<McpServerConfig>> {
+    let Some(mcp) = root.get("mcp") else {
         return Ok(Vec::new());
     };
-    let value: toml::Table = raw
-        .parse()
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-    let Some(servers) = value.get("mcp").and_then(|m| m.get("servers")) else {
+    let mcp = mcp.as_table().context("[mcp] must be a table")?;
+    for key in mcp.keys() {
+        if key != "servers" {
+            bail!("[mcp] has unknown key '{key}' (servers)");
+        }
+    }
+    let Some(servers) = mcp.get("servers") else {
         return Ok(Vec::new());
     };
     let servers = servers
@@ -368,8 +370,11 @@ fn build_source(
 
 /// Spawn + handshake + tool discovery for every configured server. A failing
 /// server degrades to a warning and is skipped — MCP never blocks startup.
-pub async fn connect_servers(servers: Vec<McpServerConfig>, warn: &dyn Fn(&str)) -> McpConnections {
-    let store = Arc::new(CredentialStore::default_path());
+pub async fn connect_servers(
+    servers: Vec<McpServerConfig>,
+    warn: &dyn Fn(&str),
+) -> Result<McpConnections> {
+    let store = Arc::new(CredentialStore::default_path()?);
     let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
     let mut statuses = Vec::new();
     for server in servers {
@@ -395,7 +400,7 @@ pub async fn connect_servers(servers: Vec<McpServerConfig>, warn: &dyn Fn(&str))
                 } => {
                     let headers = http_headers_for(bearer_token_env_var, http_headers)?;
                     let oauth = if bearer_token_env_var.is_none() {
-                        store.session_for(&server.name, url)
+                        store.session_for(&server.name, url)?
                     } else {
                         None
                     };
@@ -454,25 +459,20 @@ pub async fn connect_servers(servers: Vec<McpServerConfig>, warn: &dyn Fn(&str))
             }
         }
     }
-    McpConnections { sources, statuses }
+    Ok(McpConnections { sources, statuses })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn write_config(tag: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-mcp-cfg-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, content).unwrap();
-        path
+    fn config(content: &str) -> toml::Table {
+        content.parse().unwrap()
     }
 
     #[test]
     fn load_mcp_servers_full_round_trip() {
-        let path = write_config(
-            "full",
+        let root = config(
             r#"
 [permissions]
 allow = ["bash(ls *)"]
@@ -497,7 +497,7 @@ oauth_client_id = "preconfigured-123"
 oauth_scopes = ["mcp.read", "mcp.write"]
 "#,
         );
-        let servers = load_mcp_servers(&path).unwrap();
+        let servers = load_mcp_servers(&root).unwrap();
         assert_eq!(
             servers,
             vec![
@@ -545,23 +545,20 @@ oauth_scopes = ["mcp.read", "mcp.write"]
                 },
             ]
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn load_mcp_servers_missing_file_and_section_are_empty() {
-        assert_eq!(
-            load_mcp_servers(Path::new("/nonexistent/kloop.toml")).unwrap(),
-            vec![]
-        );
-        let path = write_config("nosection", "[permissions]\nallow = []\n");
-        assert_eq!(load_mcp_servers(&path).unwrap(), vec![]);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    fn load_mcp_servers_missing_section_is_empty() {
+        assert_eq!(load_mcp_servers(&toml::Table::new()).unwrap(), vec![]);
+        let root = config("[permissions]\nallow = []\n");
+        assert_eq!(load_mcp_servers(&root).unwrap(), vec![]);
     }
 
     #[test]
     fn load_mcp_servers_rejects_malformed_sections() {
         for (tag, bad) in [
+            ("mcp-section", "mcp = 3\n"),
+            ("mcp-unknown", "[mcp]\nother = true\n"),
             ("notransport", "[mcp.servers.x]\nenv = {}\n"),
             ("emptycmd", "[mcp.servers.x]\ncommand = []\n"),
             ("cmdstr", "[mcp.servers.x]\ncommand = \"npx\"\n"),
@@ -597,9 +594,8 @@ oauth_scopes = ["mcp.read", "mcp.write"]
                 "[mcp.servers.x]\nurl = \"https://h/mcp\"\nbearer_token_env_var = \"T\"\noauth_client_id = \"c\"\n",
             ),
         ] {
-            let path = write_config(tag, bad);
-            assert!(load_mcp_servers(&path).is_err(), "{tag} should fail");
-            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            let root = config(bad);
+            assert!(load_mcp_servers(&root).is_err(), "{tag} should fail");
         }
     }
 
@@ -645,7 +641,8 @@ oauth_scopes = ["mcp.read", "mcp.write"]
             }],
             &warn,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(connections.sources.is_empty());
         assert_eq!(

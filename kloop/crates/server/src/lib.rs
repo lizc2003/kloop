@@ -198,8 +198,8 @@ pub struct ServerPaths {
 }
 
 /// Everything the protocol server needs. The CLI owns filesystem/env/network
-/// assembly and injects immutable metadata plus cwd-scoped read callbacks; the
-/// server stays a transport/validation layer and never depends on the CLI.
+/// assembly and injects immutable metadata plus safe config/skills callbacks;
+/// the server stays a transport/validation layer and never depends on the CLI.
 pub struct ServerConfig {
     pub factory: ConfigFactory,
     pub paths: ServerPaths,
@@ -357,7 +357,8 @@ struct Server {
     /// Immutable process-level catalogs/snapshots assembled by the CLI.
     models: Vec<ModelInfo>,
     mcp_servers: Vec<McpServerStatus>,
-    /// Fresh cwd-scoped disk reads. These callbacks return allowlist DTOs only.
+    /// Safe process-config projection and fresh cwd-scoped skill discovery.
+    /// Both callbacks return allowlist DTOs only.
     config_reader: ConfigReader,
     skills_reader: SkillsReader,
     /// Canonical process cwd used when a read method or thread/start omits cwd.

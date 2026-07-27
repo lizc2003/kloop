@@ -1,11 +1,11 @@
-//! Startup wiring: reading cwd-scoped `.kloop/config.toml`, process-global
-//! provider settings, and KLOOP_* env into the runtime pieces a session needs
-//! (permissions, hooks, sandbox policy, agent types, skills, code-mode limits).
-//! Every loader is fail-soft or a hard parse error, never a silent drop.
+//! Startup wiring: parse the process-global user config and KLOOP_* env once,
+//! then combine that immutable policy with each session's cwd-bound project
+//! context, sandbox workspace root, skills, and commands.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -37,20 +37,73 @@ use kloop_server::SkillsSnapshot;
 use crate::args::CliArgs;
 use crate::context;
 use crate::provider_config::ResolvedProviderSettings;
+use crate::user_config::UserConfig;
 
-pub(crate) const PROJECT_CONFIG: &str = ".kloop/config.toml";
+/// Process-wide runtime policy parsed from the one global user config. Cwd is
+/// deliberately absent: sessions add only their workspace-specific anchors.
+pub(crate) struct RuntimeSettings {
+    config_path: PathBuf,
+    oauth_store_path: PathBuf,
+    permission_rules: Arc<Mutex<PermissionRules>>,
+    hooks: Arc<Hooks>,
+    sandbox: SandboxSettings,
+    sandbox_disabled_by_env: bool,
+    agent_types: Arc<Vec<AgentType>>,
+    program_limits: kloop_core::ProgramLimits,
+    context_window: Option<u64>,
+    fallback_model: Option<String>,
+    defer_threshold: usize,
+}
 
-/// Parse `[[hooks]]` tables from `.kloop/config.toml`. A missing file or
-/// missing section is an empty list; a malformed entry is an error (a
-/// silently dropped hook would look like a policy that never fires).
-fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return Ok(Vec::new());
-    };
-    let value: toml::Table = raw
-        .parse()
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-    let Some(entries) = value.get("hooks") else {
+impl RuntimeSettings {
+    pub(crate) fn load(config: &UserConfig, mock_mode: bool) -> Result<Self> {
+        if mock_mode {
+            return Ok(Self {
+                config_path: PathBuf::new(),
+                oauth_store_path: PathBuf::new(),
+                permission_rules: Arc::new(Mutex::new(PermissionRules::default())),
+                hooks: Arc::new(Hooks::none()),
+                sandbox: SandboxSettings::default(),
+                sandbox_disabled_by_env: false,
+                agent_types: Arc::new(Vec::new()),
+                program_limits: kloop_core::ProgramLimits::default(),
+                context_window: Some(200_000),
+                fallback_model: None,
+                defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
+            });
+        }
+        let table = config.table();
+        let config_path = config.path().to_path_buf();
+        let oauth_store_path = config_path
+            .parent()
+            .expect("global config always has a parent")
+            .join(crate::user_config::OAUTH_STORE);
+        Ok(Self {
+            config_path,
+            oauth_store_path,
+            permission_rules: Arc::new(Mutex::new(load_permission_rules(table)?)),
+            hooks: Arc::new(Hooks {
+                defs: load_hooks(table)?,
+            }),
+            sandbox: load_sandbox_settings(table)?,
+            sandbox_disabled_by_env: sandbox_disabled_from_env(),
+            agent_types: Arc::new(load_agent_types(table)?),
+            program_limits: load_program_limits(table)?,
+            context_window: context_window_from_env()?,
+            fallback_model: std::env::var("KLOOP_FALLBACK_MODEL").ok(),
+            defer_threshold: defer_threshold_from_env()?,
+        })
+    }
+
+    pub(crate) fn defer_threshold(&self) -> usize {
+        self.defer_threshold
+    }
+}
+
+/// Parse `[[hooks]]` tables from the global user config. A missing section is
+/// an empty list; malformed entries are errors.
+fn load_hooks(root: &toml::Table) -> Result<Vec<HookDef>> {
+    let Some(entries) = root.get("hooks") else {
         return Ok(Vec::new());
     };
     let entries = entries
@@ -120,17 +173,21 @@ fn load_hooks(config_path: &Path) -> Result<Vec<HookDef>> {
     Ok(defs)
 }
 
-/// Rules from `.kloop/config.toml` `[permissions]` (allow/deny/ask string
-/// arrays), with KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK (comma-separated)
-/// appended on top.
-fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
+/// Rules from global `[permissions]`, with KLOOP_ALLOW / KLOOP_DENY /
+/// KLOOP_ASK (comma-separated) appended once at process startup.
+fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     let mut rules = PermissionRules::default();
-    if let Ok(raw) = std::fs::read_to_string(config_path) {
-        let value: toml::Table = raw
-            .parse()
-            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+    if let Some(section) = root.get("permissions") {
+        let section = section
+            .as_table()
+            .context("[permissions] must be a table")?;
+        for key in section.keys() {
+            if !matches!(key.as_str(), "allow" | "deny" | "ask") {
+                bail!("[permissions] has unknown key '{key}' (allow | deny | ask)");
+            }
+        }
         let read = |key: &str, out: &mut Vec<String>| -> Result<()> {
-            let Some(entries) = value.get("permissions").and_then(|p| p.get(key)) else {
+            let Some(entries) = section.get(key) else {
                 return Ok(());
             };
             let list = entries
@@ -150,51 +207,39 @@ fn load_permission_rules(config_path: &Path) -> Result<PermissionRules> {
         read("deny", &mut rules.deny)?;
         read("ask", &mut rules.ask)?;
     }
-    let env = |var: &str, out: &mut Vec<String>| {
-        if let Ok(raw) = std::env::var(var) {
+    Ok(rules)
+}
+
+fn load_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
+    let mut rules = parse_permission_rules(root)?;
+    let append_env = |name: &str, out: &mut Vec<String>| {
+        if let Ok(raw) = std::env::var(name) {
             out.extend(
                 raw.split(',')
                     .map(str::trim)
-                    .filter(|e| !e.is_empty())
+                    .filter(|entry| !entry.is_empty())
                     .map(str::to_string),
             );
         }
     };
-    env("KLOOP_ALLOW", &mut rules.allow);
-    env("KLOOP_DENY", &mut rules.deny);
-    env("KLOOP_ASK", &mut rules.ask);
+    append_env("KLOOP_ALLOW", &mut rules.allow);
+    append_env("KLOOP_DENY", &mut rules.deny);
+    append_env("KLOOP_ASK", &mut rules.ask);
     Ok(rules)
 }
 
-/// Append allow rules to `[permissions].allow`, preserving everything else
-/// in the file (toml::Value round-trip; comments are not preserved).
-fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
-    let mut table: toml::Table = match std::fs::read_to_string(config_path) {
-        Ok(raw) => raw
-            .parse()
-            .with_context(|| format!("cannot parse {}", config_path.display()))?,
-        Err(_) => toml::Table::new(),
-    };
-    let permissions = table
-        .entry("permissions")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .context("[permissions] must be a table")?;
-    let allow = permissions
-        .entry("allow")
-        .or_insert_with(|| toml::Value::Array(Vec::new()))
-        .as_array_mut()
-        .context("permissions.allow must be an array")?;
+fn persist_global_allow_rules(
+    path: &Path,
+    shared_rules: &Mutex<PermissionRules>,
+    new_rules: &[String],
+) -> Result<()> {
+    let mut snapshot = shared_rules.lock().unwrap();
+    crate::user_config::persist_allow_rules(path, new_rules)?;
     for rule in new_rules {
-        if !allow.iter().any(|v| v.as_str() == Some(rule)) {
-            allow.push(toml::Value::String(rule.clone()));
+        if !snapshot.allow.contains(rule) {
+            snapshot.allow.push(rule.clone());
         }
     }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(config_path, toml::to_string_pretty(&table)?)
-        .with_context(|| format!("cannot write {}", config_path.display()))?;
     Ok(())
 }
 
@@ -204,7 +249,7 @@ fn persist_allow_rules(config_path: &Path, new_rules: &[String]) -> Result<()> {
 fn build_permissions(
     args: &CliArgs,
     cwd: &Path,
-    config_path: &Path,
+    settings: &RuntimeSettings,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
 ) -> Result<Permissions> {
@@ -215,20 +260,18 @@ fn build_permissions(
         return Ok(Permissions::allow_all());
     }
     let mode = args.permission_mode;
-    let config_path = config_path.to_path_buf();
-    let rules = load_permission_rules(&config_path)?;
-    let persist_path = config_path.clone();
-    let persist =
-        Arc::new(
-            move |rules: &[String]| match persist_allow_rules(&persist_path, rules) {
-                Ok(()) => notify(&format!(
-                    "saved to {}: {}",
-                    persist_path.display(),
-                    rules.join(", ")
-                )),
-                Err(e) => notify(&format!("failed to save allow rule: {e:#}")),
-            },
-        );
+    let rules = settings.permission_rules.lock().unwrap().clone();
+    let persist_path = settings.config_path.clone();
+    let shared_rules = Arc::clone(&settings.permission_rules);
+    let persist = Arc::new(move |rules: &[String]| {
+        match persist_global_allow_rules(&persist_path, &shared_rules, rules) {
+            Ok(()) => notify(&format!(
+                "saved global allow rule for all workspaces: {}",
+                rules.join(", ")
+            )),
+            Err(error) => notify(&format!("failed to save global allow rule: {error:#}")),
+        }
+    });
     Permissions::new(
         mode,
         &rules,
@@ -236,15 +279,12 @@ fn build_permissions(
         Some(approver),
         Some(persist),
     )
-    .with_context(|| {
-        format!(
-            "invalid permission rules ({}) / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK",
-            config_path.display()
-        )
-    })
+    .context(
+        "invalid permission rules in ~/.kloop/config.toml / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK",
+    )
 }
 
-/// `[sandbox]` in `.kloop/config.toml`: `enabled` (default true),
+/// `[sandbox]` in the global user config: `enabled` (default true),
 /// `allow_network` (default false), `writable_roots` (extra writable
 /// directories, default none), `auto_allow` (default true: sandboxed bash
 /// skips the asking layers of the permission gate), `escalate` (default
@@ -257,18 +297,23 @@ struct SandboxSettings {
     escalate: bool,
 }
 
-/// Custom agent types from `.kloop/config.toml` `[agents.<name>]`: each is a
-/// table with a required `description` and optional `system` / `model` /
-/// `tools` (string array). Order follows the file so the task description
-/// lists them stably. `--mock` skips this like every other config read.
-pub(crate) fn load_agent_types(config_path: &Path) -> Result<Vec<AgentType>> {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return Ok(Vec::new());
-    };
-    let value: toml::Table = raw
-        .parse()
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-    let Some(agents) = value.get("agents") else {
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_network: false,
+            writable_roots: Vec::new(),
+            auto_allow: true,
+            escalate: true,
+        }
+    }
+}
+
+/// Custom agent types from global `[agents.<name>]`: each is a table with a
+/// required `description` and optional `system` / `model` / `tools` (string
+/// array). Order follows the file so the task description lists them stably.
+pub(crate) fn load_agent_types(root: &toml::Table) -> Result<Vec<AgentType>> {
+    let Some(agents) = root.get("agents") else {
         return Ok(Vec::new());
     };
     let agents = agents
@@ -486,21 +531,9 @@ fn skills_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
     (skills, warnings)
 }
 
-fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
-    let mut settings = SandboxSettings {
-        enabled: true,
-        allow_network: false,
-        writable_roots: Vec::new(),
-        auto_allow: true,
-        escalate: true,
-    };
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return Ok(settings);
-    };
-    let value: toml::Table = raw
-        .parse()
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-    let Some(section) = value.get("sandbox") else {
+fn load_sandbox_settings(root: &toml::Table) -> Result<SandboxSettings> {
+    let mut settings = SandboxSettings::default();
+    let Some(section) = root.get("sandbox") else {
         return Ok(settings);
     };
     let section = section.as_table().context("[sandbox] must be a table")?;
@@ -546,35 +579,31 @@ fn load_sandbox_settings(config_path: &Path) -> Result<SandboxSettings> {
     Ok(settings)
 }
 
-/// `[codemode]` in `.kloop/config.toml` (all optional; defaults in
+/// `[codemode]` in the global user config (all optional; defaults in
 /// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
 /// limits) and `max_agents`, `max_items` (orchestration runaway ceilings). Each
 /// is also overridable via `KLOOP_PROGRAM_<KEY>` env, which wins over the config
 /// value. Bounds one `run_program` (code-mode) run.
-fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> {
+fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> {
     let mut limits = kloop_core::ProgramLimits::default();
-    if let Ok(raw) = std::fs::read_to_string(config_path) {
-        let value: toml::Table = raw
-            .parse()
-            .with_context(|| format!("cannot parse {}", config_path.display()))?;
-        if let Some(section) = value.get("codemode") {
-            let section = section.as_table().context("[codemode] must be a table")?;
-            for (key, v) in section {
-                let need = || {
-                    v.as_integer()
-                        .filter(|&n| n > 0)
-                        .with_context(|| format!("codemode.{key} must be a positive integer"))
-                };
-                match key.as_str() {
-                    "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
-                    "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
-                    "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
-                    "max_agents" => limits.max_agents = need()? as u64,
-                    "max_items" => limits.max_items_per_call = need()? as usize,
-                    other => bail!(
-                        "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_items)"
-                    ),
-                }
+    if let Some(section) = root.get("codemode") {
+        let section = section.as_table().context("[codemode] must be a table")?;
+        for (key, value) in section {
+            let need = || {
+                value
+                    .as_integer()
+                    .filter(|&number| number > 0)
+                    .with_context(|| format!("codemode.{key} must be a positive integer"))
+            };
+            match key.as_str() {
+                "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
+                "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
+                "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
+                "max_agents" => limits.max_agents = need()? as u64,
+                "max_items" => limits.max_items_per_call = need()? as usize,
+                other => bail!(
+                    "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_items)"
+                ),
             }
         }
     }
@@ -606,25 +635,27 @@ fn load_program_limits(config_path: &Path) -> Result<kloop_core::ProgramLimits> 
     Ok(limits)
 }
 
+fn sandbox_disabled_from_env() -> bool {
+    matches!(
+        std::env::var("KLOOP_SANDBOX").ok().as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
 /// The session sandbox policy, or None with a warning when unavailable —
-/// fail-open like hooks: the permission gate stays the enforcement layer.
-/// Built once per process and shared into every Config (server threads too).
+/// fail-open like hooks: the permission gate stays the enforcement layer. The
+/// global switches are process-stable; cwd is the per-session writable root.
 pub(crate) fn build_sandbox(
     args: &CliArgs,
     cwd: &Path,
-    config_path: &Path,
+    runtime: &RuntimeSettings,
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
-    // --mock stays hermetic; KLOOP_SANDBOX=off is the env escape hatch.
-    if args.mock
-        || matches!(
-            std::env::var("KLOOP_SANDBOX").ok().as_deref(),
-            Some("off") | Some("0") | Some("false")
-        )
-    {
+    // --mock stays hermetic; the env escape hatch was captured at startup.
+    if args.mock || runtime.sandbox_disabled_by_env {
         return Ok(None);
     }
-    let settings = load_sandbox_settings(config_path)?;
+    let settings = &runtime.sandbox;
     if !settings.enabled {
         return Ok(None);
     }
@@ -635,7 +666,8 @@ pub(crate) fn build_sandbox(
                 &settings.writable_roots,
                 settings.allow_network,
             )
-            .with_denied_read_path(&crate::provider_config::global_config_path()?);
+            .with_denied_read_path(&runtime.config_path)
+            .with_denied_read_path(&runtime.oauth_store_path);
             policy.auto_allow = settings.auto_allow;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
@@ -652,7 +684,7 @@ pub(crate) fn build_sandbox(
 /// KLOOP_DEFER_THRESHOLD: total tool count above which MCP tool definitions
 /// are deferred behind tool_search. Lower it to exercise deferral with a
 /// small server; raise it to effectively disable deferral.
-pub(crate) fn defer_threshold_from_env() -> Result<usize> {
+fn defer_threshold_from_env() -> Result<usize> {
     match std::env::var("KLOOP_DEFER_THRESHOLD").ok() {
         Some(raw) => raw
             .parse::<usize>()
@@ -672,31 +704,18 @@ fn context_window_from_env() -> Result<Option<u64>> {
     }
 }
 
-/// Safe effective-config allowlist for native `config/read`. Parsing may read
-/// the full local TOML, but only these non-sensitive values cross the protocol.
+/// Safe effective-config allowlist for native `config/read`. The source table
+/// may contain secrets, but only these non-sensitive values cross the protocol.
 pub(crate) fn server_config_snapshot(
     args: &CliArgs,
     cwd: &Path,
     provider: &ResolvedProviderSettings,
+    runtime: &RuntimeSettings,
 ) -> Result<ConfigSnapshot> {
-    let settings = if args.mock {
-        SandboxSettings {
-            enabled: false,
-            allow_network: false,
-            writable_roots: Vec::new(),
-            auto_allow: false,
-            escalate: false,
-        }
-    } else {
-        load_sandbox_settings(&cwd.join(PROJECT_CONFIG))?
-    };
-    let env_disables_sandbox = matches!(
-        std::env::var("KLOOP_SANDBOX").ok().as_deref(),
-        Some("off") | Some("0") | Some("false")
-    );
+    let settings = &runtime.sandbox;
     let sandbox_enabled = !args.mock
         && settings.enabled
-        && !env_disables_sandbox
+        && !runtime.sandbox_disabled_by_env
         && kloop_core::sandbox::availability().is_ok();
     Ok(ConfigSnapshot {
         cwd: cwd.to_string_lossy().to_string(),
@@ -706,13 +725,13 @@ pub(crate) fn server_config_snapshot(
         } else {
             args.permission_mode.label().into()
         },
-        context_window: context_window_from_env()?,
-        defer_threshold: defer_threshold_from_env()?,
+        context_window: runtime.context_window,
+        defer_threshold: runtime.defer_threshold,
         sandbox: SandboxConfigInfo {
             enabled: sandbox_enabled,
-            allow_network: settings.allow_network,
-            auto_allow: settings.auto_allow,
-            escalate: settings.escalate,
+            allow_network: !args.mock && settings.allow_network,
+            auto_allow: !args.mock && settings.auto_allow,
+            escalate: !args.mock && settings.escalate,
         },
         worktree_enabled: !args.mock,
     })
@@ -722,38 +741,21 @@ pub(crate) fn server_config_snapshot(
 pub(crate) fn config_from_settings(
     args: &CliArgs,
     provider: &ResolvedProviderSettings,
+    runtime: &RuntimeSettings,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
     project: &context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
-    agent_types: Arc<Vec<AgentType>>,
     skills: Arc<Vec<Skill>>,
     cwd: &Path,
-    config_path: &Path,
 ) -> Result<Config> {
-    let permissions = Arc::new(build_permissions(args, cwd, config_path, approver, notify)?);
-    // --mock stays hermetic: no config reads, no hook child processes.
-    let hooks = if args.mock {
-        Hooks::none()
-    } else {
-        Hooks {
-            defs: load_hooks(config_path)?,
-        }
-    };
+    let permissions = Arc::new(build_permissions(args, cwd, runtime, approver, notify)?);
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
     // The main agent's cwd anchor is the process cwd (same value build_permissions
     // reads); a worktree sub-agent later rewires its own clone off this.
     let cwd = cwd.to_path_buf();
-    // Code-mode resource limits: default unless [codemode]/KLOOP_PROGRAM_* set.
-    let program_limits = if args.mock {
-        kloop_core::ProgramLimits::default()
-    } else {
-        load_program_limits(config_path)?
-    };
-    // KLOOP_CONTEXT_WINDOW: token budget for compaction ("off" disables).
-    let context_window = context_window_from_env()?;
     let base = Config {
         provider: Arc::new(Provider::mock(vec![])),
         model: "mock".into(),
@@ -763,25 +765,25 @@ pub(crate) fn config_from_settings(
         cwd,
         offload_dir,
         sessions_dir,
-        context_window,
-        fallback_model: std::env::var("KLOOP_FALLBACK_MODEL").ok(),
+        context_window: runtime.context_window,
+        fallback_model: runtime.fallback_model.clone(),
         permissions,
         tool_sources: tool_sources.to_vec(),
         // The caller stamps the real session id once it knows it (after
         // open_history / per server thread).
         session_id: String::new(),
         agent_label: String::new(),
-        hooks: Arc::new(hooks),
+        hooks: Arc::clone(&runtime.hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         background_tasks: kloop_core::tools::BackgroundTasks::new(),
         sandbox,
-        agent_types,
+        agent_types: Arc::clone(&runtime.agent_types),
         tool_allowlist: None,
-        defer_threshold: defer_threshold_from_env()?,
+        defer_threshold: runtime.defer_threshold,
         unlocked_tools: Default::default(),
         todos: Default::default(),
         inbox: Default::default(),
-        program_limits,
+        program_limits: runtime.program_limits,
         skills,
         active_worktree: Arc::new(std::sync::RwLock::new(None)),
         // Worktree mode (enter/exit tools) is on everywhere but --mock (which is
@@ -857,6 +859,103 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
 mod tests {
     use super::*;
 
+    fn config(raw: &str) -> toml::Table {
+        raw.parse().unwrap()
+    }
+
+    #[test]
+    fn config_snapshot_uses_global_policy_and_ignores_cwd_config() {
+        let base =
+            std::env::temp_dir().join(format!("kloop-global-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd_a = base.join("a");
+        let cwd_b = base.join("b");
+        std::fs::create_dir_all(cwd_a.join(".kloop")).unwrap();
+        std::fs::create_dir_all(cwd_b.join(".kloop")).unwrap();
+        std::fs::write(cwd_a.join(".kloop/config.toml"), "not valid toml = [").unwrap();
+        std::fs::write(
+            cwd_b.join(".kloop/config.toml"),
+            "[sandbox]\nallow_network = false\nauto_allow = true\n",
+        )
+        .unwrap();
+        let root = config(
+            r#"
+model = "secret-model"
+[model_providers.secret]
+wire_api = "responses"
+http_headers = { Authorization = "Bearer SENTINEL-PROVIDER" }
+[permissions]
+allow = ["bash(secret *)"]
+[[hooks]]
+event = "pre_turn"
+command = ["SENTINEL-HOOK"]
+[sandbox]
+allow_network = true
+auto_allow = false
+escalate = false
+[mcp.servers.remote]
+url = "https://mcp.example.test"
+http_headers = { Authorization = "SENTINEL-MCP" }
+"#,
+        );
+        let config = UserConfig::from_parts(base.join("home/.kloop/config.toml"), root);
+        let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
+        let args = crate::args::parse_args(&[]).unwrap();
+        let provider = ResolvedProviderSettings::mock();
+
+        let snapshot_a = server_config_snapshot(&args, &cwd_a, &provider, &runtime).unwrap();
+        let snapshot_b = server_config_snapshot(&args, &cwd_b, &provider, &runtime).unwrap();
+
+        let mut normalized_a = snapshot_a.clone();
+        normalized_a.cwd = snapshot_b.cwd.clone();
+        assert_eq!(normalized_a, snapshot_b);
+        assert!(snapshot_a.sandbox.allow_network);
+        assert!(!snapshot_a.sandbox.auto_allow);
+        assert!(!snapshot_a.sandbox.escalate);
+        let wire = serde_json::to_string(&snapshot_a).unwrap();
+        for secret in [
+            "secret-model",
+            "SENTINEL-PROVIDER",
+            "bash(secret *)",
+            "SENTINEL-HOOK",
+            "SENTINEL-MCP",
+        ] {
+            assert!(!wire.contains(secret), "config/read leaked {secret}");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn sandbox_denies_global_config_and_oauth_store_reads() {
+        if kloop_core::sandbox::availability().is_err()
+            || matches!(
+                std::env::var("KLOOP_SANDBOX").ok().as_deref(),
+                Some("off") | Some("0") | Some("false")
+            )
+        {
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("kloop-global-sandbox-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let config_path = base.join("home/.kloop/config.toml");
+        let oauth_path = config_path
+            .parent()
+            .unwrap()
+            .join(crate::user_config::OAUTH_STORE);
+        let config = UserConfig::from_parts(config_path.clone(), toml::Table::new());
+        let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
+        let args = crate::args::parse_args(&[]).unwrap();
+
+        let policy = build_sandbox(&args, &base, &runtime, |_| {})
+            .unwrap()
+            .unwrap();
+
+        assert!(policy.denied_read_paths.contains(&config_path));
+        assert!(policy.denied_read_paths.contains(&oauth_path));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn native_skills_snapshot_omits_commands_and_bodies() {
         let base = std::env::temp_dir().join(format!("kloop-native-skills-{}", std::process::id()));
@@ -899,17 +998,12 @@ mod tests {
 
     #[test]
     fn agent_types_parse_fields_and_reject_malformed() {
-        let dir = std::env::temp_dir().join(format!("kloop-agents-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
+        assert!(load_agent_types(&toml::Table::new()).unwrap().is_empty());
+        assert!(load_agent_types(&config("[permissions]\nallow = []\n"))
+            .unwrap()
+            .is_empty());
 
-        // Missing file / no [agents]: empty.
-        assert!(load_agent_types(&path).unwrap().is_empty());
-        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
-        assert!(load_agent_types(&path).unwrap().is_empty());
-
-        std::fs::write(
-            &path,
+        let root = config(
             "[agents.researcher]\n\
              description = \"Searches the codebase.\"\n\
              system = \"You research.\"\n\
@@ -918,11 +1012,13 @@ mod tests {
              \n\
              [agents.reviewer]\n\
              description = \"Reviews a diff.\"\n",
-        )
-        .unwrap();
-        let types = load_agent_types(&path).unwrap();
+        );
+        let types = load_agent_types(&root).unwrap();
         assert_eq!(types.len(), 2);
-        let researcher = types.iter().find(|t| t.name == "researcher").unwrap();
+        let researcher = types
+            .iter()
+            .find(|agent| agent.name == "researcher")
+            .unwrap();
         assert_eq!(
             (
                 researcher.description.as_str(),
@@ -937,22 +1033,21 @@ mod tests {
                 Some(vec!["grep".to_string(), "read_file".to_string()]),
             )
         );
-        let reviewer = types.iter().find(|t| t.name == "reviewer").unwrap();
+        let reviewer = types.iter().find(|agent| agent.name == "reviewer").unwrap();
         assert_eq!(reviewer.system, None);
         assert_eq!(reviewer.model, None);
         assert_eq!(reviewer.tools, None);
 
         for bad in [
-            "[agents.x]\n",                                        // no description
-            "[agents.x]\ndescription = 3\n",                       // wrong type
-            "[agents.x]\ndescription = \"d\"\nmodel = 5\n",        // wrong type
-            "[agents.x]\ndescription = \"d\"\ntools = \"grep\"\n", // tools not an array
-            "[agents.x]\ndescription = \"d\"\ntools = [3]\n",      // tools not strings
-            "[agents.x]\ndescription = \"d\"\nprompt = \"p\"\n",   // unknown key
-            "agents = 3\n",                                        // [agents] not a table
+            "[agents.x]\n",
+            "[agents.x]\ndescription = 3\n",
+            "[agents.x]\ndescription = \"d\"\nmodel = 5\n",
+            "[agents.x]\ndescription = \"d\"\ntools = \"grep\"\n",
+            "[agents.x]\ndescription = \"d\"\ntools = [3]\n",
+            "[agents.x]\ndescription = \"d\"\nprompt = \"p\"\n",
+            "agents = 3\n",
         ] {
-            std::fs::write(&path, bad).unwrap();
-            assert!(load_agent_types(&path).is_err(), "accepted: {bad}");
+            assert!(load_agent_types(&config(bad)).is_err(), "accepted: {bad}");
         }
     }
 
@@ -1101,39 +1196,41 @@ mod tests {
 
     #[test]
     fn sandbox_settings_parse_defaults_and_reject_unknown_keys() {
-        let dir = std::env::temp_dir().join(format!("kloop-sbxcfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-
-        // Missing file / missing section: sandbox on, network off, no
-        // extras, auto-allow on, escalate on.
-        let settings = load_sandbox_settings(&path).unwrap();
+        let settings = load_sandbox_settings(&toml::Table::new()).unwrap();
         assert!(settings.enabled);
         assert!(!settings.allow_network);
         assert!(settings.writable_roots.is_empty());
         assert!(settings.auto_allow);
         assert!(settings.escalate);
-        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
-        assert!(load_sandbox_settings(&path).unwrap().enabled);
+        assert!(
+            load_sandbox_settings(&config("[permissions]\nallow = []\n"))
+                .unwrap()
+                .enabled
+        );
 
-        std::fs::write(
-            &path,
+        let settings = load_sandbox_settings(&config(
             "[sandbox]\nenabled = true\nallow_network = true\nwritable_roots = [\"/opt/data\"]\n",
-        )
+        ))
         .unwrap();
-        let settings = load_sandbox_settings(&path).unwrap();
         assert!(settings.enabled);
         assert!(settings.allow_network);
         assert_eq!(settings.writable_roots, vec![PathBuf::from("/opt/data")]);
 
-        std::fs::write(&path, "[sandbox]\nenabled = false\n").unwrap();
-        assert!(!load_sandbox_settings(&path).unwrap().enabled);
-
-        std::fs::write(&path, "[sandbox]\nauto_allow = false\n").unwrap();
-        assert!(!load_sandbox_settings(&path).unwrap().auto_allow);
-
-        std::fs::write(&path, "[sandbox]\nescalate = false\n").unwrap();
-        assert!(!load_sandbox_settings(&path).unwrap().escalate);
+        assert!(
+            !load_sandbox_settings(&config("[sandbox]\nenabled = false\n"))
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !load_sandbox_settings(&config("[sandbox]\nauto_allow = false\n"))
+                .unwrap()
+                .auto_allow
+        );
+        assert!(
+            !load_sandbox_settings(&config("[sandbox]\nescalate = false\n"))
+                .unwrap()
+                .escalate
+        );
 
         for bad in [
             "[sandbox]\nenabled = \"yes\"\n",
@@ -1145,70 +1242,116 @@ mod tests {
             "[sandbox]\nnetwork = true\n",
             "sandbox = true\n",
         ] {
-            std::fs::write(&path, bad).unwrap();
-            assert!(load_sandbox_settings(&path).is_err(), "accepted: {bad}");
+            assert!(
+                load_sandbox_settings(&config(bad)).is_err(),
+                "accepted: {bad}"
+            );
         }
     }
 
     #[test]
-    fn permission_config_round_trip_and_merge() {
-        let dir = std::env::temp_dir().join(format!("kloop-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
+    fn codemode_config_rejects_unknown_and_nonpositive_limits() {
+        for bad in [
+            "codemode = false\n",
+            "[codemode]\nmax_agents = 0\n",
+            "[codemode]\nmemory_mb = \"large\"\n",
+            "[codemode]\nunknown = 1\n",
+        ] {
+            assert!(
+                load_program_limits(&config(bad)).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
 
-        // Missing file: empty rules, no error.
+    #[test]
+    fn permission_config_parses_and_rejects_malformed_sections() {
         assert_eq!(
-            load_permission_rules(&path).unwrap(),
+            parse_permission_rules(&toml::Table::new()).unwrap(),
             PermissionRules::default()
         );
 
-        // Persist into a file that has unrelated content to preserve.
-        std::fs::write(
-            &path,
-            "[provider]\nname = \"anthropic\"\n\n[permissions]\ndeny = [\"bash(git push *)\"]\n",
-        )
+        let rules = parse_permission_rules(&config(
+            "[permissions]\nallow = [\"bash(cargo build *)\"]\ndeny = [\"bash(git push *)\"]\nask = [\"web_fetch\"]\n",
+        ))
         .unwrap();
-        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap();
-        persist_allow_rules(&path, &["bash(cargo build *)".into()]).unwrap(); // dedup
-
-        let rules = load_permission_rules(&path).unwrap();
         assert_eq!(
             rules,
             PermissionRules {
                 allow: vec!["bash(cargo build *)".into()],
                 deny: vec!["bash(git push *)".into()],
+                ask: vec!["web_fetch".into()],
+            }
+        );
+
+        for bad in [
+            "[permissions]\nallow = \"not-an-array\"\n",
+            "[permissions]\nallow = [3]\n",
+            "[permissions]\nunknown = []\n",
+            "permissions = false\n",
+        ] {
+            assert!(
+                parse_permission_rules(&config(bad)).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_allow_rules_update_the_process_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "kloop-global-permission-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.join("config.toml");
+        crate::user_config::write_private_atomic(
+            &path,
+            "test config",
+            b"[permissions]\ndeny = [\"bash(git push *)\"]\n",
+        )
+        .unwrap();
+        let shared = Arc::new(Mutex::new(PermissionRules {
+            deny: vec!["bash(git push *)".into()],
+            ..PermissionRules::default()
+        }));
+
+        persist_global_allow_rules(&path, &shared, &["bash(cargo test *)".into()]).unwrap();
+
+        assert_eq!(
+            shared.lock().unwrap().clone(),
+            PermissionRules {
+                allow: vec!["bash(cargo test *)".into()],
+                deny: vec!["bash(git push *)".into()],
                 ask: vec![],
             }
         );
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            raw.contains("[provider]"),
-            "unrelated sections preserved:\n{raw}"
+        let raw = crate::user_config::read_private_string(&path, "test config")
+            .unwrap()
+            .unwrap();
+        let disk: toml::Table = raw.parse().unwrap();
+        assert_eq!(
+            disk["permissions"]["allow"].as_array().unwrap(),
+            &[toml::Value::String("bash(cargo test *)".into())]
         );
-        assert_eq!(raw.matches("cargo build").count(), 1, "no duplicate rule");
-
-        // Malformed arrays are an error, not a silent skip.
-        std::fs::write(&path, "[permissions]\nallow = \"not-an-array\"\n").unwrap();
-        assert!(load_permission_rules(&path).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn load_hooks_full_round_trip() {
-        let dir = std::env::temp_dir().join(format!("kloop-hooks-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-
-        // Missing file / missing section: empty, no error.
+        assert_eq!(load_hooks(&toml::Table::new()).unwrap(), vec![]);
         assert_eq!(
-            load_hooks(Path::new("/nonexistent/kloop.toml")).unwrap(),
+            load_hooks(&config("[permissions]\nallow = []\n")).unwrap(),
             vec![]
         );
-        std::fs::write(&path, "[permissions]\nallow = []\n").unwrap();
-        assert_eq!(load_hooks(&path).unwrap(), vec![]);
 
-        std::fs::write(
-            &path,
+        let root = config(
             r#"
 [[hooks]]
 event = "pre_tool"
@@ -1220,10 +1363,9 @@ timeout_ms = 5000
 event = "post_turn"
 command = ["notify-send"]
 "#,
-        )
-        .unwrap();
+        );
         assert_eq!(
-            load_hooks(&path).unwrap(),
+            load_hooks(&root).unwrap(),
             vec![
                 HookDef {
                     event: HookEvent::PreTool,
@@ -1239,14 +1381,10 @@ command = ["notify-send"]
                 },
             ]
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn load_hooks_rejects_malformed_entries() {
-        let dir = std::env::temp_dir().join(format!("kloop-hooks-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
         for (tag, bad) in [
             ("noevent", "[[hooks]]\ncommand = [\"x\"]\n"),
             (
@@ -1274,10 +1412,9 @@ command = ["notify-send"]
                 "unknownkey",
                 "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"x\"]\nwhen = \"always\"\n",
             ),
+            ("section", "hooks = false\n"),
         ] {
-            std::fs::write(&path, bad).unwrap();
-            assert!(load_hooks(&path).is_err(), "{tag} should fail");
+            assert!(load_hooks(&config(bad)).is_err(), "{tag} should fail");
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

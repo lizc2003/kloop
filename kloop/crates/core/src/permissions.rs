@@ -102,8 +102,8 @@ pub trait Approver: Send + Sync {
 }
 
 /// Sink invoked on [`Decision::AllowAlways`] with the rule strings to
-/// persist; the CLI writes them to `.kloop/config.toml`. Errors are the
-/// sink's problem to report (the gate has no UI).
+/// persist; the CLI writes them to global `~/.kloop/config.toml`. Errors are
+/// the sink's problem to report (the gate has no UI).
 pub type PersistFn = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 /// Gating mode, after cc's permission modes.

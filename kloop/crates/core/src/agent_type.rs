@@ -1,7 +1,7 @@
 //! Custom agent types (plan 17 slice 2): named sub-agent definitions that
 //! override the system prompt, model, and available tools. Dispatched via the
-//! `task` tool's `agent_type` parameter; loaded from `.kloop/config.toml`
-//! `[agents.<name>]` by the CLI. The shape follows cc's `.claude/agents`
+//! `task` tool's `agent_type` parameter; loaded from global
+//! `~/.kloop/config.toml` `[agents.<name>]` by the CLI. The shape follows cc's `.claude/agents`
 //! frontmatter — the system prompt is **replaced**, not concatenated; an
 //! omitted model or tool set inherits the parent's; an unknown type is an
 //! error that lists what is available.
