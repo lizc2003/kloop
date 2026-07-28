@@ -92,7 +92,19 @@ Plan 48 已提交以下可重放基线:
 - `collect.py`/`verify.py`:采集前 exact identity guard，隔离 HOME/config/cwd、本地 provider/Web/MCP，
   受限 normalization、hash/determinism、证据引用、文件集合、环境/网络和敏感信息 fail-closed 校验。
 
-当前矩阵有 47 个 `compatible`、43 个 `intentional-diff`、20 个 `missing`、215 个
+Plan 49 的 CC 证据检查点现有 82 条静态证据；上列 46 条保持为 Plan 48 的历史提交数。
+当前采集集为 71 组 capture：40 组 schema v1，31 组 schema v2 scripted workspace，
+包含 17 组 normalized bytes 完全一致的 determinism pair；矩阵为 55 行。schema v2 保留
+provider/tool/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace mtime，以及由
+fixture 明示的 interactive PTY 收尾状态。
+
+新增证据固定了 Read 文本/媒体/二进制分支、Write/Edit prior-read 与 stale 路径、Grep parser/output、
+hidden/VCS/gitignore allowed-path 观察、路径种类和同轮读写顺序。Write/Edit interactive pair 进一步证明：
+approve 后 Write 会重新检查 stale；Edit 可在 old string 仍唯一时 stale-recover 并保留无关外部修改；
+明确 No 和 Esc 均不返回最终工具结果且不改文件。search-policy fixture 使用 case-scoped allow override，
+不能作为默认敏感路径 ask/deny gate 的证据。
+
+当前矩阵有 47 个 `compatible`、43 个 `intentional-diff`、20 个 `missing`、311 个
 `unknown`、19 个 `n/a` 单元，**没有 `same`**。这不是漏标：`same` 必须同时有对应 CC fixture
 与锁定相同行为的 kloop golden；静态 locator、名字或相似 schema 都不够。WebFetch 本地 URL 在
 2.1.220 的 domain-safety 层先被拒、stub 收到 0 请求，因此只证明权限顺序，重定向/认证/大响应
