@@ -92,24 +92,35 @@ Plan 48 已提交以下可重放基线:
 - `collect.py`/`verify.py`:采集前 exact identity guard，隔离 HOME/config/cwd、本地 provider/Web/MCP，
   受限 normalization、hash/determinism、证据引用、文件集合、环境/网络和敏感信息 fail-closed 校验。
 
-Plan 49 的 CC 证据检查点现有 82 条静态证据；上列 46 条保持为 Plan 48 的历史提交数。
-当前采集集为 71 组 capture：40 组 schema v1，31 组 schema v2 scripted workspace，
-包含 17 组 normalized bytes 完全一致的 determinism pair；矩阵为 55 行。schema v2 保留
-provider/tool/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace mtime，以及由
-fixture 明示的 interactive PTY 收尾状态。
+Plan 49 已在该基线上闭环文件/搜索簇。`static-evidence.jsonl` 现有 92 条证据：Plan 48
+的 46 条仍是历史提交数，新增 kloop Read/Write/Edit/file-state/Glob/Grep code + golden anchor
+也进入 fail-closed 必备集合。采集集仍为 71 组 capture：40 组 schema v1，31 组 schema v2
+scripted workspace，包含 17 组 normalized bytes 完全一致的 determinism pair；矩阵仍为 55 行。
+schema v2 保留 provider/tool/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace
+mtime，以及由 fixture 明示的 interactive PTY 收尾状态。
 
-新增证据固定了 Read 文本/媒体/二进制分支、Write/Edit prior-read 与 stale 路径、Grep parser/output、
-hidden/VCS/gitignore allowed-path 观察、路径种类和同轮读写顺序。Write/Edit interactive pair 进一步证明：
-approve 后 Write 会重新检查 stale；Edit 可在 old string 仍唯一时 stale-recover 并保留无关外部修改；
-明确 No 和 Esc 均不返回最终工具结果且不改文件。search-policy fixture 使用 case-scoped allow override，
-不能作为默认敏感路径 ask/deny gate 的证据。
+新增证据固定了 Read 文本/媒体/二进制分支、Write/Edit prior-read 与 stale 路径、Grep
+parser/output、hidden/VCS/gitignore allowed-path 观察、路径种类和同轮读写顺序。CC 的
+interactive pair 证明批准后 Write 会重新检查 stale；Edit 可在 old string 对当前内容仍唯一时
+stale-recover 并保留无关外部修改；明确 No 和 Esc 均不返回最终工具结果且不改文件。
 
-当前矩阵有 47 个 `compatible`、43 个 `intentional-diff`、20 个 `missing`、311 个
-`unknown`、19 个 `n/a` 单元，**没有 `same`**。这不是漏标：`same` 必须同时有对应 CC fixture
-与锁定相同行为的 kloop golden；静态 locator、名字或相似 schema 都不够。WebFetch 本地 URL 在
-2.1.220 的 domain-safety 层先被拒、stub 收到 0 请求，因此只证明权限顺序，重定向/认证/大响应
-executor 仍为 `unknown`。ToolSearch 则已黑盒证明 `ENABLE_TOOL_SEARCH=true` 下首请求 defer、
-`select:` 引入目标 MCP schema，以及 `tools/list_changed` 后 100→101 刷新。
+kloop 则保留更严格的安全边界：Read 在 permission 前 canonicalize + no-follow/nonblocking 打开 regular-file descriptor，仍用原始 alias 匹配规则，Unix 多 hard-link regular file 因 pathname 无法分类同 inode 的其他名字而拒绝，只有最终成功、完整展示的结果建立 session-only observation；
+existing Write/Edit 要求完整且 fresh，任意版本漂移都 fail closed；pre-hook 后只允许 leaf 缺失、
+直接父目录必须存在，先 canonicalize + no-follow 打开 parent directory handle，让 permission deny/
+sensitive/acceptEdits 与审批 preview 判断同一 effective target；批准后复核 parent dev/inode，随后 target
+read、同目录 temp、最终复核、rename、cleanup 与 parent sync 全 descriptor-relative，不重新遍历父路径，
+因此 parent alias 不能隐藏或在等待中改指 `.git` 等目标。提交保留权限、sync 并拒绝 symlink/非普通
+leaf。Read 文本和 Grep/Glob 模型输出使用 UTF-8 安全的 7k 字符上限；PDF 与非 UTF-8 文本明确拒绝。
+Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 inode，permission 同看 original + resolved path，再由 `search_reader` 搜 descriptor，消除 filter→pathname reopen 竞态；多 hard-link candidate 作为不可安全分类的 inode alias 隐藏并计数；Glob/Grep 继续尊重 `.gitignore`、跳 VCS，并在读取前过滤 deny/sensitive 路径。CC 会为新文件隐式
+创建缺失父目录，kloop 也不复制这一行为；它与 CC partial-read、Edit stale recovery、广义搜索可见性
+均记为 `intentional-diff`，没有为字面一致降级。descriptor boundary 阻断审批等待中的常规 alias retarget，但不是 hostile same-UID 文件系统事务；最终 identity check→`renameat` 的微小 namespace window 仍明确保留。
+
+当前 440 个矩阵单元为 71 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
+241 个 `unknown`、20 个 `n/a`、5 个 `same`。五个 `same` 只出现在有 CC fixture、直接
+`kloop:` golden 和 `kloop_golden: true` 三重证据的并发分类；verifier 会拒绝缺任一条件的生成物。
+Grep 在 CC clean profile 被条件 gate 隐藏，而 kloop 始终可用，故注册记有意差异。WebFetch 本地
+URL 仍在 2.1.220 domain-safety 层先被拒、stub 收到 0 请求，所以重定向/认证/大响应 executor
+继续为 `unknown`；Plan 49 没有外推其他工具簇。
 
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
@@ -121,9 +132,15 @@ python3 -B refs/claude-code-2.1.220/build_matrix.py
 python3 -B refs/claude-code-2.1.220/verify.py
 ```
 
+`collect --all` 会采出带新临时路径/端口的 raw 文件，它是重放审计，不是改写 Plan 48 历史
+capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复 immutable legacy raw/manifest
+条目；`verify.py` 会故意拒绝 40 份历史 hash 漂移。只在 case 契约本身变更时发布对应 pair，随后
+运行 `build_matrix.py` 与 `build_matrix.py --check`。
+
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
-`docs/plan/48-claude-code-2.1.220-tool-parity.md`。基线只完成事实盘点，不表示 kloop 已全工具
-对齐或可替换 Claude Code；产品行为要由 Plan 49–59 逐簇实现与验收。
+`docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
+`docs/plan/49-file-search-parity.md`。Plan 49 的完成不表示 kloop 已全工具对齐或可替换
+Claude Code；其余产品行为仍由 Plan 50–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

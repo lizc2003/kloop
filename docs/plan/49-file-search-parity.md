@@ -1,6 +1,6 @@
 # Plan 49 — 文件与搜索工具对齐
 
-> 状态：进行中（2026-07-28）
+> 状态：✅ 已完成（2026-07-29）
 >
 > 母计划：Plan 48
 >
@@ -10,11 +10,11 @@
 
 ## 背景
 
-Plan 48 只建立了 Claude Code 2.1.220 的工具矩阵与采集基线，并纵向打通了 Glob 的部分行为。Read、Write、Edit 和 Grep 目前主要停留在注册面，不能据工具同名、相似 schema 或 kloop 已有测试宣称行为一致。
+Plan 48 只建立了 Claude Code 2.1.220 的工具矩阵与采集基线，并纵向打通了 Glob 的部分行为。开工时 Read、Write、Edit 和 Grep 主要停留在注册面，不能据工具同名、相似 schema 或 kloop 已有测试宣称行为一致。
 
 本计划收敛文件与搜索行为簇：Read、Write、Edit、Glob、Grep，以及 stale-read、路径边界、分页、排序、截断、并发和生命周期。Worktree 生命周期留给 Plan 56，Notebook/LSP 留给 Plan 57。
 
-kloop 当前还有两个独立产品缺口：Read 尚无有界输出和读取状态；Write/Edit 直接覆盖文件，既不能可靠阻止 stale update，也不能保证写入失败时原文件不出现半写。因此本轮按以下硬顺序推进：
+kloop 开工时还有两个独立产品缺口：Read 尚无有界输出和读取状态；Write/Edit 直接覆盖文件，既不能可靠阻止 stale update，也不能保证写入失败时原文件不出现半写。因此本轮按以下硬顺序推进：
 
 ```text
 精确 bundle 静态链
@@ -27,7 +27,7 @@ kloop 当前还有两个独立产品缺口：Read 尚无有界输出和读取状
 
 精确 2.1.220 bundle 与隔离黑盒 fixture 是 CC 契约的唯一裁决源；固定参考源码只用于设计 probe。安全性冲突时保留 kloop 更严格的敏感路径、读取新鲜度和失败原子性，并标为 `intentional-diff`，不为追求字面一致而降级。
 
-## 当前证据与差距
+## 完成裁决
 
 对应 matrix 行：
 
@@ -36,29 +36,31 @@ kloop 当前还有两个独立产品缺口：Read 尚无有界输出和读取状
 - `edit@clean-cli`
 - `glob@allow-cli`
 - `grep@clean-cli`
+- `grep@allow-cli`
 
-当前结论：
+最终结论：
 
-- Read/Write/Edit 只有 registration、schema 为 `compatible`；parser 到 lifecycle 均未成对核验。
-- Glob 的 parser、executor、output 有黑盒 fixture，但只保守标 `compatible`；permission、concurrency 仍为 `unknown`。
-- Grep 没出现在 clean CC profile；这只说明该 profile 下未观察到，不能推断工具不存在或不适用。
-- 现有 Glob fixture 覆盖最小输入、缺字段、错类型、空 pattern、100 文件上限和字符截断。
-- bundle 中 Notebook/Edit stale-read 稳定字符串只是静态线索，不能代替 Edit 完整链或 NotebookRead 注册证据。
+- Read/Write/Edit 的注册与 schema 为 `compatible`；Read、Glob、Grep 只读并发与 Write 串行分类有成对动态证据，标为 `same`。其余结果按实际语义分成 `compatible` 或 `intentional-diff`，不把名字相同外推成逐字节一致。
+- 只有最终成功且完整展示的 Read 建立 session mutation observation。kloop 对 existing Write/Edit 要求完整 fresh Read；CC 接受部分 Write 资格、unread/partial Edit，并可对唯一 old string stale-recover，因此执行和 lifecycle 保留有意差异。
+- kloop mutation 用 normalized-path keyed lock、同目录 `create_new` 临时文件、权限保留、sync、最终版本复核、atomic rename、parent sync 和失败清理；symlink/非普通文件拒绝。
+- Read 文本按字符安全地限制为 7k，PDF 与非 UTF-8 明确拒绝；图片仍为结构化 block。Grep 已补 `context`、`-o`、数字字符串、单文件路径格式和分页；Glob 精确 100 项并把 program 数组与模型字符预算分开。
+- Glob/Grep 继续尊重 `.gitignore`、跳 VCS，并在读取前过滤 deny/sensitive 路径并报告 hidden count。CC 的 allowed-path fixture 会列 ignored/VCS/sensitive 内容，这些安全/产品差异不移除。
+- Grep 在 CC clean profile 受条件 gate 隐藏、allow profile 才可见；kloop 始终注册。clean 注册标 `intentional-diff`，不是 `missing`。
 
-### CC 证据检查点（2026-07-28）
+### 证据与 matrix 闭环（2026-07-29）
 
-产品实现前的 CC 侧闸门已形成可重放 corpus，暂不把任何行为标为 `same`：
+CC 侧可重放 corpus 与 kloop paired goldens 已共同进入生成器和 verifier：
 
-- 精确 2.1.220 静态证据增至 82 条，补齐 Read media/result、Write/Edit permission/result/inherited concurrency、Glob permission/concurrency，以及 Glob/Grep 条件注册过滤链。
-- capture 增至 71 组：40 组 schema v1、31 组 schema v2；17 个 determinism group 均为两次 normalized bytes 完全一致，same-round concurrency 仍是显式 singleton，不伪装 deterministic pair。
-- matrix 增至 55 行，当前为 47 `compatible`、43 `intentional-diff`、20 `missing`、311 `unknown`、19 `n/a`、0 `same`。新增 evidence 只填引用；没有 paired kloop golden 的维度继续保持 `unknown`。
-- Read fixture 已固定文本范围/错误/截断，以及 non-UTF-8、PNG、PDF、普通二进制和工作区内 symlink 分支；PDF 页提取在本机缺少 poppler 时保留明确依赖错误，不外推跨平台结果。
-- Write/Edit fixture 已固定 prior-read、partial/unread、stale、匹配与 path-kind 行为。interactive pair 证明 stale 检查发生在批准后：Write 拒绝覆盖已外部修改的文件；Edit 在 old string 对当前内容仍唯一时 stale-recover，并保留无关外部修改。
-- Write/Edit 的明确 No 与 Esc cancel 均不产生最终 round 的 tool result，workspace 保持不变。交互 fixture 的进程由 harness 在 provider final 或按键后受控收尾；raw returncode 保留实值，normalized 以已声明的 termination policy 消除 0/143 收尾竞态。
-- Grep 的可见性由 CLI opt-in 与默认 suppression/final pool filter 共同控制；clean profile 缺席仍只作负观察。search-policy capture 使用 case-scoped allow override，只证明 allowed-path 下的 hidden/VCS/gitignore、敏感文件读取和顺序，不证明默认 ask/deny gate。
-- Write/Edit descriptor 未覆写 concurrency/read-only 方法，证据只在完整 descriptor span 零命中并结合 shared adapter defaults 后裁决为继承 `false`；不是仅凭字符串缺席推断。
+- 精确 2.1.220 静态证据现为 92 条：CC adapter/media/permission/result/concurrency/条件注册链，加 kloop registry/dispatch/Read/Write/Edit/file-state/Glob/Grep/permission 的 code + golden anchors。
+- capture 为 71 组：40 组 schema v1、31 组 schema v2；17 个 determinism group 的 normalized bytes 完全一致，same-round concurrency 仍是明确 singleton，不伪装 deterministic pair。
+- matrix 为 55 行、440 个维度单元：71 `compatible`、83 `intentional-diff`、20 `missing`、241 `unknown`、20 `n/a`、5 `same`。
+- `same` 只在同一行同时引用 CC fixture、直接 `kloop:` golden 且声明 `kloop_golden: true` 时成立；`verify.py` 对这三门 fail closed。其余 paired 但非逐字节同义的行为只标 `compatible`。
+- Read/Write/Edit/Grep/file-state 的 kloop anchor 已加入 Plan 49 required evidence set；手改 `tool-matrix.json` 会被 generator 重建和 verifier 拒绝。
+- interactive No/Esc 没有 CC 最终 tool result；kloop 为保持 provider history 合法会返回 error/interrupted pairing。批准后的 Write stale check、Edit stale recovery 及 workspace 结果均由 CC fixture 固定。
+- search-policy fixture 只证明 case-scoped allow 下的 CC 可见性和顺序；kloop 默认 deny/sensitive 过滤由独立 code/golden 固定，没有拿该 fixture 冒充默认 permission ask/deny 证据。
+- 241 个 `unknown` 主要属于 Plan 50–59 的其他工具簇，或当前 profile/平台未运行的维度；Plan 49 没有为降低数字越界外推。
 
-该检查点只完成 CC 事实取证和 matrix 引用，不修改 kloop 产品。下一步仍从 session-scoped observation 与 stale-safe 原子提交开始。
+该闭环只宣称文件/搜索簇完成，不表示 kloop 已全工具对齐或可替换 Claude Code。
 
 kloop 侧优先复用：
 
@@ -170,8 +172,9 @@ kloop 侧优先复用：
 
 - prior-read、完整/部分读取资格和 freshness 规则由 fixture 裁决；若 CC 更宽，kloop 保持已记录的严格 fail-closed 边界。
 - stale 检查在 permission 批准后、实际写入点重新执行；preview 读取不参与判断。
+- pre-hook 后只允许叶文件缺失；直接父目录必须已存在。先 canonicalize 并打开父目录句柄，permission/preview 使用该 canonical target，审批后复核父目录身份。
 - 同一路径通过 session keyed lock 串行。
-- 锁内 blocking critical section 完成最终复核、Edit 替换计算、同目录独占临时文件写入、flush/sync、原子 rename、父目录 sync 和失败清理。
+- 锁内 blocking critical section 的 target read、同目录独占临时文件、最终复核、rename、cleanup 和 parent sync 全部相对保留的目录句柄执行，不重新遍历已批准的父路径。
 - 保留既有文件权限；符号链接和非普通文件按 fixture 裁决且不得降低安全性。
 
 ### 6. Read、Glob、Grep 产品对齐
@@ -191,14 +194,16 @@ kloop 侧优先复用：
 - 新增 Read/Write/Edit/Grep 静态 anchor 完整性检查；禁止手工修改生成物绕过 generator。
 - 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`kloop/README.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
 
-## 不提前承诺的行为
+## 最终裁决的有意差异
 
-- Grep 在哪个 profile 注册、是否 defer，以及 CC 的真实并发 predicate。
-- Read 的精确 offset/limit、PDF/二进制、长行和截断格式。
-- Write/Edit 是否允许未读新建/覆盖、partial read、空 `old_string`、模糊匹配和符号链接。
-- Glob/Grep 的排序、`.gitignore`、hidden 和字符预算。
+- Grep 在 kloop 始终注册，不复制 CC clean/allow profile 的 search-tools gate。
+- Read 的 7k 字符预算只授权实际完整展示的行；PDF 与非 UTF-8 文本明确失败，不通过 lossy conversion 建写权限。
+- existing Write/Edit 必须完整 fresh Read；不接受 CC 的 partial Write、unread/partial Edit 或 stale recovery。
+- CC 可为新文件隐式创建缺失父目录；kloop 只允许叶文件缺失，要求直接父目录已存在，并以审批前打开的目录句柄固定提交边界。
+- Glob/Grep 尊重 `.gitignore`、跳过 VCS internals，并硬过滤 deny/sensitive 路径；输出显式说明 hidden count。
+- kloop 的成功/拒绝/取消文案和 tool_result pairing 保持 canonical provider history 合法，不复制 CC PTY 的无最终结果形态。
 
-这些必须先由 2.1.220 fixture 裁决。无法在当前平台确定性运行的分支保留 `unknown`，并写明不可运行条件和后续归属。
+这些差异都在 matrix 中标 `intentional-diff` 并有 paired fixture/golden 或静态链。其他 profile/平台不可运行的维度继续保留 `unknown`，归 Plan 50–59 各自裁决。
 
 ## 非目标与有意保留
 
@@ -250,3 +255,15 @@ git diff --check
 - verifier、focused tests、workspace 门禁、mock 和 diff check 全绿。
 - 本 plan 有完成记录、裁决、验证结果和提交号。
 - 一次提交，提交信息带 `plan49`。
+
+## 完成记录 ✅（2026-07-29）
+
+- 新增 `FileState`：以规范化绝对路径保存内容 SHA-256 + 元数据版本与实际可见 Read 范围，容量、内存、range 数均有硬上限并按最旧访问序确定淘汰；同路径 keyed lock 串行 mutation。状态只活在 session 内，不写 rollout；resume、task 子 agent 和独立 worktree 均 fresh。
+- `read_file` 在 permission 前 canonicalize 并 no-follow/nonblocking 打开 regular-file descriptor，权限规则仍保留原始 alias spelling，审批等待中 alias 改指敏感文件也只读已批准 inode；Unix 多 hard-link regular file 因无法按 pathname 安全分类同一 inode 的其他名字而 fail closed；只有最终成功 tool result 才提交 staged observation。post-hook 取消、permission preview、错误与拒绝不授权。文本用 `split('\n')` 保留尾空行，支持 0/数字字符串，EOF/空文件有明确提示，7k 字符截断不切 UTF-8 且只记录完整展示的行；图片保留结构化 block，PDF/non-UTF-8/普通 binary 明确失败。
+- existing `write_file` 与全部 `edit_file` 要完整 fresh Read；Read 后被删除也按 stale 拒绝，不退化成新建。pre-hook 后只允许 leaf 缺失，直接父目录必须已存在；canonicalize 父目录并打开 no-follow directory handle 后，permission deny/sensitive/acceptEdits 与审批 preview 使用同一 effective target。批准后复核父目录 dev/inode，随后 target read、同目录 exclusive temp、保权限、sync、最终复核、rename、cleanup 和 parent sync 全部走 descriptor-relative `openat`/`renameat`/`unlinkat`，不重新遍历父路径；审批等待中把 `inside-link/newdir` 换成指向 `.git/hooks` 的 symlink 会拒绝且不落 hook。mutation 尝试先清旧 authority；cwd 内 alias 共用 lock，ancestor symlink 不得逃出 workspace，symlink leaf/非普通目标拒绝。最终成功刷新 observation，post-hook 取消保留已提交文件但不留下资格。target open 带 `O_NONBLOCK`，FIFO swap 不挂 worker；temp name 在 rename 前按 dev/inode + bytes 绑定 opened FD，new file 仍按 0666 经 umask，existing mode 原样保留。严格 hostile same-UID 仍可竞争最后一次 identity check→`renameat` 的微小 namespace 窗口，本 plan 不把 descriptor boundary 宣称成文件系统事务。
+- Grep 补齐 `context`、`-o`、数字字符串分页、single-file content 格式和 CC-shaped 分页提示；`usize::MAX` 级 offset/head limit 使用 saturating arithmetic，不 panic/回绕。每个 walker candidate 先通过与 Read 共用的 canonical parent FD + no-follow leaf open 绑定 inode，deny/sensitive 同看 original + resolved path，再由 `search_reader` 搜已打开 descriptor；filter 后 leaf 换成敏感 symlink 也不会泄漏，多 hard-link candidate 作为不可安全分类的 inode alias 隐藏并计数。Glob 的空 pattern、100 项 cap、字符截断后的实际 shown/remaining 计数与 program path array 已锁定。Read/Grep/Glob 统一使用 UTF-8 安全 7k 模型文本预算，搜索继续尊重 `.gitignore`、跳 VCS、过滤 deny/sensitive 并报告 hidden count。
+- CC `scripted-read-edit` 原把两个 Read 放同轮，重采时合法并发结果顺序翻转导致 determinism pair 失败；已拆成顺序 round，保留 stale Edit 语义且不扩大 normalization。Plan 48 的 40 份历史 capture/hash 已恢复不动，只更新该 paired fixture。
+- `static-evidence.jsonl` 为 92 条，`tool-matrix.json` 由 generator 生成 55 行/440 单元：71 `compatible`、83 `intentional-diff`、20 `missing`、241 `unknown`、20 `n/a`、5 `same`。verifier 强制 Plan 49 kloop anchors，并要求每个 `same` 同时有 CC fixture、直接 `kloop:` golden 与 `kloop_golden: true`。
+- 裁决：kloop 不复制 CC 的隐式缺失父目录创建、partial Write qualification、unread/partial Edit、unique-match stale recovery、clean-profile Grep gate、广义 ignored/VCS/sensitive 搜索可见性或 PTY 无最终 tool result；这些均以安全/合法 history 理由标 `intentional-diff`。文件/搜索簇完成不外推 Plan 50–59。
+- 验证：`collect.py identity`、`collect.py list`、完整 71-case `collect.py collect --all`（重采后按 immutable baseline 门恢复历史 raw，只保留修正 pair）、`build_matrix.py`、`verify.py`、focused fs/search/file_state tests、`cargo fmt --all --check`、workspace clippy `-D warnings`、workspace tests、`cargo run -p kloop -- --mock`、`git diff --check` 全绿。
+- 提交：本次（plan 49，见 git log）。

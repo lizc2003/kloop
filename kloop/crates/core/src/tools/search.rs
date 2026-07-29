@@ -1,10 +1,9 @@
 //! Built-in `grep` and `glob` tools on ripgrep's own crates
-//! (`grep-searcher`/`grep-regex`/`ignore`) — no external binary, same
-//! .gitignore semantics as rg. Shapes follow cc's Grep/Glob with two
-//! deliberate deviations (documented in plan 14): `glob` respects
-//! .gitignore (cc's does not), and `glob` returns newest-first so the
-//! 100-entry cap keeps the most recently modified files (cc slices
-//! oldest-first, dropping exactly the fresh ones).
+//! (`grep-searcher`/`grep-regex`/`ignore`) — no external binary. Output and
+//! parser shapes follow cc where that does not weaken kloop's safety boundary.
+//! Deliberate differences: `glob` respects .gitignore, skips VCS internals, and
+//! returns newest-first; both tools hide read-denied/sensitive paths and keep
+//! model-facing text below the inline History budget.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +15,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::BinaryDetection;
@@ -40,6 +40,8 @@ const MAX_LINE_CHARS: usize = 500;
 const GREP_DEFAULT_LIMIT: usize = 250;
 /// cc's Glob maxResults.
 const GLOB_LIMIT: usize = 100;
+/// Keep model-facing search text below History's generic 8k offload threshold.
+const SEARCH_CONTENT_CHARS: usize = 7_000;
 /// cc kills rg after 20s; we stop between files and return partial results.
 const SEARCH_BUDGET: Duration = Duration::from_secs(20);
 
@@ -53,11 +55,14 @@ enum OutputMode {
 struct GrepArgs {
     pattern: String,
     root: PathBuf,
+    display_base: PathBuf,
+    absolute_paths: bool,
     glob: Option<String>,
     file_type: Option<String>,
     mode: OutputMode,
     case_insensitive: bool,
     line_numbers: bool,
+    only_matching: bool,
     before: usize,
     after: usize,
     /// 0 = unlimited.
@@ -69,7 +74,9 @@ struct GrepArgs {
 impl GrepArgs {
     fn parse(input: &Value, cwd: &Path) -> Result<Self> {
         let pattern = crate::tools::str_arg(input, "pattern", "grep")?.to_string();
-        let mode = match input["output_mode"].as_str().unwrap_or("files_with_matches") {
+        let mode = match optional_string(input, "output_mode", "grep")?
+            .unwrap_or("files_with_matches")
+        {
             "files_with_matches" => OutputMode::FilesWithMatches,
             "content" => OutputMode::Content,
             "count" => OutputMode::Count,
@@ -77,35 +84,84 @@ impl GrepArgs {
                 "grep: unknown output_mode '{other}' (expected files_with_matches, content or count)"
             ),
         };
-        let around = input["-C"].as_u64();
+        let supplied_path = optional_string(input, "path", "grep")?;
+        let root = supplied_path
+            .map(|path| crate::tools::resolve_path(cwd, path))
+            .unwrap_or_else(|| cwd.to_path_buf());
+        let around = integer_arg(input, "context", "grep")?.or(integer_arg(input, "-C", "grep")?);
         Ok(GrepArgs {
             pattern,
-            // Relative `path` (or its absence) anchors at the agent's cwd, so a
-            // worktree sub-agent searches its own tree, not the process cwd.
-            root: match input["path"].as_str() {
-                Some(p) => crate::tools::resolve_path(cwd, p),
-                None => cwd.to_path_buf(),
-            },
-            glob: input["glob"]
-                .as_str()
-                .filter(|s| !s.is_empty())
+            root,
+            display_base: cwd.to_path_buf(),
+            absolute_paths: supplied_path.is_some_and(|path| Path::new(path).is_absolute()),
+            glob: optional_string(input, "glob", "grep")?
+                .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            file_type: input["type"]
-                .as_str()
-                .filter(|s| !s.is_empty())
+            file_type: optional_string(input, "type", "grep")?
+                .filter(|value| !value.is_empty())
                 .map(str::to_string),
             mode,
-            case_insensitive: input["-i"].as_bool().unwrap_or(false),
-            line_numbers: input["-n"].as_bool().unwrap_or(true),
-            before: around.or(input["-B"].as_u64()).unwrap_or(0) as usize,
-            after: around.or(input["-A"].as_u64()).unwrap_or(0) as usize,
-            limit: input["head_limit"]
-                .as_u64()
-                .unwrap_or(GREP_DEFAULT_LIMIT as u64) as usize,
-            offset: input["offset"].as_u64().unwrap_or(0) as usize,
-            multiline: input["multiline"].as_bool().unwrap_or(false),
+            case_insensitive: optional_bool(input, "-i", "grep")?.unwrap_or(false),
+            line_numbers: optional_bool(input, "-n", "grep")?.unwrap_or(true),
+            only_matching: optional_bool(input, "-o", "grep")?.unwrap_or(false),
+            before: around.or(integer_arg(input, "-B", "grep")?).unwrap_or(0),
+            after: around.or(integer_arg(input, "-A", "grep")?).unwrap_or(0),
+            limit: integer_arg(input, "head_limit", "grep")?.unwrap_or(GREP_DEFAULT_LIMIT),
+            offset: integer_arg(input, "offset", "grep")?.unwrap_or(0),
+            multiline: optional_bool(input, "multiline", "grep")?.unwrap_or(false),
         })
     }
+}
+
+fn optional_string<'a>(input: &'a Value, key: &str, tool: &str) -> Result<Option<&'a str>> {
+    let value = &input[key];
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(Some)
+        .with_context(|| format!("{tool}: {key} must be a string"))
+}
+
+fn optional_bool(input: &Value, key: &str, tool: &str) -> Result<Option<bool>> {
+    let value = &input[key];
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_bool()
+        .map(Some)
+        .with_context(|| format!("{tool}: {key} must be a boolean"))
+}
+
+fn integer_arg(input: &Value, key: &str, tool: &str) -> Result<Option<usize>> {
+    let value = &input[key];
+    if value.is_null() {
+        return Ok(None);
+    }
+    let parsed = if let Some(value) = value.as_u64() {
+        value
+    } else if let Some(value) = value.as_i64() {
+        if value < 0 {
+            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
+        }
+        value as u64
+    } else if let Some(value) = value.as_f64() {
+        if value < 0.0 || value.fract() != 0.0 {
+            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
+        }
+        value as u64
+    } else if let Some(value) = value.as_str() {
+        value.trim().parse::<u64>().with_context(|| {
+            format!("{tool}: {key} must be a whole number of 0 or more, got {value:?}")
+        })?
+    } else {
+        bail!("{tool}: {key} must be a whole number of 0 or more");
+    };
+    usize::try_from(parsed)
+        .map(Some)
+        .with_context(|| format!("{tool}: {key} is too large"))
 }
 
 pub async fn grep_tool(input: &Value, cwd: &Path, perms: Arc<Permissions>) -> Result<String> {
@@ -122,14 +178,19 @@ pub async fn glob_tool(
     perms: Arc<Permissions>,
 ) -> Result<String> {
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
-    let root = match input["path"].as_str() {
-        Some(p) => crate::tools::resolve_path(cwd, p),
-        None => cwd.to_path_buf(),
-    };
-    let (text, paths) = tokio::task::spawn_blocking(move || run_glob(&pattern, &root, &perms))
-        .await
-        .map_err(|e| anyhow!("glob: worker panicked: {e}"))??;
-    // A program gets the path list as an array; the model gets the text.
+    let supplied_path = optional_string(input, "path", "glob")?;
+    let root = supplied_path
+        .map(|path| crate::tools::resolve_path(cwd, path))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let display_base = cwd.to_path_buf();
+    let absolute_paths = supplied_path.is_some_and(|path| Path::new(path).is_absolute());
+    let (text, paths) = tokio::task::spawn_blocking(move || {
+        run_glob(&pattern, &root, &display_base, absolute_paths, &perms)
+    })
+    .await
+    .map_err(|e| anyhow!("glob: worker panicked: {e}"))??;
+    // A program gets the count-capped path array. The model gets the same list
+    // as text, with an additional character cap to keep it inline in History.
     if let Some(slot) = program_result {
         *slot.lock().unwrap() = Some(Value::Array(paths.into_iter().map(Value::String).collect()));
     }
@@ -137,22 +198,33 @@ pub async fn glob_tool(
 }
 
 fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
+    run_grep_with_hook(args, perms, |_| {})
+}
+
+fn run_grep_with_hook(
+    args: &GrepArgs,
+    perms: &Permissions,
+    mut after_open: impl FnMut(&Path),
+) -> Result<String> {
     if !args.root.exists() {
         bail!("grep: path does not exist: {}", args.root.display());
     }
     let matcher = build_matcher(args)?;
     let mut searcher = build_searcher(args);
+    let single_file = args.root.is_file();
 
     // Content mode can stop early: collect one line past the requested
     // window to learn whether it was truncated. Files mode must see every
     // match (sorted before slicing); count mode reports exact totals.
     let stop_at = match (args.mode, args.limit) {
-        (OutputMode::Content, limit) if limit > 0 => Some(args.offset + limit + 1),
+        (OutputMode::Content, limit) if limit > 0 => {
+            Some(args.offset.saturating_add(limit).saturating_add(1))
+        }
         _ => None,
     };
 
     let mut lines: Vec<String> = Vec::new();
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut files: Vec<(SystemTime, String)> = Vec::new();
     let mut counts: Vec<(String, u64)> = Vec::new();
     let started = Instant::now();
     let mut timed_out = false;
@@ -167,22 +239,43 @@ fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        // Read-accessibility filter: a file the read gate would hide (sensitive
-        // path or read_file deny) is skipped before its contents are ever read.
-        if perms.read_path_blocked(entry.path()) {
+        let display = if single_file && args.mode == OutputMode::Content {
+            String::new()
+        } else {
+            output_path(&args.display_base, args.absolute_paths, entry.path())
+        };
+        let prepared = match super::fs::prepare_read_target(entry.path(), &display) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if error.downcast_ref::<super::fs::UnsafeHardLink>().is_some() {
+                    hidden += 1;
+                }
+                continue;
+            }
+        };
+        let (resolved, file) = prepared.into_parts();
+        after_open(entry.path());
+        // Permission and search consume facts bound to the same opened inode.
+        // A leaf/parent swap after the walker cannot redirect search_reader.
+        if perms.read_path_blocked_with_resolved_path(entry.path(), Some(&resolved)) {
             hidden += 1;
             continue;
         }
-        let display = display_path(&args.root, entry.path());
+        let modified = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         match args.mode {
             OutputMode::Content => {
                 let sink = ContentSink {
                     display: &display,
+                    matcher: &matcher,
+                    only_matching: args.only_matching,
                     show_numbers: args.line_numbers,
                     stop_at,
                     lines: &mut lines,
                 };
-                let _ = searcher.search_path(&matcher, entry.path(), sink);
+                let _ = searcher.search_reader(&matcher, file, sink);
                 if stop_at.is_some_and(|s| lines.len() >= s) {
                     break;
                 }
@@ -190,15 +283,15 @@ fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
             OutputMode::FilesWithMatches => {
                 let mut found = false;
                 let sink = FoundSink { found: &mut found };
-                let _ = searcher.search_path(&matcher, entry.path(), sink);
+                let _ = searcher.search_reader(&matcher, file, sink);
                 if found {
-                    files.push((entry.path().to_path_buf(), display));
+                    files.push((modified, display));
                 }
             }
             OutputMode::Count => {
                 let mut count = 0;
                 let sink = CountSink { count: &mut count };
-                let _ = searcher.search_path(&matcher, entry.path(), sink);
+                let _ = searcher.search_reader(&matcher, file, sink);
                 if count > 0 {
                     counts.push((display, count));
                 }
@@ -208,63 +301,99 @@ fn run_grep(args: &GrepArgs, perms: &Permissions) -> Result<String> {
 
     let mut out = match args.mode {
         OutputMode::Content => {
-            let truncated = stop_at.is_some_and(|s| lines.len() >= s);
+            let total = lines.len();
+            let truncated = stop_at.is_some_and(|stop| total >= stop);
             let shown = page(lines, args.offset, args.limit);
-            if shown.is_empty() {
-                "No matches found".to_string()
-            } else {
-                let mut out = shown.join("\n");
-                if truncated {
-                    out.push_str(&page_note(args.limit, args.offset));
+            let pagination = pagination(
+                truncated.then_some(args.limit),
+                (args.offset > 0).then_some(args.offset),
+            );
+            let base = if shown.is_empty() {
+                if args.offset > 0 && total > 0 {
+                    "No entries at this offset".to_string()
+                } else {
+                    "No matches found".to_string()
                 }
-                out
-            }
+            } else {
+                shown.join("\n")
+            };
+            append_content_pagination(base, pagination.as_deref())
         }
         OutputMode::FilesWithMatches => {
             // cc sorts newest-first so the freshest files survive the cap.
             // Cached: the key does an mtime() syscall + name clone, so compute
             // it once per file, not O(n log n) times.
-            files.sort_by_cached_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
+            files.sort_by_cached_key(|(modified, name)| {
+                (std::cmp::Reverse(*modified), name.clone())
+            });
             let total = files.len();
             let shown = page(
-                files.into_iter().map(|(_, d)| d).collect(),
+                files.into_iter().map(|(_, display)| display).collect(),
                 args.offset,
                 args.limit,
             );
+            let truncated = args.limit > 0 && total > args.offset.saturating_add(shown.len());
+            let pagination = pagination(
+                truncated.then_some(args.limit),
+                (args.offset > 0).then_some(args.offset),
+            );
             if shown.is_empty() {
-                "No files found".to_string()
-            } else {
-                let mut out = format!("Found {}\n{}", plural(total, "file"), shown.join("\n"));
-                if total > args.offset + shown.len() {
-                    out.push_str(&page_note(args.limit, args.offset));
+                if args.offset > 0 && total > 0 {
+                    format!(
+                        "No entries at this offset. [Showing results with pagination = {}]",
+                        pagination.unwrap_or_else(|| format!("offset: {}", args.offset))
+                    )
+                } else {
+                    "No files found".to_string()
                 }
-                out
+            } else {
+                let detail = pagination
+                    .as_deref()
+                    .map(|value| format!(" {value}"))
+                    .unwrap_or_default();
+                format!(
+                    "Found {}{detail}\n{}",
+                    plural(shown.len(), "file"),
+                    shown.join("\n")
+                )
             }
         }
         OutputMode::Count => {
-            let total_matches: u64 = counts.iter().map(|(_, n)| n).sum();
+            let total_matches: u64 = counts.iter().map(|(_, count)| count).sum();
             let total_files = counts.len();
             let shown = page(
-                counts.iter().map(|(d, n)| format!("{d}:{n}")).collect(),
+                counts
+                    .iter()
+                    .map(|(display, count)| format!("{display}:{count}"))
+                    .collect(),
                 args.offset,
                 args.limit,
             );
-            if shown.is_empty() {
-                "No matches found".to_string()
-            } else {
-                let mut out = format!(
-                    "{}\n\nFound {} across {}.",
-                    shown.join("\n"),
-                    plural(total_matches as usize, "total occurrence"),
-                    plural(total_files, "file"),
-                );
-                if total_files > args.offset + shown.len() {
-                    out.push_str(&page_note(args.limit, args.offset));
+            let truncated = args.limit > 0 && total_files > args.offset.saturating_add(shown.len());
+            let pagination = pagination(
+                truncated.then_some(args.limit),
+                (args.offset > 0).then_some(args.offset),
+            );
+            let base = if shown.is_empty() {
+                if total_matches > 0 {
+                    "No entries at this offset".to_string()
+                } else {
+                    "No matches found".to_string()
                 }
-                out
-            }
+            } else {
+                shown.join("\n")
+            };
+            let suffix = pagination
+                .map(|value| format!(" with pagination = {value}"))
+                .unwrap_or_default();
+            format!(
+                "{base}\n\nFound {} across {}.{suffix}",
+                plural(total_matches as usize, "total occurrence"),
+                plural(total_files, "file"),
+            )
         }
     };
+    out = cap_search_output(out);
     if hidden > 0 {
         out.push_str(&hidden_note(hidden));
     }
@@ -282,10 +411,15 @@ fn hidden_note(n: usize) -> String {
     format!("\n\n[{} hidden by deny/sensitive rules]", plural(n, "path"))
 }
 
-/// Returns the model-facing text and the capped list of matched paths (the
-/// array a code-mode program receives). The two share the same paths — the text
-/// is just those paths joined, with truncation/timeout notices appended.
-fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, Vec<String>)> {
+/// Returns the character-capped model text and the 100-entry path list a
+/// code-mode program receives.
+fn run_glob(
+    pattern: &str,
+    root: &Path,
+    display_base: &Path,
+    absolute_paths: bool,
+    perms: &Permissions,
+) -> Result<(String, Vec<String>)> {
     if !root.is_dir() {
         bail!("glob: not a directory: {}", root.display());
     }
@@ -293,7 +427,8 @@ fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, 
     let mut timed_out = false;
     let mut hidden = 0usize;
     let mut files: Vec<(PathBuf, String)> = Vec::new();
-    for entry in build_walk(root, Some(pattern), None)? {
+    let glob = (!pattern.is_empty()).then_some(pattern);
+    for entry in build_walk(root, glob, None)? {
         if started.elapsed() > SEARCH_BUDGET {
             timed_out = true;
             break;
@@ -305,7 +440,10 @@ fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, 
                 hidden += 1;
                 continue;
             }
-            files.push((entry.path().to_path_buf(), display_path(root, entry.path())));
+            files.push((
+                entry.path().to_path_buf(),
+                output_path(display_base, absolute_paths, entry.path()),
+            ));
         }
     }
     // Newest first: the cap must keep the most recently touched files.
@@ -313,13 +451,18 @@ fn run_glob(pattern: &str, root: &Path, perms: &Permissions) -> Result<(String, 
     files.sort_by_cached_key(|(path, name)| (std::cmp::Reverse(mtime(path)), name.clone()));
     let total = files.len();
     let paths: Vec<String> = files.into_iter().take(GLOB_LIMIT).map(|(_, d)| d).collect();
+    let shown_in_text = complete_items_in_capped_output(&paths);
     let mut out = if paths.is_empty() {
         "No files found".to_string()
     } else {
         paths.join("\n")
     };
+    out = cap_search_output(out);
     if total > GLOB_LIMIT {
-        out.push_str("\n(Results are truncated. Consider using a more specific path or pattern.)");
+        let more = total - shown_in_text;
+        out.push_str(&format!(
+            "\n(Showing {shown_in_text} of {total} matching files; {more} more are not listed. Narrow the pattern or path to see the rest.)"
+        ));
     }
     if hidden > 0 {
         out.push_str(&hidden_note(hidden));
@@ -375,8 +518,10 @@ fn build_walk(root: &Path, glob: Option<&str>, file_type: Option<&str>) -> Resul
         over.add(vcs).expect("static vcs globs parse");
     }
     if let Some(glob) = glob {
-        over.add(glob)
-            .with_context(|| format!("invalid glob pattern '{glob}'"))?;
+        for glob in expand_glob_filters(glob) {
+            over.add(glob)
+                .with_context(|| format!("invalid glob pattern '{glob}'"))?;
+        }
     }
     let mut walk = WalkBuilder::new(root);
     walk.hidden(/*skip_hidden*/ false)
@@ -393,20 +538,27 @@ fn build_walk(root: &Path, glob: Option<&str>, file_type: Option<&str>) -> Resul
     Ok(walk.build())
 }
 
-/// Model-facing path: relative to the search root (which is the agent's cwd or
-/// the `path` arg resolved against it), so output stays cwd-relative whether
-/// the root is the process cwd or a worktree. Leftover "./" noise is stripped;
-/// the root itself (a single-file target) shows its file name.
-fn display_path(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let s = rel.to_string_lossy();
-    if s.is_empty() {
-        return path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
+/// Match rg's path presentation: an explicitly absolute search path yields
+/// absolute results; omitted or relative paths stay relative to the agent cwd.
+fn expand_glob_filters(glob: &str) -> Vec<&str> {
+    glob.split_whitespace()
+        .flat_map(|part| {
+            if part.contains('{') && part.contains('}') {
+                vec![part]
+            } else {
+                part.split(',').filter(|value| !value.is_empty()).collect()
+            }
+        })
+        .collect()
+}
+
+fn output_path(display_base: &Path, absolute_paths: bool, path: &Path) -> String {
+    if absolute_paths {
+        return path.to_string_lossy().to_string();
     }
-    s.strip_prefix("./").unwrap_or(&s).to_string()
+    let relative = path.strip_prefix(display_base).unwrap_or(path);
+    let display = relative.to_string_lossy();
+    display.strip_prefix("./").unwrap_or(&display).to_string()
 }
 
 fn mtime(path: &Path) -> SystemTime {
@@ -424,11 +576,24 @@ fn page(items: Vec<String>, offset: usize, limit: usize) -> Vec<String> {
     }
 }
 
-fn page_note(limit: usize, offset: usize) -> String {
-    format!(
-        "\n\n[results truncated at head_limit={limit}; pass offset={} for the next page]",
-        offset + limit
-    )
+fn pagination(limit: Option<usize>, offset: Option<usize>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(limit) = limit {
+        parts.push(format!("limit: {limit}"));
+    }
+    if let Some(offset) = offset {
+        parts.push(format!("offset: {offset}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn append_content_pagination(mut content: String, pagination: Option<&str>) -> String {
+    if let Some(pagination) = pagination {
+        content.push_str(&format!(
+            "\n\n[Showing results with pagination = {pagination}]"
+        ));
+    }
+    content
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -436,13 +601,56 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{s}")
 }
 
-fn clip(text: &str) -> String {
-    let mut chars = text.chars();
-    let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
-    if chars.next().is_none() {
-        head
+fn complete_items_in_capped_output(items: &[String]) -> usize {
+    let total_chars = items
+        .iter()
+        .enumerate()
+        .fold(0usize, |total, (index, item)| {
+            total
+                .saturating_add(usize::from(index > 0))
+                .saturating_add(item.chars().count())
+        });
+    if total_chars <= SEARCH_CONTENT_CHARS {
+        return items.len();
+    }
+
+    let mut chars = 0usize;
+    let mut complete = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        chars = chars
+            .saturating_add(usize::from(index > 0))
+            .saturating_add(item.chars().count());
+        // cap_search_output drops the final line whenever the prefix itself is
+        // truncated, so a path counts only if its following newline fits too.
+        if chars >= SEARCH_CONTENT_CHARS {
+            break;
+        }
+        complete += 1;
+    }
+    complete
+}
+
+fn cap_search_output(output: String) -> String {
+    let (prefix, truncated) = crate::tools::char_prefix(&output, SEARCH_CONTENT_CHARS);
+    if truncated {
+        let prefix = prefix
+            .rfind('\n')
+            .map(|end| &prefix[..end])
+            .unwrap_or(prefix);
+        format!(
+            "{prefix}\n\n[search output truncated at {SEARCH_CONTENT_CHARS} characters; narrow the path or pattern]"
+        )
     } else {
+        output
+    }
+}
+
+fn clip(text: &str) -> String {
+    let (head, truncated) = crate::tools::char_prefix(text, MAX_LINE_CHARS);
+    if truncated {
         format!("{head} [line truncated]")
+    } else {
+        head.to_string()
     }
 }
 
@@ -452,9 +660,11 @@ fn line_text(bytes: &[u8]) -> String {
 }
 
 fn fmt_line(display: &str, n: Option<u64>, show_numbers: bool, sep: char, text: &str) -> String {
-    match n.filter(|_| show_numbers) {
-        Some(n) => format!("{display}{sep}{n}{sep}{text}"),
-        None => format!("{display}{sep}{text}"),
+    match (display.is_empty(), n.filter(|_| show_numbers)) {
+        (true, Some(n)) => format!("{n}{sep}{text}"),
+        (true, None) => text.to_string(),
+        (false, Some(n)) => format!("{display}{sep}{n}{sep}{text}"),
+        (false, None) => format!("{display}{sep}{text}"),
     }
 }
 
@@ -462,6 +672,8 @@ fn fmt_line(display: &str, n: Option<u64>, show_numbers: bool, sep: char, text: 
 /// `path-n-text` (rg's separators).
 struct ContentSink<'a> {
     display: &'a str,
+    matcher: &'a RegexMatcher,
+    only_matching: bool,
     show_numbers: bool,
     stop_at: Option<usize>,
     lines: &'a mut Vec<String>,
@@ -477,15 +689,36 @@ impl ContentSink<'_> {
 impl Sink for ContentSink<'_> {
     type Error = std::io::Error;
 
-    fn matched(&mut self, _: &Searcher, m: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        if self.only_matching {
+            let mut keep_searching = true;
+            let line_number = matched.line_number();
+            let _ = self.matcher.find_iter(matched.bytes(), |found| {
+                if found.start() == found.end() {
+                    return true;
+                }
+                let text = line_text(&matched.bytes()[found.start()..found.end()]);
+                let out = fmt_line(self.display, line_number, self.show_numbers, ':', &text);
+                keep_searching = self.push(out);
+                keep_searching
+            });
+            return Ok(keep_searching);
+        }
+
         // A multiline match spans several lines; number them from the first.
-        let mut n = m.line_number();
-        for line in m.lines() {
-            let out = fmt_line(self.display, n, self.show_numbers, ':', &line_text(line));
+        let mut line_number = matched.line_number();
+        for line in matched.lines() {
+            let out = fmt_line(
+                self.display,
+                line_number,
+                self.show_numbers,
+                ':',
+                &line_text(line),
+            );
             if !self.push(out) {
                 return Ok(false);
             }
-            n = n.map(|v| v + 1);
+            line_number = line_number.map(|value| value + 1);
         }
         Ok(true)
     }
@@ -631,6 +864,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_contract_supports_context_alias_only_matching_and_single_file_paths() {
+        let t = Tree::new("grep-contract", &[("a.txt", "alpha\nBeta alpha\ngamma\n")]);
+        let file = t.root.join("a.txt");
+
+        let out = grep(json!({
+            "pattern": "alpha",
+            "path": file,
+            "output_mode": "content",
+            "context": 1,
+            "-n": true
+        }))
+        .await
+        .unwrap();
+        assert_eq!(out, "1:alpha\n2:Beta alpha\n3-gamma");
+
+        let out = grep(json!({
+            "pattern": "alpha",
+            "path": t.root.join("a.txt"),
+            "output_mode": "content",
+            "-o": true
+        }))
+        .await
+        .unwrap();
+        assert_eq!(out, "1:alpha\n2:alpha");
+    }
+
+    #[tokio::test]
     async fn files_mode_is_default_with_count_header() {
         let t = Tree::new("files", &[("a.txt", "needle\n"), ("b/c.txt", "needle\n")]);
         let out = grep(json!({"pattern": "needle", "path": t.path()}))
@@ -675,7 +935,10 @@ mod tests {
         let count = grep(json!({"pattern": "zzz", "path": t.path(), "output_mode": "count"}))
             .await
             .unwrap();
-        assert_eq!(count, "No matches found");
+        assert_eq!(
+            count,
+            "No matches found\n\nFound 0 total occurrences across 0 files."
+        );
     }
 
     #[tokio::test]
@@ -713,6 +976,12 @@ mod tests {
             .unwrap();
         let out = rel(&out, &t);
         assert!(out.contains("a.rs") && !out.contains("b.py") && !out.contains("c.txt"));
+
+        let out = grep(json!({"pattern": "needle", "path": t.path(), "glob": "*.rs,*.py"}))
+            .await
+            .unwrap();
+        let out = rel(&out, &t);
+        assert!(out.contains("a.rs") && out.contains("b.py") && !out.contains("c.txt"));
 
         let out = grep(json!({"pattern": "needle", "path": t.path(), "type": "py"}))
             .await
@@ -808,7 +1077,7 @@ mod tests {
         assert!(out.contains("a.txt:3:needle 3"));
         assert!(!out.contains("needle 4"));
         assert!(
-            out.contains("[results truncated at head_limit=3; pass offset=3 for the next page]"),
+            out.contains("[Showing results with pagination = limit: 3]"),
             "got: {out}"
         );
 
@@ -816,12 +1085,26 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("needle 4") && out.contains("needle 6") && !out.contains("needle 7"));
+        assert!(out.contains("[Showing results with pagination = limit: 3, offset: 3]"));
 
         // head_limit 0 = unlimited, no truncation note.
         let out = grep(json!({"pattern": "needle", "path": t.path(), "output_mode": "content", "head_limit": 0}))
             .await
             .unwrap();
         assert!(out.contains("needle 10") && !out.contains("truncated"));
+
+        let max = usize::MAX.to_string();
+        let out = grep(json!({
+            "pattern": "needle",
+            "path": t.path(),
+            "output_mode": "content",
+            "head_limit": max,
+            "offset": usize::MAX.to_string()
+        }))
+        .await
+        .unwrap();
+        assert!(out.starts_with("No entries at this offset"), "{out}");
+        assert!(out.contains(&format!("offset: {}", usize::MAX)), "{out}");
     }
 
     #[tokio::test]
@@ -871,6 +1154,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unknown output_mode"));
+
+        for input in [
+            json!({"pattern": "x", "head_limit": -1}),
+            json!({"pattern": "x", "offset": 1.5}),
+            json!({"pattern": "x", "-i": "true"}),
+            json!({"pattern": "x", "glob": 7}),
+        ] {
+            let err = grep(input).await.unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("must be a whole number")
+                    || message.contains("must be a boolean")
+                    || message.contains("must be a string"),
+                "{message}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -884,6 +1183,10 @@ mod tests {
         let out = glob(json!({"pattern": "**/*.rs", "path": t.path()}))
             .await
             .unwrap();
+        assert!(
+            out.lines().all(|line| line.starts_with(t.path())),
+            "an absolute root yields absolute paths: {out}"
+        );
         let out = rel(&out, &t);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.first(), Some(&"new.rs"), "newest first: {out}");
@@ -895,6 +1198,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rel(&out, &t).lines().count(), 3);
+
+        let out = glob(json!({"pattern": "", "path": t.path()}))
+            .await
+            .unwrap();
+        let out = rel(&out, &t);
+        assert!(out.contains("new.rs") && out.contains("skip.txt") && out.contains("sub/mid.rs"));
     }
 
     #[tokio::test]
@@ -926,9 +1235,49 @@ mod tests {
         let out = glob(json!({"pattern": "*.txt", "path": t.path()}))
             .await
             .unwrap();
-        assert_eq!(out.lines().count(), 101, "100 paths + truncation notice");
-        assert!(out
-            .ends_with("(Results are truncated. Consider using a more specific path or pattern.)"));
+        assert!(out.lines().count() <= 103, "bounded path list plus notices");
+        assert!(out.chars().count() < 8_000);
+        assert!(out.contains("[search output truncated at 7000 characters"));
+        let listed = out
+            .split_once("\n\n[search output truncated")
+            .map(|(listed, _)| listed)
+            .unwrap();
+        let shown = listed.lines().count();
+        assert!(shown < 100, "character cap should hide some paths: {shown}");
+        assert!(out.ends_with(&format!(
+            "(Showing {shown} of 105 matching files; {} more are not listed. Narrow the pattern or path to see the rest.)",
+            105 - shown
+        )));
+    }
+
+    #[tokio::test]
+    async fn glob_model_text_is_character_bounded_without_shrinking_program_array() {
+        let t = Tree::new("glob-char-cap", &[]);
+        let segment = "x".repeat(180);
+        for index in 0..40 {
+            t.write(&format!("{segment}/file-{index:03}.txt"), "x");
+        }
+        let sink: crate::tools::ProgramResultSink = Arc::new(std::sync::Mutex::new(None));
+        let out = glob_tool(
+            &json!({"pattern": "*.txt", "path": t.path()}),
+            Path::new("."),
+            Some(&sink),
+            no_gate(),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.chars().count() < 8_000);
+        assert!(out.contains("[search output truncated at 7000 characters"));
+        assert_eq!(
+            sink.lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            40
+        );
     }
 
     #[tokio::test]
@@ -1015,6 +1364,77 @@ mod tests {
         assert!(
             out.contains("[1 path hidden by deny/sensitive rules]"),
             "got: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_searches_opened_inode_when_leaf_changes_after_filter_boundary() {
+        let t = Tree::new(
+            "grep-open-binding",
+            &[
+                ("search/safe.txt", "needle-safe\n"),
+                (".kloop/config.toml", "needle-secret\n"),
+            ],
+        );
+        let search_root = t.root.join("search");
+        let safe = search_root.join("safe.txt");
+        let secret = t.root.join(".kloop/config.toml");
+        let args = GrepArgs::parse(
+            &json!({
+                "pattern": "needle",
+                "path": search_root,
+                "output_mode": "content"
+            }),
+            &t.root,
+        )
+        .unwrap();
+        let permissions = Permissions::new(
+            crate::permissions::Mode::Bypass,
+            &Default::default(),
+            t.root.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut swapped = false;
+        let out = run_grep_with_hook(&args, &permissions, |path| {
+            if !swapped && path == safe {
+                std::fs::remove_file(&safe).unwrap();
+                std::os::unix::fs::symlink(&secret, &safe).unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap();
+
+        assert!(swapped, "fault hook reached the opened safe candidate");
+        assert!(out.contains("needle-safe"), "{out}");
+        assert!(!out.contains("needle-secret"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_hides_hard_link_aliases_to_sensitive_content() {
+        let t = Tree::new("grep-hardlink", &[(".env", "needle-secret\n")]);
+        let search_root = t.root.join("search");
+        std::fs::create_dir_all(&search_root).unwrap();
+        std::fs::hard_link(t.root.join(".env"), search_root.join("safe.txt")).unwrap();
+        let out = grep_tool(
+            &json!({
+                "pattern": "needle",
+                "path": search_root,
+                "output_mode": "content"
+            }),
+            &t.root,
+            gated(t.path(), &[]),
+        )
+        .await
+        .unwrap();
+
+        assert!(!out.contains("needle-secret"), "{out}");
+        assert!(
+            out.contains("[1 path hidden by deny/sensitive rules]"),
+            "{out}"
         );
     }
 

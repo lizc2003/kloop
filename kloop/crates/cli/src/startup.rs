@@ -768,6 +768,7 @@ pub(crate) fn config_from_settings(
         context_window: runtime.context_window,
         fallback_model: runtime.fallback_model.clone(),
         permissions,
+        file_state: Default::default(),
         tool_sources: tool_sources.to_vec(),
         // The caller stamps the real session id once it knows it (after
         // open_history / per server thread).

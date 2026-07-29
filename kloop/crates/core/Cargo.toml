@@ -12,12 +12,15 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
+grep-matcher = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 ignore = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
+sha2 = { workspace = true }
 similar = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

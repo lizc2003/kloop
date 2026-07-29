@@ -182,6 +182,7 @@ pub struct ActiveWorktree {
     /// tracks the session cwd (the server's `thread/cwd/updated` notification).
     pub branch: String,
     pub permissions: Arc<Permissions>,
+    pub file_state: Arc<crate::file_state::FileState>,
     pub sandbox: Option<Arc<SandboxPolicy>>,
     pub system: String,
 }
@@ -213,6 +214,7 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
         cwd: wt.path.clone(),
         branch: wt.branch.clone(),
         permissions,
+        file_state: Arc::new(crate::file_state::FileState::default()),
         sandbox,
         system,
         wt,
@@ -366,6 +368,36 @@ mod tests {
             exclude.lines().any(|l| l.trim() == ".kloop-worktrees/"),
             "exclude injected: {exclude:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn entered_worktree_starts_with_fresh_file_observations() {
+        use crate::file_state::FileObservation;
+        use crate::file_state::FileStateUpdate;
+        use crate::tools::testutil::test_ctx;
+
+        let root = temp_repo("fresh-state").await;
+        let observed = root.join("observed.txt");
+        std::fs::write(&observed, b"parent read\n").unwrap();
+        let observed = std::fs::canonicalize(observed).unwrap();
+        let metadata = std::fs::metadata(&observed).unwrap();
+        let mut cfg = (*test_ctx(0, "worktree-fresh-state").cfg).clone();
+        cfg.cwd = root.clone();
+        cfg.file_state.apply(FileStateUpdate::Replace {
+            path: observed.clone(),
+            observation: FileObservation::full(b"parent read\n", &metadata),
+        });
+
+        enter(&cfg, "agent-fresh").await.unwrap();
+        let active_state = cfg.effective_file_state();
+        assert!(!Arc::ptr_eq(&cfg.file_state, &active_state));
+        assert!(active_state.observation(&observed).is_none());
+        assert!(cfg.file_state.observation(&observed).is_some());
+
+        exit(&cfg, /* discard */ true).await.unwrap();
+        assert!(Arc::ptr_eq(&cfg.file_state, &cfg.effective_file_state()));
+        assert!(cfg.file_state.observation(&observed).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 

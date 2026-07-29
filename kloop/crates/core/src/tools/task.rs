@@ -430,6 +430,7 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -
         // onto its own tree.
         cwd: ctx.cfg.effective_cwd(),
         permissions: ctx.cfg.effective_permissions(),
+        file_state: Arc::new(crate::file_state::FileState::default()),
         sandbox: ctx.cfg.effective_sandbox(),
         system: ctx.cfg.effective_system(),
         active_worktree: Arc::new(std::sync::RwLock::new(None)),
@@ -481,6 +482,29 @@ mod tests {
     use kloop_protocol::ContentBlock;
     use kloop_provider::Provider;
     use serde_json::json;
+
+    #[test]
+    fn subagent_file_observations_are_fresh() {
+        use crate::file_state::FileObservation;
+        use crate::file_state::FileStateUpdate;
+
+        let path =
+            std::env::temp_dir().join(format!("kloop-subagent-file-state-{}", std::process::id()));
+        std::fs::write(&path, b"parent read\n").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let ctx = test_ctx(0, "subagent-file-state");
+        ctx.cfg.file_state.apply(FileStateUpdate::Replace {
+            path: path.clone(),
+            observation: FileObservation::full(b"parent read\n", &metadata),
+        });
+
+        let sub = clone_for_subagent(&ctx, None, "agent-fresh".into());
+        assert!(!Arc::ptr_eq(&ctx.cfg.file_state, &sub.file_state));
+        assert!(sub.file_state.observation(&path).is_none());
+        assert!(ctx.cfg.file_state.observation(&path).is_some());
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn task_is_refused_at_depth_one() {

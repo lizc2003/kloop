@@ -1,6 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-15,plan 1–32 完成、plan 33–37 已立备忘(提交 b3e79d1)。
+> 基线:2026-07-29,plan 1–49 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus 与文件/搜索簇闭环见 plan 48–49。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -24,6 +25,7 @@
 | code mode 用 QuickJS + 内存硬限 | codex V8 包袱且恰缺内存上限 | 教训 17 |
 | sandbox denial 判定含 DNS 失败 | codex 关键词表自身的洞 | 教训 15 |
 | grep/glob 路径级保护 | codex 完全没有(cc 有,已对齐) | plan 31 |
+| stale-safe 原子文件修改 | cc 接受 partial Write / unread-partial Edit 且可 stale-recover、会隐式创建缺失父目录；kloop 完整 fresh Read + keyed lock + 审批前 parent FD + descriptor-relative sync/rename fail closed | plan 49 |
 | 双轨 provider 对等 + 三线协议 | 两家各自单主轨 | plan 15 |
 | MCP 工具名消毒比 cc 严(`-`→`_`) | cc 规则语法不兼容风险 | 教训 10 |
 
@@ -55,15 +57,20 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐
+### 4. 工具面——🟡 主干齐；文件/搜索簇已完成 exact 2.1.220 parity（plan 49）
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | plan 29 不做节挂账 | 真实 PDF 需求 |
+| PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | plan 49 明确返回 unsupported；不在 canonical provider wire 未统一时伪兼容 | 真实 PDF 需求 |
 | 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门) | 真痛感再重启,连 PTY 一起 |
 | 自动后台化 / stall 探测 / 完成通知 | cc 单家 | plan 14 挂账 | 长命令 dogfood 痛感 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook 编辑 | cc 单家 | 不立 | 无需求 |
+
+Plan 49 已销账 Read/Write/Edit/Glob/Grep 的主干正确性：session-only 完整读取资格、stale-safe
+原子 mutation、UTF-8 安全的 7k Read/Search 输出预算、Grep context/`-o`/分页，以及搜索
+ignore/VCS/敏感路径策略均有 exact CC fixture + kloop golden。当前 matrix 仍保留 241 个跨其他
+工具簇或不可运行分支的 `unknown`；5 个 `same` 仅指有成对动态证据的并发分类，不外推“全工具一致”。
 
 ### 5. 子 agent / 多 agent——✅ 收敛解全齐
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use kloop_provider::Provider;
 
+use crate::file_state::FileState;
 use crate::hooks::Hooks;
 use crate::inbox::Inbox;
 use crate::permissions::Permissions;
@@ -51,6 +52,11 @@ pub struct Config {
     /// Tool-execution gate; the Arc is shared into sub-agent configs so the
     /// session approval cache is inherited.
     pub permissions: Arc<Permissions>,
+    /// Session-scoped file observations used to prove that a model-visible Read
+    /// still describes the bytes a later Write/Edit would replace. This state is
+    /// never persisted. Ordinary Config clones share it within one session;
+    /// sub-agents and entered worktrees explicitly receive fresh instances.
+    pub file_state: Arc<FileState>,
     /// External tool providers (Web tools, MCP servers), merged after the
     /// built-ins. Shared into sub-agent configs like everything else.
     pub tool_sources: Vec<Arc<dyn ToolSource>>,
@@ -168,6 +174,17 @@ impl Config {
             .as_ref()
             .map(|a| a.permissions.clone())
             .unwrap_or_else(|| self.permissions.clone())
+    }
+
+    /// File-observation state in effect now. An entered worktree starts fresh
+    /// and does not inherit observations from the main checkout.
+    pub fn effective_file_state(&self) -> Arc<FileState> {
+        self.active_worktree
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.file_state.clone())
+            .unwrap_or_else(|| self.file_state.clone())
     }
 
     /// The OS sandbox policy in effect now — with the active worktree added as

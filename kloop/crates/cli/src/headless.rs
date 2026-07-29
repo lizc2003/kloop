@@ -287,6 +287,7 @@ mod tests {
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(Permissions::allow_all()),
+            file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: "hl".into(),
             agent_label: String::new(),

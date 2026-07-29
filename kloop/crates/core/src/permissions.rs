@@ -230,7 +230,12 @@ impl Rule {
                         .relative
                         .as_ref()
                         .is_some_and(|rel| glob.is_match(rel))
-                        || glob.is_match(&facts.normalized))
+                        || facts
+                            .original_relative
+                            .as_ref()
+                            .is_some_and(|rel| glob.is_match(rel))
+                        || glob.is_match(&facts.normalized)
+                        || glob.is_match(&facts.original))
             }
             Rule::BashPrefix { .. } => false,
         }
@@ -443,10 +448,31 @@ impl Permissions {
         depth: u8,
         sandbox_auto_allow: bool,
     ) -> Result<(), String> {
+        self.check_call_with_resolved_path(name, input, None, depth, sandbox_auto_allow)
+            .await
+    }
+
+    /// Mutation dispatch resolves and opens the target parent before permission.
+    /// Supplying that effective path keeps safety/containment on the frozen
+    /// target while path rules still see the model's original alias spelling.
+    pub(crate) async fn check_call_with_resolved_path(
+        &self,
+        name: &str,
+        input: &Value,
+        resolved_path: Option<&Path>,
+        depth: u8,
+        sandbox_auto_allow: bool,
+    ) -> Result<(), String> {
         if self.allow_everything {
             return Ok(());
         }
-        let call = CallFacts::gather(name, input, &self.cwd);
+        let call = CallFacts::gather(name, input, &self.cwd, resolved_path);
+        let resolved_input = call.path.as_ref().map(|path| {
+            let mut resolved = input.clone();
+            resolved["path"] = Value::String(path.normalized.to_string_lossy().into_owned());
+            resolved
+        });
+        let approval_input = resolved_input.as_ref().unwrap_or(input);
 
         // 1. Deny rules — before everything, immune to every mode.
         if self.matches_deny(name, &call) {
@@ -486,13 +512,13 @@ impl Permissions {
                 .then(|| remember_payload(name, &call))
                 .flatten();
             return self
-                .ask_user(name, input, depth, Some(hazard.tag), remember)
+                .ask_user(name, approval_input, depth, Some(hazard.tag), remember)
                 .await;
         }
 
         // 5. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
-            return self.ask_user(name, input, depth, None, None).await;
+            return self.ask_user(name, approval_input, depth, None, None).await;
         }
 
         // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
@@ -541,7 +567,8 @@ impl Permissions {
         }
 
         // 12. Ask.
-        self.ask_user(name, input, depth, None, remember).await
+        self.ask_user(name, approval_input, depth, None, remember)
+            .await
     }
 
     fn matches_deny(&self, name: &str, call: &CallFacts) -> bool {
@@ -626,10 +653,18 @@ impl Permissions {
     /// filters, mirroring the gate where deny and safety checks are
     /// bypass-immune.
     pub fn read_path_blocked(&self, path: &Path) -> bool {
+        self.read_path_blocked_with_resolved_path(path, None)
+    }
+
+    pub(crate) fn read_path_blocked_with_resolved_path(
+        &self,
+        path: &Path,
+        resolved_path: Option<&Path>,
+    ) -> bool {
         if self.allow_everything {
             return false;
         }
-        let facts = PathFacts::gather(path, &self.cwd);
+        let facts = PathFacts::gather_with_resolved(path, &self.cwd, resolved_path);
         facts.sensitive
             || self
                 .deny
@@ -714,15 +749,20 @@ struct CallFacts {
 }
 
 struct PathFacts {
+    /// Canonical existing ancestor plus any not-yet-created suffix.
     normalized: PathBuf,
-    /// Present when the path is inside the working directory.
+    /// Resolved path relative to the canonical working directory.
     relative: Option<PathBuf>,
+    /// Original lexical spelling, retained so explicit path rules keep matching
+    /// aliases in addition to the resolved target.
+    original: PathBuf,
+    original_relative: Option<PathBuf>,
     inside_cwd: bool,
     sensitive: bool,
 }
 
 impl CallFacts {
-    fn gather(name: &str, input: &Value, cwd: &Path) -> Self {
+    fn gather(name: &str, input: &Value, cwd: &Path, resolved_path: Option<&Path>) -> Self {
         let bash_command = (name == "bash")
             .then(|| input["command"].as_str())
             .flatten();
@@ -731,7 +771,7 @@ impl CallFacts {
             .then(|| {
                 input["path"]
                     .as_str()
-                    .map(|raw| PathFacts::gather(Path::new(raw), cwd))
+                    .map(|raw| PathFacts::gather_with_resolved(Path::new(raw), cwd, resolved_path))
             })
             .flatten();
         let sensitive_read = (name == "read_file"
@@ -903,18 +943,53 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
 
 impl PathFacts {
     fn gather(raw: &Path, cwd: &Path) -> Self {
-        let normalized = lexical_normalize(cwd, raw);
-        let relative = normalized.strip_prefix(cwd).ok().map(Path::to_path_buf);
+        Self::gather_with_resolved(raw, cwd, None)
+    }
+
+    fn gather_with_resolved(raw: &Path, cwd: &Path, resolved_path: Option<&Path>) -> Self {
+        let original = lexical_normalize(cwd, raw);
+        let canonical_cwd =
+            std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical_normalize(Path::new("/"), cwd));
+        let normalized = resolved_path.map(Path::to_path_buf).unwrap_or_else(|| {
+            canonicalize_nearest_existing(&original).unwrap_or_else(|| original.clone())
+        });
+        let relative = normalized
+            .strip_prefix(&canonical_cwd)
+            .ok()
+            .map(Path::to_path_buf);
+        let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
-        let sensitive = path_is_sensitive(&normalized)
-            || std::fs::canonicalize(&normalized)
-                .ok()
-                .is_some_and(|canonical| path_is_sensitive(&canonical));
+        let sensitive = path_is_sensitive(&original) || path_is_sensitive(&normalized);
         PathFacts {
             normalized,
             relative,
+            original,
+            original_relative,
             inside_cwd,
             sensitive,
+        }
+    }
+}
+
+/// Canonicalize the nearest existing ancestor and reattach a missing suffix.
+/// This resolves parent symlinks even when the final write target does not yet
+/// exist, so permissions judge the same path the filesystem executor will use.
+fn canonicalize_nearest_existing(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
         }
     }
 }
@@ -1428,6 +1503,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_targets_follow_parent_symlinks_for_sensitive_and_deny_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "kloop-sensitive-parent-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::os::unix::fs::symlink(&hooks, root.join("innocent")).unwrap();
+
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let permissions = Permissions::new(
+            Mode::AcceptEdits,
+            &rules(&[], &[], &[]),
+            root.clone(),
+            Some(approver.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(permissions
+            .check("write_file", &file("innocent/pre-commit"), 0)
+            .await
+            .is_err());
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "sensitive alias must not auto-allow");
+        assert!(asked[0].description.contains("[sensitive path]"));
+        assert!(asked[0].description.contains(".git/hooks/pre-commit"));
+
+        let denied = Permissions::new(
+            Mode::AcceptEdits,
+            &rules(&[], &["write_file(.git/**)"], &[]),
+            root.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let error = denied
+            .check("write_file", &file("innocent/pre-commit"), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("blocked by a deny permission rule"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // ── layer 3: ask rules ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -1676,7 +1800,7 @@ mod tests {
             asked[0].description,
             "[sub-agent] [destructive] bash: rm -rf x"
         );
-        assert_eq!(asked[1].description, "write_file: a.txt");
+        assert_eq!(asked[1].description, "write_file: /work/proj/a.txt");
     }
 
     /// The approval request carries a file-change diff for edit/write so the

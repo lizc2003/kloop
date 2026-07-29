@@ -195,6 +195,7 @@ mod tests {
             context_window: window,
             fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+            file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
             agent_label: String::new(),

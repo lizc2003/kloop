@@ -202,6 +202,12 @@ Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
 macOS sandbox also denies reads of `~/.kloop/config.toml` and
 `~/.kloop/mcp-oauth.json`, including through a
 symlink, and provider/search key env vars are removed from model shell children.
+The direct file tools bind canonical descriptors to their permission facts; this
+is stronger than a pathname-only check. Unsandboxed Bash remains a policy check,
+not a filesystem transaction: a hostile same-UID process can race a checked
+pathname before the child opens it. Use the OS sandbox for adversarial process
+containment.
+
 The sandbox auto-allow layer is the sandbox/approval coupling — see OS sandbox
 below: a bash call the OS sandbox will contain skips everything beneath this
 layer, while deny rules, sensitive reads, safety checks and explicit ask rules
@@ -736,7 +742,53 @@ filesystem); the IO — file discovery, git commands — lives in
 server threads share one process-wide assembly. `--mock` stays hermetic:
 no file reads, no git commands, the pre-assembly hardcoded prompt.
 
-## Search tools (Phase 2, ninth slice)
+## File tools (Plan 49)
+
+`read_file`, `write_file`, and `edit_file` share session-scoped file observations
+(`core/src/file_state.rs`) rather than trusting a path forever:
+
+- **read_file** resolves and opens a canonical no-follow regular-file descriptor
+  before permission, so an approval wait cannot retarget a benign alias into a
+  sensitive file. It numbers UTF-8 text lines and accepts `offset`/`limit` as whole
+  numbers or numeric strings (`0` keeps the documented unbounded/from-start
+  behavior). Model-facing text is capped at 7,000 characters without splitting
+  UTF-8; empty files, past-EOF offsets, PDFs, and non-image binary data return
+  explicit results. PNG/JPEG/GIF/WebP continue as structured image blocks.
+  On Unix, regular files with multiple hard links are rejected because pathname
+  sensitivity cannot safely classify another name for the same inode.
+- Only a complete range that reaches the model in a final successful
+  `tool_result` qualifies an existing file for mutation. Preview reads, errors,
+  permission rejection, post-hook cancellation, restored sessions, sub-agents,
+  and separate worktrees do not inherit that authority. The bounded observation
+  table is process-memory only and deterministically evicts old entries.
+- **write_file** may create a new file only when its direct parent directory
+  already exists; it never creates missing intermediate directories. Replacing an
+  existing file, and every **edit_file**, requires a complete fresh read. A
+  partial, stale, or externally deleted observation fails closed; a successful
+  mutation refreshes the observation, while a failed or uncertain one clears it.
+- Mutations canonicalize the existing parent and open it as a directory handle
+  after pre-hooks but before permission checks; only the leaf may be absent. The
+  gate and approval preview see the canonical target. After an approval wait the
+  executor revalidates the parent identity, then performs target reads, temporary
+  creation, freshness checks, rename, cleanup, and parent sync relative to the
+  retained handle. Replacing a parent path with a symlink to `.git` or another
+  sensitive/denied location therefore rejects the call rather than retargeting
+  it. Internal parent aliases share one lock key, while a cwd-contained spelling
+  cannot escape through an ancestor symlink. Target opens are no-follow/nonblocking;
+  the commit preserves existing permissions (new files use conventional 0666
+  filtered by umask), checks the temporary name still denotes the opened inode,
+  and rejects symbolic-link leaves, FIFOs, or other non-regular targets.
+
+The descriptor boundary closes approval-time alias retargeting; it is not a
+filesystem transaction against a hostile same-UID process. POSIX still leaves a
+small final identity-check-to-`renameat` namespace window, documented in Plan 49.
+
+The complete-read requirement and fail-on-any-drift Edit policy are deliberately
+stricter than Claude Code 2.1.220, which accepts partial qualification in some
+paths and may stale-recover an unambiguous edit. The paired evidence and reasons
+are recorded in Plan 49 and `refs/claude-code-2.1.220/tool-matrix.json`.
+
+## Search tools (Phase 2, ninth slice; Plan 49 parity pass)
 
 Dedicated read-only `grep` and `glob` tools (`core/src/tools/search.rs`), built on
 ripgrep's own crates (`grep-searcher`/`grep-regex`/`ignore`) — no external
@@ -748,13 +800,19 @@ Grep/Glob:
   empty JSON strings for `glob`/`type` mean “filter omitted” (whitespace is
   not trimmed); `output_mode` = `files_with_matches` (default,
   newest-first) | `content`
-  (`path:line:text`, `-n`/`-A`/`-B`/`-C` supported) | `count`; `-i`,
-  `multiline`, and `head_limit`/`offset` paging (default 250). Honors
-  .gitignore, searches hidden files, never descends into VCS dirs, skips
-  binary files, clips matched lines at 500 chars, stops after a 20s budget
-  with a partial-results note.
-- **glob**: gitignore-style `pattern` under `path`, newest-first, capped
-  at 100 with cc's truncation notice.
+  (`path:line:text`, `-n`/`-A`/`-B`/`-C`, `context`, and `-o` supported) |
+  `count`; `-i`, `multiline`, and numeric-or-string `head_limit`/`offset`
+  paging (default 250). An explicitly supplied single-file path uses CC's
+  basename-free content format. Honors .gitignore, searches hidden files,
+  never descends into VCS dirs, skips binary files, binds each candidate to a
+  canonical no-follow regular-file descriptor before filtering and searches that
+  descriptor (not a later pathname lookup), clips matched lines at 500
+  characters, caps model-facing text at 7,000 characters, and stops after a
+  20s budget with a partial-results note.
+- **glob**: gitignore-style `pattern` under `path` (an empty pattern lists the
+  tree), newest-first, capped at exactly 100 paths with an explicit count of
+  paths actually shown after the character cap; model-facing text has the same
+  code-mode caller retains the full 100-entry array.
 
 Two deliberate deviations from cc (documented in plan 14): `glob` honors
 .gitignore (cc's does not — a Rust tree would drown in `target/`), and the
@@ -768,7 +826,8 @@ covered by a `read_file` deny rule (`read_file(**/*.pem)`, or the whole-tool
 `read_file` form) or on the sensitive-path list (`.env*`, `.ssh`, `.git`,
 `.kloop`, …) is dropped from grep/glob output — before its contents are read —
 so a deny meant for reads is not slipped by grep, and secrets do not leak
-through a search. The dropped count is reported (`[N path(s) hidden by
+through a search. Grep also skips files with multiple hard links because the
+pathname cannot classify another name for the same inode. The dropped count is reported (`[N path(s) hidden by
 deny/sensitive rules]`) rather than silently swallowed. This is an output
 filter, not an approval prompt (a tree walk touches too many paths for the
 gate's one-path ask); it applies in every mode but `--mock`, `--permission-mode

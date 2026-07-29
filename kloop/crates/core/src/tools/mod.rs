@@ -99,6 +99,25 @@ impl SourceOutput {
     }
 }
 
+struct ToolExecution {
+    result: Result<ToolResultContent>,
+    file_state_update: Option<(
+        Arc<crate::file_state::FileState>,
+        crate::file_state::FileStateUpdate,
+    )>,
+    path_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ToolExecution {
+    fn from_result(result: Result<ToolResultContent>) -> Self {
+        Self {
+            result,
+            file_state_update: None,
+            path_lock: None,
+        }
+    }
+}
+
 pub trait ToolSource: Send + Sync {
     /// Tool definitions as advertised by the source (schema passed through).
     fn defs(&self) -> &[ToolDef];
@@ -332,13 +351,13 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` (up to 2000 by default; use offset/limit to page). Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply.".into(),
+            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "offset": {"type": "integer", "description": "1-based line number to start from (default 1)"},
-                    "limit": {"type": "integer", "description": "Max lines to return (default 2000)"}
+                    "offset": {"type": "integer", "minimum": 0, "description": "Line number to start from (default 1; 0 is accepted for compatibility)"},
+                    "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return (omit or pass 0 for all lines within the character budget)"}
                 },
                 "required": ["path"]
             }),
@@ -382,11 +401,13 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
                     "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"], "description": "files_with_matches: file paths newest-first (default); content: matching lines as path:line:text; count: per-file match counts"},
                     "-i": {"type": "boolean", "description": "Case-insensitive (default false)"},
                     "-n": {"type": "boolean", "description": "Show line numbers in content mode (default true)"},
-                    "-A": {"type": "integer", "description": "Lines shown after each match (content mode only)"},
-                    "-B": {"type": "integer", "description": "Lines shown before each match (content mode only)"},
-                    "-C": {"type": "integer", "description": "Lines shown around each match (content mode only; overrides -A/-B)"},
-                    "head_limit": {"type": "integer", "description": "Max results returned (default 250, 0 = unlimited)"},
-                    "offset": {"type": "integer", "description": "Skip this many results before head_limit applies (default 0)"},
+                    "-A": {"type": "integer", "minimum": 0, "description": "Lines shown after each match (content mode only)"},
+                    "-B": {"type": "integer", "minimum": 0, "description": "Lines shown before each match (content mode only)"},
+                    "-C": {"type": "integer", "minimum": 0, "description": "Lines shown around each match (content mode only; overridden by context)"},
+                    "context": {"type": "integer", "minimum": 0, "description": "Lines shown before and after each match (content mode only)"},
+                    "-o": {"type": "boolean", "description": "Print only matched non-empty text (content mode only; default false)"},
+                    "head_limit": {"type": "integer", "minimum": 0, "description": "Max results returned (default 250, 0 = unlimited)"},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Skip this many results before head_limit applies (default 0)"},
                     "multiline": {"type": "boolean", "description": "Patterns may span lines and . matches newlines (default false)"}
                 },
                 "required": ["pattern"]
@@ -595,6 +616,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             },
         });
     }
+    let event_input = input.clone();
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -632,21 +654,51 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 ctx.hook_context.lock().unwrap().extend(context);
             }
         }
+        // Prepare mutations after pre-hooks but before permission. The gate sees
+        // the canonical effective target, while the executor retains an open
+        // parent directory handle across any approval wait.
+        let input = input;
+        let prepared_mutation = if matches!(name.as_str(), "write_file" | "edit_file") {
+            Some(fs::prepare_mutation_input(&name, &input, &ctx).await?)
+        } else {
+            None
+        };
+        let prepared_read = if name == "read_file" {
+            Some(fs::prepare_read(&input, &ctx).await?)
+        } else {
+            None
+        };
         let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &ctx);
         // effective_*: gate on the active worktree's re-anchored permissions
         // when the session entered one (plan 35 slice 2), else the base gate.
         if let Err(reason) = ctx
             .cfg
             .effective_permissions()
-            .check_call(&name, &input, ctx.depth, sandbox_auto_allow)
+            .check_call_with_resolved_path(
+                &name,
+                &input,
+                prepared_mutation
+                    .as_ref()
+                    .map(fs::PreparedMutation::resolved_path)
+                    .or(prepared_read.as_ref().map(fs::PreparedRead::resolved_path)),
+                ctx.depth,
+                sandbox_auto_allow,
+            )
             .await
         {
             bail!(reason);
         }
-        let result = execute_tool(&name, &input, &ctx).await;
+        let execution = execute_tool(
+            &name,
+            &input,
+            prepared_read.as_ref(),
+            prepared_mutation.as_ref(),
+            &ctx,
+        )
+        .await;
         // post_tool hooks (and other text-only surfaces) see the flattened
         // text; an image result renders as an `[image: <media_type>]` tag.
-        let (text, is_error) = match &result {
+        let (text, is_error) = match &execution.result {
             Ok(content) => (content.as_text().into_owned(), false),
             Err(e) => (format!("{e:#}"), true),
         };
@@ -662,23 +714,46 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             )
             .await;
         ctx.hook_context.lock().unwrap().extend(context);
-        result
+        Ok::<ToolExecution, anyhow::Error>(execution)
     };
-    let result = tokio::select! {
-        _ = ctx.cancel.cancelled() => interrupted(&id),
+    let (result, file_state_update, path_lock) = tokio::select! {
+        _ = ctx.cancel.cancelled() => (interrupted(&id), None, None),
         r = gated => match r {
-            Ok(content) => ContentBlock::ToolResult {
-                tool_use_id: id,
-                content,
-                is_error: false,
-            },
-            Err(e) => ContentBlock::ToolResult {
-                tool_use_id: id,
+            Ok(execution) => {
+                let ToolExecution {
+                    result,
+                    file_state_update,
+                    path_lock,
+                } = execution;
+                let result = match result {
+                    Ok(content) => ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content,
+                        is_error: false,
+                    },
+                    Err(e) => ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("{e:#}").into(),
+                        is_error: true,
+                    },
+                };
+                (result, file_state_update, path_lock)
+            }
+            Err(e) => (ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
                 content: format!("{e:#}").into(),
                 is_error: true,
-            },
+            }, None, None),
         },
     };
+    // The model has a successful Read/Write/Edit only once the final tool_result
+    // exists. Executor-local reads and work canceled while a post-hook runs do
+    // not create write authority. Mutation executors clear authority before
+    // touching disk, so an interrupted commit remains conservative.
+    if let Some((state, update)) = file_state_update {
+        state.apply(update);
+    }
+    drop(path_lock);
     let ContentBlock::ToolResult {
         tool_use_id,
         is_error,
@@ -697,7 +772,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             item: Item::ToolCall {
                 agent: ctx.cfg.agent_label.clone(),
                 name: name.clone(),
-                input: input.clone(),
+                input: event_input,
                 status: if *is_error {
                     ItemStatus::Failed
                 } else {
@@ -717,29 +792,69 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
 fn execute_tool<'a>(
     name: &'a str,
     input: &'a Value,
+    prepared_read: Option<&'a fs::PreparedRead>,
+    prepared_mutation: Option<&'a fs::PreparedMutation>,
     ctx: &'a ToolCtx,
-) -> Pin<Box<dyn Future<Output = Result<ToolResultContent>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>> {
     Box::pin(async move {
         // read_file is the sole BUILT-IN that can return non-text: on an image
         // file it returns an image block (ToolResultContent::Blocks).
         if name == "read_file" {
-            return fs::read_file_tool(input, ctx).await;
+            let Some(prepared) = prepared_read else {
+                return ToolExecution::from_result(Err(anyhow!(
+                    "read_file: target was not prepared"
+                )));
+            };
+            let state = ctx.cfg.effective_file_state();
+            return match fs::read_file_tool(input, prepared).await {
+                Ok(output) => ToolExecution {
+                    result: Ok(output.content),
+                    file_state_update: Some((state, output.state_update)),
+                    path_lock: None,
+                },
+                Err(error) => ToolExecution::from_result(Err(error)),
+            };
         }
-        // External source tools can also return images — handle them before the text-returning built-ins so their result can be Text OR
-        // Blocks. A program still gets the structured form via the sink.
+        if name == "write_file" || name == "edit_file" {
+            let Some(prepared) = prepared_mutation else {
+                return ToolExecution::from_result(Err(anyhow!(
+                    "{name}: mutation target was not prepared"
+                )));
+            };
+            let state = ctx.cfg.effective_file_state();
+            let output = if name == "write_file" {
+                fs::write_file_tool(input, prepared, ctx).await
+            } else {
+                fs::edit_file_tool(input, prepared, ctx).await
+            };
+            return match output {
+                Ok(output) => ToolExecution {
+                    result: Ok(ToolResultContent::Text(output.content)),
+                    file_state_update: Some((state, output.state_update)),
+                    path_lock: Some(output.path_lock),
+                },
+                Err(error) => ToolExecution::from_result(Err(error)),
+            };
+        }
+
+        // External source tools can also return images — handle them before the
+        // text-returning built-ins so their result can be Text OR Blocks. A
+        // program still gets the structured form via the sink.
         if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
-            let out = source.call(name, input).await?;
-            if let Some(slot) = &ctx.program_result {
-                *slot.lock().unwrap() = out.structured.clone();
-            }
-            return Ok(out.into_content());
+            return match source.call(name, input).await {
+                Ok(out) => {
+                    if let Some(slot) = &ctx.program_result {
+                        *slot.lock().unwrap() = out.structured.clone();
+                    }
+                    ToolExecution::from_result(Ok(out.into_content()))
+                }
+                Err(error) => ToolExecution::from_result(Err(error)),
+            };
         }
         let text: Result<String> = match name {
             "bash" => bash::bash_tool(input, ctx).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
-            "write_file" => fs::write_file_tool(input, ctx).await,
-            "edit_file" => fs::edit_file_tool(input, ctx).await,
             "grep" => {
                 search::grep_tool(input, &ctx.cfg.effective_cwd(), ctx.cfg.effective_permissions())
                     .await
@@ -774,8 +889,15 @@ fn execute_tool<'a>(
             // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
             other => Err(anyhow!("unknown tool: {other}")),
         };
-        text.map(ToolResultContent::Text)
+        ToolExecution::from_result(text.map(ToolResultContent::Text))
     })
+}
+
+pub(crate) fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
+    }
 }
 
 pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
@@ -837,6 +959,7 @@ pub(crate) mod testutil {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                file_state: Default::default(),
                 tool_sources: sources,
                 session_id: String::new(),
                 agent_label: String::new(),
@@ -1392,6 +1515,13 @@ mod tests {
         assert!(!is_concurrency_safe("bash", &json!({})));
     }
 
+    #[test]
+    fn char_prefix_never_splits_utf8() {
+        assert_eq!(char_prefix("a界b", 2), ("a界", true));
+        assert_eq!(char_prefix("a界b", 3), ("a界b", false));
+        assert_eq!(char_prefix("a界b", 99), ("a界b", false));
+    }
+
     #[tokio::test]
     async fn cancelled_dispatch_patches_every_tool_use() {
         use kloop_provider::Provider;
@@ -1416,6 +1546,7 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                file_state: Default::default(),
                 tool_sources: Vec::new(),
                 session_id: String::new(),
                 agent_label: String::new(),
