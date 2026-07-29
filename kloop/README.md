@@ -35,10 +35,20 @@ per-dimension matrix under [`../refs/claude-code-2.1.220/`](../refs/claude-code-
 The methodology, current counts, replay commands, and Plan 49–59 follow-up map
 are documented in [`../refs/README.md`](../refs/README.md) and
 [`../docs/plan/48-claude-code-2.1.220-tool-parity.md`](../docs/plan/48-claude-code-2.1.220-tool-parity.md).
+Plan 49 now adds an executable file/search gate on top of that corpus: generated
+`paired-parity.json` contracts cover every `same` matrix cell, CC fixtures carry
+per-call Pre/Post hook lifecycle evidence, and one fixed Rust test runs the real
+kloop dispatcher and emits the call/event report compared by `verify.py`. The
+comparison includes normalized inputs, lifecycle, results, ordering, and workspace;
+cross-profile cells additionally require exact-bundle profile-bridge evidence. The default
+verifier checks the pinned binary and bundle bytes; `verify.py --corpus-only`
+keeps all fixture/hash/tamper/matrix/pair/Rust checks for ordinary macOS/Linux
+CI runners that do not contain the target binary.
 
 This baseline is evidence and a roadmap, not a claim that all tools already
 match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 49–59; kloop-only capabilities stay intentionally separate.
+remain for Plans 50–59; kloop-only capabilities stay intentionally separate.
+
 
 ## Compaction (Phase 2, first slice)
 
@@ -785,8 +795,12 @@ small final identity-check-to-`renameat` namespace window, documented in Plan 49
 
 The complete-read requirement and fail-on-any-drift Edit policy are deliberately
 stricter than Claude Code 2.1.220, which accepts partial qualification in some
-paths and may stale-recover an unambiguous edit. The paired evidence and reasons
-are recorded in Plan 49 and `refs/claude-code-2.1.220/tool-matrix.json`.
+paths and may stale-recover an unambiguous edit. Plan 49's executor-level hook
+fixtures and dependent mutation pair use the same normalized call inputs as the
+real-dispatch kloop report; generated contracts in
+`refs/claude-code-2.1.220/paired-parity.json` compare call/event/result/order/workspace
+projections and require exact-bundle bridges for cross-profile cells. Detailed
+policy differences remain in `tool-matrix.json`.
 
 ## Search tools (Phase 2, ninth slice; Plan 49 parity pass)
 

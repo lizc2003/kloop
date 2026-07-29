@@ -28,3 +28,4 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: python3 -B ../refs/claude-code-2.1.220/verify.py --corpus-only

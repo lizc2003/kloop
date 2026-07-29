@@ -18,20 +18,21 @@ Plan 49–58 按行为簇补齐单工具纵向证据。Plan 59 不新增工具�
 
 对应 matrix 行：
 
-- 无专属行；验收 matrix 全部 43 行，包括 Plan 49–58 覆盖的 38 行、3 个 kloop-only 行和 2 个平台/入口 `n/a` 排除行。
+- 无专属行；当前验收 matrix 为 55 行。后续 Plan 50–58 若按证据新增 profile/surface 行，以开工时 generator 产物为准，不为 Plan 59 伪造专属 row。
 
 当前结论：
 
-- Plan 48 已固定 2.1.220 identity、collector、manifest、static evidence、matrix schema、38 组 fixtures 和 fail-closed verifier。
-- Plan 49–58 在本计划开工前必须分别完成；当前不能预写其最终兼容结论。
-- 单工具 golden 不能自动证明文件/Bash/Worktree、Agent/后台/调度、MCP/Web、plan/PTY 等跨工具链。
-- “零 unknown”不是机械验收指标；当前两个平台/入口排除行应保持 `n/a`，其他无法运行的条件分支可保留有证据理由的 `unknown`。
+- Plan 48 已固定 2.1.220 identity、collector、manifest、static evidence、matrix schema、38 组历史 fixtures 和 fail-closed verifier。
+- Plan 49 已完成，并提供首个可复用的 executable pair 基线：`paired-parity.json` 由 matrix generator 同步生成，固定 Rust report test 运行真实 dispatcher，full/corpus-only verifier 比较 CC/kloop 共同语义；corpus-only 已进 macOS/Linux CI。
+- Plan 50–58 在本计划开工前仍必须分别完成；当前不能预写其最终兼容结论。
+- 单工具/pair contract 不能自动证明文件/Bash/Worktree、Agent/后台/调度、MCP/Web、plan/PTY 等跨工具链。
+- “零 unknown”不是机械验收指标；平台/入口排除行和条件 gate 可保持有证据理由的 `n/a`/`unknown`。
 - 只有本计划完成后，才允许重新评估“全工具已对齐”或“可替换 Claude Code”的产品表述。
 
 优先复用：
 
 - Plan 48 的 exact binary identity guard、collector、manifest、matrix generator 与 verifier
-- Plan 49–58 的 raw/normalized fixtures、static evidence、kloop golden 和完成裁决
+- Plan 49–58 的 raw/normalized fixtures、static evidence、kloop executable report/golden、generated pair contract 和完成裁决
 - `refs/claude-code-2.1.220/` 下的全部 parity 产物
 - kloop 全 workspace 测试、mock smoke test 与前端/session 清理 seam
 
@@ -51,7 +52,7 @@ Plan 49–58 按行为簇补齐单工具纵向证据。Plan 59 不新增工具�
 - matrix 每行均映射到子计划裁决或明确排除理由；Plan 59 不接管未完成的行为实现。
 - 所有非 `unknown`/`n/a` 维度都有可定位 evidence；`static:*` locator 的 `covers` 必须包含当前维度。
 - executor/output/lifecycle 等运行维度必须有 CC 调用 fixture，不能只引用 registration capture 或工具描述。
-- 双边兼容状态必须同时有 CC 与 kloop 对应证据；所有 `same` 都有相同 profile/case 的 CC fixture 与 kloop golden。
+- 双边兼容状态必须同时有 CC 与 kloop 对应证据；所有 `same` 都由 generated pair contract 精确覆盖，并在 verifier 中对同一规范化输入执行共同语义 projection 比较。fixture profile 与 matrix cell 不同时，必须逐 cell 声明 exact-bundle profile bridge，且证据覆盖当前维度；不能退化成布尔声明或源码行号门。
 - collector、generator、verifier 可从 clean checkout 运行；生成产物与已提交字节一致。
 - 跨工具 case 使用临时 HOME/config/cwd/repo/storage 与本地 stub，不访问公网、真实用户会话或用户仓库。
 
@@ -122,6 +123,7 @@ Plan 49–58 按行为簇补齐单工具纵向证据。Plan 59 不新增工具�
 
 ```bash
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 cd kloop
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings

@@ -21,9 +21,13 @@
 > file mutation 资格，恢复、子 agent 与独立 worktree 都从 fresh state 开始。Write/Edit 在 keyed
 > path lock 内复核版本，用同目录独占临时文件 + sync + atomic rename + parent sync 提交，保留权限；Read 后删除按 stale 拒绝，cwd 内 parent-symlink escape 与 symlink leaf/非普通目标都拒绝；partial/stale read 一律 fail closed。Read 与搜索文本统一 UTF-8 安全 7k 字符预算，
 > Grep 补 `context`/`-o`/数字字符串/单文件格式，Glob 保持 100 项精确提示。`.gitignore`、VCS 跳过及
-> deny/sensitive 过滤继续作为安全产品差异。基线现为 71 captures、92 static evidence、55 matrix rows；
-> 440 单元中 71 compatible / 83 intentional-diff / 20 missing / 241 unknown / 20 n/a / 5 same。
-> `same` 只允许 CC fixture + 直接 `kloop:` golden + `kloop_golden: true` 三门齐全。Plan 50–59 尚未执行。
+> deny/sensitive 过滤继续作为安全产品差异。补强证据门后基线为 73 captures、95 static evidence、55 matrix rows；
+> 440 单元中 70 compatible / 83 intentional-diff / 20 missing / 237 unknown / 22 n/a / 8 same。
+> 3 个 generated pair contract 精确覆盖全部 `same`：CC 侧用 per-call Pre/Post hook barrier/serial trace，
+> kloop 侧由固定 Rust test 运行真实 `dispatch_tools` 并输出 call/event report，`verify.py` 比较规范化输入、生命周期、result、偏序与 workspace；跨 profile cell 还必须有该维度的 exact-bundle bridge。
+> No/Esc 已自然续跑取证：第一次 continuation sampling 无 result，下一 settlement request 带唯一 error
+> result 后 final；旧的 harness 强杀结论作废。默认 verifier 校 exact binary，`--corpus-only` 已进双平台 CI。
+> Plan 50–59 尚未执行。
 >
 > **CodeWhale 调研已完成（2026-07-27）**：本地只读克隆固定在 `refs/codewhale`，当前 commit 为
 > `b494236312ef3ac36489c83706a0b11ab73935a1`；`60-codewhale-source-review.md` 区分已接通主路径、
@@ -259,6 +263,6 @@
 - **plan 46(✅ 完成,2026-07-24)** 唯一全局用户配置：删除 cwd `.kloop/config.toml` 自动配置层，provider/model/permissions/MCP/web/hooks/sandbox/agents/codemode 全部从一次解析的 `~/.kloop/config.toml` 进程快照构建；thread cwd 只留 workspace anchor。AllowAlways 改为私有原子写全局规则并同步进程内 snapshot；OAuth store 移到 `~/.kloop/mcp-oauth.json`，config/OAuth 同时纳入 sandbox deny-read。legacy cwd config 完全不探测、不警告、不合并；`--mock` 不解析 HOME/config/provider/runtime env，并有 clean-env 进程级回归。Unix 私有读写校验并锚定配置目录 descriptor，以 `O_NOFOLLOW` `openat` / `renameat` 消除叶文件和父目录替换窗口，`mkdirat` / `chmodat` / `fchmod` 保证严格 umask 下仍为目录 `0700`、文件 `0600`，`O_NONBLOCK` 保证 FIFO 等非普通文件立即拒绝；严格 schema、跨 cwd 一致性、secret-safe projection、symlink/开放目录拒绝回归已补。详见 plan 46 完成记录。
 - **plan 47(✅ 完成,2026-07-27)** grep 空过滤器兼容：`GrepArgs::parse` 将精确零长度的 `glob` / `type` 规范化为未提供，避免空 type 报错并让空 glob 正常搜索；纯空白字符串不裁剪。解析层与行为层回归测试、README 已同步，context/-o、glob 拆分、长行策略及独立 glob 工具不变。详见 plan 47 完成记录。
 - **plan 48(✅ 完成,2026-07-27)** Claude Code 2.1.220 工具 parity 基线：目标二进制按 version/size/SHA-256 精确钉死；`refs/claude-code-2.1.220/` 已提交 hermetic collector、本地 provider/Web/MCP/PTY stubs、6 profiles 下 38 组 raw/normalized fixtures、46 条 static evidence、43 行 machine-readable matrix、deterministic generator 与 fail-closed verifier。六个 anchor(Glob/ToolSearch/ExitPlanMode/WebFetch/Agent/Bash)已纵向探测；WebFetch loopback 仅得到 domain-safety ordering 负证据，不冒充 executor 成功。矩阵为 47 compatible / 43 intentional-diff / 20 missing / 215 unknown / 19 n/a / 0 same；kloop-only 三工具单列。**该提交当时未改任何产品工具行为，Plan 49–59 均未执行；Plan 49 现已由下一条闭环，其余仍不得外推为全工具对齐或可替换 Claude Code。**详见 plan 48 完成记录与 `refs/README.md`。
-- **plan 49(✅ 完成,2026-07-29)** 文件/搜索工具 exact parity：session-only bounded file observations、成功完整 Read 才授权 existing mutation、fresh sub-agent/resume/worktree state；Write/Edit keyed path lock + stale final check + same-directory sync/atomic rename/parent sync，拒 symlink/非普通文件，失败清 authority；Read 7k UTF-8 安全文本/明确 PDF 与 binary 边界；Grep 补 context/-o/数字分页/单文件格式，Glob 精确 100 + 字符预算，搜索安全策略不降级。CC corpus 71 captures，静态 evidence 92，matrix 55 行/440 单元 = 71 compatible、83 intentional-diff、20 missing、241 unknown、20 n/a、5 same；verifier 强制 same 的 fixture+kloop golden+声明三门。详见 plan 49 完成记录。
+- **plan 49(✅ 完成,2026-07-29)** 文件/搜索工具 exact parity：session-only bounded file observations、成功完整 Read 才授权 existing mutation、fresh sub-agent/resume/worktree state；Write/Edit keyed path lock + stale final check + same-directory sync/atomic rename/parent sync，拒 symlink/非普通文件，失败清 authority；Read 7k UTF-8 安全文本/明确 PDF 与 binary 边界；Grep 补 context/-o/数字分页/单文件格式，Glob 精确 100 + 字符预算，搜索安全策略不降级。补强证据后 CC corpus 73 captures、static evidence 95、matrix 55 行/440 单元 = 70 compatible、83 intentional-diff、20 missing、237 unknown、22 n/a、8 same；3 个 generated pair contract 覆盖全部 same，固定 Rust report test 运行真实 dispatcher，由 full/corpus-only verifier 比较规范化调用输入、生命周期、result、偏序与 workspace，跨 profile cell 另由 exact-bundle bridge fail closed。Pre/Post hook barrier 证明 Read/Glob/Grep 并发，dependent Edit/Edit/Write/Write pair 证明 mutation 串行；Glob/Grep lifecycle 升 same。No/Esc 自然 continuation 证明先 omitted sampling、后 error-result settlement 再 final，订正旧强杀观察。corpus-only 门已进 macOS/Linux CI。详见 plan 49 完成记录。
 
 不占编号的小事:首次推远端后看 CI 实跑一次绿(用户已暂缓)。备选池(未编号未承诺):OpenAI-compat reasoning、hook 的 stdout JSON 协议/更多挂点、`/cost` 累计花费(逐轮 usage 明细 + 每模型价目表,现只做了当前上下文大小)、图片输入余项(MCP 图结果 / client 端 resize / 模型视觉能力位检测 / PDF 块 / TUI 粘贴入口 / 暴露 detail,plan 29「不做」节)。真 key 在 `.kloop/env.local`(gitignored,勿写进任何提交文件)。

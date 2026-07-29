@@ -92,17 +92,20 @@ Plan 48 已提交以下可重放基线:
 - `collect.py`/`verify.py`:采集前 exact identity guard，隔离 HOME/config/cwd、本地 provider/Web/MCP，
   受限 normalization、hash/determinism、证据引用、文件集合、环境/网络和敏感信息 fail-closed 校验。
 
-Plan 49 已在该基线上闭环文件/搜索簇。`static-evidence.jsonl` 现有 92 条证据：Plan 48
-的 46 条仍是历史提交数，新增 kloop Read/Write/Edit/file-state/Glob/Grep code + golden anchor
-也进入 fail-closed 必备集合。采集集仍为 71 组 capture：40 组 schema v1，31 组 schema v2
-scripted workspace，包含 17 组 normalized bytes 完全一致的 determinism pair；矩阵仍为 55 行。
-schema v2 保留 provider/tool/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace
+Plan 49 已在该基线上闭环文件/搜索簇并补齐 executable parity 门。`static-evidence.jsonl` 现有
+95 条证据：Plan 48 的 46 条仍是历史提交数，新增 kloop Read/Write/Edit/file-state/Glob/Grep、
+permission、per-call Pre/Post hook 与 Rust parity report code/golden anchors 进入 fail-closed 必备集合。
+采集集为 73 组 capture：40 组 schema v1，33 组 schema v2 scripted workspace，包含 18 组
+normalized bytes 完全一致的 determinism pair；同轮并发仍为明确 singleton，不伪装 deterministic pair。
+schema v2 保留 provider/tool/hook/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace
 mtime，以及由 fixture 明示的 interactive PTY 收尾状态。
 
 新增证据固定了 Read 文本/媒体/二进制分支、Write/Edit prior-read 与 stale 路径、Grep
 parser/output、hidden/VCS/gitignore allowed-path 观察、路径种类和同轮读写顺序。CC 的
 interactive pair 证明批准后 Write 会重新检查 stale；Edit 可在 old string 对当前内容仍唯一时
-stale-recover 并保留无关外部修改；明确 No 和 Esc 均不返回最终工具结果且不改文件。
+stale-recover 并保留无关外部修改。No/Esc 已改为自然 continuation：第一次采样不携被拒调用
+result，下一 settlement request 带唯一 `is_error` result 后正常 final；旧的 harness Ctrl-C/SIGTERM
+“无最终结果”观察已订正。
 
 kloop 则保留更严格的安全边界：Read 在 permission 前 canonicalize + no-follow/nonblocking 打开 regular-file descriptor，仍用原始 alias 匹配规则，Unix 多 hard-link regular file 因 pathname 无法分类同 inode 的其他名字而拒绝，只有最终成功、完整展示的结果建立 session-only observation；
 existing Write/Edit 要求完整且 fresh，任意版本漂移都 fail closed；pre-hook 后只允许 leaf 缺失、
@@ -115,12 +118,17 @@ Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 
 创建缺失父目录，kloop 也不复制这一行为；它与 CC partial-read、Edit stale recovery、广义搜索可见性
 均记为 `intentional-diff`，没有为字面一致降级。descriptor boundary 阻断审批等待中的常规 alias retarget，但不是 hostile same-UID 文件系统事务；最终 identity check→`renameat` 的微小 namespace window 仍明确保留。
 
-当前 440 个矩阵单元为 71 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
-241 个 `unknown`、20 个 `n/a`、5 个 `same`。五个 `same` 只出现在有 CC fixture、直接
-`kloop:` golden 和 `kloop_golden: true` 三重证据的并发分类；verifier 会拒绝缺任一条件的生成物。
-Grep 在 CC clean profile 被条件 gate 隐藏，而 kloop 始终可用，故注册记有意差异。WebFetch 本地
-URL 仍在 2.1.220 domain-safety 层先被拒、stub 收到 0 请求，所以重定向/认证/大响应 executor
-继续为 `unknown`；Plan 49 没有外推其他工具簇。
+当前 440 个矩阵单元为 70 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
+237 个 `unknown`、22 个 `n/a`、8 个 `same`。`paired-parity.json` 由 matrix generator 同步生成，
+3 个 contract 精确覆盖全部 8 个 `same`：Read/Glob/Grep 并发，Write/Edit 串行，以及 Glob/Grep
+无孤儿 lifecycle。verifier 固定运行一个真实 `dispatch_tools` Rust report test，再比较 CC/kloop 的
+规范化调用输入、start/finish、result、偏序和 workspace projection；fixture profile 与 matrix cell
+不同时还要求该 cell 引用由精确 bundle 支撑、覆盖当前维度的 profile bridge。旧的
+`kloop_golden: true` 声明门已移除。
+`grep@clean-cli` 因精确 search-tools gate 不注册，downstream parser/executor/output/lifecycle 有负注册
+证据并要求 allow-profile coverage 后标 `n/a`，不是静默删除未知。WebFetch 本地 URL 仍在 2.1.220
+domain-safety 层先被拒、stub 收到 0 请求，所以重定向/认证/大响应 executor 继续为 `unknown`；
+Plan 49 没有外推其他工具簇。
 
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
@@ -130,7 +138,10 @@ python3 -B refs/claude-code-2.1.220/collect.py list
 python3 -B refs/claude-code-2.1.220/collect.py collect --all
 python3 -B refs/claude-code-2.1.220/build_matrix.py
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 ```
+
+默认 `verify.py` 读取并校验本机精确 target identity 与 bundle locator bytes；`--corpus-only` 只跳过这两项，仍执行 fixture/hash/normalization/tamper、matrix/pair 生成一致性、fake provider、敏感信息和 kloop Rust semantic report，供不含目标二进制的 macOS/Linux CI 使用。
 
 `collect --all` 会采出带新临时路径/端口的 raw 文件，它是重放审计，不是改写 Plan 48 历史
 capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复 immutable legacy raw/manifest

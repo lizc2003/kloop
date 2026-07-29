@@ -69,8 +69,12 @@
 
 Plan 49 已销账 Read/Write/Edit/Glob/Grep 的主干正确性：session-only 完整读取资格、stale-safe
 原子 mutation、UTF-8 安全的 7k Read/Search 输出预算、Grep context/`-o`/分页，以及搜索
-ignore/VCS/敏感路径策略均有 exact CC fixture + kloop golden。当前 matrix 仍保留 241 个跨其他
-工具簇或不可运行分支的 `unknown`；5 个 `same` 仅指有成对动态证据的并发分类，不外推“全工具一致”。
+ignore/VCS/敏感路径策略均有 exact CC fixture + kloop golden。补强证据门后，descriptor-locked
+Pre/Post hook barrier 证明 Read/Glob/Grep 真并发，dependent Edit/Edit/Write/Write pair 证明 mutation
+串行；generated pair contract 再以相同规范化调用输入与真实 `dispatch_tools` Rust call/event report 比较，
+跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。当前 matrix 保留 237 个跨其他
+工具簇或不可运行分支的 `unknown`；8 个 `same` 只覆盖上述并发/串行分类与 Glob/Grep 无孤儿
+lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门已进双平台 CI。
 
 ### 5. 子 agent / 多 agent——✅ 收敛解全齐
 

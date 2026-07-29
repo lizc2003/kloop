@@ -8,6 +8,8 @@ mod bash;
 mod codemode;
 mod fs;
 mod inject;
+#[cfg(test)]
+mod plan49_parity_tests;
 mod plan_mode;
 mod search;
 mod skill;

@@ -1,6 +1,6 @@
 # Plan 49 — 文件与搜索工具对齐
 
-> 状态：✅ 已完成（2026-07-29）
+> 状态：✅ 已完成（2026-07-29；同日补齐 executable parity 与 corpus CI）
 >
 > 母计划：Plan 48
 >
@@ -40,7 +40,7 @@ kloop 开工时还有两个独立产品缺口：Read 尚无有界输出和读取
 
 最终结论：
 
-- Read/Write/Edit 的注册与 schema 为 `compatible`；Read、Glob、Grep 只读并发与 Write 串行分类有成对动态证据，标为 `same`。其余结果按实际语义分成 `compatible` 或 `intentional-diff`，不把名字相同外推成逐字节一致。
+- Read/Write/Edit 的注册与 schema 为 `compatible`；Read、Glob、Grep 的只读并发、Write/Edit 串行分类，以及 Glob/Grep 的无孤儿调用 lifecycle 都有 CC executor hook 与 kloop real-dispatch 成对动态证据，标为 `same`。其余结果按实际语义分成 `compatible` 或 `intentional-diff`，不把名字相同外推成逐字节一致。
 - 只有最终成功且完整展示的 Read 建立 session mutation observation。kloop 对 existing Write/Edit 要求完整 fresh Read；CC 接受部分 Write 资格、unread/partial Edit，并可对唯一 old string stale-recover，因此执行和 lifecycle 保留有意差异。
 - kloop mutation 用 normalized-path keyed lock、同目录 `create_new` 临时文件、权限保留、sync、最终版本复核、atomic rename、parent sync 和失败清理；symlink/非普通文件拒绝。
 - Read 文本按字符安全地限制为 7k，PDF 与非 UTF-8 明确拒绝；图片仍为结构化 block。Grep 已补 `context`、`-o`、数字字符串、单文件路径格式和分页；Glob 精确 100 项并把 program 数组与模型字符预算分开。
@@ -49,16 +49,17 @@ kloop 开工时还有两个独立产品缺口：Read 尚无有界输出和读取
 
 ### 证据与 matrix 闭环（2026-07-29）
 
-CC 侧可重放 corpus 与 kloop paired goldens 已共同进入生成器和 verifier：
+CC 侧可重放 corpus、generated pair contract 与 kloop executable report 已共同进入 generator、verifier 和 CI：
 
-- 精确 2.1.220 静态证据现为 92 条：CC adapter/media/permission/result/concurrency/条件注册链，加 kloop registry/dispatch/Read/Write/Edit/file-state/Glob/Grep/permission 的 code + golden anchors。
-- capture 为 71 组：40 组 schema v1、31 组 schema v2；17 个 determinism group 的 normalized bytes 完全一致，same-round concurrency 仍是明确 singleton，不伪装 deterministic pair。
-- matrix 为 55 行、440 个维度单元：71 `compatible`、83 `intentional-diff`、20 `missing`、241 `unknown`、20 `n/a`、5 `same`。
-- `same` 只在同一行同时引用 CC fixture、直接 `kloop:` golden 且声明 `kloop_golden: true` 时成立；`verify.py` 对这三门 fail closed。其余 paired 但非逐字节同义的行为只标 `compatible`。
-- Read/Write/Edit/Grep/file-state 的 kloop anchor 已加入 Plan 49 required evidence set；手改 `tool-matrix.json` 会被 generator 重建和 verifier 拒绝。
-- interactive No/Esc 没有 CC 最终 tool result；kloop 为保持 provider history 合法会返回 error/interrupted pairing。批准后的 Write stale check、Edit stale recovery 及 workspace 结果均由 CC fixture 固定。
-- search-policy fixture 只证明 case-scoped allow 下的 CC 可见性和顺序；kloop 默认 deny/sensitive 过滤由独立 code/golden 固定，没有拿该 fixture 冒充默认 permission ask/deny 证据。
-- 241 个 `unknown` 主要属于 Plan 50–59 的其他工具簇，或当前 profile/平台未运行的维度；Plan 49 没有为降低数字越界外推。
+- 精确 2.1.220 静态证据现为 95 条：除 adapter/media/permission/result/条件注册链与 kloop code/golden anchors 外，新增了 per-call PreToolUse/PostToolUse bundle call-site 和 kloop parity report 锚点。
+- capture 为 73 组：40 组 schema v1、33 组 schema v2；18 个 determinism group 的 normalized bytes 完全一致。`search-policy-concurrency` 继续是 singleton，因为并发组内合法 start/finish 顺序不能被归一化成伪确定性。
+- matrix 为 55 行、440 个维度单元：70 `compatible`、83 `intentional-diff`、20 `missing`、237 `unknown`、22 `n/a`、8 `same`。
+- `paired-parity.json` 由 `build_matrix.py` 同步生成，3 个 contract 精确覆盖全部 8 个 `same` 单元。`verify.py` 用固定 cargo selector 运行 `tools::plan49_parity_tests::emit_plan49_parity_report`，再比较 CC/kloop 的规范化调用输入、start/finish、result、偏序和 workspace projection；fixture profile 与 matrix cell 不同时，contract 必须逐 cell 声明由精确 bundle 证据支撑的 profile bridge。缺 pair/bridge、输入漂移、0 tests matched、事件缺失/重排或 scenario 漂移都会 fail closed。旧的 row-level `kloop_golden: true` 声明已移除。
+- CC 并发 fixture 通过 descriptor-locked hook barrier 证明 Read/Glob/Grep 真正同时进入 per-call execution；dependent `mutation-seriality-1/2` 则证明 Edit/Edit/Write/Write 严格串行。两者都不靠 wall-clock 阈值猜测。
+- interactive No/Esc 不再由 harness 强杀：composer 恢复后发送固定 follow-up，第一次 continuation sampling 明确没有被拒调用的 result，下一请求再携带唯一 `is_error` settlement result 后正常 final。kloop 同样保留合法 error pairing，但交付时机和文案仍是 lifecycle/output `intentional-diff`。批准后的 Write stale check、Edit stale recovery 及 workspace 结果继续由既有 fixture 固定。
+- `grep@clean-cli` 的 parser/executor/output/lifecycle 因精确 search-tools gate 不适用于该 profile，改为有负注册证据且要求 allow-profile downstream coverage 的 `n/a`；不是把未知静默删除。
+- 默认 `verify.py` 仍校验本机 exact binary 与 bundle bytes；`verify.py --corpus-only` 只跳过这两项，仍运行 hashes、tamper、matrix/pair、provider、secret/local-network 和 Rust semantic report，并已接入 macOS/Linux CI。
+- 237 个 `unknown` 属于 Plan 50–59 的其他工具簇或当前 profile/平台尚未运行的维度；Plan 49 没有为降低数字越界外推。
 
 该闭环只宣称文件/搜索簇完成，不表示 kloop 已全工具对齐或可替换 Claude Code。
 
@@ -77,7 +78,7 @@ kloop 侧优先复用：
 3. 固定 Read 的 offset/limit、文本/图片/二进制分支、长行和总输出截断。
 4. 固定 Write/Edit 的创建、覆盖、唯一替换、失败原子性、stale-read 和并发修改语义。
 5. 固定 Glob/Grep 的排序、过滤、分页、结果上限、字符上限、错误输入和并发分类。
-6. 只有同 profile、同输入的 CC fixture 与 kloop golden 成对后，才把对应维度标为 `same`。
+6. 只有同输入的 CC fixture 与 kloop executable report 经 generated pair contract 语义比较后，才把对应维度标为 `same`；fixture profile 必须与 matrix cell 一致，或由 contract 逐 cell 声明 exact-bundle profile bridge，且 bridge evidence 覆盖该维度并被 cell 引用。
 
 ## 已拍板边界
 
@@ -190,7 +191,7 @@ kloop 侧优先复用：
 - 在 `tools/fs.rs`、`tools/search.rs`、`tools/mod.rs`、`permissions.rs` 的测试中，为 CC fixture 建立同输入的完整 `ToolResultContent`/`ContentBlock`、事件顺序和 workspace-after 断言。
 - 用确定性故障注入验证原子写错误时原文件不变、临时文件清理。
 - 覆盖 observation 容量/淘汰、partial/full read、取消、写后刷新、同路径竞争和 sub-agent fresh state。
-- 更新 `build_matrix.py`、`tool-matrix.json` 和 `verify.py`：每个非 `unknown`/`n/a` 单元引用 exact evidence；`same` 同时引用 CC capture 与 `kloop:` golden，并设置 `kloop_golden: true`。
+- 更新 `build_matrix.py`、`tool-matrix.json`、`paired-parity.json` 和 `verify.py`：每个非 `unknown`/`n/a` 单元引用 exact evidence；`same` 必须引用覆盖该精确 cell 的 generated `pair:` contract，并执行比较 CC fixture projection 与 kloop real-dispatch report。
 - 新增 Read/Write/Edit/Grep 静态 anchor 完整性检查；禁止手工修改生成物绕过 generator。
 - 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`kloop/README.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
 
@@ -201,7 +202,7 @@ kloop 侧优先复用：
 - existing Write/Edit 必须完整 fresh Read；不接受 CC 的 partial Write、unread/partial Edit 或 stale recovery。
 - CC 可为新文件隐式创建缺失父目录；kloop 只允许叶文件缺失，要求直接父目录已存在，并以审批前打开的目录句柄固定提交边界。
 - Glob/Grep 尊重 `.gitignore`、跳过 VCS internals，并硬过滤 deny/sensitive 路径；输出显式说明 hidden count。
-- kloop 的成功/拒绝/取消文案和 tool_result pairing 保持 canonical provider history 合法，不复制 CC PTY 的无最终结果形态。
+- kloop 的成功/拒绝/取消文案保持 canonical provider history 合法；CC No/Esc 的 error pairing 只在后续 continuation settlement request 中出现，kloop 则在当前工具轮立即返回，时序差异明确保留。
 
 这些差异都在 matrix 中标 `intentional-diff` 并有 paired fixture/golden 或静态链。其他 profile/平台不可运行的维度继续保留 `unknown`，归 Plan 50–59 各自裁决。
 
@@ -232,6 +233,7 @@ python3 -B refs/claude-code-2.1.220/collect.py list
 python3 -B refs/claude-code-2.1.220/collect.py collect --all
 python3 -B refs/claude-code-2.1.220/build_matrix.py
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 
 cd kloop
 cargo test -p kloop-core tools::fs::tests
@@ -263,7 +265,8 @@ git diff --check
 - existing `write_file` 与全部 `edit_file` 要完整 fresh Read；Read 后被删除也按 stale 拒绝，不退化成新建。pre-hook 后只允许 leaf 缺失，直接父目录必须已存在；canonicalize 父目录并打开 no-follow directory handle 后，permission deny/sensitive/acceptEdits 与审批 preview 使用同一 effective target。批准后复核父目录 dev/inode，随后 target read、同目录 exclusive temp、保权限、sync、最终复核、rename、cleanup 和 parent sync 全部走 descriptor-relative `openat`/`renameat`/`unlinkat`，不重新遍历父路径；审批等待中把 `inside-link/newdir` 换成指向 `.git/hooks` 的 symlink 会拒绝且不落 hook。mutation 尝试先清旧 authority；cwd 内 alias 共用 lock，ancestor symlink 不得逃出 workspace，symlink leaf/非普通目标拒绝。最终成功刷新 observation，post-hook 取消保留已提交文件但不留下资格。target open 带 `O_NONBLOCK`，FIFO swap 不挂 worker；temp name 在 rename 前按 dev/inode + bytes 绑定 opened FD，new file 仍按 0666 经 umask，existing mode 原样保留。严格 hostile same-UID 仍可竞争最后一次 identity check→`renameat` 的微小 namespace 窗口，本 plan 不把 descriptor boundary 宣称成文件系统事务。
 - Grep 补齐 `context`、`-o`、数字字符串分页、single-file content 格式和 CC-shaped 分页提示；`usize::MAX` 级 offset/head limit 使用 saturating arithmetic，不 panic/回绕。每个 walker candidate 先通过与 Read 共用的 canonical parent FD + no-follow leaf open 绑定 inode，deny/sensitive 同看 original + resolved path，再由 `search_reader` 搜已打开 descriptor；filter 后 leaf 换成敏感 symlink 也不会泄漏，多 hard-link candidate 作为不可安全分类的 inode alias 隐藏并计数。Glob 的空 pattern、100 项 cap、字符截断后的实际 shown/remaining 计数与 program path array 已锁定。Read/Grep/Glob 统一使用 UTF-8 安全 7k 模型文本预算，搜索继续尊重 `.gitignore`、跳 VCS、过滤 deny/sensitive 并报告 hidden count。
 - CC `scripted-read-edit` 原把两个 Read 放同轮，重采时合法并发结果顺序翻转导致 determinism pair 失败；已拆成顺序 round，保留 stale Edit 语义且不扩大 normalization。Plan 48 的 40 份历史 capture/hash 已恢复不动，只更新该 paired fixture。
-- `static-evidence.jsonl` 为 92 条，`tool-matrix.json` 由 generator 生成 55 行/440 单元：71 `compatible`、83 `intentional-diff`、20 `missing`、241 `unknown`、20 `n/a`、5 `same`。verifier 强制 Plan 49 kloop anchors，并要求每个 `same` 同时有 CC fixture、直接 `kloop:` golden 与 `kloop_golden: true`。
-- 裁决：kloop 不复制 CC 的隐式缺失父目录创建、partial Write qualification、unread/partial Edit、unique-match stale recovery、clean-profile Grep gate、广义 ignored/VCS/sensitive 搜索可见性或 PTY 无最终 tool result；这些均以安全/合法 history 理由标 `intentional-diff`。文件/搜索簇完成不外推 Plan 50–59。
-- 验证：`collect.py identity`、`collect.py list`、完整 71-case `collect.py collect --all`（重采后按 immutable baseline 门恢复历史 raw，只保留修正 pair）、`build_matrix.py`、`verify.py`、focused fs/search/file_state tests、`cargo fmt --all --check`、workspace clippy `-D warnings`、workspace tests、`cargo run -p kloop -- --mock`、`git diff --check` 全绿。
-- 提交：本次（plan 49，见 git log）。
+- `static-evidence.jsonl` 为 95 条，`tool-matrix.json` 由 generator 生成 55 行/440 单元：70 `compatible`、83 `intentional-diff`、20 `missing`、237 `unknown`、22 `n/a`、8 `same`。`paired-parity.json` 的 3 个 contract 精确覆盖全部 8 个 `same`；verifier 运行固定 Rust report test 后比较规范化调用输入、生命周期、result、偏序与 workspace，并要求跨 profile cell 有 exact-bundle bridge，不再接受不可执行的 `kloop_golden` 声明。
+- 裁决：kloop 不复制 CC 的隐式缺失父目录创建、partial Write qualification、unread/partial Edit、unique-match stale recovery、clean-profile Grep gate或广义 ignored/VCS/sensitive 搜索可见性。PTY 复核订正旧结论：No/Esc 在恢复 composer 后先产生一次无 result 的 continuation sampling，随后 settlement request 带唯一 error tool_result 再自然 final；kloop 的立即 error pairing 仍记 lifecycle/output `intentional-diff`。文件/搜索簇完成不外推 Plan 50–59。
+- 证据补强新增 descriptor-locked PreToolUse barrier、dependent Edit/Edit/Write/Write deterministic pair、真实 `dispatch_tools` event/call report、同输入比较、跨 profile exact-bundle bridge、generated pair coverage 门和 `--corpus-only` CI。Plan 48 的 40 份历史 capture/hash 保持不动。
+- 验证：`collect.py identity`、`collect.py list`、73-case corpus 重放/changed-case publication、`build_matrix.py`/`--check`、full exact-binary `verify.py`、`verify.py --corpus-only`、Plan 49 parity report test、focused fs/search/file_state tests、workspace fmt/clippy/tests、mock 与 `git diff --check` 全绿。
+- 提交：产品实现为 `208e7cf`；本证据补强与完成记录在同一个 `test(plan49)` follow-up 提交中，SHA 以本行所在提交为准。
