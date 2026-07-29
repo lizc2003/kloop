@@ -471,6 +471,7 @@ mod tests {
             "(ls)",                       // subshell
             "ls > out.txt",               // redirection
             "echo hi & echo bye",         // background chaining
+            "sleep 60 >/dev/null 2>&1 &", // detached-from-pipes child
             "FOO=bar ls",                 // assignment prefix
             "for f in *; do rm $f; done", // control flow
             "ls &&",                      // parse error

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -23,6 +24,8 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::str_arg;
@@ -43,6 +46,12 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const BLOCK_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 const BLOCK_TIMEOUT_MAX_MS: u64 = 600_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Each foreground fd is drained to EOF while retaining at most this many
+/// bytes. The final model-visible merge is tighter, matching CC's default
+/// inline Bash budget without inheriting its unbounded child-pipe buffering.
+const FOREGROUND_STREAM_CAP_BYTES: usize = 150_000;
+const FOREGROUND_OUTPUT_CAP_CHARS: usize = 30_000;
+const FOREGROUND_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Process-global so parent/sub-agents and server threads sharing one
 /// offload directory never collide on output file names (same lesson as the
@@ -136,8 +145,11 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             sandbox.as_deref(),
         );
     }
+    if ctx.cancel.is_cancelled() {
+        bail!("interrupted");
+    }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = run_foreground(command, &cwd, sandbox.as_deref(), timeout_ms).await?;
+    let output = run_foreground(command, &cwd, sandbox.as_deref(), timeout_ms, &ctx.cancel).await?;
     let mut text = format_output(&output);
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
@@ -157,7 +169,8 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
                     .await
                 {
                     EscalationOutcome::Approved => {
-                        let raw = run_foreground(command, &cwd, None, timeout_ms).await?;
+                        let raw =
+                            run_foreground(command, &cwd, None, timeout_ms, &ctx.cancel).await?;
                         return Ok(format!(
                             "{}{}",
                             sandbox::ESCALATED_PREFIX,
@@ -176,13 +189,14 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 }
 
 /// One foreground run of `sh -lc <command>`, wrapped in the OS sandbox per
-/// `sandbox`. The caller turns the raw output into model-facing text.
+/// `sandbox`. The caller turns the bounded raw output into model-facing text.
 async fn run_foreground(
     command: &str,
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
     timeout_ms: u64,
-) -> Result<std::process::Output> {
+    cancel: &CancellationToken,
+) -> Result<ForegroundOutput> {
     let mut cmd = shell_command(command, cwd, sandbox);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -193,22 +207,150 @@ async fn run_foreground(
     // child, leaving `make`/`npm` grandchildren orphaned and still running.
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd.spawn().context("bash: failed to spawn sh")?;
-    // Group-kills the tree if this future is dropped mid-run (turn cancel) or
-    // times out; disarmed once the child has exited cleanly on its own.
-    let mut guard = GroupKillGuard { pid: child.id() };
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
-        Ok(result) => {
-            guard.disarm();
-            result.context("bash: failed to run sh")
+    let mut child = cmd.spawn().context("bash: failed to spawn sh")?;
+    let pid = child.id();
+    let stdout = child.stdout.take().context("bash: stdout pipe missing")?;
+    let stderr = child.stderr.take().context("bash: stderr pipe missing")?;
+    // This remains the synchronous fallback for a future drop caused by a
+    // panic or caller that does not participate in the cancellation protocol.
+    let mut guard = GroupKillGuard { pid };
+
+    enum Completion {
+        Finished(Result<ForegroundOutput>),
+        TimedOut,
+        Cancelled,
+    }
+    let completion = {
+        let output = collect_foreground_output(&mut child, stdout, stderr);
+        tokio::pin!(output);
+        let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        tokio::pin!(timeout);
+        tokio::select! {
+            biased;
+            result = &mut output => Completion::Finished(result),
+            _ = cancel.cancelled() => Completion::Cancelled,
+            _ = &mut timeout => Completion::TimedOut,
         }
-        Err(_) => bail!("bash: command timed out after {timeout_ms}ms"),
+    };
+
+    match completion {
+        Completion::Finished(result) => {
+            let output = result?;
+            // A foreground command may start a detached-from-pipes child and
+            // let its shell leader exit. Foreground mode promises no residual
+            // process group; callers that need persistence use run_in_background.
+            terminate_residual_group(pid).await?;
+            guard.disarm();
+            Ok(output)
+        }
+        Completion::TimedOut => {
+            terminate_and_reap(&mut child, pid).await?;
+            guard.disarm();
+            bail!("bash: command timed out after {timeout_ms}ms")
+        }
+        Completion::Cancelled => {
+            terminate_and_reap(&mut child, pid).await?;
+            guard.disarm();
+            bail!("interrupted")
+        }
     }
 }
 
+#[derive(Debug)]
+struct ForegroundOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    omitted_bytes: usize,
+}
+
+struct BoundedStream {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+}
+
+async fn collect_foreground_output(
+    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+) -> Result<ForegroundOutput> {
+    let (status, stdout, stderr) = tokio::try_join!(
+        async { child.wait().await.context("bash: failed to wait for sh") },
+        read_bounded_stream(stdout),
+        read_bounded_stream(stderr),
+    )?;
+    let omitted_bytes = stdout
+        .total_bytes
+        .saturating_sub(stdout.bytes.len())
+        .saturating_add(stderr.total_bytes.saturating_sub(stderr.bytes.len()));
+    Ok(ForegroundOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        omitted_bytes,
+    })
+}
+
+async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<BoundedStream> {
+    let mut bytes = Vec::with_capacity(FOREGROUND_STREAM_CAP_BYTES);
+    let mut total_bytes = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .context("bash: failed to drain output pipe")?;
+        if count == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(count);
+        let retained = FOREGROUND_STREAM_CAP_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..count.min(retained)]);
+    }
+    Ok(BoundedStream { bytes, total_bytes })
+}
+
+async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) -> Result<()> {
+    let group_result = pid.map_or(Ok(()), kill_group);
+    let direct_result = child.start_kill();
+    tokio::time::timeout(FOREGROUND_REAP_TIMEOUT, child.wait())
+        .await
+        .context("bash: timed out reaping sh")?
+        .context("bash: failed to reap sh")?;
+    if let Err(error) = group_result {
+        return Err(error).context("bash: failed to kill process group");
+    }
+    if let Err(error) = direct_result {
+        // A successful group signal can race the leader's exit; only surface a
+        // direct-kill failure when the process group itself could not be used.
+        if pid.is_none() {
+            return Err(error).context("bash: failed to kill sh");
+        }
+    }
+    Ok(())
+}
+
+async fn terminate_residual_group(pid: Option<u32>) -> Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    if !process_group_alive(pid)? {
+        return Ok(());
+    }
+    kill_group(pid).context("bash: failed to kill residual process group")?;
+    let deadline = tokio::time::Instant::now() + FOREGROUND_REAP_TIMEOUT;
+    while process_group_alive(pid)? {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("bash: residual process group {pid} did not exit")
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 /// Group-kills a foreground shell's process tree if dropped before its child
-/// exits on its own (timeout, or the owning turn being cancelled). Disarmed on
-/// a clean exit so a reused group id is never signalled.
+/// is explicitly reaped. Disarmed only after the normal or termination path
+/// has established that the foreground group is gone.
 struct GroupKillGuard {
     pid: Option<u32>,
 }
@@ -222,7 +364,7 @@ impl GroupKillGuard {
 impl Drop for GroupKillGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.pid {
-            kill_group(pid);
+            let _ = kill_group(pid);
         }
     }
 }
@@ -230,9 +372,26 @@ impl Drop for GroupKillGuard {
 /// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
 /// placeholder when empty — the model-facing text for one run (denial
 /// annotation is the caller's job, so an escalated re-run reuses this).
-fn format_output(output: &std::process::Output) -> String {
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+fn format_output(output: &ForegroundOutput) -> String {
+    let mut merged = Vec::with_capacity(output.stdout.len() + output.stderr.len());
+    merged.extend_from_slice(&output.stdout);
+    merged.extend_from_slice(&output.stderr);
+    let mut text = String::from_utf8_lossy(&merged).into_owned();
+    let captured_chars = text.chars().count();
+    let omitted_chars = captured_chars.saturating_sub(FOREGROUND_OUTPUT_CAP_CHARS);
+    if omitted_chars > 0 {
+        let boundary = text
+            .char_indices()
+            .nth(FOREGROUND_OUTPUT_CAP_CHARS)
+            .map_or(text.len(), |(index, _)| index);
+        text.truncate(boundary);
+    }
+    if omitted_chars > 0 || output.omitted_bytes > 0 {
+        text.push_str(&format!(
+            "\n[output truncated: {omitted_chars} characters and {} additional bytes omitted]",
+            output.omitted_bytes
+        ));
+    }
     if !output.status.success() {
         let code = output
             .status
@@ -452,7 +611,7 @@ impl Drop for BackgroundShells {
         for shell in self.shells.lock().unwrap().values() {
             if matches!(shell.status, BgStatus::Running) {
                 if let Some(pid) = shell.pid {
-                    kill_group(pid);
+                    let _ = kill_group(pid);
                 }
             }
         }
@@ -460,21 +619,39 @@ impl Drop for BackgroundShells {
 }
 
 /// SIGKILL the whole process group (the child is its own group leader).
-fn kill_group(pid: u32) {
+fn kill_group(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        // `status()` (not `spawn()`) so the short-lived `kill` helper is
-        // reaped instead of piling up as a zombie across a long session; it
-        // exits the instant the signal is delivered, so the wait is trivial.
-        let _ = std::process::Command::new("kill")
-            .arg("-9")
-            .arg(format!("-{pid}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let pid = rustix::process::Pid::from_raw(pid as _)
+            .context("process group id must be non-zero")?;
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::Kill) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+fn process_group_alive(pid: u32) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(pid as _)
+            .context("process group id must be non-zero")?;
+        match rustix::process::test_kill_process_group(pid) {
+            Ok(()) | Err(rustix::io::Errno::PERM) => Ok(true),
+            Err(rustix::io::Errno::SRCH) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
 }
 
 /// Owns the child: waits for exit, executes kill requests, and enforces the
@@ -496,7 +673,7 @@ async fn monitor(
             status = child.wait() => break status.ok(),
             _ = kill.cancelled(), if kill_reason.is_none() => {
                 if let Some(pid) = pid {
-                    kill_group(pid);
+                    let _ = kill_group(pid);
                 }
                 let _ = child.start_kill();
                 kill_reason = Some("stopped".into());
@@ -505,7 +682,7 @@ async fn monitor(
                 let size = std::fs::metadata(&output_path).map_or(0, |m| m.len());
                 if size > OUTPUT_FILE_CAP && kill_reason.is_none() {
                     if let Some(pid) = pid {
-                        kill_group(pid);
+                        let _ = kill_group(pid);
                     }
                     let _ = child.start_kill();
                     kill_reason = Some(format!("output file exceeded {OUTPUT_FILE_CAP} bytes"));
@@ -553,8 +730,120 @@ async fn read_tail(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::scrub_model_shell_env;
+    use super::FOREGROUND_OUTPUT_CAP_CHARS;
     use crate::tools::testutil::*;
     use serde_json::json;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    struct ForegroundTree {
+        root: PathBuf,
+    }
+
+    impl ForegroundTree {
+        fn new(tag: &str) -> Self {
+            let sequence = FOREGROUND_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "kloop-foreground-{tag}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("runner.sh"),
+                r#"trap '' TERM
+root=$1
+if [ "$2" = child ]; then
+    printf '%s' $$ > "$root/grandchild.pid"
+else
+    printf '%s' $$ > "$root/child.pid"
+    /bin/sh "$0" "$root" child &
+fi
+exec sleep 60
+"#,
+            )
+            .unwrap();
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+
+        fn command(&self) -> String {
+            format!(
+                "/bin/sh '{}' '{}'",
+                self.root.join("runner.sh").display(),
+                self.root.display()
+            )
+        }
+    }
+
+    impl Drop for ForegroundTree {
+        fn drop(&mut self) {
+            for name in ["child.pid", "grandchild.pid"] {
+                let Ok(text) = std::fs::read_to_string(self.root.join(name)) else {
+                    continue;
+                };
+                let Ok(raw) = text.trim().parse::<i32>() else {
+                    continue;
+                };
+                if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn process_alive(raw: i32) -> bool {
+        let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+            return false;
+        };
+        match rustix::process::test_kill_process(pid) {
+            Ok(()) | Err(rustix::io::Errno::PERM) => true,
+            Err(rustix::io::Errno::SRCH) => false,
+            Err(error) => panic!("cannot probe pid {raw}: {error}"),
+        }
+    }
+
+    async fn wait_for_tree_pids(tree: &ForegroundTree) -> [i32; 2] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let parsed = ["child.pid", "grandchild.pid"].map(|name| {
+                std::fs::read_to_string(tree.path().join(name))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+            });
+            if let [Some(child), Some(grandchild)] = parsed {
+                return [child, grandchild];
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "runner did not publish both pids"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn assert_processes_dead(pids: [i32; 2]) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let alive = pids.map(process_alive);
+            if alive == [false, false] {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "foreground descendants survived: pids={pids:?}, alive={alive:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 
     /// Pull the `bg-N` id out of the spawn message.
     fn bg_id(spawn_message: &str) -> String {
@@ -649,6 +938,86 @@ mod tests {
             .success();
         assert!(!alive, "grandchild {pid} outlived the group kill");
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn foreground_timeout_reaps_term_ignoring_child_and_grandchild() {
+        let tree = ForegroundTree::new("stubborn-timeout");
+        let ctx = test_ctx(0, "stubborn-timeout");
+        let command = tree.command();
+        let execution = run_tool("bash", json!({"command": command, "timeout_ms": 500}), &ctx);
+        let (result, pids) = tokio::join!(execution, wait_for_tree_pids(&tree));
+        let (out, is_error) = result;
+        assert!(is_error && out.contains("timed out"), "{out}");
+        assert_processes_dead(pids).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn foreground_cancellation_reaps_term_ignoring_child_and_grandchild() {
+        let tree = ForegroundTree::new("stubborn-cancel");
+        let ctx = test_ctx(0, "stubborn-cancel");
+        let command = tree.command();
+        let execution = run_tool(
+            "bash",
+            json!({"command": command, "timeout_ms": 60_000}),
+            &ctx,
+        );
+        let cancel = async {
+            let pids = wait_for_tree_pids(&tree).await;
+            ctx.cancel.cancel();
+            pids
+        };
+        let (result, pids) = tokio::join!(execution, cancel);
+        let (out, is_error) = result;
+        assert!(is_error);
+        assert_eq!(out, "interrupted");
+        assert_processes_dead(pids).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn foreground_success_does_not_orphan_closed_pipe_child() {
+        let tree = ForegroundTree::new("residual-child");
+        let pidfile = tree.path().join("child.pid");
+        let command = format!(
+            "sh -c 'trap \"\" TERM; exec sleep 60' >/dev/null 2>&1 & printf '%s' $! > '{}'",
+            pidfile.display()
+        );
+        let ctx = test_ctx(0, "residual-child");
+        let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+        assert!(!is_error, "{out}");
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_processes_dead([pid, pid]).await;
+    }
+
+    #[tokio::test]
+    async fn foreground_large_stdout_and_stderr_are_drained_and_bounded() {
+        let ctx = test_ctx(0, "bounded-output");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_tool(
+                "bash",
+                bash_input("yes A | head -c 200000; yes B | head -c 200000 >&2"),
+                &ctx,
+            ),
+        )
+        .await
+        .expect("large dual-pipe command deadlocked");
+        let (out, is_error) = result;
+        assert!(!is_error, "{out}");
+        assert!(out.starts_with("A\nA\n"), "{out}");
+        assert!(out.contains("[output truncated:"), "{out}");
+        assert!(
+            out.chars().count() <= FOREGROUND_OUTPUT_CAP_CHARS + 100,
+            "bounded output grew to {} characters",
+            out.chars().count()
+        );
     }
 
     #[tokio::test]

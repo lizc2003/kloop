@@ -10,6 +10,8 @@ mod fs;
 mod inject;
 #[cfg(test)]
 mod plan49_parity_tests;
+#[cfg(test)]
+mod plan50_parity_tests;
 mod plan_mode;
 mod search;
 mod skill;
@@ -38,6 +40,8 @@ pub use todo::TodoStatus;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -619,6 +623,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         });
     }
     let event_input = input.clone();
+    // Once a foreground Bash has spawned, its own cancellation branch must
+    // finish the group-kill and direct-child reap before we emit interrupted.
+    // Earlier cancellation (hooks/permission) still drops the gated future and
+    // therefore cannot spawn anything after the turn was cancelled.
+    let foreground_bash_started = AtomicBool::new(false);
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -690,6 +699,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         {
             bail!(reason);
         }
+        let foreground_bash =
+            name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false);
+        if foreground_bash {
+            foreground_bash_started.store(true, Ordering::Release);
+        }
         let execution = execute_tool(
             &name,
             &input,
@@ -698,6 +712,9 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             &ctx,
         )
         .await;
+        if foreground_bash {
+            foreground_bash_started.store(false, Ordering::Release);
+        }
         // post_tool hooks (and other text-only surfaces) see the flattened
         // text; an image result renders as an `[image: <media_type>]` tag.
         let (text, is_error) = match &execution.result {
@@ -718,35 +735,48 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         ctx.hook_context.lock().unwrap().extend(context);
         Ok::<ToolExecution, anyhow::Error>(execution)
     };
-    let (result, file_state_update, path_lock) = tokio::select! {
-        _ = ctx.cancel.cancelled() => (interrupted(&id), None, None),
-        r = gated => match r {
-            Ok(execution) => {
-                let ToolExecution {
-                    result,
-                    file_state_update,
-                    path_lock,
-                } = execution;
-                let result = match result {
-                    Ok(content) => ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content,
-                        is_error: false,
-                    },
-                    Err(e) => ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: format!("{e:#}").into(),
-                        is_error: true,
-                    },
-                };
-                (result, file_state_update, path_lock)
+    let mut gated = Box::pin(gated);
+    let gated_result = tokio::select! {
+        _ = ctx.cancel.cancelled() => {
+            if foreground_bash_started.load(Ordering::Acquire) {
+                Some(gated.await)
+            } else {
+                None
             }
-            Err(e) => (ContentBlock::ToolResult {
+        }
+        result = &mut gated => Some(result),
+    };
+    let (result, file_state_update, path_lock) = match gated_result {
+        None => (interrupted(&id), None, None),
+        Some(Ok(execution)) => {
+            let ToolExecution {
+                result,
+                file_state_update,
+                path_lock,
+            } = execution;
+            let result = match result {
+                Ok(content) => ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    is_error: false,
+                },
+                Err(e) => ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: format!("{e:#}").into(),
+                    is_error: true,
+                },
+            };
+            (result, file_state_update, path_lock)
+        }
+        Some(Err(e)) => (
+            ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: format!("{e:#}").into(),
                 is_error: true,
-            }, None, None),
-        },
+            },
+            None,
+            None,
+        ),
     };
     // The model has a successful Read/Write/Edit only once the final tool_result
     // exists. Executor-local reads and work canceled while a post-hook runs do
@@ -1424,6 +1454,129 @@ mod tests {
         assert!(is_error);
         assert_eq!(out, "interrupted");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    struct PendingApprover {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl crate::permissions::Approver for PendingApprover {
+        fn confirm(
+            &self,
+            _request: crate::permissions::ConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::permissions::Decision> + Send + '_>> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_bash_approval_is_pending_never_spawns() {
+        let marker = std::env::temp_dir().join(format!(
+            "kloop-pending-bash-approval-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let (entered, pending) = tokio::sync::oneshot::channel();
+        let permissions = crate::permissions::Permissions::new(
+            crate::permissions::Mode::Manual,
+            &crate::permissions::PermissionRules::default(),
+            std::env::current_dir().unwrap(),
+            Some(Arc::new(PendingApprover {
+                entered: std::sync::Mutex::new(Some(entered)),
+            })),
+            None,
+        )
+        .unwrap();
+        let base = test_ctx(0, "pending-bash-approval");
+        let mut config = (*base.cfg).clone();
+        config.permissions = Arc::new(permissions);
+        let ctx = ToolCtx {
+            cfg: Arc::new(config),
+            ..base
+        };
+        let command = format!("printf spawned > '{}'", marker.display());
+        let execution = run_tool("bash", bash_input(&command), &ctx);
+        let cancel = async {
+            pending.await.expect("approval prompt was not entered");
+            ctx.cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(execution, cancel);
+        let (out, is_error) = result;
+        assert!(is_error);
+        assert_eq!(out, "interrupted");
+        assert!(!marker.exists(), "cancelled approval still spawned Bash");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn concurrent_readonly_bash_calls_overlap_and_cancel_together() {
+        let root = std::env::temp_dir().join(format!(
+            "kloop-concurrent-bash-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.fifo");
+        let second = root.join("second.fifo");
+        for path in [&first, &second] {
+            assert!(std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let ctx = test_ctx(0, "concurrent-bash-cancel");
+        let calls = vec![
+            (
+                "bash-overlap-a".into(),
+                "bash".into(),
+                bash_input(&format!("cat '{}'", first.display())),
+            ),
+            (
+                "bash-overlap-b".into(),
+                "bash".into(),
+                bash_input(&format!("cat '{}'", second.display())),
+            ),
+        ];
+        let execution = dispatch_tools(calls, &ctx);
+        let first_writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(first)
+        });
+        let second_writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(second)
+        });
+        let control = async {
+            let (first, second) = tokio::join!(first_writer, second_writer);
+            let first = first.unwrap().unwrap();
+            let second = second.unwrap().unwrap();
+            ctx.cancel.cancel();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop((first, second));
+        };
+        let (results, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(execution, control)
+        })
+        .await
+        .expect("readonly Bash calls did not overlap");
+        assert_eq!(results.len(), 2);
+        for (result, expected_id) in results.iter().zip(["bash-overlap-a", "bash-overlap-b"]) {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = result
+            else {
+                panic!("expected tool result")
+            };
+            assert_eq!(tool_use_id, expected_id);
+            assert_eq!(content.as_text().as_ref(), "interrupted");
+            assert!(is_error);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

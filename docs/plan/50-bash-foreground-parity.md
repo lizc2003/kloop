@@ -1,6 +1,6 @@
 # Plan 50 — Bash 前台工具对齐
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-07-30）
 >
 > 母计划：Plan 48
 >
@@ -126,8 +126,21 @@ git diff --check
 - timeout/取消后无遗留进程。
 - 所有门禁全绿，一次提交，提交信息带 `plan50`。
 
-## 开工时定 / 问用户
+## 开工时定 / 已裁决
 
-- permission/sandbox 与 CC 冲突时，哪些 kloop 更严格行为明确保留。
-- timeout/cancel/output envelope 采用精确适配还是兼容层。
-- 并发 fixture 证实 CC 策略后，kloop 是否需要调整动态分类。
+- permission/sandbox：保留 kloop 的 deny/sensitive/safety/explicit-ask 优先顺序、真实 shell AST 和 sandbox 双轴；不复制 CC 更宽松的 sandbox-bypass ask 分支，matrix 记 `intentional-diff`。
+- timeout/cancel/output：保留 kloop 原生 `timeout_ms` 与 canonical tool-result 文案，不做逐字节适配层；前台输出采用每 fd 150k bytes 有界 drain、合并后 UTF-8 lossy 且 30k 字符模型预算。timeout/cancel 同步 SIGKILL 全进程组并 reap，明确优于 CC stubborn command 转后台后留下 descendants 的观察。
+- concurrency：CC 精确 bundle 与 Pre/Post hook probe 证明按输入 read-only 判定；kloop 现有动态分类和连续 safe batch 正确，无需重写调度器，只补 executable pair 与取消回归。
+
+## 完成记录 ✅（2026-07-30）
+
+- 精确 2.1.220 Bash 证据新增 9 个 capture：schema、输出、timeout tree、cancel tree 各有 normalized bytes 完全一致的 determinism pair，并有一个 barrier/serial concurrency singleton；collector 只在隔离 workspace/process probe 中运行，tree fixture 结束后由 collector 明示 `SIGKILL` 清理 CC 遗留进程。
+- schema/parser fixture 锁定必填/空/null/错类型 command，timeout 的 null/字符串/负数/0/600000/越界，background/sandbox/description 错类型及 unknown field；bundle exact locator 锚定输入/输出 schema、spawn、permission+sandbox override、timeout cap、stdio/result mapping、30k inline cap、persisted output 与 process-tree kill 入口。
+- 输出 fixture 锁定 stdout 后接 stderr、无换行、空输出提示、非 UTF-8 replacement、非零/信号 envelope 和大输出 persisted-output preview。kloop 不复制 CC 文件化大输出 envelope：前台 stdout/stderr 两条 pipe 并行 drain 到 EOF，每 fd 最多保留 150k bytes，合并模型文本最多 30k 字符并报告省略字符/字节，避免双 pipe 死锁与无界内存。
+- CC stubborn timeout 在请求 500ms 时按 1s 文案转后台并返回成功，SIGINT cancel 返回 user-rejected/aborted-tools；两者结果后 TERM-ignoring child/grandchild 仍存活。kloop 有意不复制：前台 shell 独立 process group，timeout/cancel 先 SIGKILL 全组、显式 wait/reap direct child、再确认 residual group 消失后才返回；正常 leader 已退出但组内仍有 descendants 也同步清理。Drop guard 只作 panic/非协议 drop 的兜底。
+- dispatch cancellation 现在区分“尚未 spawn”和“前台 Bash 已 spawn”：hook/审批期间取消仍直接 drop 且绝不启动命令；spawn 后取消等待 Bash executor 完成 kill/reap，再返回 interrupted tool_result。两个同批只读 Bash 会共同收到取消、各自清完整进程组，并保留每个 tool_use 的配对结果。
+- concurrency fixture 用 per-call hook barrier 证明 `pwd`/`ls -d .` 同批重叠，用 redirection 写文件对证明 opaque calls 串行；精确 bundle 的 `isConcurrencySafe(input) → isReadOnly(input)` locator 与真实 kloop `dispatch_tools` report 共同进入第 4 个 generated pair contract `bash-batching`，覆盖两个 Bash concurrency `same` cell。
+- corpus 现为 82 captures、109 条 static evidence、56 行/448 单元 matrix：70 `compatible`、90 `intentional-diff`、20 `missing`、236 `unknown`、22 `n/a`、10 `same`；`paired-parity.json` 共 4 个 contract，全部 10 个 `same` 都由 executable comparator 覆盖。Bash executor/permission/output/lifecycle 保留 `intentional-diff`，未取证面继续 `unknown`。
+- Plan 51 的自动后台化、stall、Monitor、完成通知与后台结果回灌仍未实现；Plan 50 只声明前台 Bash 与输入依赖并发闭环，不把既有显式 `run_in_background` 扩张成 CC 后台任务状态机。
+- 验证：`build_matrix.py`/`--check`、full exact-binary `verify.py`、`verify.py --corpus-only`、Plan 50 Rust report、focused tools/Bash regression、workspace fmt/clippy/tests、mock 与 `git diff --check` 全绿。
+- 提交：本实现、证据与完成记录在同一个 `plan50` 提交中，SHA 以本行所在提交为准。

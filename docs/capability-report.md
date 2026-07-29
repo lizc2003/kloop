@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-29,plan 1–49 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus 与文件/搜索簇闭环见 plan 48–49。
+> 基线:2026-07-30,plan 1–50 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、文件/搜索簇与前台 Bash 闭环见 plan 48–50。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -25,6 +25,7 @@
 | code mode 用 QuickJS + 内存硬限 | codex V8 包袱且恰缺内存上限 | 教训 17 |
 | sandbox denial 判定含 DNS 失败 | codex 关键词表自身的洞 | 教训 15 |
 | grep/glob 路径级保护 | codex 完全没有(cc 有,已对齐) | plan 31 |
+| 前台 Bash timeout/cancel 无遗留进程 | cc stubborn timeout 转后台、cancel abort 后 fixture 仍有 descendants 存活 | plan 50 |
 | stale-safe 原子文件修改 | cc 接受 partial Write / unread-partial Edit 且可 stale-recover、会隐式创建缺失父目录；kloop 完整 fresh Read + keyed lock + 审批前 parent FD + descriptor-relative sync/rename fail closed | plan 49 |
 | 双轨 provider 对等 + 三线协议 | 两家各自单主轨 | plan 15 |
 | MCP 工具名消毒比 cc 严(`-`→`_`) | cc 规则语法不兼容风险 | 教训 10 |
@@ -57,13 +58,13 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；文件/搜索簇已完成 exact 2.1.220 parity（plan 49）
+### 4. 工具面——🟡 主干齐；文件/搜索簇与前台 Bash 已完成 exact 2.1.220 parity（plan 49–50）
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | plan 49 明确返回 unsupported；不在 canonical provider wire 未统一时伪兼容 | 真实 PDF 需求 |
 | 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门) | 真痛感再重启,连 PTY 一起 |
-| 自动后台化 / stall 探测 / 完成通知 | cc 单家 | plan 14 挂账 | 长命令 dogfood 痛感 |
+| 自动后台化 / stall 探测 / Monitor / 完成通知与结果回灌 | cc 单家 | **plan 51**；plan 50 只闭环前台，显式 `run_in_background` 不等于该状态机 | 长命令 dogfood 痛感 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook 编辑 | cc 单家 | 不立 | 无需求 |
 
@@ -75,6 +76,15 @@ Pre/Post hook barrier 证明 Read/Glob/Grep 真并发，dependent Edit/Edit/Writ
 跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。当前 matrix 保留 237 个跨其他
 工具簇或不可运行分支的 `unknown`；8 个 `same` 只覆盖上述并发/串行分类与 Glob/Grep 无孤儿
 lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门已进双平台 CI。
+
+Plan 50 已销账前台 Bash：schema/output/timeout-tree/cancel-tree determinism pairs 与 hook-based
+concurrency singleton 将 exact corpus 扩至 82 captures/109 evidence，matrix 为 56 行/448 单元；
+10 个 `same` 全由 4 个 executable contracts 覆盖。`bash-batching` 证明 read-only 调用同批并发、
+opaque redirection 串行。kloop 新增双 pipe 有界 drain（每 fd 150k bytes、最终 30k chars）与
+no-survivor 前台生命周期：timeout/cancel 同步 SIGKILL process group、reap direct child 并确认
+residual group 消失。CC stubborn timeout/cancel fixture 在结果后仍留 descendants，因此 executor/
+output/lifecycle 保留安全型 `intentional-diff`。自动后台化、stall、Monitor、完成通知与后台回灌继续
+是 Plan 51 的明确缺口，不能由 Plan 50 或现有显式 background Bash 冒充完成。
 
 ### 5. 子 agent / 多 agent——✅ 收敛解全齐
 

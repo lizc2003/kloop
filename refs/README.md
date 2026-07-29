@@ -130,6 +130,29 @@ Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 
 domain-safety 层先被拒、stub 收到 0 请求，所以重定向/认证/大响应 executor 继续为 `unknown`；
 Plan 49 没有外推其他工具簇。
 
+Plan 50 随后闭环前台 Bash。采集集现为 82 组 capture，新增 schema、output、timeout tree、
+cancel tree 四组 determinism pair 与一个 concurrency singleton；`static-evidence.jsonl` 为 109 条，
+其中 exact bundle locator 固定输入/输出 schema、input-dependent `isConcurrencySafe`、permission+
+sandbox override、spawn/stdio、timeout cap、process-tree kill、result mapper、30k inline cap 与 persisted
+output truncation。schema fixture 覆盖 command 缺失/null/空/错类型，timeout null/字符串/负数/0/
+600000/越界，boolean/description 错类型和 unknown field；output fixture 覆盖 stdout/stderr、无换行、
+空结果、non-UTF-8、非零/signal 与大输出文件化 preview。
+
+精确 fixture 也固定了不能抹平的生命周期差异：CC 对 TERM-ignoring tree 的短 timeout 会转为
+background task 并返回成功，运行中 SIGINT 则返回 user-rejected/aborted-tools；两条路径在工具结果后
+child/grandchild 都仍存活，collector 只为 hermetic 收尾额外 `SIGKILL`。kloop 不复制该行为：前台
+stdout/stderr pipe 并行 drain 到 EOF且有界（每 fd 150k bytes、最终 30k 字符），每次 spawn 建独立
+process group；timeout/cancel 同步 SIGKILL 全组、wait/reap direct child，再确认 residual group 消失才
+完成调用。正常 shell leader 先退出但仍留同组 descendant 时也清组。审批/hook 期间取消不 spawn，
+spawn 后 dispatch 会等待上述 executor cleanup，不能用外层 cancel 先 drop future。
+
+matrix 现为 56 行/448 单元：70 `compatible`、90 `intentional-diff`、20 `missing`、236 `unknown`、
+22 `n/a`、10 `same`。第 4 个 generated contract `bash-batching` 覆盖两个 Bash concurrency
+`same` cell：CC 用 Pre/Post hook barrier 证明 `pwd`/`ls -d .` 同批重叠、两个 redirection 调用串行；
+kloop 固定 Rust report 跑同输入真实 `dispatch_tools` 并比较 call/event/result/workspace。Bash 的
+permission、native output envelope 和 no-survivor lifecycle 保持 `intentional-diff`。自动后台化、stall、
+Monitor、完成通知及后台结果回灌仍归 Plan 51，不能从既有显式 `run_in_background` 外推已完成。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -150,8 +173,8 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
-`docs/plan/49-file-search-parity.md`。Plan 49 的完成不表示 kloop 已全工具对齐或可替换
-Claude Code；其余产品行为仍由 Plan 50–59 逐簇实现与验收。
+`docs/plan/49-file-search-parity.md` 与 `docs/plan/50-bash-foreground-parity.md`。Plan 50 的完成不表示 kloop 已全工具对齐或可替换
+Claude Code；其余产品行为仍由 Plan 51–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

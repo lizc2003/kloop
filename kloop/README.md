@@ -45,9 +45,17 @@ verifier checks the pinned binary and bundle bytes; `verify.py --corpus-only`
 keeps all fixture/hash/tamper/matrix/pair/Rust checks for ordinary macOS/Linux
 CI runners that do not contain the target binary.
 
+Plan 50 closes the foreground Bash slice against the same exact binary. The corpus now has
+82 captures and 109 static-evidence records; the generated 56-row/448-cell matrix contains
+10 `same` cells, all covered by four executable contracts. The new `bash-batching` contract
+compares the same read-only and opaque-redirection calls through CC's hook trace and kloop's
+real dispatcher report. Schema, output, timeout/cancellation trees and process survival are
+captured separately. This deliberately does not claim CC's auto-background, stall, Monitor,
+completion notification or background-result reinjection behavior; those remain Plan 51.
+
 This baseline is evidence and a roadmap, not a claim that all tools already
 match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 50–59; kloop-only capabilities stay intentionally separate.
+remain for Plans 51–59; kloop-only capabilities stay intentionally separate.
 
 
 ## Compaction (Phase 2, first slice)
@@ -846,6 +854,32 @@ deny/sensitive rules]`) rather than silently swallowed. This is an output
 filter, not an approval prompt (a tree walk touches too many paths for the
 gate's one-path ask); it applies in every mode but `--mock`, `--permission-mode
 bypass` included.
+
+## Foreground bash lifecycle (Plan 50 parity pass)
+
+Foreground `bash` runs `sh -lc` in its own process group with stdin closed and stdout/stderr
+on separate pipes. Both pipes are drained concurrently to EOF, so a child filling one stream
+cannot deadlock behind an unread other stream. Each stream retains at most 150,000 bytes while
+continuing to drain discarded bytes; the merged model-facing result is UTF-8 lossy, capped at
+30,000 characters, and says how many captured characters and additional bytes were omitted.
+stdout precedes stderr in the canonical result, followed by `[exit status N]` or
+`[killed by signal]`; an empty successful run returns `(no output)`.
+
+A timeout or turn cancellation SIGKILLs the entire process group, explicitly waits/reaps the
+direct shell child, and only then returns the error. If the shell leader exits normally while
+a descendant remains in its group, foreground completion kills and waits for that residual
+group too. A synchronous group-kill guard covers panic or a caller dropping outside the normal
+cancellation protocol. The dispatch layer preserves the boundary: cancellation during hooks or
+approval cannot spawn the command; once foreground Bash has spawned, dispatch waits for its
+cleanup path rather than dropping the future and returning early. Concurrent read-only Bash
+calls each finish their own cleanup before their paired interrupted results are returned.
+
+These are intentional safety differences from the pinned Claude Code 2.1.220 behavior: its
+stubborn timeout is promoted to a background task and its running SIGINT path reports a user
+rejection/abort; the isolated fixtures observe TERM-ignoring descendants still alive after both
+results. kloop keeps no-survivor foreground semantics, its native `timeout_ms`/result envelope,
+and the stricter permission/sandbox pipeline. Both implementations do agree on input-dependent
+batching: read-only calls may overlap, while opaque/redirection calls execute serially.
 
 ## Background bash (Phase 2, tenth slice)
 
