@@ -10,7 +10,7 @@
 
 ## 背景
 
-调度能力横跨工具注册、时间计算、持久化、后台执行、通知回灌和 session 生命周期，因此必须等待 Plan 51 的后台/Monitor 契约与 Plan 52 的 Agent/Task 回灌边界稳定。
+调度能力横跨工具注册、时间计算、持久化、后台执行、通知回灌和 session 生命周期。Plan 51 的后台/Monitor 契约已稳定；开工仍须等待 Plan 52 的 Agent/Task 回灌边界稳定。
 
 Plan 48 只证明 CronCreate、CronDelete、CronList、ScheduleWakeup 在 CC clean fixture 中注册并带 schema。kloop 当前没有同形的 model-visible scheduler；四项的 executor、permission、concurrency、output 和 lifecycle 均未运行。
 

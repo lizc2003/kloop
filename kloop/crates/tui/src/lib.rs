@@ -188,6 +188,10 @@ pub async fn run(
         Ok(t) => t,
         Err(e) => {
             restore_terminal();
+            let remaining = cfg_shutdown.shutdown_background_work().await;
+            if remaining > 0 {
+                eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+            }
             worker.abort();
             if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
                 eprintln!("{}", note.trim());
@@ -206,6 +210,10 @@ pub async fn run(
     )
     .await;
     restore_terminal();
+    let remaining = cfg_shutdown.shutdown_background_work().await;
+    if remaining > 0 {
+        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    }
     // The worker holds the session rollout; aborting mid-write is equivalent
     // to a killed session, which resume already repairs.
     worker.abort();

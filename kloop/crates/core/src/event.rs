@@ -24,6 +24,35 @@ use crate::tools::TodoStatus;
 /// fixed per-owner slot; assistant/reasoning messages use a turn-local counter.
 pub type ItemId = String;
 
+/// Session-scoped background work is not owned by the turn that launched it.
+/// Shells, sub-agents, and code-mode programs keep separate registries but share
+/// this read-only projection so every frontend can render one lifecycle without
+/// inventing a late `turnId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskKind {
+    Shell,
+    Agent,
+    Program,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub kind: BackgroundTaskKind,
+    pub description: String,
+    pub status: BackgroundTaskStatus,
+    pub output_path: Option<String>,
+    pub detail: Option<String>,
+}
+
 /// Everything core tells a front-end about a turn. The turn bracket
 /// (`TurnStarted`/`TurnEnded`/`Usage`) is constructed by each front-end's worker
 /// around its `run_turn` call; the rest flow through the `Ui::emit` seam as core
@@ -49,6 +78,10 @@ pub enum Event {
         id: ItemId,
         item: Item,
     },
+    /// A session-scoped background shell/agent/program changed state. Unlike an
+    /// item event this deliberately has no turn owner: the terminal update may
+    /// arrive after the launching turn completed.
+    BackgroundTaskUpdated(BackgroundTask),
     /// Full context size after a request (total input+output tokens).
     Usage(u64),
     /// The session entered (`branch = Some`) or left (`None`) a worktree.
@@ -159,6 +192,25 @@ impl Event {
                     "failed"
                 }
             )),
+            Event::BackgroundTaskUpdated(task) => {
+                let kind = match task.kind {
+                    BackgroundTaskKind::Shell => "shell",
+                    BackgroundTaskKind::Agent => "agent",
+                    BackgroundTaskKind::Program => "program",
+                };
+                let state = match task.status {
+                    BackgroundTaskStatus::Running => "started",
+                    BackgroundTaskStatus::Completed => "completed",
+                    BackgroundTaskStatus::Failed => "failed",
+                    BackgroundTaskStatus::Cancelled => "cancelled",
+                };
+                let detail = task
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default();
+                Some(format!("background {kind} {} {state}{detail}", task.id))
+            }
             Event::ItemCompleted {
                 item: Item::Todo { agent, items },
                 ..
@@ -312,6 +364,22 @@ mod tests {
         assert_eq!(
             all_done.as_note().as_deref(),
             Some("agent-1 · todos 1/1 done")
+        );
+    }
+
+    #[test]
+    fn background_task_note_preserves_terminal_detail() {
+        let event = Event::BackgroundTaskUpdated(BackgroundTask {
+            id: "program-2".into(),
+            kind: BackgroundTaskKind::Program,
+            description: "run checks".into(),
+            status: BackgroundTaskStatus::Cancelled,
+            output_path: None,
+            detail: Some("session shutdown".into()),
+        });
+        assert_eq!(
+            event.as_note().as_deref(),
+            Some("background program program-2 cancelled: session shutdown")
         );
     }
 

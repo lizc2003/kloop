@@ -1128,6 +1128,12 @@ async fn thread_worker(
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
     }
+    let remaining = cfg.shutdown_background_work().await;
+    if remaining > 0 {
+        ui.emit(&Event::Note(format!(
+            "{remaining} background task(s) missed the shutdown deadline"
+        )));
+    }
     // The thread is ending (turn channel closed on server shutdown): tear down
     // its active worktree if the model never exited (dirty kept on its branch,
     // clean removed), so trees don't leak past the session.

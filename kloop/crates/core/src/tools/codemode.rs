@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::background_tasks::TaskStatus;
 use super::ToolCtx;
+use crate::event::BackgroundTaskKind;
 use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
 use kloop_codemode::HostBridge;
@@ -189,26 +190,60 @@ fn spawn_background_program(
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
     let bridge = Arc::new(CoreBridge::new(bg_ctx, limits, Some(journal.clone())));
-    super::task::emit_agent_start(&ui, &label, &preview);
+    super::task::emit_background_task(
+        &ui,
+        &label,
+        BackgroundTaskKind::Program,
+        &preview,
+        TaskStatus::Running,
+        None,
+    );
+
+    let worker_cancel = own_cancel.clone();
+    let worker = tokio::spawn(async move {
+        kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
+    });
+    background_tasks.attach_abort(&label, worker.abort_handle());
     tokio::spawn({
         let label = label.clone();
         let ui = ui.clone();
+        let preview = preview.clone();
         async move {
-            let outcome =
-                kloop_codemode::run_program(&source, &names, bridge, own_cancel.clone(), limits)
-                    .await;
-            let (status, reinject) = classify_program(outcome, &own_cancel, &journal, &run_id);
-            background_tasks.set_status(&label, status);
-            match reinject {
-                Some(summary) => parent_inbox.push(InboxItem::ProgramResult {
-                    label: label.clone(),
-                    summary,
-                }),
-                // Stopped/aborted: no reinjection, but still wake a blocked
-                // `wait` so it re-evaluates instead of blocking its full deadline.
-                None => parent_inbox.notify_activity(),
+            let (status, reinject) = match worker.await {
+                Ok(outcome) => classify_program(outcome, &own_cancel, &journal, &run_id),
+                Err(error) if error.is_cancelled() => (TaskStatus::Aborted, None),
+                Err(error) => (
+                    TaskStatus::Failed,
+                    Some(format!(
+                        "[background program failed] program task panicked: {error}\nYou may re-run it or try another approach."
+                    )),
+                ),
+            };
+            let terminal = background_tasks.finish(&label, status, |actual, deliver| {
+                if deliver {
+                    if let Some(summary) = reinject {
+                        parent_inbox.push(InboxItem::ProgramResult {
+                            label: label.clone(),
+                            summary,
+                        });
+                    } else {
+                        parent_inbox.notify_activity();
+                    }
+                } else {
+                    debug_assert_eq!(actual, TaskStatus::Aborted);
+                    parent_inbox.notify_activity();
+                }
+            });
+            if let Some(terminal) = terminal {
+                super::task::emit_background_task(
+                    &ui,
+                    &label,
+                    BackgroundTaskKind::Program,
+                    &preview,
+                    terminal,
+                    super::task::task_status_detail(terminal),
+                );
             }
-            super::task::emit_agent_end(&ui, &label, matches!(status, TaskStatus::Completed));
         }
     });
     Ok(format!(

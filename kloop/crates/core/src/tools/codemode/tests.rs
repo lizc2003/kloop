@@ -33,6 +33,13 @@ impl RecordUi {
     fn events(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
+
+    fn background_events(&self) -> Vec<String> {
+        self.events()
+            .into_iter()
+            .filter(|event| event.starts_with("background "))
+            .collect()
+    }
 }
 impl Ui for RecordUi {
     fn emit(&self, ev: &Event) {
@@ -49,6 +56,11 @@ impl Ui for RecordUi {
                 let ok = *status == ItemStatus::Completed;
                 self.0.lock().unwrap().push(format!("tool_end: {ok}"));
             }
+            Event::BackgroundTaskUpdated(task) => self
+                .0
+                .lock()
+                .unwrap()
+                .push(format!("background {} {:?}", task.id, task.status)),
             _ => {}
         }
     }
@@ -184,7 +196,8 @@ async fn agent_cap_refuses_runaway_fanout() {
 #[tokio::test]
 async fn background_program_returns_immediately_and_reinjects() {
     use crate::inbox::InboxItem;
-    let ctx = test_ctx(0, "bg-program");
+    let ui = Arc::new(RecordUi::default());
+    let ctx = with_ui(test_ctx(0, "bg-program"), ui.clone());
     let (out, is_error) = run_tool(
         "run_program",
         json!({ "source": "return 'PROG_DONE';", "background": true }),
@@ -206,21 +219,30 @@ async fn background_program_returns_immediately_and_reinjects() {
     }
     let items = ctx.cfg.inbox.drain();
     assert_eq!(items.len(), 1, "one reinjected result");
-    match &items[0] {
+    let label = match &items[0] {
         InboxItem::ProgramResult { label, summary } => {
             assert!(label.starts_with("program-"), "{label}");
             assert_eq!(summary, "PROG_DONE");
+            label.clone()
         }
         other => panic!("expected ProgramResult, got {other:?}"),
-    }
+    };
     assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
+    assert_eq!(
+        ui.background_events(),
+        vec![
+            format!("background {label} Running"),
+            format!("background {label} Completed"),
+        ]
+    );
 }
 
 /// A background program cancelled via stop_agent ends Aborted and reinjects
 /// NOTHING (codex's is_final) — only a wake so a blocked wait re-evaluates.
 #[tokio::test]
 async fn stopped_background_program_does_not_reinject() {
-    let ctx = test_ctx(0, "bg-prog-stop");
+    let ui = Arc::new(RecordUi::default());
+    let ctx = with_ui(test_ctx(0, "bg-prog-stop"), ui.clone());
     // The program blocks on a long bash so stop_agent can catch it running.
     let (out, _) = run_tool(
         "run_program",
@@ -249,9 +271,21 @@ async fn stopped_background_program_does_not_reinject() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(
+        ctx.cfg.background_tasks.running_count(),
+        0,
+        "stopped program did not reach a terminal state"
+    );
     assert!(
         ctx.cfg.inbox.is_empty(),
         "an interrupted program reinjects nothing"
+    );
+    assert_eq!(
+        ui.background_events(),
+        vec![
+            format!("background {id} Running"),
+            format!("background {id} Cancelled"),
+        ]
     );
 }
 

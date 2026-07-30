@@ -497,6 +497,15 @@ impl App {
                     }
                 }
             }
+            Event::BackgroundTaskUpdated(task) => {
+                let event = Event::BackgroundTaskUpdated(task);
+                if let Some(note) = event.as_note() {
+                    self.assistant_open = false;
+                    self.thinking_open = false;
+                    self.last_note = Some(note.clone());
+                    self.cells.push(Cell::Note(note));
+                }
+            }
             Event::Note(n) => {
                 self.assistant_open = false;
                 self.thinking_open = false;
@@ -1120,6 +1129,42 @@ mod tests {
     }
     fn mode_changed(mode: Mode) -> AgentEvent {
         AgentEvent::Core(Event::ModeChanged(mode))
+    }
+
+    fn background_update(
+        status: kloop_core::event::BackgroundTaskStatus,
+        detail: Option<&str>,
+    ) -> AgentEvent {
+        AgentEvent::Core(Event::BackgroundTaskUpdated(
+            kloop_core::event::BackgroundTask {
+                id: "agent-4".into(),
+                kind: kloop_core::event::BackgroundTaskKind::Agent,
+                description: "inspect logs".into(),
+                status,
+                output_path: None,
+                detail: detail.map(str::to_string),
+            },
+        ))
+    }
+
+    #[test]
+    fn background_updates_render_as_session_notes() {
+        let mut app = App::new("s".into());
+        app.apply(background_update(
+            kloop_core::event::BackgroundTaskStatus::Running,
+            None,
+        ));
+        app.apply(background_update(
+            kloop_core::event::BackgroundTaskStatus::Cancelled,
+            Some("session shutdown"),
+        ));
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Note("background agent agent-4 started".into()),
+                Cell::Note("background agent agent-4 cancelled: session shutdown".into()),
+            ]
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {

@@ -12,7 +12,7 @@
 
 Plan 48 已采集 Bash 的成功、失败、坏输入、timeout、显式后台和默认权限拒绝。当前 matrix 的 registration、schema、parser、executor、output、lifecycle 为 `compatible`，permission 为 `intentional-diff`，concurrency 为 `unknown`。
 
-本计划只收敛前台 Bash。自动后台化、完成通知、stall 和 Monitor 留给 Plan 51。
+本计划只收敛前台 Bash。自动后台化、完成通知、stall 和 Monitor 不在本计划实现；后续 Plan 51 已独立闭环显式后台终态通知/回灌与清理，并把自动后台化、stall、逐事件 Monitor 留作明确边界。
 
 ## 当前证据与差距
 
@@ -84,7 +84,7 @@ kloop 侧优先复用：
 
 ## 非目标与有意保留
 
-- 不实现自动后台化、Monitor、stall 或后台完成回灌。
+- 本计划不实现自动后台化、Monitor、stall 或后台完成回灌；显式后台通知/回灌已由 Plan 51 单独完成。
 - 不改变后台 agent 生命周期。
 - 不移除 kloop shell AST、deny、敏感路径和 sandbox 防御。
 - 不改 `run_program`。
@@ -117,7 +117,7 @@ git diff --check
 
 ## 文档同步
 
-完成时同步本 plan、HANDOFF、refs/README、kloop README、capability report 与 parity 产物。Plan 51 的后台状态不得在本计划完成记录中冒充已完成。
+完成时同步本 plan、HANDOFF、refs/README、kloop README、capability report 与 parity 产物。后台状态不在本计划冒充完成，后续由 Plan 51 的独立证据与完成记录承接。
 
 ## 完成标准
 
@@ -141,6 +141,6 @@ git diff --check
 - dispatch cancellation 现在区分“尚未 spawn”和“前台 Bash 已 spawn”：hook/审批期间取消仍直接 drop 且绝不启动命令；spawn 后取消等待 Bash executor 完成 kill/reap，再返回 interrupted tool_result。两个同批只读 Bash 会共同收到取消、各自清完整进程组，并保留每个 tool_use 的配对结果。
 - concurrency fixture 用 per-call hook barrier 证明 `pwd`/`ls -d .` 同批重叠，用 redirection 写文件对证明 opaque calls 串行；精确 bundle 的 `isConcurrencySafe(input) → isReadOnly(input)` locator 与真实 kloop `dispatch_tools` report 共同进入第 4 个 generated pair contract `bash-batching`，覆盖两个 Bash concurrency `same` cell。
 - corpus 现为 82 captures、109 条 static evidence、56 行/448 单元 matrix：70 `compatible`、90 `intentional-diff`、20 `missing`、236 `unknown`、22 `n/a`、10 `same`；`paired-parity.json` 共 4 个 contract，全部 10 个 `same` 都由 executable comparator 覆盖。Bash executor/permission/output/lifecycle 保留 `intentional-diff`，未取证面继续 `unknown`。
-- Plan 51 的自动后台化、stall、Monitor、完成通知与后台结果回灌仍未实现；Plan 50 只声明前台 Bash 与输入依赖并发闭环，不把既有显式 `run_in_background` 扩张成 CC 后台任务状态机。
+- Plan 51 后续已独立闭环显式后台 completion/failure/cancel 通知、下一 step 回灌与 session cleanup；自动后台化、stall 和逐事件 Monitor 仍是 intentional boundary。Plan 50 本身只声明前台 Bash 与输入依赖并发闭环，不把既有显式 `run_in_background` 扩张成当时尚未证明的 CC 后台状态机。
 - 验证：`build_matrix.py`/`--check`、full exact-binary `verify.py`、`verify.py --corpus-only`、Plan 50 Rust report、focused tools/Bash regression、workspace fmt/clippy/tests、mock 与 `git diff --check` 全绿。
 - 提交：本实现、证据与完成记录在同一个 `plan50` 提交中，SHA 以本行所在提交为准。

@@ -187,6 +187,30 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             "item/completed",
             json!({"turnId": turn_id, "item": item_json(id, item, "completed")}),
         )),
+        Event::BackgroundTaskUpdated(task) => {
+            let kind = match task.kind {
+                kloop_core::event::BackgroundTaskKind::Shell => "shell",
+                kloop_core::event::BackgroundTaskKind::Agent => "agent",
+                kloop_core::event::BackgroundTaskKind::Program => "program",
+            };
+            let status = match task.status {
+                kloop_core::event::BackgroundTaskStatus::Running => "running",
+                kloop_core::event::BackgroundTaskStatus::Completed => "completed",
+                kloop_core::event::BackgroundTaskStatus::Failed => "failed",
+                kloop_core::event::BackgroundTaskStatus::Cancelled => "cancelled",
+            };
+            Some((
+                "thread/backgroundTask/updated",
+                json!({"task": {
+                    "id": task.id,
+                    "kind": kind,
+                    "description": task.description,
+                    "status": status,
+                    "outputPath": task.output_path,
+                    "detail": task.detail,
+                }}),
+            ))
+        }
         // Token usage and cwd are thread-scoped, not turn-scoped: no turnId.
         Event::Usage(n) => Some((
             "thread/tokenUsage/updated",
@@ -382,6 +406,32 @@ mod tests {
 
         // The turn bracket is not projected here (the worker owns the turn id).
         assert_eq!(project_event(&Event::TurnStarted, 2), None);
+    }
+
+    #[test]
+    fn background_updates_are_thread_scoped() {
+        let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
+            id: "bg-7".into(),
+            kind: kloop_core::event::BackgroundTaskKind::Shell,
+            description: "make test".into(),
+            status: kloop_core::event::BackgroundTaskStatus::Failed,
+            output_path: Some("/tmp/bg-7.out".into()),
+            detail: Some("exit 2".into()),
+        });
+        assert_eq!(
+            project_event(&update, 99),
+            Some((
+                "thread/backgroundTask/updated",
+                json!({"task": {
+                    "id": "bg-7",
+                    "kind": "shell",
+                    "description": "make test",
+                    "status": "failed",
+                    "outputPath": "/tmp/bg-7.out",
+                    "detail": "exit 2",
+                }})
+            ))
+        );
     }
 
     #[test]

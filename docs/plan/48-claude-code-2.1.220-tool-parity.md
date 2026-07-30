@@ -261,7 +261,7 @@ clean profile 连跑两次，normalized 结果必须完全一致。
 - `read_offloaded`：kloop 专有超长结果回读；
 - `call_tool`：弱模型的 deferred-tool 兼容层；
 - Web/Skill 当前自有行为：先标 `intentional-diff` 或 `unknown`；
-- 后台 Bash 当前没有 CC 自动后台化、完成通知、stall 和 Monitor；
+- 后台 Bash 在 Plan 48 建基线时没有 CC 自动后台化、完成通知回灌、stall 和 Monitor；其中显式后台终态通知、下一 step 回灌与 session 清理由 Plan 51 完成，自动后台化/stall/逐事件 Monitor 仍保留为有据的兼容边界；
 - 并行 task 当前没有 CC 的 10 路上限。
 
 Plan 48 不做：

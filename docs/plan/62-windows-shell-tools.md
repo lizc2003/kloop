@@ -4,7 +4,7 @@
 >
 > 依赖：Plan 50、Plan 61
 >
-> 交界：Plan 51 继续负责自动后台化、stall、Monitor、完成通知与结果回灌
+> 交界：Plan 51 已完成显式后台 lifecycle/通知/回灌与 session cleanup；自动后台化、stall 和逐事件 Monitor 仍为产品边界
 >
 > 调研基线：kloop `70eebfc`；Claude Code 固定源码 `<redacted>` 只作 Windows 架构参考，精确 2.1.220 target 是 darwin-arm64，不能充当 Windows 运行证据。
 
@@ -14,7 +14,7 @@ Claude Code 在原生 Windows 上不把 Bash 偷换成 PowerShell：Bash 使用 
 
 kloop 当前只有 `bash`，执行器固定为 `sh -lc`。Unix 前后台路径依赖独立 process group；non-Unix 的 `kill_group` 是 no-op，`process_group_alive` 恒为 false。因此当前代码即使在 Windows 找到某个 `sh.exe`，timeout、cancel、`kill_bash`、watchdog 和 session Drop 也只能可靠处理直接子进程，不能兑现 Plan 50 的无遗留进程树保证。
 
-本计划只闭环 **Windows 原生 shell execution**：Git Bash、独立 PowerShell、Job Object 进程树所有权、权限和原生 CI。Windows 文件 mutation/reparse-point/handle-relative safety 仍由 Plan 61 负责；Windows filesystem/network sandbox 仍未实现；Plan 51 的后台任务状态机不并入本计划。
+本计划只闭环 **Windows 原生 shell execution**：Git Bash、独立 PowerShell、Job Object 进程树所有权、权限和原生 CI。Windows 文件 mutation/reparse-point/handle-relative safety 仍由 Plan 61 负责；Windows filesystem/network sandbox 仍未实现；Plan 51 已完成的显式后台 lifecycle 状态机在本计划只复用、不重新设计。
 
 ## 固定目标与边界
 
@@ -97,7 +97,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'  # optional
 - Windows Bash schema 不广告 `disable_sandbox`；直调携该字段时明确报 Windows sandbox unavailable，不静默忽略。
 - 前台成功/失败、30k 输出、timeout/cancel 和 no-residual 继续走共享 process layer。
 - 显式后台继续使用同一个 `BackgroundShells` registry、output file、1 GiB watchdog 和查询/kill contract，但 entry 保存 Job controller。turn cancel 不杀后台；`kill_bash`、watchdog、registry/session Drop 必须终止完整 Job。
-- Plan 51 的前台自动转后台、stall、Monitor、通知和回灌不进入本计划。
+- 本计划复用 Plan 51 已有的显式后台通知、回灌和 session cleanup，不新增前台自动转后台、stall 或逐事件 Monitor。
 
 ## 4. 新增独立 PowerShell v1
 
@@ -249,7 +249,7 @@ Windows-only schema：
 ## 非目标
 
 - PowerShell background、`powershell_output`、`kill_powershell` 或 PowerShell 自动后台化。
-- Plan 51 的 auto-background/stall/Monitor/通知/结果回灌。
+- 已存在的 Plan 51 lifecycle/通知/回灌不在本计划重做；auto-background/stall/逐事件 Monitor 不实现。
 - Windows restricted token/AppContainer、filesystem/network/registry sandbox。
 - PowerShell AST、read-only/dangerous cmdlet classifier、alias 解析、prefix permission 规则。
 - cmd.exe、WSL bridge、Cygwin、任意 MSYS、PTY、交互 stdin、persistent shell state。

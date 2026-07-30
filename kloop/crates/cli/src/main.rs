@@ -305,6 +305,10 @@ async fn main() -> Result<ExitCode> {
         )
         .await;
         watcher.abort();
+        let remaining = cfg.shutdown_background_work().await;
+        if remaining > 0 {
+            eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+        }
         // Tear down the worktree (dirty kept on its branch, clean removed).
         if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
             eprintln!("{}", note.trim());
@@ -426,6 +430,7 @@ async fn plain_main(
             "\n--- mock run: {:?} after {} round(s) ---",
             outcome.reason, outcome.rounds
         );
+        let _ = cfg.shutdown_background_work().await;
         return Ok(());
     }
 
@@ -445,11 +450,17 @@ async fn plain_main(
     // `--image` blocks ride the first user turn; taken once, then empty.
     let mut pending_images = pending_images;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut input_error = None;
     loop {
         print!("> ");
         let _ = std::io::stdout().flush();
-        let Some(line) = lines.next_line().await? else {
-            break;
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                input_error = Some(error);
+                break;
+            }
         };
         let mut line = line.trim().to_string();
         if line.is_empty() {
@@ -507,12 +518,19 @@ async fn plain_main(
             EndReason::Error(e) => println!("[error: {e}]"),
         }
     }
+    let remaining = cfg.shutdown_background_work().await;
+    if remaining > 0 {
+        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    }
     // Tear down the session worktree on exit (dirty kept on its branch, clean
     // removed); the kept-tree note tells the user where its changes live.
     if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
         println!("{}", note.trim());
     }
-    Ok(())
+    match input_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

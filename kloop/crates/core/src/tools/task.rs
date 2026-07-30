@@ -16,6 +16,9 @@ use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
 use crate::agent_type::AgentType;
 use crate::config::Config;
+use crate::event::BackgroundTask;
+use crate::event::BackgroundTaskKind;
+use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
@@ -165,6 +168,30 @@ pub(super) fn emit_agent_end(ui: &Arc<dyn crate::agent::Ui>, label: &str, ok: bo
     });
 }
 
+pub(super) fn emit_background_task(
+    ui: &Arc<dyn crate::agent::Ui>,
+    label: &str,
+    kind: BackgroundTaskKind,
+    description: &str,
+    status: TaskStatus,
+    detail: Option<String>,
+) {
+    let status = match status {
+        TaskStatus::Running => BackgroundTaskStatus::Running,
+        TaskStatus::Completed | TaskStatus::MaxRounds => BackgroundTaskStatus::Completed,
+        TaskStatus::Failed => BackgroundTaskStatus::Failed,
+        TaskStatus::Aborted => BackgroundTaskStatus::Cancelled,
+    };
+    ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+        id: label.to_string(),
+        kind,
+        description: description.to_string(),
+        status,
+        output_path: None,
+        detail,
+    }));
+}
+
 /// Run a sub-agent synchronously and map its outcome to a tool result. The
 /// sub-agent runs as its OWN tokio task — besides matching the semantics, this
 /// breaks the recursion cycle (execute_tool -> run_turn -> dispatch_tools ->
@@ -298,41 +325,82 @@ async fn spawn_background(
     let background_tasks = ctx.cfg.background_tasks.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
-    emit_agent_start(&ui, &agent, preview);
-    tokio::spawn({
+    let description = preview.to_string();
+    emit_background_task(
+        &ui,
+        &agent,
+        BackgroundTaskKind::Agent,
+        &description,
+        TaskStatus::Running,
+        None,
+    );
+
+    // The worker owns only the model turn. A supervisor awaits its JoinHandle so
+    // panic/forced abort still reaches worktree cleanup, one terminal registry
+    // transition, one inbox publication, and one frontend event.
+    let worker = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
         async move {
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
-            let outcome = run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await;
-            let (status, mut reinject) = classify_background(outcome);
-            // Tear down or preserve the worktree; a preserved tree's location
-            // is folded into the reinjected result so the parent learns of it.
+            run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await
+        }
+    });
+    background_tasks.attach_abort(&agent, worker.abort_handle());
+    tokio::spawn({
+        let label = agent.clone();
+        let ui = ui.clone();
+        let description = description.clone();
+        async move {
+            let (status, mut reinject) = match worker.await {
+                Ok(outcome) => classify_background(outcome),
+                Err(error) if error.is_cancelled() => (TaskStatus::Aborted, None),
+                Err(error) => (
+                    TaskStatus::Failed,
+                    Some(format!(
+                        "[sub-agent failed] background task panicked: {error}\nYou may re-dispatch it or try another approach."
+                    )),
+                ),
+            };
+            // Tear down or preserve the worktree. Natural completion folds the
+            // location into the reinjected result; cancellation keeps it on the
+            // session-scoped terminal event so the preserved tree is never hidden.
+            let mut cleanup_detail = None;
             if let Some(wt) = worktree {
                 if let Some(note) = worktree::finish(wt).await {
+                    cleanup_detail = Some(note.trim().to_string());
                     match &mut reinject {
                         Some(summary) => summary.push_str(&note),
                         None => reinject = Some(note.trim_start().to_string()),
                     }
                 }
             }
-            background_tasks.set_status(&label, status);
-            match reinject {
-                Some(summary) => parent_inbox.push(InboxItem::SubAgentResult {
-                    label: label.clone(),
-                    summary,
-                }),
-                // Terminal with no reinjection (interrupted): still wake a
-                // blocked `wait` so it re-evaluates instead of blocking out its
-                // full deadline.
-                None => parent_inbox.notify_activity(),
+            let terminal = background_tasks.finish(&label, status, |actual, deliver| {
+                if deliver {
+                    if let Some(summary) = reinject {
+                        parent_inbox.push(InboxItem::SubAgentResult {
+                            label: label.clone(),
+                            summary,
+                        });
+                    } else {
+                        parent_inbox.notify_activity();
+                    }
+                } else {
+                    debug_assert_eq!(actual, TaskStatus::Aborted);
+                    parent_inbox.notify_activity();
+                }
+            });
+            if let Some(terminal) = terminal {
+                emit_background_task(
+                    &ui,
+                    &label,
+                    BackgroundTaskKind::Agent,
+                    &description,
+                    terminal,
+                    background_terminal_detail(terminal, cleanup_detail),
+                );
             }
-            emit_agent_end(
-                &ui,
-                &label,
-                matches!(status, TaskStatus::Completed | TaskStatus::MaxRounds),
-            );
         }
     });
     Ok(format!(
@@ -401,6 +469,34 @@ fn classify_background(outcome: TurnOutcome) -> (TaskStatus, Option<String>) {
         ),
         EndReason::Aborted => (TaskStatus::Aborted, None),
     }
+}
+
+pub(super) fn task_status_detail(status: TaskStatus) -> Option<String> {
+    match status {
+        TaskStatus::Running | TaskStatus::Completed => None,
+        TaskStatus::Failed => Some("background task failed".into()),
+        TaskStatus::MaxRounds => Some("stopped at round limit".into()),
+        TaskStatus::Aborted => Some("stopped".into()),
+    }
+}
+
+fn background_terminal_detail(
+    status: TaskStatus,
+    cleanup_detail: Option<String>,
+) -> Option<String> {
+    let mut detail = task_status_detail(status);
+    if status == TaskStatus::Aborted {
+        if let Some(cleanup) = cleanup_detail {
+            match &mut detail {
+                Some(text) => {
+                    text.push_str(": ");
+                    text.push_str(&cleanup);
+                }
+                None => detail = Some(cleanup),
+            }
+        }
+    }
+    detail
 }
 
 fn truncate_error(e: &str) -> String {
@@ -793,6 +889,11 @@ mod tests {
                     let ok = *status == ItemStatus::Completed;
                     self.0.lock().unwrap().push(format!("end {label} {ok}"));
                 }
+                Event::BackgroundTaskUpdated(task) => self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(format!("background {} {:?}", task.id, task.status)),
                 _ => {}
             }
         }
@@ -1052,7 +1153,9 @@ mod tests {
         let provider = Provider::mock(vec![vec![ContentBlock::Text {
             text: "sub result".into(),
         }]]);
-        let ctx = with_provider(test_ctx(0, "bg-reinject"), provider);
+        let mut ctx = with_provider(test_ctx(0, "bg-reinject"), provider);
+        let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        ctx.ui = rec.clone();
 
         let (out, is_error) = run_tool(
             "task",
@@ -1076,14 +1179,22 @@ mod tests {
         }
         let items = ctx.cfg.inbox.drain();
         assert_eq!(items.len(), 1, "one reinjected result");
-        match &items[0] {
+        let label = match &items[0] {
             InboxItem::SubAgentResult { label, summary } => {
                 assert!(label.starts_with("agent-"), "{label}");
                 assert_eq!(summary, "sub result");
+                label.clone()
             }
             other => panic!("expected SubAgentResult, got {other:?}"),
-        }
+        };
         assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![
+                format!("background {label} Running"),
+                format!("background {label} Completed"),
+            ]
+        );
     }
 
     /// A background sub-agent cancelled via stop_agent ends Aborted and
@@ -1097,7 +1208,9 @@ mod tests {
             name: "bash".into(),
             input: json!({"command": "sleep 30"}),
         }]]);
-        let ctx = with_provider(test_ctx(0, "bg-stopped"), provider);
+        let mut ctx = with_provider(test_ctx(0, "bg-stopped"), provider);
+        let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        ctx.ui = rec.clone();
 
         let (out, _) = run_tool("task", json!({"prompt": "long", "background": true}), &ctx).await;
         let agent = out
@@ -1123,10 +1236,62 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            ctx.cfg.background_tasks.running_count(),
+            0,
+            "stopped sub-agent did not reach a terminal state"
+        );
         assert!(
             ctx.cfg.inbox.is_empty(),
             "an interrupted sub-agent reinjects nothing"
         );
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![
+                format!("background {agent} Running"),
+                format!("background {agent} Cancelled"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_cancels_real_background_subagent() {
+        let provider = Provider::mock(vec![vec![ContentBlock::ToolUse {
+            id: "s1".into(),
+            name: "bash".into(),
+            input: json!({"command": "sleep 30"}),
+        }]]);
+        let mut ctx = with_provider(test_ctx(0, "bg-session-shutdown"), provider);
+        let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        ctx.ui = rec.clone();
+
+        let (out, is_error) =
+            run_tool("task", json!({"prompt": "long", "background": true}), &ctx).await;
+        assert!(!is_error, "{out}");
+        let agent = out
+            .split_whitespace()
+            .find(|word| word.starts_with("agent-"))
+            .unwrap()
+            .to_string();
+        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+        assert!(ctx.cfg.inbox.is_empty());
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![
+                format!("background {agent} Running"),
+                format!("background {agent} Cancelled"),
+            ]
+        );
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "too late", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error);
+        assert!(out.contains("session is closing"), "{out}");
     }
 
     /// A sub-agent spawned by a PERSISTENT parent writes its own session file:
@@ -1275,6 +1440,26 @@ mod tests {
         assert_eq!(
             classify_background(outcome(EndReason::Aborted)),
             (TaskStatus::Aborted, None)
+        );
+    }
+
+    #[test]
+    fn cancelled_worktree_location_survives_as_terminal_detail() {
+        assert_eq!(
+            background_terminal_detail(
+                TaskStatus::Aborted,
+                Some("worktree kept at /tmp/agent-1".into())
+            )
+            .as_deref(),
+            Some("stopped: worktree kept at /tmp/agent-1")
+        );
+        assert_eq!(
+            background_terminal_detail(
+                TaskStatus::Completed,
+                Some("worktree kept at /tmp/agent-1".into())
+            ),
+            None,
+            "natural completion reports the location through its reinjected result"
         );
     }
 

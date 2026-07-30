@@ -130,7 +130,7 @@ Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 
 domain-safety 层先被拒、stub 收到 0 请求，所以重定向/认证/大响应 executor 继续为 `unknown`；
 Plan 49 没有外推其他工具簇。
 
-Plan 50 随后闭环前台 Bash。采集集现为 82 组 capture，新增 schema、output、timeout tree、
+Plan 50 随后闭环前台 Bash。采集集当时为 82 组 capture，新增 schema、output、timeout tree、
 cancel tree 四组 determinism pair 与一个 concurrency singleton；`static-evidence.jsonl` 为 109 条，
 其中 exact bundle locator 固定输入/输出 schema、input-dependent `isConcurrencySafe`、permission+
 sandbox override、spawn/stdio、timeout cap、process-tree kill、result mapper、30k inline cap 与 persisted
@@ -150,8 +150,27 @@ matrix 现为 56 行/448 单元：70 `compatible`、90 `intentional-diff`、20 `
 22 `n/a`、10 `same`。第 4 个 generated contract `bash-batching` 覆盖两个 Bash concurrency
 `same` cell：CC 用 Pre/Post hook barrier 证明 `pwd`/`ls -d .` 同批重叠、两个 redirection 调用串行；
 kloop 固定 Rust report 跑同输入真实 `dispatch_tools` 并比较 call/event/result/workspace。Bash 的
-permission、native output envelope 和 no-survivor lifecycle 保持 `intentional-diff`。自动后台化、stall、
-Monitor、完成通知及后台结果回灌仍归 Plan 51，不能从既有显式 `run_in_background` 外推已完成。
+permission、native output envelope 和 no-survivor lifecycle 保持 `intentional-diff`。
+
+Plan 51 将 corpus 扩至 83 captures/116 static evidence。`bash-background` 与
+`bash-background-failure` 的 raw/normalized 对固定：显式后台立即返 id + output file，随后独立发
+`task_started → task_updated(completed|failed) → task_notification`，再以
+`origin.kind=task-notification` 启动一轮采样；输出正文不塞进通知。bundle locators 同时裁决了
+model-visible `Monitor`：`tengu_amber_sentinel` server flag 默认 false，且还要求 Bash 可用；输入是
+command/WebSocket 二选一 + description + bounded timeout/persistent，command 每个 stdout 行、WS 每个
+text frame 都成为通知，TaskStop/timeout/session exit 收尾，URL 与 command 分别走 egress/SSRF 和 Bash
+权限。clean CLI 没暴露它，local harness 也不能权威开启 server flag，因此 `monitor@clean-cli` 八格
+仍是有理由的 `unknown`，绝不改写成 `missing`。
+
+kloop 没新增同名 Monitor：那是逐事件 watch，而已证明的 background Bash 是一次性终态通知，不能
+混为一谈。Plan 51 在现有两套 registry 上补一个共享的只读 lifecycle event：shell、agent、program
+都发 session-scoped running→单一 terminal；server 用无 `turnId` 的
+`thread/backgroundTask/updated`，TUI/plain 显示 note。shell 终态把 status/summary/output-file pointer
+回灌 launching agent inbox（命令输出仍只在文件），所以运行中在下一 step、TUI 空闲靠 autowake、
+plain/server 在下一 turn 交付。agent/program 的结果回灌语义不变。两套 registry 不合并，但都用原子
+终态裁决和 generation signal；session shutdown 先关注册、协作取消，deadline 后 abort/SIGKILL
+process group，并在 active worktree teardown 前等待，防 orphan、重复通知和 server sender 挂账。
+自动后台化、stall policy 与逐事件 Monitor 保留为明确的产品边界。
 
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
@@ -173,8 +192,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
-`docs/plan/49-file-search-parity.md` 与 `docs/plan/50-bash-foreground-parity.md`。Plan 50 的完成不表示 kloop 已全工具对齐或可替换
-Claude Code；其余产品行为仍由 Plan 51–59 逐簇实现与验收。
+`docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md` 与
+`docs/plan/51-background-monitor-parity.md`。Plan 51 的完成不表示 kloop 已全工具对齐或可替换
+Claude Code；其余产品行为仍由 Plan 52–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

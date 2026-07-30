@@ -98,7 +98,9 @@ task 工具:深度限 1、`is_concurrency_safe` 标死 false(连续 task 调用�
 
 另:plan 14 第三片已落 `BackgroundShells`(`tools/bash.rs`):id/状态/输出落盘/查询(block 语义)/进程组终止/monitor task 生命周期——如果本 plan 把 task 做成异步派发,它需要的正是同一套东西。
 
-## 候选切片(开工时和用户定选哪几片、什么顺序)
+## 历史候选切片（已被后续完成记录取代）
+
+> 以下为开工前方案与 2026-07-13 中间进展。最终裁决：并行/agent type/持久化/UI/hooks 已在本计划完成；异步派发、回灌与 TUI autowake 由 Plan 26 完成；Plan 51 又补强了 agent/program/shell 的统一外部 lifecycle 与 session shutdown。`BackgroundTasks` 和 `BackgroundShells` 最终明确不合并。
 
 1. **并行 task**:连续 task 调用并发跑(cc 形态)。子 agent 本来就是独立 tokio task,缺的是把 task 从"永不并发"改成可并发批。要解决:并发写文件的风险怎么表达(权限门是共享的、会各自询问——询问并发弹出的 UI 排队 TUI 已有,plain 会乱,开工时定);UI 上多个子 agent 的 tool 行混流怎么区分(见片 4)。
 2. **自定义 agent 类型**:config 定义命名 agent(独立 system prompt、工具子集白名单、模型 override),task 工具加 `agent_type` 参数,模型可见的类型清单进 task 的 description。文件形态(`.kloop/agents/*.md` frontmatter 还是 config.toml 表)开工时问用户。便宜模型跑搜索型子任务是主要收益。

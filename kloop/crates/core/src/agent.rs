@@ -438,8 +438,8 @@ const TRUNCATION_CONTINUE_MSG: &str = "Your previous response was cut off by the
 limit. Continue exactly where you left off; break the remaining work into smaller pieces.";
 
 /// Drain the step-boundary injection queue into history as user messages, each
-/// framed by its own kind ([`InboxItem::into_message`]: steering vs a background
-/// sub-agent's result). Returns true if anything was injected. Called only at
+/// framed by its own kind ([`InboxItem::into_message`]: steering, detached-task
+/// results, or a background-shell terminal notification). Returns true if anything was injected. Called only at
 /// round boundaries (top of the loop, and just before the turn would end) —
 /// never mid-request, so an in-flight sampling never sees a partial write and
 /// tool_result blocks are never interleaved with the injected user message.

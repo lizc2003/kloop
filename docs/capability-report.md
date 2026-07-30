@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-30,plan 1–50 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、文件/搜索簇与前台 Bash 闭环见 plan 48–50。
+> 基线:2026-07-30,plan 1–51 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、文件/搜索、前台 Bash 与后台 lifecycle 闭环见 plan 48–51。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -64,7 +64,9 @@
 |---|---|---|---|
 | PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | plan 49 明确返回 unsupported；不在 canonical provider wire 未统一时伪兼容 | 真实 PDF 需求 |
 | 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门) | 真痛感再重启,连 PTY 一起 |
-| 自动后台化 / stall 探测 / Monitor / 完成通知与结果回灌 | cc 单家 | **plan 51**；plan 50 只闭环前台，显式 `run_in_background` 不等于该状态机 | 长命令 dogfood 痛感 |
+| 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
+| model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
+| 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook 编辑 | cc 单家 | 不立 | 无需求 |
 
@@ -83,8 +85,18 @@ concurrency singleton 将 exact corpus 扩至 82 captures/109 evidence，matrix 
 opaque redirection 串行。kloop 新增双 pipe 有界 drain（每 fd 150k bytes、最终 30k chars）与
 no-survivor 前台生命周期：timeout/cancel 同步 SIGKILL process group、reap direct child 并确认
 residual group 消失。CC stubborn timeout/cancel fixture 在结果后仍留 descendants，因此 executor/
-output/lifecycle 保留安全型 `intentional-diff`。自动后台化、stall、Monitor、完成通知与后台回灌继续
-是 Plan 51 的明确缺口，不能由 Plan 50 或现有显式 background Bash 冒充完成。
+output/lifecycle 保留安全型 `intentional-diff`。
+
+Plan 51 将 corpus 扩至 83 captures/116 static evidence：exact `bash-background` 与新增的
+`bash-background-failure` 固定 `task_started → task_updated(completed|failed) → task_notification →
+origin:task-notification` 再采样；bundle 静态证据固定 Monitor 的 `tengu_amber_sentinel`（默认 false）
++ Bash availability gate、command/WebSocket 二选一 schema、逐行/frame 通知、1h timeout/persistent、
+TaskStop/session cleanup 和 URL/Bash 权限分流。clean CLI 未暴露 Monitor，harness 又不能权威开启
+server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missing`。kloop 不新增同名工具；
+它为 shell/agent/program 发无 turn owner 的统一 lifecycle event，后台 shell 终态只回灌状态和输出
+文件指针（不塞命令输出），TUI 空闲自动唤醒、plain/server 下一 turn 交付；两套 registry 各自原子
+裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再清 worktree。
+自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
 
 ### 5. 子 agent / 多 agent——✅ 收敛解全齐
 

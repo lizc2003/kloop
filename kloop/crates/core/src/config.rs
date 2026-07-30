@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kloop_provider::Provider;
 
@@ -106,16 +107,17 @@ pub struct Config {
     /// gets its OWN fresh list — the task tool resets this on the cloned
     /// Config so a sub-agent's planning never touches the parent's.
     pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
-    /// Step-boundary injection queue (plan 22 + 26). Items pushed here — user
-    /// steering typed while the turn runs, or a background sub-agent's result —
-    /// are drained at round boundaries (never mid-request) and recorded as user
-    /// messages before the next sampling, each with its own framing. cc and
-    /// codex independently converge on this: enqueue-not-interrupt, delivered
-    /// only between steps. Each sub-agent gets its OWN fresh queue (the task
-    /// tool resets it on the cloned Config, like `todos`) so a parent's steering
-    /// is never drained by a running sub-agent; a *background* sub-agent instead
-    /// reinjects into a clone of the PARENT's queue captured before the reset.
-    /// The front-end holds a clone of this Arc to enqueue while a turn runs.
+    /// Step-boundary injection queue (plans 22, 26, and 51). Items pushed here —
+    /// user steering, detached-task results, or a background shell's terminal
+    /// notification — are drained at round boundaries (never mid-request) and
+    /// recorded as user messages before the next sampling, each with its own
+    /// framing. Each sub-agent gets its OWN fresh queue (the task tool resets it
+    /// on the cloned Config, like `todos`) so a parent's steering is never drained
+    /// by a running sub-agent; a *background* sub-agent instead reinjects into a
+    /// clone of the PARENT's queue captured before the reset. A background shell
+    /// notifies the inbox of the agent that launched it while keeping command
+    /// output in its file. The front-end also holds a clone of this Arc to enqueue
+    /// while a turn runs.
     pub inbox: Arc<Inbox>,
     /// Registry of background async tasks — sub-agents (`task {"background":
     /// true}`, plan 26) and programs (`run_program {"background": true}`, plan
@@ -123,8 +125,9 @@ pub struct Config {
     /// inbox). Tracks in-flight tasks for `wait`/`stop_agent` and enforces a
     /// concurrency cap. Shared into sub-agent configs like everything else,
     /// though only the depth-0 agent spawns into it. Kept separate from
-    /// `background_shells` on purpose (a shell delivers via an output file, not
-    /// a reinjected result — a different lifecycle; see [`BackgroundTasks`]).
+    /// `background_shells` on purpose (a shell owns a readable output file and
+    /// reinjects only a terminal pointer, not the result body — a different
+    /// lifecycle; see [`BackgroundTasks`]).
     pub background_tasks: Arc<BackgroundTasks>,
     /// Resource ceilings for a `run_program` (code-mode) run — engine limits
     /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
@@ -152,6 +155,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// Stop every session-scoped detached worker before its frontend/runtime is
+    /// torn down. Returns the number that missed the bounded reap deadline.
+    pub async fn shutdown_background_work(&self) -> usize {
+        let timeout = Duration::from_secs(2);
+        let (tasks, shells) = tokio::join!(
+            self.background_tasks.shutdown(timeout),
+            self.background_shells.shutdown(timeout)
+        );
+        tasks + shells
+    }
+
     /// The working directory in effect for tool calls right now: the active
     /// worktree's if the session has entered one, else `cwd`. Every tool that
     /// resolves a relative path (or picks a git/search root) reads this, so

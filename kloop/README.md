@@ -45,17 +45,24 @@ verifier checks the pinned binary and bundle bytes; `verify.py --corpus-only`
 keeps all fixture/hash/tamper/matrix/pair/Rust checks for ordinary macOS/Linux
 CI runners that do not contain the target binary.
 
-Plan 50 closes the foreground Bash slice against the same exact binary. The corpus now has
-82 captures and 109 static-evidence records; the generated 56-row/448-cell matrix contains
-10 `same` cells, all covered by four executable contracts. The new `bash-batching` contract
+Plan 50 closes the foreground Bash slice against the same exact binary. Its corpus had
+82 captures and 109 static-evidence records; the generated 56-row/448-cell matrix contained
+10 `same` cells, all covered by four executable contracts. The `bash-batching` contract
 compares the same read-only and opaque-redirection calls through CC's hook trace and kloop's
 real dispatcher report. Schema, output, timeout/cancellation trees and process survival are
-captured separately. This deliberately does not claim CC's auto-background, stall, Monitor,
-completion notification or background-result reinjection behavior; those remain Plan 51.
+captured separately.
+
+Plan 51 extends that corpus to 83 captures and 116 static-evidence records. Exact successful
+and failed background-Bash fixtures prove terminal task updates, one-shot notifications, and
+a following `task-notification` sampling step. kloop now emits session-scoped lifecycle events
+for background shells, agents, and programs; reinjects shell terminal status plus its output-file
+pointer at the next step boundary; and explicitly shuts background work down before worktree
+teardown. CC's auto-background, stall detection, and feature-gated model-visible Monitor remain
+deliberate product boundaries rather than unproven parity claims.
 
 This baseline is evidence and a roadmap, not a claim that all tools already
 match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 51–59; kloop-only capabilities stay intentionally separate.
+remain for Plans 52–59; kloop-only capabilities stay intentionally separate.
 
 
 ## Compaction (Phase 2, first slice)
@@ -504,6 +511,9 @@ turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
 `assistantMessage` / `reasoning` / `toolCall` / `subAgent` / `todo` (a tool
 call carries its full `input`, and `output` + `agent` label when present; a
 `todo_write` surfaces only as a `todo` item, never a tool row); plus
+`thread/backgroundTask/updated {task:{id, kind, description, status,
+outputPath?, detail?}}` for session-scoped shell/agent/program work (**no
+`turnId`**, because completion may arrive after the launching turn),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
 error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
@@ -900,11 +910,29 @@ returns immediately with the ID and the output path. Companions:
 Semantics: permission checks are identical to foreground bash (the command
 string is what's judged, not where it runs); `timeout_ms` is ignored in
 background mode (cc drops the timer too); interrupting a turn never touches
-background shells — only `kill_bash`, a 1 GiB output-file watchdog, and
-session exit (process-group kill on registry drop) reap them. IDs are
-process-global (`bg-1`, `bg-2`, …) so sub-agents and server threads sharing
-one offload directory never collide. cc's auto-backgrounding, completion
-notifications, stall detection and Monitor tool are not ported.
+background shells. Every shell publishes a session-scoped lifecycle
+(`running` → exactly one `completed` / `failed` / `cancelled`) to all
+frontends. On terminal state, the launching agent's step-boundary inbox receives
+only the status, summary, and output-file pointer — command output stays in the
+file. A running turn sees it at the next sampling boundary; the TUI autowakes
+when idle; plain/server deliver it on the next turn. `kill_bash`, a 1 GiB
+output-file watchdog, and explicit session shutdown reap the whole process
+group. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
+threads sharing one offload directory never collide.
+
+Session shutdown closes both background registries before worktree teardown,
+requests cooperative cancellation, then bounds the wait (worker abort or shell
+SIGKILL fallback). Late terminal events are thread/session scoped rather than
+being attached to a fake turn id; a terminal transition wins once, so a stop /
+natural-completion race cannot reinject or notify twice. The shell registry
+remains separate from the agent/program registry because it owns an output file
+and reinjects only a pointer, while agents/programs reinject result bodies.
+
+Deliberately not ported: cc's automatic foreground→background promotion, stall
+policy, and model-visible `Monitor`. Exact 2.1.220 evidence shows Monitor is a
+different, server-flagged (`tengu_amber_sentinel`, default off) tool for
+streaming every command stdout line or WebSocket frame; the clean CLI profile
+does not expose it. See `docs/plan/51-background-monitor-parity.md`.
 
 ## Web tools (Phase 2, eleventh slice)
 
@@ -1138,8 +1166,9 @@ dropped: it queues, and is delivered to the model as a user message at the
 next round boundary — never spliced into an in-flight request. It does not
 interrupt the current tools (Ctrl+C stays the hard stop). This is a general
 **step-boundary injection queue** (`Config.inbox`, a signalling `Inbox` of
-typed `InboxItem`s); its two consumers are user steering and background
-sub-agent results (see *Async sub-agents* below), each with its own framing.
+typed `InboxItem`s); its producers are user steering, background
+sub-agent/program results, and background-shell terminal pointers, each with its
+own framing.
 
 The mechanism is a straight drain of `Config.inbox` at round boundaries in the
 agent loop (`core/src/agent.rs`): at the **top of each round** (delivering
@@ -1304,7 +1333,7 @@ wholesale (see "Async sub-agents" below): the same registry, the same `wait` /
 `stop_agent` tools, the same inbox reinjection and TUI autowake — a background
 program and a background sub-agent are the same kind of detached task, so they
 share one registry (the shell registry stays separate: a shell has an output
-file, not a reinjected result). Deliberately **not** copied from codex: its
+file and reinjects a terminal pointer rather than the result body). Deliberately **not** copied from codex: its
 cell/observation-frontier machinery (incremental pull-based output streamed to
 the model between `yield`s) — that is pull-based observation coupled to V8's
 synchronous-pause model, whereas kloop is push-based (result reinjected on
@@ -1363,6 +1392,10 @@ enforces a concurrency cap (8), and reaps on session end — kept **separate** f
 the background-shell registry, because codex keeps its shell tasks and
 sub-agents in distinct mechanisms and cc only unifies the *state* model, not
 spawn (a shared `Tasks` abstraction would be pre-abstracting against that).
+Plan 51 adds atomic stop-vs-completion arbitration and a supervisor around each
+worker, so panic/forced abort still publishes exactly one terminal state. Both
+registries project through the same session-scoped `BackgroundTaskUpdated`
+event; this shared DTO is the compatibility seam, not a forced internal merge.
 
 **Autowake** closes the loop when the parent turn has already ended: in the TUI,
 a background sub-agent finishing while the agent sits idle starts a delivery turn
@@ -1624,9 +1657,10 @@ kloop --mock --headless --json
   **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
   stdout — `turn/started`, `item/started|delta|completed`,
-  `thread/tokenUsage/updated`, `note`, `turn/completed` — the **exact same
-  item vocabulary the native protocol server emits** (via one shared
-  `project_event`), `threadId` and all. One event vocabulary, two front-ends.
+  `thread/backgroundTask/updated`, `thread/tokenUsage/updated`, `note`,
+  `turn/completed` — the **exact same item vocabulary the native protocol server
+  emits** (via one shared `project_event`), `threadId` and all. One event
+  vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
   deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `KLOOP_ALLOW`

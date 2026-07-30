@@ -3,9 +3,9 @@
 //! (stdout/stderr interleaved at the fd level — no reader tasks, no pipe
 //! deadlock), `bash_output` blocks on completion by default, `kill_bash`
 //! kills the whole process group. Interrupting a turn never touches
-//! background shells; only kill_bash, the size watchdog, and process exit
-//! reap them. cc's auto-backgrounding, completion notifications and Monitor
-//! tool are not ported.
+//! background shells; kill_bash, the size watchdog, and explicit session
+//! shutdown reap them. State changes emit session-scoped background-task
+//! events. cc's auto-backgrounding and model-visible Monitor tool are not ported.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,10 +26,18 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::str_arg;
 use super::ToolCtx;
+use crate::agent::Ui;
+use crate::event::BackgroundTask;
+use crate::event::BackgroundTaskKind;
+use crate::event::BackgroundTaskStatus;
+use crate::event::Event;
+use crate::inbox::Inbox;
+use crate::inbox::InboxItem;
 use crate::permissions::EscalationOutcome;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
@@ -143,6 +151,8 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
             &cwd,
             &ctx.cfg.offload_dir,
             sandbox.as_deref(),
+            ctx.ui.clone(),
+            ctx.cfg.inbox.clone(),
         );
     }
     if ctx.cancel.is_cancelled() {
@@ -418,14 +428,16 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         let Some((status, path, sandboxed)) = shells.snapshot(id) else {
             bail!("bash_output: no background command with id {id}");
         };
-        let done = !matches!(status, BgStatus::Running);
+        let done = !status.is_active();
         if done || !block || started.elapsed() >= Duration::from_millis(timeout_ms) {
             break (status, path, sandboxed);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
     let status_line = match &status {
-        BgStatus::Running if block => format!("{id}: still running after {timeout_ms}ms"),
+        BgStatus::Running | BgStatus::Stopping if block => {
+            format!("{id}: still {} after {timeout_ms}ms", status_text(&status))
+        }
         _ => format!("{id}: {}", status_text(&status)),
     };
     let mut tail = read_tail(&path).await;
@@ -452,7 +464,7 @@ pub(super) async fn kill_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<Strin
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
         match shells.snapshot(id) {
-            Some((BgStatus::Running, _, _)) => tokio::time::sleep(POLL_INTERVAL).await,
+            Some((status, _, _)) if status.is_active() => tokio::time::sleep(POLL_INTERVAL).await,
             _ => break,
         }
     }
@@ -462,19 +474,34 @@ pub(super) async fn kill_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<Strin
 #[derive(Clone, Debug)]
 enum BgStatus {
     Running,
+    /// A user/session stop won, but the monitor has not reaped the child yet.
+    Stopping,
+    /// A terminal publisher won, but has not completed frontend/inbox delivery.
+    Finishing,
     /// Normal termination; None = killed by an external signal.
     Exited(Option<i32>),
-    /// Killed through this registry, with the reason.
+    /// Cancelled through this registry, with the reason.
     Killed(String),
+    /// The registry killed it because a lifecycle guard failed.
+    Failed(String),
+}
+
+impl BgStatus {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Running | Self::Stopping | Self::Finishing)
+    }
 }
 
 fn status_text(status: &BgStatus) -> String {
     match status {
         BgStatus::Running => "running".into(),
+        BgStatus::Stopping => "stopping".into(),
+        BgStatus::Finishing => "finishing".into(),
         BgStatus::Exited(Some(0)) => "completed (exit 0)".into(),
         BgStatus::Exited(Some(code)) => format!("failed (exit {code})"),
-        BgStatus::Exited(None) => "killed by signal".into(),
+        BgStatus::Exited(None) => "failed (killed by signal)".into(),
         BgStatus::Killed(reason) => format!("killed ({reason})"),
+        BgStatus::Failed(reason) => format!("failed ({reason})"),
     }
 }
 
@@ -490,16 +517,34 @@ struct BgShell {
     output_path: PathBuf,
     status: BgStatus,
     kill: CancellationToken,
+    stop_reason: Arc<Mutex<Option<String>>>,
     pid: Option<u32>,
     /// Some = ran inside the OS sandbox.
     sandbox: Option<BgSandbox>,
 }
 
-/// Session-scoped registry of background shells (one per Config; sub-agents
-/// share the parent's through the Config clone).
 #[derive(Default)]
+struct ShellRegistry {
+    closed: bool,
+    shells: HashMap<String, BgShell>,
+}
+
+/// Session-scoped registry of background shells (one per Config; sub-agents
+/// share the parent's through the Config clone). Normal teardown calls
+/// [`BackgroundShells::shutdown`]; `Drop` is only the synchronous fallback.
 pub struct BackgroundShells {
-    shells: Mutex<HashMap<String, BgShell>>,
+    state: Mutex<ShellRegistry>,
+    activity: watch::Sender<u64>,
+}
+
+impl Default for BackgroundShells {
+    fn default() -> Self {
+        let (activity, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(ShellRegistry::default()),
+            activity,
+        }
+    }
 }
 
 impl BackgroundShells {
@@ -516,6 +561,8 @@ impl BackgroundShells {
         cwd: &Path,
         offload_dir: &Path,
         sandbox: Option<&SandboxPolicy>,
+        ui: Arc<dyn Ui>,
+        inbox: Arc<Inbox>,
     ) -> Result<String> {
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
@@ -535,44 +582,66 @@ impl BackgroundShells {
         // reach it, and kill_bash can take down the whole tree at once.
         #[cfg(unix)]
         cmd.process_group(0);
-        let child = cmd.spawn().context("bash: failed to spawn sh")?;
-        let pid = child.id();
-        self.shells.lock().unwrap().insert(
-            id.clone(),
-            BgShell {
-                command: command.to_string(),
-                output_path: path.clone(),
-                status: BgStatus::Running,
-                kill: CancellationToken::new(),
-                pid,
-                sandbox: sandbox.map(|p| BgSandbox {
-                    network_disabled: !p.allow_network,
-                }),
-            },
-        );
-        let kill = self.shells.lock().unwrap()[&id].kill.clone();
+        let (child, pid, kill) = {
+            // Hold the registry lock across spawn+insert so shutdown cannot close
+            // the table between the process becoming real and its PID being
+            // tracked.
+            let mut registry = self.state.lock().unwrap();
+            if registry.closed {
+                bail!("bash: the session is closing; no new background commands may start");
+            }
+            let child = cmd.spawn().context("bash: failed to spawn sh")?;
+            let pid = child.id();
+            let kill = CancellationToken::new();
+            let stop_reason = Arc::new(Mutex::new(None));
+            registry.shells.insert(
+                id.clone(),
+                BgShell {
+                    command: command.to_string(),
+                    output_path: path.clone(),
+                    status: BgStatus::Running,
+                    kill: kill.clone(),
+                    stop_reason,
+                    pid,
+                    sandbox: sandbox.map(|policy| BgSandbox {
+                        network_disabled: !policy.allow_network,
+                    }),
+                },
+            );
+            (child, pid, kill)
+        };
+        ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+            id: id.clone(),
+            kind: BackgroundTaskKind::Shell,
+            description: command.to_string(),
+            status: BackgroundTaskStatus::Running,
+            output_path: Some(path.to_string_lossy().to_string()),
+            detail: None,
+        }));
         // A Weak, not an Arc: an owning ref would keep the registry alive as
-        // long as any shell runs, so `Drop for BackgroundShells` (the session
-        // teardown that group-kills leftover shells) could never fire while it
-        // still had work to reap. The monitor only needs the registry to write
-        // back a final status, which it skips if the session is already gone.
-        tokio::spawn(monitor(
-            Arc::downgrade(self),
-            id.clone(),
+        // long as any shell runs, so the synchronous Drop fallback could not fire.
+        tokio::spawn(monitor(BackgroundMonitor {
+            shells: Arc::downgrade(self),
+            id: id.clone(),
+            command: command.to_string(),
             child,
+            pid,
             kill,
-            path.clone(),
-        ));
+            output_path: path.clone(),
+            ui,
+            inbox,
+        }));
         Ok(format!(
             "Command running in background with ID: {id}. Output is being written to: {}. \
-             Check on it with bash_output; stop it with kill_bash.",
+             You will be notified when it changes state. Check on it with bash_output; stop it \
+             with kill_bash.",
             path.display()
         ))
     }
 
     fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf, Option<BgSandbox>)> {
-        let shells = self.shells.lock().unwrap();
-        let shell = shells.get(id)?;
+        let registry = self.state.lock().unwrap();
+        let shell = registry.shells.get(id)?;
         Some((
             shell.status.clone(),
             shell.output_path.clone(),
@@ -580,36 +649,172 @@ impl BackgroundShells {
         ))
     }
 
-    /// Flags the shell for its monitor task to kill; Err carries the
-    /// model-facing reason.
+    /// Atomically mark a running shell as stopping before firing its monitor
+    /// token. A duplicate kill therefore reports the stable in-progress state
+    /// instead of racing another successful request.
     fn request_kill(&self, id: &str) -> Result<String, String> {
-        let shells = self.shells.lock().unwrap();
-        let Some(shell) = shells.get(id) else {
-            return Err(format!("no background command with id {id}"));
+        let (command, kill) = {
+            let mut registry = self.state.lock().unwrap();
+            let Some(shell) = registry.shells.get_mut(id) else {
+                return Err(format!("no background command with id {id}"));
+            };
+            match shell.status {
+                BgStatus::Running => {
+                    shell.status = BgStatus::Stopping;
+                    *shell.stop_reason.lock().unwrap() = Some("stopped".into());
+                    (shell.command.clone(), shell.kill.clone())
+                }
+                BgStatus::Stopping => return Err(format!("stop already requested for {id}")),
+                _ => {
+                    return Err(format!(
+                        "{id} is not running (status: {})",
+                        status_text(&shell.status)
+                    ));
+                }
+            }
         };
-        if !matches!(shell.status, BgStatus::Running) {
-            return Err(format!(
-                "{id} is not running (status: {})",
-                status_text(&shell.status)
-            ));
-        }
-        shell.kill.cancel();
-        Ok(shell.command.clone())
+        kill.cancel();
+        Ok(command)
     }
 
-    fn set_status(&self, id: &str, status: BgStatus) {
-        if let Some(shell) = self.shells.lock().unwrap().get_mut(id) {
+    /// Claim the one terminal transition. A stop that linearized first overrides
+    /// a concurrently observed natural exit. `Finishing` stays active until the
+    /// frontend event and inbox delivery have both been published.
+    fn begin_finish(&self, id: &str, observed: BgStatus) -> Option<BgStatus> {
+        debug_assert!(!observed.is_active());
+        let mut registry = self.state.lock().unwrap();
+        let shell = registry.shells.get_mut(id)?;
+        let terminal = match &shell.status {
+            BgStatus::Running => observed,
+            BgStatus::Stopping => BgStatus::Killed(
+                shell
+                    .stop_reason
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "stopped".into()),
+            ),
+            BgStatus::Finishing
+            | BgStatus::Exited(_)
+            | BgStatus::Killed(_)
+            | BgStatus::Failed(_) => return None,
+        };
+        shell.status = BgStatus::Finishing;
+        shell.pid = None;
+        Some(terminal)
+    }
+
+    fn complete_finish(&self, id: &str, status: BgStatus) -> bool {
+        let changed = {
+            let mut registry = self.state.lock().unwrap();
+            let Some(shell) = registry.shells.get_mut(id) else {
+                return false;
+            };
+            if !matches!(shell.status, BgStatus::Finishing) {
+                return false;
+            }
             shell.status = status;
+            true
+        };
+        let next = (*self.activity.borrow()).wrapping_add(1);
+        self.activity.send_replace(next);
+        changed
+    }
+
+    /// Close the registry, cancel every active process tree, and wait for the
+    /// monitors to reap their direct children. Returns the number still active
+    /// after `timeout` (normally zero).
+    pub(crate) async fn shutdown(&self, timeout: Duration) -> usize {
+        let kills = {
+            let mut registry = self.state.lock().unwrap();
+            registry.closed = true;
+            registry
+                .shells
+                .values_mut()
+                .filter_map(|shell| {
+                    if matches!(&shell.status, BgStatus::Running) {
+                        shell.status = BgStatus::Stopping;
+                        *shell.stop_reason.lock().unwrap() = Some("session shutdown".into());
+                        Some(shell.kill.clone())
+                    } else if matches!(&shell.status, BgStatus::Stopping) {
+                        Some(shell.kill.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for kill in kills {
+            kill.cancel();
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut activity = self.activity.subscribe();
+        loop {
+            let active = self
+                .state
+                .lock()
+                .unwrap()
+                .shells
+                .values()
+                .filter(|shell| shell.status.is_active())
+                .count();
+            if active == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, activity.changed())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let pids = self
+            .state
+            .lock()
+            .unwrap()
+            .shells
+            .values()
+            .filter(|shell| shell.status.is_active())
+            .filter_map(|shell| shell.pid)
+            .collect::<Vec<_>>();
+        for pid in pids {
+            let _ = kill_group(pid);
+        }
+
+        let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let active = self
+                .state
+                .lock()
+                .unwrap()
+                .shells
+                .values()
+                .filter(|shell| shell.status.is_active())
+                .count();
+            if active == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(hard_deadline, activity.changed())
+                .await
+                .is_err()
+            {
+                return active;
+            }
         }
     }
 }
 
 impl Drop for BackgroundShells {
-    /// Best-effort reaping at session end: kill_on_drop takes the `sh`
-    /// itself, the group kill takes its descendants.
+    /// Synchronous fallback when the session cannot await `shutdown`.
     fn drop(&mut self) {
-        for shell in self.shells.lock().unwrap().values() {
-            if matches!(shell.status, BgStatus::Running) {
+        let registry = self.state.get_mut().unwrap();
+        registry.closed = true;
+        for shell in registry.shells.values_mut() {
+            if shell.status.is_active() {
+                *shell.stop_reason.lock().unwrap() = Some("session dropped".into());
+                shell.kill.cancel();
                 if let Some(pid) = shell.pid {
                     let _ = kill_group(pid);
                 }
@@ -654,50 +859,124 @@ fn process_group_alive(pid: u32) -> Result<bool> {
     }
 }
 
+struct BackgroundMonitor {
+    shells: Weak<BackgroundShells>,
+    id: String,
+    command: String,
+    child: tokio::process::Child,
+    pid: Option<u32>,
+    kill: CancellationToken,
+    output_path: PathBuf,
+    ui: Arc<dyn Ui>,
+    inbox: Arc<Inbox>,
+}
+
 /// Owns the child: waits for exit, executes kill requests, and enforces the
 /// output-file cap. Deliberately not tied to any turn's cancel token — that
 /// is what makes the shell "background".
-async fn monitor(
-    shells: Weak<BackgroundShells>,
-    id: String,
-    mut child: tokio::process::Child,
-    kill: CancellationToken,
-    output_path: PathBuf,
-) {
-    let pid = child.id();
+async fn monitor(monitor: BackgroundMonitor) {
+    let BackgroundMonitor {
+        shells,
+        id,
+        command,
+        mut child,
+        pid,
+        kill,
+        output_path,
+        ui,
+        inbox,
+    } = monitor;
     let mut watchdog = tokio::time::interval(WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut kill_reason: Option<String> = None;
+    let mut failure_reason: Option<String> = None;
+    let mut signal_sent = false;
     let exit = loop {
         tokio::select! {
-            status = child.wait() => break status.ok(),
-            _ = kill.cancelled(), if kill_reason.is_none() => {
+            status = child.wait() => break status,
+            _ = kill.cancelled(), if !signal_sent => {
                 if let Some(pid) = pid {
                     let _ = kill_group(pid);
                 }
                 let _ = child.start_kill();
-                kill_reason = Some("stopped".into());
+                signal_sent = true;
             }
             _ = watchdog.tick() => {
-                let size = std::fs::metadata(&output_path).map_or(0, |m| m.len());
-                if size > OUTPUT_FILE_CAP && kill_reason.is_none() {
+                let size = std::fs::metadata(&output_path).map_or(0, |metadata| metadata.len());
+                if size > OUTPUT_FILE_CAP && !signal_sent {
+                    let reason = format!("output file exceeded {OUTPUT_FILE_CAP} bytes");
                     if let Some(pid) = pid {
                         let _ = kill_group(pid);
                     }
                     let _ = child.start_kill();
-                    kill_reason = Some(format!("output file exceeded {OUTPUT_FILE_CAP} bytes"));
+                    failure_reason = Some(reason);
+                    signal_sent = true;
                 }
             }
         }
     };
-    let status = match kill_reason {
-        Some(reason) => BgStatus::Killed(reason),
-        None => BgStatus::Exited(exit.and_then(|s| s.code())),
+    let observed = if let Some(reason) = failure_reason {
+        BgStatus::Failed(reason)
+    } else {
+        match exit {
+            Ok(status) => BgStatus::Exited(status.code()),
+            Err(error) => BgStatus::Failed(format!("wait failed: {error}")),
+        }
     };
-    // The session may have ended while this shell ran; if so there is no
-    // registry left to update (Drop already group-killed it).
+    // The session may have ended while this shell ran; if so Drop already
+    // group-killed it and there is no live frontend to notify.
     if let Some(shells) = shells.upgrade() {
-        shells.set_status(&id, status);
+        if let Some(status) = shells.begin_finish(&id, observed) {
+            let (event_status, detail) = match &status {
+                BgStatus::Exited(Some(0)) => {
+                    (BackgroundTaskStatus::Completed, Some("exit 0".into()))
+                }
+                BgStatus::Exited(Some(code)) => {
+                    (BackgroundTaskStatus::Failed, Some(format!("exit {code}")))
+                }
+                BgStatus::Exited(None) => (
+                    BackgroundTaskStatus::Failed,
+                    Some("killed by signal".into()),
+                ),
+                BgStatus::Killed(reason) => (BackgroundTaskStatus::Cancelled, Some(reason.clone())),
+                BgStatus::Failed(reason) => (BackgroundTaskStatus::Failed, Some(reason.clone())),
+                BgStatus::Running | BgStatus::Stopping | BgStatus::Finishing => {
+                    unreachable!("monitor produced active status")
+                }
+            };
+            let status_label = match event_status {
+                BackgroundTaskStatus::Running => unreachable!("monitor emitted running"),
+                BackgroundTaskStatus::Completed => "completed",
+                BackgroundTaskStatus::Failed => "failed",
+                BackgroundTaskStatus::Cancelled => "cancelled",
+            };
+            let output_path = output_path.to_string_lossy().to_string();
+            let summary = match detail.as_deref() {
+                Some(detail) => format!("Background command {command:?} {status_label}: {detail}"),
+                None => format!("Background command {command:?} {status_label}"),
+            };
+            ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+                id: id.clone(),
+                kind: BackgroundTaskKind::Shell,
+                description: command,
+                status: event_status,
+                output_path: Some(output_path.clone()),
+                detail: detail.clone(),
+            }));
+            let closing = event_status == BackgroundTaskStatus::Cancelled
+                && matches!(
+                    detail.as_deref(),
+                    Some("session shutdown" | "session dropped")
+                );
+            if !closing {
+                inbox.push(InboxItem::ShellResult {
+                    id: id.clone(),
+                    status: status_label.into(),
+                    output_path,
+                    summary,
+                });
+            }
+            debug_assert!(shells.complete_finish(&id, status));
+        }
     }
 }
 
@@ -731,14 +1010,37 @@ async fn read_tail(path: &Path) -> String {
 mod tests {
     use super::scrub_model_shell_env;
     use super::FOREGROUND_OUTPUT_CAP_CHARS;
+    use crate::event::BackgroundTaskStatus;
+    use crate::event::Event;
+    use crate::inbox::InboxItem;
     use crate::tools::testutil::*;
     use serde_json::json;
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct RecordingUi {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl crate::agent::Ui for RecordingUi {
+        fn emit(&self, event: &Event) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    fn recording_ctx(tag: &str) -> (crate::tools::ToolCtx, Arc<RecordingUi>) {
+        let mut ctx = test_ctx(0, tag);
+        let ui = Arc::new(RecordingUi::default());
+        ctx.ui = ui.clone();
+        (ctx, ui)
+    }
 
     struct ForegroundTree {
         root: PathBuf,
@@ -1043,8 +1345,58 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn background_shell_emits_one_start_and_one_terminal_update() {
+        let (ctx, ui) = recording_ctx("bg-events");
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "printf done", "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        let id = bg_id(&out);
+        let (out, is_error) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+        assert!(!is_error, "{out}");
+
+        let updates = ui
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::BackgroundTaskUpdated(task) if task.id == id => Some(task.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(updates[0].description, "printf done");
+        assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
+        assert!(updates[0].output_path.is_some());
+        assert_eq!(updates[1].status, BackgroundTaskStatus::Completed);
+        assert_eq!(updates[1].detail.as_deref(), Some("exit 0"));
+        assert_eq!(updates[1].output_path, updates[0].output_path);
+        let items = ctx.cfg.inbox.drain();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            InboxItem::ShellResult {
+                id: notified_id,
+                status,
+                output_path,
+                summary,
+            } => {
+                assert_eq!(notified_id, &id);
+                assert_eq!(status, "completed");
+                assert_eq!(Some(output_path), updates[1].output_path.as_ref());
+                assert!(summary.contains("printf done"), "{summary}");
+                assert!(summary.contains("exit 0"), "{summary}");
+            }
+            other => panic!("expected ShellResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn background_failure_reports_exit_code() {
-        let ctx = test_ctx(0, "bg-fail");
+        let (ctx, ui) = recording_ctx("bg-fail");
         let (out, _) = run_tool(
             "bash",
             json!({"command": "echo pre; exit 7", "run_in_background": true}),
@@ -1056,6 +1408,26 @@ exec sleep 60
         assert!(!is_error, "a failed command is still a successful query");
         assert!(out.contains(&format!("{id}: failed (exit 7)")), "{out}");
         assert!(out.contains("pre"));
+        let updates = ui
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::BackgroundTaskUpdated(task) if task.id == id => Some(task.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
+        assert_eq!(updates[1].status, BackgroundTaskStatus::Failed);
+        assert_eq!(updates[1].detail.as_deref(), Some("exit 7"));
+        let items = ctx.cfg.inbox.drain();
+        assert!(matches!(
+            items.as_slice(),
+            [InboxItem::ShellResult { status, summary, .. }]
+                if status == "failed" && summary.contains("exit 7")
+        ));
     }
 
     #[tokio::test]
@@ -1108,11 +1480,69 @@ exec sleep 60
 
         let (out, _) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
         assert!(out.contains(&format!("{id}: killed (stopped)")), "{out}");
+        let items = ctx.cfg.inbox.drain();
+        assert!(matches!(
+            items.as_slice(),
+            [InboxItem::ShellResult { status, summary, .. }]
+                if status == "cancelled" && summary.contains("stopped")
+        ));
 
         // A second kill is an error: the shell is no longer running.
         let (out, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("not running"), "{out}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn session_shutdown_reaps_background_tree_and_closes_registry() {
+        let tree = ForegroundTree::new("background-shutdown");
+        let (ctx, ui) = recording_ctx("background-shutdown");
+        let command = tree.command();
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": command, "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        let id = bg_id(&out);
+        let pids = wait_for_tree_pids(&tree).await;
+
+        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_processes_dead(pids).await;
+        let (out, is_error) =
+            run_tool("bash_output", json!({"bash_id": id, "block": false}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("killed (session shutdown)"), "{out}");
+
+        let updates = ui
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::BackgroundTaskUpdated(task) if task.id == id => Some(task.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
+        assert_eq!(updates[1].status, BackgroundTaskStatus::Cancelled);
+        assert_eq!(updates[1].detail.as_deref(), Some("session shutdown"));
+        assert!(
+            ctx.cfg.inbox.is_empty(),
+            "session teardown must not enqueue a turn that cannot run"
+        );
+
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "true", "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error);
+        assert!(out.contains("session is closing"), "{out}");
     }
 
     #[tokio::test]
