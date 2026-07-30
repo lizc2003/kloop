@@ -1020,9 +1020,7 @@ further sub-agents, and they share the parent's permission gate — the human's
 last word doesn't loosen inside a sub-agent. `--mock` reads no config, so it
 sees no types.
 
-Not yet (deliberate): sub-agent history persistence, async dispatch with a
-completion mailbox (codex spawn/wait shape), hook events tagged with the
-agent, and per-type effort/max-turns — see `docs/plan/17-subagents.md`.
+Sub-agent transcripts are persisted in their own `{parent}-agent-N.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `task {"background": true}` plus `wait`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
 
 ### Worktree isolation
 
@@ -1407,7 +1405,15 @@ idle + pending work). The plain REPL (blocking stdin, no event loop) and the
 server (client-driven turns) don't autowake — their reinjection is delivered at
 the next user / `turn/start`; only the TUI has the event loop to be woken.
 Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
-See `docs/plan/26-async-dispatch.md`.
+
+Plan 52 fixes the product boundary against exact Claude Code 2.1.220 rather than treating similar names as aliases:
+
+- kloop keeps the native `task` name and defaults to **synchronous** execution; Claude Code `Agent` requires both `description` and `prompt` and defaults to background unless `run_in_background:false` is explicit. kloop does not add an `Agent` compatibility wrapper or change its default.
+- `todo_write` is a full-table checklist, not Claude Code's stable-ID Task registry. There are no kloop `TaskCreate/Get/List/Update/Output/Stop` aliases; `wait` only observes activity without draining the inbox, and `stop_agent` only owns native background agent/program entries.
+- `Config.inbox` is an internal step-boundary delivery queue, not an addressable Team mailbox. kloop does not expose `SendMessage` or `ListAgents`, and does not connect remote/cloud or user team state.
+- consecutive synchronous task calls remain dispatcher-parallel; detached agent/program work remains capped at 8 per session. Exact Claude Code concurrency limits are evidence, not a reason to replace the native policy.
+
+The Plan 52 executable report proves those boundaries with a two-phase mock sampling gate: two task calls must both enter sampling before either is released; background completion and stop race to one terminal state; late inbox delivery is folded in only at a sampling boundary. See `docs/plan/52-agent-task-team-parity.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

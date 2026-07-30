@@ -41,10 +41,18 @@ pub struct MockRequest {
     pub tools: Vec<ToolDef>,
 }
 
-/// One scripted Mock response: content blocks, a truncated response, or a
-/// provider error.
+/// One scripted Mock response: content blocks, a gate-delayed response, a
+/// truncated response, or a provider error.
 pub enum MockTurn {
     Blocks(Vec<ContentBlock>),
+    /// Report that sampling started, then wait for an explicit release before
+    /// emitting blocks. Tests use this to coordinate concurrent and cancelled
+    /// requests without wall-clock timing assumptions.
+    Gate {
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        blocks: Vec<ContentBlock>,
+    },
     /// Blocks delivered, but the stream reports the output limit was hit.
     Truncated(Vec<ContentBlock>),
     /// Content deltas arrive, then the stream fails before any block completes.
@@ -205,6 +213,15 @@ impl Provider {
                 tokio::spawn(async move {
                     let (blocks, stop_reason) = match turn {
                         MockTurn::Blocks(blocks) => (blocks, None),
+                        MockTurn::Gate {
+                            started,
+                            release,
+                            blocks,
+                        } => {
+                            let _ = started.send(());
+                            let _ = release.await;
+                            (blocks, None)
+                        }
                         MockTurn::Truncated(blocks) => (blocks, Some("max_tokens".to_string())),
                         MockTurn::PartialError(blocks, message) => {
                             for block in blocks {

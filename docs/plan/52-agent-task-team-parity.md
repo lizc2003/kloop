@@ -1,6 +1,6 @@
 # Plan 52 — Agent、Task 与 Team 对齐
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-07-30）
 >
 > 母计划：Plan 48
 >
@@ -35,6 +35,25 @@ kloop 的 `task`、`todo`、`wait`、`stop_agent` 与 CC 的 Agent、TaskCreate/
 - SendMessage 在 CC clean fixture 可见而 kloop 无对应工具，因此 registration/schema 为 `missing`。
 - ListAgents 未在 clean profile 观察到，不能推断其不存在。
 - 所有 Plan 48 profile 都是 `team=false`、`remote=false`、`depth=0`。
+
+## 已拍板产品边界
+
+1. 保留 kloop 原生 `task` / `todo_write` / `wait` / `stop_agent`，不增加 Claude Code 同名 `Agent` / `Task*` / `SendMessage` / `ListAgents` adapter。
+2. 本计划不引入独立 Task registry。CC Task* 逐项取证后按真实语义登记 `intentional-diff`；不把 todo、后台执行 registry 或 wait/stop 拼成半套 registry。
+3. Team roster/mailbox 与 remote/cloud 仅取证，不连接真实服务、凭据、用户团队或 mailbox；无法 hermetic 运行的分支保持 `unknown`。
+4. 保留 kloop 当前并发策略：连续同步 `task` 由 dispatcher 并发执行；后台 Agent/program 每 session 上限为 8，不照搬 CC 上限。
+5. 内部 `Inbox` 继续只做 step-boundary steering/completion 交付，不暴露为 model-visible mailbox。
+
+## 完成裁决
+
+- **Agent**：exact fixture 证明 CC 要求 `description + prompt`、默认后台、显式 `run_in_background:false` 才前台；model override 在前台 child 生效。kloop `task` 故意保留 `prompt` 必填、默认同步、`agent_type/background/max_rounds/shared|worktree` 原生面。local 前台/后台执行能力为 `compatible`，registration/schema/parser/output/lifecycle 为 `intentional-diff`。
+- **remote**：`isolation:remote` 在 clean/allow profile 不满足 account/environment/server gate 时回退成 local async agent；fixture 的 `task_type=local_agent` 与本地 child marker 固定该边界。真实 remote 分支仍 `unknown`。
+- **Task registry**：独立 lifecycle fixture 固定 Create 两条稳定 ID、Update owner/metadata/status/blocks、Get/List 双向依赖投影、completed→deleted 与删除后查询。六个 Task* 均不能映射成 todo/wait/stop；TaskOutput/TaskStop 仅补了 missing-ID 分支，运行中/终态 lifecycle 未外推。
+- **SendMessage**：clean profile 可见；fixture 固定 string message 的 observable-input backfill 和 unknown-recipient 结果。kloop 没有 model-visible endpoint，已执行的 registration/schema/parser/executor/output 标 `missing`；成功 team mailbox lifecycle 仍 `unknown`。
+- **ListAgents**：exact bundle 声明 `ListAgents`（legacy alias `ListPeers`），但 `team=false` clean profile 不注册。没有权威 true-profile，八维保持 `unknown`，不是全局 `missing`。
+- **kloop native golden**：新增两相 mock sampling gate 和 Plan 52 executable report，真实驱动 `dispatch_tools`/`run_turn`，锁定两个同步 task 同时进入 sampling、后台完成回灌、stop-vs-completion 一次终态、final sampling inbox 兜底、todo 全表替换、wait 不 drain、stop_agent scope，以及 CC 同名入口确实不存在。
+
+最终 corpus 为 **96 captures**（43 个 schema v2）、**137 条 static evidence**、**56 rows / 448 cells**；状态为 67 compatible / 119 intentional-diff / 23 missing / 207 unknown / 22 n/a / 10 same。既有 4 个 pair contract 不变；Plan 52 没有为追求 `same` 制造 adapter。
 
 优先复用：
 
@@ -119,13 +138,17 @@ kloop 的 `task`、`todo`、`wait`、`stop_agent` 与 CC 的 Agent、TaskCreate/
 
 ```bash
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 cd kloop
+cargo test -p kloop-core tools::plan52_parity_tests::emit_plan52_parity_report -- --exact
 cargo test -p kloop-core tools::task::tests
+cargo test -p kloop-core tools::background_tasks::tests
 cargo test -p kloop-core tools::todo::tests
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p kloop -- --mock
+cargo run -p kloop -- --mock --headless --json
 cd ..
 git diff --check
 ```
@@ -141,8 +164,18 @@ git diff --check
 - 并发、取消、回灌和父子清理有确定性测试。
 - 所有门禁全绿，一次提交，提交信息带 `plan52`。
 
-## 开工时定 / 问用户
+## 开工决策（已确认）
 
-- Agent 与 kloop `task` 的公开命名和兼容 adapter。
-- 是否实现独立 Task registry，还是保留 todo/wait/stop 状态模型。
-- team、remote、mailbox 与并发上限对 kloop 的产品适用性。
+- Agent 与 kloop `task` 保留各自公开命名，不做兼容 adapter。
+- 不实现独立 Task registry，保留 todo/wait/stop 原生状态模型。
+- team、remote、mailbox 仅取证；并发上限保留 kloop 原生策略。
+
+## 完成记录 ✅（2026-07-30）
+
+- exact bundle 静态链新增 Agent 默认后台/前台、async result、remote/team gate、六个 Task* 独立 executor、SendMessage parser/team gate 与 ListAgents descriptor/alias 证据。
+- 新增 13 组 hermetic captures：Agent 必填 description、显式前台、显式后台、remote-disabled local fallback；六个 Task* 单工具分支；完整 Task registry lifecycle；SendMessage unknown recipient；ListAgents clean negative registration。
+- fake provider 未连接任何真实 team/cloud/mailbox；profile gate 不满足的真实 team/remote/ListAgents 分支均保留 `unknown` 并记录 exact blocker。
+- `kloop-provider::MockTurn::Gate` 用 started/release 两相同步点替代 sleep/文件轮询；Plan 52 Rust report 由 verifier 固定 selector 运行，并有缺场景、事件重排与伪同名 adapter 的 tamper guard。
+- kloop 产品语义未因 CC 默认值改变：task 仍默认同步、同步批并发不设 CC cap、后台 Agent/program 上限仍为 8；todo、BackgroundTasks 与 Inbox 继续分层。
+- README、HANDOFF、capability report、refs 导读、raw/normalized fixture、manifest、static evidence、matrix 与 verifier 已同步。
+- 提交：本次（plan 52，见 git log）。

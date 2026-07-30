@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-30,plan 1–51 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、文件/搜索、前台 Bash 与后台 lifecycle 闭环见 plan 48–51。
+> 基线:2026-07-30,plan 1–52 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、文件/搜索、前台 Bash、后台 lifecycle 与 Agent/Task/Team 闭环见 plan 48–52。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -98,13 +98,23 @@ server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missin
 裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再清 worktree。
 自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
 
-### 5. 子 agent / 多 agent——✅ 收敛解全齐
+Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，corpus 现为
+96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /
+23 missing / 207 unknown / 22 n/a / 10 same）。exact CC Agent 要求 description+prompt、默认后台；kloop
+保留原生 task 默认同步与参数面。Task lifecycle 已固定稳定 ID、owner/metadata、依赖、完成/删除，但产品
+决定不实现独立 registry；todo/wait/stop 不冒充 Task*。SendMessage 只闭合 unknown-recipient，ListAgents/
+team/remote 因无权威 hermetic true-profile 保持 unknown。新增两相 sampling gate + native report 锁定 task
+真并发、后台终态与 inbox 边界；未接真实 cloud/team/mailbox。
+
+### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| worktree 隔离(并行写不互踩) | 双家 | **plan 35** | 已立 |
-| send_message(与运行中子 agent 持续对话) | codex 单家 | 未立 | 异步子 agent dogfood 痛感 |
-| 并发上限(cc 10) | cc 单家 | 不做(kloop uncapped 先例,教训见 plan 24) | 失控实例出现 |
+| worktree 隔离(并行写不互踩) | 双家 | **plan 35 已完成** | — |
+| 独立 stable-ID Task registry | CC/CodeWhale 有独立状态层 | **Plan 52 拍板不实现**；todo 与执行 registry 分层保留 | 原生多 agent 共享任务分配成为产品需求时另立计划 |
+| send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **Plan 52 仅取证**；内部 Inbox 不暴露 | 需要向运行中子 agent 追加消息或横向协作时 |
+| ListAgents / team roster / remote | exact bundle 有 descriptor/gate；本机 true-profile 不权威 | 保持 `unknown`，不接真实团队/云 | 有 hermetic transport/profile 与明确产品需求时 |
+| Agent 并发上限 | exact 2.1.220 当前 profile 未测出统一 cap | 保留 kloop：同步批并发；后台 agent/program 每 session 8 | native 压测或失控实例证明需排队策略时 |
 | agent 类型 per-type effort/max_turns | cc 单家 | plan 17 片 2 未做节 | 有真实 agent 类型库再说 |
 
 ### 6. code mode——✅ 无挂账(plan 24/27 全清)

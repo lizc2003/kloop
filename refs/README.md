@@ -172,6 +172,30 @@ plain/server 在下一 turn 交付。agent/program 的结果回灌语义不变�
 process group，并在 active worktree teardown 前等待，防 orphan、重复通知和 server sender 挂账。
 自动后台化、stall policy 与逐事件 Monitor 保留为明确的产品边界。
 
+Plan 52 将 corpus 扩至 **96 captures / 137 static evidence**，matrix 仍为 56 行/448 单元，状态更新为
+67 `compatible` / 119 `intentional-diff` / 23 `missing` / 207 `unknown` / 22 `n/a` / 10 `same`。
+新增 Agent fixture 固定 `description + prompt` 必填、默认后台、显式 `run_in_background:false` 前台、
+model override，以及 remote gate 不满足时回退 local async；bundle locator 则补齐 async output、默认分支与
+team/remote gate。kloop 保留 `task` 原生默认同步、参数名、depth=1 和并发策略，故只把 local executor
+能力记为 compatible，wire/schema/parser/output/lifecycle 均为 intentional diff。
+
+六个 Task* 现在各有独立 runtime case；额外的 scripted lifecycle 固定两条稳定 ID、owner/metadata、
+`blocks/blockedBy` 双向投影、pending→in_progress→completed→deleted 与删除后查询。TaskOutput/TaskStop
+只裁决 missing-ID 分支，不能外推 live lifecycle。kloop 不把 `todo_write`、`BackgroundTasks`、`wait`、
+`stop_agent` 组装成同名 registry：todo 仍是无 ID 全表替换，后台 registry 仍只拥有 agent/program
+执行生命周期，wait 仍只等 activity 且不 drain。
+
+SendMessage clean fixture 固定 string-message observable-input backfill 与 unknown recipient；kloop 无
+model-visible mailbox，已执行维度标 missing。ListAgents 只在 bundle/alias 中坐实，`team=false` clean
+profile 明确不注册；真实 team/remote/ListAgents 因 account/environment/server gate 无法 hermetic 开启，
+继续 unknown，未连接真实 cloud、团队、凭据或用户 mailbox。
+
+kloop 新增公开 mock-only sampling `Gate`（started/release 两相同步），Plan 52 Rust report 真实运行
+`dispatch_tools`/`run_turn`，无 sleep/文件轮询地证明两个同步 task 同时到达 sampling，并锁定后台完成回灌、
+stop-vs-completion 一次终态、final sampling inbox 兜底、todo replacement、wait non-drain、stop scope 与
+CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter tamper
+测试 fail closed；没有新增 pair contract 或人为制造 `same`。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -192,9 +216,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
-`docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md` 与
-`docs/plan/51-background-monitor-parity.md`。Plan 51 的完成不表示 kloop 已全工具对齐或可替换
-Claude Code；其余产品行为仍由 Plan 52–59 逐簇实现与验收。
+`docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
+`docs/plan/51-background-monitor-parity.md` 与 `docs/plan/52-agent-task-team-parity.md`。Plan 52 的完成不表示
+kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 53–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

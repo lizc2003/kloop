@@ -12,6 +12,8 @@ mod inject;
 mod plan49_parity_tests;
 #[cfg(test)]
 mod plan50_parity_tests;
+#[cfg(test)]
+mod plan52_parity_tests;
 mod plan_mode;
 mod search;
 mod skill;
