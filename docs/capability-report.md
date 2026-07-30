@@ -43,11 +43,12 @@
 | microcompaction / 工具结果分档预算(200k/50k) | cc 单家 | 未立(offload 已覆盖大头) | 超长工具输出场景痛感 |
 | autocompact 警告带(剩 20k 提醒) | cc 单家 | 未立,小件 | 顺手做 |
 
-### 2. 权限系统——✅ 核心(两家之合),宽度缺口如下
+### 2. 权限系统——🟡 gate 核心齐，Project/Session 作用域待纠偏
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| permission modes 全集(plan 档) | 概念双家 | **plan 37** | 已立 |
+| permission modes 全集（含 plan） | 概念双家 | **✅ Plan 37（2026-07-16）** | 已完成 |
+| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权 | **已立，且应先于 Plan 61/62 实施** |
 | AI 分类器 auto 模式 / updatedInput 改写 | cc 单家 | 暂不做(plan 8 判) | 有小模型基建再议 |
 | execpolicy(execve 级 Starlark 规则) | codex 单家 | 暂不做 | 沙箱已有,重;痛感驱动 |
 
@@ -152,13 +153,15 @@ codex 拉取式增量观察。
 | 子目录懒加载(conditionalRules + paths glob) | cc 单家(codex/claw 均无) | plan 32 片 3 挂账,弱收敛 | 大 monorepo 痛感 |
 | claudeMdExcludes / enterprise 层 | cc 单家 | 不立 | 定位外 |
 
-### 11. MCP——🔴 传输宽度是当前最大生态缺口
+### 11. MCP——🟡 Streamable HTTP/OAuth 主干齐，资源与双向能力缺
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| streamable HTTP 远程传输 | 双家 | **plan 34** | 已立 |
-| OAuth(授权码+回调+keyring) | 双家 | plan 34 挂账,独立 plan 级体量 | 接需 OAuth 的真实 server |
+| streamable HTTP 远程传输 | 双家 | **✅ Plan 34（2026-07-16）**：session/version、SSE response、重试与 reinitialize 已完成 | 已完成 |
+| OAuth 授权码 + PKCE + discovery + refresh + 私有文件存储 | 双家 | **✅ Plan 34b（2026-07-16）** | 已完成 |
+| OAuth keyring、跨进程 refresh lock、device/manual flow 等硬化 | 双家长尾 | 未立 | 真实托管 server 或凭据治理需求 |
 | MCP resources(@-mention)/ prompts | cc 单家 | 未立 | 生态需求 |
+| server-initiated request / 长期订阅 | 协议生态 | 未立；现有 Transport 只承诺 client-originated request/notify | sampling/elicitation/roots 或推送需求 |
 | 旧版 SSE 传输 | cc legacy,codex 不做 | ⛔ 不做 | — |
 | MCP server 模式(kloop 自身作为 server) | cc 单家 | 未立 | 被集成需求 |
 
@@ -166,7 +169,7 @@ codex 拉取式增量观察。
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| 用户自定义 commands 目录 + `!cmd`/`@file` 注入 | cc 单家(已折进 skills) | **plan 36** | 已立 |
+| 用户自定义 commands 目录 + `!cmd`/`@file` 注入 | cc 单家(已折进 skills) | **✅ Plan 36（2026-07-16）** | 已完成 |
 | skills 余项(effort/bundled 懒解压/paths/远程 skills/开关字段) | cc 单家 | plan 28 挂账清单 | 生态兼容痛感 |
 | plain 前端 steering enqueue | — | 平台事实(阻塞读),接受 | TUI/server 已覆盖 |
 
@@ -174,17 +177,16 @@ codex 拉取式增量观察。
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| 语法高亮 / intraline 词级 diff | cc(词级仅 cc) | 未立,nice-to-have | dogfood 体感 |
-| 输入补全(slash/@file/历史)| 两家皆有 | 未立 | dogfood 体感 |
-| 粘贴图片入口 / `--image` 实时占位行 | — | plan 29 挂账 | 图片 dogfood |
-| TUI 模式/档位状态栏显示 | 两家皆有 | 可并入 plan 37 决定 3 | plan 37 开工时定 |
+| intraline 词级 diff | cc 单家 | 未立，代码块语法高亮已由 Plan 38 完成 | dogfood 体感 |
+| slash / `@file` / 历史补全 | 两家皆有 | **✅ Plan 38 切片 4** | 已完成 |
+| `--image`、TUI 图片路径/剪贴板附件 | — | **✅ Plan 29 + Plan 38** | 已完成 |
+| TUI 模式/档位状态栏显示 | 两家皆有 | **✅ Plan 37 + Plan 38 HUD** | 已完成 |
 | server 不转发 thinking delta | — | HANDOFF 记录在案 | client 需要时 |
 | vim mode / 主题 / statusline | cc 单家 | 不立 | 定位外 |
 
-### 14. headless / 脚本化——🔴
+### 14. headless / 脚本化——✅
 
-**plan 33**(已立):位置参数/stdin、`--json` 事件流(复用 server wire)、审批默认
-拒、退出码。双家收敛;同时是 CI 端到端与 dogfood 自举的入口。
+**Plan 33（2026-07-16）已完成**：位置参数/stdin、`--json` 事件流（复用 server wire）、无人审批默认拒绝、稳定退出码与 mock/headless 回归均已落地。
 
 ### 15. 测试 / CI / 工程质量——✅ 纪律同级
 
@@ -198,7 +200,7 @@ codex 拉取式增量观察。
 
 两家被海量用户长期锤过;kloop 的真 key 验收是每能力单场景闭环。长会话稳定性、大
 repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood**:
-- 建议第一步:**用 kloop 自己做 plan 33**(自举,顺带把 headless 需求真跑一遍);
+- 建议下一步：继续用 kloop 自己实施 **Plan 63**，用真实多 workspace/server session 压力验证新的 Project/Session 权限归属；
 - 之后每个 plan 的实现会话尽量在 kloop 里跑,痛点直接变本报告新行;
 - 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯五类边界(多字节、
   大小写、Drop/Weak、预算耗尽、截断累积)。
@@ -211,13 +213,10 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 已立编号**:plan 33(exec,最便宜、解锁 dogfood/CI)→ 34(MCP 远程,生态价值
-  最高)→ 37(plan mode)→ 36(commands)→ 35(worktree,靠真实并行写痛感)。
-- **T1 有明确外部触发**:Linux 沙箱 + CI 首跑(推远端后);responses 契约销账 +
-  `/compact` 真 key 验收(拿到官方/真 key 时顺手)。
-- **T2 痛感驱动**(出现痛感时从三节明细里提):hooks JSON 协议、`/cost` 累计花费、
-  压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP OAuth、子目录懒加载、
-  会话性能工程。
+- **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
+- **T0 parity 余线**：Plan 53–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
+- **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resources/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训
   24)、并发 pacing、V8 引擎、旧版 SSE 传输、worktree 自动合回、bedrock/vertex、
   vim/主题。

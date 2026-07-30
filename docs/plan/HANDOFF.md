@@ -57,6 +57,15 @@
 > verifier 对缺场景、事件重排和伪同名 adapter fail closed。未连接真实 cloud/team/mailbox。
 > Plan 53–59 尚未执行。
 >
+> **Plan 63 已立（未开工）**：`63-project-permission-lifecycle.md` 纠正 flat `Config` 混合
+> process/project/session/workspace/agent 生命周期，以及 `AllowAlways` 把项目批准写成全局授权的问题。用户已拍板
+> 不保留兼容：实施后 global `[permissions].allow`、`KLOOP_ALLOW` 与 server `acceptAlways` 全部删除，不自动
+> 迁移；global 只留 deny/ask，durable allow 存于用户私有、按 Git common-dir/canonical path 生成 ProjectId
+> 分区的 ProjectStore，仓库内容仍不能授权。native server 直接升 protocol 2.0，Desktop kloop adapter 同步；
+> Config 改用显式 Runtime/Project/Session/Agent + Workspace 构造，worktree sandbox 同时修复主 checkout root
+> 被隐式保留的问题。**当前产品行为在 Plan 63 实施前仍是 Plan 46 的 global allow + protocol 1.0**，不得把
+> 计划态写成已落地能力。Plan 63 与 Plan 61/62 修改面重叠，必须串行，推荐 63 先做。
+>
 > **CodeWhale 调研已完成（2026-07-27）**：本地只读克隆固定在 `refs/codewhale`，当前 commit 为
 > `b494236312ef3ac36489c83706a0b11ab73935a1`；`60-codewhale-source-review.md` 区分已接通主路径、
 > 局部实现与 stub，并按 A–D 记录对 kloop 的候选借鉴项。它只是后续规划输入，未修改产品行为；
