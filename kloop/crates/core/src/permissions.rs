@@ -846,6 +846,10 @@ impl CallFacts {
             // conversation — no system side effect (cc never prompts to
             // activate one); tools those instructions later prompt are gated
             // on their own.
+            // Listing only discloses the catalog a configured MCP server
+            // advertises. Reading a model-selected URI still requires the
+            // normal external-tool approval; read-only here would bypass it.
+            "list_mcp_resources" => true,
             "skill" => true,
             "bash" => matches!(&self.bash, Some(BashAnalysis::Commands(cmds))
                 if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c))),
@@ -1079,6 +1083,12 @@ struct Remember {
 /// remember the parent directory. `None` = not remember-able (opaque bash,
 /// or tokens that would corrupt a rule string).
 fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
+    // Resource URIs are model-selected dynamic locators. Remembering the generic
+    // tool name would let approval for one server/URI authorize every future
+    // resource read, so only an explicit configured allow rule may do that.
+    if matches!(name, "read_mcp_resource" | "read_mcp_resource_dir") {
+        return None;
+    }
     match (&call.bash, &call.path) {
         (Some(BashAnalysis::Commands(cmds)), _) => {
             let mut rules = Vec::new();
@@ -1254,9 +1264,64 @@ mod tests {
         assert!(ok(&p, "kill_bash", json!({"bash_id": "bg-1"})).await);
         assert!(ok(&p, "task", json!({"prompt": "go"})).await);
         assert!(ok(&p, "tool_search", json!({"query": "select:x"})).await);
+        assert!(ok(&p, "skill", json!({"name": "fixture"})).await);
+        assert!(ok(&p, "list_mcp_resources", json!({})).await);
         assert!(ok(&p, "todo_write", json!({"todos": []})).await);
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
         assert!(ok(&p, "bash", bash("sed -n 1,20p f.rs")).await);
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_resource_reads_follow_external_tool_approval_policy() {
+        let read = json!({"server": "fixture", "uri": "fixture://note"});
+        let directory = json!({"server": "fixture", "uri": "fixture://root"});
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let manual = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&manual, "read_mcp_resource", read.clone()).await);
+        assert!(!ok(&manual, "read_mcp_resource_dir", directory.clone()).await);
+        assert_eq!(approver.ask_count(), 2);
+
+        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::Allow]);
+        let no_cache = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&no_cache, "read_mcp_resource", read.clone()).await);
+        assert!(
+            ok(
+                &no_cache,
+                "read_mcp_resource",
+                json!({"server": "other", "uri": "other://secret"})
+            )
+            .await
+        );
+        assert_eq!(
+            approver.ask_count(),
+            2,
+            "AllowSession for one dynamic URI must not authorize another"
+        );
+
+        let approver = ScriptedApprover::new(vec![]);
+        let denied = gate(
+            Mode::Manual,
+            rules(&[], &["read_mcp_resource"], &[]),
+            approver.clone(),
+        );
+        assert!(!ok(&denied, "read_mcp_resource", read.clone()).await);
+        assert_eq!(approver.ask_count(), 0);
+
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let asked_in_bypass = gate(
+            Mode::Bypass,
+            rules(&[], &[], &["read_mcp_resource"]),
+            approver.clone(),
+        );
+        assert!(!ok(&asked_in_bypass, "read_mcp_resource", read.clone()).await);
+        assert_eq!(approver.ask_count(), 1);
+
+        let approver = ScriptedApprover::new(vec![]);
+        let bypass = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&bypass, "read_mcp_resource", read).await);
+        assert!(ok(&bypass, "read_mcp_resource_dir", directory).await);
         assert_eq!(approver.ask_count(), 0);
     }
 

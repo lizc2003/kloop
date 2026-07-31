@@ -60,9 +60,11 @@ pointer at the next step boundary; and explicitly shuts background work down bef
 teardown. CC's auto-background, stall detection, and feature-gated model-visible Monitor remain
 deliberate product boundaries rather than unproven parity claims.
 
+Plan 52–54 continue the same evidence discipline. Agent/task/team and interaction/workflow controls remain explicit native-vs-CC adapters rather than name-based claims. Plan 54 grows the fixed corpus to **129 captures / 164 static evidence** and keeps the 56-row/448-cell matrix conservative at 89 compatible / 143 intentional-diff / 34 missing / 150 unknown / 22 n/a / 10 same. Skill, ToolSearch, stdio dynamic MCP and MCP resources now have exact fixtures; dynamic MCP permission/concurrency remain unknown where the pinned profile did not expose them. Resource reads intentionally keep kloop's external-tool approval instead of silently authorizing a model-selected URI.
+
 This baseline is evidence and a roadmap, not a claim that all tools already
 match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 52–59; kloop-only capabilities stay intentionally separate.
+remain for Plans 55–59; kloop-only capabilities stay intentionally separate.
 
 
 ## Compaction (Phase 2, first slice)
@@ -656,20 +658,26 @@ fallback are out of scope (see the plan).
 
 Servers are spawned/connected once at startup (stdio children killed on exit);
 the handshake is `initialize` → `notifications/initialized` → `tools/list`
-(with `nextCursor` pagination), and each advertised tool joins the model's tool
-list as `{server}__{tool}` with its inputSchema passed through verbatim. A
-failing server degrades to a startup warning — MCP never blocks kloop. Name
-sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
-allow rules round-trip through the permission-rule grammar); collisions warn
-at startup and the colliding later definitions are skipped.
+(with bounded `nextCursor` pagination), and each advertised tool joins the model's tool
+list as `{server}__{tool}` with its inputSchema passed through verbatim. A stdio
+server advertising `tools.listChanged` drives an atomic catalog refresh: burst
+notifications coalesce, receiver lag still marks the catalog dirty, transient list
+failures retry, and a final failure leaves the old catalog intact. Streamable HTTP
+currently has no long-lived server-notification stream; if an HTTP server advertises
+listChanged, kloop reports that the startup catalog remains fixed instead of silently
+claiming dynamic refresh. A failing server degrades to a startup warning — MCP never
+blocks kloop. Name sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so
+persisted allow rules round-trip through the permission-rule grammar); collisions
+warn at startup and the colliding later definitions are skipped.
 
-Calls go out with the raw server-side tool name; the result content array is
-flattened to text (binary blocks degrade to `[image: …]`-style tags), and
-`isError: true` surfaces as an is_error tool_result — same shape as a failing
-built-in. MCP tools run serially unless listed in `readonly`, and always ask
-for permission unless covered by an allow rule (`memory__create_entities` in
+Calls go out with the raw server-side tool name. Text content is flattened;
+supported image blocks are lifted into canonical model image blocks, while
+unsupported binary/audio content degrades to explicit text tags. `isError: true`
+surfaces as an is_error tool_result — the same shape as a failing built-in. MCP
+tools run serially unless listed in `readonly`, and always ask for permission
+unless covered by an allow rule (`memory__create_entities` in
 `[permissions].allow`) or the session cache — the `a`/`p` answers work on
-whole-tool granularity.
+whole-tool granularity for ordinary MCP tools. Resource reads are the exception below.
 
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (protocol layer transport-agnostic behind a
@@ -680,30 +688,74 @@ secret resolution, namespacing, the adapter, and the OAuth login command + token
 store in `mcp_auth.rs`, so nothing with a terminal/config-file side-effect
 leaks into the wire crate).
 
+### MCP resources
+
+A server whose initialize result advertises `resources` contributes three global
+resource helpers. They are always deferred behind `tool_search`, even when the
+ordinary tool count is below the threshold:
+
+- **list_mcp_resources** `{server?}` lists one server or aggregates all
+  resources-capable servers concurrently. It is catalog-only and auto-allowed.
+  Single-server and all-server failures are errors; a partial aggregate keeps
+  successful entries and names the failed servers.
+- **read_mcp_resource** `{server, uri}` reads text or a supported image resource.
+  It refreshes `resources/list` first and accepts only a URI the server currently
+  advertises; the model-selected server/URI goes through normal external-tool
+  approval instead of being treated as intrinsically safe because the operation
+  is read-only. `AllowSession`/`AllowAlways` is deliberately not remembered for
+  a dynamic URI; use an explicit configured allow rule or bypass mode only when
+  broad server/resource access is intentional.
+- **read_mcp_resource_dir** `{server, uri}` lists direct children through the
+  `io.modelcontextprotocol/skills` `directoryRead` extension. It has the same
+  current-catalog and approval rule and fails clearly when the capability or URI
+  is unsuitable.
+
+Both stdio frames and HTTP JSON/SSE response bodies have an 8 MiB wire cap
+before JSON parsing. Tool/resource pagination then rejects repeated cursors and
+adds page/item/byte budgets; resource reads also cap content count/bytes, while
+tools/call validates content count and supported image base64/decoded size before
+an image can enter history. Large text within those wire budgets still uses the
+ordinary History offload path. Supported
+image MIME types become model image blocks; other blobs never inject raw base64.
+Resource templates, prompts, sampling/elicitation/roots, and HTTP server-notification
+subscription remain outside this slice.
+
 ### Deferred tools + tool_search
 
 Past 30 total tools (`KLOOP_DEFER_THRESHOLD` overrides; built-ins never
-defer), MCP tool definitions stop being sent to the model. Instead the
-request carries the built-ins plus two extra tools, and the synthetic
-context message lists the deferred tool names:
+defer), external source definitions stop being sent to the model. A source may
+also force selected helpers to defer below that threshold (the MCP resource
+helpers do this). The request carries the built-ins plus two extra tools, and
+the synthetic context message lists the deferred names:
 
 - **tool_search** `{query, max_results=5}` — `select:<name>[,<name>...]`
-  fetches exact tools; anything else is a keyword search over names (ranked
-  first) and descriptions. Matching tools' full definitions (description +
-  JSON schema) come back in the result and those tools unlock for the rest
-  of the session.
-- **call_tool** `{tool_name, params}` — escape hatch for models that refuse
-  to emit tool calls for names absent from their declared tool list (some
-  OpenAI-compat models). Dispatch unwraps the envelope up front, so
-  permissions, hooks, concurrency and the UI all judge the real tool name.
+  fetches exact tools case-insensitively and deduplicates one selection;
+  otherwise exact/prefix names and keyword terms are ranked over name,
+  description and schema. Prefix a required term with `+`. `max_results` must
+  be a positive integer. Matching tools' full definitions (description + JSON
+  schema) come back in the result and unlock at the exact source-definition
+  generation that supplied that schema.
+- **call_tool** `{tool_name, params}` — the standard deferred execution path for
+  providers that refuse to emit calls to names absent from the original tool
+  array (some OpenAI-compat models). Dispatch unwraps the envelope up front, so
+  permissions, hooks, concurrency and the UI all judge the real tool name;
+  direct calls remain a compatibility optimization for providers that permit
+  undeclared names.
 
-The tool defs array and the injected name list are byte-stable for the whole
-session — unlocking only opens the dispatch gate, it never mutates the
-request prefix, so the prompt cache survives. Calling a deferred tool before
-searching bounces with guidance (and does not unlock); permission rules and
-the approval cache keep whole-tool-name granularity throughout. Sub-agents
-share the parent's unlock set. Under the threshold nothing changes: all
-tools ship inline and neither tool_search nor call_tool exists.
+Searching never mutates the current provider tool array or deferred-name notice,
+so the request prefix stays cache-friendly. A successful dynamic MCP refresh is
+picked up when the next sampling round rebuilds its source snapshot. Unlocks are
+bound to a definition generation: if the same tool name receives a replacement
+schema, old direct/enveloped calls are rejected until the model searches again.
+The schema and generation are taken from one atomic source snapshot. MCP calls
+hold a shared generation gate through the wire request; refresh takes the write
+side, so an already-started call completes before publication or a published
+replacement rejects the stale call — no check→await race can route through a
+new catalog. Calling a deferred tool before searching likewise bounces with
+guidance and does not unlock it. Permission rules and the approval cache keep
+whole-tool-name granularity; sub-agents share the parent's generation-bound
+unlock map. Below the threshold ordinary source tools ship inline; source-forced
+helpers remain deferred.
 
 ## Hooks (Phase 2, seventh slice)
 
@@ -1556,6 +1608,13 @@ which faces the permission gate like any command. The `skill` tool is read-only
 (activating a skill has no system side effect — cc never prompts for it); a fork
 skill's sub-agent and any tool an inline skill's instructions later prompt are
 each gated on their own.
+
+Plan 54's exact 2.1.220 fixtures confirm this as the same model-visible,
+progressively disclosed capability, with an intentional surface/lifecycle
+difference: Claude Code names the tool `Skill {skill,args}` and queues the
+expanded body as a companion user block; kloop keeps `skill {name,arguments}`
+and returns the inline/fork result through the normal tool-result path. User
+commands remain slash-only rather than becoming model-invocable skills.
 
 Skills converge across cc (full system) and claw (archived subsystem); the
 codex checkout has neither. **Not done** (deferred): `effort`

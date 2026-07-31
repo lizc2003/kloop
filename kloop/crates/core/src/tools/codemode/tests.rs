@@ -583,8 +583,8 @@ fn srv() -> std::sync::Arc<dyn ToolSource> {
 }
 
 impl ToolSource for Srv {
-    fn defs(&self) -> &[ToolDef] {
-        &self.defs
+    fn defs(&self) -> Arc<[ToolDef]> {
+        Arc::from(self.defs.clone())
     }
     fn is_readonly(&self, tool: &str) -> bool {
         tool == "srv__echo" || tool == "srv__data"

@@ -106,12 +106,12 @@ pub struct Config {
     /// source tools are deferred: excluded from the request's tool defs and
     /// discoverable via the tool_search tool instead. Built-ins never defer.
     pub defer_threshold: usize,
-    /// Deferred tools unlocked by tool_search this session. Unlocking never
-    /// changes the tool defs sent to the model (the array stays byte-stable
-    /// for the prompt cache) — it only opens the dispatch gate; the model
-    /// works from the schema returned in the tool_search result. Shared into
-    /// sub-agent configs so a parent's discoveries carry over.
-    pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Deferred tools unlocked by tool_search this session, keyed by the source
+    /// definition generation that was searched. A dynamic source refresh makes
+    /// an old entry stale, forcing the model to discover the replacement schema
+    /// before dispatch. Shared into sub-agent configs so a parent's discoveries
+    /// carry over.
+    pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashMap<String, u64>>>,
     /// The structured task list the model maintains via todo_write (full-table
     /// replace). Session-scoped process state, not history: it survives across
     /// turns within a session and starts empty on resume (the model rebuilds

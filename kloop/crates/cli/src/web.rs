@@ -98,7 +98,7 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
     };
     match WebTools::new(search) {
         Ok(tools) => {
-            let defs = web::tool_defs(tools.search_backend_name());
+            let defs = Arc::from(web::tool_defs(tools.search_backend_name()));
             Some(Arc::new(WebToolSource { tools, defs }))
         }
         Err(e) => {
@@ -110,12 +110,12 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
 
 struct WebToolSource {
     tools: WebTools,
-    defs: Vec<ToolDef>,
+    defs: Arc<[ToolDef]>,
 }
 
 impl ToolSource for WebToolSource {
-    fn defs(&self) -> &[ToolDef] {
-        &self.defs
+    fn defs(&self) -> Arc<[ToolDef]> {
+        self.defs.clone()
     }
 
     /// Both tools only read the network — eligible for concurrent dispatch.
@@ -189,8 +189,8 @@ mod tests {
             search_provider: "duckduckgo".into(),
         };
         let source = build_web_source(&cfg, &warn).expect("fetch-only source");
-        let names: Vec<&str> = source.defs().iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["web_fetch"]);
+        let names: Vec<String> = source.defs().iter().map(|def| def.name.clone()).collect();
+        assert_eq!(names, vec!["web_fetch".to_string()]);
         assert!(source.is_readonly("web_fetch"));
         let warnings = warnings.into_inner().unwrap();
         assert_eq!(warnings.len(), 1);

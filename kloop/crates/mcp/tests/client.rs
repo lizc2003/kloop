@@ -74,7 +74,13 @@ async fn handshake_sends_initialize_then_initialized_notification() {
                 &init["id"],
                 json!({
                     "protocolVersion": "2025-06-18",
-                    "capabilities": {},
+                    "capabilities": {
+                        "tools": {"listChanged": true},
+                        "resources": {"listChanged": true},
+                        "extensions": {
+                            "io.modelcontextprotocol/skills": {"directoryRead": true}
+                        }
+                    },
                     "serverInfo": {"name": "mock", "version": "0"},
                 }),
             )
@@ -83,7 +89,16 @@ async fn handshake_sends_initialize_then_initialized_notification() {
         (init, initialized)
     });
 
-    client.initialize().await.unwrap();
+    let capabilities = client.initialize().await.unwrap();
+    assert_eq!(
+        capabilities,
+        kloop_mcp::McpServerCapabilities {
+            tools_list_changed: true,
+            resources: true,
+            resources_list_changed: true,
+            directory_read: true,
+        }
+    );
 
     let (init, initialized) = server_task.await.unwrap();
     assert_eq!(init["method"], "initialize");
@@ -169,6 +184,244 @@ async fn list_tools_paginates_and_passes_schema_through() {
     );
 }
 
+#[tokio::test]
+async fn catalog_paginators_reject_repeated_cursors() {
+    let (client, mut server) = pair();
+    let server_task = tokio::spawn(async move {
+        for method in [
+            "tools/list",
+            "tools/list",
+            "resources/list",
+            "resources/list",
+        ] {
+            let request = server.recv().await;
+            assert_eq!(request["method"], method);
+            let result = if method == "tools/list" {
+                json!({"tools": [], "nextCursor": "same-cursor"})
+            } else {
+                json!({"resources": [], "nextCursor": "same-cursor"})
+            };
+            server.respond(&request["id"], result).await;
+        }
+    });
+
+    let error = client.list_tools().await.unwrap_err();
+    assert!(error.to_string().contains("repeated nextCursor"));
+    let error = client.list_resources().await.unwrap_err();
+    assert!(error.to_string().contains("repeated nextCursor"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn resource_reads_reject_invalid_base64_and_oversized_content_lists() {
+    let (client, mut server) = pair();
+    let server_task = tokio::spawn(async move {
+        let invalid = server.recv().await;
+        server
+            .respond(
+                &invalid["id"],
+                json!({
+                    "contents": [{
+                        "uri": "fixture://blob",
+                        "mimeType": "application/octet-stream",
+                        "blob": "not-base64!"
+                    }]
+                }),
+            )
+            .await;
+
+        let oversized = server.recv().await;
+        let contents = (0..257)
+            .map(|index| {
+                json!({
+                    "uri": format!("fixture://item/{index}"),
+                    "mimeType": "text/plain",
+                    "text": "x"
+                })
+            })
+            .collect::<Vec<_>>();
+        server
+            .respond(&oversized["id"], json!({"contents": contents}))
+            .await;
+    });
+
+    let error = client.read_resource("fixture://blob").await.unwrap_err();
+    assert!(error.to_string().contains("not valid base64"));
+    let error = client.read_resource("fixture://many").await.unwrap_err();
+    assert!(error.to_string().contains("resource content budget"));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn resources_list_read_and_directory_preserve_wire_data() {
+    let (client, mut server) = pair();
+    let server_task = tokio::spawn(async move {
+        let list_page1 = server.recv().await;
+        server
+            .respond(
+                &list_page1["id"],
+                json!({
+                    "resources": [{
+                        "uri": "fixture://root",
+                        "name": "root",
+                        "description": "root dir",
+                        "mimeType": "inode/directory",
+                        "size": 54,
+                    }],
+                    "nextCursor": "resources-2",
+                }),
+            )
+            .await;
+        let list_page2 = server.recv().await;
+        server
+            .respond(
+                &list_page2["id"],
+                json!({
+                    "resources": [{
+                        "uri": "fixture://note",
+                        "name": "note",
+                        "mimeType": "text/plain",
+                        "_meta": {"fixture": true},
+                    }]
+                }),
+            )
+            .await;
+        let read = server.recv().await;
+        server
+            .respond(
+                &read["id"],
+                json!({
+                    "contents": [{
+                        "uri": "fixture://note",
+                        "mimeType": "text/plain",
+                        "text": "resource body",
+                    }]
+                }),
+            )
+            .await;
+        let directory_page1 = server.recv().await;
+        server
+            .respond(
+                &directory_page1["id"],
+                json!({
+                    "resources": [{
+                        "uri": "fixture://root/nested",
+                        "name": "nested",
+                        "mimeType": "inode/directory",
+                    }],
+                    "nextCursor": "directory-2",
+                }),
+            )
+            .await;
+        let directory_page2 = server.recv().await;
+        server
+            .respond(
+                &directory_page2["id"],
+                json!({
+                    "resources": [{
+                        "uri": "fixture://note",
+                        "name": "note",
+                        "mimeType": "text/plain",
+                    }]
+                }),
+            )
+            .await;
+        (
+            list_page1,
+            list_page2,
+            read,
+            directory_page1,
+            directory_page2,
+        )
+    });
+
+    let resources = client.list_resources().await.unwrap();
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].uri, "fixture://root");
+    assert_eq!(resources[0].name, "root");
+    assert_eq!(resources[0].description.as_deref(), Some("root dir"));
+    assert_eq!(resources[0].mime_type.as_deref(), Some("inode/directory"));
+    assert_eq!(resources[0].raw["size"], 54);
+    assert_eq!(resources[1].raw["_meta"], json!({"fixture": true}));
+
+    let read = client.read_resource("fixture://note").await.unwrap();
+    assert_eq!(read.contents.len(), 1);
+    assert_eq!(read.contents[0].uri, "fixture://note");
+    assert_eq!(read.contents[0].text.as_deref(), Some("resource body"));
+    assert_eq!(read.contents[0].blob, None);
+
+    let children = client
+        .read_resource_directory("fixture://root")
+        .await
+        .unwrap();
+    assert_eq!(
+        children
+            .iter()
+            .map(|resource| resource.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fixture://root/nested", "fixture://note"]
+    );
+
+    let (list_page1, list_page2, read, directory_page1, directory_page2) =
+        server_task.await.unwrap();
+    assert_eq!(list_page1["method"], "resources/list");
+    assert_eq!(list_page1["params"], json!({}));
+    assert_eq!(list_page2["params"], json!({"cursor": "resources-2"}));
+    assert_eq!(read["method"], "resources/read");
+    assert_eq!(read["params"], json!({"uri": "fixture://note"}));
+    assert_eq!(directory_page1["method"], "resources/directory/read");
+    assert_eq!(directory_page1["params"], json!({"uri": "fixture://root"}));
+    assert_eq!(
+        directory_page2["params"],
+        json!({"uri": "fixture://root", "cursor": "directory-2"})
+    );
+}
+
+#[tokio::test]
+async fn list_changed_notifications_are_published_without_stealing_responses() {
+    let (client, mut server) = pair();
+    let mut notifications = client.subscribe_notifications().unwrap();
+    tokio::spawn(async move {
+        let list = server.recv().await;
+        server
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+            }))
+            .await;
+        server
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/list_changed",
+            }))
+            .await;
+        server
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {"uri": "fixture://note"},
+            }))
+            .await;
+        server.respond(&list["id"], json!({"tools": []})).await;
+    });
+
+    assert!(client.list_tools().await.unwrap().is_empty());
+    assert_eq!(
+        notifications.recv().await.unwrap(),
+        kloop_mcp::McpNotification::ToolsListChanged
+    );
+    assert_eq!(
+        notifications.recv().await.unwrap(),
+        kloop_mcp::McpNotification::ResourcesListChanged
+    );
+    assert_eq!(
+        notifications.recv().await.unwrap(),
+        kloop_mcp::McpNotification::ResourceUpdated {
+            uri: "fixture://note".into()
+        }
+    );
+}
+
 /// tools/call sends the raw name + arguments verbatim; a multi-block content
 /// array renders as joined text, with resource/image blocks degraded to
 /// tagged text.
@@ -233,6 +486,12 @@ fn content_blocks_lifts_images_and_leaves_text_alone() {
         ])),
         None
     );
+    assert_eq!(
+        kloop_mcp::content_blocks(&json!([
+            {"type": "image", "data": "not-base64!", "mimeType": "image/png"}
+        ])),
+        None
+    );
     // A usable image is lifted; surrounding text/resource items fold into Text
     // blocks around it, in order.
     assert_eq!(
@@ -278,6 +537,50 @@ async fn call_tool_is_error_result_maps_to_err() {
 
     let err = client.call_tool("lookup", &json!({})).await.unwrap_err();
     assert_eq!(err.to_string(), "no such entity");
+}
+
+#[tokio::test]
+async fn call_tool_rejects_invalid_image_payloads() {
+    let (client, mut server) = pair();
+    let server_task = tokio::spawn(async move {
+        let invalid = server.recv().await;
+        server
+            .respond(
+                &invalid["id"],
+                json!({
+                    "content": [{
+                        "type": "image",
+                        "mimeType": "image/png",
+                        "data": "not-base64!"
+                    }]
+                }),
+            )
+            .await;
+        let missing = server.recv().await;
+        server
+            .respond(
+                &missing["id"],
+                json!({
+                    "content": [{"type": "image", "mimeType": "image/png"}]
+                }),
+            )
+            .await;
+        let oversized = server.recv().await;
+        let content = (0..257)
+            .map(|index| json!({"type": "text", "text": format!("item-{index}")}))
+            .collect::<Vec<_>>();
+        server
+            .respond(&oversized["id"], json!({"content": content}))
+            .await;
+    });
+
+    let error = client.call_tool("image", &json!({})).await.unwrap_err();
+    assert!(error.to_string().contains("not valid base64"));
+    let error = client.call_tool("image", &json!({})).await.unwrap_err();
+    assert!(error.to_string().contains("has no base64 data"));
+    let error = client.call_tool("many", &json!({})).await.unwrap_err();
+    assert!(error.to_string().contains("content item budget"));
+    server_task.await.unwrap();
 }
 
 /// A JSON-RPC error object (protocol-level failure) maps to Err carrying

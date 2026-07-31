@@ -14,7 +14,9 @@ mod sse;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
@@ -27,10 +29,12 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use base64::Engine;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use serde_json::json;
 use serde_json::Value;
+use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -57,6 +61,142 @@ pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// cap them before they land in every sampling request (cc uses the same
 /// limit).
 const MAX_DESCRIPTION_CHARS: usize = 2048;
+const MAX_LIST_PAGES: usize = 20;
+const MAX_LIST_ITEMS: usize = 10_000;
+const MAX_LIST_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_WIRE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CALL_CONTENTS: usize = 256;
+const MAX_CALL_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_READ_CONTENTS: usize = 256;
+const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpServerCapabilities {
+    pub tools_list_changed: bool,
+    pub resources: bool,
+    pub resources_list_changed: bool,
+    pub directory_read: bool,
+}
+
+impl McpServerCapabilities {
+    fn from_initialize(result: &Value) -> Self {
+        let capabilities = &result["capabilities"];
+        McpServerCapabilities {
+            tools_list_changed: capabilities["tools"]["listChanged"]
+                .as_bool()
+                .unwrap_or(false),
+            resources: !capabilities["resources"].is_null(),
+            resources_list_changed: capabilities["resources"]["listChanged"]
+                .as_bool()
+                .unwrap_or(false),
+            directory_read: capabilities["extensions"]["io.modelcontextprotocol/skills"]
+                ["directoryRead"]
+                .as_bool()
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpNotification {
+    ToolsListChanged,
+    ResourcesListChanged,
+    ResourceUpdated { uri: String },
+}
+
+impl McpNotification {
+    fn from_message(message: &Value) -> Option<Self> {
+        match message["method"].as_str()? {
+            "notifications/tools/list_changed" => Some(McpNotification::ToolsListChanged),
+            "notifications/resources/list_changed" => Some(McpNotification::ResourcesListChanged),
+            "notifications/resources/updated" => Some(McpNotification::ResourceUpdated {
+                uri: message["params"]["uri"].as_str()?.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    pub raw: Value,
+}
+
+impl McpResource {
+    fn parse(value: &Value) -> Result<Self> {
+        Ok(McpResource {
+            uri: value["uri"]
+                .as_str()
+                .context("resource entry has no uri")?
+                .to_string(),
+            name: value["name"]
+                .as_str()
+                .context("resource entry has no name")?
+                .to_string(),
+            description: value["description"].as_str().map(str::to_string),
+            mime_type: value["mimeType"].as_str().map(str::to_string),
+            raw: value.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpResourceContent {
+    pub uri: String,
+    pub mime_type: Option<String>,
+    pub text: Option<String>,
+    pub blob: Option<String>,
+    pub raw: Value,
+}
+
+impl McpResourceContent {
+    fn parse(value: &Value) -> Result<Self> {
+        let text = value["text"].as_str().map(str::to_string);
+        let blob = value["blob"].as_str().map(str::to_string);
+        if let Some(blob) = &blob {
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .context("resource content blob is not valid base64")?;
+        }
+        if text.is_none() && blob.is_none() {
+            bail!("resource content has neither text nor blob");
+        }
+        Ok(McpResourceContent {
+            uri: value["uri"]
+                .as_str()
+                .context("resource content has no uri")?
+                .to_string(),
+            mime_type: value["mimeType"].as_str().map(str::to_string),
+            text,
+            blob,
+            raw: value.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpReadResourceResult {
+    pub contents: Vec<McpResourceContent>,
+    pub raw: Value,
+}
+
+#[derive(Debug)]
+pub struct McpRpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl std::fmt::Display for McpRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "mcp error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for McpRpcError {}
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
@@ -74,6 +214,10 @@ pub(crate) trait Transport: Send + Sync {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
 
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<McpNotification>> {
+        None
+    }
+
     fn notify<'a>(
         &'a self,
         method: &'a str,
@@ -86,6 +230,7 @@ pub(crate) trait Transport: Send + Sync {
 /// (stdio kills the child via kill_on_drop and stops the reader task).
 pub struct McpClient {
     transport: Box<dyn Transport>,
+    capabilities: Mutex<McpServerCapabilities>,
 }
 
 impl McpClient {
@@ -95,6 +240,7 @@ impl McpClient {
     pub fn spawn(command: &[String], env: &BTreeMap<String, String>) -> Result<Self> {
         Ok(Self {
             transport: Box::new(StdioTransport::spawn(command, env)?),
+            capabilities: Mutex::new(McpServerCapabilities::default()),
         })
     }
 
@@ -107,6 +253,7 @@ impl McpClient {
     ) -> Self {
         Self {
             transport: Box::new(StdioTransport::over(reader, writer, child)),
+            capabilities: Mutex::new(McpServerCapabilities::default()),
         }
     }
 
@@ -123,6 +270,7 @@ impl McpClient {
     ) -> Result<Self> {
         Ok(Self {
             transport: Box::new(http::HttpTransport::new(url, headers, oauth)?),
+            capabilities: Mutex::new(McpServerCapabilities::default()),
         })
     }
 
@@ -130,14 +278,18 @@ impl McpClient {
     /// inject a fast retry schedule.
     #[cfg(test)]
     pub(crate) fn from_transport(transport: Box<dyn Transport>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            capabilities: Mutex::new(McpServerCapabilities::default()),
+        }
     }
 
     /// The MCP handshake: `initialize`, then the REQUIRED
     /// `notifications/initialized` (strict servers refuse further requests
     /// without it).
-    pub async fn initialize(&self) -> Result<()> {
-        self.transport
+    pub async fn initialize(&self) -> Result<McpServerCapabilities> {
+        let result = self
+            .transport
             .request(
                 "initialize",
                 json!({
@@ -149,9 +301,22 @@ impl McpClient {
             )
             .await
             .context("mcp initialize failed")?;
+        let capabilities = McpServerCapabilities::from_initialize(&result);
+        *self.capabilities.lock().unwrap() = capabilities.clone();
         self.transport
             .notify("notifications/initialized", None)
-            .await
+            .await?;
+        Ok(capabilities)
+    }
+
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        self.capabilities.lock().unwrap().clone()
+    }
+
+    pub fn subscribe_notifications(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<McpNotification>> {
+        self.transport.subscribe()
     }
 
     /// Full tool list (follows `nextCursor` pagination). Names are the raw
@@ -160,7 +325,9 @@ impl McpClient {
     pub async fn list_tools(&self) -> Result<Vec<kloop_protocol::ToolDef>> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        let mut seen_cursors = HashSet::new();
+        let mut total_bytes = 0;
+        for _ in 0..MAX_LIST_PAGES {
             let params = match &cursor {
                 Some(c) => json!({"cursor": c}),
                 None => json!({}),
@@ -172,6 +339,10 @@ impl McpClient {
             let listed = result["tools"]
                 .as_array()
                 .context("tools/list result has no tools array")?;
+            total_bytes += serde_json::to_vec(&result)?.len();
+            if total_bytes > MAX_LIST_BYTES || tools.len() + listed.len() > MAX_LIST_ITEMS {
+                bail!("tools/list result exceeds the tool catalog budget");
+            }
             for tool in listed {
                 let name = tool["name"]
                     .as_str()
@@ -192,12 +363,85 @@ impl McpClient {
                     schema,
                 });
             }
-            match result["nextCursor"].as_str() {
-                Some(c) => cursor = Some(c.to_string()),
-                None => break,
+            let Some(next) = result["nextCursor"].as_str() else {
+                return Ok(tools);
+            };
+            if !seen_cursors.insert(next.to_string()) {
+                bail!("tools/list repeated nextCursor '{next}'");
             }
+            cursor = Some(next.to_string());
         }
-        Ok(tools)
+        bail!("tools/list exceeds the {MAX_LIST_PAGES}-page limit")
+    }
+
+    async fn list_resources_method(
+        &self,
+        method: &str,
+        base_params: &Value,
+    ) -> Result<Vec<McpResource>> {
+        let mut resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut total_bytes = 0;
+        for _ in 0..MAX_LIST_PAGES {
+            let mut params = base_params.clone();
+            let params_object = params
+                .as_object_mut()
+                .context("resource list params must be an object")?;
+            if let Some(cursor) = &cursor {
+                params_object.insert("cursor".into(), Value::String(cursor.clone()));
+            }
+            let result = self.transport.request(method, params, LIST_TIMEOUT).await?;
+            let listed = result["resources"]
+                .as_array()
+                .with_context(|| format!("{method} result has no resources array"))?;
+            total_bytes += serde_json::to_vec(&result)?.len();
+            if total_bytes > MAX_LIST_BYTES || resources.len() + listed.len() > MAX_LIST_ITEMS {
+                bail!("{method} result exceeds the resource catalog budget");
+            }
+            for resource in listed {
+                resources.push(McpResource::parse(resource)?);
+            }
+            let Some(next) = result["nextCursor"].as_str() else {
+                return Ok(resources);
+            };
+            if !seen_cursors.insert(next.to_string()) {
+                bail!("{method} repeated nextCursor '{next}'");
+            }
+            cursor = Some(next.to_string());
+        }
+        bail!("{method} exceeds the {MAX_LIST_PAGES}-page limit")
+    }
+
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>> {
+        self.list_resources_method("resources/list", &json!({}))
+            .await
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<McpReadResourceResult> {
+        let result = self
+            .transport
+            .request("resources/read", json!({"uri": uri}), LIST_TIMEOUT)
+            .await?;
+        let listed = result["contents"]
+            .as_array()
+            .context("resources/read result has no contents array")?;
+        if listed.len() > MAX_READ_CONTENTS || serde_json::to_vec(&result)?.len() > MAX_READ_BYTES {
+            bail!("resources/read result exceeds the resource content budget");
+        }
+        let contents = listed
+            .iter()
+            .map(McpResourceContent::parse)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(McpReadResourceResult {
+            contents,
+            raw: result,
+        })
+    }
+
+    pub async fn read_resource_directory(&self, uri: &str) -> Result<Vec<McpResource>> {
+        self.list_resources_method("resources/directory/read", &json!({"uri": uri}))
+            .await
     }
 
     /// One tools/call with the RAW tool name, returning the full structured
@@ -213,6 +457,7 @@ impl McpClient {
                 CALL_TIMEOUT,
             )
             .await?;
+        validate_call_tool_result(&result)?;
         if result["isError"].as_bool().unwrap_or(false) {
             bail!("{}", render_result(&result));
         }
@@ -228,12 +473,40 @@ impl McpClient {
     }
 }
 
+fn validate_call_tool_result(result: &Value) -> Result<()> {
+    if serde_json::to_vec(result)?.len() > MAX_WIRE_MESSAGE_BYTES {
+        bail!("tools/call result exceeds the tool result budget");
+    }
+    let content = result["content"]
+        .as_array()
+        .context("tools/call result has no content array")?;
+    if content.len() > MAX_CALL_CONTENTS {
+        bail!("tools/call result exceeds the content item budget");
+    }
+    for item in content {
+        if item["type"] != "image" {
+            continue;
+        }
+        let data = item["data"]
+            .as_str()
+            .context("tools/call image content has no base64 data")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("tools/call image data is not valid base64")?;
+        if decoded.len() > MAX_CALL_IMAGE_BYTES {
+            bail!("tools/call image exceeds the decoded image budget");
+        }
+    }
+    Ok(())
+}
+
 /// The stdio transport: newline-delimited JSON over a child process's (or, in
 /// tests, a duplex pipe's) byte streams. A background reader task routes
 /// responses to pending requests by id.
 struct StdioTransport {
     writer: SharedWriter,
     pending: Pending,
+    notifications: tokio::sync::broadcast::Sender<McpNotification>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
     /// Held only so kill_on_drop fires when the transport is dropped.
@@ -275,10 +548,17 @@ impl StdioTransport {
     ) -> Self {
         let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let reader_task = tokio::spawn(read_loop(reader, writer.clone(), pending.clone()));
+        let (notifications, _) = tokio::sync::broadcast::channel(32);
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            writer.clone(),
+            pending.clone(),
+            notifications.clone(),
+        ));
         StdioTransport {
             writer,
             pending,
+            notifications,
             next_id: AtomicU64::new(1),
             reader: reader_task,
             _child: child,
@@ -313,6 +593,10 @@ impl Transport for StdioTransport {
         })
     }
 
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<McpNotification>> {
+        Some(self.notifications.subscribe())
+    }
+
     fn notify<'a>(
         &'a self,
         method: &'a str,
@@ -339,27 +623,78 @@ async fn write_line(writer: &SharedWriter, msg: &Value) -> Result<()> {
     writer.flush().await.context("mcp flush failed")
 }
 
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let (consumed, ended) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                if oversized {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("MCP message exceeds the {limit}-byte wire limit"),
+                    ));
+                }
+                return if line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(line))
+                };
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let take = newline.unwrap_or(buffer.len());
+            if !oversized {
+                if line.len().saturating_add(take) > limit {
+                    oversized = true;
+                } else {
+                    line.extend_from_slice(&buffer[..take]);
+                }
+            }
+            (take + usize::from(newline.is_some()), newline.is_some())
+        };
+        reader.consume(consumed);
+        if ended {
+            if oversized {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("MCP message exceeds the {limit}-byte wire limit"),
+                ));
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
+}
+
 /// Reader half: routes responses to pending requests by id, refuses
-/// server-to-client requests with -32601 (we advertise no capabilities),
-/// ignores notifications, and fails every pending request on EOF.
+/// server-to-client requests with -32601, publishes recognized notifications,
+/// and fails every pending request on EOF.
 async fn read_loop(
     reader: impl AsyncRead + Send + Unpin + 'static,
     writer: SharedWriter,
     pending: Pending,
+    notifications: tokio::sync::broadcast::Sender<McpNotification>,
 ) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut reader = BufReader::new(reader);
+    let terminal_error = loop {
+        let line = match read_bounded_line(&mut reader, MAX_WIRE_MESSAGE_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break "mcp server closed the connection".to_string(),
+            Err(error) => break format!("mcp read failed: {error}"),
+        };
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
             continue; // stray non-JSON output; skip rather than kill the link
         };
         if msg.get("method").is_some() {
-            // Server-initiated request (roots/list, sampling, ...): we
-            // support none, so answer method-not-found. id-less = a
-            // notification; ignored.
             if let Some(id) = msg.get("id") {
                 let refusal = json!({
                     "jsonrpc": "2.0",
@@ -367,6 +702,8 @@ async fn read_loop(
                     "error": {"code": -32601, "message": "method not supported by this client"},
                 });
                 let _ = write_line(&writer, &refusal).await;
+            } else if let Some(notification) = McpNotification::from_message(&msg) {
+                let _ = notifications.send(notification);
             }
             continue;
         }
@@ -377,19 +714,19 @@ async fn read_loop(
             continue; // response to a timed-out request; drop
         };
         let outcome = match msg.get("error") {
-            Some(err) => Err(anyhow!(
-                "mcp error {}: {}",
-                err["code"].as_i64().unwrap_or(0),
-                err["message"].as_str().unwrap_or("unknown")
-            )),
+            Some(err) => Err(anyhow::Error::new(McpRpcError {
+                code: err["code"].as_i64().unwrap_or(0),
+                message: err["message"].as_str().unwrap_or("unknown").to_string(),
+            })),
             None => Ok(msg["result"].clone()),
         };
         let _ = tx.send(outcome);
-    }
-    // EOF or read error: everything still in flight gets a definite answer.
+    };
+    // EOF, read failure, or an oversized frame: every in-flight request gets a
+    // definite answer and the untrusted stream is not parsed further.
     let stranded: Vec<_> = pending.lock().unwrap().drain().collect();
     for (_, tx) in stranded {
-        let _ = tx.send(Err(anyhow!("mcp server closed the connection")));
+        let _ = tx.send(Err(anyhow!(terminal_error.clone())));
     }
 }
 
@@ -452,6 +789,16 @@ fn supported_image_mime(mime: &str) -> bool {
     )
 }
 
+fn usable_image(item: &Value) -> bool {
+    item["type"] == "image"
+        && item["mimeType"].as_str().is_some_and(supported_image_mime)
+        && item["data"].as_str().is_some_and(|data| {
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .is_ok_and(|decoded| decoded.len() <= MAX_CALL_IMAGE_BYTES)
+        })
+}
+
 /// Build canonical content blocks from an MCP content array **when it carries
 /// at least one usable image** — so the model sees the picture instead of an
 /// `[image: …]` tag. Returns `None` for a text-only (or image-free) result,
@@ -460,9 +807,7 @@ fn supported_image_mime(mime: &str) -> bool {
 /// [`render_item`]), preserving order relative to the images.
 pub fn content_blocks(content: &Value) -> Option<Vec<ContentBlock>> {
     let items = content.as_array()?;
-    let has_usable_image = items.iter().any(|it| {
-        it["type"] == "image" && it["mimeType"].as_str().is_some_and(supported_image_mime)
-    });
+    let has_usable_image = items.iter().any(usable_image);
     if !has_usable_image {
         return None;
     }
@@ -470,7 +815,7 @@ pub fn content_blocks(content: &Value) -> Option<Vec<ContentBlock>> {
     let mut pending = String::new();
     for item in items {
         let mime = item["mimeType"].as_str();
-        if item["type"] == "image" && mime.is_some_and(supported_image_mime) {
+        if usable_image(item) {
             if !pending.is_empty() {
                 blocks.push(ContentBlock::Text {
                     text: std::mem::take(&mut pending),
@@ -493,4 +838,22 @@ pub fn content_blocks(content: &Value) -> Option<Vec<ContentBlock>> {
         blocks.push(ContentBlock::Text { text: pending });
     }
     Some(blocks)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::read_bounded_line;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn bounded_line_rejects_oversized_frames_before_json_parsing() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"12345\nnext\n").await.unwrap();
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let error = read_bounded_line(&mut reader, 4).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("wire limit"));
+    }
 }

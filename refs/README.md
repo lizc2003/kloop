@@ -210,6 +210,27 @@ intentional-diff。RunStore 使用受控 run component、descriptor-bound/no-fol
 completion/phase/terminal event 保持 task/run/store identity；resume journal 保留 JSON Value 并兼容 legacy
 string entry。full exact-binary verifier 与 corpus-only 门均通过。
 
+Plan 54 将 corpus 扩至 **129 captures / 164 static evidence**，matrix 仍为 56 行/448 单元，
+状态为 89 `compatible` / 143 `intentional-diff` / 34 `missing` / 150 `unknown` / 22 `n/a` /
+10 `same`。新增 19 个 capture：Skill 成功双样本与三种错误、ToolSearch required-term/ranking/parser
+双样本、select/`tools/list_changed` refresh 后真实 `tools/call` 双样本，以及独立 resources-capable
+local MCP 的 list/read/missing/directory。采集明确固定 `ENABLE_TOOL_SEARCH=true`；proxy 默认关闭
+ToolSearch 的条件没有被抹平。
+
+六个 `child_plan:54` 行保守裁决：Skill 与 ToolSearch 的核心能力 compatible，但 CC 的
+`Skill {skill,args}` companion user block、`tool_reference` + 后续 tools 重组，与 kloop 的
+`skill {name,arguments}` inline/fork、稳定 provider array + `call_tool` 分别记 intentional diff。
+Dynamic MCP 的权限/并发仍无权威 fixture，继续 unknown。Resource list 八维 compatible；read 与
+directory 因 kloop 对模型选择 URI 保留外部工具批准而在 permission 标 intentional diff，图像/blob
+输出和目录 feature lifecycle 另保留已证明差异。没有新增 `same` 或 executable pair。
+
+kloop 实现同时把安全边界收紧：stdio list_changed 原子替换 catalog、lag/失败有界重试；unlock 绑定
+definition generation from one atomic source snapshot，同名 schema 更新后必须重新 ToolSearch；MCP call 与 refresh 以 async gate 线性化（已开始调用先完成，随后才发布 catalog；发布后的旧代调用拒绝）；
+stdio/HTTP 在 JSON parse 前限单消息 wire bytes，tools/resources paginator 与 read/tools-call content 另有 page/cursor/item/byte/base64/image 限制。Resource read/directory
+先刷新 catalog、只接受当前 advertised URI，动态 URI 的 AllowSession/AllowAlways 不记忆；list 的单/全失败为错误，部分失败保留成功项并点名 server。
+Streamable HTTP 仍无长期 server-notification stream，因此连接状态明确报告 startup catalog 固定，未把
+request 内短 SSE response 伪装成动态订阅。full exact-binary verifier 与 workspace Rust 门均通过。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -231,9 +252,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
-`docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md` 与
-`docs/plan/53-interaction-control-parity.md`。Plan 53 的完成不表示
-kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 54–59 逐簇实现与验收。
+`docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
+`docs/plan/53-interaction-control-parity.md` 与 `docs/plan/54-discovery-extension-parity.md`。Plan 54 的完成不表示
+kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 55–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

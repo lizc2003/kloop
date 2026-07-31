@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use crate::oauth::OAuthSession;
 use crate::sse::SseParser;
+use crate::McpRpcError;
 use crate::Transport;
 
 /// codex's schedule: back off 250ms, then 1s, then one final attempt (3
@@ -210,7 +211,8 @@ impl HttpTransport {
                     return Err(Attempt::Unauthorized(bearer));
                 }
             }
-            let text = resp.text().await.unwrap_or_default();
+            let bytes = read_body_bounded(resp).await?;
+            let text = String::from_utf8_lossy(&bytes);
             let msg = anyhow!("mcp http {status}: {text}");
             // 403 and other 4xx are terminal (retrying won't help); the
             // server-error and transient-load codes retry.
@@ -234,10 +236,7 @@ impl HttpTransport {
         let message = if ctype.contains("text/event-stream") {
             read_sse_message(resp, want).await?
         } else {
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| Attempt::Fatal(anyhow!("mcp http: reading body failed: {e}")))?;
+            let bytes = read_body_bounded(resp).await?;
             if bytes.is_empty() {
                 return Err(Attempt::Fatal(anyhow!("mcp http: empty response body")));
             }
@@ -255,11 +254,10 @@ impl HttpTransport {
     /// protocol version (present only on the `initialize` result) is captured.
     fn finish(&self, message: Value) -> std::result::Result<Value, Attempt> {
         if let Some(err) = message.get("error") {
-            return Err(Attempt::Fatal(anyhow!(
-                "mcp error {}: {}",
-                err["code"].as_i64().unwrap_or(0),
-                err["message"].as_str().unwrap_or("unknown")
-            )));
+            return Err(Attempt::Fatal(anyhow::Error::new(McpRpcError {
+                code: err["code"].as_i64().unwrap_or(0),
+                message: err["message"].as_str().unwrap_or("unknown").to_string(),
+            })));
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         if let Some(ver) = result.get("protocolVersion").and_then(|v| v.as_str()) {
@@ -390,6 +388,32 @@ enum Attempt {
     Fatal(anyhow::Error),
 }
 
+async fn read_body_bounded(resp: reqwest::Response) -> std::result::Result<Vec<u8>, Attempt> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > crate::MAX_WIRE_MESSAGE_BYTES as u64)
+    {
+        return Err(Attempt::Fatal(anyhow!(
+            "mcp http: response exceeds the {}-byte wire limit",
+            crate::MAX_WIRE_MESSAGE_BYTES
+        )));
+    }
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| Attempt::Fatal(anyhow!("mcp http: reading body failed: {error}")))?;
+        if body.len().saturating_add(chunk.len()) > crate::MAX_WIRE_MESSAGE_BYTES {
+            return Err(Attempt::Fatal(anyhow!(
+                "mcp http: response exceeds the {}-byte wire limit",
+                crate::MAX_WIRE_MESSAGE_BYTES
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Read an SSE response stream until the JSON-RPC message answering `want`
 /// arrives. Server→client requests/notifications interleaved before it are
 /// ignored (we advertise no capabilities). The stream is consumed
@@ -400,9 +424,17 @@ async fn read_sse_message(
 ) -> std::result::Result<Value, Attempt> {
     let mut parser = SseParser::default();
     let mut stream = resp.bytes_stream();
+    let mut total_bytes = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
             .map_err(|e| Attempt::Fatal(anyhow!("mcp http: reading event stream failed: {e}")))?;
+        total_bytes = total_bytes.saturating_add(chunk.len());
+        if total_bytes > crate::MAX_WIRE_MESSAGE_BYTES {
+            return Err(Attempt::Fatal(anyhow!(
+                "mcp http: event stream exceeds the {}-byte wire limit",
+                crate::MAX_WIRE_MESSAGE_BYTES
+            )));
+        }
         for data in parser.feed(&chunk) {
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
@@ -605,6 +637,24 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
         let client = client(server.uri(), headers);
         // No matching mock without the header ⇒ this only succeeds if it was sent.
         assert_eq!(client.list_tools().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_http_body_is_rejected_before_json_parsing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                vec![b'x'; crate::MAX_WIRE_MESSAGE_BYTES + 1],
+                "application/json",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(server.uri(), BTreeMap::new());
+        let error = client.list_tools().await.unwrap_err();
+        assert!(error.to_string().contains("wire limit"), "{error:#}");
+        server.verify().await;
     }
 
     /// 503 twice, then success — the backoff schedule retries (3 tries total).

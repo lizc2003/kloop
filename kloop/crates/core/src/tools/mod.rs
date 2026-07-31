@@ -131,7 +131,26 @@ impl ToolExecution {
 
 pub trait ToolSource: Send + Sync {
     /// Tool definitions as advertised by the source (schema passed through).
-    fn defs(&self) -> &[ToolDef];
+    fn defs(&self) -> Arc<[ToolDef]>;
+    fn should_defer(&self, _tool: &str) -> bool {
+        false
+    }
+    /// Monotonic definition generation for a tool. Dynamic sources increment
+    /// this only after atomically publishing a replacement catalog; tool_search
+    /// binds each unlock to the generation whose schema it returned.
+    fn definition_generation(&self, _tool: &str) -> u64 {
+        0
+    }
+    /// One definition and the generation it belongs to. Dynamic sources
+    /// override this so tool_search cannot bind a pre-refresh schema to a
+    /// post-refresh generation.
+    fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+        self.defs()
+            .iter()
+            .find(|def| def.name == tool)
+            .cloned()
+            .map(|def| (def, self.definition_generation(tool)))
+    }
     /// Whether this tool was explicitly marked read-only in config, making
     /// it eligible for concurrent dispatch. External tools default to NOT
     /// read-only — serial. (The permission gate is independent: external
@@ -145,6 +164,17 @@ pub trait ToolSource: Send + Sync {
         tool: &'a str,
         input: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>>;
+    /// Execute against the definition generation the caller discovered. Static
+    /// sources use the default; dynamic sources reject a stale generation before
+    /// routing the input to a replacement schema.
+    fn call_at_generation<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a Value,
+        _generation: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+        self.call(tool, input)
+    }
 }
 
 /// Per-call sink a code-mode program call carries: a tool drops a structured
@@ -190,8 +220,8 @@ pub struct ToolCtx {
 ///
 /// Past `defer_threshold` total tools the source defs are withheld: the model
 /// gets built-ins + tool_search only, and loads deferred definitions through
-/// search results. The returned array is then stable for the whole session —
-/// unlocking never mutates it (prompt-cache friendliness is the point).
+/// search results. Unlocking does not mutate the returned array; a dynamic
+/// source refresh is picked up when the agent rebuilds the next round.
 pub fn all_tool_defs(
     depth: u8,
     sources: &[Arc<dyn ToolSource>],
@@ -199,29 +229,24 @@ pub fn all_tool_defs(
     surface: crate::config::SurfaceCapabilities,
 ) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth);
-    let deferred_regime = defer_active(sources, defer_threshold);
-    // Source tools the program's TypeScript API declares in full (inline
-    // regime) — empty when deferred, where they degrade to a compact name +
-    // description list instead (see `run_program_def`).
-    let inline_sources = if deferred_regime {
+    let merged = merged_source_defs(sources);
+    let deferred = deferred_tool_defs(sources, defer_threshold);
+    let deferred_names: std::collections::HashSet<&str> =
+        deferred.iter().map(|def| def.name.as_str()).collect();
+    if !deferred.is_empty() {
         defs.push(tool_search::tool_search_def());
         defs.push(tool_search::call_tool_def());
-        Vec::new()
-    } else {
-        let merged = merged_source_defs(sources);
-        defs.extend(merged.iter().cloned());
-        merged
-    };
+    }
+    let inline_sources: Vec<ToolDef> = merged
+        .into_iter()
+        .filter(|def| !deferred_names.contains(def.name.as_str()))
+        .collect();
+    defs.extend(inline_sources.iter().cloned());
     // run_program is depth-0 only (like task). Now that sources are visible, its
     // TypeScript API can list them: full declarations for inline source tools
     // (typed `Promise<CallToolResult>`), or a compact manifest for deferred
     // ones — both callable at runtime.
     if depth == 0 {
-        let deferred = if deferred_regime {
-            deferred_tool_defs(sources, defer_threshold)
-        } else {
-            Vec::new()
-        };
         defs.push(codemode::run_program_def(
             &builtin_defs(0),
             &inline_sources,
@@ -254,27 +279,35 @@ pub fn all_tool_defs(
     defs
 }
 
-/// Whether the deferred-tools regime is on. The verdict is computed from the
-/// depth-0 view (the most built-ins) and holds session-wide, so parent and
-/// sub-agents never disagree about which tools are deferred.
+/// Whether the current depth-0 source snapshot has deferred tools. Parent and
+/// sub-agents use the same threshold; a dynamic source refresh may change the
+/// verdict at the next sampling round.
 pub fn defer_active(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> bool {
-    tool_defs(0).len() + merged_source_defs(sources).len() > defer_threshold
+    !deferred_tool_defs(sources, defer_threshold).is_empty()
 }
 
-/// The source tools hidden behind tool_search: every merged source def when
-/// deferral is active, none otherwise. Collision-skipped defs are excluded —
-/// they are not callable, so they must not be discoverable either.
+/// The source tools hidden behind tool_search. An oversized catalog defers all
+/// merged source tools; a source may also force selected helpers to remain
+/// deferred even below the global threshold.
 pub fn deferred_tool_defs(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<ToolDef> {
-    if defer_active(sources, defer_threshold) {
-        merged_source_defs(sources)
-    } else {
-        Vec::new()
+    let merged = merged_source_defs(sources);
+    if tool_defs(0).len() + merged.len() > defer_threshold {
+        return merged;
     }
+    merged
+        .into_iter()
+        .filter(|def| {
+            find_source(sources, &def.name).is_some_and(|source| source.should_defer(&def.name))
+        })
+        .collect()
 }
 
 fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
     seen.extend(
         [
+            "skill",
+            "tool_search",
+            "call_tool",
             "ask_user_question",
             "enter_plan_mode",
             "exit_plan_mode",
@@ -294,7 +327,8 @@ fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
     reserve_surface_names(&mut seen);
     let mut defs = Vec::new();
     for source in sources {
-        for def in source.defs() {
+        let source_defs = source.defs();
+        for def in source_defs.iter() {
             if seen.insert(def.name.clone()) {
                 defs.push(def.clone());
             }
@@ -312,7 +346,8 @@ pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usi
         tool_defs(0).into_iter().map(|d| d.name).collect();
     reserve_surface_names(&mut seen);
     for source in sources {
-        for def in source.defs() {
+        let source_defs = source.defs();
+        for def in source_defs.iter() {
             if !seen.insert(def.name.clone()) {
                 warnings.push(format!(
                     "tool name collision: '{}' is already registered; the later definition is skipped",
@@ -334,10 +369,30 @@ fn find_source<'a>(
     sources: &'a [Arc<dyn ToolSource>],
     name: &str,
 ) -> Option<&'a Arc<dyn ToolSource>> {
+    let mut reserved: std::collections::HashSet<String> =
+        tool_defs(0).into_iter().map(|def| def.name).collect();
+    reserve_surface_names(&mut reserved);
+    if reserved.contains(name) {
+        return None;
+    }
     // First source claiming the name wins, mirroring the merge order.
     sources
         .iter()
-        .find(|s| s.defs().iter().any(|d| d.name == name))
+        .find(|source| source.defs().iter().any(|def| def.name == name))
+}
+
+pub(super) fn source_definition_snapshot(
+    sources: &[Arc<dyn ToolSource>],
+    name: &str,
+) -> Option<(ToolDef, u64)> {
+    find_source(sources, name)?.definition_snapshot(name)
+}
+
+pub(super) fn source_definition_generation(
+    sources: &[Arc<dyn ToolSource>],
+    name: &str,
+) -> Option<u64> {
+    source_definition_snapshot(sources, name).map(|(_, generation)| generation)
 }
 
 /// The built-in tool defs (bash, file, search, todo, and — at depth 0 —
@@ -687,6 +742,8 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
             );
         }
+        let expected_source_generation =
+            tool_search::unlocked_generation_for_dispatch(&name, &ctx.cfg);
         // pre_tool hooks run BEFORE the permission gate: hooks are automation
         // policy, permissions are the human's last word — a hook block means
         // there is nothing left to ask about.
@@ -748,6 +805,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             &input,
             prepared_read.as_ref(),
             prepared_mutation.as_ref(),
+            expected_source_generation,
             &ctx,
         )
         .await;
@@ -865,6 +923,7 @@ fn execute_tool<'a>(
     input: &'a Value,
     prepared_read: Option<&'a fs::PreparedRead>,
     prepared_mutation: Option<&'a fs::PreparedMutation>,
+    expected_source_generation: Option<u64>,
     ctx: &'a ToolCtx,
 ) -> Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>> {
     Box::pin(async move {
@@ -912,7 +971,10 @@ fn execute_tool<'a>(
         // text-returning built-ins so their result can be Text OR Blocks. A
         // program still gets the structured form via the sink.
         if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
-            return match source.call(name, input).await {
+            return match source
+                .call_at_generation(name, input, expected_source_generation)
+                .await
+            {
                 Ok(out) => {
                     if let Some(slot) = &ctx.program_result {
                         *slot.lock().unwrap() = out.structured.clone();
@@ -1184,8 +1246,8 @@ mod tests {
     }
 
     impl ToolSource for StubSource {
-        fn defs(&self) -> &[ToolDef] {
-            &self.defs
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(self.defs.clone())
         }
 
         fn is_readonly(&self, tool: &str) -> bool {
@@ -1292,6 +1354,89 @@ mod tests {
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
+    }
+
+    #[test]
+    fn source_can_force_only_selected_tools_to_defer() {
+        struct ForcedSource {
+            defs: Vec<ToolDef>,
+        }
+        impl ToolSource for ForcedSource {
+            fn defs(&self) -> Arc<[ToolDef]> {
+                Arc::from(self.defs.clone())
+            }
+            fn should_defer(&self, tool: &str) -> bool {
+                tool == "srv__resource_helper"
+            }
+            fn is_readonly(&self, _tool: &str) -> bool {
+                true
+            }
+            fn call<'a>(
+                &'a self,
+                _tool: &'a str,
+                _input: &'a Value,
+            ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+                Box::pin(async { Ok(SourceOutput::text("ok".into())) })
+            }
+        }
+        let source: Arc<dyn ToolSource> = Arc::new(ForcedSource {
+            defs: vec![
+                ToolDef {
+                    name: "srv__inline".into(),
+                    description: "inline".into(),
+                    schema: json!({"type": "object"}),
+                },
+                ToolDef {
+                    name: "srv__resource_helper".into(),
+                    description: "deferred".into(),
+                    schema: json!({"type": "object"}),
+                },
+            ],
+        });
+        let sources = vec![source];
+        let defs = all_tool_defs(0, &sources, usize::MAX, interactive_surface());
+        let names: Vec<&str> = defs.iter().map(|def| def.name.as_str()).collect();
+        assert!(names.contains(&"srv__inline"));
+        assert!(names.contains(&"tool_search"));
+        assert!(names.contains(&"call_tool"));
+        assert!(!names.contains(&"srv__resource_helper"));
+        assert_eq!(
+            deferred_tool_defs(&sources, usize::MAX),
+            vec![ToolDef {
+                name: "srv__resource_helper".into(),
+                description: "deferred".into(),
+                schema: json!({"type": "object"}),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn builtins_shadow_colliding_sources_at_dispatch() {
+        let source: Arc<dyn ToolSource> = Arc::new(StubSource {
+            defs: vec![ToolDef {
+                name: "bash".into(),
+                description: "impostor".into(),
+                schema: json!({"type": "object"}),
+            }],
+            readonly: "bash".into(),
+        });
+        let ctx = test_ctx_with_sources(0, "builtin-shadow", vec![source]);
+        let (direct, direct_error) =
+            run_tool("bash", json!({"command": "printf BUILTIN-54"}), &ctx).await;
+        assert!(!direct_error, "{direct}");
+        assert_eq!(direct, "BUILTIN-54");
+
+        let (wrapped, wrapped_error) = run_tool(
+            "call_tool",
+            json!({
+                "tool_name": "bash",
+                "params": {"command": "printf WRAPPED-BUILTIN-54"}
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!wrapped_error, "{wrapped}");
+        assert_eq!(wrapped, "WRAPPED-BUILTIN-54");
     }
 
     #[test]

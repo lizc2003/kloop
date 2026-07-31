@@ -9,15 +9,24 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use serde_json::json;
 use serde_json::Value;
 
 use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
 use kloop_mcp::McpClient;
+use kloop_mcp::McpNotification;
+use kloop_mcp::McpResource;
+use kloop_mcp::McpRpcError;
+use kloop_mcp::McpServerCapabilities;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::ToolDef;
 use kloop_server::McpServerState;
 use kloop_server::McpServerStatus;
@@ -31,6 +40,18 @@ use crate::mcp_auth::CredentialStore;
 /// "p"-persisted allow rule parses back on the next start). 64 is the
 /// stricter (OpenAI-compat) length limit.
 const MAX_TOOL_NAME_LEN: usize = 64;
+const MAX_AGGREGATE_RESOURCE_ITEMS: usize = 10_000;
+const MAX_AGGREGATE_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
+const TOOL_REFRESH_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(500)];
+const DYNAMIC_CATALOG_UNSUPPORTED: &str = "server advertises tools/list_changed, but this transport has no notification stream; the startup tool catalog will remain fixed";
+
+fn dynamic_catalog_message(
+    capabilities: &McpServerCapabilities,
+    has_notifications: bool,
+) -> Option<&'static str> {
+    (capabilities.tools_list_changed && !has_notifications).then_some(DYNAMIC_CATALOG_UNSUPPORTED)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -280,22 +301,59 @@ pub fn qualified_name(server: &str, tool: &str) -> String {
     format!("{}__{}", sanitize(server), sanitize(tool))
 }
 
-/// One connected server exposed through core's tool seam. Names in `defs`
-/// are qualified; the map recovers the raw wire name per call.
-struct McpToolSource {
-    client: McpClient,
-    defs: Vec<ToolDef>,
+/// One immutable tool-generation snapshot. A tools/list_changed refresh builds
+/// the complete replacement first, then publishes it under one write lock.
+struct McpToolCatalog {
+    generation: u64,
+    defs: Arc<[ToolDef]>,
     raw_names: HashMap<String, String>,
     readonly: HashSet<String>,
 }
 
+/// One connected server exposed through core's tool seam. Calls hold the read
+/// side of `refresh_gate` through the wire request; refresh takes the write side
+/// before listing and publishing. Thus an old-generation call either finishes
+/// before publication or observes the replacement and rejects as stale.
+struct McpToolSource {
+    client: Arc<McpClient>,
+    server: McpServerConfig,
+    catalog: RwLock<Arc<McpToolCatalog>>,
+    refresh_gate: tokio::sync::RwLock<()>,
+}
+
+impl McpToolSource {
+    async fn refresh(&self) -> Result<()> {
+        let _refresh = self.refresh_gate.write().await;
+        let advertised = self.client.list_tools().await?;
+        let mut catalog = self.catalog.write().unwrap();
+        let generation = catalog.generation.wrapping_add(1);
+        let next = Arc::new(build_catalog(&self.server, generation, advertised, &|_| {}));
+        *catalog = next;
+        Ok(())
+    }
+}
+
 impl ToolSource for McpToolSource {
-    fn defs(&self) -> &[ToolDef] {
-        &self.defs
+    fn defs(&self) -> Arc<[ToolDef]> {
+        self.catalog.read().unwrap().defs.clone()
+    }
+
+    fn definition_generation(&self, _tool: &str) -> u64 {
+        self.catalog.read().unwrap().generation
+    }
+
+    fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+        let catalog = self.catalog.read().unwrap();
+        catalog
+            .defs
+            .iter()
+            .find(|def| def.name == tool)
+            .cloned()
+            .map(|def| (def, catalog.generation))
     }
 
     fn is_readonly(&self, tool: &str) -> bool {
-        self.readonly.contains(tool)
+        self.catalog.read().unwrap().readonly.contains(tool)
     }
 
     fn call<'a>(
@@ -303,16 +361,29 @@ impl ToolSource for McpToolSource {
         tool: &'a str,
         input: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+        self.call_at_generation(tool, input, None)
+    }
+
+    fn call_at_generation<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a Value,
+        generation: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
         Box::pin(async move {
-            let raw = self
+            let _call = self.refresh_gate.read().await;
+            let catalog = self.catalog.read().unwrap().clone();
+            if generation.is_some_and(|generation| generation != catalog.generation) {
+                bail!(
+                    "MCP tool definition changed after discovery; run tool_search for {tool} again before retrying"
+                );
+            }
+            let raw = catalog
                 .raw_names
                 .get(tool)
+                .cloned()
                 .with_context(|| format!("unknown mcp tool: {tool}"))?;
-            // One wire call: the structured CallToolResult for a program, its
-            // flattened text for the model-facing tool_result, and — when the
-            // result carries a usable image — content blocks so the model sees
-            // the picture instead of an `[image: …]` tag.
-            let structured = self.client.call_tool_structured(raw, input).await?;
+            let structured = self.client.call_tool_structured(&raw, input).await?;
             let text = kloop_mcp::render_result(&structured);
             let blocks = kloop_mcp::content_blocks(&structured["content"]);
             Ok(SourceOutput {
@@ -324,14 +395,14 @@ impl ToolSource for McpToolSource {
     }
 }
 
-/// Namespace a server's advertised tools, dropping (with a warning) any
-/// whose qualified name is oversized or collides after sanitization.
-fn build_source(
+/// Namespace a server's advertised tools, dropping any oversized or sanitized
+/// collision. The same builder is used at startup and for every refresh.
+fn build_catalog(
     server: &McpServerConfig,
-    client: McpClient,
+    generation: u64,
     advertised: Vec<ToolDef>,
     warn: &dyn Fn(&str),
-) -> McpToolSource {
+) -> McpToolCatalog {
     let readonly_raw: HashSet<&str> = server.readonly.iter().map(String::as_str).collect();
     let mut defs = Vec::new();
     let mut raw_names = HashMap::new();
@@ -360,12 +431,474 @@ fn build_source(
         def.name = qualified;
         defs.push(def);
     }
-    McpToolSource {
-        client,
-        defs,
+    McpToolCatalog {
+        generation,
+        defs: Arc::from(defs),
         raw_names,
         readonly,
     }
+}
+
+fn build_source(
+    server: &McpServerConfig,
+    client: Arc<McpClient>,
+    advertised: Vec<ToolDef>,
+    warn: &dyn Fn(&str),
+) -> Arc<McpToolSource> {
+    Arc::new(McpToolSource {
+        client,
+        server: server.clone(),
+        catalog: RwLock::new(Arc::new(build_catalog(server, 0, advertised, warn))),
+        refresh_gate: tokio::sync::RwLock::new(()),
+    })
+}
+
+async fn retry_tool_refresh_with_delays<F, Fut>(delays: &[Duration], mut refresh: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut last_error = None;
+    for attempt in 0..=delays.len() {
+        match refresh().await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if let Some(delay) = delays.get(attempt) {
+            tokio::time::sleep(*delay).await;
+        }
+    }
+    Err(last_error.expect("refresh loop always attempts at least once"))
+}
+
+fn spawn_tool_refresh(
+    source: Arc<McpToolSource>,
+    mut notifications: tokio::sync::broadcast::Receiver<McpNotification>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let refresh_needed = match notifications.recv().await {
+                Ok(McpNotification::ToolsListChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                Ok(McpNotification::ResourcesListChanged)
+                | Ok(McpNotification::ResourceUpdated { .. }) => false,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if !refresh_needed {
+                continue;
+            }
+
+            let mut closed = false;
+            loop {
+                match notifications.try_recv() {
+                    Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            let _ = retry_tool_refresh_with_delays(&TOOL_REFRESH_RETRY_DELAYS, || source.refresh())
+                .await;
+            if closed {
+                break;
+            }
+        }
+    });
+}
+
+const LIST_MCP_RESOURCES: &str = "list_mcp_resources";
+const READ_MCP_RESOURCE: &str = "read_mcp_resource";
+const READ_MCP_RESOURCE_DIR: &str = "read_mcp_resource_dir";
+
+#[derive(Clone)]
+struct McpResourceServer {
+    name: String,
+    client: Arc<McpClient>,
+    capabilities: McpServerCapabilities,
+}
+
+struct McpResourceSource {
+    defs: Arc<[ToolDef]>,
+    servers: Vec<McpResourceServer>,
+}
+
+impl McpResourceSource {
+    fn new(servers: Vec<McpResourceServer>) -> Self {
+        let defs = vec![
+            ToolDef {
+                name: LIST_MCP_RESOURCES.into(),
+                description: "List resources advertised by configured MCP servers. Pass server to filter; omit it to aggregate every resources-capable server. Returned entries preserve standard MCP fields and add server.".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Optional MCP server name"}
+                    },
+                    "additionalProperties": false
+                }),
+            },
+            ToolDef {
+                name: READ_MCP_RESOURCE.into(),
+                description: "Read one currently advertised MCP resource by server and URI. The call requires normal external-tool approval. Text is returned inline; supported image blobs become image blocks; other blobs are reported without injecting base64 into the model context.".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string"},
+                        "uri": {"type": "string"}
+                    },
+                    "required": ["server", "uri"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDef {
+                name: READ_MCP_RESOURCE_DIR.into(),
+                description: "List direct children of a currently advertised MCP directory resource through the io.modelcontextprotocol/skills directoryRead extension. The call requires normal external-tool approval and the listing is not recursive.".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string"},
+                        "uri": {"type": "string"}
+                    },
+                    "required": ["server", "uri"],
+                    "additionalProperties": false
+                }),
+            },
+        ];
+        McpResourceSource {
+            defs: Arc::from(defs),
+            servers,
+        }
+    }
+
+    fn server(&self, requested: &str) -> Result<McpResourceServer> {
+        let normalized = normalize_server_name(requested);
+        self.servers
+            .iter()
+            .find(|server| {
+                server.name == requested || normalize_server_name(&server.name) == normalized
+            })
+            .cloned()
+            .with_context(|| {
+                let available = self
+                    .servers
+                    .iter()
+                    .map(|server| server.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Server \"{requested}\" not found. Available servers: {available}")
+            })
+    }
+
+    async fn list(&self, requested: Option<&str>) -> Result<SourceOutput> {
+        let selected: Vec<McpResourceServer> = match requested {
+            Some(name) => vec![self.server(name)?],
+            None => self.servers.clone(),
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, server) in selected.into_iter().enumerate() {
+            tasks.spawn(async move {
+                let result = server.client.list_resources().await;
+                (index, server.name, result)
+            });
+        }
+        let mut groups = Vec::new();
+        let mut failures = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let (index, server, result) = result.context("MCP resource listing task failed")?;
+            match result {
+                Ok(resources) => groups.push((index, server, resources)),
+                Err(error) => failures.push((index, server, error)),
+            }
+        }
+        groups.sort_by_key(|(index, _, _)| *index);
+        failures.sort_by_key(|(index, _, _)| *index);
+        if groups.is_empty() && failures.len() == 1 {
+            let (_, server, error) = failures.pop().unwrap();
+            return Err(error)
+                .with_context(|| format!("MCP resource listing failed for server \"{server}\""));
+        }
+        if groups.is_empty() && !failures.is_empty() {
+            let names = failures
+                .iter()
+                .map(|(_, server, _)| server.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("MCP resource listing failed for every selected server: {names}");
+        }
+
+        let mut values = Vec::new();
+        let mut total_bytes = 0;
+        for (_, server, resources) in groups {
+            for resource in &resources {
+                let value = resource_value(resource, &server);
+                total_bytes += serde_json::to_vec(&value)?.len();
+                if values.len() >= MAX_AGGREGATE_RESOURCE_ITEMS
+                    || total_bytes > MAX_AGGREGATE_RESOURCE_BYTES
+                {
+                    bail!("aggregated MCP resource catalog exceeds the tool result budget");
+                }
+                values.push(value);
+            }
+        }
+        let failed_servers = failures
+            .iter()
+            .map(|(_, server, _)| server.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let partial_failure = (!failed_servers.is_empty())
+            .then(|| format!("\n\nResource listing failed for server(s): {failed_servers}"));
+        if values.is_empty() {
+            return Ok(SourceOutput {
+                text: format!(
+                    "No resources found. MCP servers may still provide tools even if they have no resources.{}",
+                    partial_failure.as_deref().unwrap_or("")
+                ),
+                blocks: None,
+                structured: Some(Value::Array(Vec::new())),
+            });
+        }
+        Ok(SourceOutput {
+            text: format!(
+                "{}{}",
+                serde_json::to_string(&values)?,
+                partial_failure.as_deref().unwrap_or("")
+            ),
+            blocks: None,
+            structured: Some(Value::Array(values)),
+        })
+    }
+
+    async fn require_advertised_uri(&self, server: &McpResourceServer, uri: &str) -> Result<()> {
+        let resources =
+            server.client.list_resources().await.with_context(|| {
+                format!("cannot refresh resources from server \"{}\"", server.name)
+            })?;
+        if resources.iter().any(|resource| resource.uri == uri) {
+            return Ok(());
+        }
+        bail!(
+            "Resource URI is not currently advertised by server \"{}\": {uri}. Re-run list_mcp_resources to refresh.",
+            server.name
+        )
+    }
+
+    async fn read(&self, server_name: &str, uri: &str) -> Result<SourceOutput> {
+        let server = self.server(server_name)?;
+        self.require_advertised_uri(&server, uri).await?;
+        let read = match server.client.read_resource(uri).await {
+            Ok(read) => read,
+            Err(error) => {
+                match rpc_code(&error) {
+                    Some(-32601) => bail!(
+                        "Server \"{}\" advertises resource support but does not implement resource reads.",
+                        server.name
+                    ),
+                    Some(-32002 | -32602) => {
+                        let directory_hint = server.capabilities.directory_read.then_some(
+                            " If the URI is a directory resource, use read_mcp_resource_dir instead.",
+                        );
+                        bail!(
+                            "Resource not found: {uri} — it may have been deleted or the URI is stale. Re-run list_mcp_resources to refresh.{}",
+                            directory_hint.unwrap_or("")
+                        )
+                    }
+                    _ => return Err(error),
+                }
+            }
+        };
+        let mut rendered = Vec::new();
+        let mut images = Vec::new();
+        for content in &read.contents {
+            if let Some(text) = &content.text {
+                rendered.push(json!({
+                    "uri": content.uri,
+                    "mimeType": content.mime_type,
+                    "text": text,
+                }));
+                continue;
+            }
+            let mime = content
+                .mime_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            if supported_image_mime(mime) {
+                if let Some(blob) = &content.blob {
+                    images.push(ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: mime.to_string(),
+                            data: blob.clone(),
+                        },
+                    });
+                }
+                rendered.push(json!({
+                    "uri": content.uri,
+                    "mimeType": content.mime_type,
+                    "text": format!("[binary image resource from {} at {}]", server.name, content.uri),
+                }));
+            } else {
+                rendered.push(json!({
+                    "uri": content.uri,
+                    "mimeType": content.mime_type,
+                    "text": format!("Binary resource from {} at {} was not injected into model context", server.name, content.uri),
+                }));
+            }
+        }
+        let value = json!({"contents": rendered});
+        let text = serde_json::to_string(&value)?;
+        let blocks = if images.is_empty() {
+            None
+        } else {
+            let mut blocks = vec![ContentBlock::Text { text: text.clone() }];
+            blocks.extend(images);
+            Some(blocks)
+        };
+        Ok(SourceOutput {
+            text,
+            blocks,
+            structured: Some(read.raw),
+        })
+    }
+
+    async fn directory(&self, server_name: &str, uri: &str) -> Result<SourceOutput> {
+        let server = self.server(server_name)?;
+        if !server.capabilities.directory_read {
+            bail!(
+                "Server \"{}\" does not support directory listing.",
+                server.name
+            );
+        }
+        self.require_advertised_uri(&server, uri).await?;
+        let resources = match server.client.read_resource_directory(uri).await {
+            Ok(resources) => resources,
+            Err(error) if rpc_code(&error) == Some(-32602) => {
+                bail!(
+                    "Not a directory resource: {uri}. If it is a file resource, use read_mcp_resource instead."
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        let values: Vec<Value> = resources
+            .iter()
+            .map(|resource| {
+                json!({
+                    "uri": clean_resource_text(&resource.uri),
+                    "name": clean_resource_text(&resource.name),
+                    "mimeType": resource.mime_type.as_deref().map(clean_resource_text),
+                })
+            })
+            .collect();
+        let value = json!({"resources": values});
+        let listing = if resources.is_empty() {
+            "Directory is empty.".to_string()
+        } else {
+            let names = resources
+                .iter()
+                .map(|resource| {
+                    let suffix = if resource.mime_type.as_deref() == Some("inode/directory") {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    format!("{}{suffix}", clean_resource_text(&resource.name))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Directory listing ({} entries):\n{names}", resources.len())
+        };
+        Ok(SourceOutput {
+            text: format!("{listing}\n\n{}", serde_json::to_string(&value)?),
+            blocks: None,
+            structured: Some(value),
+        })
+    }
+}
+
+impl ToolSource for McpResourceSource {
+    fn defs(&self) -> Arc<[ToolDef]> {
+        self.defs.clone()
+    }
+
+    fn should_defer(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn is_readonly(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+        Box::pin(async move {
+            match tool {
+                LIST_MCP_RESOURCES => {
+                    let server = input.get("server").and_then(Value::as_str);
+                    self.list(server).await
+                }
+                READ_MCP_RESOURCE => {
+                    let server = required_resource_arg(input, "server", tool)?;
+                    let uri = required_resource_arg(input, "uri", tool)?;
+                    self.read(server, uri).await
+                }
+                READ_MCP_RESOURCE_DIR => {
+                    let server = required_resource_arg(input, "server", tool)?;
+                    let uri = required_resource_arg(input, "uri", tool)?;
+                    self.directory(server, uri).await
+                }
+                _ => bail!("unknown MCP resource tool: {tool}"),
+            }
+        })
+    }
+}
+
+fn required_resource_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
+    input[key]
+        .as_str()
+        .with_context(|| format!("{tool}: missing required string argument '{key}'"))
+}
+
+fn normalize_server_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn resource_value(resource: &McpResource, server: &str) -> Value {
+    let mut value = resource.raw.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("server".into(), Value::String(server.to_string()));
+    }
+    value
+}
+
+fn rpc_code(error: &anyhow::Error) -> Option<i64> {
+    error
+        .downcast_ref::<McpRpcError>()
+        .map(|rpc_error| rpc_error.code)
+}
+
+fn supported_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+fn clean_resource_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    *character,
+                    '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+                )
+        })
+        .collect()
 }
 
 /// Spawn + handshake + tool discovery for every configured server. A failing
@@ -376,6 +909,7 @@ pub async fn connect_servers(
 ) -> Result<McpConnections> {
     let store = Arc::new(CredentialStore::default_path()?);
     let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+    let mut resource_servers = Vec::new();
     let mut statuses = Vec::new();
     for server in servers {
         let transport = server.transport.kind();
@@ -407,22 +941,33 @@ pub async fn connect_servers(
                     McpClient::http(url.clone(), headers, oauth)?
                 }
             };
-            client.initialize().await?;
+            let client = Arc::new(client);
+            let capabilities = client.initialize().await?;
+            let notifications = capabilities
+                .tools_list_changed
+                .then(|| client.subscribe_notifications())
+                .flatten();
             let advertised = client.list_tools().await?;
-            anyhow::Ok((client, advertised))
+            anyhow::Ok((client, capabilities, notifications, advertised))
         };
         match connect.await {
-            Ok((client, advertised)) => {
+            Ok((client, capabilities, notifications, advertised)) => {
                 let count = advertised.len();
-                let source = build_source(&server, client, advertised, warn);
+                let source = build_source(&server, client.clone(), advertised, warn);
                 let tools = source
-                    .defs
+                    .defs()
                     .iter()
                     .map(|def| McpToolInfo {
                         name: def.name.clone(),
                         description: def.description.clone(),
                     })
                     .collect();
+                let dynamic_message =
+                    dynamic_catalog_message(&capabilities, notifications.is_some())
+                        .map(str::to_string);
+                if let Some(message) = &dynamic_message {
+                    warn(&format!("mcp server '{}': {message}", server.name));
+                }
                 warn(&format!(
                     "mcp server '{}': connected, {count} tool(s)",
                     server.name
@@ -432,9 +977,19 @@ pub async fn connect_servers(
                     transport,
                     state: McpServerState::Connected,
                     tools,
-                    message: None,
+                    message: dynamic_message,
                 });
-                sources.push(Arc::new(source));
+                if capabilities.resources {
+                    resource_servers.push(McpResourceServer {
+                        name: server.name.clone(),
+                        client,
+                        capabilities,
+                    });
+                }
+                if let Some(notifications) = notifications {
+                    spawn_tool_refresh(source.clone(), notifications);
+                }
+                sources.push(source);
             }
             Err(_) => {
                 let hint = if oauth_capable {
@@ -459,12 +1014,74 @@ pub async fn connect_servers(
             }
         }
     }
+    if !resource_servers.is_empty() {
+        sources.push(Arc::new(McpResourceSource::new(resource_servers)));
+    }
     Ok(McpConnections { sources, statuses })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ResourceServerEnd {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    impl ResourceServerEnd {
+        async fn recv(&mut self) -> Value {
+            let line = self
+                .lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("client closed unexpectedly");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn send(&mut self, message: Value) {
+            use tokio::io::AsyncWriteExt;
+            let mut line = message.to_string();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn respond(&mut self, id: &Value, result: Value) {
+            self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                .await;
+        }
+
+        async fn respond_error(&mut self, id: &Value, code: i64, message: &str) {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": code, "message": message}
+            }))
+            .await;
+        }
+    }
+
+    fn resource_pair(name: &str) -> (McpResourceServer, ResourceServerEnd) {
+        use tokio::io::AsyncBufReadExt;
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = tokio::io::split(client_io);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        (
+            McpResourceServer {
+                name: name.into(),
+                client: Arc::new(McpClient::over(reader, writer, None)),
+                capabilities: McpServerCapabilities {
+                    resources: true,
+                    ..Default::default()
+                },
+            },
+            ResourceServerEnd {
+                lines: tokio::io::BufReader::new(server_reader).lines(),
+                writer: server_writer,
+            },
+        )
+    }
 
     fn config(content: &str) -> toml::Table {
         content.parse().unwrap()
@@ -665,6 +1282,254 @@ oauth_scopes = ["mcp.read", "mcp.write"]
         );
         assert!(!warnings[0].contains("SUPER-SECRET"));
         assert!(!warnings[0].contains("kloop-mcp-secret"));
+    }
+
+    #[tokio::test]
+    async fn resource_reads_require_a_currently_advertised_uri() {
+        let (server, mut wire) = resource_pair("fixture");
+        let source = McpResourceSource::new(vec![server]);
+        let server_task = tokio::spawn(async move {
+            let request = wire.recv().await;
+            assert_eq!(request["method"], "resources/list");
+            wire.respond(
+                &request["id"],
+                json!({
+                    "resources": [{
+                        "uri": "fixture://note",
+                        "name": "note",
+                        "mimeType": "text/plain"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        let error = match source.read("fixture", "fixture://secret").await {
+            Ok(_) => panic!("unadvertised URI unexpectedly reached resources/read"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not currently advertised"));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resource_listing_propagates_single_server_errors() {
+        let (server, mut wire) = resource_pair("broken");
+        let source = McpResourceSource::new(vec![server]);
+        let server_task = tokio::spawn(async move {
+            let request = wire.recv().await;
+            assert_eq!(request["method"], "resources/list");
+            wire.respond_error(&request["id"], -32601, "not implemented")
+                .await;
+        });
+
+        let error = match source.list(Some("broken")).await {
+            Ok(_) => panic!("server failure was reported as an empty catalog"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("resource listing failed for server \"broken\""));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aggregate_resource_listing_preserves_partial_failures() {
+        let (good, mut good_wire) = resource_pair("good");
+        let (bad, mut bad_wire) = resource_pair("bad");
+        let source = McpResourceSource::new(vec![good, bad]);
+        let good_task = tokio::spawn(async move {
+            let request = good_wire.recv().await;
+            good_wire
+                .respond(
+                    &request["id"],
+                    json!({
+                        "resources": [{
+                            "uri": "fixture://note",
+                            "name": "note",
+                            "mimeType": "text/plain"
+                        }]
+                    }),
+                )
+                .await;
+        });
+        let bad_task = tokio::spawn(async move {
+            let request = bad_wire.recv().await;
+            bad_wire
+                .respond_error(&request["id"], -32000, "temporarily unavailable")
+                .await;
+        });
+
+        let output = source.list(None).await.unwrap();
+        assert!(output.text.contains("\"server\":\"good\""));
+        assert!(output
+            .text
+            .contains("Resource listing failed for server(s): bad"));
+        assert_eq!(
+            output.structured,
+            Some(Value::Array(vec![json!({
+                "uri": "fixture://note",
+                "name": "note",
+                "mimeType": "text/plain",
+                "server": "good"
+            })]))
+        );
+        good_task.await.unwrap();
+        bad_task.await.unwrap();
+    }
+
+    #[test]
+    fn dynamic_catalog_boundary_is_explicit_without_notifications() {
+        let capabilities = McpServerCapabilities {
+            tools_list_changed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_catalog_message(&capabilities, false),
+            Some(DYNAMIC_CATALOG_UNSUPPORTED)
+        );
+        assert_eq!(dynamic_catalog_message(&capabilities, true), None);
+        assert_eq!(
+            dynamic_catalog_message(&McpServerCapabilities::default(), false),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_source_rejects_calls_against_a_stale_definition_generation() {
+        let (client_io, _server_io) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client_io);
+        let client = Arc::new(McpClient::over(reader, writer, None));
+        let server = McpServerConfig {
+            name: "fixture".into(),
+            transport: McpTransport::Stdio {
+                command: vec!["unused".into()],
+                env: BTreeMap::new(),
+            },
+            readonly: Vec::new(),
+        };
+        let source = build_source(
+            &server,
+            client,
+            vec![ToolDef {
+                name: "echo".into(),
+                description: "echo".into(),
+                schema: json!({"type": "object"}),
+            }],
+            &|_| {},
+        );
+
+        let error = match source
+            .call_at_generation("fixture__echo", &json!({}), Some(1))
+            .await
+        {
+            Ok(_) => panic!("stale generation unexpectedly dispatched"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("definition changed after discovery"));
+    }
+
+    #[tokio::test]
+    async fn refresh_publication_waits_for_in_flight_generation_calls() {
+        let (resource_server, mut wire) = resource_pair("fixture");
+        let server = McpServerConfig {
+            name: "fixture".into(),
+            transport: McpTransport::Stdio {
+                command: vec!["unused".into()],
+                env: BTreeMap::new(),
+            },
+            readonly: Vec::new(),
+        };
+        let source = build_source(
+            &server,
+            resource_server.client,
+            vec![ToolDef {
+                name: "echo".into(),
+                description: "old".into(),
+                schema: json!({"type": "object", "properties": {"old": {"type": "string"}}}),
+            }],
+            &|_| {},
+        );
+
+        let call_source = source.clone();
+        let call = tokio::spawn(async move {
+            call_source
+                .call_at_generation("fixture__echo", &json!({"old": "x"}), Some(0))
+                .await
+        });
+        let call_request = wire.recv().await;
+        assert_eq!(call_request["method"], "tools/call");
+
+        let refresh_source = source.clone();
+        let refresh = tokio::spawn(async move { refresh_source.refresh().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wire.recv())
+                .await
+                .is_err(),
+            "refresh must not publish or list while an old-generation call holds the gate"
+        );
+
+        wire.respond(
+            &call_request["id"],
+            json!({"content": [{"type": "text", "text": "old-result"}]}),
+        )
+        .await;
+        let output = call.await.unwrap().unwrap();
+        assert_eq!(output.text, "old-result");
+
+        let list_request = wire.recv().await;
+        assert_eq!(list_request["method"], "tools/list");
+        wire.respond(
+            &list_request["id"],
+            json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "new",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"new": {"type": "string"}}
+                    }
+                }]
+            }),
+        )
+        .await;
+        refresh.await.unwrap().unwrap();
+        assert_eq!(source.definition_generation("fixture__echo"), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_refresh_retries_transient_failures_with_a_bound() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        retry_tool_refresh_with_delays(&[Duration::ZERO, Duration::ZERO], move || {
+            let seen = seen.clone();
+            async move {
+                let attempt = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if attempt < 2 {
+                    bail!("transient refresh failure");
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let error = retry_tool_refresh_with_delays(&[Duration::ZERO], move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                bail!("permanent refresh failure")
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("permanent refresh failure"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

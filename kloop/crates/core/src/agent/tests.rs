@@ -67,8 +67,8 @@ impl BarrierSource {
 }
 
 impl ToolSource for BarrierSource {
-    fn defs(&self) -> &[ToolDef] {
-        &self.defs
+    fn defs(&self) -> Arc<[ToolDef]> {
+        Arc::from(self.defs.clone())
     }
 
     fn is_readonly(&self, tool: &str) -> bool {
@@ -99,7 +99,7 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
         "required": ["count"],
         "additionalProperties": false
     });
-    let (base, seen) = structured_config(vec![
+    let (cfg, seen) = structured_config(vec![
         MockTurn::Blocks(vec![tool_use_named(
             "s1",
             "StructuredOutput",
@@ -107,16 +107,10 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
         )]),
         MockTurn::Blocks(vec![tool_use_named(
             "s2",
-            "call_tool",
-            json!({
-                "tool_name": "StructuredOutput",
-                "params": {"count": 2}
-            }),
+            "StructuredOutput",
+            json!({"count": 2}),
         )]),
     ]);
-    let mut cfg = (*base).clone();
-    cfg.defer_threshold = 0;
-    let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
     history.record(Message::user_text("return a count"));
@@ -142,9 +136,6 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
             .unwrap();
         assert_eq!(synthetic.schema, schema);
     }
-    assert!(requests
-        .iter()
-        .all(|request| { request.tools.iter().any(|tool| tool.name == "call_tool") }));
     assert!(matches!(
         &history.messages()[2].content[0],
         ContentBlock::ToolResult { is_error: true, .. }
@@ -1488,8 +1479,8 @@ async fn deferred_tools_shrink_defs_inject_notice_and_gate_dispatch() {
         defs: Vec<kloop_protocol::ToolDef>,
     }
     impl ToolSource for Srv {
-        fn defs(&self) -> &[kloop_protocol::ToolDef] {
-            &self.defs
+        fn defs(&self) -> Arc<[kloop_protocol::ToolDef]> {
+            Arc::from(self.defs.clone())
         }
         fn is_readonly(&self, _tool: &str) -> bool {
             false

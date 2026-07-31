@@ -170,50 +170,51 @@ async fn turn_rounds(
     depth: u8,
     options: &TurnOptions,
 ) -> TurnOutcome {
-    let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold, cfg.surface);
-    // The `skill` tool exists only at depth 0 (like `task`) and only when a
-    // model-invocable skill is loaded — user commands (`SkillSource::Command`)
-    // are `/name`-only and don't warrant the tool on their own. Skills are a
-    // top-level orchestration feature: a sub-agent gets a focused task, not the
-    // whole skills catalog (which would otherwise ride every sub-agent request,
-    // and a `fork` skill's own sub-agent could re-trigger it). Added after
-    // all_tool_defs so it is not counted toward the defer threshold or exposed
-    // to run_program's API — it is a prompt-activation seam, not a source tool.
-    // Placed before the allowlist filter so a restricted agent type can gate it
-    // like any tool.
-    let has_model_skill = cfg
-        .skills
-        .iter()
-        .any(|s| s.source == crate::skills::SkillSource::Skill);
-    if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
-        tools.push(crate::tools::skill_tool_def());
-    }
-    // A custom agent type may restrict this sub-agent's tools; the main agent
-    // (None) keeps them all. read_offloaded is never filtered out.
-    if cfg.tool_allowlist.is_some() {
-        let allow = cfg.tool_allowlist.as_deref();
-        tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
-    }
-    if let Some(schema) = &options.structured_schema {
-        // Appended after agent-type filtering: this is an internal completion
-        // protocol, never a user-configurable capability or ordinary tool.
-        tools.push(crate::structured_output::tool_def(schema));
-    }
-    // At depth 0 the task tool exists; list the configured agent types in its
-    // description so the model knows what it can dispatch to.
-    if depth == 0 && !cfg.agent_types.is_empty() {
-        if let Some(task) = tools.iter_mut().find(|t| t.name == "task") {
-            task.description
-                .push_str(&crate::agent_type::agent_types_hint(&cfg.agent_types));
+    let build_tools = || {
+        let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold, cfg.surface);
+        // The `skill` tool exists only at depth 0 (like `task`) and only when a
+        // model-invocable skill is loaded — user commands (`SkillSource::Command`)
+        // are `/name`-only and don't warrant the tool on their own. Skills are a
+        // top-level orchestration feature: a sub-agent gets a focused task, not the
+        // whole skills catalog (which would otherwise ride every sub-agent request,
+        // and a `fork` skill's own sub-agent could re-trigger it). Added after
+        // all_tool_defs so it is not counted toward the defer threshold or exposed
+        // to run_program's API — it is a prompt-activation seam, not a source tool.
+        // Placed before the allowlist filter so a restricted agent type can gate it
+        // like any tool.
+        let has_model_skill = cfg
+            .skills
+            .iter()
+            .any(|s| s.source == crate::skills::SkillSource::Skill);
+        if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
+            tools.push(crate::tools::skill_tool_def());
         }
-    }
+        // A custom agent type may restrict this sub-agent's tools; the main agent
+        // (None) keeps them all. read_offloaded is never filtered out.
+        if cfg.tool_allowlist.is_some() {
+            let allow = cfg.tool_allowlist.as_deref();
+            tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
+        }
+        if let Some(schema) = &options.structured_schema {
+            // Appended after agent-type filtering: this is an internal completion
+            // protocol, never a user-configurable capability or ordinary tool.
+            tools.push(crate::structured_output::tool_def(schema));
+        }
+        // At depth 0 the task tool exists; list the configured agent types in its
+        // description so the model knows what it can dispatch to.
+        if depth == 0 && !cfg.agent_types.is_empty() {
+            if let Some(task) = tools.iter_mut().find(|t| t.name == "task") {
+                task.description
+                    .push_str(&crate::agent_type::agent_types_hint(&cfg.agent_types));
+            }
+        }
+        tools
+    };
+    let mut tools = build_tools();
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
     let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
-    // The injected context message is not part of history, so the overflow
-    // prediction must account for it separately.
-    let instructions_tokens = injected_context(cfg, depth).map_or(0, |s| s.len() as u64 / 4);
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
@@ -238,6 +239,12 @@ async fn turn_rounds(
                 structured_output: None,
             };
         }
+        if rounds > 0 {
+            // MCP list_changed publishes a new source generation between
+            // sampling rounds. Never mutate an in-flight request; rebuild the
+            // next round from one fresh source snapshot instead.
+            tools = build_tools();
+        }
         let round = rounds;
         rounds += 1;
         // Step-boundary steering: deliver anything the user typed during the
@@ -245,6 +252,10 @@ async fn turn_rounds(
         // this round's request. At round 0 the queue is empty (the turn just
         // started) so this is a no-op. Never touches an in-flight request.
         drain_inbox(&cfg.inbox, history);
+        // The injected context is outside history and a dynamic MCP refresh may
+        // replace its deferred-tool notice between rounds, so account for the
+        // current version rather than pinning the turn's first estimate.
+        let instructions_tokens = injected_context(cfg, depth).map_or(0, |s| s.len() as u64 / 4);
         // Predictive: compact BEFORE sampling when this round's estimated
         // growth would overflow the window — don't wait to be rejected.
         if let Some(window) = cfg.context_window {
@@ -614,11 +625,11 @@ approval before making any changes.\n</plan-mode>";
 
 /// The synthetic first user message: the plan-mode reminder (when in plan mode),
 /// project instructions, the skills catalog, and the deferred-tools notice, in
-/// that order. Every part but the mode reminder is session-stable, and the mode
-/// toggles rarely, so the composed message is stable enough for the prompt-cache
-/// prefix to survive across rounds. The skills catalog rides only depth-0
-/// requests (skills are a top-level feature; see the `skill` tool registration
-/// in `turn_rounds`).
+/// that order. Project instructions and the skills catalog are session-stable;
+/// a dynamic MCP catalog may replace the deferred-tools notice at a round
+/// boundary, while the mode reminder changes only on explicit mode toggles. The
+/// skills catalog rides only depth-0 requests (skills are a top-level feature;
+/// see the `skill` tool registration in `turn_rounds`).
 fn injected_context(cfg: &Config, depth: u8) -> Option<String> {
     let plan_reminder = (cfg.effective_permissions().mode() == crate::permissions::Mode::Plan)
         .then(|| PLAN_MODE_REMINDER.to_string());

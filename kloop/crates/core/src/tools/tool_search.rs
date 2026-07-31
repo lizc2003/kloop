@@ -1,8 +1,8 @@
 //! Deferred-tool discovery: the tool_search tool, the injected notice that
 //! tells the model which tools exist but are not loaded, and the dispatch
-//! gate for locked tools. Unlocking is deliberately one-way and only ever
-//! flows through a search hit — the tool defs sent to the model never change
-//! (see `Config.unlocked_tools`).
+//! gate for locked tools. An unlock is bound to the source definition
+//! generation returned by a search hit; catalog refresh invalidates it. The
+//! provider tool array does not change merely because a tool was unlocked.
 
 use anyhow::bail;
 use anyhow::Result;
@@ -20,13 +20,14 @@ const DEFAULT_MAX_RESULTS: usize = 5;
 pub(super) fn tool_search_def() -> ToolDef {
     ToolDef {
         name: "tool_search".into(),
-        description: "Search the deferred tools (listed by name in the context). Matching tools' full definitions are returned in the result and those tools become directly callable from then on. Use \"select:<name>[,<name>...]\" to fetch exact tools by name, or keywords to search names and descriptions.".into(),
+        description: "Search deferred tools and load their full definitions. Use \"select:<name>[,<name>...]\" for exact tools, or keywords (prefix a required term with `+`). After loading, invoke the tool through call_tool; direct calls remain a compatibility optimization for providers that permit undeclared names.".into(),
         schema: json!({
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "\"select:<name>[,<name>...]\" for exact selection, or keywords"},
-                "max_results": {"type": "integer", "description": "Max keyword matches returned (default 5)"}
+                "max_results": {"type": "integer", "minimum": 1, "description": "Max keyword matches returned (default 5)"}
             },
+            "additionalProperties": false,
             "required": ["query"]
         }),
     }
@@ -40,13 +41,14 @@ pub(super) fn tool_search_def() -> ToolDef {
 pub(super) fn call_tool_def() -> ToolDef {
     ToolDef {
         name: "call_tool".into(),
-        description: "Invoke a tool that was loaded via tool_search. Prefer calling loaded tools directly by their own name; use this wrapper only if your runtime rejects such direct calls. The tool must have been loaded by a tool_search first.".into(),
+        description: "Invoke a tool whose definition was loaded via tool_search. This is the standard deferred-tool execution path because it works with providers that reject direct calls to names absent from the original tool array. The inner tool still passes through its normal hooks, permission and concurrency checks.".into(),
         schema: json!({
             "type": "object",
             "properties": {
                 "tool_name": {"type": "string", "description": "Name of the loaded tool to invoke"},
                 "params": {"type": "object", "description": "Arguments for that tool, matching its returned schema"}
             },
+            "additionalProperties": false,
             "required": ["tool_name"]
         }),
     }
@@ -73,9 +75,10 @@ pub(super) fn unwrap_call_tool(name: String, input: Value) -> (String, Value) {
 }
 
 /// The synthetic-context block announcing deferred tools. Lists every
-/// deferred name for the whole session regardless of unlock state, so the
-/// injected message — like the tool defs — stays byte-stable for the prompt
-/// cache. None when deferral is inactive.
+/// deferred name in the current source snapshot regardless of unlock state,
+/// so searching does not perturb the prompt-cache prefix. A dynamic catalog
+/// refresh may replace the list at the next sampling round. None when deferral
+/// is inactive.
 pub fn deferred_notice(cfg: &Config) -> Option<String> {
     let defs = deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold);
     if defs.is_empty() {
@@ -83,7 +86,7 @@ pub fn deferred_notice(cfg: &Config) -> Option<String> {
     }
     let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     Some(format!(
-        "<system-reminder>\nThe following tools exist but are deferred — their definitions are not loaded and calling them before loading fails:\n{}\nTo use one, first call tool_search (query \"select:<name>\" for an exact pick, or keywords to search). Matching definitions are returned in the result and those tools become directly callable. If your runtime rejects direct calls to loaded tools, invoke them through call_tool instead.\n</system-reminder>",
+        "<system-reminder>\nThe following tools exist but are deferred — their definitions are not loaded and calling them before loading fails:\n{}\nTo use one, first call tool_search (query \"select:<name>\" for an exact pick, or keywords to search), then invoke it through call_tool with the returned schema. A direct call by the loaded tool's own name is only a provider-compatibility optimization.\n</system-reminder>",
         names.join("\n")
     ))
 }
@@ -93,10 +96,34 @@ pub fn deferred_notice(cfg: &Config) -> Option<String> {
 /// a locked call is a protocol error to bounce back at the model, not
 /// something to ask the human about.
 pub(super) fn locked(name: &str, cfg: &Config) -> bool {
+    let deferred = deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold);
+    if !deferred.iter().any(|def| def.name == name) {
+        return false;
+    }
+    let Some(generation) = super::source_definition_generation(&cfg.tool_sources, name) else {
+        return true;
+    };
+    cfg.unlocked_tools.read().unwrap().get(name).copied() != Some(generation)
+}
+
+pub(super) fn unlocked_generation_for_dispatch(name: &str, cfg: &Config) -> Option<u64> {
     deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold)
         .iter()
-        .any(|d| d.name == name)
-        && !cfg.unlocked_tools.read().unwrap().contains(name)
+        .any(|def| def.name == name)
+        .then(|| cfg.unlocked_tools.read().unwrap().get(name).copied())
+        .flatten()
+}
+
+fn max_results(input: &Value) -> Result<usize> {
+    match input.get("max_results") {
+        None => Ok(DEFAULT_MAX_RESULTS),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("tool_search: max_results must be a positive integer")),
+        Some(_) => bail!("tool_search: max_results must be a positive integer"),
+    }
 }
 
 pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -105,67 +132,152 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         bail!("tool_search: query must not be empty");
     }
     let deferred = deferred_tool_defs(&ctx.cfg.tool_sources, ctx.cfg.defer_threshold);
+    let max_results = max_results(input)?;
 
     let mut found: Vec<ToolDef> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
-    if let Some(rest) = query.strip_prefix("select:") {
+    if query
+        .get(.."select:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select:"))
+    {
+        let rest = &query["select:".len()..];
         let loaded = super::all_tool_defs(
             ctx.depth,
             &ctx.cfg.tool_sources,
             ctx.cfg.defer_threshold,
             ctx.cfg.surface,
         );
-        for name in rest.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if let Some(def) = deferred.iter().find(|d| d.name == name) {
-                found.push(def.clone());
-            } else if loaded.iter().any(|d| d.name == name) {
+        let mut selected = std::collections::HashSet::new();
+        let mut selected_any = false;
+        for name in rest
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            selected_any = true;
+            if let Some(def) = deferred
+                .iter()
+                .find(|def| def.name.eq_ignore_ascii_case(name))
+            {
+                if selected.insert(def.name.clone()) {
+                    found.push(def.clone());
+                }
+            } else if loaded.iter().any(|def| def.name.eq_ignore_ascii_case(name)) {
                 notes.push(format!("'{name}' is already loaded; call it directly"));
             } else {
                 notes.push(format!("no deferred tool named '{name}'"));
             }
         }
+        if !selected_any {
+            bail!("tool_search: select: requires at least one tool name");
+        }
     } else {
-        let max_results = match input["max_results"].as_u64() {
-            Some(0) => bail!("tool_search: max_results must be greater than zero"),
-            Some(n) => n as usize,
-            None => DEFAULT_MAX_RESULTS,
-        };
-        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        let mut scored: Vec<(u32, &ToolDef)> = deferred
+        if let Some(def) = deferred
             .iter()
-            .map(|def| (keyword_score(def, &terms), def))
-            .filter(|(score, _)| *score > 0)
-            .collect();
-        // Name hits outrank description hits; ties break alphabetically so
-        // results are deterministic.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-        found.extend(scored.into_iter().take(max_results).map(|(_, d)| d.clone()));
-    }
-
-    if !found.is_empty() {
-        let mut unlocked = ctx.cfg.unlocked_tools.write().unwrap();
-        for def in &found {
-            unlocked.insert(def.name.clone());
+            .find(|def| def.name.eq_ignore_ascii_case(&query))
+        {
+            found.push(def.clone());
+        } else {
+            let query_lower = query.to_lowercase();
+            let prefix_matches: Vec<ToolDef> = deferred
+                .iter()
+                .filter(|def| def.name.to_lowercase().starts_with(&query_lower))
+                .take(max_results)
+                .cloned()
+                .collect();
+            if query_lower.contains("__") && !prefix_matches.is_empty() {
+                found = prefix_matches;
+            } else {
+                let terms: Vec<SearchTerm> = query
+                    .split_whitespace()
+                    .filter_map(SearchTerm::parse)
+                    .collect();
+                let mut scored: Vec<(u32, &ToolDef)> = deferred
+                    .iter()
+                    .filter_map(|def| keyword_score(def, &terms).map(|score| (score, def)))
+                    .filter(|(score, _)| *score > 0)
+                    .collect();
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+                found.extend(
+                    scored
+                        .into_iter()
+                        .take(max_results)
+                        .map(|(_, def)| def.clone()),
+                );
+            }
         }
     }
+
+    let mut current_found = Vec::with_capacity(found.len());
+    for def in found {
+        if let Some((current, generation)) =
+            super::source_definition_snapshot(&ctx.cfg.tool_sources, &def.name)
+        {
+            current_found.push((current, generation));
+        }
+    }
+    if !current_found.is_empty() {
+        let mut unlocked = ctx.cfg.unlocked_tools.write().unwrap();
+        for (def, generation) in &current_found {
+            unlocked.insert(def.name.clone(), *generation);
+        }
+    }
+    let found: Vec<ToolDef> = current_found
+        .into_iter()
+        .map(|(def, _generation)| def)
+        .collect();
     Ok(render(&found, &notes, deferred.len()))
 }
 
-fn keyword_score(def: &ToolDef, terms: &[String]) -> u32 {
-    let name = def.name.to_lowercase();
-    let description = def.description.to_lowercase();
-    terms
-        .iter()
-        .map(|t| {
-            if name.contains(t.as_str()) {
-                10
-            } else if description.contains(t.as_str()) {
-                2
-            } else {
-                0
-            }
+#[derive(Debug)]
+struct SearchTerm {
+    value: String,
+    required: bool,
+}
+
+impl SearchTerm {
+    fn parse(raw: &str) -> Option<Self> {
+        let (required, value) = match raw.strip_prefix('+') {
+            Some(value) => (true, value),
+            None => (false, raw),
+        };
+        (!value.is_empty()).then(|| SearchTerm {
+            value: value.to_lowercase(),
+            required,
         })
-        .sum()
+    }
+}
+
+fn keyword_score(def: &ToolDef, terms: &[SearchTerm]) -> Option<u32> {
+    let name = def.name.to_lowercase();
+    let normalized_name = name.replace(['_', '-'], " ");
+    let name_tokens: Vec<&str> = normalized_name.split_whitespace().collect();
+    let description = def.description.to_lowercase();
+    let schema = def.schema.to_string().to_lowercase();
+    let mut score = 0;
+    for term in terms {
+        let name_exact = name_tokens.contains(&term.value.as_str());
+        let name_substring = name_tokens
+            .iter()
+            .any(|token| token.contains(term.value.as_str()));
+        let description_hit = description.contains(term.value.as_str());
+        let schema_hit = schema.contains(term.value.as_str());
+        if term.required && !(name_substring || description_hit || schema_hit) {
+            return None;
+        }
+        score += if name_exact {
+            10
+        } else if name_substring || name.contains(term.value.as_str()) {
+            5
+        } else if description_hit {
+            2
+        } else if schema_hit {
+            1
+        } else {
+            0
+        };
+    }
+    Some(score)
 }
 
 fn render(found: &[ToolDef], notes: &[String], total_deferred: usize) -> String {
@@ -175,7 +287,7 @@ fn render(found: &[ToolDef], notes: &[String], total_deferred: usize) -> String 
     }
     if !found.is_empty() {
         out.push_str(&format!(
-            "Found {} tool(s); they are now loaded. Even though they were not in your original tool list, invoke them like any other tool — emit a regular tool call with the name and parameters below. If your runtime rejects that, invoke via call_tool({{\"tool_name\": \"<name>\", \"params\": {{...}}}}) instead. Do not delegate this or fall back to other tools:\n",
+            "Found {} tool(s); they are now loaded. Invoke each through call_tool({{\"tool_name\": \"<name>\", \"params\": {{...}}}}) using the schema below. A direct call by the loaded tool's own name is also accepted when the provider permits it:\n",
             found.len()
         ));
         for def in found {
@@ -225,12 +337,119 @@ mod tests {
     }
 
     impl ToolSource for Srv {
-        fn defs(&self) -> &[ToolDef] {
-            &self.defs
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(self.defs.clone())
         }
+
         fn is_readonly(&self, _tool: &str) -> bool {
             false
         }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move { Ok(crate::tools::SourceOutput::text(format!("ran {tool}"))) })
+        }
+    }
+
+    struct ChangingSrv {
+        defs: std::sync::RwLock<Vec<ToolDef>>,
+        generation: std::sync::atomic::AtomicU64,
+    }
+
+    impl ChangingSrv {
+        fn new(field: &str) -> Self {
+            Self {
+                defs: std::sync::RwLock::new(vec![Self::definition(field)]),
+                generation: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn definition(field: &str) -> ToolDef {
+            ToolDef {
+                name: "srv__changing".into(),
+                description: "A tool whose schema changes".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {field: {"type": "string"}},
+                    "required": [field]
+                }),
+            }
+        }
+
+        fn replace_schema(&self, field: &str) {
+            *self.defs.write().unwrap() = vec![Self::definition(field)];
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl ToolSource for ChangingSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(self.defs.read().unwrap().clone())
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move { Ok(crate::tools::SourceOutput::text(format!("ran {tool}"))) })
+        }
+    }
+
+    struct SnapshotRaceSrv {
+        defs_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SnapshotRaceSrv {
+        fn definition(field: &str) -> ToolDef {
+            ToolDef {
+                name: "srv__racing".into(),
+                description: "A tool refreshed during search".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {field: {"type": "string"}},
+                    "required": [field]
+                }),
+            }
+        }
+    }
+
+    impl ToolSource for SnapshotRaceSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            let call = self
+                .defs_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::from(vec![Self::definition(if call == 0 {
+                "old"
+            } else {
+                "new"
+            })])
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            1
+        }
+
+        fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+            (tool == "srv__racing").then(|| (Self::definition("new"), 1))
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
         fn call<'a>(
             &'a self,
             tool: &'a str,
@@ -245,7 +464,7 @@ mod tests {
     }
 
     fn unlocked(cfg: &Config) -> Vec<String> {
-        let mut names: Vec<String> = cfg.unlocked_tools.read().unwrap().iter().cloned().collect();
+        let mut names: Vec<String> = cfg.unlocked_tools.read().unwrap().keys().cloned().collect();
         names.sort();
         names
     }
@@ -267,6 +486,78 @@ mod tests {
             "{out}"
         );
         assert_eq!(unlocked(&ctx.cfg), vec!["srv__web_search"]);
+    }
+
+    #[tokio::test]
+    async fn search_returns_schema_and_generation_from_one_source_snapshot() {
+        let source: Arc<dyn ToolSource> = Arc::new(SnapshotRaceSrv {
+            defs_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ctx = with_defer_threshold(test_ctx_with_sources(0, "snapshot-race", vec![source]), 0);
+        let (out, is_error) =
+            run_tool("tool_search", json!({"query": "select:srv__racing"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains(r#""new""#), "{out}");
+        assert!(!out.contains(r#""old""#), "{out}");
+        assert_eq!(
+            ctx.cfg.unlocked_tools.read().unwrap().get("srv__racing"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn select_is_case_insensitive_and_deduplicates() {
+        let ctx = deferred_ctx("select-case");
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({
+                "query": "SeLeCt:SRV__WEB_SEARCH, srv__web_search, srv__page_fetch"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out.matches("## srv__web_search").count(), 1, "{out}");
+        assert_eq!(out.matches("## srv__page_fetch").count(), 1, "{out}");
+        assert_eq!(
+            unlocked(&ctx.cfg),
+            vec!["srv__page_fetch", "srv__web_search"]
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_supports_required_terms_exact_and_prefix_queries() {
+        let ctx = deferred_ctx("keyword-required");
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "+engine search", "max_results": 5}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("## srv__web_search"), "{out}");
+        assert!(!out.contains("## srv__page_fetch"), "{out}");
+
+        let ctx = deferred_ctx("exact-name");
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "SRV__PAGE_FETCH", "max_results": 5}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("## srv__page_fetch"), "{out}");
+        assert!(!out.contains("## srv__web_search"), "{out}");
+
+        let ctx = deferred_ctx("prefix-name");
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "srv__page", "max_results": 5}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("## srv__page_fetch"), "{out}");
     }
 
     #[tokio::test]
@@ -334,7 +625,28 @@ mod tests {
         .await;
         assert!(is_error);
         assert!(
-            out.contains("max_results must be greater than zero"),
+            out.contains("max_results must be a positive integer"),
+            "{out}"
+        );
+
+        for invalid in [json!(-1), json!("1"), json!(1.5), Value::Null, json!([])] {
+            let (out, is_error) = run_tool(
+                "tool_search",
+                json!({"query": "search", "max_results": invalid}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{out}");
+            assert!(
+                out.contains("max_results must be a positive integer"),
+                "{out}"
+            );
+        }
+
+        let (out, is_error) = run_tool("tool_search", json!({"query": "select: , "}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(
+            out.contains("select: requires at least one tool name"),
             "{out}"
         );
     }
@@ -368,6 +680,42 @@ mod tests {
         assert_eq!(out, "ran srv__web_search");
     }
 
+    #[tokio::test]
+    async fn refreshed_schema_invalidates_the_previous_unlock() {
+        let source = Arc::new(ChangingSrv::new("old"));
+        let ctx = with_defer_threshold(
+            test_ctx_with_sources(0, "generation", vec![source.clone()]),
+            0,
+        );
+
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "select:srv__changing"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains(r#""old""#), "{out}");
+        let (out, is_error) = run_tool("srv__changing", json!({"old": "x"}), &ctx).await;
+        assert!(!is_error, "{out}");
+
+        source.replace_schema("new");
+        let (out, is_error) = run_tool("srv__changing", json!({"old": "x"}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "select:srv__changing"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains(r#""new""#), "{out}");
+        let (out, is_error) = run_tool("srv__changing", json!({"new": "x"}), &ctx).await;
+        assert!(!is_error, "{out}");
+    }
+
     /// Below the threshold nothing is deferred: source tools dispatch
     /// directly and tool_search does not exist.
     #[tokio::test]
@@ -394,7 +742,7 @@ mod tests {
             .unlocked_tools
             .write()
             .unwrap()
-            .insert("srv__web_search".into());
+            .insert("srv__web_search".into(), 0);
         assert_eq!(deferred_notice(&ctx.cfg), Some(notice));
     }
 

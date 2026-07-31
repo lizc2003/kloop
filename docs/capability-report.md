@@ -161,15 +161,17 @@ codex 拉取式增量观察。
 | 子目录懒加载(conditionalRules + paths glob) | cc 单家(codex/claw 均无) | plan 32 片 3 挂账,弱收敛 | 大 monorepo 痛感 |
 | claudeMdExcludes / enterprise 层 | cc 单家 | 不立 | 定位外 |
 
-### 11. MCP——🟡 Streamable HTTP/OAuth 主干齐，资源与双向能力缺
+### 11. MCP——🟡 tools/resources 主干齐，双向能力缺
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | streamable HTTP 远程传输 | 双家 | **✅ Plan 34（2026-07-16）**：session/version、SSE response、重试与 reinitialize 已完成 | 已完成 |
 | OAuth 授权码 + PKCE + discovery + refresh + 私有文件存储 | 双家 | **✅ Plan 34b（2026-07-16）** | 已完成 |
 | OAuth keyring、跨进程 refresh lock、device/manual flow 等硬化 | 双家长尾 | 未立 | 真实托管 server 或凭据治理需求 |
-| MCP resources(@-mention)/ prompts | cc 单家 | 未立 | 生态需求 |
-| server-initiated request / 长期订阅 | 协议生态 | 未立；现有 Transport 只承诺 client-originated request/notify | sampling/elicitation/roots 或推送需求 |
+| MCP resources list/read/directory | cc 单家 + 协议生态 | **✅ Plan 54（2026-07-31）**：独立 deferred surface、catalog/read/directory wire、有界分页/内容、错误与人工批准边界 | 已完成 |
+| MCP resource templates / prompts / @-mention UX | cc 单家 | 未立；Plan 54 只闭合 resources | 生态需求 |
+| HTTP server notification subscription | 协议生态 | 未立；Plan 54 对无 notification stream 明示 startup catalog 固定 | dynamic remote catalog 需求 |
+| server-initiated request / sampling / elicitation / roots | 协议生态 | 未立；现有 Transport 只承诺 client-originated request/notify | 双向 MCP 需求 |
 | 旧版 SSE 传输 | cc legacy,codex 不做 | ⛔ 不做 | — |
 | MCP server 模式(kloop 自身作为 server) | cc 单家 | 未立 | 被集成需求 |
 
@@ -222,9 +224,9 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
 - **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
-- **T0 parity 余线**：Plan 53–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T0 parity 余线**：Plan 55–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
-- **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resources/双向 request、子目录懒加载、会话性能工程。
+- **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训
   24)、并发 pacing、V8 引擎、旧版 SSE 传输、worktree 自动合回、bedrock/vertex、
   vim/主题。
