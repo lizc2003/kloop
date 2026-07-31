@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 rquickjs = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-javascript = { workspace = true }

@@ -156,7 +156,7 @@ async fn main() -> Result<ExitCode> {
             let args = args.clone();
             let provider = provider.clone();
             let runtime = runtime.clone();
-            Arc::new(move |options, approver, notify| {
+            Arc::new(move |options, approver, questioner, notify| {
                 let project = if args.mock {
                     context::mock(&options.cwd)
                 } else {
@@ -181,6 +181,7 @@ async fn main() -> Result<ExitCode> {
                     &provider,
                     &runtime,
                     approver,
+                    questioner,
                     notify,
                     &tool_sources,
                     &project,
@@ -270,6 +271,7 @@ async fn main() -> Result<ExitCode> {
             &provider,
             &runtime,
             Arc::new(headless::DenyApprover),
+            None,
             notify,
             &tool_sources,
             &project,
@@ -337,12 +339,13 @@ async fn main() -> Result<ExitCode> {
     let factory_session_id = session_id.clone();
     let worktree = args.worktree.clone();
     kloop_tui::run(
-        move |approver, notify| {
+        move |approver, questioner, notify| {
             let mut cfg = config_from_settings(
                 &args,
                 &provider,
                 &runtime,
                 approver,
+                Some(questioner),
                 notify,
                 &tool_sources,
                 &project,
@@ -406,11 +409,13 @@ async fn plain_main(
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    let interaction = Arc::new(CliApprover::default());
     let mut cfg = config_from_settings(
         &args,
         &provider,
         &runtime,
-        Arc::new(CliApprover::default()),
+        interaction.clone(),
+        Some(interaction),
         notify,
         &tool_sources,
         &project,

@@ -92,7 +92,7 @@ fn guard(ctx: &ToolCtx, tool: &str) -> Result<()> {
     if ctx.depth >= 1 {
         bail!("{tool}: only the top-level agent manages the session worktree");
     }
-    if !ctx.cfg.worktree_enabled {
+    if !ctx.cfg.surface.worktree {
         bail!("{tool}: worktree mode is not enabled for this session");
     }
     Ok(())
@@ -209,10 +209,18 @@ mod tests {
     #[tokio::test]
     async fn worktree_tools_gated_by_mode() {
         use crate::tools::all_tool_defs;
-        let on = all_tool_defs(0, &[], 30, true);
+        let on = all_tool_defs(
+            0,
+            &[],
+            30,
+            crate::config::SurfaceCapabilities {
+                worktree: true,
+                ..Default::default()
+            },
+        );
         assert!(on.iter().any(|d| d.name == "enter_worktree"));
         assert!(on.iter().any(|d| d.name == "exit_worktree"));
-        let off = all_tool_defs(0, &[], 30, false);
+        let off = all_tool_defs(0, &[], 30, Default::default());
         assert!(!off.iter().any(|d| d.name == "enter_worktree"));
 
         // Even if a model somehow calls it, a mode-off session refuses.

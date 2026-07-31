@@ -113,7 +113,7 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             ctx.depth,
             &ctx.cfg.tool_sources,
             ctx.cfg.defer_threshold,
-            ctx.cfg.worktree_enabled,
+            ctx.cfg.surface,
         );
         for name in rest.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             if let Some(def) = deferred.iter().find(|d| d.name == name) {

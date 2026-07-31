@@ -13,6 +13,9 @@ use kloop_core::event::Delta;
 use kloop_core::event::Event;
 use kloop_core::event::Item;
 use kloop_core::event::ItemStatus;
+use kloop_core::interaction::QuestionAnswer;
+use kloop_core::interaction::QuestionOutcome;
+use kloop_core::interaction::QuestionRequest;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
@@ -96,12 +99,62 @@ pub enum Cell {
     },
 }
 
-/// A permission prompt currently waiting for a keypress. Prompts queue:
-/// concurrent tool batches can ask more than once before the first answer.
+/// One modal interaction owns the terminal at a time. Permission approvals and
+/// general questions share this FIFO so concurrent tool calls cannot interleave.
 #[derive(Debug)]
-pub struct PendingConfirm {
-    pub req: ConfirmRequest,
-    reply: oneshot::Sender<Decision>,
+pub enum PendingInteraction {
+    Confirm {
+        req: ConfirmRequest,
+        reply: oneshot::Sender<Decision>,
+    },
+    Question(PendingQuestion),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestionPhase {
+    Select,
+    Other,
+    Notes,
+}
+
+#[derive(Debug)]
+pub struct PendingQuestion {
+    pub req: QuestionRequest,
+    pub question_index: usize,
+    pub cursor: usize,
+    pub selected: Vec<usize>,
+    pub answers: Vec<QuestionAnswer>,
+    pub phase: QuestionPhase,
+    pub editor: String,
+    pending_other: Option<String>,
+    reply: oneshot::Sender<QuestionOutcome>,
+}
+
+impl PendingQuestion {
+    fn new(req: QuestionRequest, reply: oneshot::Sender<QuestionOutcome>) -> Self {
+        Self {
+            req,
+            question_index: 0,
+            cursor: 0,
+            selected: Vec::new(),
+            answers: Vec::new(),
+            phase: QuestionPhase::Select,
+            editor: String::new(),
+            pending_other: None,
+            reply,
+        }
+    }
+
+    pub fn current(&self) -> &kloop_core::interaction::Question {
+        &self.req.questions[self.question_index]
+    }
+
+    pub fn selected_preview(&self) -> Option<&str> {
+        self.selected
+            .first()
+            .and_then(|index| self.current().options.get(*index))
+            .and_then(|option| option.preview.as_deref())
+    }
 }
 
 /// The open rewind picker (plan 18): the fork targets the worker read off the
@@ -162,7 +215,7 @@ pub struct App {
     /// because `ContentBlock` isn't `Eq` (Command derives it).
     submit_images: Vec<ContentBlock>,
     pub running: bool,
-    pub confirms: VecDeque<PendingConfirm>,
+    pub interactions: VecDeque<PendingInteraction>,
     /// Scroll offset (in display lines) into the active confirm popup's body,
     /// so a diff taller than the popup can be read in full. Reset to 0 when the
     /// front prompt changes; clamped to a valid range at render time.
@@ -218,7 +271,7 @@ impl App {
             composer: Composer::new(),
             submit_images: Vec::new(),
             running: false,
-            confirms: VecDeque::new(),
+            interactions: VecDeque::new(),
             confirm_scroll: 0,
             last_note: None,
             assistant_open: false,
@@ -314,7 +367,14 @@ impl App {
                 self.fork_picker = None;
             }
             AgentEvent::Confirm { req, reply } => {
-                self.confirms.push_back(PendingConfirm { req, reply });
+                self.interactions
+                    .push_back(PendingInteraction::Confirm { req, reply });
+            }
+            AgentEvent::Question { req, reply } => {
+                self.interactions
+                    .push_back(PendingInteraction::Question(PendingQuestion::new(
+                        req, reply,
+                    )));
             }
         }
     }
@@ -541,7 +601,7 @@ impl App {
                 self.last_note = None;
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
-                self.confirms.clear();
+                self.interactions.clear();
                 self.confirm_scroll = 0;
                 // An interrupted turn drops task futures mid-await, so a
                 // sub-agent's completion may never arrive: no row may outlive
@@ -637,9 +697,9 @@ impl App {
             self.ctrl_c_exit_armed = true;
             return Command::None;
         }
-        // A pending permission prompt captures the keyboard.
-        if !self.confirms.is_empty() {
-            return self.on_confirm_key(key);
+        // A pending interaction captures the keyboard.
+        if !self.interactions.is_empty() {
+            return self.on_interaction_key(key);
         }
         // So does an open rewind picker.
         if self.fork_picker.is_some() {
@@ -865,7 +925,35 @@ impl App {
     /// A bracketed-paste of text (the event loop routes image-file pastes to
     /// [`App::attach_image`] instead).
     pub fn paste_text(&mut self, s: &str) {
+        if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() {
+            if matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes) {
+                question.editor.push_str(s);
+                return;
+            }
+        }
         self.composer.paste(s);
+    }
+
+    pub fn interaction_active(&self) -> bool {
+        !self.interactions.is_empty()
+    }
+
+    pub fn question_editor_active(&self) -> bool {
+        matches!(
+            self.interactions.front(),
+            Some(PendingInteraction::Question(PendingQuestion {
+                phase: QuestionPhase::Other | QuestionPhase::Notes,
+                ..
+            }))
+        )
+    }
+
+    fn on_interaction_key(&mut self, key: KeyEvent) -> Command {
+        match self.interactions.front() {
+            Some(PendingInteraction::Confirm { .. }) => self.on_confirm_key(key),
+            Some(PendingInteraction::Question(_)) => self.on_question_key(key),
+            None => Command::None,
+        }
     }
 
     /// Attach a pasted image (the loop already read + validated it into a block).
@@ -908,16 +996,118 @@ impl App {
             KeyCode::Char('p') | KeyCode::Char('P') => Decision::AllowAlways,
             _ => return Command::None,
         };
-        let pending = self.confirms.pop_front().expect("checked non-empty");
+        let pending = self.interactions.pop_front().expect("checked non-empty");
+        let PendingInteraction::Confirm { reply, .. } = pending else {
+            unreachable!("interaction type changed while handling approval")
+        };
         // The next queued prompt (if any) starts unscrolled.
         self.confirm_scroll = 0;
         // a/p degrade to allow-once in the gate when the call isn't
         // remember-able, same as the plain REPL.
-        let _ = pending.reply.send(decision);
+        let _ = reply.send(decision);
         Command::None
     }
 
-    /// Keys while the rewind picker is open. ↑↓/kj move the cursor, Enter forks
+    fn on_question_key(&mut self, key: KeyEvent) -> Command {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Command::None;
+        }
+        if key.code == KeyCode::Esc {
+            self.resolve_question(QuestionOutcome::Cancelled);
+            return Command::None;
+        }
+
+        let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() else {
+            return Command::None;
+        };
+        let mut outcome = None;
+        match question.phase {
+            QuestionPhase::Select => {
+                let option_count = question.current().options.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        question.cursor = question.cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        question.cursor = (question.cursor + 1).min(option_count);
+                    }
+                    KeyCode::PageUp => {
+                        self.confirm_scroll = self.confirm_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.confirm_scroll += 10;
+                    }
+                    KeyCode::Char(' ') if question.current().multi_select => {
+                        if question.cursor < option_count {
+                            if let Some(position) = question
+                                .selected
+                                .iter()
+                                .position(|index| *index == question.cursor)
+                            {
+                                question.selected.remove(position);
+                            } else {
+                                question.selected.push(question.cursor);
+                                question.selected.sort_unstable();
+                            }
+                        }
+                    }
+                    KeyCode::Enter if question.cursor == option_count => {
+                        question.phase = QuestionPhase::Other;
+                        question.editor.clear();
+                    }
+                    KeyCode::Enter if question.current().multi_select => {
+                        if question.selected.is_empty() {
+                            question.selected.push(question.cursor);
+                        }
+                        outcome = finish_question(question, None, None);
+                    }
+                    KeyCode::Enter => {
+                        question.selected.clear();
+                        question.selected.push(question.cursor);
+                        if question.selected_preview().is_some() {
+                            question.phase = QuestionPhase::Notes;
+                            question.editor.clear();
+                        } else {
+                            outcome = finish_question(question, None, None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            QuestionPhase::Other | QuestionPhase::Notes => match key.code {
+                KeyCode::Char(c) => question.editor.push(c),
+                KeyCode::Backspace => {
+                    question.editor.pop();
+                }
+                KeyCode::Enter if question.phase == QuestionPhase::Other => {
+                    let value = question.editor.trim().to_string();
+                    if !value.is_empty() {
+                        question.pending_other = Some(value.clone());
+                        outcome = finish_question(question, Some(value), None);
+                    }
+                }
+                KeyCode::Enter => {
+                    let value = question.editor.trim();
+                    let notes = (!value.is_empty()).then(|| value.to_string());
+                    let other = question.pending_other.take();
+                    outcome = finish_question(question, other, notes);
+                }
+                _ => {}
+            },
+        }
+        if let Some(outcome) = outcome {
+            self.resolve_question(outcome);
+        }
+        Command::None
+    }
+
+    fn resolve_question(&mut self, outcome: QuestionOutcome) {
+        let Some(PendingInteraction::Question(question)) = self.interactions.pop_front() else {
+            return;
+        };
+        self.confirm_scroll = 0;
+        let _ = question.reply.send(outcome);
+    }
     /// at the selected point, Esc backs out without touching History (Ctrl+C is
     /// the two-tap quit, intercepted before routing here).
     fn on_fork_key(&mut self, key: KeyEvent) -> Command {
@@ -946,6 +1136,34 @@ impl App {
         }
         Command::None
     }
+}
+
+fn finish_question(
+    question: &mut PendingQuestion,
+    other: Option<String>,
+    notes: Option<String>,
+) -> Option<QuestionOutcome> {
+    question.answers.push(QuestionAnswer {
+        question_index: question.question_index,
+        selected: std::mem::take(&mut question.selected),
+        other,
+        notes,
+    });
+    if question.question_index + 1 < question.req.questions.len() {
+        question.question_index += 1;
+        question.cursor = 0;
+        question.phase = QuestionPhase::Select;
+        question.editor.clear();
+        question.pending_other = None;
+        return None;
+    }
+    let answers = std::mem::take(&mut question.answers);
+    Some(match question.req.validate_answers(&answers) {
+        Ok(()) => QuestionOutcome::Answered(answers),
+        Err(error) => QuestionOutcome::Unavailable(format!(
+            "TUI produced an invalid question answer: {error}"
+        )),
+    })
 }
 
 /// Replay a resumed session's history into transcript cells so `--resume`
@@ -1138,6 +1356,7 @@ mod tests {
         AgentEvent::Core(Event::BackgroundTaskUpdated(
             kloop_core::event::BackgroundTask {
                 id: "agent-4".into(),
+                run_id: None,
                 kind: kloop_core::event::BackgroundTaskKind::Agent,
                 description: "inspect logs".into(),
                 status,
@@ -1173,6 +1392,36 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn front_confirm_description(app: &App) -> &str {
+        match app.interactions.front() {
+            Some(PendingInteraction::Confirm { req, .. }) => &req.description,
+            _ => panic!("expected a queued confirmation"),
+        }
+    }
+
+    fn question_request(multi_select: bool, preview: Option<&str>) -> QuestionRequest {
+        QuestionRequest {
+            questions: vec![kloop_core::interaction::Question {
+                question: "Which option?".into(),
+                header: "Choice".into(),
+                options: vec![
+                    kloop_core::interaction::QuestionOption {
+                        label: "A".into(),
+                        description: "first".into(),
+                        preview: preview.map(str::to_string),
+                    },
+                    kloop_core::interaction::QuestionOption {
+                        label: "B".into(),
+                        description: "second".into(),
+                        preview: None,
+                    },
+                ],
+                multi_select,
+            }],
+            metadata: None,
+        }
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -1774,7 +2023,7 @@ mod tests {
         assert_eq!(app.on_key(ctrl('c')), Command::None, "first tap arms");
         assert!(app.ctrl_c_exit_armed);
         assert!(
-            !app.confirms.is_empty(),
+            !app.interactions.is_empty(),
             "the prompt is untouched by the tap"
         );
         assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
@@ -1816,7 +2065,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(rx.try_recv().unwrap(), Decision::AllowSession);
-        assert!(app.confirms.is_empty());
+        assert!(app.interactions.is_empty());
     }
 
     /// While a prompt is up, arrow/j/k/PageUp/PageDown scroll the popup instead
@@ -1862,7 +2111,7 @@ mod tests {
         app.on_key(key(KeyCode::PageDown));
         assert_eq!(app.confirm_scroll, 10);
         app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(app.confirms.front().unwrap().req.description, "second");
+        assert_eq!(front_confirm_description(&app), "second");
         assert_eq!(app.confirm_scroll, 0, "the next prompt is unscrolled");
     }
 
@@ -1887,9 +2136,91 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('y')));
         assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
-        assert_eq!(app.confirms.front().unwrap().req.description, "second");
+        assert_eq!(front_confirm_description(&app), "second");
         app.on_key(key(KeyCode::Char('n')));
         assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
+    }
+
+    #[tokio::test]
+    async fn question_single_preview_notes_and_cancel_round_trip() {
+        let mut app = App::new("s".into());
+        let (reply, mut rx) = oneshot::channel();
+        app.apply(AgentEvent::Question {
+            req: question_request(false, Some("preview A")),
+            reply,
+        });
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
+            panic!("expected question interaction");
+        };
+        assert_eq!(question.phase, QuestionPhase::Notes);
+        assert_eq!(question.selected_preview(), Some("preview A"));
+        app.paste_text("ship it");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            QuestionOutcome::Answered(vec![QuestionAnswer {
+                question_index: 0,
+                selected: vec![0],
+                other: None,
+                notes: Some("ship it".into()),
+            }])
+        );
+        assert!(app.interactions.is_empty());
+
+        let (reply, mut rx) = oneshot::channel();
+        app.apply(AgentEvent::Question {
+            req: question_request(false, None),
+            reply,
+        });
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(rx.try_recv().unwrap(), QuestionOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn question_multi_other_and_mixed_interactions_share_fifo() {
+        let mut app = App::new("s".into());
+        let (confirm_reply, mut confirm_rx) = oneshot::channel();
+        let (question_reply, mut question_rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "first approval".into(),
+                remember_rules: None,
+                preview: None,
+            },
+            reply: confirm_reply,
+        });
+        app.apply(AgentEvent::Question {
+            req: question_request(true, None),
+            reply: question_reply,
+        });
+
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(confirm_rx.try_recv().unwrap(), Decision::Allow);
+        assert!(matches!(
+            app.interactions.front(),
+            Some(PendingInteraction::Question(_))
+        ));
+
+        // Toggle A, move to Other, enter free text, then submit both.
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.question_editor_active());
+        app.paste_text("custom");
+        assert_eq!(app.composer.text(), "", "paste stays in the modal editor");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            question_rx.try_recv().unwrap(),
+            QuestionOutcome::Answered(vec![QuestionAnswer {
+                question_index: 0,
+                selected: vec![0],
+                other: Some("custom".into()),
+                notes: None,
+            }])
+        );
     }
 
     #[test]
@@ -2021,7 +2352,7 @@ mod tests {
         app.apply(turn_ended(EndReason::Aborted));
 
         assert!(!app.running);
-        assert!(app.confirms.is_empty());
+        assert!(app.interactions.is_empty());
         // The dropped sender resolves the agent-side future as Deny.
         assert!(rx.try_recv().is_err());
         assert_eq!(app.cells, vec![Cell::Note("interrupted".into())]);

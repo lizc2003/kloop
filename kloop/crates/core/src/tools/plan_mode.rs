@@ -17,6 +17,31 @@ use crate::permissions::Mode;
 use crate::permissions::PlanExitOutcome;
 use kloop_protocol::ToolDef;
 
+pub(super) fn enter_plan_mode_def() -> ToolDef {
+    ToolDef {
+        name: "enter_plan_mode".into(),
+        description: "Enter plan mode before a non-trivial implementation. This changes the current session to read-only exploration: mutating tools stay blocked until exit_plan_mode presents the finished plan for approval. The call is idempotent. Only the top-level agent may use it.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) async fn enter_plan_mode_tool(_input: &Value, ctx: &ToolCtx) -> Result<String> {
+    if ctx.depth >= 1 {
+        bail!("enter_plan_mode: only the top-level agent can enter plan mode");
+    }
+    let perms = ctx.cfg.effective_permissions();
+    if perms.enter_plan() {
+        ctx.ui.emit(&crate::event::Event::ModeChanged(Mode::Plan));
+        Ok("Entered plan mode. Continue with read-only exploration, then call exit_plan_mode with the complete implementation plan for approval.".into())
+    } else {
+        Ok("Already in plan mode. Continue with read-only exploration and do not call mutating tools until the plan is approved.".into())
+    }
+}
+
 pub(super) fn exit_plan_mode_def() -> ToolDef {
     ToolDef {
         name: "exit_plan_mode".into(),
@@ -133,6 +158,53 @@ mod tests {
             cfg: Arc::new(cfg),
             ..ctx
         }
+    }
+
+    fn mode_ctx(ctx: ToolCtx, mode: Mode, approver: Arc<PlanApprover>) -> ToolCtx {
+        let perms = Permissions::new(
+            mode,
+            &PermissionRules::default(),
+            PathBuf::from("/work/proj"),
+            Some(approver),
+            None,
+        )
+        .unwrap();
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.permissions = Arc::new(perms);
+        ToolCtx {
+            cfg: Arc::new(cfg),
+            ..ctx
+        }
+    }
+
+    /// Enter is a session transition: the first call changes mode, a repeated
+    /// call is idempotent, and Exit restores the mode from before the first call.
+    #[tokio::test]
+    async fn enter_is_idempotent_and_exit_restores_original_mode() {
+        let approver = PlanApprover::new(vec![Decision::Allow]);
+        let ctx = mode_ctx(test_ctx(0, "planenter"), Mode::AcceptEdits, approver);
+
+        let (first, first_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
+        assert!(!first_error, "{first}");
+        assert!(first.contains("Entered plan mode"), "{first}");
+        assert_eq!(ctx.cfg.permissions.mode(), Mode::Plan);
+
+        let (second, second_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
+        assert!(!second_error, "{second}");
+        assert!(second.contains("Already in plan mode"), "{second}");
+
+        let (exit, exit_error) =
+            run_tool("exit_plan_mode", json!({"plan": "implement it"}), &ctx).await;
+        assert!(!exit_error, "{exit}");
+        assert_eq!(ctx.cfg.permissions.mode(), Mode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn subagent_cannot_enter_plan_mode() {
+        let ctx = test_ctx(1, "planentersub");
+        let (out, is_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("top-level"), "{out}");
     }
 
     /// Approve: plan mode turns off (restores manual), the result confirms it,

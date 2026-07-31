@@ -78,6 +78,20 @@ pub enum Outgoing {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
+pub(super) enum QuestionResponse {
+    Answered {
+        #[serde(default)]
+        selected: Vec<usize>,
+        #[serde(default)]
+        other: Option<String>,
+        #[serde(default)]
+        notes: Option<String>,
+    },
+    Cancelled,
+}
+
 pub const PARSE_ERROR: i64 = -32700;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
@@ -192,6 +206,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                 kloop_core::event::BackgroundTaskKind::Shell => "shell",
                 kloop_core::event::BackgroundTaskKind::Agent => "agent",
                 kloop_core::event::BackgroundTaskKind::Program => "program",
+                kloop_core::event::BackgroundTaskKind::Workflow => "workflow",
             };
             let status = match task.status {
                 kloop_core::event::BackgroundTaskStatus::Running => "running",
@@ -199,17 +214,18 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                 kloop_core::event::BackgroundTaskStatus::Failed => "failed",
                 kloop_core::event::BackgroundTaskStatus::Cancelled => "cancelled",
             };
-            Some((
-                "thread/backgroundTask/updated",
-                json!({"task": {
-                    "id": task.id,
-                    "kind": kind,
-                    "description": task.description,
-                    "status": status,
-                    "outputPath": task.output_path,
-                    "detail": task.detail,
-                }}),
-            ))
+            let mut task_json = json!({
+                "id": task.id,
+                "kind": kind,
+                "description": task.description,
+                "status": status,
+                "outputPath": task.output_path,
+                "detail": task.detail,
+            });
+            if let Some(run_id) = &task.run_id {
+                task_json["runId"] = Value::String(run_id.clone());
+            }
+            Some(("thread/backgroundTask/updated", json!({"task": task_json})))
         }
         // Token usage and cwd are thread-scoped, not turn-scoped: no turnId.
         Event::Usage(n) => Some((
@@ -412,6 +428,7 @@ mod tests {
     fn background_updates_are_thread_scoped() {
         let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
             id: "bg-7".into(),
+            run_id: None,
             kind: kloop_core::event::BackgroundTaskKind::Shell,
             description: "make test".into(),
             status: kloop_core::event::BackgroundTaskStatus::Failed,
@@ -429,6 +446,34 @@ mod tests {
                     "status": "failed",
                     "outputPath": "/tmp/bg-7.out",
                     "detail": "exit 2",
+                }})
+            ))
+        );
+    }
+
+    #[test]
+    fn workflow_updates_include_durable_run_identity() {
+        let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
+            id: "workflow-7".into(),
+            run_id: Some("wf_123-7".into()),
+            kind: kloop_core::event::BackgroundTaskKind::Workflow,
+            description: "scan repository".into(),
+            status: kloop_core::event::BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: Some("Scan".into()),
+        });
+        assert_eq!(
+            project_event(&update, 99),
+            Some((
+                "thread/backgroundTask/updated",
+                json!({"task": {
+                    "id": "workflow-7",
+                    "kind": "workflow",
+                    "description": "scan repository",
+                    "status": "running",
+                    "outputPath": null,
+                    "detail": "Scan",
+                    "runId": "wf_123-7",
                 }})
             ))
         );

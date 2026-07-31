@@ -1104,6 +1104,7 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                questioner: None,
                 file_state: Default::default(),
                 tool_sources: Vec::new(),
                 session_id: String::new(),
@@ -1121,7 +1122,7 @@ mod tests {
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-                worktree_enabled: false,
+                surface: Default::default(),
             })
         };
         let path = temp_file("restart");

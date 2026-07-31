@@ -15,12 +15,15 @@ mod plan50_parity_tests;
 #[cfg(test)]
 mod plan52_parity_tests;
 mod plan_mode;
+mod question;
+mod run_store;
 mod search;
 mod skill;
 mod task;
 mod todo;
 mod tool_search;
 pub mod web;
+mod workflow;
 mod worktree_tool;
 
 pub use background_tasks::BackgroundTasks;
@@ -193,7 +196,7 @@ pub fn all_tool_defs(
     depth: u8,
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
-    worktree_enabled: bool,
+    surface: crate::config::SurfaceCapabilities,
 ) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth);
     let deferred_regime = defer_active(sources, defer_threshold);
@@ -224,18 +227,26 @@ pub fn all_tool_defs(
             &inline_sources,
             &deferred,
         ));
-        // Plan mode (plan 37): the model presents its plan for approval and, on
-        // approval, leaves plan mode. Session-control like the worktree tools —
-        // depth-0 only, kept out of run_program's TS API and the defer count.
-        // Advertised unconditionally so the tool array stays byte-stable while
-        // the mode toggles (shift+Tab / exit) within the session; it errors
-        // cleanly when called outside plan mode.
-        defs.push(plan_mode::exit_plan_mode_def());
+        // General questions are a user-interaction surface, not a permission
+        // prompt. Kept out of run_program's tools API and limited to depth 0.
+        if surface.questions {
+            defs.push(question::ask_user_question_def());
+        }
+        // Plan controls are advertised together so the request's tool array stays
+        // byte-stable while the session mode changes. Both are depth-0 only and
+        // intentionally absent from run_program's generated TypeScript API.
+        if surface.plan_control {
+            defs.push(plan_mode::enter_plan_mode_def());
+            defs.push(plan_mode::exit_plan_mode_def());
+        }
+        if surface.workflow {
+            defs.push(workflow::workflow_def());
+        }
         // Session worktree tools (plan 35 slice 2): only when the front-end
         // enables worktree mode (CLI/TUI/plain — not server threads or --mock),
         // and only top-level (a sub-agent isolates via task {isolation}). Kept
         // out of run_program's TS API and the deferral count on purpose.
-        if worktree_enabled {
+        if surface.worktree {
             defs.push(worktree_tool::enter_worktree_def());
             defs.push(worktree_tool::exit_worktree_def());
         }
@@ -261,11 +272,26 @@ pub fn deferred_tool_defs(sources: &[Arc<dyn ToolSource>], defer_threshold: usiz
     }
 }
 
-/// Source defs deduplicated against the depth-0 built-ins and earlier
-/// sources — the same merge order [`all_tool_defs`] uses.
+fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
+    seen.extend(
+        [
+            "ask_user_question",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "workflow",
+            "enter_worktree",
+            "exit_worktree",
+            "StructuredOutput",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+}
+
 fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
     let mut seen: std::collections::HashSet<String> =
         tool_defs(0).into_iter().map(|d| d.name).collect();
+    reserve_surface_names(&mut seen);
     let mut defs = Vec::new();
     for source in sources {
         for def in source.defs() {
@@ -284,6 +310,7 @@ pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usi
     let mut warnings = Vec::new();
     let mut seen: std::collections::HashSet<String> =
         tool_defs(0).into_iter().map(|d| d.name).collect();
+    reserve_surface_names(&mut seen);
     for source in sources {
         for def in source.defs() {
             if !seen.insert(def.name.clone()) {
@@ -294,7 +321,7 @@ pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usi
             }
         }
     }
-    let total = seen.len();
+    let total = tool_defs(0).len() + merged_source_defs(sources).len();
     if total > defer_threshold {
         warnings.push(format!(
             "{total} tools registered (> {defer_threshold}); MCP tool definitions are deferred — the model loads them on demand via tool_search"
@@ -531,6 +558,7 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
+        "ask_user_question" | "workflow" => true,
         // task is always safe to batch (cc shape): consecutive task calls run
         // as parallel sub-agents. Their own tool calls are gated individually
         // — a sub-agent's write still faces hooks and the permission gate.
@@ -545,6 +573,21 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
     }
 }
 
+/// Normalize compatibility envelopes before any caller classifies a tool use.
+/// Structured turns share this with the ordinary dispatcher so a deferred-mode
+/// `call_tool` wrapper around the synthetic terminal tool is still intercepted.
+pub(crate) fn normalize_tool_uses(
+    tool_uses: Vec<(String, String, Value)>,
+) -> Vec<(String, String, Value)> {
+    tool_uses
+        .into_iter()
+        .map(|(id, name, input)| {
+            let (name, input) = tool_search::unwrap_call_tool(name, input);
+            (id, name, input)
+        })
+        .collect()
+}
+
 /// Execute one round of tool calls. Consecutive concurrency-safe calls run as
 /// one concurrent batch (join_all); everything else runs sequentially. Every
 /// tool_use always gets a paired tool_result: cancellation patches the
@@ -556,13 +599,7 @@ pub async fn dispatch_tools(
     // call_tool envelopes are unwrapped before anything else looks at the
     // calls: concurrency batching, hooks, permissions and the UI must all
     // judge the inner tool, never the wrapper.
-    let tool_uses: Vec<(String, String, Value)> = tool_uses
-        .into_iter()
-        .map(|(id, name, input)| {
-            let (name, input) = tool_search::unwrap_call_tool(name, input);
-            (id, name, input)
-        })
-        .collect();
+    let tool_uses = normalize_tool_uses(tool_uses);
     let sources = &ctx.cfg.tool_sources;
     let mut results = Vec::with_capacity(tool_uses.len());
     let mut i = 0;
@@ -914,12 +951,15 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "task" => task::task_tool(input, ctx).await,
+            "ask_user_question" => question::ask_user_question_tool(input, ctx).await,
+            "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx).await,
             "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx).await,
             "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
             "wait" => background_tasks::wait_tool(input, ctx).await,
             "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
+            "workflow" => workflow::workflow_tool(input, ctx).await,
             // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
             other => Err(anyhow!("unknown tool: {other}")),
         };
@@ -993,6 +1033,7 @@ pub(crate) mod testutil {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                questioner: None,
                 file_state: Default::default(),
                 tool_sources: sources,
                 session_id: String::new(),
@@ -1010,7 +1051,7 @@ pub(crate) mod testutil {
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-                worktree_enabled: false,
+                surface: Default::default(),
             }),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
@@ -1088,7 +1129,7 @@ pub(crate) mod testutil {
     ) -> ToolCtx {
         let mut cfg = (*ctx.cfg).clone();
         cfg.cwd = repo.to_path_buf();
-        cfg.worktree_enabled = worktree_enabled;
+        cfg.surface.worktree = worktree_enabled;
         ctx.cfg = Arc::new(cfg);
         ctx
     }
@@ -1112,6 +1153,14 @@ pub(crate) mod testutil {
 mod tests {
     use super::testutil::*;
     use super::*;
+
+    fn interactive_surface() -> crate::config::SurfaceCapabilities {
+        crate::config::SurfaceCapabilities {
+            questions: true,
+            plan_control: true,
+            ..Default::default()
+        }
+    }
 
     /// External source stub: `{prefix}__echo` (marked read-only) and
     /// `{prefix}__fail` (always errors).
@@ -1190,10 +1239,11 @@ mod tests {
     fn all_tool_defs_appends_sources_and_skips_collisions() {
         let sources: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let names: Vec<String> = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, false)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let names: Vec<String> =
+            all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, interactive_surface())
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
         // Built-ins first, then the first source; the duplicate source's
         // identical names are dropped. run_program comes last: its TypeScript
         // API is generated from the built-ins AND the source tools, so it is
@@ -1218,6 +1268,8 @@ mod tests {
                 "srv__fail",
                 "srv__image",
                 "run_program",
+                "ask_user_question",
+                "enter_plan_mode",
                 "exit_plan_mode",
             ]
         );
@@ -1231,7 +1283,12 @@ mod tests {
             }],
             readonly: String::new(),
         })];
-        let defs = all_tool_defs(0, &builtin_clash, TOOL_DEFER_THRESHOLD, false);
+        let defs = all_tool_defs(
+            0,
+            &builtin_clash,
+            TOOL_DEFER_THRESHOLD,
+            interactive_surface(),
+        );
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
@@ -1280,20 +1337,23 @@ mod tests {
 
         // Exactly at the threshold (built-ins + the stub's 3 tools): everything
         // inline, no tool_search.
-        let inline = all_tool_defs(0, &sources, builtin_count + 3, false);
+        let inline = all_tool_defs(0, &sources, builtin_count + 3, interactive_surface());
         assert!(inline.iter().any(|d| d.name == "srv__echo"));
         assert!(inline.iter().all(|d| d.name != "tool_search"));
         assert!(deferred_tool_defs(&sources, builtin_count + 3).is_empty());
 
         // One past it: built-ins + tool_search + call_tool only; sources
-        // deferred. (+1 for the always-present depth-0 exit_plan_mode tool.)
-        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2, false);
+        // deferred. The three always-present depth-0 interaction controls are
+        // appended after run_program and do not count toward the threshold.
+        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2, interactive_surface());
         let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
+        assert!(names.contains(&"ask_user_question"));
+        assert!(names.contains(&"enter_plan_mode"));
         assert!(names.contains(&"exit_plan_mode"));
         assert!(!names.contains(&"srv__echo"));
-        assert_eq!(deferred_regime.len(), builtin_count + 3);
+        assert_eq!(deferred_regime.len(), builtin_count + 5);
         let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 2)
             .into_iter()
             .map(|d| d.name)
@@ -1306,7 +1366,7 @@ mod tests {
     #[test]
     fn run_program_def_declares_inline_source_tools() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
-        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, false);
+        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, interactive_surface());
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("srv__echo(args:"),
@@ -1327,7 +1387,7 @@ mod tests {
     fn run_program_def_lists_deferred_source_tools_as_a_manifest() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
         // One source (2 tools) past the built-in count forces the defer regime.
-        let defs = all_tool_defs(0, &sources, tool_defs(0).len(), false);
+        let defs = all_tool_defs(0, &sources, tool_defs(0).len(), interactive_surface());
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("- tools.srv__echo:"),
@@ -1703,6 +1763,7 @@ mod tests {
                 context_window: None,
                 fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+                questioner: None,
                 file_state: Default::default(),
                 tool_sources: Vec::new(),
                 session_id: String::new(),
@@ -1720,7 +1781,7 @@ mod tests {
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-                worktree_enabled: false,
+                surface: Default::default(),
             }),
             ui: Arc::new(NullUi),
             cancel,

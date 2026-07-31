@@ -22,6 +22,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::background_tasks::TaskStatus;
+use super::run_store::RunId;
+use super::run_store::RunLease;
+use super::run_store::RunNamespace;
+use super::run_store::RunStore;
 use super::ToolCtx;
 use crate::event::BackgroundTaskKind;
 use crate::inbox::InboxItem;
@@ -39,7 +43,7 @@ const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 /// reasoning as the offload/agent counters.
 static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
 
-mod journal;
+pub(super) mod journal;
 use journal::agent_call_key;
 use journal::Claim;
 use journal::Journal;
@@ -50,7 +54,10 @@ use journal::Journal;
 /// synchronously via `agent()`/`parallel()`; fire-and-forget is a model-loop
 /// concept with no meaning inside one program run).
 fn is_program_callable(name: &str) -> bool {
-    !matches!(name, "run_program" | "task" | "wait" | "stop_agent")
+    !matches!(
+        name,
+        "run_program" | "workflow" | "task" | "wait" | "stop_agent"
+    )
 }
 
 /// The tool names a program may call: the depth-0 built-ins plus every external
@@ -79,17 +86,36 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     // Each run has a run_id and an agent()-call journal. A resume passes the old
     // run_id back, reusing the journal dir so completed agent() calls are
     // skipped instead of re-spawned (and re-charged) — plan 24 journal resume.
-    let run_id = input["resume_from_run_id"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(new_run_id);
-    let journal = Arc::new(Journal::open(journal_path(&ctx.cfg.offload_dir, &run_id)));
+    let store = RunStore::new(&ctx.cfg.offload_dir, RunNamespace::Program)
+        .map_err(|error| anyhow!("run_program: cannot open run store: {error:#}"))?;
+    let (run_id, run_dir) = match input["resume_from_run_id"].as_str() {
+        Some(raw) => {
+            let id = RunId::parse(raw).map_err(|error| anyhow!("run_program: {error:#}"))?;
+            let run = store
+                .open(&id)
+                .map_err(|error| anyhow!("run_program: cannot resume {raw}: {error:#}"))?;
+            (id, run)
+        }
+        None => {
+            let id = RunId::parse(&new_run_id()).expect("generated run id is valid");
+            let run = store
+                .create(&id)
+                .map_err(|error| anyhow!("run_program: cannot create run: {error:#}"))?;
+            (id, run)
+        }
+    };
+    let run_id = run_id.as_str().to_string();
+    let lease = run_dir
+        .acquire()
+        .map_err(|error| anyhow!("run_program: run is already active: {error:#}"))?;
+    let journal = Arc::new(Journal::open_run(run_dir, "journal.jsonl"));
 
     // Fire-and-forget: spawn detached, return a program id now, reinject the
     // return value at the next round boundary (reuses the plan-26 async path).
     if input["background"].as_bool().unwrap_or(false) {
-        return spawn_background_program(ctx, source, names, limits, run_id, journal);
+        return spawn_background_program(ctx, source, names, limits, run_id, journal, lease);
     }
+    let _lease = lease;
     let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits, Some(journal.clone())));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
@@ -114,18 +140,6 @@ fn new_run_id() -> String {
         "run-{secs}-{}",
         PROGRAM_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// `.kloop/program-runs/<run_id>/journal.jsonl` — a sibling of the offload dir
-/// (so it lives under `.kloop/` without a new Config field). Created lazily on
-/// the first journaled agent() call.
-fn journal_path(offload_dir: &std::path::Path, run_id: &str) -> std::path::PathBuf {
-    offload_dir
-        .parent()
-        .unwrap_or(offload_dir)
-        .join("program-runs")
-        .join(run_id)
-        .join("journal.jsonl")
 }
 
 /// Append resume guidance to a program failure, but only if at least one
@@ -174,6 +188,7 @@ fn spawn_background_program(
     limits: kloop_codemode::Limits,
     run_id: String,
     journal: Arc<Journal>,
+    lease: RunLease,
 ) -> Result<String> {
     let label = format!("program-{}", PROGRAM_SEQ.fetch_add(1, Ordering::Relaxed));
     let own_cancel = CancellationToken::new();
@@ -201,6 +216,7 @@ fn spawn_background_program(
 
     let worker_cancel = own_cancel.clone();
     let worker = tokio::spawn(async move {
+        let _lease = lease;
         kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
     });
     background_tasks.attach_abort(&label, worker.abort_handle());
@@ -380,7 +396,7 @@ impl HostBridge for CoreBridge {
         seq: u32,
         prompt: String,
         opts: Value,
-    ) -> BoxFuture<Result<String, String>> {
+    ) -> BoxFuture<Result<Value, String>> {
         let ctx = self.ctx.clone();
         // Journal replay is a synchronous, deterministic decision (seq comes
         // from JS): a hit reuses a prior run's result and skips the spawn — and
@@ -415,6 +431,7 @@ impl HostBridge for CoreBridge {
             }
             let result = super::task::task_tool(&task_input, &ctx)
                 .await
+                .map(Value::String)
                 .map_err(|e| format!("{e:#}"));
             // Record only a successful live call so a resume can skip it.
             if let (Ok(out), Some(j)) = (&result, &journal) {

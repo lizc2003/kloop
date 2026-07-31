@@ -33,6 +33,7 @@ pub enum BackgroundTaskKind {
     Shell,
     Agent,
     Program,
+    Workflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub enum BackgroundTaskStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTask {
     pub id: String,
+    /// Durable run identity when the task has one (Workflow); ordinary shell,
+    /// agent, and program tasks remain task-id-only.
+    pub run_id: Option<String>,
     pub kind: BackgroundTaskKind,
     pub description: String,
     pub status: BackgroundTaskStatus,
@@ -197,6 +201,7 @@ impl Event {
                     BackgroundTaskKind::Shell => "shell",
                     BackgroundTaskKind::Agent => "agent",
                     BackgroundTaskKind::Program => "program",
+                    BackgroundTaskKind::Workflow => "workflow",
                 };
                 let state = match task.status {
                     BackgroundTaskStatus::Running => "started",
@@ -371,6 +376,7 @@ mod tests {
     fn background_task_note_preserves_terminal_detail() {
         let event = Event::BackgroundTaskUpdated(BackgroundTask {
             id: "program-2".into(),
+            run_id: None,
             kind: BackgroundTaskKind::Program,
             description: "run checks".into(),
             status: BackgroundTaskStatus::Cancelled,

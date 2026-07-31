@@ -17,6 +17,7 @@ enum Behavior {
 struct TestBridge {
     behavior: Behavior,
     logs: Mutex<Vec<String>>,
+    phases: Mutex<Vec<String>>,
     // When present, every tool call parks on the barrier before returning, so a
     // batch that is genuinely concurrent releases and a serial one deadlocks.
     barrier: Option<Arc<Barrier>>,
@@ -27,6 +28,7 @@ impl TestBridge {
         Arc::new(Self {
             behavior: Behavior::Echo,
             logs: Mutex::new(Vec::new()),
+            phases: Mutex::new(Vec::new()),
             barrier: None,
         })
     }
@@ -52,12 +54,16 @@ impl HostBridge for TestBridge {
         seq: u32,
         prompt: String,
         opts: Value,
-    ) -> BoxFuture<Result<String, String>> {
-        Box::pin(async move { Ok(format!("agent#{seq}[{opts}]: {prompt}")) })
+    ) -> BoxFuture<Result<Value, String>> {
+        Box::pin(async move { Ok(Value::String(format!("agent#{seq}[{opts}]: {prompt}"))) })
     }
 
     fn log(&self, message: String) {
         self.logs.lock().unwrap().push(message);
+    }
+
+    fn phase(&self, title: String) {
+        self.phases.lock().unwrap().push(title);
     }
 }
 
@@ -148,6 +154,7 @@ async fn tool_error_is_a_catchable_exception() {
     let bridge = Arc::new(TestBridge {
         behavior: Behavior::Fail,
         logs: Mutex::new(Vec::new()),
+        phases: Mutex::new(Vec::new()),
         barrier: None,
     });
     let out = run(
@@ -167,6 +174,7 @@ async fn promise_all_runs_tool_calls_concurrently() {
     let bridge = Arc::new(TestBridge {
         behavior: Behavior::Echo,
         logs: Mutex::new(Vec::new()),
+        phases: Mutex::new(Vec::new()),
         barrier: Some(Arc::new(Barrier::new(2))),
     });
     let fut = run(
@@ -189,6 +197,7 @@ async fn parallel_helper_turns_failures_into_null() {
     let bridge = Arc::new(TestBridge {
         behavior: Behavior::Fail,
         logs: Mutex::new(Vec::new()),
+        phases: Mutex::new(Vec::new()),
         barrier: None,
     });
     let out = run(
@@ -361,6 +370,71 @@ async fn thrown_program_error_surfaces() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("boom in program"), "{err}");
+}
+
+#[test]
+fn workflow_meta_parser_accepts_pure_literal_and_rejects_code() {
+    let prepared = prepare_workflow(
+        r#"export const meta = {
+            name: 'demo',
+            description: 'A demo',
+            phases: [{ title: 'Scan', detail: 'read inputs' }],
+        };
+        return args;"#,
+    )
+    .unwrap();
+    assert_eq!(prepared.meta.name, "demo");
+    assert_eq!(prepared.meta.phases[0].title, "Scan");
+    assert!(prepared.body.contains("return args"));
+
+    for bad in [
+        "export const meta = buildMeta(); return 1;",
+        "export const meta = { name: 'x', description: Date.now() }; return 1;",
+        "export const meta = { name: 'x', description: 'x' }; return Math.random();",
+        "return 1;",
+    ] {
+        assert!(prepare_workflow(bad).is_err(), "accepted bad script: {bad}");
+    }
+}
+
+#[tokio::test]
+async fn workflow_has_only_orchestration_globals_and_returns_json() {
+    let workflow = prepare_workflow(
+        r#"export const meta = {
+            name: 'demo', description: 'A demo',
+            phases: [{ title: 'Scan', detail: 'read inputs' }],
+        };
+        phase('Scan');
+        const child = await agent('inspect', {});
+        return {
+            args,
+            metaName: meta.name,
+            child,
+            tools: typeof tools,
+            hiddenTool: typeof __call_tool,
+            process: typeof process,
+            fetch: typeof fetch,
+        };"#,
+    )
+    .unwrap();
+    let bridge = TestBridge::echo();
+    let out = run_workflow(
+        &workflow,
+        &serde_json::json!({"items": [1, 2]}),
+        bridge.clone(),
+        CancellationToken::new(),
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["args"], serde_json::json!({"items": [1, 2]}));
+    assert_eq!(out["metaName"], "demo");
+    assert_eq!(out["child"], "agent#0[{}]: inspect");
+    assert_eq!(out["tools"], "undefined");
+    assert_eq!(out["hiddenTool"], "undefined");
+    assert_eq!(out["process"], "undefined");
+    assert_eq!(out["fetch"], "undefined");
+    assert_eq!(*bridge.phases.lock().unwrap(), vec!["Scan"]);
 }
 
 #[tokio::test]

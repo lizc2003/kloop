@@ -51,6 +51,10 @@ use kloop_core::event::Event;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
+use kloop_core::interaction::QuestionAnswer;
+use kloop_core::interaction::QuestionOutcome;
+use kloop_core::interaction::QuestionRequest;
+use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -82,8 +86,16 @@ pub struct ThreadStartOptions {
 /// Builds one Config per thread. Called with the thread's resolved runtime
 /// choices, approver (routes to `approval/request`), and note sink, so cwd-bound
 /// policy and approval caches stay per-thread.
-pub type ConfigFactory =
-    Arc<dyn Fn(ThreadStartOptions, Arc<dyn Approver>, NoteFn) -> Result<Config> + Send + Sync>;
+pub type ConfigFactory = Arc<
+    dyn Fn(
+            ThreadStartOptions,
+            Arc<dyn Approver>,
+            Option<Arc<dyn Questioner>>,
+            NoteFn,
+        ) -> Result<Config>
+        + Send
+        + Sync,
+>;
 
 /// One model the engine can start a new thread with. Slice 4 deliberately
 /// reports only models the process can name locally; it never fabricates a
@@ -281,6 +293,7 @@ where
         skills_reader,
         default_cwd,
         initialized: false,
+        client_questions: false,
     };
     let mut lines = BufReader::new(input).lines();
     while let Some(line) = lines.next_line().await? {
@@ -296,6 +309,7 @@ where
             cancel.cancel();
         }
     }
+    server.pending.lock().unwrap().clear();
     drop(server);
     writer.await.context("writer task panicked")?
 }
@@ -345,12 +359,31 @@ struct ThreadHandle {
     model: String,
 }
 
-type PendingApprovals = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Decision>>>>;
+enum PendingInteraction {
+    Approval(oneshot::Sender<Decision>),
+    Question {
+        question_index: usize,
+        reply: oneshot::Sender<QuestionOutcome>,
+    },
+}
+
+type PendingInteractions = Arc<Mutex<HashMap<RequestId, PendingInteraction>>>;
+
+struct PendingGuard {
+    id: RequestId,
+    pending: PendingInteractions,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
 
 struct Server {
     out: mpsc::UnboundedSender<Value>,
     threads: HashMap<String, ThreadHandle>,
-    pending: PendingApprovals,
+    pending: PendingInteractions,
     srv_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
@@ -367,6 +400,8 @@ struct Server {
     /// method is rejected until then, so a version mismatch surfaces
     /// immediately instead of as mysterious downstream failures.
     initialized: bool,
+    /// Whether the initialized client opted into `question/request` reverse RPCs.
+    client_questions: bool,
 }
 
 impl Server {
@@ -390,7 +425,7 @@ impl Server {
             // A method without an id has nobody to answer; ignore it.
             (Some(_), None) => {}
             // No method: the client answering one of our approval requests.
-            (None, Some(id)) => self.handle_approval_response(id, incoming.result),
+            (None, Some(id)) => self.handle_interaction_response(id, incoming.result),
             (None, None) => self.send(Outgoing::Error {
                 id: None,
                 code: wire::PARSE_ERROR,
@@ -449,6 +484,11 @@ impl Server {
                 ),
             ));
         }
+        self.client_questions = params
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("questions"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.initialized = true;
         Ok(json!({
             "serverInfo": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
@@ -459,6 +499,7 @@ impl Server {
                 "mcp": true,
                 "images": true,
                 "approvals": true,
+                "questions": true,
                 "models": {"list": true},
                 "config": {"read": true},
                 "skills": {"list": true},
@@ -473,23 +514,49 @@ impl Server {
         }))
     }
 
-    fn handle_approval_response(&mut self, id: RequestId, result: Value) {
-        let Some(reply) = self.pending.lock().unwrap().remove(&id) else {
+    fn handle_interaction_response(&mut self, id: RequestId, result: Value) {
+        let Some(pending) = self.pending.lock().unwrap().remove(&id) else {
             return self.send(Outgoing::Error {
                 id: Some(id),
                 code: wire::SERVER_ERROR,
-                message: "no pending approval with this id".into(),
+                message: "no pending interaction with this id".into(),
             });
         };
-        let decision = match result["decision"].as_str() {
-            Some("accept") => Decision::Allow,
-            Some("acceptForSession") => Decision::AllowSession,
-            Some("acceptAlways") => Decision::AllowAlways,
-            // "decline", "cancel", anything unrecognized, or missing: the safe
-            // answer (a client that wants to stop the turn sends turn/interrupt).
-            _ => Decision::Deny,
-        };
-        let _ = reply.send(decision);
+        match pending {
+            PendingInteraction::Approval(reply) => {
+                let decision = match result["decision"].as_str() {
+                    Some("accept") => Decision::Allow,
+                    Some("acceptForSession") => Decision::AllowSession,
+                    Some("acceptAlways") => Decision::AllowAlways,
+                    // "decline", "cancel", anything unrecognized, or missing:
+                    // the safe answer.
+                    _ => Decision::Deny,
+                };
+                let _ = reply.send(decision);
+            }
+            PendingInteraction::Question {
+                question_index,
+                reply,
+            } => {
+                let outcome = match serde_json::from_value::<wire::QuestionResponse>(result) {
+                    Ok(wire::QuestionResponse::Answered {
+                        selected,
+                        other,
+                        notes,
+                    }) => QuestionOutcome::Answered(vec![QuestionAnswer {
+                        question_index,
+                        selected,
+                        other,
+                        notes,
+                    }]),
+                    Ok(wire::QuestionResponse::Cancelled) => QuestionOutcome::Cancelled,
+                    Err(error) => QuestionOutcome::Unavailable(format!(
+                        "malformed question response: {error}"
+                    )),
+                };
+                let _ = reply.send(outcome);
+            }
+        }
     }
 
     fn thread_start(&mut self, params: &Value) -> MethodResult {
@@ -863,11 +930,15 @@ impl Server {
             turn: turn.clone(),
         });
         let note_ui = ui.clone();
+        let questioner: Option<Arc<dyn Questioner>> = self
+            .client_questions
+            .then(|| ui.clone() as Arc<dyn Questioner>);
         let runtime_cwd = options.cwd.to_string_lossy().to_string();
         let pin_default_model = options.model.is_none();
         let mut cfg = (self.factory)(
             options,
             ui.clone(),
+            questioner,
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
         )
         .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
@@ -1224,7 +1295,7 @@ async fn run_turn_or_command(
 struct ThreadUi {
     thread_id: String,
     out: mpsc::UnboundedSender<Value>,
-    pending: PendingApprovals,
+    pending: PendingInteractions,
     srv_seq: Arc<AtomicU64>,
     /// The running turn's id (shared with the handle), used to tag item events.
     turn: Arc<Mutex<Option<u64>>>,
@@ -1238,8 +1309,12 @@ impl ThreadUi {
             .send(Outgoing::Notification { method, params }.to_json());
     }
 
+    fn active_turn_id(&self) -> Option<u64> {
+        *self.turn.lock().unwrap()
+    }
+
     fn turn_id(&self) -> u64 {
-        self.turn.lock().unwrap().unwrap_or(0)
+        self.active_turn_id().unwrap_or(0)
     }
 }
 
@@ -1263,7 +1338,10 @@ impl Approver for ThreadUi {
         // space (§ wire): a no-method response always answers one of ours.
         let id = RequestId::Num(self.srv_seq.fetch_add(1, Ordering::SeqCst) as i64);
         let (reply, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id.clone(), reply);
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), PendingInteraction::Approval(reply));
         // A file change carries a diff preview; nothing else does — so the
         // preview's presence is exactly the command/fileChange discriminant.
         let kind = if req.preview.is_some() {
@@ -1294,16 +1372,94 @@ impl Approver for ThreadUi {
                 .to_json(),
             )
             .is_ok();
-        let pending = self.pending.clone();
+        let guard = PendingGuard {
+            id,
+            pending: self.pending.clone(),
+        };
         Box::pin(async move {
+            let _guard = guard;
             if !sent {
-                pending.lock().unwrap().remove(&id);
                 return Decision::Deny;
             }
             // Dropped sender (input closed, server shutting down) = deny.
-            let decision = rx.await.unwrap_or(Decision::Deny);
-            pending.lock().unwrap().remove(&id);
-            decision
+            rx.await.unwrap_or(Decision::Deny)
+        })
+    }
+}
+
+impl Questioner for ThreadUi {
+    fn ask(
+        &self,
+        request: QuestionRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
+        Box::pin(async move {
+            let mut answers = Vec::with_capacity(request.questions.len());
+            for (question_index, question) in request.questions.iter().enumerate() {
+                let Some(turn_id) = self.active_turn_id() else {
+                    return QuestionOutcome::Unavailable(
+                        "question requested outside an active turn".into(),
+                    );
+                };
+                let id = RequestId::Num(self.srv_seq.fetch_add(1, Ordering::SeqCst) as i64);
+                let (reply, rx) = oneshot::channel();
+                self.pending.lock().unwrap().insert(
+                    id.clone(),
+                    PendingInteraction::Question {
+                        question_index,
+                        reply,
+                    },
+                );
+                let guard = PendingGuard {
+                    id: id.clone(),
+                    pending: self.pending.clone(),
+                };
+                let params = json!({
+                    "threadId": self.thread_id,
+                    "turnId": turn_id,
+                    "questionIndex": question_index,
+                    "question": question,
+                });
+                if self
+                    .out
+                    .send(
+                        Outgoing::ServerRequest {
+                            id,
+                            method: "question/request",
+                            params,
+                        }
+                        .to_json(),
+                    )
+                    .is_err()
+                {
+                    return QuestionOutcome::Unavailable(
+                        "server output channel closed while asking a question".into(),
+                    );
+                }
+                let outcome = rx.await.unwrap_or_else(|_| {
+                    QuestionOutcome::Unavailable("question response channel was dropped".into())
+                });
+                drop(guard);
+                match outcome {
+                    QuestionOutcome::Answered(mut one) if one.len() == 1 => {
+                        answers.push(one.remove(0));
+                    }
+                    QuestionOutcome::Answered(_) => {
+                        return QuestionOutcome::Unavailable(
+                            "question response contained the wrong answer count".into(),
+                        )
+                    }
+                    QuestionOutcome::Cancelled => return QuestionOutcome::Cancelled,
+                    QuestionOutcome::Unavailable(error) => {
+                        return QuestionOutcome::Unavailable(error)
+                    }
+                }
+            }
+            match request.validate_answers(&answers) {
+                Ok(()) => QuestionOutcome::Answered(answers),
+                Err(error) => QuestionOutcome::Unavailable(format!(
+                    "client returned an invalid question answer: {error}"
+                )),
+            }
         })
     }
 }

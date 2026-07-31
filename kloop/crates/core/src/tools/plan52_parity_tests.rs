@@ -460,8 +460,8 @@ async fn native_surface_report() -> Value {
         "ListAgents",
         "ListPeers",
     ];
-    let depth_zero = all_tool_defs(0, &[], 30, false);
-    let depth_one = all_tool_defs(1, &[], 30, false);
+    let depth_zero = all_tool_defs(0, &[], 30, Default::default());
+    let depth_one = all_tool_defs(1, &[], 30, Default::default());
     let names_zero: Vec<&str> = depth_zero.iter().map(|def| def.name.as_str()).collect();
     let names_one: Vec<&str> = depth_one.iter().map(|def| def.name.as_str()).collect();
     let native_zero: Vec<&str> = EXPECTED_NATIVE

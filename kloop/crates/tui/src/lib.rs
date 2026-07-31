@@ -45,6 +45,7 @@ use kloop_core::event::Event as CoreEvent;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
+use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::rollout::fork_points;
 use kloop_core::rollout::fork_session;
@@ -106,7 +107,7 @@ enum WorkerMsg {
 /// TUI's approver (the y/a/p/n popup) and note sink, so the caller can wire
 /// them into `Permissions` without this crate knowing about rule loading.
 pub async fn run(
-    make_config: impl FnOnce(Arc<dyn Approver>, NoteFn) -> Result<Config>,
+    make_config: impl FnOnce(Arc<dyn Approver>, Arc<dyn Questioner>, NoteFn) -> Result<Config>,
     history: History,
     session_id: String,
     pending_images: Vec<ContentBlock>,
@@ -116,6 +117,7 @@ pub async fn run(
     let channel_ui = Arc::new(ChannelUi::new(event_tx.clone()));
     let note_ui = channel_ui.clone();
     let cfg = Arc::new(make_config(
+        channel_ui.clone(),
         channel_ui.clone(),
         Arc::new(move |s: &str| note_ui.emit(&CoreEvent::Note(s.to_string()))),
     )?);
@@ -660,7 +662,7 @@ async fn ui_loop(
         if let Err(e) = terminal.autoresize() {
             break Err(e.into());
         }
-        if app.confirms.is_empty() && app.fork_picker.is_none() && app.popup.is_none() {
+        if app.interactions.is_empty() && app.fork_picker.is_none() && app.popup.is_none() {
             if let Err(e) = commit_overflow(terminal, &mut app) {
                 break Err(e);
             }
@@ -673,7 +675,7 @@ async fn ui_loop(
         // idle, the tick is disabled so `select` blocks with zero CPU (the
         // FrameRequester role, played by tokio, plan 38 slice 5).
         let animating = app.running
-            && app.confirms.is_empty()
+            && app.interactions.is_empty()
             && app.fork_picker.is_none()
             && app.popup.is_none();
         let tick_ms = if reduced_motion { 1000 } else { anim::STEP_MS };
@@ -758,6 +760,7 @@ async fn ui_loop(
                 // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
                 // path attaches as an image, anything else goes to the composer
                 // (a large paste collapses to a placeholder there).
+                Some(Event::Paste(s)) if app.question_editor_active() => app.paste_text(&s),
                 Some(Event::Paste(s)) => match load_image_paste(&s) {
                     Some((label, block)) => app.attach_image(label, block),
                     None => app.paste_text(&s),

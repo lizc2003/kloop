@@ -59,7 +59,7 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；文件/搜索簇与前台 Bash 已完成 exact 2.1.220 parity（plan 49–50）
+### 4. 工具面——🟡 主干齐；文件/搜索、前台 Bash、后台生命周期与交互控制已完成（Plan 49–53）
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -106,6 +106,14 @@ Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆
 决定不实现独立 registry；todo/wait/stop 不冒充 Task*。SendMessage 只闭合 unknown-recipient，ListAgents/
 team/remote 因无权威 hermetic true-profile 保持 unknown。新增两相 sampling gate + native report 锁定 task
 真并发、后台终态与 inbox 边界；未接真实 cloud/team/mailbox。
+
+Plan 53 将一般问答、Plan control、Workflow 与 StructuredOutput 分开落地：`ask_user_question`
+使用独立 Questioner seam，plain/TUI/server 支持而 headless/断线 fail closed；`enter_plan_mode`
+与 `exit_plan_mode` 固定 depth-0 工具数组并由共享 ModeState 精确保存/恢复前态。独立 `workflow`
+始终后台，只暴露 agent 编排原语，不是 `run_program` alias；managed run store、phase/terminal identity、
+stop/shutdown、resume hit/miss 和 edited script 均已接通。`StructuredOutput` 仅在 Workflow schema child
+中作为 synthetic tool 临时注入，本地 JSON Schema 复验后以原生 JSON Value 回传，不进入主 registry。
+Named/nested workflow、token budget、remote execution 与 per-child provider effort 保持 intentional-diff。
 
 ### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 

@@ -21,6 +21,9 @@ use std::time::Duration;
 
 use crate::app::App;
 use crate::app::Cell;
+use crate::app::PendingInteraction;
+use crate::app::PendingQuestion;
+use crate::app::QuestionPhase;
 use crate::app::ToolStatus;
 use crate::menu;
 use crate::menu::Popup;
@@ -412,7 +415,7 @@ fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
 /// its layout reservation, where no `Hud` is available; mirrors the conditions
 /// in `activity_line`.
 pub fn has_activity_line(app: &App) -> bool {
-    app.ctrl_c_exit_armed || !app.confirms.is_empty() || app.running
+    app.ctrl_c_exit_armed || app.interaction_active() || app.running
 }
 
 /// The dynamic "what's happening now" line, shown at the BOTTOM of the
@@ -424,8 +427,12 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
         // Unmissable, right above the composer where Ctrl+C was pressed.
         return Some(Line::from("press Ctrl+C again to exit".to_string()));
     }
-    if !app.confirms.is_empty() {
-        return Some(Line::from("awaiting your approval".to_string()));
+    if let Some(interaction) = app.interactions.front() {
+        let text = match interaction {
+            PendingInteraction::Confirm { .. } => "awaiting your approval",
+            PendingInteraction::Question(_) => "awaiting your answer",
+        };
+        return Some(Line::from(text.to_string()));
     }
     if !app.running {
         return None;
@@ -454,6 +461,20 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
 /// running/idle hint set, and the (per-turn) context gauge change — never per
 /// event — so the bar barely moves. Live activity lives in [`activity_line`].
 pub fn footer_line(app: &App, width: usize) -> Line<'static> {
+    if let Some(interaction) = app.interactions.front() {
+        let hint = match interaction {
+            PendingInteraction::Confirm { .. } => "approval: y allow · n/esc deny · ↑↓ scroll",
+            PendingInteraction::Question(question) => match question.phase {
+                QuestionPhase::Select if question.current().multi_select => {
+                    "question: ↑↓ choose · Space toggle · Enter submit · Esc cancel"
+                }
+                QuestionPhase::Select => "question: ↑↓ choose · Enter select · Esc cancel",
+                QuestionPhase::Other => "question: type Other · Enter submit · Esc cancel",
+                QuestionPhase::Notes => "question: optional notes · Enter submit · Esc cancel",
+            },
+        };
+        return Line::from(Span::styled(hint.to_string(), DIM));
+    }
     if app.fork_picker.is_some() {
         return Line::from(Span::styled(
             "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".to_string(),
@@ -576,8 +597,16 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     comp_rows.extend(view.rows);
     f.render_widget(Paragraph::new(comp_rows), input_area);
 
-    if !app.confirms.is_empty() {
+    if matches!(
+        app.interactions.front(),
+        Some(PendingInteraction::Confirm { .. })
+    ) {
         draw_confirm(f, app, full);
+    } else if matches!(
+        app.interactions.front(),
+        Some(PendingInteraction::Question(_))
+    ) {
+        draw_question(f, app, full);
     } else if app.fork_picker.is_some() {
         draw_fork_picker(f, app, full);
     } else {
@@ -718,10 +747,161 @@ fn draw_fork_picker(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(visible).block(block), popup);
 }
 
+fn draw_question(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup_w = area.width.saturating_sub(4).clamp(24, 84);
+    let inner_w = usize::from(popup_w - 2);
+    let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
+        return;
+    };
+    let title = format!(
+        "question {}/{} · {}",
+        question.question_index + 1,
+        question.req.questions.len(),
+        question.current().header
+    );
+    let body = question_body_lines(question, inner_w);
+    let (footer, editor_prefix) = question_footer_lines(question, inner_w);
+    let overhead = 3 + footer.len();
+    let avail = usize::from(area.height);
+    let popup_h = (body.len() + overhead).min(avail).max(overhead.min(avail));
+    let content_h = popup_h.saturating_sub(overhead).max(1);
+    let (scroll, mut lines, more_above, more_below) =
+        window_lines(&body, app.confirm_scroll, content_h);
+    app.confirm_scroll = scroll;
+    lines.push(Line::default());
+    lines.extend(footer);
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
+        width: popup_w,
+        height: popup_h as u16,
+    };
+    let mut block = Block::bordered().title(title);
+    if let Some(hint) = scroll_hint(more_above, more_below) {
+        block = block.title_bottom(Line::from(hint).right_aligned());
+    }
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+
+    if let Some(prefix_width) = editor_prefix {
+        let editor_width = display_width(&question.editor);
+        let x = popup
+            .x
+            .saturating_add(1)
+            .saturating_add((prefix_width + editor_width).min(inner_w) as u16);
+        let y = popup.y.saturating_add(popup.height.saturating_sub(2));
+        f.set_cursor_position((x, y));
+    }
+}
+
+fn question_body_lines(question: &PendingQuestion, inner_w: usize) -> Vec<Line<'static>> {
+    let current = question.current();
+    let mut lines: Vec<Line<'static>> = wrap(&current.question, inner_w)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    lines.push(Line::default());
+    for (index, option) in current.options.iter().enumerate() {
+        let selected = question.selected.contains(&index);
+        let marker = if current.multi_select {
+            if selected {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else if selected {
+            "(●)"
+        } else {
+            "( )"
+        };
+        let text = format!("{marker} {} — {}", option.label, option.description);
+        let style = if question.phase == QuestionPhase::Select && question.cursor == index {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        for fragment in wrap(&text, inner_w) {
+            lines.push(Line::from(Span::styled(fragment, style)));
+        }
+    }
+    let other_style =
+        if question.phase == QuestionPhase::Select && question.cursor == current.options.len() {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+    lines.push(Line::from(Span::styled(
+        "Other — type a custom answer".to_string(),
+        other_style,
+    )));
+    if let Some(preview) = question.selected_preview() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("Preview", DIM)));
+        lines.extend(
+            preview
+                .lines()
+                .flat_map(|line| wrap(line, inner_w))
+                .map(Line::from),
+        );
+    }
+    lines
+}
+
+fn question_footer_lines(
+    question: &PendingQuestion,
+    inner_w: usize,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    match question.phase {
+        QuestionPhase::Select => {
+            let hint = if question.current().multi_select {
+                "↑↓ choose · Space toggle · Enter submit · Esc cancel"
+            } else {
+                "↑↓ choose · Enter select · Esc cancel"
+            };
+            (
+                wrap(hint, inner_w)
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(line, Style::new().fg(Color::Cyan))))
+                    .collect(),
+                None,
+            )
+        }
+        QuestionPhase::Other => {
+            let prefix = "Other > ";
+            (
+                vec![Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(Color::Cyan)),
+                    Span::raw(truncate(
+                        &question.editor,
+                        inner_w.saturating_sub(prefix.len()),
+                    )),
+                ])],
+                Some(display_width(prefix)),
+            )
+        }
+        QuestionPhase::Notes => {
+            let prefix = "Notes (optional) > ";
+            (
+                vec![Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(Color::Cyan)),
+                    Span::raw(truncate(
+                        &question.editor,
+                        inner_w.saturating_sub(prefix.len()),
+                    )),
+                ])],
+                Some(display_width(prefix)),
+            )
+        }
+    }
+}
+
 fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
     let popup_w = area.width.saturating_sub(4).clamp(20, 76);
     let inner_w = usize::from(popup_w - 2);
-    let req = &app.confirms.front().expect("checked non-empty").req;
+    let Some(PendingInteraction::Confirm { req, .. }) = app.interactions.front() else {
+        return;
+    };
     let body = confirm_body_lines(req, inner_w);
     // The y/a/p/n options are pinned below the scroll region — the point of the
     // popup is those keys, so they must stay visible however far the diff runs.

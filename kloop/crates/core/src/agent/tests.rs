@@ -3,7 +3,11 @@ use crate::event::Delta;
 use crate::event::Item;
 use crate::inbox::InboxItem;
 use crate::inbox::STEERING_PREFIX;
+use crate::tools::SourceOutput;
+use crate::tools::ToolSource;
 use kloop_protocol::Role;
+use kloop_protocol::ToolDef;
+use kloop_provider::MockTurn;
 use kloop_provider::Provider;
 use serde_json::json;
 
@@ -24,9 +28,278 @@ fn tool_use_named(id: &str, name: &str, input: Value) -> ContentBlock {
     }
 }
 
-/// End-to-end over the Mock provider: round 1 issues two concurrency-safe
-/// bash calls (one concurrent batch), round 2 one unsafe call (sequential),
-/// round 3 plain text ends the turn. Asserts the full history shape.
+fn structured_config(
+    turns: Vec<MockTurn>,
+) -> (
+    Arc<Config>,
+    Arc<std::sync::Mutex<Vec<kloop_provider::MockRequest>>>,
+) {
+    let (provider, seen) = Provider::mock_recording(turns);
+    let ctx = crate::tools::testutil::test_ctx(1, "structured-agent");
+    let mut cfg = (*ctx.cfg).clone();
+    cfg.provider = Arc::new(provider);
+    cfg.max_rounds = Some(10);
+    cfg.agent_label = "agent-structured".into();
+    (Arc::new(cfg), seen)
+}
+
+struct BarrierSource {
+    defs: Vec<ToolDef>,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+impl BarrierSource {
+    fn new(barrier: Arc<tokio::sync::Barrier>) -> Arc<Self> {
+        Arc::new(Self {
+            defs: vec![ToolDef {
+                name: "test__blocking_read".into(),
+                description: "Wait until both read calls have started".into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+            }],
+            barrier,
+        })
+    }
+}
+
+impl ToolSource for BarrierSource {
+    fn defs(&self) -> &[ToolDef] {
+        &self.defs
+    }
+
+    fn is_readonly(&self, tool: &str) -> bool {
+        tool == "test__blocking_read"
+    }
+
+    fn call<'a>(
+        &'a self,
+        _tool: &'a str,
+        input: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<SourceOutput>> + Send + 'a>,
+    > {
+        let barrier = self.barrier.clone();
+        let value = input["value"].as_str().unwrap_or_default().to_string();
+        Box::pin(async move {
+            barrier.wait().await;
+            Ok(SourceOutput::text(value))
+        })
+    }
+}
+
+#[tokio::test]
+async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+        "additionalProperties": false
+    });
+    let (base, seen) = structured_config(vec![
+        MockTurn::Blocks(vec![tool_use_named(
+            "s1",
+            "StructuredOutput",
+            json!({"count": "bad"}),
+        )]),
+        MockTurn::Blocks(vec![tool_use_named(
+            "s2",
+            "call_tool",
+            json!({
+                "tool_name": "StructuredOutput",
+                "params": {"count": 2}
+            }),
+        )]),
+    ]);
+    let mut cfg = (*base).clone();
+    cfg.defer_threshold = 0;
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("return a count"));
+    let outcome = run_structured_turn(
+        &cfg,
+        &mut history,
+        &ui,
+        &CancellationToken::new(),
+        1,
+        schema.clone(),
+    )
+    .await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.structured_output, Some(json!({"count": 2})));
+    assert_eq!(outcome.final_text, "");
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let synthetic = request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "StructuredOutput")
+            .unwrap();
+        assert_eq!(synthetic.schema, schema);
+    }
+    assert!(requests
+        .iter()
+        .all(|request| { request.tools.iter().any(|tool| tool.name == "call_tool") }));
+    assert!(matches!(
+        &history.messages()[2].content[0],
+        ContentBlock::ToolResult { is_error: true, .. }
+    ));
+    assert!(matches!(
+        &history.messages().last().unwrap().content[0],
+        ContentBlock::ToolResult {
+            is_error: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn structured_turn_nudges_missing_calls_and_exhausts() {
+    let schema = json!({"type": "string"});
+    let (cfg, seen) = structured_config(vec![
+        MockTurn::Blocks(vec![ContentBlock::Text {
+            text: "plain".into(),
+        }]),
+        MockTurn::Blocks(vec![ContentBlock::Text {
+            text: "still plain".into(),
+        }]),
+        MockTurn::Blocks(vec![ContentBlock::Text {
+            text: "never called".into(),
+        }]),
+    ]);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("return structured"));
+    let outcome = run_structured_turn(
+        &cfg,
+        &mut history,
+        &ui,
+        &CancellationToken::new(),
+        1,
+        schema,
+    )
+    .await;
+    assert!(matches!(outcome.reason, EndReason::Error(ref error) if error.contains("3 attempts")));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert!(history.messages().iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.contains("Call StructuredOutput now"))
+        })
+    }));
+}
+
+#[tokio::test]
+async fn structured_turn_batches_ordinary_tools_and_preserves_response_order() {
+    let schema = json!({"type": "array", "items": {"type": "integer"}});
+    let (base, _) = structured_config(vec![MockTurn::Blocks(vec![
+        tool_use_named("o1", "test__blocking_read", json!({"value": "first"})),
+        tool_use_named("s1", "StructuredOutput", json!([1, 2])),
+        tool_use_named("o2", "test__blocking_read", json!({"value": "second"})),
+    ])]);
+    let mut cfg = (*base).clone();
+    cfg.tool_sources = vec![BarrierSource::new(Arc::new(tokio::sync::Barrier::new(2)))];
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("work then return"));
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_structured_turn(
+            &cfg,
+            &mut history,
+            &ui,
+            &CancellationToken::new(),
+            1,
+            schema,
+        ),
+    )
+    .await
+    .expect("ordinary read-only tools should run as one concurrent batch");
+    assert_eq!(outcome.structured_output, Some(json!([1, 2])));
+    let results = &history.messages().last().unwrap().content;
+    assert_eq!(results.len(), 3);
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|result| match result {
+            ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+            _ => panic!("expected tool result"),
+        })
+        .collect();
+    assert_eq!(ids, vec!["o1", "s1", "o2"]);
+    assert!(matches!(
+        &results[1],
+        ContentBlock::ToolResult {
+            is_error: false,
+            ..
+        }
+    ));
+}
+#[tokio::test]
+async fn ordinary_turn_never_exposes_structured_output() {
+    let (cfg, seen) = structured_config(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+        text: "plain result".into(),
+    }])]);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("ordinary child"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "plain result");
+    assert!(seen.lock().unwrap()[0]
+        .tools
+        .iter()
+        .all(|tool| tool.name != "StructuredOutput"));
+}
+
+#[tokio::test]
+async fn structured_turn_cancellation_never_accepts_a_late_value() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (cfg, _) = structured_config(vec![MockTurn::Gate {
+        started: started_tx,
+        release: release_rx,
+        blocks: vec![tool_use_named(
+            "late",
+            "StructuredOutput",
+            json!("late value"),
+        )],
+    }]);
+    let cancel = CancellationToken::new();
+    let child_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("return a string"));
+        run_structured_turn(
+            &cfg,
+            &mut history,
+            &ui,
+            &child_cancel,
+            1,
+            json!({"type": "string"}),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+        .await
+        .expect("sampling did not start")
+        .expect("sampling gate dropped");
+    cancel.cancel();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("structured child ignored cancellation")
+        .expect("structured child panicked");
+    let _ = release_tx.send(());
+    assert_eq!(outcome.reason, EndReason::Aborted);
+    assert_eq!(outcome.structured_output, None);
+    assert_eq!(outcome.final_text, "");
+}
+
 #[tokio::test]
 async fn mock_end_to_end_three_rounds() {
     let provider = Provider::mock(vec![
@@ -48,6 +321,7 @@ async fn mock_end_to_end_three_rounds() {
         context_window: None,
         fallback_model: None,
         permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+        questioner: None,
         file_state: Default::default(),
         tool_sources: Vec::new(),
         session_id: String::new(),
@@ -65,7 +339,7 @@ async fn mock_end_to_end_three_rounds() {
         program_limits: Default::default(),
         skills: Default::default(),
         active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-        worktree_enabled: false,
+        surface: Default::default(),
     });
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let cancel = CancellationToken::new();
@@ -223,6 +497,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         context_window: Some(window),
         fallback_model: None,
         permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+        questioner: None,
         file_state: Default::default(),
         tool_sources: Vec::new(),
         session_id: String::new(),
@@ -240,7 +515,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         program_limits: Default::default(),
         skills: Default::default(),
         active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-        worktree_enabled: false,
+        surface: Default::default(),
     })
 }
 

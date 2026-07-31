@@ -196,6 +196,20 @@ stop-vs-completion 一次终态、final sampling inbox 兜底、todo replacement
 CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter tamper
 测试 fail closed；没有新增 pair contract 或人为制造 `same`。
 
+Plan 53 将 corpus 扩至 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
+状态为 65 `compatible` / 132 `intentional-diff` / 36 `missing` / 183 `unknown` / 22 `n/a` /
+10 `same`。AskUserQuestion 新增 single/multi/Other/two-question/preview/notes/cancel/invalid/headless
+九组 PTY 与 headless fixture；EnterPlanMode 新增 enter→exit、重复 enter、headless 三组；Workflow 新增
+minimal async launch/phase/completion 与 invalid-script-before-task 两组。bundle locator 同时固定 Workflow
+pure-literal meta、runtime capability、journal/resume 与 StructuredOutput synthetic adapter/AJV/nudge 链。
+
+kloop 不把 Approver、ReportFindings 或 `run_program` 改名计作 parity：新增独立 Questioner、Enter/Exit
+ModeState、always-background `workflow` profile 和 Workflow-child-only StructuredOutput。公共名字保留 snake_case，
+Exit 继续 inline plan preview；named/nested workflow、budget、remote 与 per-child provider effort 诚实标为
+intentional-diff。RunStore 使用受控 run component、descriptor-bound/no-follow artifact IO，Workflow
+completion/phase/terminal event 保持 task/run/store identity；resume journal 保留 JSON Value 并兼容 legacy
+string entry。full exact-binary verifier 与 corpus-only 门均通过。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -217,8 +231,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
-`docs/plan/51-background-monitor-parity.md` 与 `docs/plan/52-agent-task-team-parity.md`。Plan 52 的完成不表示
-kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 53–59 逐簇实现与验收。
+`docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md` 与
+`docs/plan/53-interaction-control-parity.md`。Plan 53 的完成不表示
+kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 54–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

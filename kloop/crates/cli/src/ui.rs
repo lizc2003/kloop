@@ -8,6 +8,10 @@ use kloop_core::agent::Ui;
 use kloop_core::event::Delta;
 use kloop_core::event::Event;
 use kloop_core::event::Item;
+use kloop_core::interaction::QuestionAnswer;
+use kloop_core::interaction::QuestionOutcome;
+use kloop_core::interaction::QuestionRequest;
+use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -81,6 +85,170 @@ impl Approver for CliApprover {
     }
 }
 
+impl Questioner for CliApprover {
+    fn ask(
+        &self,
+        request: QuestionRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
+        Box::pin(async move {
+            let _one_at_a_time = self.prompting.lock().await;
+            match tokio::task::spawn_blocking(move || prompt_questions(&request)).await {
+                Ok(outcome) => outcome,
+                Err(error) => QuestionOutcome::Unavailable(format!(
+                    "terminal question reader panicked: {error}"
+                )),
+            }
+        })
+    }
+}
+
+fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
+    let mut answers = Vec::with_capacity(request.questions.len());
+    for (question_index, question) in request.questions.iter().enumerate() {
+        loop {
+            println!(
+                "\n[question {}/{} · {}] {}",
+                question_index + 1,
+                request.questions.len(),
+                question.header,
+                question.question
+            );
+            for (option_index, option) in question.options.iter().enumerate() {
+                println!(
+                    "  {}. {} — {}",
+                    option_index + 1,
+                    option.label,
+                    option.description
+                );
+                if let Some(preview) = &option.preview {
+                    for line in preview.lines() {
+                        println!("     | {line}");
+                    }
+                }
+            }
+            let other_index = question.options.len() + 1;
+            println!("  {other_index}. Other (type a custom answer)");
+            let hint = if question.multi_select {
+                "comma-separated numbers"
+            } else {
+                "one number"
+            };
+            print!("  {hint}; c = cancel > ");
+            let _ = std::io::stdout().flush();
+            let line = match read_terminal_line() {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    return QuestionOutcome::Unavailable("terminal input reached EOF".into())
+                }
+                Err(error) => {
+                    return QuestionOutcome::Unavailable(format!(
+                        "cannot read terminal input: {error}"
+                    ))
+                }
+            };
+            if matches!(line.trim().to_ascii_lowercase().as_str(), "c" | "cancel") {
+                return QuestionOutcome::Cancelled;
+            }
+            let Some(mut selected) =
+                parse_selection(&line, question.options.len(), question.multi_select)
+            else {
+                eprintln!("[invalid selection — choose the displayed number(s)]");
+                continue;
+            };
+            let wants_other = selected
+                .iter()
+                .position(|index| *index == question.options.len())
+                .map(|position| {
+                    selected.remove(position);
+                })
+                .is_some();
+            let other = if wants_other {
+                print!("  Other answer > ");
+                let _ = std::io::stdout().flush();
+                match read_terminal_line() {
+                    Ok(Some(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+                    Ok(Some(_)) => {
+                        eprintln!("[Other answer cannot be empty]");
+                        continue;
+                    }
+                    Ok(None) => {
+                        return QuestionOutcome::Unavailable(
+                            "terminal input reached EOF while entering Other".into(),
+                        )
+                    }
+                    Err(error) => {
+                        return QuestionOutcome::Unavailable(format!(
+                            "cannot read Other answer: {error}"
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            let notes = if question
+                .options
+                .iter()
+                .any(|option| option.preview.is_some())
+            {
+                print!("  Notes (optional; Enter to skip) > ");
+                let _ = std::io::stdout().flush();
+                match read_terminal_line() {
+                    Ok(Some(value)) => {
+                        let value = value.trim();
+                        (!value.is_empty()).then(|| value.to_string())
+                    }
+                    Ok(None) => {
+                        return QuestionOutcome::Unavailable(
+                            "terminal input reached EOF while entering notes".into(),
+                        )
+                    }
+                    Err(error) => {
+                        return QuestionOutcome::Unavailable(format!("cannot read notes: {error}"))
+                    }
+                }
+            } else {
+                None
+            };
+            answers.push(QuestionAnswer {
+                question_index,
+                selected,
+                other,
+                notes,
+            });
+            break;
+        }
+    }
+    QuestionOutcome::Answered(answers)
+}
+
+fn read_terminal_line() -> std::io::Result<Option<String>> {
+    let mut line = String::new();
+    let bytes = std::io::stdin().read_line(&mut line)?;
+    Ok((bytes != 0).then_some(line))
+}
+
+fn parse_selection(input: &str, option_count: usize, multi_select: bool) -> Option<Vec<usize>> {
+    let mut selected = Vec::new();
+    for token in input
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let number = token.parse::<usize>().ok()?;
+        if !(1..=option_count + 1).contains(&number) {
+            return None;
+        }
+        let index = number - 1;
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    if selected.is_empty() || (!multi_select && selected.len() != 1) {
+        return None;
+    }
+    Some(selected)
+}
+
 pub(crate) struct StdoutUi;
 
 impl StdoutUi {
@@ -146,5 +314,14 @@ mod tests {
             color_diff("+1  add\n-2  del\n 3  ctx"),
             "\x1b[32m+1  add\x1b[0m\n\x1b[31m-2  del\x1b[0m\n\x1b[2m 3  ctx\x1b[0m"
         );
+    }
+
+    #[test]
+    fn selection_parser_handles_single_multi_other_and_rejects_bad_input() {
+        assert_eq!(parse_selection("2", 2, false), Some(vec![1]));
+        assert_eq!(parse_selection("1, 3, 1", 2, true), Some(vec![0, 2]));
+        assert_eq!(parse_selection("1,2", 2, false), None);
+        assert_eq!(parse_selection("0", 2, true), None);
+        assert_eq!(parse_selection("", 2, true), None);
     }
 }

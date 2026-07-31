@@ -9,6 +9,9 @@ use std::pin::Pin;
 
 use kloop_core::agent::Ui;
 use kloop_core::event::Event;
+use kloop_core::interaction::QuestionOutcome;
+use kloop_core::interaction::QuestionRequest;
+use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -49,6 +52,11 @@ pub enum AgentEvent {
     Confirm {
         req: ConfirmRequest,
         reply: oneshot::Sender<Decision>,
+    },
+    /// A general product question, separate from permission approval.
+    Question {
+        req: QuestionRequest,
+        reply: oneshot::Sender<QuestionOutcome>,
     },
 }
 
@@ -93,12 +101,86 @@ impl Approver for ChannelUi {
     }
 }
 
+impl Questioner for ChannelUi {
+    fn ask(
+        &self,
+        req: QuestionRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.tx.send(AgentEvent::Question { req, reply }).is_ok();
+        Box::pin(async move {
+            if !sent {
+                return QuestionOutcome::Unavailable("TUI event channel is closed".into());
+            }
+            rx.await.unwrap_or_else(|_| {
+                QuestionOutcome::Unavailable("TUI question reply channel was dropped".into())
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kloop_core::event::Delta;
 
-    /// Each `Ui::emit` becomes one `AgentEvent::Core`, in call order.
+    fn question_request() -> QuestionRequest {
+        QuestionRequest {
+            questions: vec![kloop_core::interaction::Question {
+                question: "Which?".into(),
+                header: "Choice".into(),
+                options: vec![
+                    kloop_core::interaction::QuestionOption {
+                        label: "A".into(),
+                        description: "first".into(),
+                        preview: None,
+                    },
+                    kloop_core::interaction::QuestionOption {
+                        label: "B".into(),
+                        description: "second".into(),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn question_round_trips_and_channel_loss_is_unavailable() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ui = ChannelUi::new(tx);
+        let req = question_request();
+        let fut = ui.ask(req.clone());
+        let Some(AgentEvent::Question { req: got, reply }) = rx.recv().await else {
+            panic!("expected a Question event");
+        };
+        assert_eq!(got, req);
+        let answer = kloop_core::interaction::QuestionAnswer {
+            question_index: 0,
+            selected: vec![1],
+            other: None,
+            notes: None,
+        };
+        reply
+            .send(QuestionOutcome::Answered(vec![answer.clone()]))
+            .unwrap();
+        assert_eq!(fut.await, QuestionOutcome::Answered(vec![answer]));
+
+        let fut = ui.ask(question_request());
+        let Some(AgentEvent::Question { reply, .. }) = rx.recv().await else {
+            panic!("expected a Question event");
+        };
+        drop(reply);
+        assert!(matches!(fut.await, QuestionOutcome::Unavailable(_)));
+
+        drop(rx);
+        assert!(matches!(
+            ui.ask(question_request()).await,
+            QuestionOutcome::Unavailable(_)
+        ));
+    }
     #[tokio::test]
     async fn emit_wraps_core_events_in_order() {
         let (tx, mut rx) = mpsc::unbounded_channel();

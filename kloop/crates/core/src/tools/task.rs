@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::background_tasks::TaskStatus;
 use super::str_arg;
 use super::ToolCtx;
+use crate::agent::run_structured_turn;
 use crate::agent::run_turn;
 use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
@@ -109,6 +110,96 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     .await
 }
 
+pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx) -> Result<Value> {
+    if ctx.depth >= 1 {
+        bail!("workflow agent: nested sub-agents are unavailable");
+    }
+    crate::structured_output::validate_schema(&schema)?;
+    let prompt = str_arg(input, "prompt", "workflow agent")?.to_string();
+    let max_rounds = match input.get("max_rounds") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let rounds = value
+                .as_u64()
+                .filter(|rounds| *rounds > 0)
+                .ok_or_else(|| anyhow!("workflow agent: max_rounds must be a positive integer"))?;
+            Some(usize::try_from(rounds).unwrap_or(usize::MAX))
+        }
+    };
+    let agent_type = match input["agent_type"].as_str() {
+        Some(name) => Some(
+            AgentType::lookup(&ctx.cfg.agent_types, name)
+                .map_err(|error| anyhow!("workflow agent: {error}"))?,
+        ),
+        None => None,
+    };
+    let isolate = match input["isolation"].as_str() {
+        None | Some("shared") => false,
+        Some("worktree") => true,
+        Some(other) => bail!("workflow agent: unknown isolation '{other}' (expected \"worktree\")"),
+    };
+    let agent = next_agent_label();
+    let mut sub = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
+    if let Some(model) = input["model"].as_str() {
+        sub.model = model.to_string();
+    }
+    let preview = match agent_type {
+        Some(agent_type) => format!("[{}] {}", agent_type.name, task_preview(&prompt)),
+        None => task_preview(&prompt),
+    };
+    let worktree = if isolate {
+        let worktree = worktree::create(&ctx.cfg.cwd, &agent)
+            .await
+            .map_err(|error| anyhow!("workflow agent: {error:#}"))?;
+        rewire_for_worktree(&mut sub, &worktree);
+        Some(worktree)
+    } else {
+        None
+    };
+    let sub_cfg = Arc::new(sub);
+    let ui = ctx.ui.clone();
+    let cancel = ctx.cancel.clone();
+    let depth = ctx.depth + 1;
+    let subagent_of = ctx.parent_rollout_id.clone();
+    emit_agent_start(&ui, &agent, &preview);
+    let handle = tokio::spawn({
+        let ui = ui.clone();
+        let label = agent.clone();
+        async move {
+            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
+            history.record(Message::user_text(prompt));
+            run_structured_turn(&sub_cfg, &mut history, &ui, &cancel, depth, schema).await
+        }
+    });
+    let outcome = match handle.await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(worktree) = worktree {
+                worktree::finish(worktree).await;
+            }
+            emit_agent_end(&ui, &agent, false);
+            return Err(anyhow!("workflow agent: sub-agent panicked: {error}"));
+        }
+    };
+    let result = match outcome.reason {
+        EndReason::Completed => outcome.structured_output.ok_or_else(|| {
+            anyhow!("workflow agent: child completed without valid StructuredOutput")
+        }),
+        EndReason::MaxRounds => Err(anyhow!(
+            "workflow agent: child stopped at its round limit without valid StructuredOutput"
+        )),
+        EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
+        EndReason::Error(error) => Err(anyhow!("workflow agent: child failed: {error}")),
+    };
+    if let Some(worktree) = worktree {
+        if let Some(note) = worktree::finish(worktree).await {
+            ui.emit(&Event::Note(note.trim().to_string()));
+        }
+    }
+    emit_agent_end(&ui, &agent, result.is_ok());
+    result
+}
+
 /// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
 /// (so acceptEdits allows writes inside the tree), the OS sandbox (so its bash
 /// may write the tree), and the working-directory line the model reads in the
@@ -184,6 +275,7 @@ pub(super) fn emit_background_task(
     };
     ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
         id: label.to_string(),
+        run_id: None,
         kind,
         description: description.to_string(),
         status,
@@ -526,6 +618,8 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -
         // onto its own tree.
         cwd: ctx.cfg.effective_cwd(),
         permissions: ctx.cfg.effective_permissions(),
+        questioner: None,
+        surface: Default::default(),
         file_state: Arc::new(crate::file_state::FileState::default()),
         sandbox: ctx.cfg.effective_sandbox(),
         system: ctx.cfg.effective_system(),
@@ -1422,6 +1516,7 @@ mod tests {
             reason,
             final_text: "the answer".into(),
             rounds: 1,
+            structured_output: None,
         };
         // Success passes through verbatim.
         assert_eq!(

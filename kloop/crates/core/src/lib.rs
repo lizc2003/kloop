@@ -23,11 +23,13 @@ pub mod history;
 pub mod hooks;
 pub mod image;
 pub mod inbox;
+pub mod interaction;
 pub mod permissions;
 pub mod rollout;
 pub mod sandbox;
 pub mod shell;
 pub mod skills;
+mod structured_output;
 pub mod tools;
 pub mod worktree;
 

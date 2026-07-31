@@ -297,6 +297,7 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let run_id = format!("ktr-{}", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&jdir);
+    std::fs::create_dir_all(&jdir).unwrap();
 
     let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
     let provider = kloop_provider::Provider::mock(vec![text("FIRST"), text("SECOND")]);
@@ -320,6 +321,45 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
+#[tokio::test]
+async fn concurrent_resume_of_one_program_run_is_rejected() {
+    let run_id = format!("ktrlock-{}", std::process::id());
+    let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&jdir);
+    std::fs::create_dir_all(&jdir).unwrap();
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let provider = kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Gate {
+        started: started_tx,
+        release: release_rx,
+        blocks: vec![kloop_protocol::ContentBlock::Text {
+            text: "LOCKED_RESULT".into(),
+        }],
+    }]);
+    let ctx = with_provider(test_ctx(0, "resume-lock"), provider);
+    let args = json!({
+        "source": "return await agent('hold the run lock');",
+        "resume_from_run_id": run_id
+    });
+    let first_ctx = ctx.clone();
+    let first_args = args.clone();
+    let first = tokio::spawn(async move { run_tool("run_program", first_args, &first_ctx).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+        .await
+        .expect("first program did not reach sampling")
+        .expect("sampling gate dropped");
+
+    let (second, is_error) = run_tool("run_program", args, &ctx).await;
+    assert!(is_error, "{second}");
+    assert!(second.contains("already active"), "{second}");
+    let _ = release_tx.send(());
+    let (first_out, first_error) = first.await.unwrap();
+    assert!(!first_error, "{first_out}");
+    assert_eq!(first_out, "LOCKED_RESULT");
+    let _ = std::fs::remove_dir_all(&jdir);
+}
+
 /// A program that fails after completing an agent() call reports its run_id and
 /// how to resume — so the model can skip the completed work on retry.
 #[tokio::test]
@@ -327,6 +367,7 @@ async fn failure_after_agent_reports_a_resumable_run_id() {
     let run_id = format!("ktrf-{}", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&jdir);
+    std::fs::create_dir_all(&jdir).unwrap();
 
     let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
     let provider = kloop_provider::Provider::mock(vec![text("STEP_ONE_DONE")]);

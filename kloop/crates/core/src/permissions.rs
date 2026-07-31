@@ -38,8 +38,6 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -127,24 +125,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn as_u8(self) -> u8 {
-        match self {
-            Mode::Manual => 0,
-            Mode::AcceptEdits => 1,
-            Mode::Bypass => 2,
-            Mode::Plan => 3,
-        }
-    }
-
-    fn from_u8(v: u8) -> Mode {
-        match v {
-            1 => Mode::AcceptEdits,
-            2 => Mode::Bypass,
-            3 => Mode::Plan,
-            _ => Mode::Manual,
-        }
-    }
-
     /// Short name shown in the CLI flag, the TUI status bar, and prompt text.
     pub fn label(self) -> &'static str {
         match self {
@@ -292,18 +272,19 @@ fn parse_rules(entries: &[String]) -> Result<Vec<Rule>> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModeState {
+    current: Mode,
+    pre_plan: Mode,
+}
+
 pub struct Permissions {
     /// Tests and `--mock` only: skip every layer including deny.
     allow_everything: bool,
-    /// The gating mode, held in a shared atomic cell so it can change at runtime
-    /// (shift+Tab in the TUI, `exit_plan_mode`) and — because `rebased` clones
-    /// the Arc, not the value — a mode change is seen by the base gate, an active
-    /// worktree's re-anchored gate, and every sub-agent at once.
-    mode: Arc<AtomicU8>,
-    /// The mode to restore when `exit_plan_mode` is approved: whatever was active
-    /// when plan mode was entered (manual if it was never recorded). Shared like
-    /// `mode`.
-    pre_plan: Arc<AtomicU8>,
+    /// Session-global mode state shared by the base gate, worktrees and
+    /// sub-agents. Keeping current + pre-plan in one critical section makes
+    /// Enter/Exit and the TUI mode cycle one atomic transition.
+    mode: Arc<Mutex<ModeState>>,
     /// Mutable: `AllowAlways` appends at runtime.
     allow: Mutex<Vec<Rule>>,
     deny: Vec<Rule>,
@@ -321,8 +302,10 @@ impl Permissions {
     pub fn allow_all() -> Self {
         Permissions {
             allow_everything: true,
-            mode: Arc::new(AtomicU8::new(Mode::Bypass.as_u8())),
-            pre_plan: Arc::new(AtomicU8::new(Mode::Manual.as_u8())),
+            mode: Arc::new(Mutex::new(ModeState {
+                current: Mode::Bypass,
+                pre_plan: Mode::Manual,
+            })),
             allow: Mutex::new(Vec::new()),
             deny: Vec::new(),
             ask: Vec::new(),
@@ -342,9 +325,10 @@ impl Permissions {
     ) -> Result<Self> {
         Ok(Permissions {
             allow_everything: false,
-            mode: Arc::new(AtomicU8::new(mode.as_u8())),
-            // No prior mode at construction, so exit_plan_mode restores manual.
-            pre_plan: Arc::new(AtomicU8::new(Mode::Manual.as_u8())),
+            mode: Arc::new(Mutex::new(ModeState {
+                current: mode,
+                pre_plan: Mode::Manual,
+            })),
             allow: Mutex::new(parse_rules(&rules.allow)?),
             deny: parse_rules(&rules.deny)?,
             ask: parse_rules(&rules.ask)?,
@@ -366,10 +350,8 @@ impl Permissions {
     pub fn rebased(&self, cwd: PathBuf) -> Self {
         Permissions {
             allow_everything: self.allow_everything,
-            // Share the mode cells (clone the Arc): a shift+Tab / exit_plan_mode
-            // in the base gate is seen here too — the mode is session-global.
+            // Share the transition state: mode changes are session-global.
             mode: self.mode.clone(),
-            pre_plan: self.pre_plan.clone(),
             allow: Mutex::new(self.allow.lock().unwrap().clone()),
             deny: self.deny.clone(),
             ask: self.ask.clone(),
@@ -382,24 +364,39 @@ impl Permissions {
 
     /// The gating mode in effect right now.
     pub fn mode(&self) -> Mode {
-        Mode::from_u8(self.mode.load(Ordering::Relaxed))
+        self.mode.lock().unwrap().current
     }
 
     /// Change the gating mode at runtime (the TUI's shift+Tab cycle). Entering
     /// plan mode from a non-plan mode records what to restore on a later
     /// `exit_plan_mode` approval.
     pub fn set_mode(&self, mode: Mode) {
-        if mode == Mode::Plan && self.mode() != Mode::Plan {
-            self.pre_plan.store(self.mode().as_u8(), Ordering::Relaxed);
+        let mut state = self.mode.lock().unwrap();
+        if mode == Mode::Plan && state.current != Mode::Plan {
+            state.pre_plan = state.current;
         }
-        self.mode.store(mode.as_u8(), Ordering::Relaxed);
+        state.current = mode;
+    }
+
+    /// Enter plan mode as one session transition. Returns true only when the
+    /// mode changed; repeated EnterPlanMode calls are idempotent and preserve
+    /// the original pre-plan mode.
+    pub fn enter_plan(&self) -> bool {
+        let mut state = self.mode.lock().unwrap();
+        if state.current == Mode::Plan {
+            return false;
+        }
+        state.pre_plan = state.current;
+        state.current = Mode::Plan;
+        true
     }
 
     /// Leave plan mode, restoring the mode active when it was entered (manual
     /// if none was recorded); returns the restored mode.
     fn exit_plan(&self) -> Mode {
-        let restore = Mode::from_u8(self.pre_plan.load(Ordering::Relaxed));
-        self.mode.store(restore.as_u8(), Ordering::Relaxed);
+        let mut state = self.mode.lock().unwrap();
+        let restore = state.pre_plan;
+        state.current = restore;
         restore
     }
 
@@ -831,14 +828,14 @@ impl CallFacts {
             // exit_plan_mode only shows the plan and flips the session mode —
             // no system side effect. Read-only here so it passes the plan-mode
             // gate above and does its own approval (Permissions::confirm_exit_plan).
-            "exit_plan_mode" => true,
+            "ask_user_question" | "enter_plan_mode" | "exit_plan_mode" => true,
             // wait only blocks; stop_agent only signals a sub-agent this agent
             // itself spawned — neither touches anything the sub-agent's own
             // calls weren't already gated on (same reasoning as kill_bash).
             "wait" | "stop_agent" => true,
             // run_program (code-mode) itself touches nothing; every tools.<name>()
             // and agent() call the program makes re-enters this same gate.
-            "run_program" => true,
+            "run_program" | "workflow" => true,
             // tool_search only reads tool definitions and marks them
             // unlocked; the unlocked tool's own calls still pass this gate.
             "tool_search" => true,

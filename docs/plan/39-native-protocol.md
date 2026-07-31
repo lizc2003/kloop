@@ -126,6 +126,12 @@ fmt/clippy/test 全绿(现有 TUI/plain/server 行为不变即证明重构无回
 
 reverse request `approval/request {threadId, turnId, itemId, kind:"command"|"fileChange", description, preview?, rememberRules?}` → `{decision: accept|acceptForSession|acceptAlways|decline}`。丢失/EOF = decline;app 旧 `cancel` 兼容值也只会 fail-closed 映成 decline。
 
+### 3.5a 一般问答与 Workflow lifecycle（Plan 53 ✅）
+
+一般问答不复用 approval：server 固定报告 `capabilities.questions: true`，仅当 client 在 initialize 也声明 `questions:true` 时，thread Config 才安装 Questioner。每题独立 reverse request `question/request {threadId, turnId, questionIndex, question}`，回复 `{outcome:"answered", selected:[optionIndex...], other?, notes?}` 或 `{outcome:"cancelled"}`；unknown/malformed/type mismatch、turn interrupt、disconnect、shutdown、reply sender drop 均清 pending 并返回 Unavailable，不自动选答案，也不跨 thread 串响应。
+
+Workflow 继续走共享 session-scoped `thread/backgroundTask/updated`，`kind:"workflow"` 时 task 额外携带 `runId`，running/phase/terminal 与 launch tool result、manifest 和 inbox 使用同一 task/run identity；其他 shell/agent/program 保持旧 wire（不新增 `runId:null`）。Workflow result 正文不塞 lifecycle event，仍在下一安全 step boundary 进入模型输入。
+
 ### 3.6 入口
 
 `kloop app-server`(位置子命令,app 起的形态) + 保留 `kloop --serve` 别名。验证用 `ENGINE_BIN` 指向 kloop 二进制。

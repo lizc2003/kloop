@@ -612,6 +612,7 @@ impl BackgroundShells {
         };
         ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
             id: id.clone(),
+            run_id: None,
             kind: BackgroundTaskKind::Shell,
             description: command.to_string(),
             status: BackgroundTaskStatus::Running,
@@ -956,6 +957,7 @@ async fn monitor(monitor: BackgroundMonitor) {
             };
             ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
                 id: id.clone(),
+                run_id: None,
                 kind: BackgroundTaskKind::Shell,
                 description: command,
                 status: event_status,

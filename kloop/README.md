@@ -322,13 +322,25 @@ promise ("what the gate shows = what runs" is the hardest contract, so the
 enforcement is the hard gate, not a prompt the model may ignore — codex's
 Plan is a soft prompt; kloop takes cc's hard form). Reads, searches, read-only
 bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
-rides every request so the model knows to plan, not act. When ready, the model
-calls **`exit_plan_mode`** with the plan text; it rides the same approval popup
-a change-diff does (the plan is the scrollable `preview`). Approve → plan mode
-turns off, restoring the mode it was entered from (manual at startup), and the
-model implements; reject → it stays in plan mode and keeps planning. Sub-agents
-inherit plan mode with the session and are read-only in it, but only the
-top-level agent can `exit_plan_mode`.
+rides every request so the model knows to plan, not act. The top-level model can
+call **`enter_plan_mode {}`** from manual, accept-edits, or bypass; entering is
+idempotent and remembers the exact previous mode. When ready, it calls
+**`exit_plan_mode`** with the plan text; that rides the approval popup a
+change-diff does (the plan is the scrollable `preview`). Approve restores the
+remembered mode and the model implements; reject leaves the session in Plan.
+Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it.
+The provider tool array advertises both controls for the whole session, so mode
+changes do not invalidate the prompt-cache prefix.
+
+**General questions are not approvals.** The depth-0-only
+`ask_user_question` tool uses a separate `Questioner` contract and can ask one
+to four bounded single- or multi-select questions, with Other text, option
+previews, and notes. An answer is recorded only as the matching tool result;
+explicit cancel is a non-error result, while EOF, disconnect, a dropped reply,
+or an unsupported client fails closed. Plain and TUI sessions render the
+question directly (TUI questions and approvals share one FIFO modal owner), and
+the native server uses a separately negotiated `question/request` reverse RPC.
+Headless mode never guesses an answer.
 
 ## TUI (Phase 2, fourth slice)
 
@@ -375,9 +387,11 @@ shows raw, so a half-written table or fence never reflows mid-stream, and it
 snaps to markdown once it completes.
 
 Structure (`crates/tui`): the agent runs on its own tokio task and owns
-`History`; `ChannelUi` implements both `Ui` and `Approver` by forwarding
-everything as events over an mpsc channel (approval decisions travel back
-over a oneshot; a dropped reply means deny). Keys arrive from a dedicated
+`History`; `ChannelUi` implements `Ui`, `Approver`, and `Questioner` by
+forwarding everything as events over an mpsc channel (approval/question answers
+travel back over oneshots; dropped question replies are Unavailable rather than
+invented answers). Questions and approvals share one FIFO modal owner so
+concurrent interactions never overlap. Keys arrive from a dedicated
 poll thread (`poll(200ms)+read`, not crossterm's `EventStream`) so the input
 reader never parks holding the lock a resize's cursor-position query needs.
 The UI loop `select!`s those key events against agent events, folds both into
@@ -462,7 +476,8 @@ speak one item vocabulary by construction.
 `{serverInfo, protocolVersion, capabilities}` negotiates the version (from
 `"1.0"`; a version the engine doesn't speak is a hard error, not a silent
 downgrade) and gates every other method until it succeeds. Capabilities are
-structured: `{streaming, subagents, mcp, images, approvals, threads:{list,
+structured: `{streaming, subagents, mcp, images, approvals, questions,
+threads:{list,
 read,resume,fork}, models:{list}, config:{read}, skills:{list},
 mcpServers:{status}}`.
 
@@ -512,7 +527,7 @@ turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
 call carries its full `input`, and `output` + `agent` label when present; a
 `todo_write` surfaces only as a `todo` item, never a tool row); plus
 `thread/backgroundTask/updated {task:{id, kind, description, status,
-outputPath?, detail?}}` for session-scoped shell/agent/program work (**no
+outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present only for Workflow; **no
 `turnId`**, because completion may arrive after the launching turn),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
@@ -521,16 +536,21 @@ error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
 model: its output comes back as a `system` notification, `/clear` also emits
 `thread/cleared`, and the turn bracket is unchanged.
 
-**Approvals** are one reverse request — `approval/request {threadId, turnId,
-kind:"command"|"fileChange", description, preview?, rememberRules?}` (server
-ids are integers in the server's own counter space) — answered
-`{"decision": "accept" | "acceptForSession" | "acceptAlways" | "decline"}`. A
-dropped/never-answered reply, `cancel`, or anything unrecognized declines
-(interrupt the turn to unblock).
+**Interactions use two independent reverse requests.** Permission decisions use
+`approval/request {threadId, turnId, kind:"command"|"fileChange",
+description, preview?, rememberRules?}` (server ids are integers in the
+server's own counter space), answered `{"decision": "accept" |
+"acceptForSession" | "acceptAlways" | "decline"}`. General model questions use
+`question/request {threadId, turnId, questionIndex, question}` only when the
+client advertised `capabilities.questions: true`; each question is answered
+`{"outcome":"answered","selected":[...],"other"?,"notes"?}` or
+`{"outcome":"cancelled"}`. Unknown, malformed, mismatched, disconnected, or
+dropped replies fail closed and pending reverse requests are removed when their
+turn is interrupted.
 
 ```jsonc
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"questions":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
 → {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
@@ -1362,6 +1382,60 @@ kloop that's the same seam as user commands, the User-commands slice under
 Skills, not a code-mode one). See `docs/plan/24-code-mode.md` and
 `docs/plan/27-codemode-mcp-tools.md`.
 
+## Workflow orchestration (Plan 53)
+
+`workflow` is a separate, depth-0-only orchestration tool; it is not an alias
+for `run_program`. It always launches in the background and returns a task id,
+a stable `wf_*` run id, the managed script path, and resume guidance before any
+agent work completes. The script must begin with a pure-literal
+`export const meta = {name, description, phases?}` declaration and then has only
+these host capabilities:
+
+```js
+declare const args: unknown
+declare function agent(prompt, opts?)
+declare function log(message)
+declare function phase(title)
+declare function parallel(thunks)
+declare function pipeline(items, ...stages)
+```
+
+There is deliberately no `tools`, `__call_tool`, filesystem, network, process,
+module import, `Date.now()`, or randomness in this runtime profile. Workflow
+code controls deterministic fan-out; each child `agent()` still re-enters the
+ordinary sub-agent runner and every child tool call still passes the normal
+allowlist → hook → permission → sandbox → executor chain. `parallel` is a
+barrier and `pipeline` is per-item/no-stage-barrier, as in code mode. `phase()`
+updates the background task detail and `log()` emits live notes; neither changes
+the script's return value.
+
+Each run is stored under `.kloop/workflow-runs/<run-id>/`; a versioned
+manifest governs its managed script, args, journal, and terminal result/error,
+and journal entries carry their own replay version. A later call with
+`resume_from_run_id` reuses matching `(sequence, prompt+result-affecting opts)`
+agent results, including JSON objects and arrays, while changed calls run live.
+`script_path` is accepted only when it resolves to that run's managed script;
+arbitrary workspace paths, separators, traversal, and symlink escapes are
+rejected. On Unix, namespace/run directories and artifact read/write/rename/
+lease operations are descriptor-relative with no-follow; the non-Unix fallback
+revalidates paths but does not claim race-hard reparse-point safety until the
+future Windows backend lands. Background completion/failure is delivered at a
+step boundary and is
+also observable through the shared `wait` / `stop_agent` task registry.
+
+Passing `schema` in a Workflow `agent()` call activates the internal
+**`StructuredOutput`** protocol for that child. The requested JSON Schema is
+installed as a one-turn synthetic tool definition, then the host validates the
+returned object/array/scalar again. Invalid values receive a paired error result
+and bounded retry; a missing call receives a nudge; exhaustion rejects the
+Workflow promise rather than falling back to unvalidated text. A valid value
+ends the child turn and reaches JavaScript as its native JSON type. This
+synthetic tool never appears in the main registry, `run_program`, a frontend
+capability, or an ordinary child without `schema`.
+
+Named/nested workflows, token budget, remote execution, and arbitrary file
+resolution are intentional first-release omissions.
+
 ## Async sub-agents (Phase 2, eighteenth slice)
 
 `task` takes `background: true`: instead of blocking and returning the
@@ -1672,6 +1746,11 @@ kloop --mock --headless --json
   deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `KLOOP_ALLOW`
   — these act before the approver, so they still open the gate. (Sandbox
   auto-allow still covers safe bash without asking.)
+- **Interactive control surfaces are absent.** Headless installs neither a
+  `Questioner` nor detached Workflow lifecycle, so `ask_user_question`,
+  `enter_plan_mode`, and `workflow` are not advertised. It never reads stdin
+  for a model-generated dialog or manufactures a default answer; use plain,
+  TUI, or a questions-capable native-protocol client for those flows.
 - **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
   or hitting `--max-rounds`. Without that explicit flag, headless uses the same
   unbounded turn loop as interactive/server mode.

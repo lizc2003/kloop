@@ -12,6 +12,14 @@ use crate::tools::BackgroundShells;
 use crate::tools::BackgroundTasks;
 use crate::tools::ToolSource;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceCapabilities {
+    pub questions: bool,
+    pub plan_control: bool,
+    pub workflow: bool,
+    pub worktree: bool,
+}
+
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
 #[derive(Clone)]
@@ -53,6 +61,10 @@ pub struct Config {
     /// Tool-execution gate; the Arc is shared into sub-agent configs so the
     /// session approval cache is inherited.
     pub permissions: Arc<Permissions>,
+    /// General decision questions for the user. This is deliberately separate
+    /// from permission approval: a missing frontend returns unavailable rather
+    /// than silently choosing an answer.
+    pub questioner: Option<Arc<dyn crate::interaction::Questioner>>,
     /// Session-scoped file observations used to prove that a model-visible Read
     /// still describes the bytes a later Write/Edit would replace. This state is
     /// never persisted. Ordinary Config clones share it within one session;
@@ -147,11 +159,9 @@ pub struct Config {
     /// immediately, without rebuilding the Config. Sub-agents get a FRESH empty
     /// slot — they can't enter/exit; see `clone_for_subagent`.
     pub active_worktree: Arc<std::sync::RwLock<Option<crate::worktree::ActiveWorktree>>>,
-    /// Whether this session exposes the enter/exit worktree tools and honors
-    /// `--worktree` (cc's `isWorktreeModeEnabled` gate). True for the single
-    /// CLI/TUI/plain session; false for server threads (worktree semantics
-    /// there is unbuilt) and `--mock`.
-    pub worktree_enabled: bool,
+    /// Session-control tools are capability-gated per frontend. The set is
+    /// immutable for a Config so mode changes never churn the provider tool array.
+    pub surface: SurfaceCapabilities,
 }
 
 impl Config {

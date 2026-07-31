@@ -17,6 +17,7 @@ use kloop_core::agent_type::AgentType;
 use kloop_core::hooks::HookDef;
 use kloop_core::hooks::HookEvent;
 use kloop_core::hooks::Hooks;
+use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
@@ -743,6 +744,7 @@ pub(crate) fn config_from_settings(
     provider: &ResolvedProviderSettings,
     runtime: &RuntimeSettings,
     approver: Arc<dyn Approver>,
+    questioner: Option<Arc<dyn Questioner>>,
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
     project: &context::GatheredContext,
@@ -756,6 +758,7 @@ pub(crate) fn config_from_settings(
     // The main agent's cwd anchor is the process cwd (same value build_permissions
     // reads); a worktree sub-agent later rewires its own clone off this.
     let cwd = cwd.to_path_buf();
+    let questions_enabled = questioner.is_some();
     let base = Config {
         provider: Arc::new(Provider::mock(vec![])),
         model: "mock".into(),
@@ -768,6 +771,7 @@ pub(crate) fn config_from_settings(
         context_window: runtime.context_window,
         fallback_model: runtime.fallback_model.clone(),
         permissions,
+        questioner,
         file_state: Default::default(),
         tool_sources: tool_sources.to_vec(),
         // The caller stamps the real session id once it knows it (after
@@ -787,12 +791,12 @@ pub(crate) fn config_from_settings(
         program_limits: runtime.program_limits,
         skills,
         active_worktree: Arc::new(std::sync::RwLock::new(None)),
-        // Worktree mode (enter/exit tools) is on everywhere but --mock (which is
-        // hermetic, no git). Server threads support it too — each thread gets
-        // its own active-worktree slot and a `thread/cwd/updated` notification on
-        // switch. (The `--worktree` startup flag is still single-session only;
-        // main.rs rejects it with --serve.)
-        worktree_enabled: !args.mock,
+        surface: kloop_core::config::SurfaceCapabilities {
+            questions: questions_enabled,
+            plan_control: !args.headless,
+            workflow: !args.headless,
+            worktree: !args.mock,
+        },
     };
     if args.mock {
         return Ok(Config {

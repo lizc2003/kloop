@@ -100,13 +100,17 @@ impl TestClient {
     /// The `initialize` handshake every session opens with; returns the
     /// server's capabilities object. Asserts the protocol version echoes back.
     async fn initialize(&mut self) -> Value {
+        self.initialize_with_capabilities(json!({})).await
+    }
+
+    async fn initialize_with_capabilities(&mut self, capabilities: Value) -> Value {
         let id = self
             .request(
                 "initialize",
                 json!({
                     "clientInfo": {"name": "test", "version": "0"},
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "capabilities": capabilities,
                 }),
             )
             .await;
@@ -119,6 +123,15 @@ impl TestClient {
     /// Handshake, then start a fresh thread; returns its id.
     async fn init_and_start(&mut self) -> String {
         self.initialize().await;
+        let id = self.request("thread/start", json!({})).await;
+        let resp = self.recv().await;
+        assert_eq!(resp["id"], id);
+        resp["result"]["thread"]["id"].as_str().unwrap().to_string()
+    }
+
+    async fn init_questions_and_start(&mut self) -> String {
+        self.initialize_with_capabilities(json!({"questions": true}))
+            .await;
         let id = self.request("thread/start", json!({})).await;
         let resp = self.recv().await;
         assert_eq!(resp["id"], id);
@@ -182,7 +195,7 @@ fn text(t: &str) -> ContentBlock {
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
 fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
-    Arc::new(move |options, approver, _notify| {
+    Arc::new(move |options, approver, questioner, _notify| {
         let permissions = if gated {
             Permissions::new(
                 Mode::Manual,
@@ -194,6 +207,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
         } else {
             Permissions::allow_all()
         };
+        let questions = questioner.is_some();
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
             model: options.model.unwrap_or_else(|| "mock".into()),
@@ -208,6 +222,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(permissions),
+            questioner,
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
@@ -225,7 +240,12 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            worktree_enabled: false,
+            surface: kloop_core::config::SurfaceCapabilities {
+                questions,
+                plan_control: true,
+                workflow: true,
+                worktree: false,
+            },
         })
     })
 }
@@ -234,8 +254,8 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
     use kloop_provider::MockTurn;
 
     let inner = factory(Vec::new(), offload, false);
-    Arc::new(move |options, approver, notify| {
-        let mut cfg = inner(options, approver, notify)?;
+    Arc::new(move |options, approver, questioner, notify| {
+        let mut cfg = inner(options, approver, questioner, notify)?;
         cfg.provider = Arc::new(Provider::mock_scripted(vec![MockTurn::PartialError(
             vec![text("half answer")],
             "stream dropped".into(),
@@ -250,9 +270,9 @@ fn recording_factory(
     seen: Arc<Mutex<Vec<ThreadStartOptions>>>,
 ) -> ConfigFactory {
     let inner = factory(turns, offload, false);
-    Arc::new(move |options, approver, notify| {
+    Arc::new(move |options, approver, questioner, notify| {
         seen.lock().unwrap().push(options.clone());
-        inner(options, approver, notify)
+        inner(options, approver, questioner, notify)
     })
 }
 
@@ -294,7 +314,8 @@ fn worktree_factory(
     offload: PathBuf,
     cwd: PathBuf,
 ) -> ConfigFactory {
-    Arc::new(move |_options, _approver, _notify| {
+    Arc::new(move |_options, _approver, questioner, _notify| {
+        let questions = questioner.is_some();
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
             model: "mock".into(),
@@ -307,6 +328,7 @@ fn worktree_factory(
             context_window: None,
             fallback_model: None,
             permissions: Arc::new(Permissions::allow_all()),
+            questioner,
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
@@ -324,7 +346,12 @@ fn worktree_factory(
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            worktree_enabled: true,
+            surface: kloop_core::config::SurfaceCapabilities {
+                questions,
+                plan_control: true,
+                workflow: true,
+                worktree: true,
+            },
         })
     })
 }
@@ -485,6 +512,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             "mcp": true,
             "mcpServers": {"status": true},
             "models": {"list": true},
+            "questions": true,
             "skills": {"list": true},
             "streaming": true,
             "subagents": true,
@@ -1273,6 +1301,136 @@ async fn approval_declined_then_accepted() {
         && m["params"]["item"]["status"] == "completed"));
     assert!(target.exists(), "accept must let the write through");
 
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn negotiated_questions_round_trip_multiple_answers() {
+    let dirs = test_dirs("questions");
+    let ask = tool_use(
+        "q1",
+        "ask_user_question",
+        json!({
+            "questions": [
+                {
+                    "question": "Choose one",
+                    "header": "Single",
+                    "options": [
+                        {"label": "A", "description": "first", "preview": "preview A"},
+                        {"label": "B", "description": "second"}
+                    ],
+                    "multiSelect": false
+                },
+                {
+                    "question": "Choose several",
+                    "header": "Multi",
+                    "options": [
+                        {"label": "X", "description": "x"},
+                        {"label": "Y", "description": "y"}
+                    ],
+                    "multiSelect": true
+                }
+            ]
+        }),
+    );
+    let mut client = start_server(
+        factory(
+            vec![vec![ask], vec![text("answers received")]],
+            dirs.offload.clone(),
+            false,
+        ),
+        &dirs,
+    );
+    let thread_id = client.init_questions_and_start().await;
+    client
+        .request("turn/start", json!({"threadId": thread_id, "input": "ask"}))
+        .await;
+
+    let log = client
+        .recv_until(|message| message["method"] == "question/request")
+        .await;
+    let first = log.last().unwrap();
+    assert_eq!(first["params"]["threadId"], thread_id);
+    assert_eq!(first["params"]["turnId"], 1);
+    assert_eq!(first["params"]["questionIndex"], 0);
+    assert_eq!(first["params"]["question"]["header"], "Single");
+    assert_eq!(
+        first["params"]["question"]["options"][0]["preview"],
+        "preview A"
+    );
+    let first_id = first["id"].as_i64().unwrap();
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": first_id,
+            "result": {"outcome": "answered", "selected": [1], "notes": "prefer B"}
+        }))
+        .await;
+
+    let second = client
+        .recv_until(|message| message["method"] == "question/request")
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(second["params"]["questionIndex"], 1);
+    assert_eq!(second["params"]["question"]["multiSelect"], true);
+    let second_id = second["id"].as_i64().unwrap();
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": second_id,
+            "result": {"outcome": "answered", "selected": [0, 1], "other": "Z"}
+        }))
+        .await;
+
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert!(log.iter().any(|m| {
+        m["method"] == "item/completed"
+            && m["params"]["item"]["name"] == "ask_user_question"
+            && m["params"]["item"]["status"] == "completed"
+    }));
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn missing_question_capability_fails_closed_without_reverse_request() {
+    let dirs = test_dirs("questions-unsupported");
+    let ask = tool_use(
+        "q1",
+        "ask_user_question",
+        json!({
+            "questions": [{
+                "question": "Choose",
+                "header": "Choice",
+                "options": [
+                    {"label": "A", "description": "first"},
+                    {"label": "B", "description": "second"}
+                ],
+                "multiSelect": false
+            }]
+        }),
+    );
+    let mut client = start_server(
+        factory(
+            vec![vec![ask], vec![text("continued")]],
+            dirs.offload.clone(),
+            false,
+        ),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+    client
+        .request("turn/start", json!({"threadId": thread_id, "input": "ask"}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert!(!log.iter().any(|m| m["method"] == "question/request"));
+    assert!(log.iter().any(|m| {
+        m["method"] == "item/completed"
+            && m["params"]["item"]["name"] == "ask_user_question"
+            && m["params"]["item"]["status"] == "failed"
+    }));
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }

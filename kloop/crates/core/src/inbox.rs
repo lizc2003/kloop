@@ -41,6 +41,10 @@ below — fold it into your work, and if you were waiting on it, continue from h
 const PROGRAM_PREFIX: &str = "A background program you launched has finished. Its return value is \
 below — fold it into your work, and if you were waiting on it, continue from here:";
 
+const WORKFLOW_PREFIX: &str =
+    "A background Workflow you launched has finished. Its bounded result is \
+below; the full result is persisted at the supplied output file:";
+
 /// Framing for a background shell's terminal notification (plan 51). The
 /// command output remains in its file; this message only tells the model that
 /// the state changed and where to inspect it.
@@ -60,6 +64,12 @@ pub enum InboxItem {
     /// A background program's return value, reinjected to its parent
     /// (plan 24). `label` is the "program-N" id; `summary` is the return value.
     ProgramResult { label: String, summary: String },
+    WorkflowResult {
+        task_id: String,
+        run_id: String,
+        summary: String,
+        output_path: String,
+    },
     /// A background shell's terminal state (plan 51). Output is not copied into
     /// context; the output file remains the bounded/read-on-demand source.
     ShellResult {
@@ -81,6 +91,14 @@ impl InboxItem {
             InboxItem::ProgramResult { label, summary } => {
                 format!("{PROGRAM_PREFIX}\n[{label}]\n{summary}")
             }
+            InboxItem::WorkflowResult {
+                task_id,
+                run_id,
+                summary,
+                output_path,
+            } => format!(
+                "{WORKFLOW_PREFIX}\n[{task_id}] run {run_id}\n{summary}\noutput file: {output_path}"
+            ),
             InboxItem::ShellResult {
                 id,
                 status,

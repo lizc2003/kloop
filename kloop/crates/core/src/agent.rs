@@ -45,6 +45,43 @@ pub struct TurnOutcome {
     pub reason: EndReason,
     pub final_text: String,
     pub rounds: usize,
+    /// Present only for a Workflow child forced through the internal
+    /// StructuredOutput tool; ordinary turns always leave it None.
+    pub structured_output: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TurnOptions {
+    structured_schema: Option<Value>,
+}
+
+pub(crate) async fn run_structured_turn(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    schema: Value,
+) -> TurnOutcome {
+    if let Err(error) = crate::structured_output::validate_schema(&schema) {
+        return TurnOutcome {
+            reason: EndReason::Error(format!("{error:#}")),
+            final_text: String::new(),
+            rounds: 0,
+            structured_output: None,
+        };
+    }
+    run_turn_with_options(
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        TurnOptions {
+            structured_schema: Some(schema),
+        },
+    )
+    .await
 }
 
 /// The agent loop. One "round" = one sampling request plus the tool calls it
@@ -59,6 +96,17 @@ pub async fn run_turn(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     depth: u8,
+) -> TurnOutcome {
+    run_turn_with_options(cfg, history, ui, cancel, depth, TurnOptions::default()).await
+}
+
+async fn run_turn_with_options(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    options: TurnOptions,
 ) -> TurnOutcome {
     // A sub-agent (agent_label set) fires subagent_start/subagent_stop instead
     // of pre_turn/post_turn — the split both cc and codex converge on (a
@@ -83,6 +131,7 @@ pub async fn run_turn(
                 reason: EndReason::Error(format!("turn blocked by {which} hook: {reason}")),
                 final_text: String::new(),
                 rounds: 0,
+                structured_output: None,
             };
         }
         crate::hooks::HookDecision::Allow { context } => {
@@ -91,7 +140,7 @@ pub async fn run_turn(
             }
         }
     }
-    let outcome = turn_rounds(cfg, history, ui, cancel, depth).await;
+    let outcome = turn_rounds(cfg, history, ui, cancel, depth, &options).await;
     let stop_context = if agent.is_empty() {
         cfg.hooks.post_turn(&cfg.session_id, ui.as_ref()).await
     } else {
@@ -119,13 +168,9 @@ async fn turn_rounds(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     depth: u8,
+    options: &TurnOptions,
 ) -> TurnOutcome {
-    let mut tools = all_tool_defs(
-        depth,
-        &cfg.tool_sources,
-        cfg.defer_threshold,
-        cfg.worktree_enabled,
-    );
+    let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold, cfg.surface);
     // The `skill` tool exists only at depth 0 (like `task`) and only when a
     // model-invocable skill is loaded — user commands (`SkillSource::Command`)
     // are `/name`-only and don't warrant the tool on their own. Skills are a
@@ -148,6 +193,11 @@ async fn turn_rounds(
     if cfg.tool_allowlist.is_some() {
         let allow = cfg.tool_allowlist.as_deref();
         tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
+    }
+    if let Some(schema) = &options.structured_schema {
+        // Appended after agent-type filtering: this is an internal completion
+        // protocol, never a user-configurable capability or ordinary tool.
+        tools.push(crate::structured_output::tool_def(schema));
     }
     // At depth 0 the task tool exists; list the configured agent types in its
     // description so the model knows what it can dispatch to.
@@ -178,12 +228,14 @@ async fn turn_rounds(
     // `reasoning-N`): owned here so ids don't reset each round.
     let mut item_seq = 0u64;
     let mut rounds = 0;
+    let mut structured_failures = 0usize;
     loop {
         if cfg.max_rounds.is_some_and(|limit| rounds >= limit) {
             return TurnOutcome {
                 reason: EndReason::MaxRounds,
                 final_text: String::new(),
                 rounds,
+                structured_output: None,
             };
         }
         let round = rounds;
@@ -217,6 +269,7 @@ async fn turn_rounds(
                                 reason: EndReason::Aborted,
                                 final_text: String::new(),
                                 rounds: round,
+                                structured_output: None,
                             };
                         }
                         // Predictive failure is not fatal: fall through and let
@@ -254,6 +307,7 @@ async fn turn_rounds(
                         ),
                         final_text: String::new(),
                         rounds: round,
+                        structured_output: None,
                     };
                 }
                 overflow_compact_attempted = true;
@@ -277,6 +331,7 @@ async fn turn_rounds(
                             },
                             final_text: String::new(),
                             rounds: round,
+                            structured_output: None,
                         }
                     }
                 }
@@ -289,6 +344,7 @@ async fn turn_rounds(
                     reason: EndReason::Aborted,
                     final_text: String::new(),
                     rounds: round,
+                    structured_output: None,
                 };
             }
             Sampled::Partial { error, blocks } => {
@@ -299,6 +355,7 @@ async fn turn_rounds(
                     reason: EndReason::Error(error),
                     final_text: String::new(),
                     rounds: round,
+                    structured_output: None,
                 };
             }
             Sampled::Failed(e) => {
@@ -317,6 +374,7 @@ async fn turn_rounds(
                     reason: EndReason::Error(e),
                     final_text: String::new(),
                     rounds: round,
+                    structured_output: None,
                 };
             }
         };
@@ -338,6 +396,21 @@ async fn turn_rounds(
             })
             .collect();
         if tool_uses.is_empty() {
+            if options.structured_schema.is_some() {
+                structured_failures += 1;
+                if structured_failures >= 3 {
+                    return TurnOutcome {
+                        reason: EndReason::Error(
+                            "structured output was not produced after 3 attempts".into(),
+                        ),
+                        final_text: String::new(),
+                        rounds: round + 1,
+                        structured_output: None,
+                    };
+                }
+                history.record(Message::user_text(crate::structured_output::nudge()));
+                continue;
+            }
             // The turn would end here — but a steer that landed during this
             // final sampling must not be lost. Absorb it and keep going, so a
             // late "wait, also do X" is answered instead of dropped. (Steers
@@ -375,6 +448,7 @@ async fn turn_rounds(
                 reason: EndReason::Completed,
                 final_text,
                 rounds: round + 1,
+                structured_output: None,
             };
         }
 
@@ -391,7 +465,10 @@ async fn turn_rounds(
             parent_rollout_id: history.rollout_last_id().map(str::to_string),
             program_result: None,
         };
-        let results = dispatch_tools(tool_uses, &ctx).await;
+        let (results, structured_output) = match &options.structured_schema {
+            Some(schema) => dispatch_structured_tools(tool_uses, &ctx, schema).await,
+            None => (dispatch_tools(tool_uses, &ctx).await, None),
+        };
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
         history.record(Message::tool_results(results));
@@ -406,9 +483,80 @@ async fn turn_rounds(
                 reason: EndReason::Aborted,
                 final_text: String::new(),
                 rounds: round + 1,
+                structured_output: None,
             };
         }
+        if let Some(value) = structured_output {
+            return TurnOutcome {
+                reason: EndReason::Completed,
+                final_text: String::new(),
+                rounds: round + 1,
+                structured_output: Some(value),
+            };
+        }
+        if options.structured_schema.is_some() {
+            structured_failures += 1;
+            if structured_failures >= 3 {
+                return TurnOutcome {
+                    reason: EndReason::Error(
+                        "valid structured output was not produced after 3 attempts".into(),
+                    ),
+                    final_text: String::new(),
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            history.record(Message::user_text(crate::structured_output::nudge()));
+        }
     }
+}
+
+async fn dispatch_structured_tools(
+    tool_uses: Vec<(String, String, Value)>,
+    ctx: &ToolCtx,
+    schema: &Value,
+) -> (Vec<ContentBlock>, Option<Value>) {
+    let tool_uses = crate::tools::normalize_tool_uses(tool_uses);
+    let mut results: Vec<Option<ContentBlock>> = (0..tool_uses.len()).map(|_| None).collect();
+    let mut ordinary_positions = Vec::new();
+    let mut ordinary_calls = Vec::new();
+    let mut accepted = None;
+
+    for (position, (id, name, input)) in tool_uses.into_iter().enumerate() {
+        if name == crate::structured_output::TOOL_NAME {
+            let result = if accepted.is_some() {
+                crate::structured_output::error_result(
+                    id,
+                    "only one StructuredOutput call may complete a turn",
+                )
+            } else {
+                match crate::structured_output::validate_value(schema, &input) {
+                    Ok(()) => {
+                        accepted = Some(input);
+                        crate::structured_output::success_result(id)
+                    }
+                    Err(error) => crate::structured_output::error_result(id, &error),
+                }
+            };
+            results[position] = Some(result);
+        } else {
+            ordinary_positions.push(position);
+            ordinary_calls.push((id, name, input));
+        }
+    }
+
+    let ordinary_results = dispatch_tools(ordinary_calls, ctx).await;
+    for (position, result) in ordinary_positions.into_iter().zip(ordinary_results) {
+        results[position] = Some(result);
+    }
+
+    (
+        results
+            .into_iter()
+            .map(|result| result.expect("every tool use has one result"))
+            .collect(),
+        accepted,
+    )
 }
 
 /// The response was cut off by the output token limit ("max_tokens" on the
