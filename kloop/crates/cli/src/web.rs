@@ -97,15 +97,17 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
         },
     };
     match WebTools::new(search) {
-        Ok(tools) => {
-            let defs = Arc::from(web::tool_defs(tools.search_backend_name()));
-            Some(Arc::new(WebToolSource { tools, defs }))
-        }
+        Ok(tools) => Some(web_source(tools)),
         Err(e) => {
             warn(&format!("web tools unavailable, skipped: {e:#}"));
             None
         }
     }
+}
+
+fn web_source(tools: WebTools) -> Arc<dyn ToolSource> {
+    let defs = Arc::from(web::tool_defs(tools.search_backend_name()));
+    Arc::new(WebToolSource { tools, defs })
 }
 
 struct WebToolSource {
@@ -198,5 +200,59 @@ mod tests {
             warnings[0].contains("unknown [web].search_provider"),
             "{warnings:?}"
         );
+    }
+
+    struct FakeSearch;
+
+    impl SearchBackend for FakeSearch {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn search<'a>(
+            &'a self,
+            _client: &'a reqwest::Client,
+            query: &'a str,
+            count: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<kloop_web::SearchHit>>> + Send + 'a>> {
+            Box::pin(async move {
+                assert_eq!(query, "rust agent");
+                assert_eq!(count, 5);
+                Ok(vec![kloop_web::SearchHit {
+                    title: "Rust".into(),
+                    url: "https://www.rust-lang.org/".into(),
+                    snippet: "A language".into(),
+                }])
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn source_binds_defs_calls_and_errors() {
+        let tools = WebTools::new(Some(Box::new(FakeSearch))).unwrap();
+        let source = web_source(tools);
+        let defs = source.defs();
+        let names: Vec<&str> = defs.iter().map(|def| def.name.as_str()).collect();
+        assert_eq!(names, vec!["web_fetch", "web_search"]);
+        assert!(source.is_readonly("web_fetch"));
+        assert!(source.is_readonly("web_search"));
+
+        let input = serde_json::json!({
+            "query": "rust agent",
+            "allowed_domains": ["rust-lang.org"]
+        });
+        let output = source.call("web_search", &input).await.unwrap();
+        assert_eq!(
+            output.text,
+            "1. Rust\n   https://www.rust-lang.org/\n   A language"
+        );
+        assert!(output.blocks.is_none());
+        assert!(output.structured.is_none());
+
+        let err = match source.call("web_unknown", &serde_json::json!({})).await {
+            Ok(_) => panic!("unknown tool should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(format!("{err:#}"), "unknown web tool: web_unknown");
     }
 }

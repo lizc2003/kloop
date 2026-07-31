@@ -60,11 +60,18 @@ pointer at the next step boundary; and explicitly shuts background work down bef
 teardown. CC's auto-background, stall detection, and feature-gated model-visible Monitor remain
 deliberate product boundaries rather than unproven parity claims.
 
-Plan 52–54 continue the same evidence discipline. Agent/task/team and interaction/workflow controls remain explicit native-vs-CC adapters rather than name-based claims. Plan 54 grows the fixed corpus to **129 captures / 164 static evidence** and keeps the 56-row/448-cell matrix conservative at 89 compatible / 143 intentional-diff / 34 missing / 150 unknown / 22 n/a / 10 same. Skill, ToolSearch, stdio dynamic MCP and MCP resources now have exact fixtures; dynamic MCP permission/concurrency remain unknown where the pinned profile did not expose them. Resource reads intentionally keep kloop's external-tool approval instead of silently authorizing a model-selected URI.
+Plan 52–55 continue the same evidence discipline. Agent/task/team, interaction/workflow,
+discovery/extension, and Web/remote controls remain explicit native-vs-CC adapters rather
+than name-based claims. Plan 55 grows the fixed corpus to **145 captures / 180 static
+evidence**; splitting WebSearch clean/allow execution profiles produces a conservative
+57-row/456-cell matrix at 92 compatible / 149 intentional-diff / 34 missing / 149 unknown /
+22 n/a / 10 same. CC WebFetch loopback cases still stop before transport with zero local
+requests; CC WebSearch success/empty/error does reach a hermetic local provider side query.
+True remote/cloud lifecycle and every unexecuted Web transport branch remain unknown.
 
 This baseline is evidence and a roadmap, not a claim that all tools already
 match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 55–59; kloop-only capabilities stay intentionally separate.
+remain for Plans 56–59; kloop-only capabilities stay intentionally separate.
 
 
 ## Compaction (Phase 2, first slice)
@@ -1014,25 +1021,32 @@ operations remain implemented in the `kloop-web` crate and are bound to core's
 `ToolSource` seam by the CLI (exactly like MCP servers — core stays
 network-free, reqwest lives only in provider and web):
 
-- **web_fetch** `{url}` — HTTP upgraded to HTTPS, embedded credentials and
-  2000-char URLs rejected, SSRF guard (loopback/private/link-local/CGNAT/
-  metadata ranges refused, DNS names resolved and checked), same-host
-  redirects followed (max 5), cross-host redirects reported back for an
-  explicit re-fetch (cc shape — kills open-redirect laundering), 5MB
-  download cap, HTML→text (hand-rolled: scripts/styles/comments dropped,
-  block tags to newlines, entities decoded), 50k-char text cap.
-- **web_search** `{query, max_results}` — pluggable `SearchBackend` trait
-  with two backends: Tavily (default, `TAVILY_API_KEY`; its free tier needs
-  no card) and Brave (`BRAVE_API_KEY`). Without the selected backend's key
-  the tool is not registered and startup warns. `[web] search_provider`
-  in global `~/.kloop/config.toml` selects the backend; adding a provider = one
-  trait impl + one match arm.
+- **web_fetch** `{url}` (strict; unknown fields rejected) — HTTP upgraded to
+  HTTPS, embedded credentials and 2000-char URLs rejected, SSRF guard
+  (loopback/private/link-local/CGNAT/metadata ranges refused, DNS names resolved
+  and checked on every hop), same-site redirects followed (max 5), cross-host
+  redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text,
+  and a 50k-character model-text cap. Download and text truncation are reported
+  independently.
+- **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
+  at least two characters; allow/block lists are mutually exclusive) —
+  pluggable `SearchBackend` trait with Tavily (default, `TAVILY_API_KEY`) and
+  Brave (`BRAVE_API_KEY`). The backend result count is an internal fixed bound,
+  result URLs must be HTTP(S), domain matching uses exact-host/subdomain
+  boundaries, provider JSON responses are capped at 5 MiB, and formatted model
+  output is capped at 50k characters. Without the selected backend's key the
+  tool is not registered and startup warns. `[web] search_provider` in global
+  `~/.kloop/config.toml` selects the backend.
 
-Both are read-only for concurrency; the permission gate treats them like
-any external tool (ask by default, `web_fetch`/`web_search` allow rules or
-session approvals apply). Not ported from cc: the `prompt` parameter with
-small-model post-processing, the 15-minute fetch cache, turndown-style
-HTML→Markdown, and the preapproved-domain list.
+Both are read-only for concurrency; the permission gate treats them like any
+external tool (ask by default, `web_fetch`/`web_search` allow rules or session
+approvals apply). Deliberately not ported from CC 2.1.220: WebFetch's mandatory
+`prompt` plus secondary small-model processing, the 15-minute fetch cache,
+turndown-style HTML→Markdown, and the preapproved-domain list. Exact Plan 55
+evidence proves CC WebSearch success/empty/server-tool error through a hermetic
+`ANTHROPIC_BASE_URL` side query, but leaves CC WebFetch transport, WebSearch
+timeout/large/dynamic-concurrency/CCR branches, and true remote-agent execution
+unknown rather than weakening kloop's safety policy to manufacture fixtures.
 
 ## Parallel sub-agents (Phase 2, twelfth slice)
 

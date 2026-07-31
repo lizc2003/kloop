@@ -1,6 +1,6 @@
 # Plan 55 — Web 与 remote 条件对齐
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-07-31）
 >
 > 母计划：Plan 48
 >
@@ -20,13 +20,17 @@ Plan 48 对 WebFetch 的本地 URL case 只取得权限顺序负证据：2.1.220
 
 - `web-fetch@allow-cli`
 - `web-search@clean-cli`
+- `web-search-execution@allow-cli`
+- `agent@allow-cli`（只消费 remote gate/fallback 证据，不代表 remote=true）
 
 当前结论：
 
-- WebFetch registration/schema/parser 为 `compatible`，permission 为 `intentional-diff`，output 只有前置拒绝的 `compatible`，executor/concurrency 未知。
-- 现有 `webfetch-ok/redirect/cross-host-redirect/http-error/large/auth-error` 均未到达 local stub。
-- WebSearch registration/schema 为 `compatible`；parser 到 lifecycle 均未知。
-- CC profile 均为 `remote=false`；remote gate 和平台条件未被当前 fixtures 裁决。
+- corpus 为 145 captures / 180 static evidence；matrix 拆分 WebSearch clean/allow profile 后为 57 行/456 单元（92 compatible / 149 intentional-diff / 34 missing / 149 unknown / 22 n/a / 10 same）。
+- WebFetch registration 为 `compatible`；CC strict `{url,prompt}` + 二级模型处理与 kloop strict `{url}` 有界纯抓取导致 schema/parser/permission/output 为 `intentional-diff`，executor/concurrency 继续 `unknown`，lifecycle 为 `n/a`。
+- 15 个 WebFetch fixture 中，所有 loopback transport case 都在 CC domain-safety preflight 前拒绝，LocalWeb 请求严格为 0；redirect/auth/status/large/decode 没有被动态执行。
+- WebSearch clean profile 固定 unconditional registration、strict basic parser 和默认 permission denial；allow profile 真正把 `web_search_20250305` side query 发到本地 `ANTHROPIC_BASE_URL` fake provider，固定 filter conflict、success/empty/server-tool error 与模型输出映射。两 profile 分行，禁止用 allow fixture 无声明覆盖 clean executor cell。
+- kloop WebSearch strict query/domain contract 与 readonly concurrency 为 `compatible`；按 Tavily/Brave key 条件注册及 bounded plain-text output 为 `intentional-diff`。timeout、large output、动态目标并发、HTTP provider/CCR proxy 和 lifecycle 仍 `unknown`。
+- 所有 manifest profile 均为 `remote=false`；只证明请求 `isolation:"remote"` 时 gate false 会回退 worktree/local async Agent，不是 remote=true/cloud lifecycle 成功证据。
 
 优先复用：
 
@@ -79,6 +83,16 @@ Plan 48 对 WebFetch 的本地 URL case 只取得权限顺序负证据：2.1.220
 
 只实现已裁决差距；SSRF/redirect 防线冲突优先保留安全策略并记录有意差异。
 
+## 完成记录（✅ 2026-07-31）
+
+- 新增 16 个 raw/normalized capture：WebFetch 7 个 strict parser/safety case，WebSearch 9 个 permission/parser/executor/output case；复用既有 8 个 WebFetch transport fixture 与 `agent-remote-gate-disabled`，并将 required corpus 固定为 145 captures / 180 static evidence。
+- WebFetch exact evidence 固定 `{url,prompt}` schema、URL guard、domain preflight、redirect/fetch/decode/truncation 静态链和所有 loopback case 的 zero-request envelope。运行证据只能裁决 preflight ordering，不能把 bundle 中 transport 代码升级为 executor success。
+- WebSearch 通过本地 fake provider 捕获真正的 side query：`web_search_20250305`、`max_uses:8`、allowed/blocked filters、success/empty/server-tool error 及最终模型输出均由 verifier fail closed；无公网、真实 key 或实时搜索结果。
+- matrix 将 `web-search@clean-cli` 与 `web-search-execution@allow-cli` 分开，避免跨 profile 吸收 executor evidence；Agent executor/lifecycle 同时引用 remote fallback 静态链。最终 57 行/456 单元，4 个 generated pair / 10 个 `same` 未增加。
+- kloop WebFetch/WebSearch 契约归 core、网络实现归 `kloop-web`、CLI 绑定为普通 `ToolSource`。Fetch 输入 strict、逐跳 safety/redirect/size 边界不放宽；Search 输入改为 strict query/domain filters，provider/result/output 有界，Tavily/Brave 配置 gate 保留。
+- remote 只闭合 gate false 的 worktree/local async fallback；true cloud/team、其他平台和 remote lifecycle 继续 `unknown`。
+- 完整验证全绿：matrix generator check、full exact-binary verifier、corpus-only verifier、`kloop-web` 27 tests、core Web 定向测试、fmt、workspace all-targets clippy、workspace tests、mock smoke 与 `git diff --check`。全部证据、实现、测试与文档合为一次 `plan55` commit（本次，见 git log）。
+
 ## 非目标与有意保留
 
 - 不访问公网、不用真实搜索 key、不提交缓存或实时结果。
@@ -100,7 +114,9 @@ Plan 48 对 WebFetch 的本地 URL case 只取得权限顺序负证据：2.1.220
 验证：
 
 ```bash
+python3 -B refs/claude-code-2.1.220/build_matrix.py --check
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 cd kloop
 cargo test -p kloop-web
 cargo test -p kloop-core web
@@ -123,8 +139,8 @@ git diff --check
 - 无 stub 外网络访问，敏感信息扫描全绿。
 - 所有门禁全绿，一次提交，提交信息带 `plan55`。
 
-## 开工时定 / 问用户
+## 开工裁决
 
-- 是否存在合规、可重放的本地 executor profile。
-- kloop 更严格 Web 安全策略哪些明确保留为有意差异。
-- remote 的真实产品入口和当前平台必须覆盖的范围。
+- 不存在合规、可重放且能穿过 2.1.220 domain-safety 的本地 WebFetch executor profile；executor 保守保留 `unknown`，没有绕过安全层。
+- kloop 明确保留 strict url-only 输入、逐跳 DNS/SSRF、embedded credentials、redirect、5 MiB download 与 50k model-text 边界，均作为安全/产品型 `intentional-diff`。
+- 当前平台只覆盖 `remote=false` 下的 fallback；remote=true、cloud/team transport、其他平台工具和 lifecycle 不作推断。

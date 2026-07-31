@@ -9,11 +9,8 @@ use anyhow::Context;
 use anyhow::Result;
 use reqwest::Url;
 
-/// Hard cap on downloaded bytes; reading stops here mid-body.
-const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
-/// Cap on the text returned to the model (the record-time offload handles
-/// anything over the history threshold; this keeps single pages sane).
-const MAX_TEXT_CHARS: usize = 50_000;
+use crate::limits;
+
 const MAX_REDIRECTS: usize = 5;
 
 pub(crate) async fn fetch_url(
@@ -105,8 +102,8 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
         .with_context(|| format!("web_fetch: reading body from {url} failed"))?
     {
         bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_DOWNLOAD_BYTES {
-            bytes.truncate(MAX_DOWNLOAD_BYTES);
+        if bytes.len() > limits::MAX_DOWNLOAD_BYTES {
+            bytes.truncate(limits::MAX_DOWNLOAD_BYTES);
             download_truncated = true;
             break;
         }
@@ -131,20 +128,14 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     if text.is_empty() {
         text = "(empty response body)".into();
     }
-    let mut clipped = clip_chars(&text, MAX_TEXT_CHARS);
-    if clipped.len() < text.len() {
+    let (mut clipped, text_truncated) = limits::truncate_chars(text, limits::MAX_TEXT_CHARS);
+    if text_truncated {
         clipped.push_str("\n\n[content truncated at 50000 characters]");
-    } else if download_truncated {
+    }
+    if download_truncated {
         clipped.push_str("\n\n[download truncated at 5MB]");
     }
     Ok(clipped)
-}
-
-fn clip_chars(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((cut, _)) => text[..cut].to_string(),
-        None => text.to_string(),
-    }
 }
 
 /// Scheme and address policy. Every redirect hop passes through here; DNS
@@ -408,11 +399,19 @@ mod tests {
     #[tokio::test]
     async fn errors_on_status_and_binary_content() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        let cases = [
+            ("/unauthorized", 401),
+            ("/forbidden", 403),
+            ("/missing", 404),
+            ("/error", 500),
+        ];
+        for &(route, status) in &cases {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
         Mock::given(method("GET"))
             .and(path("/blob"))
             .respond_with(
@@ -422,10 +421,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = fetch_private(&format!("{}/missing", server.uri()))
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("HTTP 404"));
+        for &(route, status) in &cases {
+            let err = fetch_private(&format!("{}{route}", server.uri()))
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("HTTP {status}")));
+        }
 
         let err = fetch_private(&format!("{}/blob", server.uri()))
             .await
@@ -449,6 +450,27 @@ mod tests {
             out.ends_with("[content truncated at 50000 characters]"),
             "note appended"
         );
+        assert!(out.len() < 51_000);
+    }
+
+    #[tokio::test]
+    async fn download_and_text_caps_are_reported_independently() {
+        let server = MockServer::start().await;
+        let body = vec![b'x'; limits::MAX_DOWNLOAD_BYTES + 1024];
+        Mock::given(method("GET"))
+            .and(path("/oversized"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .mount(&server)
+            .await;
+
+        let out = fetch_private(&format!("{}/oversized", server.uri()))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[content truncated at 50000 characters]"),
+            "{out:?}"
+        );
+        assert!(out.ends_with("[download truncated at 5MB]"), "{out:?}");
         assert!(out.len() < 51_000);
     }
 }

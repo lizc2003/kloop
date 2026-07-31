@@ -231,6 +231,27 @@ stdio/HTTP 在 JSON parse 前限单消息 wire bytes，tools/resources paginator
 Streamable HTTP 仍无长期 server-notification stream，因此连接状态明确报告 startup catalog 固定，未把
 request 内短 SSE response 伪装成动态订阅。full exact-binary verifier 与 workspace Rust 门均通过。
 
+Plan 55 将 corpus 扩至 **145 captures / 180 static evidence**。WebSearch 按 profile 拆分后，matrix 为
+57 行/456 单元，状态为 92 `compatible` / 149 `intentional-diff` / 34 `missing` /
+149 `unknown` / 22 `n/a` / 10 `same`。新增 16 个 capture：WebFetch 7 个 strict
+`url+prompt` parser/URL safety case，WebSearch 9 个 permission/parser/side-query/output case；既有
+8 个 WebFetch transport case 与 Agent remote-gate fallback fixture 继续复用。generated pair 仍为 4 个，
+没有把静态链或负证据包装成新 `same`。
+
+WebFetch 的 exact 2.1.220 loopback case 全在 domain-safety preflight 前失败，LocalWeb 请求严格为 0；
+所以 redirect/auth/status/large/decode 和 transport concurrency 继续 `unknown`。kloop 不为制造成功 fixture
+放宽安全边界，保留 strict `{url}` 纯抓取、逐跳 DNS/SSRF、embedded credentials、same-site redirect、
+5 MiB download 与 50k model-text 限制，和 CC 的 mandatory `prompt` + secondary model/cache/markdown
+pipeline 明确记为 `intentional-diff`。
+
+WebSearch clean profile 固定 unconditional registration、strict basic parser 与默认 permission denial；
+allow profile 真正把 `web_search_20250305` side query 发到本地 `ANTHROPIC_BASE_URL` fake provider，
+固定 conflict filters、success/empty/server-tool error 与模型输出映射。matrix 分为
+`web-search@clean-cli` 和 `web-search-execution@allow-cli`，不靠跨 profile 隐式吸收运行证据。
+kloop 保留按 Tavily/Brave key 条件注册和 bounded plain-text output；timeout、large、动态目标并发、
+HTTP provider/CCR proxy 与 lifecycle 仍 `unknown`。remote 只证明 `remote=false` 时请求 remote isolation
+会回退 worktree/local async Agent；true cloud/team 和 remote lifecycle 没有被当前 hermetic profile 裁决。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -253,8 +274,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
-`docs/plan/53-interaction-control-parity.md` 与 `docs/plan/54-discovery-extension-parity.md`。Plan 54 的完成不表示
-kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 55–59 逐簇实现与验收。
+`docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md` 与
+`docs/plan/55-web-remote-parity.md`。Plan 55 的完成不表示 kloop 已全工具对齐或可替换 Claude Code；
+其余产品行为仍由 Plan 56–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

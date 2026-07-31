@@ -7,9 +7,12 @@ use std::pin::Pin;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use reqwest::Url;
 use serde_json::Value;
 
-#[derive(Debug)]
+use crate::limits;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
     pub title: String,
     pub url: String,
@@ -31,7 +34,8 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
     if hits.is_empty() {
         return "No results found".into();
     }
-    hits.iter()
+    let rendered = hits
+        .iter()
         .enumerate()
         .map(|(i, hit)| {
             format!(
@@ -43,26 +47,103 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    let (mut bounded, truncated) = limits::truncate_chars(rendered, limits::MAX_TEXT_CHARS);
+    if truncated {
+        bounded.push_str("\n\n[search results truncated at 50000 characters]");
+    }
+    bounded
+}
+
+/// Keep only valid HTTP(S) result URLs that satisfy the model-provided domain
+/// filters. A blocked domain always wins when both lists match.
+pub(crate) fn filter_hits(
+    hits: Vec<SearchHit>,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+) -> Vec<SearchHit> {
+    let restrict_to_allowed = !allowed_domains.is_empty();
+    let allowed_domains = normalize_domains(allowed_domains);
+    let blocked_domains = normalize_domains(blocked_domains);
+    hits.into_iter()
+        .filter(|hit| {
+            let Ok(url) = Url::parse(&hit.url) else {
+                return false;
+            };
+            if !matches!(url.scheme(), "http" | "https") {
+                return false;
+            }
+            let Some(host) = url
+                .host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            else {
+                return false;
+            };
+            let allowed = !restrict_to_allowed
+                || allowed_domains
+                    .iter()
+                    .any(|domain| domain_matches(&host, domain));
+            allowed
+                && !blocked_domains
+                    .iter()
+                    .any(|domain| domain_matches(&host, domain))
+        })
+        .collect()
+}
+
+fn normalize_domains(raw_domains: &[String]) -> Vec<String> {
+    raw_domains
+        .iter()
+        .filter_map(|raw_domain| {
+            let raw_domain = raw_domain.trim().trim_start_matches("*.");
+            if raw_domain.is_empty() {
+                return None;
+            }
+            let parsed = if raw_domain.contains("://") {
+                Url::parse(raw_domain).ok()
+            } else {
+                Url::parse(&format!("https://{raw_domain}")).ok()
+            }?;
+            parsed
+                .host_str()
+                .map(|domain| domain.trim_end_matches('.').to_ascii_lowercase())
+                .filter(|domain| !domain.is_empty())
+        })
+        .collect()
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Send a backend's built request, validate the status, and parse the body —
 /// the skeleton every backend shares. `name` labels the errors.
 async fn send_and_parse(req: reqwest::RequestBuilder, name: &str) -> Result<Value> {
-    let resp = req
+    let mut resp = req
         .send()
         .await
         .with_context(|| format!("web_search: request to {name} failed"))?;
     let status = resp.status();
-    let body = resp
-        .text()
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .with_context(|| format!("web_search: reading {name} response failed"))?;
+        .with_context(|| format!("web_search: reading {name} response failed"))?
+    {
+        if body.len().saturating_add(chunk.len()) > limits::MAX_DOWNLOAD_BYTES {
+            bail!("web_search: {name} response exceeded 5MB");
+        }
+        body.extend_from_slice(&chunk);
+    }
     if !status.is_success() {
-        let head: String = body.chars().take(200).collect();
+        let head: String = String::from_utf8_lossy(&body).chars().take(200).collect();
         bail!("web_search: {name} returned HTTP {status}: {head}");
     }
-    serde_json::from_str(&body).with_context(|| format!("web_search: {name} returned invalid JSON"))
+    serde_json::from_slice(&body)
+        .with_context(|| format!("web_search: {name} returned invalid JSON"))
 }
 
 /// Map a backend's result array to hits. `snippet_field` is the per-backend
@@ -314,5 +395,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(format_hits(&hits), "No results found");
+    }
+
+    #[test]
+    fn domain_filters_use_host_boundaries_and_blocked_wins() {
+        let hit = |url: &str| SearchHit {
+            title: url.into(),
+            url: url.into(),
+            snippet: String::new(),
+        };
+        let hits = vec![
+            hit("https://example.com/a"),
+            hit("https://docs.example.com/b"),
+            hit("https://blocked.example.com/c"),
+            hit("https://badexample.com/d"),
+            hit("file:///tmp/not-web"),
+        ];
+        let filtered = filter_hits(
+            hits,
+            &["*.EXAMPLE.com.".into()],
+            &["https://blocked.example.com/path".into()],
+        );
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|hit| hit.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://example.com/a", "https://docs.example.com/b"]
+        );
+        assert!(filter_hits(vec![hit("https://example.com/a")], &[String::new()], &[]).is_empty());
+    }
+
+    #[test]
+    fn formatted_results_have_a_unicode_safe_total_cap() {
+        let output = format_hits(&[SearchHit {
+            title: "界".repeat(60_000),
+            url: "https://example.com".into(),
+            snippet: "tail".into(),
+        }]);
+        assert!(
+            output.ends_with("[search results truncated at 50000 characters]"),
+            "{output:?}"
+        );
+        assert!(output.chars().count() < 50_100);
+    }
+
+    #[tokio::test]
+    async fn backend_response_body_is_bounded_and_json_must_be_valid() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                vec![b'x'; limits::MAX_DOWNLOAD_BYTES + 1],
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::client();
+        let err = Tavily::with_base("k".into(), server.uri())
+            .search(&client, "oversized", 5)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("response exceeded 5MB"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&server)
+            .await;
+        let err = Tavily::with_base("k".into(), server.uri())
+            .search(&client, "invalid", 5)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid JSON"));
     }
 }

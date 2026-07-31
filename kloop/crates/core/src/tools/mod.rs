@@ -1285,6 +1285,50 @@ mod tests {
         }
     }
 
+    struct WebGateSource {
+        defs: Arc<[ToolDef]>,
+        both_started: tokio::sync::Barrier,
+    }
+
+    impl WebGateSource {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                defs: Arc::from(
+                    ["web_fetch", "web_search"]
+                        .into_iter()
+                        .map(|name| ToolDef {
+                            name: name.into(),
+                            description: format!("test {name}"),
+                            schema: json!({"type": "object"}),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                both_started: tokio::sync::Barrier::new(2),
+            })
+        }
+    }
+
+    impl ToolSource for WebGateSource {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            self.defs.clone()
+        }
+
+        fn is_readonly(&self, tool: &str) -> bool {
+            matches!(tool, "web_fetch" | "web_search")
+        }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.both_started.wait().await;
+                Ok(SourceOutput::text(format!("completed {tool}")))
+            })
+        }
+    }
+
     #[test]
     fn tool_defs_expose_task_only_at_depth_zero() {
         let names = |depth| {
@@ -1295,6 +1339,57 @@ mod tests {
         };
         assert!(names(0).iter().any(|n| n == "task"));
         assert!(!names(1).iter().any(|n| n == "task"));
+    }
+
+    #[tokio::test]
+    async fn readonly_web_source_calls_share_a_concurrent_batch() {
+        let source: Arc<dyn ToolSource> = WebGateSource::new();
+        let ctx = test_ctx_with_sources(0, "web-concurrency", vec![source]);
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch_tools(
+                vec![
+                    (
+                        "fetch".into(),
+                        "web_fetch".into(),
+                        json!({"url": "https://example.com"}),
+                    ),
+                    (
+                        "search".into(),
+                        "web_search".into(),
+                        json!({"query": "rust"}),
+                    ),
+                ],
+                &ctx,
+            ),
+        )
+        .await
+        .expect("web calls must overlap rather than deadlock at the two-party barrier");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| {
+                    let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } = result
+                    else {
+                        panic!("expected tool result")
+                    };
+                    (
+                        tool_use_id.as_str(),
+                        content.as_text().into_owned(),
+                        *is_error,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("fetch", "completed web_fetch".into(), false),
+                ("search", "completed web_search".into(), false),
+            ]
+        );
     }
 
     #[test]

@@ -15,28 +15,47 @@ pub const WEB_SEARCH: &str = "web_search";
 pub fn tool_defs(search_backend: Option<&str>) -> Vec<ToolDef> {
     let mut defs = vec![ToolDef {
         name: WEB_FETCH.into(),
-        description: "Fetch a URL and return its content as plain text (HTML is converted, tags stripped). HTTP is upgraded to HTTPS. Same-host redirects are followed; a cross-host redirect is reported back so you can fetch the new URL explicitly. Refuses private/internal addresses. Long pages are truncated.".into(),
+        description: "Fetch a URL and return its bounded plain-text content (HTML is converted, tags stripped). HTTP is upgraded to HTTPS. Same-site redirects are followed; a cross-host redirect is reported back so you can fetch the new URL explicitly. Refuses private/internal addresses and embedded credentials. This tool returns page content directly; it does not run a second model prompt over the page.".into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Full URL to fetch (http or https)"}
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Full URL to fetch (http or https)"
+                }
             },
-            "required": ["url"]
+            "required": ["url"],
+            "additionalProperties": false
         }),
     }];
     if let Some(backend) = search_backend {
         defs.push(ToolDef {
             name: WEB_SEARCH.into(),
             description: format!(
-                "Search the web (via {backend}). Returns the top results as title, URL and snippet; fetch a result with web_fetch for the full page."
+                "Search the web (via {backend}). Returns bounded results as title, URL and snippet; fetch a result with web_fetch for the full page. Optional domain lists restrict the returned URLs."
             ),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                    "max_results": {"type": "integer", "description": "Number of results (1-10, default 5)"}
+                    "query": {
+                        "type": "string",
+                        "minLength": 2,
+                        "description": "The search query"
+                    },
+                    "allowed_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only include results from these domains"
+                    },
+                    "blocked_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Never include results from these domains"
+                    }
                 },
-                "required": ["query"]
+                "required": ["query"],
+                "additionalProperties": false
             }),
         });
     }
@@ -49,25 +68,55 @@ mod tests {
 
     #[test]
     fn definitions_follow_backend_availability() {
-        assert_eq!(
-            tool_defs(None),
-            vec![ToolDef {
-                name: "web_fetch".into(),
-                description: "Fetch a URL and return its content as plain text (HTML is converted, tags stripped). HTTP is upgraded to HTTPS. Same-host redirects are followed; a cross-host redirect is reported back so you can fetch the new URL explicitly. Refuses private/internal addresses. Long pages are truncated.".into(),
-                schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "Full URL to fetch (http or https)"}
-                    },
-                    "required": ["url"]
-                }),
-            }]
-        );
+        let fetch = ToolDef {
+            name: "web_fetch".into(),
+            description: "Fetch a URL and return its bounded plain-text content (HTML is converted, tags stripped). HTTP is upgraded to HTTPS. Same-site redirects are followed; a cross-host redirect is reported back so you can fetch the new URL explicitly. Refuses private/internal addresses and embedded credentials. This tool returns page content directly; it does not run a second model prompt over the page.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "format": "uri",
+                        "description": "Full URL to fetch (http or https)"
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+        };
+        assert_eq!(tool_defs(None), vec![fetch.clone()]);
 
-        let defs = tool_defs(Some("tavily"));
-        assert_eq!(defs.len(), 2);
-        assert_eq!(defs[1].name, "web_search");
-        assert!(defs[1].description.contains("via tavily"));
-        assert_eq!(defs[1].schema["required"], json!(["query"]));
+        assert_eq!(
+            tool_defs(Some("tavily")),
+            vec![
+                fetch,
+                ToolDef {
+                    name: "web_search".into(),
+                    description: "Search the web (via tavily). Returns bounded results as title, URL and snippet; fetch a result with web_fetch for the full page. Optional domain lists restrict the returned URLs.".into(),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "minLength": 2,
+                                "description": "The search query"
+                            },
+                            "allowed_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Only include results from these domains"
+                            },
+                            "blocked_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Never include results from these domains"
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }),
+                }
+            ]
+        );
     }
 }

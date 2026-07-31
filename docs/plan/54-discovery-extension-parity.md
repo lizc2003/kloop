@@ -98,7 +98,7 @@ Plan 48 已证明强制 defer profile 下 ToolSearch、`select:`、关键词搜�
 ## 非目标与有意保留
 
 - 不连接公网或真实 MCP server。
-- 不在本计划实现 remote MCP/OAuth/Web；留 Plan 55。
+- 本计划不实现 remote MCP/OAuth/Web；Web 已由 Plan 55 独立取证和闭环，remote MCP/OAuth 仍不在 Plan 54/55 范围。
 - 不在本计划增加 stdio child 退出后的进程内自动重连；transport 关闭后调用报错，重新启动会话时重连。
 - 不删除或隐藏 `call_tool`。
 - 不从公开 Skills/MCP 文档推导 2.1.220 schema。
