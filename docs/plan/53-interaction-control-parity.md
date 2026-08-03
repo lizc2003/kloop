@@ -69,13 +69,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 refs/claude-code-2.1.220/verify.py
 
 1. kloop 新增独立 model-visible `ask_user_question`；与权限审批在类型、transport、UI 和结果语义上分离。
 2. kloop 新增独立 model-visible `enter_plan_mode`；只切 session mode、重复幂等、depth > 0 禁用。`exit_plan_mode` 继续审批并恢复。
-3. StructuredOutput 只实现为 internal protocol；首期服务 Workflow `agent({schema})`，不注册到主工具列表。
+3. `structured_output` 只实现为 internal protocol；首期服务 Workflow `agent({schema})`，不注册到主工具列表。
 4. kloop 新增独立 model-visible `workflow`；`run_program` 继续作为 kloop-only CodeAct 工具。
 5. 两个脚本 surface 共享 QuickJS/runtime 基础，但抽象边界不同：
    - `run_program` 可直接 `tools.<name>()`，默认前台、可选后台。
    - `workflow` 只能编排 agent，始终后台，有 meta/args/phase/persistence/resume；脚本中完全不存在 `tools`/`__call_tool`。
 6. TUI/plain/server 支持一般问答；headless、EOF、断线及不支持 capability 的客户端 fail closed，绝不自动选择答案。
-7. 公共工具使用 kloop snake_case 名称；内部 synthetic tool 使用证据中的 `StructuredOutput`。
+7. kloop-owned 工具（包括内部 synthetic tool）统一使用 snake_case；精确 CC 证据中的目标名仍为 `StructuredOutput`。
 
 ## 实施计划
 
@@ -207,12 +207,12 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 
 测试：depth-0 注册与 headless/child 缺席；tools/__call_tool/fs/net/process/import 不可达；args/meta；parallel barrier、pipeline no-barrier、caps；child tool permission/hook/plan gate；立即 launch；phase；complete/fail/stop/shutdown；inbox boundary；persistence；resume hit/miss；task/run/store/event identity。
 
-### Slice 7 — Internal StructuredOutput
+### Slice 7 — Internal `structured_output`（CC：`StructuredOutput`）
 
 在 core 新增 internal structured turn contract（代表路径 `agent/structured_output.rs`），使用成熟 JSON Schema validator，并限制 schema/result 大小、深度和 `$ref`：
 
 - `run_turn` 增加内部 options/入口；普通主 turn、task、run_program 默认路径不变。
-- 仅 Workflow `agent({schema})` 在该 child request 临时追加 `StructuredOutput` ToolDef，input schema 就是调用方 schema。
+- 仅 Workflow `agent({schema})` 在该 child request 临时追加 `structured_output` ToolDef，input schema 就是调用方 schema。
 - synthetic tool 不进入 `all_tool_defs`、defer count、run_program API 或 frontend capability。
 - agent loop 截获调用并 host-side validate；成功记录成对 tool_result、保存 `TurnOutcome.structured_output`，立即结束 child turn。
 - mismatch 记录 `is_error` tool_result（bounded JSON path/error）并继续；无 tool call直接结束时追加强制 nudge；到硬上限后 reject Promise，绝不降级成未验证 final text。
@@ -229,8 +229,8 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 同步：
 
 - 本文件：完成记录、测试和提交号。
-- `docs/plan/HANDOFF.md`：Questioner/Approver 分离、ModeState、Workflow profile、StructuredOutput、RunStore 安全教训。
-- `kloop/README.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal StructuredOutput、headless 降级。
+- `docs/plan/HANDOFF.md`：Questioner/Approver 分离、ModeState、Workflow profile、`structured_output`、RunStore 安全教训。
+- `kloop/README.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal `structured_output`、headless 降级。
 - `refs/README.md`、`docs/capability-report.md`、server native protocol 文档。
 - `refs/claude-code-2.1.220/{static-evidence.jsonl,tool-matrix.json,verify.py}` 和生成产物；保留本会话新增 fixtures。
 
@@ -243,14 +243,14 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 - `kloop-codemode` 新增独立 Workflow runtime profile与 AST 级 pure-literal meta parser；脚本只得到 args/meta/agent/log/phase/parallel/pipeline，tools/`__call_tool`/fs/net/process/import/Date/random 均不可达。
 - 新增始终后台的 `workflow`：同步校验后立即返回 task/run/script identity，phase 与 terminal event 保持同一 task/run/description，结果/错误 step-boundary 回灌；stop、shutdown、失败、resume hit/miss 与 edited managed script 均有专门测试。
 - 新增 Unix descriptor-bound `RunStore`：run ID/component 校验、namespace/run directory FD 绑定、artifact openat/no-follow、descriptor-relative atomic rename、advisory run lease 与 Program/Workflow journal 均不再依赖可被 symlink swap 重定向的裸路径；manifest version 统辖同目录 artifact，journal entry 自带 version 且兼容旧字符串 result。非 Unix fallback 只承诺路径复核，不宣称 reparse-point race hardening，留待 Windows backend。
-- 新增内部 `StructuredOutput`：仅 schema Workflow child 临时注入，schema/result 大小与深度有界、拒 `$ref`、host-side `jsonschema` 复验；invalid/missing 有界重试，合法 object/array/scalar 才终止 child并以原生 JSON Value 入 journal/JS。
-- Structured response 中的普通 tool uses 重新合并为一次真实 `dispatch_tools` batch，再按原 response slot 复位结果；回归测试以 barrier 证明 concurrency-safe 普通工具仍真并发且 StructuredOutput 插槽前后顺序不变。
-- 保留并明确 intentional differences：公共工具名用 snake_case；Exit 继续 inline plan preview；Workflow 首版没有 named registry、嵌套、token budget、remote execution或任意 workspace script path；per-agent `effort` 尚无 session-local provider seam，`label`/per-call phase 只保留为未来更富进度树输入，不宣称同形。
+- 新增内部 `structured_output`（CC 精确目标名 `StructuredOutput`）：仅 schema Workflow child 临时注入，schema/result 大小与深度有界、拒 `$ref`、host-side `jsonschema` 复验；invalid/missing 有界重试，合法 object/array/scalar 才终止 child并以原生 JSON Value 入 journal/JS。
+- Structured response 中的普通 tool uses 重新合并为一次真实 `dispatch_tools` batch，再按原 response slot 复位结果；回归测试以 barrier 证明 concurrency-safe 普通工具仍真并发且 `structured_output` 插槽前后顺序不变。
+- 保留并明确 intentional differences：kloop-owned 工具名用 snake_case；Exit 继续 inline plan preview；Workflow 首版没有 named registry、嵌套、token budget、remote execution或任意 workspace script path；per-agent `effort` 尚无 session-local provider seam，`label`/per-call phase 只保留为未来更富进度树输入，不宣称同形。
 
 ### 关键验证
 
 - exact 2.1.220 corpus/binary verifier：通过。
-- Ask/Plan、四前端、Workflow/RunStore/StructuredOutput、codemode、server wire 的定向与 workspace 测试：通过。
+- Ask/Plan、四前端、Workflow/RunStore/`structured_output`、codemode、server wire 的定向与 workspace 测试：通过。
 - `cargo fmt --all --check`、workspace `clippy -D warnings`、workspace tests、mock 与真实 API dogfood 的最终结果见本文件“验证”节及提交说明。
 
 ## 关键不变量
@@ -282,7 +282,7 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 - stop/shutdown 后不得晚到成功结果。
 - resume cache 中 object 仍是 object。
 
-### StructuredOutput
+### `structured_output`（CC：`StructuredOutput`）
 
 - 不进入主注册面。
 - 只在显式 schema Workflow child 中注入。
@@ -350,7 +350,7 @@ git diff --check
 
 - plain `ask_user_question`：模型发单选 Color，terminal 回 `2`，下一轮精确得到 `ANSWER:Blue`。
 - plain Plan：模型 `enter_plan_mode` 后按要求尝试 side-effect Bash，hard gate 拒绝；`exit_plan_mode` 经 y 审批恢复 manual，最终 `PLAN-DONE`；临时 marker 确认不存在。
-- plain Workflow + StructuredOutput + resume：首个 `wf_*` run 的 schema child 成功产生 `RESUME-53` 后脚本按计划失败；第二次以同一 inline script、`args.fail=false`、原 run ID resume，完成返回；终端观测两次 Workflow launch 但只有一次 child start，证明 JSON Value journal hit 跳过第二次真实采样。
+- plain Workflow + `structured_output` + resume：首个 `wf_*` run 的 schema child 成功产生 `RESUME-53` 后脚本按计划失败；第二次以同一 inline script、`args.fail=false`、原 run ID resume，完成返回；终端观测两次 Workflow launch 但只有一次 child start，证明 JSON Value journal hit 跳过第二次真实采样。
 - 默认轨一次真实 Workflow 尝试遇到上游 stream read error；按既有 fallback 纪律改用 `claude-sonnet-4-6` 完成验收，没有把服务端瞬时错误误判为实现失败。
 
 真实会话 transcript、key 与代理地址均只留在被 gitignore 的本地 `.kloop/`，不进入提交。全部证据、实现、测试与文档合为一次 `plan53` commit（本次，见 git log）。
@@ -358,7 +358,7 @@ git diff --check
 ## 完成标准
 
 - 五个 surface 的类型、注册条件、schema、executor 和 lifecycle 有静态/动态/实现三层证据。
-- Ask/Plan/Workflow/StructuredOutput 的上述不变量均由测试锁定。
+- Ask/Plan/Workflow/CC `StructuredOutput` ↔ kloop `structured_output` 的上述不变量均由测试锁定。
 - TUI/plain/headless/server 的可用、降级、取消和断线路径明确且 fail closed。
 - run_program contract 不回归，resume 路径安全收口。
 - matrix 的 missing/unknown/intentional-diff 重新裁决并诚实保留。

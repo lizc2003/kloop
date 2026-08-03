@@ -102,12 +102,12 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
     let (cfg, seen) = structured_config(vec![
         MockTurn::Blocks(vec![tool_use_named(
             "s1",
-            "StructuredOutput",
+            "structured_output",
             json!({"count": "bad"}),
         )]),
         MockTurn::Blocks(vec![tool_use_named(
             "s2",
-            "StructuredOutput",
+            "structured_output",
             json!({"count": 2}),
         )]),
     ]);
@@ -132,7 +132,7 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
         let synthetic = request
             .tools
             .iter()
-            .find(|tool| tool.name == "StructuredOutput")
+            .find(|tool| tool.name == "structured_output")
             .unwrap();
         assert_eq!(synthetic.schema, schema);
     }
@@ -179,7 +179,7 @@ async fn structured_turn_nudges_missing_calls_and_exhausts() {
     assert_eq!(seen.lock().unwrap().len(), 3);
     assert!(history.messages().iter().any(|message| {
         message.content.iter().any(|block| {
-            matches!(block, ContentBlock::Text { text } if text.contains("Call StructuredOutput now"))
+            matches!(block, ContentBlock::Text { text } if text.contains("Call structured_output now"))
         })
     }));
 }
@@ -189,7 +189,7 @@ async fn structured_turn_batches_ordinary_tools_and_preserves_response_order() {
     let schema = json!({"type": "array", "items": {"type": "integer"}});
     let (base, _) = structured_config(vec![MockTurn::Blocks(vec![
         tool_use_named("o1", "test__blocking_read", json!({"value": "first"})),
-        tool_use_named("s1", "StructuredOutput", json!([1, 2])),
+        tool_use_named("s1", "structured_output", json!([1, 2])),
         tool_use_named("o2", "test__blocking_read", json!({"value": "second"})),
     ])]);
     let mut cfg = (*base).clone();
@@ -244,7 +244,7 @@ async fn ordinary_turn_never_exposes_structured_output() {
     assert!(seen.lock().unwrap()[0]
         .tools
         .iter()
-        .all(|tool| tool.name != "StructuredOutput"));
+        .all(|tool| tool.name != "structured_output"));
 }
 
 #[tokio::test]
@@ -256,7 +256,7 @@ async fn structured_turn_cancellation_never_accepts_a_late_value() {
         release: release_rx,
         blocks: vec![tool_use_named(
             "late",
-            "StructuredOutput",
+            "structured_output",
             json!("late value"),
         )],
     }]);

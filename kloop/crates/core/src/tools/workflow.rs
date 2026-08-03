@@ -60,7 +60,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run a deterministic JavaScript Workflow in the background. Use only when the user explicitly requested multi-agent orchestration. The script must begin with `export const meta = { name, description, phases }`; its body can use args, agent(), log(), phase(), parallel(), and pipeline(). Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. The tool returns task/run IDs immediately; the result is persisted and delivered at a later step boundary. Structured agent schemas are supported by the internal StructuredOutput protocol.".into(),
+        description: "Run a deterministic JavaScript Workflow in the background. Use only when the user explicitly requested multi-agent orchestration. The script must begin with `export const meta = { name, description, phases }`; its body can use args, agent(), log(), phase(), parallel(), and pipeline(). Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. The tool returns task/run IDs immediately; the result is persisted and delivered at a later step boundary. Structured agent schemas are supported by the internal structured_output protocol.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -826,7 +826,7 @@ mod tests {
         let (provider, first_seen) = kloop_provider::Provider::mock_recording(vec![
             kloop_provider::MockTurn::Blocks(vec![kloop_protocol::ContentBlock::ToolUse {
                 id: "structured-first".into(),
-                name: "StructuredOutput".into(),
+                name: "structured_output".into(),
                 input: json!({"count": 7}),
             }]),
         ]);
@@ -887,7 +887,7 @@ mod tests {
         let (provider, miss_seen) = kloop_provider::Provider::mock_recording(vec![
             kloop_provider::MockTurn::Blocks(vec![kloop_protocol::ContentBlock::ToolUse {
                 id: "structured-changed".into(),
-                name: "StructuredOutput".into(),
+                name: "structured_output".into(),
                 input: json!({"count": 9}),
             }]),
         ]);
@@ -926,7 +926,7 @@ mod tests {
         cfg.provider = Arc::new(kloop_provider::Provider::mock(vec![vec![
             kloop_protocol::ContentBlock::ToolUse {
                 id: "structured-1".into(),
-                name: "StructuredOutput".into(),
+                name: "structured_output".into(),
                 input: json!({"count": 7}),
             },
         ]]));

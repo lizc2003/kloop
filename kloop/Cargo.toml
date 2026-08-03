@@ -47,6 +47,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.46.10", default-features = false }
 # Global config/OAuth IO: macOS search-only directory descriptors plus safe
 # descriptor-relative no-follow opens and atomic renames.

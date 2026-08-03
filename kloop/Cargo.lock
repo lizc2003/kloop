@@ -1161,6 +1161,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1298,11 +1300,13 @@ dependencies = [
  "anyhow",
  "base64",
  "futures",
+ "getrandom 0.2.17",
  "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "indexmap",
  "jsonschema",
  "kloop-codemode",
  "kloop-protocol",

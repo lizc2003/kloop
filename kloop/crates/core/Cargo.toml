@@ -11,11 +11,13 @@ kloop-provider = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }
 globset = { workspace = true }
 grep-matcher = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 ignore = { workspace = true }
+indexmap = { workspace = true }
 jsonschema = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }

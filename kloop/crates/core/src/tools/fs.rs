@@ -13,6 +13,7 @@ use anyhow::Result;
 use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
+use super::notebook;
 use super::resolve_path;
 use super::str_arg;
 use super::ToolCtx;
@@ -85,6 +86,9 @@ enum Mutation {
         old: String,
         new: String,
         replace_all: bool,
+    },
+    Notebook {
+        request: notebook::NotebookEditRequest,
     },
 }
 
@@ -261,6 +265,38 @@ pub(super) async fn read_file_tool(
     .await
     .with_context(|| format!("read_file: read worker failed for {path}"))??;
 
+    // Notebook dispatch is extension-based: unlike image media sniffing, JSON
+    // notebooks have no magic bytes. A cell-aware read must be complete before
+    // it grants notebook_edit authority.
+    if key
+        .extension()
+        .is_some_and(|extension| extension == "ipynb")
+    {
+        let offset = integer_arg(input, "offset", "read_file")?;
+        let limit = integer_arg(input, "limit", "read_file")?;
+        if !matches!(offset, None | Some(0 | 1)) || !matches!(limit, None | Some(0)) {
+            bail!("read_file: offset/limit paging is not supported for Jupyter notebooks");
+        }
+        let output = notebook::read_notebook(&bytes)?;
+        let observation = if output.editable {
+            FileObservation::full_notebook(&bytes, &before)
+        } else {
+            FileObservation::full(&bytes, &before)
+        };
+        let state_update = if observation.version().metadata_matches(&after) {
+            FileStateUpdate::Observe {
+                path: key,
+                observation,
+            }
+        } else {
+            FileStateUpdate::Clear { path: key }
+        };
+        return Ok(ReadFileOutput {
+            content: output.content,
+            state_update,
+        });
+    }
+
     // An image file returns a single image block (validated for format and the
     // 5 MiB cap); offset/limit are line concepts and simply do not apply.
     if detect_media_type(&bytes).is_some() {
@@ -422,7 +458,33 @@ pub(super) async fn prepare_mutation_input(
     input: &Value,
     ctx: &ToolCtx,
 ) -> Result<PreparedMutation> {
-    let path = str_arg(input, "path", tool)?.to_string();
+    prepare_mutation_input_with_key(tool, input, "path", ctx).await
+}
+
+pub(super) async fn prepare_notebook_mutation_input(
+    input: &Value,
+    ctx: &ToolCtx,
+) -> Result<PreparedMutation> {
+    let path = str_arg(input, "notebook_path", "notebook_edit")?;
+    if Path::new(path)
+        .extension()
+        .is_none_or(|extension| extension != "ipynb")
+    {
+        bail!("File must be a Jupyter notebook (.ipynb file). For editing other file types, use edit_file.");
+    }
+    prepare_mutation_input_with_key("notebook_edit", input, "notebook_path", ctx).await
+}
+
+async fn prepare_mutation_input_with_key(
+    tool: &str,
+    input: &Value,
+    path_key: &str,
+    ctx: &ToolCtx,
+) -> Result<PreparedMutation> {
+    let path = str_arg(input, path_key, tool)?.to_string();
+    if tool == "notebook_edit" && !Path::new(&path).is_absolute() {
+        bail!("notebook_edit: notebook_path must be an absolute path");
+    }
     let cwd = ctx.cfg.effective_cwd();
     let requested = resolve_path(&cwd, &path);
     let tool_for_worker = tool.to_string();
@@ -483,6 +545,23 @@ pub(super) async fn edit_file_tool(
     .await
 }
 
+pub(super) async fn notebook_edit_tool(
+    input: &Value,
+    prepared: &PreparedMutation,
+    ctx: &ToolCtx,
+) -> Result<FileMutationOutput> {
+    let path = str_arg(input, "notebook_path", "notebook_edit")?;
+    let request = notebook::request_from_input(input)?;
+    mutate_file(
+        "notebook_edit",
+        path,
+        prepared,
+        Mutation::Notebook { request },
+        ctx,
+    )
+    .await
+}
+
 async fn mutate_file(
     tool: &'static str,
     path: &str,
@@ -492,6 +571,7 @@ async fn mutate_file(
 ) -> Result<FileMutationOutput> {
     let key = prepared.path.clone();
     let state = ctx.cfg.effective_file_state();
+    let notebook_mutation = matches!(&mutation, Mutation::Notebook { .. });
     // Capture the qualification before waiting. Two concurrent mutations based
     // on one Read must not let the second inherit the first mutation's refresh.
     let expected = state.observation(&key);
@@ -529,7 +609,11 @@ async fn mutate_file(
     .with_context(|| format!("{tool}: write worker failed for {path}"))?;
     let outcome = outcome?;
 
-    let observation = FileObservation::full(&outcome.bytes, &outcome.metadata);
+    let observation = if notebook_mutation {
+        FileObservation::full_notebook(&outcome.bytes, &outcome.metadata)
+    } else {
+        FileObservation::full(&outcome.bytes, &outcome.metadata)
+    };
     Ok(FileMutationOutput {
         content: outcome.content,
         state_update: FileStateUpdate::Replace {
@@ -750,7 +834,7 @@ fn commit_mutation(
         Mutation::Write { bytes } => {
             let target_version = match current {
                 Some(snapshot) => {
-                    validate_observation(expected, &snapshot, tool, display_path)?;
+                    validate_observation(expected, &snapshot, tool, display_path, false)?;
                     let permissions = snapshot.metadata.permissions();
                     let version = snapshot.version;
                     (Some(permissions), Some(version))
@@ -772,7 +856,7 @@ fn commit_mutation(
         } => {
             let snapshot =
                 current.with_context(|| format!("edit_file: cannot read {display_path}"))?;
-            validate_observation(expected, &snapshot, tool, display_path)?;
+            validate_observation(expected, &snapshot, tool, display_path, false)?;
             let current = String::from_utf8(snapshot.bytes).map_err(|_| {
                 anyhow::anyhow!("edit_file: {display_path} is not valid UTF-8 text")
             })?;
@@ -797,6 +881,18 @@ fn commit_mutation(
                 content,
             )
         }
+        Mutation::Notebook { request } => {
+            let snapshot = current
+                .context("Notebook file is unavailable; read it again before editing it.")?;
+            validate_observation(expected, &snapshot, tool, display_path, true)?;
+            let mutation = notebook::apply_edit(&snapshot.bytes, &request)?;
+            (
+                mutation.bytes,
+                Some(snapshot.metadata.permissions()),
+                Some(snapshot.version),
+                mutation.content,
+            )
+        }
     };
 
     atomic_replace(target, &bytes, permissions, target_version.as_ref(), fault)?;
@@ -817,10 +913,17 @@ fn validate_observation(
     current: &TargetSnapshot,
     tool: &str,
     path: &str,
+    require_notebook: bool,
 ) -> Result<()> {
     let Some(expected) = expected else {
+        if require_notebook {
+            bail!("File has not been read yet. Read it first before writing to it.");
+        }
         bail!("{tool}: must read {path} before modifying the existing file");
     };
+    if require_notebook && !expected.is_notebook() {
+        bail!("File has not been read as a complete notebook. Read it first before writing to it.");
+    }
     if !expected.is_complete() {
         bail!("{tool}: must read the entire file {path} before modifying it");
     }
@@ -828,6 +931,9 @@ fn validate_observation(
         .version()
         .matches(&current.bytes, &current.metadata)
     {
+        if require_notebook {
+            bail!("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.");
+        }
         bail!("{tool}: {path} changed since it was read; read it again before modifying it");
     }
     Ok(())

@@ -71,6 +71,21 @@ pub async fn file_change_preview(name: &str, input: &Value) -> Option<String> {
                 Err(_) => new_file_preview(content),
             }
         }
+        "notebook_edit" => {
+            let path = input["notebook_path"].as_str()?;
+            let bytes = tokio::fs::read(path).await.ok()?;
+            if bytes.len() > MAX_DIFF_INPUT {
+                format!("(editing notebook cell; file is {} bytes)", bytes.len())
+            } else {
+                let preview = crate::tools::notebook::change_preview(&bytes, input).ok()?;
+                let diff = numbered_diff(&preview.old_source, &preview.new_source);
+                if diff.is_empty() {
+                    preview.header
+                } else {
+                    format!("{}\n{diff}", preview.header)
+                }
+            }
+        }
         _ => return None,
     };
     (!preview.is_empty()).then_some(preview)

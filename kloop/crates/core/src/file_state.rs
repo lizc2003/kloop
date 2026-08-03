@@ -38,6 +38,7 @@ struct Entry {
 pub(crate) struct FileObservation {
     version: FileVersion,
     coverage: ReadCoverage,
+    notebook_cells: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,7 +111,9 @@ impl FileState {
                 mut observation,
             } => {
                 if let Some(existing) = inner.observations.get(&path) {
-                    if existing.observation.version == observation.version {
+                    if existing.observation.version == observation.version
+                        && existing.observation.notebook_cells == observation.notebook_cells
+                    {
                         if existing.observation.coverage.complete {
                             observation.coverage.complete = true;
                         } else if existing.observation.coverage.total_units
@@ -208,12 +211,23 @@ impl FileObservation {
         Self {
             version: FileVersion::new(bytes, metadata),
             coverage: ReadCoverage::new(total_units, range, empty_from_start),
+            notebook_cells: false,
         }
     }
 
     pub(crate) fn full(bytes: &[u8], metadata: &std::fs::Metadata) -> Self {
         let len = bytes.len() as u64;
         Self::from_read(bytes, metadata, len, 0..len, true)
+    }
+
+    pub(crate) fn full_notebook(bytes: &[u8], metadata: &std::fs::Metadata) -> Self {
+        let mut observation = Self::full(bytes, metadata);
+        observation.notebook_cells = true;
+        observation
+    }
+
+    pub(crate) fn is_notebook(&self) -> bool {
+        self.notebook_cells
     }
 
     pub(crate) fn version(&self) -> &FileVersion {
@@ -454,6 +468,29 @@ mod tests {
             observation: FileObservation::full(b"x", &metadata),
         });
         assert_eq!(tiny.len(), 0);
+    }
+
+    #[test]
+    fn notebook_qualification_never_merges_into_a_generic_observation() {
+        let bytes = b"{\"cells\":[]}";
+        let (path, metadata) = temp_file("notebook-kind", bytes);
+        let state = FileState::default();
+        state.apply(FileStateUpdate::Replace {
+            path: path.clone(),
+            observation: FileObservation::full_notebook(bytes, &metadata),
+        });
+        let qualified = state.observation(&path).unwrap();
+        assert!(qualified.is_complete());
+        assert!(qualified.is_notebook());
+
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(bytes, &metadata, 1, 0..1, true),
+        });
+        let generic = state.observation(&path).unwrap();
+        assert!(generic.is_complete());
+        assert!(!generic.is_notebook());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-31,plan 1–56 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、Plan 49–56 各工具簇闭环见对应计划。
+> 基线:2026-08-03,plan 1–57 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、Plan 49–57 各工具簇闭环见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -59,7 +59,7 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；Plan 49–56 已完成 exact parity 分簇闭环
+### 4. 工具面——🟡 主干齐；Plan 49–57 已完成 exact parity 分簇闭环
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -69,7 +69,8 @@
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
-| notebook 编辑 | cc 单家 | 不立 | 无需求 |
+| notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
+| model-visible LSP / language-server client | cc 条件分支 | **Plan 57 保留 unknown**：env gate 单独开启仍未注册，正常发现链还依赖 enabled plugin；kloop 不加推测性 client | 取得权威 hermetic enabled-plugin profile 与完整 stdio lifecycle 时 |
 | CC WebFetch `prompt` + 二级模型/cache/Markdown pipeline | cc 单家 | **Plan 55 intentional-diff**：kloop 保留 strict `{url}` 有界纯抓取与更强逐跳安全边界 | 出现必须“按指令读页并总结”的产品需求再另立 adapter |
 | WebSearch timeout/large/dynamic concurrency/CCR proxy、remote=true/cloud lifecycle | cc 条件分支 | **Plan 55 保留 unknown**：本地 fake provider 已闭合 success/empty/error；remote 仅证明 gate-false fallback | 取得合规 hermetic profile 或官方暴露入口 |
 
@@ -110,11 +111,11 @@ Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆
 team/remote 因无权威 hermetic true-profile 保持 unknown。新增两相 sampling gate + native report 锁定 task
 真并发、后台终态与 inbox 边界；未接真实 cloud/team/mailbox。
 
-Plan 53 将一般问答、Plan control、Workflow 与 StructuredOutput 分开落地：`ask_user_question`
+Plan 53 将一般问答、Plan control、Workflow 与 CC `StructuredOutput` / kloop `structured_output` 分开落地：`ask_user_question`
 使用独立 Questioner seam，plain/TUI/server 支持而 headless/断线 fail closed；`enter_plan_mode`
 与 `exit_plan_mode` 固定 depth-0 工具数组并由共享 ModeState 精确保存/恢复前态。独立 `workflow`
 始终后台，只暴露 agent 编排原语，不是 `run_program` alias；managed run store、phase/terminal identity、
-stop/shutdown、resume hit/miss 和 edited script 均已接通。`StructuredOutput` 仅在 Workflow schema child
+stop/shutdown、resume hit/miss 和 edited script 均已接通。`structured_output` 仅在 Workflow schema child
 中作为 synthetic tool 临时注入，本地 JSON Schema 复验后以原生 JSON Value 回传，不进入主 registry。
 Named/nested workflow、token budget、remote execution 与 per-child provider effort 保持 intentional-diff。
 
@@ -140,6 +141,16 @@ Session/Task 所有权、provenance 复核、dirty/ignored/commit fail-closed、
 shutdown retain。clean registration 继续是明确 intentional difference；no-active error、External
 不可删除、ignored/provenance 阻断与保守 shutdown 也不伪装 exact same。native Rust report 已接入
 full/corpus verifier 并有 mutation-negative 门；generated executable pair 仍为 4 个。
+
+Plan 57 将 corpus 扩至 210 captures / 197 static evidence，matrix 为 62 行/496 单元
+（125 compatible / 160 intentional-diff / 32 missing / 145 unknown / 24 n/a / 10 same）。
+`.ipynb` 已确认是 Read internal adapter；kloop 用现有 `read_file` 输出有界 cell/text/image blocks，
+并新增 snake_case strict `notebook_edit`（CC 精确目标名 `NotebookEdit`），支持 replace/insert/delete、fallback/generated ID、ordered
+未知字段保真、code output reset 和无尾换行。编辑资格独立要求完整 fresh cell-aware Read，提交继续复用
+parent FD/no-follow/keyed lock/temp sync/rename/parent sync；permission/preview/worktree FileState 全链闭合。
+LSP 的 env-only profile 两次仍未注册工具，plugin-backed normal discovery 无权威 hermetic profile，故八维
+保持 unknown 且没有生产 client。native report 与 normalization/schema/event/state/LSP negative gates 已接
+full/corpus verifier；generated executable pair 仍为 4 个，不升级静态或 native-only 相似。
 
 ### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 
@@ -253,7 +264,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
 - **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
-- **T0 parity 余线**：Plan 56 已完成；Plan 57–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T0 parity 余线**：Plan 57 已完成；Plan 58–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训

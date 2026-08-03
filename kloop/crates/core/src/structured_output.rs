@@ -11,7 +11,7 @@ const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_ERROR_CHARS: usize = 1_000;
 
-pub(crate) const TOOL_NAME: &str = "StructuredOutput";
+pub(crate) const TOOL_NAME: &str = "structured_output";
 
 pub(crate) fn validate_schema(schema: &Value) -> Result<()> {
     let bytes = serde_json::to_vec(schema)?;

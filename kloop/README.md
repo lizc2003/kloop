@@ -267,7 +267,7 @@ can't smuggle a command past a rule.
 
 ```toml
 [permissions]
-allow = ["bash(cargo *)", "write_file(src/**)", "edit_file"]
+allow = ["bash(cargo *)", "write_file(src/**)", "edit_file", "notebook_edit(notebooks/**)"]
 deny  = ["bash(git push *)", "read_file(**/*.pem)"]
 ask   = ["bash(cargo publish *)"]   # always confirm, even if allowed
 ```
@@ -277,7 +277,8 @@ leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
 per segment — in a chain every segment must be read-only or allowed, while a
 single denied segment poisons the whole chain; `write_file(<glob>)` /
 `edit_file(<glob>)` / `read_file(<glob>)` match the lexically-normalized
-path (and its cwd-relative form) with `**` globs.
+`path`, while `notebook_edit(<glob>)` matches `notebook_path` (both also match
+their cwd-relative form), with `**` globs.
 
 **File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
 directories, shell/git rc files, and `.env*` are sensitive — confirmed every
@@ -293,13 +294,15 @@ denial is not a turn abort: the model receives an `is_error` `tool_result`
 and is told to take another approach. Sub-agents share the parent's rules
 and cache and prompt through the same seam, tagged `[sub-agent]`.
 
-**Change previews**: when a `write_file`/`edit_file` reaches the prompt, the
-request carries a line-numbered diff (`crates/core/src/diff.rs`, `similar`) so
-you approve what you can see, not just a path — approving an invisible edit is
-meaningless. Following claude-code and codex (which independently converge on
-it), `edit_file` **reads the target, applies the edit, and diffs the whole
-file** — the change shown in its real surrounding lines with real line numbers,
-not the edit strings in isolation. `write_file` diffs an existing file old→new,
+**Change previews**: when a `write_file`/`edit_file`/`notebook_edit` reaches
+the prompt, the request carries a line-numbered diff (`crates/core/src/diff.rs`,
+`similar`) so you approve what you can see, not just a path — approving an
+invisible edit is meaningless. Notebook previews identify the edit mode and cell
+ID, then diff that cell's source. Following claude-code and codex (which
+independently converge on it), `edit_file` **reads the target, applies the edit,
+and diffs the whole file** — the change shown in its real surrounding lines with
+real line numbers, not the edit strings in isolation. `write_file` diffs an
+existing file old→new,
 or shows a `(new file)` insert preview for a fresh path. When the file can't be
 read, is over 1 MiB, or the `old_string` doesn't uniquely match, it falls back
 to diffing the two edit strings (numbered from 1) — claude-code's same
@@ -849,10 +852,10 @@ filesystem); the IO — file discovery, git commands — lives in
 server threads share one process-wide assembly. `--mock` stays hermetic:
 no file reads, no git commands, the pre-assembly hardcoded prompt.
 
-## File tools (Plan 49)
+## File tools (Plans 49 and 57)
 
-`read_file`, `write_file`, and `edit_file` share session-scoped file observations
-(`core/src/file_state.rs`) rather than trusting a path forever:
+`read_file`, `write_file`, `edit_file`, and `notebook_edit` share session-scoped
+file observations (`core/src/file_state.rs`) rather than trusting a path forever:
 
 - **read_file** resolves and opens a canonical no-follow regular-file descriptor
   before permission, so an approval wait cannot retarget a benign alias into a
@@ -898,6 +901,44 @@ real-dispatch kloop report; generated contracts in
 `refs/claude-code-2.1.220/paired-parity.json` compare call/event/result/order/workspace
 projections and require exact-bundle bridges for cross-profile cells. Detailed
 policy differences remain in `tool-matrix.json`.
+
+### Notebook cells (Plan 57)
+
+A lowercase `.ipynb` path passed to `read_file` is rendered cell-by-cell rather
+than as raw JSON. Markdown, code, and raw source preserve cell order and IDs;
+missing IDs are displayed as `cell-N` without modifying the file. Code outputs
+preserve text/image/text order, and supported PNG/JPEG/GIF/WebP outputs use the
+same structured image blocks as ordinary image reads. Markdown attachments are
+not treated as code outputs. Notebook input is capped at 10 MiB, visible text at
+7,000 characters, and decoded output images at 16 files / 5 MiB total. Paging a
+notebook is rejected instead of presenting partial cells as complete.
+
+A complete, untruncated cell-aware read grants a separate notebook-qualified
+observation. The model-visible **`notebook_edit`** tool then accepts an absolute
+lowercase `.ipynb` `notebook_path`, required `new_source`, optional `cell_id`,
+`cell_type` (`code|markdown`), and `edit_mode` (`replace|insert|delete`, default
+`replace`). Replace preserves unknown fields and metadata, while resetting code
+outputs/execution count; insert requires a type and creates an 8-hex ID for
+nbformat 4.5+; delete removes only the selected cell. The ordered serializer
+preserves untouched object order, uses one-space indentation, and emits no
+trailing newline.
+
+`notebook_edit` requires the current file to be complete, fresh, and
+notebook-qualified. A generic raw read or ordinary `write_file`/`edit_file` does
+not grant that authority. It reuses the same retained parent descriptor, keyed
+path lock, no-follow opens, final version check, same-directory synced temporary
+file, atomic rename, cleanup, and parent sync as other mutations. Failed edits
+leave bytes unchanged and conservatively clear qualification. Worktree switches
+use a fresh `FileState`, so a read in the main checkout cannot authorize an edit
+inside the worktree. Permission rules and approval previews use
+`notebook_path` as a first-class canonical path and show a cell-source diff.
+
+The pinned Claude Code 2.1.220 profile did not expose a standalone
+`NotebookRead`; its behavior is likewise an internal `Read(.ipynb)` adapter.
+Plan 57 also found plugin-backed LSP locators, but `ENABLE_LSP_TOOL=1` alone did
+not register LSP and no authoritative hermetic enabled-plugin profile was
+available. kloop therefore has no speculative production LSP client; that
+matrix row remains `unknown` rather than being called globally missing.
 
 ## Search tools (Phase 2, ninth slice; Plan 49 parity pass)
 
@@ -1503,7 +1544,7 @@ step boundary and is
 also observable through the shared `wait` / `stop_agent` task registry.
 
 Passing `schema` in a Workflow `agent()` call activates the internal
-**`StructuredOutput`** protocol for that child. The requested JSON Schema is
+**`structured_output`** protocol for that child. The requested JSON Schema is
 installed as a one-turn synthetic tool definition, then the host validates the
 returned object/array/scalar again. Invalid values receive a paired error result
 and bounded retry; a missing call receives a nudge; exhaustion rejects the

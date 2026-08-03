@@ -1,118 +1,127 @@
 # Plan 57 — Notebook 与 LSP 工具对齐
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-08-03）
 >
 > 母计划：Plan 48
 >
-> 依赖：Plan 48
+> 依赖：Plan 49、Plan 56
 >
 > 固定目标：Claude Code 2.1.220；版本身份以 Plan 48 manifest 为准。
 
-## 背景
+## 背景与产品裁决
 
-Notebook 和 LSP 都受文件类型、项目环境、平台、扩展与外部进程条件影响。Plan 48 的 clean profile 只观察到 NotebookEdit；NotebookRead 与 LSP 未出现，不能据此推断不存在。
+Notebook 和 LSP 都受文件类型、项目环境、扩展与外部进程条件影响。本计划只采用精确 Claude Code 2.1.220 bundle locator 与隔离可执行 fixture，不用滚动源码、公开文档或静态字符串替代运行证据。
 
-exact bundle 中的 Notebook stale-read 字符串只能作为后续静态追踪入口，不能代替工具注册、schema 或执行证据。kloop 当前也没有可直接计作 Notebook/LSP parity 的实现与测试。
+开工时已拍板：
 
-## 当前证据与差距
+- Notebook 读取复用现有 `read_file` 的 `.ipynb` internal adapter，不新增独立 model-visible `NotebookRead`；
+- 新增 kloop 原生 snake_case `notebook_edit`；精确目标名称仍是 `NotebookEdit`，schema 与行为只实现 exact fixture 已固定的部分；
+- LSP 必须同时通过“工具真实注册、正常发现链启动本地 stdio stub、完整 cleanup 可重放”三重证据门才进入产品；门未闭合时保留 `unknown`，不写推测性 client。
+
+所有证据只操作独立临时目录中的合成 notebook。未读取用户 notebook，未安装 Jupyter、插件、编译器或 language server，也未连接远程 kernel/LSP/cloud 服务。
+
+## 最终证据与矩阵
+
+最终基线：
+
+- 210 个 capture，raw/normalized 各 210 份；Plan 57 新增 10 组 deterministic pair；
+- 197 条 static evidence；
+- 62 行 × 8 维 = 496 cells：125 compatible / 160 intentional-diff / 32 missing / 145 unknown / 24 n/a / 10 same；
+- generated executable pair 仍为 4 个；Notebook 的 native report 与静态结构没有被包装成新的 `same`；
+- `kloop-plan57-native-report` 由 full 与 corpus-only verifier 真正运行；缺场景、schema 放宽、事件重排、worktree 资格泄漏、preview 缺失、随机 ID normalization 扩大和伪造 LSP cleanup 均有 mutation-negative 门。
 
 对应 matrix 行：
 
-- `notebook-read@clean-cli`
-- `notebook-edit@clean-cli`
-- `lsp@clean-cli`
+- `notebook-read@clean-cli`：clean profile 没有独立 `NotebookRead`；缺席只证明该 profile，不升级成全局 `missing`；
+- `notebook-read-adapter@clean-cli`：CC `Read(.ipynb)` 对应 kloop `read_file(.ipynb)`；
+- `notebook-edit@clean-cli`：CC 注册 `NotebookEdit`，kloop 注册 `notebook_edit`；permission 因 kloop 的更强文件资格与提交边界为 `intentional-diff`，其余已执行维度为 `compatible`；
+- `lsp@lsp-env-cli`：即使隔离 profile 设置 `ENABLE_LSP_TOOL=1`，两次 capture 的 24 个工具中仍无 LSP；八维继续为 `unknown`。
 
-当前结论：
+## Notebook Read 契约
 
-- NotebookRead 在 clean profile 未观察到，八个维度均为 `unknown`；静态 stale-read 字符串不是 registration 证据。
-- NotebookEdit 在 CC clean fixture 可见并带 schema；kloop 无对应实现，因此 registration/schema 为 `missing`，其余维度未知。
-- LSP 在 clean profile 未观察到，kloop 也无对应实现或测试，八个维度均为 `unknown`。
-- 当前 fixtures 没有合成 notebook、受控并发修改、LSP server 请求日志或依赖条件向量。
+精确 fixture 固定 `.ipynb` 是普通 Read 内的 adapter：
 
-优先复用：
+- 顶层 `cells` 必须是对象数组；坏 JSON 使用 notebook 专属错误前缀；
+- markdown、code、raw cell 按 cell 顺序呈现 `<cell id="…">`；缺 ID 仅投影为 `cell-{index}`，不回写文件；
+- code cell 省略 `<cell_type>code</cell_type>`，markdown/raw 显式带 type；非 Python code 可带 `<language>`；
+- stream/execute-result 文本、code output 图片和尾随文本保持块顺序；markdown attachment 不冒充 code output image；
+- code-output PNG/JPEG/GIF/WebP 复用 canonical `ToolResultContent` image block；相邻文本块按 exact adapter 规则合并。
 
-- Plan 48 的 exact-binary collector、fake provider、manifest 与 verifier
-- `kloop/crates/core/src/tools/fs.rs` 的路径和文件读取边界
-- `kloop/crates/core/src/tools/mod.rs` 的注册、dispatch 与并发分类
-- Plan 49 的路径、stale-read、权限和截断成果可在其完成后复用，但不作为本计划开工前提
-- 独立临时目录中的合成 `.ipynb` 与本地 stdio LSP stub
+kloop 继续从 permission 前绑定的 no-follow regular-file descriptor 读取 bytes。Notebook 输入上限 10 MiB；模型可见文本上限 7,000 字符；最多发 16 张图片、合计解码后不超过 5 MiB。Notebook paging 不呈现伪完整 cell：非 whole-file-compatible `offset`/`limit` 明确拒绝。只有完整、未截断、成功进入最终 `tool_result` 的 cell-aware read 才授予 `notebook_edit` 资格。
 
-## 目标
+## `notebook_edit` 契约（CC：`NotebookEdit`）
 
-1. 固定 NotebookRead、NotebookEdit、LSP 的 surface_kind、注册条件、schema 与平台/依赖 gate。
-2. 固定 Notebook cell、metadata、output、cell ID 和错误输入的 parser/output 契约。
-3. 固定 NotebookEdit 的 stale-read、并发修改、原子写入、失败回滚和文件保真边界。
-4. 固定 LSP 的 server 发现、启动、请求、超时、取消、错误、输出和进程清理。
-5. 只在本地可控 profile 下裁决行为；无法运行的平台或依赖条件继续保留 `unknown`。
-6. 所有 fixture 使用合成文件和本地 stub，不读取用户 notebook，不启动真实项目 language server。
+注册的 strict schema 为：
 
-## 开工证据闸门
+- `notebook_path: string` 与 `new_source: string` 必填；
+- `cell_id?: string`；
+- `cell_type?: "code" | "markdown"`；
+- `edit_mode?: "replace" | "insert" | "delete"`，默认 `replace`；
+- `additionalProperties: false`。
 
-- 从 exact bundle 分别追 NotebookRead、NotebookEdit、LSP 的构造点、gate、schema、parser、executor 和 result mapping。
-- 先找到 NotebookRead/LSP 的真实可见 profile；没有 profile 证据时不得把 clean profile 的缺席改判为 `missing`。
-- collector 为每个 case 新建临时目录与合成 `.ipynb`，保存调用前后完整文件 hash 和结构化内容。
-- LSP fixture 只连接本地 stdio stub；保存 initialize、request、cancel、shutdown、exit 的严格顺序与进程状态。
-- 随机 request ID、临时路径和 PID 只按声明的结构化规则归一化，不归一化 cell 顺序、metadata、diagnostic 或错误文案。
-- 为 kloop 缺失 surface 建立明确 negative locator；只有取得 CC 可执行链后才决定实现、adapter 或有意不纳入。
+执行语义：
 
-## 实施切片
+- `replace` 把 source 写成 JSON string，保留 metadata/未知字段；code cell 同时清 `outputs` 并把 `execution_count` 置 null；
+- `insert` 在 `cell_id` 后插入，省略 ID 时插到开头，且必须给 `cell_type`；nbformat 4.5+ 生成 8 位小写十六进制 ID，旧格式不持久化 ID；
+- `delete` 只删除目标 cell；fallback `cell-N` 可定位，但不会被补写到未触及 cell；
+- serializer 使用一空格缩进、无尾换行，保留顶层与未触及对象的属性顺序和未知字段。
 
-### 0. surface 与条件 profile
+Notebook 模块使用局部 `IndexMap` ordered AST，没有给 workspace 全局启用 `serde_json/preserve_order`。随机 ID normalization 只允许 fixture 明确证明的单个 8-hex ID 及其派生 hash；cell 顺序、metadata、diagnostic、错误文本和 lifecycle 顺序均不可抹平。
 
-- 固定 clean、notebook 文件存在、项目依赖可用、扩展启用和平台条件下的工具数组。
-- 区分 model-visible tool、内部 notebook adapter、LSP client 与前端展示能力。
-- 固定 schema 字段、required、additionalProperties、默认值和坏类型错误。
+## 文件安全、权限与并发
 
-### 1. NotebookRead
+`notebook_edit` 复用 Plan 49/56 的完整文件边界，而不是另写路径写入器：
 
-- 采集空 notebook、单/多 cell、markdown/code/raw、outputs、attachments、metadata 和大文件。
-- 固定 cell ID、cell 顺序、分页/截断、缺失文件、坏 JSON、坏 nbformat 和非 notebook 输入。
-- 判断输出是原始 JSON、格式化文本还是结构化 adapter；未取得 fixture 前不预写答案。
+- 必须使用绝对、精确小写 `.ipynb` 路径；
+- 同时要求完整、fresh、notebook-qualified observation；普通 raw Read、`write_file`/`edit_file` 成功替换都不授予或保留该资格；
+- validation/parse/target/serialize/commit 失败保持原 bytes 不变，并保守清除旧资格；成功编辑刷新 notebook 资格；
+- parent FD、NOFOLLOW、keyed path lock、提交前版本复核、同目录独占 temp、sync、descriptor-relative rename、parent sync 和失败 cleanup 全部复用现有 mutation 内核；
+- 同轮两个 kloop `notebook_edit` 串行；exact CC `NotebookEdit` Pre/Post hook fixture 与 kloop native dispatcher report 都覆盖对应偏序；
+- `notebook_path` 是 permission 的一等 path key，参与 original/resolved glob、deny/ask、敏感路径、plan mode、AcceptEdits、session remember 与 canonical approval input 重写；
+- approval preview 是 cell-aware source diff，并标出 replace/insert/delete 与 cell ID；
+- 全链使用 effective cwd/permissions/FileState；进入 worktree 后，主 checkout 的读取资格与 bytes 不会泄漏。
 
-### 2. NotebookEdit
+这些边界强于固定目标只按 timestamp/read-state 判断的路径，因此 permission 保留 `intentional-diff`，不为字面一致降低安全性。
 
-- 固定 replace/insert/delete、目标 cell 缺失、cell type、source 和 metadata 保留行为。
-- 覆盖 read-before-edit、未读取、读取后外部修改、并发编辑和重复调用。
-- 验证失败时原文件不被部分写坏，成功时未触及字段保持结构与顺序。
+## LSP 证据门结果
 
-### 3. LSP
+exact bundle 固定了 `ENABLE_LSP_TOOL`、插件 `.lsp.json` loader 与 manifest `lspServers` locator。隔离的 `lsp-env-cli` profile 显式设置 `ENABLE_LSP_TOOL=1`，但两次确定性运行都只提供 24 个工具，未注册 LSP。证据表明 server 发现依赖 enabled plugin；当前 corpus 没有可权威、hermetic 构造的 enabled-plugin installation/profile。
 
-- 固定 server 选择、root/workspace、initialize capability、文档同步和请求映射。
-- 覆盖成功、空结果、server error、坏响应、timeout、cancel、崩溃、重启和关闭。
-- 固定并发请求、乱序响应、diagnostic/位置归一化和 session 退出后的 process cleanup。
-- 当前平台或语言依赖不可 hermetic 满足时，保存不可运行证据并保持 `unknown`。
+因此三重门在第一步即未闭合：无法让精确 2.1.220 经正常发现链调用本地 Content-Length stdio stub，也无权取得 request/cancel/shutdown/exit 的可重放 lifecycle。最终裁决：
 
-### 4. 产品与回归
-
-只实现已裁决差距；Notebook 与 LSP 可分别选择独立工具、内部 adapter 或明确不纳入。同步 matrix、fixture、static evidence、manifest、generator 与 verifier。
-
-## 非目标与有意保留
-
-- 不读取、修改或提交用户 notebook、工作区缓存或 language-server 配置。
-- 不安装 Jupyter、编辑器扩展、编译器或第三方 language server。
-- 不连接远程 LSP、notebook kernel 或云服务。
-- 不从 stale-read 字符串、公开文档或其他 Claude Code 版本推断 2.1.220 行为。
-- 不把普通 Read/Edit 自动计作 NotebookRead/NotebookEdit parity。
-- 不逐字节复制 notebook 或 diagnostic 的 UI 展示。
+- 不新增 `core/src/tools/lsp.rs` 或生产 LSP client/manager；
+- 不把 env-only 负注册外推为全局 `missing`；
+- `lsp@lsp-env-cli` 八维保持带条件向量与失败阶段的 `unknown`；
+- verifier 在门未闭合时反向拒绝生产 `lsp.rs`，也拒绝伪造 cleanup 证据。
 
 ## Fixture 与测试
 
-至少覆盖：
+Exact deterministic pairs 覆盖：
 
-- NotebookRead 的可见/不可见 profile、合法 notebook、空文件、坏 JSON、坏 nbformat、大文件和特殊 cell；
-- NotebookEdit 的 replace/insert/delete、坏 cell ID、未读取、stale-read、并发修改和失败回滚；
-- metadata、outputs、attachments、cell ID 与未知字段的保真；
-- LSP 的发现/缺失、initialize、成功/空结果、错误、timeout、cancel、崩溃和 shutdown；
-- 并发 LSP 请求与乱序响应不串扰；
-- fixture 后无临时文件、socket、子进程或用户目录改动。
+- rich notebook read、code-output image、raw/markdown/code、missing ID、坏 JSON；
+- replace/insert/delete、fallback ID、no-read、missing ID/cell、stale rollback；
+- random 8-hex insertion ID 的窄 normalization；
+- 同轮 CC `NotebookEdit` seriality；
+- `ENABLE_LSP_TOOL=1` 的确定性负注册。
 
-验证：
+Rust 覆盖：
+
+- ordered parser/serializer、cell/output/image rendering、截断资格、三种编辑与字段保真；
+- strict schema/depth registration、全体 kloop-owned tool 名称的 snake_case invariant、完整/fresh/notebook qualification、stale 与失败回滚；
+- ordinary mutation 撤销资格、同路径串行；
+- permission preview、canonical `notebook_path`、AcceptEdits/Plan/deny/sensitive/outside-cwd；
+- worktree FileState 隔离与真实 `dispatch_tools` 事件配对；
+- full/corpus verifier 使用固定 selector 执行 native report，并对关键契约做 fail-closed mutation。
+
+## 验证
 
 ```bash
+python3 -B refs/claude-code-2.1.220/build_matrix.py --check
 python3 -B refs/claude-code-2.1.220/verify.py
+python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 cd kloop
 cargo test -p kloop-core notebook
-cargo test -p kloop-core lsp
+cargo test -p kloop-core plan57
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -121,20 +130,4 @@ cd ..
 git diff --check
 ```
 
-## 文档同步
-
-完成时同步本 plan、HANDOFF、refs/README、kloop README、capability report 与 parity 产物。明确 NotebookRead/LSP 的真实注册条件、kloop 产品范围和仍不可运行的平台分支。
-
-## 完成标准
-
-- 当前平台可运行的 Notebook/LSP 链有 exact fixture 与对应 kloop golden 或明确产品裁决。
-- Notebook stale-read、并发修改、保真和失败回滚有确定性测试。
-- LSP timeout、cancel、崩溃与 session exit 后无残留进程。
-- 未运行 profile 保持有证据理由的 `unknown`，不通过删 row 或静态字符串收敛。
-- 所有门禁全绿，一次提交，提交信息带 `plan57`。
-
-## 开工时定 / 问用户
-
-- NotebookRead 与 NotebookEdit 是否进入 kloop model-visible surface，还是复用文件工具 adapter。
-- kloop 是否提供通用 LSP 工具，以及首批必须支持的本地语言环境。
-- 平台/依赖不可 hermetic 运行时的产品支持声明与验收边界。
+完成记录：Notebook implementation、exact corpus、LSP 负门、native report、matrix、文档和全量门禁在一次 `feat(plan57)` 提交中闭合。

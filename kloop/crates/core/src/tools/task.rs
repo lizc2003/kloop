@@ -190,10 +190,10 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
     };
     let mut result = match outcome.reason {
         EndReason::Completed => outcome.structured_output.ok_or_else(|| {
-            anyhow!("workflow agent: child completed without valid StructuredOutput")
+            anyhow!("workflow agent: child completed without valid structured_output")
         }),
         EndReason::MaxRounds => Err(anyhow!(
-            "workflow agent: child stopped at its round limit without valid StructuredOutput"
+            "workflow agent: child stopped at its round limit without valid structured_output"
         )),
         EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
         EndReason::Error(error) => Err(anyhow!("workflow agent: child failed: {error}")),

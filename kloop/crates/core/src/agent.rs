@@ -46,7 +46,7 @@ pub struct TurnOutcome {
     pub final_text: String,
     pub rounds: usize,
     /// Present only for a Workflow child forced through the internal
-    /// StructuredOutput tool; ordinary turns always leave it None.
+    /// structured_output tool; ordinary turns always leave it None.
     pub structured_output: Option<Value>,
 }
 
@@ -538,7 +538,7 @@ async fn dispatch_structured_tools(
             let result = if accepted.is_some() {
                 crate::structured_output::error_result(
                     id,
-                    "only one StructuredOutput call may complete a turn",
+                    "only one structured_output call may complete a turn",
                 )
             } else {
                 match crate::structured_output::validate_value(schema, &input) {

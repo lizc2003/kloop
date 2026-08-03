@@ -201,10 +201,10 @@ Plan 53 将 corpus 扩至 **110 captures / 151 static evidence**，matrix 仍为
 10 `same`。AskUserQuestion 新增 single/multi/Other/two-question/preview/notes/cancel/invalid/headless
 九组 PTY 与 headless fixture；EnterPlanMode 新增 enter→exit、重复 enter、headless 三组；Workflow 新增
 minimal async launch/phase/completion 与 invalid-script-before-task 两组。bundle locator 同时固定 Workflow
-pure-literal meta、runtime capability、journal/resume 与 StructuredOutput synthetic adapter/AJV/nudge 链。
+pure-literal meta、runtime capability、journal/resume 与 CC `StructuredOutput` synthetic adapter/AJV/nudge 链。
 
 kloop 不把 Approver、ReportFindings 或 `run_program` 改名计作 parity：新增独立 Questioner、Enter/Exit
-ModeState、always-background `workflow` profile 和 Workflow-child-only StructuredOutput。公共名字保留 snake_case，
+ModeState、always-background `workflow` profile 和 Workflow-child-only `structured_output`。kloop-owned 名称统一为 snake_case，
 Exit 继续 inline plan preview；named/nested workflow、budget、remote 与 per-child provider effort 诚实标为
 intentional-diff。RunStore 使用受控 run component、descriptor-bound/no-follow artifact IO，Workflow
 completion/phase/terminal event 保持 task/run/store identity；resume journal 保留 JSON Value 并兼容 legacy
@@ -266,8 +266,33 @@ concurrent calls、no-active 与 shutdown。每例只操作独立临时 Git repo
 status 与 cleanup 审计。kloop 侧 `kloop-plan56-native-report` 真跑 Rust dispatcher，验证 strict schema/parser、
 managed/external ownership、provenance fail-closed、effective cwd 的文件/搜索/Bash/system 重锚、permission
 与动态 AllowAlways 共享；Python verifier 对缺场景、schema 篡改、cwd 事件重排、external 删除、主树泄漏和
-stale permission gate 做 negative mutation。no-active error、ignored/provenance removal blocker、External
+stale permission gate 做 negative mutation。
+no-active error、ignored/provenance removal blocker、External
 不可删、session shutdown retain 及条件注册均明确保留为产品/安全差异。
+
+Plan 57 将 corpus 扩至 **210 captures / 197 static evidence**；新增 10 组 deterministic pair，
+覆盖 rich notebook read、replace/insert/delete、fallback ID、errors、stale、同轮 seriality 与
+`ENABLE_LSP_TOOL=1` 负注册。matrix 新增真实的 `notebook-read-adapter@clean-cli` 并把 LSP
+切到 `lsp@lsp-env-cli` 条件向量，共 62 行/496 单元：125 `compatible` / 160
+`intentional-diff` / 32 `missing` / 145 `unknown` / 24 `n/a` / 10 `same`。generated
+executable pair 仍为 4 个，没有把 native report、静态结构或负注册包装成新的 `same`。
+
+精确 fixture 证明 `.ipynb` 读取是 `Read` 的 internal adapter：按 cell 顺序呈现
+markdown/code/raw，缺 ID 投影为 `cell-N`，code-output image 成原生 image block，文本/图片/
+尾随文本顺序保留。CC `NotebookEdit` 的 strict schema、默认 replace、insert/delete、code output
+reset、8-hex insertion ID、fallback ID 不回写、one-space serializer、无尾换行和 untouched
+字段顺序/未知字段保真均已固定；随机 normalization 只允许 fixture 证明的单个 generated ID 与
+派生 hash。kloop 复用现有 `read_file` 和 descriptor-relative atomic mutation，并以原生
+snake_case `notebook_edit` 暴露编辑；不加独立
+`NotebookRead`；另加 notebook-qualified FileState、cell-aware approval preview、
+`notebook_path` permission key 和 worktree state isolation，普通 raw Read/Write/Edit 不得冒充资格。
+
+LSP 的 bundle locator 固定 `ENABLE_LSP_TOOL`、plugin `.lsp.json` loader 与 manifest
+`lspServers`。但隔离 profile 设置 `ENABLE_LSP_TOOL=1` 后，两次 capture 仍只提供 24 个工具且无
+LSP；当前无法权威 hermetic 构造 enabled-plugin profile，也就不能通过正常发现链启动本地 stdio
+stub 并重放 cleanup。因此 `lsp@lsp-env-cli` 八维继续为有条件向量与失败阶段的 `unknown`，kloop
+没有新增推测性生产 LSP client。verifier 同时拒绝未过门的 `lsp.rs`、伪 cleanup、扩大随机
+normalization、CC Notebook schema 放宽、native report 场景/事件/资格/preview 漂移。
 
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
@@ -292,8 +317,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
 `docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md`、
-`docs/plan/55-web-remote-parity.md` 与 `docs/plan/56-worktree-parity.md`。Plan 56 的完成不表示 kloop
-已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 57–59 逐簇实现与验收。
+`docs/plan/55-web-remote-parity.md`、`docs/plan/56-worktree-parity.md` 与
+`docs/plan/57-notebook-lsp-parity.md`。Plan 57 的完成不表示 kloop 已全工具对齐或可替换
+Claude Code；其余产品行为仍由 Plan 58–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

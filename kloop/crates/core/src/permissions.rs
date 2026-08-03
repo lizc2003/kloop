@@ -240,7 +240,7 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                 }
                 Ok(Rule::BashPrefix { tokens, wildcard })
             }
-            "write_file" | "edit_file" | "read_file" => {
+            "write_file" | "edit_file" | "read_file" | "notebook_edit" => {
                 // Match case-insensitively on case-folding filesystems so a
                 // deny like `write_file(secrets/**)` is not slipped by `Secrets/`.
                 let glob = globset::GlobBuilder::new(inner.trim())
@@ -464,11 +464,15 @@ impl Permissions {
             return Ok(());
         }
         let call = CallFacts::gather(name, input, &self.cwd, resolved_path);
-        let resolved_input = call.path.as_ref().map(|path| {
-            let mut resolved = input.clone();
-            resolved["path"] = Value::String(path.normalized.to_string_lossy().into_owned());
-            resolved
-        });
+        let resolved_input = call
+            .path
+            .as_ref()
+            .zip(call.path_key)
+            .map(|(path, path_key)| {
+                let mut resolved = input.clone();
+                resolved[path_key] = Value::String(path.normalized.to_string_lossy().into_owned());
+                resolved
+            });
         let approval_input = resolved_input.as_ref().unwrap_or(input);
 
         // 1. Deny rules — before everything, immune to every mode.
@@ -543,7 +547,7 @@ impl Permissions {
 
         // 9. acceptEdits: file writes inside the working directory.
         if self.mode() == Mode::AcceptEdits
-            && matches!(name, "write_file" | "edit_file")
+            && matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
         {
             return Ok(());
@@ -742,6 +746,7 @@ struct Hazard {
 struct CallFacts {
     bash: Option<BashAnalysis>,
     path: Option<PathFacts>,
+    path_key: Option<&'static str>,
     sensitive_read: bool,
     entering_existing_worktree: bool,
     removing_worktree: bool,
@@ -766,13 +771,14 @@ impl CallFacts {
             .then(|| input["command"].as_str())
             .flatten();
         let bash = bash_command.map_or_else(|| None, |command| Some(analyze_bash(command)));
-        let path = matches!(name, "write_file" | "edit_file" | "read_file")
-            .then(|| {
-                input["path"]
-                    .as_str()
-                    .map(|raw| PathFacts::gather_with_resolved(Path::new(raw), cwd, resolved_path))
-            })
-            .flatten();
+        let path_key = match name {
+            "write_file" | "edit_file" | "read_file" => Some("path"),
+            "notebook_edit" => Some("notebook_path"),
+            _ => None,
+        };
+        let path = path_key
+            .and_then(|key| input[key].as_str())
+            .map(|raw| PathFacts::gather_with_resolved(Path::new(raw), cwd, resolved_path));
         let sensitive_read = (name == "read_file"
             && path.as_ref().is_some_and(|path| path.sensitive))
             || (name == "bash"
@@ -784,6 +790,7 @@ impl CallFacts {
         CallFacts {
             bash,
             path,
+            path_key,
             sensitive_read,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),
@@ -816,7 +823,7 @@ impl CallFacts {
                 });
             }
         }
-        if matches!(name, "write_file" | "edit_file")
+        if matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && self.path.as_ref().is_some_and(|p| p.sensitive)
         {
             return Some(Hazard {
@@ -1174,6 +1181,7 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
         "write_file" | "edit_file" | "read_file" => {
             input["path"].as_str().unwrap_or("?").to_string()
         }
+        "notebook_edit" => input["notebook_path"].as_str().unwrap_or("?").to_string(),
         _ => input.to_string(),
     }
     .chars()

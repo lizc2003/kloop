@@ -8,6 +8,7 @@ mod bash;
 mod codemode;
 mod fs;
 mod inject;
+pub(crate) mod notebook;
 #[cfg(test)]
 mod plan49_parity_tests;
 #[cfg(test)]
@@ -16,6 +17,8 @@ mod plan50_parity_tests;
 mod plan52_parity_tests;
 #[cfg(test)]
 mod plan56_parity_tests;
+#[cfg(test)]
+mod plan57_parity_tests;
 mod plan_mode;
 mod question;
 mod run_store;
@@ -316,7 +319,7 @@ fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
             "workflow",
             "enter_worktree",
             "exit_worktree",
-            "StructuredOutput",
+            "structured_output",
         ]
         .into_iter()
         .map(String::from),
@@ -443,7 +446,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
+            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Jupyter notebooks (`.ipynb`) return cell-aware `<cell id=\"…\">` content and code outputs, including image blocks. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -478,6 +481,39 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
                     "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
                 },
                 "required": ["path", "old_string", "new_string"]
+            }),
+        },
+        ToolDef {
+            name: "notebook_edit".into(),
+            description: "Replaces, inserts, or deletes a single cell in a Jupyter notebook (.ipynb file).\n\nUsage:\n- You must use the read_file tool on the notebook in this conversation before editing — this tool will fail otherwise.\n- `notebook_path` must be an absolute path.\n- `cell_id` is the `id` attribute shown in the read_file tool's `<cell id=\"...\">` output. It is required for `replace` and `delete`.\n- `edit_mode` defaults to `replace`. Use `insert` to add a new cell after the cell with the given `cell_id` (or at the beginning of the notebook if `cell_id` is omitted) — `cell_type` is required when inserting. Use `delete` to remove the cell.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "notebook_path": {
+                        "type": "string",
+                        "description": "The absolute path to the Jupyter notebook file to edit (must be absolute, not relative)"
+                    },
+                    "cell_id": {
+                        "type": "string",
+                        "description": "The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID, or at the beginning if not specified."
+                    },
+                    "new_source": {
+                        "type": "string",
+                        "description": "The new source for the cell"
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "enum": ["code", "markdown"],
+                        "description": "The type of the cell (code or markdown). If not specified, it defaults to the current cell type. If using edit_mode=insert, this is required."
+                    },
+                    "edit_mode": {
+                        "type": "string",
+                        "enum": ["replace", "insert", "delete"],
+                        "description": "The type of edit to make (replace, insert, delete). Defaults to replace."
+                    }
+                },
+                "required": ["notebook_path", "new_source"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
@@ -625,7 +661,7 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         // run alone (batching it would stall its siblings behind the deadline).
         "stop_agent" => true,
         "wait" => false,
-        "write_file" | "edit_file" => false,
+        "write_file" | "edit_file" | "notebook_edit" => false,
         other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
 }
@@ -767,11 +803,19 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // the canonical effective target, while the executor retains an open
         // parent directory handle across any approval wait.
         let input = input;
-        let prepared_mutation = if matches!(name.as_str(), "write_file" | "edit_file") {
-            Some(fs::prepare_mutation_input(&name, &input, &ctx).await?)
-        } else {
-            None
-        };
+        if name == "notebook_edit" {
+            notebook::request_from_input(&input)?;
+        }
+        let prepared_mutation =
+            if matches!(name.as_str(), "write_file" | "edit_file" | "notebook_edit") {
+                Some(if name == "notebook_edit" {
+                    fs::prepare_notebook_mutation_input(&input, &ctx).await?
+                } else {
+                    fs::prepare_mutation_input(&name, &input, &ctx).await?
+                })
+            } else {
+                None
+            };
         let prepared_read = if name == "read_file" {
             Some(fs::prepare_read(&input, &ctx).await?)
         } else {
@@ -947,17 +991,18 @@ fn execute_tool<'a>(
                 Err(error) => ToolExecution::from_result(Err(error)),
             };
         }
-        if name == "write_file" || name == "edit_file" {
+        if matches!(name, "write_file" | "edit_file" | "notebook_edit") {
             let Some(prepared) = prepared_mutation else {
                 return ToolExecution::from_result(Err(anyhow!(
                     "{name}: mutation target was not prepared"
                 )));
             };
             let state = ctx.cfg.effective_file_state();
-            let output = if name == "write_file" {
-                fs::write_file_tool(input, prepared, ctx).await
-            } else {
-                fs::edit_file_tool(input, prepared, ctx).await
+            let output = match name {
+                "write_file" => fs::write_file_tool(input, prepared, ctx).await,
+                "edit_file" => fs::edit_file_tool(input, prepared, ctx).await,
+                "notebook_edit" => fs::notebook_edit_tool(input, prepared, ctx).await,
+                _ => unreachable!("matched file mutation tool"),
             };
             return match output {
                 Ok(output) => ToolExecution {
@@ -1418,6 +1463,7 @@ mod tests {
                 "read_file",
                 "write_file",
                 "edit_file",
+                "notebook_edit",
                 "grep",
                 "glob",
                 "read_offloaded",
@@ -1453,6 +1499,23 @@ mod tests {
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
+    }
+
+    #[test]
+    fn kloop_owned_tool_names_use_snake_case() {
+        let mut definitions = all_tool_defs(0, &[], TOOL_DEFER_THRESHOLD, interactive_surface());
+        definitions.push(skill_tool_def());
+        definitions.push(crate::structured_output::tool_def(&json!({"type": "null"})));
+        for definition in definitions {
+            assert!(
+                !definition.name.is_empty()
+                    && definition.name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "kloop-owned tool name must be snake_case: {}",
+                definition.name
+            );
+        }
     }
 
     #[test]
@@ -1566,7 +1629,7 @@ mod tests {
         })];
         let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("54 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("55 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
