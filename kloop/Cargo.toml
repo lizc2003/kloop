@@ -38,6 +38,8 @@ png = "0.17"
 # standard codec, so a crate beats hand-rolling it. Already in the tree
 # transitively (reqwest et al.), so no new compile cost.
 base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 ratatui = "0.29"

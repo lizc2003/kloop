@@ -302,6 +302,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
+            scheduler: kloop_core::scheduler::Scheduler::in_memory(Default::default()),
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(

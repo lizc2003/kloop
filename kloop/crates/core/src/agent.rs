@@ -251,7 +251,7 @@ async fn turn_rounds(
         // previous round (tool execution / sampling) as a user message before
         // this round's request. At round 0 the queue is empty (the turn just
         // started) so this is a no-op. Never touches an in-flight request.
-        drain_inbox(&cfg.inbox, history);
+        drain_inbox(&cfg.inbox, history, ui);
         // The injected context is outside history and a dynamic MCP refresh may
         // replace its deferred-tool notice between rounds, so account for the
         // current version rather than pinning the turn's first estimate.
@@ -426,7 +426,7 @@ async fn turn_rounds(
             // final sampling must not be lost. Absorb it and keep going, so a
             // late "wait, also do X" is answered instead of dropped. (Steers
             // during tool execution are already delivered at the loop top.)
-            if drain_inbox(&cfg.inbox, history) {
+            if drain_inbox(&cfg.inbox, history, ui) {
                 continue;
             }
             // If the response was cut off by the output limit, ending would
@@ -602,12 +602,45 @@ limit. Continue exactly where you left off; break the remaining work into smalle
 /// round boundaries (top of the loop, and just before the turn would end) —
 /// never mid-request, so an in-flight sampling never sees a partial write and
 /// tool_result blocks are never interleaved with the injected user message.
-fn drain_inbox(inbox: &Inbox, history: &mut History) -> bool {
+fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
     let pending = inbox.drain();
     if pending.is_empty() {
         return false;
     }
     for item in pending {
+        match &item {
+            crate::inbox::InboxItem::ScheduledPrompt {
+                id,
+                origin,
+                scheduled_for_ms,
+                reason,
+                missed,
+                ..
+            } => ui.emit(&Event::ScheduledTaskUpdated(crate::event::ScheduledTask {
+                id: id.clone(),
+                origin: match origin {
+                    crate::inbox::ScheduledOrigin::Cron => crate::event::ScheduledTaskOrigin::Cron,
+                    crate::inbox::ScheduledOrigin::LoopWakeup => {
+                        crate::event::ScheduledTaskOrigin::LoopWakeup
+                    }
+                },
+                status: crate::event::ScheduledTaskStatus::Fired,
+                scheduled_for_ms: Some(*scheduled_for_ms),
+                reason: reason.clone(),
+                detail: (*missed).then(|| "missed while inactive; confirmation required".into()),
+            })),
+            crate::inbox::InboxItem::SchedulerFailure { summary } => {
+                ui.emit(&Event::ScheduledTaskUpdated(crate::event::ScheduledTask {
+                    id: "scheduler".into(),
+                    origin: crate::event::ScheduledTaskOrigin::Cron,
+                    status: crate::event::ScheduledTaskStatus::Failed,
+                    scheduled_for_ms: None,
+                    reason: None,
+                    detail: Some(summary.clone()),
+                }))
+            }
+            _ => {}
+        }
         history.record(Message::user_text(item.into_message()));
     }
     true

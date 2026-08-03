@@ -610,6 +610,23 @@ fn autowake_ready(running: bool, inbox: &Inbox) -> bool {
     !running && !inbox.is_empty()
 }
 
+fn dispatch_autowake(
+    app: &mut App,
+    inbox: &Inbox,
+    msgs: &mpsc::UnboundedSender<WorkerMsg>,
+) -> Option<CancellationToken> {
+    if !autowake_ready(app.running, inbox) {
+        return None;
+    }
+    let cancel = CancellationToken::new();
+    msgs.send(WorkerMsg::Wake {
+        cancel: cancel.clone(),
+    })
+    .ok()?;
+    app.running = true;
+    Some(cancel)
+}
+
 fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
     match event {
         AgentEvent::Core(CoreEvent::CwdChanged { cwd, .. }) => Some(std::path::PathBuf::from(cwd)),
@@ -640,6 +657,7 @@ async fn ui_loop(
     let input_thread = spawn_input_thread(input_tx, stop.clone());
 
     let mut current_cancel: Option<CancellationToken> = None;
+    let mut inbox_activity = inbox.subscribe_activity();
     // Wall-clock timing for the animated HUD (plan 38 slice 5). The pure `App`
     // has no clock, so the loop owns it: the turn clock runs while `app.running`,
     // the thinking clock while a thinking block streams.
@@ -780,6 +798,14 @@ async fn ui_loop(
                 Some(_) => {}
                 None => break Ok(()),
             },
+            activity = inbox_activity.changed() => {
+                if activity.is_err() {
+                    break Ok(());
+                }
+                if let Some(cancel) = dispatch_autowake(&mut app, &inbox, &msgs) {
+                    current_cancel = Some(cancel);
+                }
+            }
             event = events.recv() => {
                 let Some(event) = event else { break Ok(()) };
                 // Snapshot before applying: a thinking block that was streaming
@@ -824,11 +850,8 @@ async fn ui_loop(
                 // while the agent sits idle. Start a turn to deliver it without
                 // waiting for the user. The guard also catches the race where a
                 // reinjection lands just after a turn ends.
-                if autowake_ready(app.running, &inbox) {
-                    let cancel = CancellationToken::new();
-                    current_cancel = Some(cancel.clone());
-                    app.running = true;
-                    let _ = msgs.send(WorkerMsg::Wake { cancel });
+                if let Some(cancel) = dispatch_autowake(&mut app, &inbox, &msgs) {
+                    current_cancel = Some(cancel);
                 }
             }
             // Frame tick: only armed while animating, so an idle loop never wakes
@@ -846,7 +869,6 @@ async fn ui_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kloop_core::inbox::InboxItem;
     use kloop_core::rollout::Rollout;
     use kloop_protocol::ContentBlock;
 
@@ -953,18 +975,39 @@ mod tests {
         ]);
     }
 
-    #[test]
-    fn autowake_only_when_idle_with_pending() {
-        let inbox = Inbox::default();
-        // Idle but nothing pending: don't wake.
-        assert!(!autowake_ready(false, &inbox));
-        inbox.push(InboxItem::SubAgentResult {
-            label: "agent-1".into(),
-            summary: "done".into(),
-        });
-        // Idle + a reinjection waiting: wake to deliver it.
-        assert!(autowake_ready(false, &inbox));
-        // A turn is running: don't wake — it drains at its own round boundary.
-        assert!(!autowake_ready(true, &inbox));
+    #[tokio::test]
+    async fn scheduled_due_dispatches_wake_when_idle() {
+        let inbox = Arc::new(Inbox::default());
+        let clock = kloop_core::scheduler::ManualClock::new(0);
+        let scheduler = kloop_core::scheduler::Scheduler::with_clock(
+            Arc::clone(&inbox),
+            None,
+            clock.clone(),
+            kloop_core::scheduler::SchedulerTimeZone::named("UTC").unwrap(),
+        );
+        scheduler.bind_owner("tui-owner").unwrap();
+        let wakeup = scheduler
+            .schedule_wakeup(60.0, "test delivery", "timer work")
+            .unwrap();
+        let mut activity = inbox.subscribe_activity();
+        clock.set(wakeup.scheduled_for_ms);
+        tokio::time::timeout(Duration::from_secs(1), activity.changed())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new("scheduler-test".into());
+        let cancel = dispatch_autowake(&mut app, &inbox, &tx).expect("idle app must wake");
+        assert!(app.running);
+        assert!(!cancel.is_cancelled());
+        match rx.recv().await.unwrap() {
+            WorkerMsg::Wake { cancel } => assert!(!cancel.is_cancelled()),
+            _ => panic!("expected scheduler wake"),
+        }
+        assert!(dispatch_autowake(&mut app, &inbox, &tx).is_none());
+        assert!(rx.try_recv().is_err());
+
+        scheduler.shutdown().await;
     }
 }

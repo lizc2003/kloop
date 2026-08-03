@@ -19,9 +19,12 @@ mod plan52_parity_tests;
 mod plan56_parity_tests;
 #[cfg(test)]
 mod plan57_parity_tests;
+#[cfg(test)]
+mod plan58_parity_tests;
 mod plan_mode;
 mod question;
 mod run_store;
+mod scheduler;
 mod search;
 mod skill;
 mod task;
@@ -257,6 +260,12 @@ pub fn all_tool_defs(
             &inline_sources,
             &deferred,
         ));
+        if surface.scheduler {
+            defs.push(scheduler::cron_create_def());
+            defs.push(scheduler::cron_delete_def());
+            defs.push(scheduler::cron_list_def());
+            defs.push(scheduler::schedule_wakeup_def());
+        }
         // General questions are a user-interaction surface, not a permission
         // prompt. Kept out of run_program's tools API and limited to depth 0.
         if surface.questions {
@@ -320,6 +329,10 @@ fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
             "enter_worktree",
             "exit_worktree",
             "structured_output",
+            "cron_create",
+            "cron_delete",
+            "cron_list",
+            "schedule_wakeup",
         ]
         .into_iter()
         .map(String::from),
@@ -651,7 +664,8 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
-        "ask_user_question" | "workflow" => true,
+        "ask_user_question" | "workflow" | "cron_list" => true,
+        "cron_create" | "cron_delete" | "schedule_wakeup" => false,
         // task is always safe to batch (cc shape): consecutive task calls run
         // as parallel sub-agents. Their own tool calls are gated individually
         // — a sub-agent's write still faces hooks and the permission gate.
@@ -1067,6 +1081,10 @@ fn execute_tool<'a>(
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
             "wait" => background_tasks::wait_tool(input, ctx).await,
             "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
+            "cron_create" => scheduler::cron_create_tool(input, ctx).await,
+            "cron_delete" => scheduler::cron_delete_tool(input, ctx).await,
+            "cron_list" => scheduler::cron_list_tool(input, ctx).await,
+            "schedule_wakeup" => scheduler::schedule_wakeup_tool(input, ctx).await,
             "run_program" => codemode::run_program_tool(input, ctx).await,
             "workflow" => workflow::workflow_tool(input, ctx).await,
             // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
@@ -1129,6 +1147,7 @@ pub(crate) mod testutil {
         tag: &str,
         sources: Vec<Arc<dyn ToolSource>>,
     ) -> ToolCtx {
+        let inbox = Arc::new(crate::inbox::Inbox::default());
         ToolCtx {
             cfg: Arc::new(Config {
                 provider: Arc::new(Provider::mock(vec![])),
@@ -1155,7 +1174,8 @@ pub(crate) mod testutil {
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
-                inbox: Default::default(),
+                inbox: Arc::clone(&inbox),
+                scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
@@ -2084,6 +2104,7 @@ mod tests {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
+                scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),

@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-03,plan 1–57 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、Plan 49–57 各工具簇闭环见对应计划。
+> 基线:2026-08-03,plan 1–58 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、Plan 49–58 各工具簇闭环见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -59,7 +59,7 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；Plan 49–57 已完成 exact parity 分簇闭环
+### 4. 工具面——🟡 主干齐；Plan 49–58 已完成 exact parity 分簇闭环
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -152,6 +152,23 @@ LSP 的 env-only profile 两次仍未注册工具，plugin-backed normal discove
 保持 unknown 且没有生产 client。native report 与 normalization/schema/event/state/LSP negative gates 已接
 full/corpus verifier；generated executable pair 仍为 4 个，不升级静态或 native-only 相似。
 
+Plan 58 已完成原生调度面：depth-0 owner surface 的 `cron_create`、`cron_delete`、
+`cron_list`、`schedule_wakeup` 与 `/loop` fixed/dynamic adapter；不提供 PascalCase alias，
+CC `ScheduleWakeup.delaySeconds` 与 kloop `delay_seconds` 的差异是公开 native contract。
+`cron_create` 的 recurring 默认 true、durable 默认 false，recurring job 最多存活七天，
+最后一个已到期 tick 投递后删除。durable state 位于
+`~/.kloop/scheduler/<project-key>/scheduled_tasks.json` 与 `.lock`；job 绑定创建它的
+session/thread，其他 owner 不可 List/Delete/claim，late durable one-shot 在无交互
+headless/server 保持 pending，等待同 owner 在可交互 frontend 恢复。TUI idle Wake、
+plain stdin/Inbox select、server 单飞完整 turn lifecycle 均可投递；headless 主 turn 后先关
+scheduler，session-only 消失而 durable 保留。调度器不安装或修改 crontab、launchd、
+systemd timer 或登录项。最终 corpus 为 218 captures / 211 static evidence，matrix 为
+62 行 × 8 维 = 496 cells（125 compatible / 170 intentional-diff / 24 missing /
+129 unknown / 24 n/a / 24 same），7 个 executable pair；其中新增
+`scheduler-cron-schema`、`scheduler-cron-contract`、`scheduler-concurrency`。timed fire、
+DST/clock jump、server-selected jitter、restart/re-arm 与 enabled dynamic-loop 成功路径仍为
+`unknown`。
+
 ### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
@@ -232,11 +249,15 @@ codex 拉取式增量观察。
 | `--image`、TUI 图片路径/剪贴板附件 | — | **✅ Plan 29 + Plan 38** | 已完成 |
 | TUI 模式/档位状态栏显示 | 两家皆有 | **✅ Plan 37 + Plan 38 HUD** | 已完成 |
 | server 不转发 thinking delta | — | HANDOFF 记录在案 | client 需要时 |
+| scheduled prompt 空闲投递 | kloop 原生；CC timed runtime 证据仍有 unknown | **✅ Plan 58（2026-08-03）**：TUI idle Wake、plain stdin/Inbox select、server single-flight 完整 turn；不伪造 `turnId:0` | 已完成 |
 | vim mode / 主题 / statusline | cc 单家 | 不立 | 定位外 |
 
 ### 14. headless / 脚本化——✅
 
 **Plan 33（2026-07-16）已完成**：位置参数/stdin、`--json` 事件流（复用 server wire）、无人审批默认拒绝、稳定退出码与 mock/headless 回归均已落地。
+
+**Plan 58 补充**：headless 主 turn 完成后先关闭 scheduler，再关闭 background task/shell；
+session-only scheduled job 消失，durable job 保留，等待同 owner 在可交互 frontend 恢复。
 
 ### 15. 测试 / CI / 工程质量——✅ 纪律同级
 
@@ -264,7 +285,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
 - **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
-- **T0 parity 余线**：Plan 57 已完成；Plan 58–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T0 parity 余线**：Plan 58 已完成（2026-08-03）；仅 Plan 59 仍按其母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训

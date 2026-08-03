@@ -280,6 +280,7 @@ async fn main() -> Result<ExitCode> {
             &cwd,
         )?;
         cfg.session_id = session_id.clone();
+        cfg.scheduler.bind_owner(session_id.clone())?;
         // An explicit headless runaway guardrail enables the otherwise-absent cap.
         if let Some(max_rounds) = args.max_rounds {
             cfg.max_rounds = Some(max_rounds);
@@ -354,6 +355,7 @@ async fn main() -> Result<ExitCode> {
                 &cwd,
             )?;
             cfg.session_id = factory_session_id.clone();
+            cfg.scheduler.bind_owner(factory_session_id.clone())?;
             Ok(cfg)
         },
         history,
@@ -394,6 +396,25 @@ fn spawn_ctrl_c(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
     })
 }
 
+enum PlainInput {
+    Line(std::io::Result<Option<String>>),
+    Inbox,
+    InboxClosed,
+}
+
+async fn next_plain_input<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut tokio::io::Lines<R>,
+    inbox_activity: &mut tokio::sync::watch::Receiver<u64>,
+) -> PlainInput {
+    tokio::select! {
+        line = lines.next_line() => PlainInput::Line(line),
+        activity = inbox_activity.changed() => match activity {
+            Ok(()) => PlainInput::Inbox,
+            Err(_) => PlainInput::InboxClosed,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn plain_main(
     args: CliArgs,
@@ -424,6 +445,7 @@ async fn plain_main(
         &cwd,
     )?;
     cfg.session_id = session_id.clone();
+    cfg.scheduler.bind_owner(session_id.clone())?;
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
 
@@ -455,11 +477,36 @@ async fn plain_main(
     // `--image` blocks ride the first user turn; taken once, then empty.
     let mut pending_images = pending_images;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut inbox_activity = cfg.inbox.subscribe_activity();
     let mut input_error = None;
     loop {
         print!("> ");
         let _ = std::io::stdout().flush();
-        let line = match lines.next_line().await {
+        let input = next_plain_input(&mut lines, &mut inbox_activity).await;
+        if matches!(input, PlainInput::InboxClosed) {
+            break;
+        }
+        if matches!(input, PlainInput::Inbox) {
+            if cfg.inbox.is_empty() {
+                continue;
+            }
+            let cancel = CancellationToken::new();
+            let watcher = spawn_ctrl_c(cancel.clone());
+            let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+            watcher.abort();
+            println!();
+            match outcome.reason {
+                EndReason::Completed => {}
+                EndReason::MaxRounds => println!("[scheduled delivery stopped: max rounds]"),
+                EndReason::Aborted => println!("[scheduled delivery interrupted]"),
+                EndReason::Error(error) => println!("[scheduled delivery error: {error}]"),
+            }
+            continue;
+        }
+        let PlainInput::Line(line) = input else {
+            unreachable!("inbox input handled above")
+        };
+        let line = match line {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -541,6 +588,37 @@ async fn plain_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scheduled_due_interrupts_an_idle_plain_input_read() {
+        let inbox = Arc::new(kloop_core::inbox::Inbox::default());
+        let clock = kloop_core::scheduler::ManualClock::new(0);
+        let scheduler = kloop_core::scheduler::Scheduler::with_clock(
+            Arc::clone(&inbox),
+            None,
+            clock.clone(),
+            kloop_core::scheduler::SchedulerTimeZone::named("UTC").unwrap(),
+        );
+        scheduler.bind_owner("plain-owner").unwrap();
+        let wakeup = scheduler
+            .schedule_wakeup(60.0, "test delivery", "timer work")
+            .unwrap();
+        let mut inbox_activity = inbox.subscribe_activity();
+        let (_writer, reader) = tokio::io::duplex(128);
+        let mut lines = BufReader::new(reader).lines();
+
+        clock.set(wakeup.scheduled_for_ms);
+        let input = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_plain_input(&mut lines, &mut inbox_activity),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(input, PlainInput::Inbox));
+        assert!(!inbox.is_empty());
+
+        scheduler.shutdown().await;
+    }
 
     #[test]
     fn mock_server_skills_reader_is_hermetic() {

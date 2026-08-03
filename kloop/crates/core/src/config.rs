@@ -18,6 +18,7 @@ pub struct SurfaceCapabilities {
     pub plan_control: bool,
     pub workflow: bool,
     pub worktree: bool,
+    pub scheduler: bool,
 }
 
 /// Everything a turn needs to run. Construction (env parsing, provider
@@ -131,6 +132,10 @@ pub struct Config {
     /// output in its file. The front-end also holds a clone of this Arc to enqueue
     /// while a turn runs.
     pub inbox: Arc<Inbox>,
+    /// Independent owner-scoped cron/dynamic-loop scheduler. The registry is not
+    /// a background task or shell: it owns timer/store state and only delivers
+    /// typed prompts into `inbox` at step boundaries.
+    pub scheduler: Arc<crate::scheduler::Scheduler>,
     /// Registry of background async tasks — sub-agents (`task {"background":
     /// true}`, plan 26) and programs (`run_program {"background": true}`, plan
     /// 24), which share one lifecycle (detached run, result reinjected into the
@@ -169,11 +174,12 @@ impl Config {
     /// torn down. Returns the number that missed the bounded reap deadline.
     pub async fn shutdown_background_work(&self) -> usize {
         let timeout = Duration::from_secs(2);
+        let scheduler = self.scheduler.shutdown().await;
         let (tasks, shells) = tokio::join!(
             self.background_tasks.shutdown(timeout),
             self.background_shells.shutdown(timeout)
         );
-        tasks + shells
+        scheduler + tasks + shells
     }
 
     /// The working directory in effect for tool calls right now: the active

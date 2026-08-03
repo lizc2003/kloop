@@ -208,6 +208,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             Permissions::allow_all()
         };
         let questions = questioner.is_some();
+        let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
             model: options.model.unwrap_or_else(|| "mock".into()),
@@ -235,7 +236,8 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
-            inbox: Default::default(),
+            inbox: Arc::clone(&inbox),
+            scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
@@ -247,8 +249,30 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
                 plan_control: true,
                 workflow: true,
                 worktree: false,
+                scheduler: false,
             },
         })
+    })
+}
+
+fn clocked_scheduler_factory(
+    turns: Vec<Vec<ContentBlock>>,
+    offload: PathBuf,
+    clock: Arc<kloop_core::scheduler::ManualClock>,
+) -> ConfigFactory {
+    let inner = factory(turns, offload, false);
+    Arc::new(move |options, approver, questioner, notify| {
+        let mut cfg = inner(options, approver, questioner, notify)?;
+        let inbox = Arc::new(kloop_core::inbox::Inbox::default());
+        cfg.inbox = Arc::clone(&inbox);
+        cfg.scheduler = kloop_core::scheduler::Scheduler::with_clock(
+            inbox,
+            None,
+            clock.clone(),
+            kloop_core::scheduler::SchedulerTimeZone::named("UTC")?,
+        );
+        cfg.surface.scheduler = true;
+        Ok(cfg)
     })
 }
 
@@ -318,6 +342,7 @@ fn worktree_factory(
 ) -> ConfigFactory {
     Arc::new(move |_options, _approver, questioner, _notify| {
         let questions = questioner.is_some();
+        let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Ok(Config {
             provider: Arc::new(Provider::mock(turns.clone())),
             model: "mock".into(),
@@ -343,7 +368,8 @@ fn worktree_factory(
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
-            inbox: Default::default(),
+            inbox: Arc::clone(&inbox),
+            scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
@@ -355,6 +381,7 @@ fn worktree_factory(
                 plan_control: true,
                 workflow: true,
                 worktree: true,
+                scheduler: false,
             },
         })
     })
@@ -1055,6 +1082,83 @@ async fn turn_streams_item_events_and_completes() {
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
             .unwrap();
     assert_eq!(messages.len(), 2);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
+    let dirs = test_dirs("scheduled-delivery");
+    let clock = kloop_core::scheduler::ManualClock::new(0);
+    let turns = vec![
+        vec![tool_use(
+            "schedule",
+            "schedule_wakeup",
+            json!({
+                "delay_seconds": 60,
+                "reason": "deterministic test",
+                "prompt": "timer work",
+            }),
+        )],
+        vec![text("ordinary turn done")],
+        vec![text("timer answer")],
+    ];
+    let mut client = start_server(
+        clocked_scheduler_factory(turns, dirs.offload.clone(), clock.clone()),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+    let request_id = client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": "start timer"}),
+        )
+        .await;
+    let first_log = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    let first_turn_id = first_log
+        .iter()
+        .find(|message| message["id"] == request_id)
+        .unwrap()["result"]["turn"]["id"]
+        .as_u64()
+        .unwrap();
+    assert!(first_log.iter().any(|message| {
+        message["method"] == "thread/scheduler/updated"
+            && message["params"]["task"]["origin"] == "loopWakeup"
+            && message["params"]["task"]["status"] == "scheduled"
+    }));
+
+    clock.set(60_000);
+    let delivery = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    let started = delivery
+        .iter()
+        .find(|message| message["method"] == "turn/started")
+        .expect("scheduled turn/started");
+    let delivery_turn_id = started["params"]["turn"]["id"].as_u64().unwrap();
+    assert_eq!(delivery_turn_id, first_turn_id + 1);
+    assert!(delivery.iter().any(|message| {
+        message["method"] == "thread/scheduler/updated"
+            && message["params"]["task"]["origin"] == "loopWakeup"
+            && message["params"]["task"]["status"] == "fired"
+            && message["params"].get("turnId").is_none()
+    }));
+    for message in &delivery {
+        if matches!(
+            message["method"].as_str(),
+            Some("item/started" | "item/delta" | "item/completed")
+        ) {
+            assert_eq!(message["params"]["turnId"], delivery_turn_id);
+        }
+    }
+    let completed = delivery.last().unwrap();
+    assert_eq!(completed["params"]["turn"]["id"], delivery_turn_id);
+    assert!(delivery.iter().any(|message| {
+        message["method"] == "item/delta" && message["params"]["text"] == "timer answer"
+    }));
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

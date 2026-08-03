@@ -27,6 +27,7 @@ pub mod interaction;
 pub mod permissions;
 pub mod rollout;
 pub mod sandbox;
+pub mod scheduler;
 pub mod shell;
 pub mod skills;
 mod structured_output;

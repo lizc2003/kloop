@@ -51,6 +51,17 @@ below; the full result is persisted at the supplied output file:";
 const SHELL_PREFIX: &str = "A background shell command you started has changed state. Inspect its \
 output file if you need the command's result:";
 
+const SCHEDULED_PREFIX: &str = "A scheduled task is due. Treat this as timer-originated work, not as a new user message. Continue only the named scheduled prompt:";
+const MISSED_SCHEDULED_PREFIX: &str = "A durable one-shot task became due while its owner session was inactive. Before running it, call ask_user_question to ask whether the user wants it run now; do not execute the prompt unless they confirm:";
+const SCHEDULER_FAILURE_PREFIX: &str =
+    "The session scheduler failed closed. No task was silently discarded or executed:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduledOrigin {
+    Cron,
+    LoopWakeup,
+}
+
 /// One pending injection. Neutral text alone would force a single framing on
 /// every producer (the drain used to hard-wrap everything as steering); a typed
 /// item lets each producer frame its own message.
@@ -60,10 +71,16 @@ pub enum InboxItem {
     Steer(String),
     /// A background sub-agent's terminal summary, reinjected to its parent
     /// (plan 26). `label` is the "agent-N" id; `summary` is the framed body.
-    SubAgentResult { label: String, summary: String },
+    SubAgentResult {
+        label: String,
+        summary: String,
+    },
     /// A background program's return value, reinjected to its parent
     /// (plan 24). `label` is the "program-N" id; `summary` is the return value.
-    ProgramResult { label: String, summary: String },
+    ProgramResult {
+        label: String,
+        summary: String,
+    },
     WorkflowResult {
         task_id: String,
         run_id: String,
@@ -76,6 +93,17 @@ pub enum InboxItem {
         id: String,
         status: String,
         output_path: String,
+        summary: String,
+    },
+    ScheduledPrompt {
+        id: String,
+        origin: ScheduledOrigin,
+        scheduled_for_ms: i64,
+        reason: Option<String>,
+        prompt: String,
+        missed: bool,
+    },
+    SchedulerFailure {
         summary: String,
     },
 }
@@ -105,6 +133,34 @@ impl InboxItem {
                 output_path,
                 summary,
             } => format!("{SHELL_PREFIX}\n[{id}] {status}\n{summary}\noutput file: {output_path}"),
+            InboxItem::ScheduledPrompt {
+                id,
+                origin,
+                scheduled_for_ms,
+                reason,
+                prompt,
+                missed,
+            } => {
+                let origin = match origin {
+                    ScheduledOrigin::Cron => "cron",
+                    ScheduledOrigin::LoopWakeup => "loop wakeup",
+                };
+                let reason = reason
+                    .as_deref()
+                    .map(|value| format!("\nreason: {value}"))
+                    .unwrap_or_default();
+                let prefix = if missed {
+                    MISSED_SCHEDULED_PREFIX
+                } else {
+                    SCHEDULED_PREFIX
+                };
+                format!(
+                    "{prefix}\n[{id}] origin: {origin}; scheduled_for_ms: {scheduled_for_ms}{reason}\n{prompt}"
+                )
+            }
+            InboxItem::SchedulerFailure { summary } => {
+                format!("{SCHEDULER_FAILURE_PREFIX}\n{summary}")
+            }
         }
     }
 }

@@ -57,6 +57,30 @@ pub struct BackgroundTask {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduledTaskOrigin {
+    Cron,
+    LoopWakeup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduledTaskStatus {
+    Scheduled,
+    Fired,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTask {
+    pub id: String,
+    pub origin: ScheduledTaskOrigin,
+    pub status: ScheduledTaskStatus,
+    pub scheduled_for_ms: Option<i64>,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+}
+
 /// Everything core tells a front-end about a turn. The turn bracket
 /// (`TurnStarted`/`TurnEnded`/`Usage`) is constructed by each front-end's worker
 /// around its `run_turn` call; the rest flow through the `Ui::emit` seam as core
@@ -86,6 +110,9 @@ pub enum Event {
     /// item event this deliberately has no turn owner: the terminal update may
     /// arrive after the launching turn completed.
     BackgroundTaskUpdated(BackgroundTask),
+    /// Owner-scoped scheduler lifecycle. Like background work this is session
+    /// scoped and may arrive without the turn that created the job.
+    ScheduledTaskUpdated(ScheduledTask),
     /// Full context size after a request (total input+output tokens).
     Usage(u64),
     /// The session entered (`branch = Some`) or left (`None`) a worktree.
@@ -215,6 +242,24 @@ impl Event {
                     .map(|detail| format!(": {detail}"))
                     .unwrap_or_default();
                 Some(format!("background {kind} {} {state}{detail}", task.id))
+            }
+            Event::ScheduledTaskUpdated(task) => {
+                let origin = match task.origin {
+                    ScheduledTaskOrigin::Cron => "cron",
+                    ScheduledTaskOrigin::LoopWakeup => "loop wakeup",
+                };
+                let state = match task.status {
+                    ScheduledTaskStatus::Scheduled => "scheduled",
+                    ScheduledTaskStatus::Fired => "fired",
+                    ScheduledTaskStatus::Cancelled => "cancelled",
+                    ScheduledTaskStatus::Failed => "failed",
+                };
+                let detail = task
+                    .detail
+                    .as_deref()
+                    .map(|value| format!(": {value}"))
+                    .unwrap_or_default();
+                Some(format!("{origin} {} {state}{detail}", task.id))
             }
             Event::ItemCompleted {
                 item: Item::Todo { agent, items },

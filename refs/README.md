@@ -294,6 +294,20 @@ stub 并重放 cleanup。因此 `lsp@lsp-env-cli` 八维继续为有条件向量
 没有新增推测性生产 LSP client。verifier 同时拒绝未过门的 `lsp.rs`、伪 cleanup、扩大随机
 normalization、CC Notebook schema 放宽、native report 场景/事件/资格/preview 漂移。
 
+Plan 58 将 corpus 收敛到 **218 captures / 211 static evidence**；matrix 为 62 行/496 单元：
+125 `compatible` / 170 `intentional-diff` / 24 `missing` / 129 `unknown` / 24 `n/a` /
+24 `same`，generated executable pair 增至 7 个，其中新增
+`scheduler-cron-schema`、`scheduler-cron-contract`、`scheduler-concurrency`。kloop 提供
+深度 0、owner-scoped 的 `cron_create`、`cron_delete`、`cron_list`、`schedule_wakeup` 和
+`/loop` adapter，明确以 snake_case 暴露 `delay_seconds`，不加 CC PascalCase alias。
+recurring job 最多七天；durable store 固定在
+`~/.kloop/scheduler/<project-key>/scheduled_tasks.{json,lock}`，job 仅创建 session/thread
+owner 可见、可 claim 和恢复。TUI/plain/server 分别以 idle Wake、stdin/Inbox select 和
+single-flight delivery turn 投递；headless 关闭 scheduler 后保留 durable state。调度为进程内
+能力，不创建或修改 crontab、launchd、systemd timer 或登录项。精确 timed fire、DST/clock
+jump、effective recurring jitter、restart/re-arm 和 enabled dynamic-loop runtime 仍保持
+`unknown`，不由 native behavior 反推 exact same。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -317,9 +331,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
 `docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md`、
-`docs/plan/55-web-remote-parity.md`、`docs/plan/56-worktree-parity.md` 与
-`docs/plan/57-notebook-lsp-parity.md`。Plan 57 的完成不表示 kloop 已全工具对齐或可替换
-Claude Code；其余产品行为仍由 Plan 58–59 逐簇实现与验收。
+`docs/plan/55-web-remote-parity.md`、`docs/plan/56-worktree-parity.md`、
+`docs/plan/57-notebook-lsp-parity.md` 与 `docs/plan/58-scheduling-parity.md`。Plan 58
+已完成不表示 kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

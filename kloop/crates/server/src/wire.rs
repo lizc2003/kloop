@@ -227,7 +227,30 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             }
             Some(("thread/backgroundTask/updated", json!({"task": task_json})))
         }
-        // Token usage and cwd are thread-scoped, not turn-scoped: no turnId.
+        Event::ScheduledTaskUpdated(task) => {
+            let origin = match task.origin {
+                kloop_core::event::ScheduledTaskOrigin::Cron => "cron",
+                kloop_core::event::ScheduledTaskOrigin::LoopWakeup => "loopWakeup",
+            };
+            let status = match task.status {
+                kloop_core::event::ScheduledTaskStatus::Scheduled => "scheduled",
+                kloop_core::event::ScheduledTaskStatus::Fired => "fired",
+                kloop_core::event::ScheduledTaskStatus::Cancelled => "cancelled",
+                kloop_core::event::ScheduledTaskStatus::Failed => "failed",
+            };
+            Some((
+                "thread/scheduler/updated",
+                json!({"task": {
+                    "id": task.id,
+                    "origin": origin,
+                    "status": status,
+                    "scheduledForMs": task.scheduled_for_ms,
+                    "reason": task.reason,
+                    "detail": task.detail,
+                }}),
+            ))
+        }
+        // Token usage, cwd and scheduler updates are thread-scoped, not turn-scoped: no turnId.
         Event::Usage(n) => Some((
             "thread/tokenUsage/updated",
             json!({"tokenUsage": {"total": n}}),

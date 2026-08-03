@@ -337,6 +337,16 @@ struct Turn {
     /// `turn/completed`, and every item event of the turn.
     id: u64,
     cancel: CancellationToken,
+    /// Scheduler/background delivery turn: drain the typed inbox without
+    /// recording an empty ordinary user message.
+    delivery_only: bool,
+}
+
+struct ThreadWorkerState {
+    running: Arc<AtomicBool>,
+    current_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    turn_seq: Arc<AtomicU64>,
+    inbox: Arc<Inbox>,
 }
 
 struct ThreadHandle {
@@ -867,10 +877,12 @@ impl Server {
                 images,
                 id: turn_id,
                 cancel,
+                delivery_only: false,
             })
             .is_err()
         {
             handle.running.store(false, Ordering::SeqCst);
+            *handle.current_cancel.lock().unwrap() = None;
             *handle.turn.lock().unwrap() = None;
             return Err((wire::SERVER_ERROR, "thread worker is gone".into()));
         }
@@ -953,22 +965,33 @@ impl Server {
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
         cfg.session_id = thread_id.clone();
+        cfg.scheduler
+            .bind_owner(thread_id.clone())
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot bind scheduler: {e:#}")))?;
         let handle_cwd = cfg.cwd.clone();
         let handle_model = cfg.model.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
+        let current_cancel = Arc::new(Mutex::new(None));
+        let turn_seq = Arc::new(AtomicU64::new(1));
         let cfg = Arc::new(cfg);
-        // The steering queue the worker's turns drain; `turn/steer` pushes here.
+        // The steering/scheduler queue the worker's turns drain.
         let inbox = cfg.inbox.clone();
-        tokio::spawn(thread_worker(cfg, history, ui, turn_rx, running.clone()));
+        let worker_state = ThreadWorkerState {
+            running: running.clone(),
+            current_cancel: current_cancel.clone(),
+            turn_seq: turn_seq.clone(),
+            inbox: inbox.clone(),
+        };
+        tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
         self.threads.insert(
             thread_id,
             ThreadHandle {
                 turn_tx,
                 running,
-                current_cancel: Arc::new(Mutex::new(None)),
+                current_cancel,
                 inbox,
-                turn_seq: Arc::new(AtomicU64::new(1)),
+                turn_seq,
                 turn,
                 cwd: handle_cwd,
                 model: handle_model,
@@ -1173,29 +1196,62 @@ fn parse_input(params: &Value) -> Result<(String, Vec<ContentBlock>), (i64, Stri
     Ok((text_parts.join("\n"), images))
 }
 
-/// Owns this thread's History for its whole life; turns run strictly one at
-/// a time (turn/start enforces single-flight via the running flag).
+/// Owns this thread's History for its whole life. Client turns and idle
+/// scheduler deliveries share one single-flight bracket and one monotonic id
+/// allocator; a scheduled prompt never borrows the id of the turn that created it.
 async fn thread_worker(
     cfg: Arc<Config>,
     mut history: History,
     ui: Arc<ThreadUi>,
     mut turns: mpsc::UnboundedReceiver<Turn>,
-    running: Arc<AtomicBool>,
+    state: ThreadWorkerState,
 ) {
-    while let Some(turn) = turns.recv().await {
-        // The turn id (allocated by turn/start) tags the bracket and every item
-        // event of the turn; it is already published on the shared `turn` slot
-        // for `turn/steer` to read.
+    let ThreadWorkerState {
+        running,
+        current_cancel,
+        turn_seq,
+        inbox,
+    } = state;
+    let mut inbox_activity = inbox.subscribe_activity();
+    loop {
+        let turn = tokio::select! {
+            turn = turns.recv() => {
+                let Some(turn) = turn else { break };
+                turn
+            }
+            activity = inbox_activity.changed() => {
+                if activity.is_err() {
+                    break;
+                }
+                if inbox.is_empty()
+                    || running
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    continue;
+                }
+                let id = turn_seq.fetch_add(1, Ordering::SeqCst);
+                *ui.turn.lock().unwrap() = Some(id);
+                let cancel = CancellationToken::new();
+                *current_cancel.lock().unwrap() = Some(cancel.clone());
+                Turn {
+                    text: String::new(),
+                    images: Vec::new(),
+                    id,
+                    cancel,
+                    delivery_only: true,
+                }
+            }
+        };
         ui.notify("turn/started", wire::turn_started_params(turn.id));
         let reason = run_turn_or_command(&cfg, &mut history, &ui, &turn).await;
         history.record_turn_terminal(turn_terminal(&reason));
-        // Report the post-turn context size, then close the bracket. Usage
-        // routes through `emit` so it projects like any other event.
         ui.emit(&Event::Usage(history.estimated_tokens()));
         ui.notify(
             "turn/completed",
             wire::turn_completed_params(turn.id, &reason),
         );
+        *current_cancel.lock().unwrap() = None;
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
     }
@@ -1205,9 +1261,6 @@ async fn thread_worker(
             "{remaining} background task(s) missed the shutdown deadline"
         )));
     }
-    // The thread is ending (turn channel closed on server shutdown): tear down
-    // its active worktree if the model never exited (dirty kept on its branch,
-    // clean removed), so trees don't leak past the session.
     if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
         ui.emit(&Event::Note(note.trim().to_string()));
     }
@@ -1246,6 +1299,12 @@ async fn run_turn_or_command(
     ui: &Arc<ThreadUi>,
     turn: &Turn,
 ) -> EndReason {
+    if turn.delivery_only {
+        let dyn_ui: Arc<dyn Ui> = ui.clone();
+        return run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
+            .await
+            .reason;
+    }
     if turn.images.is_empty() && commands::is_command(&turn.text) {
         let result = commands::run(&turn.text, history, cfg, &turn.cancel).await;
         // `/exit` is a client-side concept: quitting one thread must never stop

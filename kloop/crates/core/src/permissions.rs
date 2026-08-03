@@ -522,6 +522,14 @@ impl Permissions {
             return self.ask_user(name, approval_input, depth, None, None).await;
         }
 
+        // Safe session scheduler controls mutate only kloop's owner-scoped
+        // registry/private store. Deny, plan mode, hazards and explicit ask
+        // rules above retain priority; ordinary manual/accept/bypass modes do
+        // not prompt for these controls.
+        if matches!(name, "cron_create" | "cron_delete" | "schedule_wakeup") {
+            return Ok(());
+        }
+
         // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
@@ -862,7 +870,7 @@ impl CallFacts {
             "run_program" | "workflow" => true,
             // tool_search only reads tool definitions and marks them
             // unlocked; the unlocked tool's own calls still pass this gate.
-            "tool_search" => true,
+            "tool_search" | "cron_list" => true,
             // todo_write mutates only the in-memory task list — nothing on
             // the user's system to sign off on (cc never prompts for it).
             "todo_write" => true,

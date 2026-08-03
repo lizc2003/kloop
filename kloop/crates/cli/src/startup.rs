@@ -12,6 +12,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use kloop_core::agent_type::AgentType;
 use kloop_core::hooks::HookDef;
@@ -738,6 +739,58 @@ pub(crate) fn server_config_snapshot(
     })
 }
 
+fn scheduler_project_identity(cwd: &Path) -> Result<PathBuf> {
+    let canonical = cwd
+        .canonicalize()
+        .with_context(|| format!("canonicalize scheduler project root {}", cwd.display()))?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output();
+    let Ok(output) = output else {
+        return Ok(canonical);
+    };
+    if !output.status.success() {
+        return Ok(canonical);
+    }
+    let common = std::str::from_utf8(&output.stdout)
+        .context("git common directory is not UTF-8")?
+        .trim();
+    PathBuf::from(common)
+        .canonicalize()
+        .context("canonicalize scheduler git common directory")
+}
+
+fn scheduler_for_session(
+    args: &CliArgs,
+    runtime: &RuntimeSettings,
+    cwd: &Path,
+    inbox: Arc<kloop_core::inbox::Inbox>,
+) -> Result<Arc<kloop_core::scheduler::Scheduler>> {
+    if args.mock {
+        return Ok(kloop_core::scheduler::Scheduler::in_memory(inbox));
+    }
+    let base = scheduler_project_identity(cwd)?;
+    let project_key = format!("{:x}", Sha256::digest(base.to_string_lossy().as_bytes()));
+    let global = runtime
+        .config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("global config path has no parent"))?;
+    let store = kloop_core::scheduler::DurableStore::new(
+        global
+            .join("scheduler")
+            .join(&project_key)
+            .join("scheduled_tasks.json"),
+        project_key,
+    );
+    Ok(kloop_core::scheduler::Scheduler::persistent(
+        inbox,
+        store,
+        kloop_core::scheduler::SchedulerTimeZone::from_environment(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn config_from_settings(
     args: &CliArgs,
@@ -755,10 +808,13 @@ pub(crate) fn config_from_settings(
     let permissions = Arc::new(build_permissions(args, cwd, runtime, approver, notify)?);
     let offload_dir = PathBuf::from(".kloop/offload");
     let sessions_dir = PathBuf::from(".kloop/sessions");
+    let inbox: Arc<kloop_core::inbox::Inbox> = Default::default();
+    let scheduler = scheduler_for_session(args, runtime, cwd, Arc::clone(&inbox))?;
     // The main agent's cwd anchor is the process cwd (same value build_permissions
     // reads); a worktree sub-agent later rewires its own clone off this.
     let cwd = cwd.to_path_buf();
     let questions_enabled = questioner.is_some();
+    scheduler.set_missed_confirmation_available(questions_enabled);
     let base = Config {
         provider: Arc::new(Provider::mock(vec![])),
         model: "mock".into(),
@@ -787,7 +843,8 @@ pub(crate) fn config_from_settings(
         defer_threshold: runtime.defer_threshold,
         unlocked_tools: Default::default(),
         todos: Default::default(),
-        inbox: Default::default(),
+        inbox,
+        scheduler,
         program_limits: runtime.program_limits,
         skills,
         active_worktree: Arc::new(kloop_core::worktree::ActiveWorktreeState::default()),
@@ -796,6 +853,7 @@ pub(crate) fn config_from_settings(
             plan_control: !args.headless,
             workflow: !args.headless,
             worktree: !args.mock,
+            scheduler: !args.mock,
         },
     };
     if args.mock {
@@ -866,6 +924,60 @@ mod tests {
 
     fn config(raw: &str) -> toml::Table {
         raw.parse().unwrap()
+    }
+
+    #[test]
+    fn scheduler_identity_is_shared_by_a_git_repository_and_its_worktree() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-scheduler-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repository = root.join("repository");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repository).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&repository, &["init", "-q"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=kloop",
+                "-c",
+                "user.email=kloop@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        );
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "scheduler-test",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let base_identity = scheduler_project_identity(&repository).unwrap();
+        let worktree_identity = scheduler_project_identity(&worktree).unwrap();
+        assert_eq!(base_identity, worktree_identity);
+        assert_eq!(
+            base_identity,
+            repository.join(".git").canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -578,6 +578,15 @@ impl App {
                     self.cells.push(Cell::Note(note));
                 }
             }
+            Event::ScheduledTaskUpdated(task) => {
+                let event = Event::ScheduledTaskUpdated(task);
+                if let Some(note) = event.as_note() {
+                    self.assistant_open = false;
+                    self.thinking_open = false;
+                    self.last_note = Some(note.clone());
+                    self.cells.push(Cell::Note(note));
+                }
+            }
             Event::Note(n) => {
                 self.assistant_open = false;
                 self.thinking_open = false;

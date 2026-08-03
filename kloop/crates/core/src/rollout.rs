@@ -1118,6 +1118,7 @@ mod tests {
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
                 inbox: Default::default(),
+                scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),

@@ -25,6 +25,8 @@ mod compact;
 mod cost;
 mod exit;
 mod help;
+#[path = "loop.rs"]
+mod loop_command;
 
 /// What a command produced. `output` is shown to the user as-is; `cleared`
 /// tells the front-end to reset its own transcript view — only `/clear` sets
@@ -112,6 +114,10 @@ pub const BUILTINS: &[Builtin] = &[
         summary: clear::SUMMARY,
     },
     Builtin {
+        name: "loop",
+        summary: loop_command::SUMMARY,
+    },
+    Builtin {
         name: "exit",
         summary: exit::SUMMARY,
     },
@@ -142,6 +148,7 @@ pub async fn run(
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
+        "loop" => loop_command::run(args),
         "exit" => exit::run(),
         // A user-invoked skill or command: expand its body (same seam the
         // model's `skill` tool uses) and hand it back as a turn to run. Searches
@@ -209,6 +216,7 @@ mod tests {
             unlocked_tools: Default::default(),
             todos: Default::default(),
             inbox: Default::default(),
+            scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
@@ -321,7 +329,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear, /exit)"
+                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear, /loop, /exit)"
             )
         );
     }
@@ -359,7 +367,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /loop, /exit, /greet)"
             )
         );
     }
@@ -396,7 +404,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /loop, /exit, /deploy)"
             )
         );
     }

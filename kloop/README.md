@@ -69,9 +69,17 @@ evidence**; splitting WebSearch clean/allow execution profiles produces a conser
 requests; CC WebSearch success/empty/error does reach a hermetic local provider side query.
 True remote/cloud lifecycle and every unexecuted Web transport branch remain unknown.
 
+Plan 58 completes the native scheduler slice. The final corpus has **218 captures /
+211 static-evidence records** and a **62-row / 496-cell** matrix: 125 compatible /
+170 intentional-diff / 24 missing / 129 unknown / 24 n/a / 24 same. Seven executable
+pair contracts cover every `same` cell, including the new scheduler schema, cron-contract,
+and concurrency comparators. Exact timed fire, DST/clock-jump behavior, server-selected
+jitter, restart/re-arm, and enabled dynamic-loop execution remain `unknown`.
+
 This baseline is evidence and a roadmap, not a claim that all tools already
-match or that kloop can replace Claude Code. Product-level gaps and unknowns
-remain for Plans 56–59; kloop-only capabilities stay intentionally separate.
+match or that kloop can replace Claude Code. Plan 58 completes the scheduler
+cluster; product-level gaps and unknowns remain, including the Plan 59 cluster,
+and kloop-only capabilities stay intentionally separate.
 
 
 ## Compaction (Phase 2, first slice)
@@ -541,6 +549,9 @@ call carries its full `input`, and `output` + `agent` label when present; a
 `thread/backgroundTask/updated {task:{id, kind, description, status,
 outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present only for Workflow; **no
 `turnId`**, because completion may arrive after the launching turn),
+`thread/scheduler/updated {task:{id, origin:"cron"|"loopWakeup",
+status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detail?}}`
+for owner-scoped scheduler lifecycle (**no `turnId`**),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
 error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
@@ -1053,6 +1064,49 @@ policy, and model-visible `Monitor`. Exact 2.1.220 evidence shows Monitor is a
 different, server-flagged (`tengu_amber_sentinel`, default off) tool for
 streaming every command stdout line or WebSocket frame; the clean CLI profile
 does not expose it. See `docs/plan/51-background-monitor-parity.md`.
+
+## Scheduler (Plan 58)
+
+The scheduler is an in-process, depth-zero, owner-scoped surface. Its model-visible
+tools are strict `cron_create`, `cron_delete`, `cron_list`, and `schedule_wakeup`;
+`/loop` translates fixed intervals into cron instructions and uses dynamic wakeups when
+no interval is supplied. `cron_create` requires `cron` and `prompt`, defaults
+`recurring` to `true` and `durable` to `false`, and accepts a five-field local-time cron
+expression. A recurring job lives for at most seven days: its final due tick is delivered,
+then the job is deleted. `schedule_wakeup` normally requires `delay_seconds`, `reason`,
+and `prompt`; it rounds, clamps to 60–3600 seconds, aligns to the next minute, and
+atomically replaces the owner's previous dynamic wakeup. `stop:true` clears only that
+dynamic slot, never fixed recurring cron jobs.
+
+These names are intentionally native. kloop exposes `schedule_wakeup.delay_seconds`,
+not Claude Code's `ScheduleWakeup.delaySeconds`, and provides no PascalCase compatibility
+aliases. The tools appear only on a scheduler-capable depth-zero owner surface; they are
+not available to sub-agents, mocks, or the `run_program` TypeScript API. `cron_list` may
+run concurrently; scheduler mutations are serialized.
+
+Session-only jobs exist only in the in-process registry and disappear at shutdown.
+Durable jobs are stored at:
+
+```text
+~/.kloop/scheduler/<project-key>/scheduled_tasks.json
+~/.kloop/scheduler/<project-key>/scheduled_tasks.lock
+```
+
+The project key derives from the canonical Git common directory, so a primary checkout and
+its worktrees share one base-project identity; a non-Git project uses its canonical cwd.
+A durable job is bound to its creating session/thread owner. Other owners cannot list,
+delete, or claim it; competing runtimes of the same owner claim under the store lock and
+deliver only once. A late durable one-shot remains pending in a headless run or a
+server session without question capability until that owner resumes through a
+questions-capable interactive frontend.
+
+Due work enters the typed Inbox rather than mutating an in-flight provider request. The
+TUI sends one idle `Wake`; the plain frontend selects between stdin and Inbox activity; and
+the server allocates a real increasing turn id for a single-flight delivery turn. Headless
+stops the scheduler after its main turn and before background task/shell shutdown:
+session-only jobs disappear, while durable jobs remain. Scheduler lifecycle is separate
+from background Bash and agent registries. It never installs or modifies `crontab`,
+`launchd`, `systemd` timers, login items, or any system scheduler.
 
 ## Web tools (Phase 2, eleventh slice)
 
@@ -1864,7 +1918,8 @@ kloop --mock --headless --json
   **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
   stdout — `turn/started`, `item/started|delta|completed`,
-  `thread/backgroundTask/updated`, `thread/tokenUsage/updated`, `note`,
+  `thread/backgroundTask/updated`, `thread/scheduler/updated`,
+  `thread/tokenUsage/updated`, `note`,
   `turn/completed` — the **exact same item vocabulary the native protocol server
   emits** (via one shared `project_event`), `threadId` and all. One event
   vocabulary, two front-ends.
@@ -1883,6 +1938,9 @@ kloop --mock --headless --json
   unbounded turn loop as interactive/server mode.
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
+- **Scheduler shutdown.** After the main headless turn, kloop stops the scheduler before
+  background task/shell shutdown. Session-only scheduled jobs disappear; durable jobs remain
+  pending until their owner resumes in a questions-capable interactive frontend.
 
 `--max-rounds` and `--json` are `--headless`-only; a bare prompt without it
 is an error (interactive mode takes its input at the prompt). Not done (deferred, server
