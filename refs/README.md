@@ -92,10 +92,10 @@ Plan 48 已提交以下可重放基线:
 - `collect.py`/`verify.py`:采集前 exact identity guard，隔离 HOME/config/cwd、本地 provider/Web/MCP，
   受限 normalization、hash/determinism、证据引用、文件集合、环境/网络和敏感信息 fail-closed 校验。
 
-Plan 49 已在该基线上闭环文件/搜索簇并补齐 executable parity 门。`static-evidence.jsonl` 现有
+Plan 49 已在该基线上闭环文件/搜索簇并补齐 executable parity 门。该阶段 `static-evidence.jsonl` 有
 95 条证据：Plan 48 的 46 条仍是历史提交数，新增 kloop Read/Write/Edit/file-state/Glob/Grep、
 permission、per-call Pre/Post hook 与 Rust parity report code/golden anchors 进入 fail-closed 必备集合。
-采集集为 73 组 capture：40 组 schema v1，33 组 schema v2 scripted workspace，包含 18 组
+当时采集集为 73 组 capture：40 组 schema v1，33 组 schema v2 scripted workspace，包含 18 组
 normalized bytes 完全一致的 determinism pair；同轮并发仍为明确 singleton，不伪装 deterministic pair。
 schema v2 保留 provider/tool/hook/timeline 顺序，只归一化已声明的临时根、ID、时间、PID、workspace
 mtime，以及由 fixture 明示的 interactive PTY 收尾状态。
@@ -118,7 +118,7 @@ Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 
 创建缺失父目录，kloop 也不复制这一行为；它与 CC partial-read、Edit stale recovery、广义搜索可见性
 均记为 `intentional-diff`，没有为字面一致降级。descriptor boundary 阻断审批等待中的常规 alias retarget，但不是 hostile same-UID 文件系统事务；最终 identity check→`renameat` 的微小 namespace window 仍明确保留。
 
-当前 440 个矩阵单元为 70 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
+Plan 49 完成时的 440 个矩阵单元为 70 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
 237 个 `unknown`、22 个 `n/a`、8 个 `same`。`paired-parity.json` 由 matrix generator 同步生成，
 3 个 contract 精确覆盖全部 8 个 `same`：Read/Glob/Grep 并发，Write/Edit 串行，以及 Glob/Grep
 无孤儿 lifecycle。verifier 固定运行一个真实 `dispatch_tools` Rust report test，再比较 CC/kloop 的
@@ -146,13 +146,13 @@ process group；timeout/cancel 同步 SIGKILL 全组、wait/reap direct child，
 完成调用。正常 shell leader 先退出但仍留同组 descendant 时也清组。审批/hook 期间取消不 spawn，
 spawn 后 dispatch 会等待上述 executor cleanup，不能用外层 cancel 先 drop future。
 
-matrix 现为 56 行/448 单元：70 `compatible`、90 `intentional-diff`、20 `missing`、236 `unknown`、
+Plan 50 完成时 matrix 为 56 行/448 单元：70 `compatible`、90 `intentional-diff`、20 `missing`、236 `unknown`、
 22 `n/a`、10 `same`。第 4 个 generated contract `bash-batching` 覆盖两个 Bash concurrency
 `same` cell：CC 用 Pre/Post hook barrier 证明 `pwd`/`ls -d .` 同批重叠、两个 redirection 调用串行；
 kloop 固定 Rust report 跑同输入真实 `dispatch_tools` 并比较 call/event/result/workspace。Bash 的
 permission、native output envelope 和 no-survivor lifecycle 保持 `intentional-diff`。
 
-Plan 51 将 corpus 扩至 83 captures/116 static evidence。`bash-background` 与
+Plan 51 完成时 corpus 为 83 captures/116 static evidence。`bash-background` 与
 `bash-background-failure` 的 raw/normalized 对固定：显式后台立即返 id + output file，随后独立发
 `task_started → task_updated(completed|failed) → task_notification`，再以
 `origin.kind=task-notification` 启动一轮采样；输出正文不塞进通知。bundle locators 同时裁决了
@@ -172,7 +172,7 @@ plain/server 在下一 turn 交付。agent/program 的结果回灌语义不变�
 process group，并在 active worktree teardown 前等待，防 orphan、重复通知和 server sender 挂账。
 自动后台化、stall policy 与逐事件 Monitor 保留为明确的产品边界。
 
-Plan 52 将 corpus 扩至 **96 captures / 137 static evidence**，matrix 仍为 56 行/448 单元，状态更新为
+Plan 52 完成时 corpus 为 **96 captures / 137 static evidence**，matrix 仍为 56 行/448 单元，状态为
 67 `compatible` / 119 `intentional-diff` / 23 `missing` / 207 `unknown` / 22 `n/a` / 10 `same`。
 新增 Agent fixture 固定 `description + prompt` 必填、默认后台、显式 `run_in_background:false` 前台、
 model override，以及 remote gate 不满足时回退 local async；bundle locator 则补齐 async output、默认分支与
@@ -196,7 +196,7 @@ stop-vs-completion 一次终态、final sampling inbox 兜底、todo replacement
 CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter tamper
 测试 fail closed；没有新增 pair contract 或人为制造 `same`。
 
-Plan 53 将 corpus 扩至 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
+Plan 53 完成时 corpus 为 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
 状态为 65 `compatible` / 132 `intentional-diff` / 36 `missing` / 183 `unknown` / 22 `n/a` /
 10 `same`。AskUserQuestion 新增 single/multi/Other/two-question/preview/notes/cancel/invalid/headless
 九组 PTY 与 headless fixture；EnterPlanMode 新增 enter→exit、重复 enter、headless 三组；Workflow 新增
@@ -210,7 +210,7 @@ intentional-diff。RunStore 使用受控 run component、descriptor-bound/no-fol
 completion/phase/terminal event 保持 task/run/store identity；resume journal 保留 JSON Value 并兼容 legacy
 string entry。full exact-binary verifier 与 corpus-only 门均通过。
 
-Plan 54 将 corpus 扩至 **129 captures / 164 static evidence**，matrix 仍为 56 行/448 单元，
+Plan 54 完成时 corpus 为 **129 captures / 164 static evidence**，matrix 仍为 56 行/448 单元，
 状态为 89 `compatible` / 143 `intentional-diff` / 34 `missing` / 150 `unknown` / 22 `n/a` /
 10 `same`。新增 19 个 capture：Skill 成功双样本与三种错误、ToolSearch required-term/ranking/parser
 双样本、select/`tools/list_changed` refresh 后真实 `tools/call` 双样本，以及独立 resources-capable
@@ -231,7 +231,7 @@ stdio/HTTP 在 JSON parse 前限单消息 wire bytes，tools/resources paginator
 Streamable HTTP 仍无长期 server-notification stream，因此连接状态明确报告 startup catalog 固定，未把
 request 内短 SSE response 伪装成动态订阅。full exact-binary verifier 与 workspace Rust 门均通过。
 
-Plan 55 将 corpus 扩至 **145 captures / 180 static evidence**。WebSearch 按 profile 拆分后，matrix 为
+Plan 55 完成时 corpus 为 **145 captures / 180 static evidence**。WebSearch 按 profile 拆分后，matrix 为
 57 行/456 单元，状态为 92 `compatible` / 149 `intentional-diff` / 34 `missing` /
 149 `unknown` / 22 `n/a` / 10 `same`。新增 16 个 capture：WebFetch 7 个 strict
 `url+prompt` parser/URL safety case，WebSearch 9 个 permission/parser/side-query/output case；既有
@@ -252,7 +252,7 @@ kloop 保留按 Tavily/Brave key 条件注册和 bounded plain-text output；tim
 HTTP provider/CCR proxy 与 lifecycle 仍 `unknown`。remote 只证明 `remote=false` 时请求 remote isolation
 会回退 worktree/local async Agent；true cloud/team 和 remote lifecycle 没有被当前 hermetic profile 裁决。
 
-Plan 56 将 corpus 扩至 **190 captures / 188 static evidence**；其中 worktree 新增 45 组，
+Plan 56 完成时 corpus 为 **190 captures / 188 static evidence**；其中 worktree 新增 45 组，
 raw/normalized 各一份。matrix 以真实条件向量拆出 clean registration、
 `worktree-scripted-allow-cli` 与 `worktree-scripted-manual-pty` 行，共 61 行/488 单元：
 112 `compatible` / 157 `intentional-diff` / 34 `missing` / 151 `unknown` / 24 `n/a` /
@@ -270,7 +270,7 @@ stale permission gate 做 negative mutation。
 no-active error、ignored/provenance removal blocker、External
 不可删、session shutdown retain 及条件注册均明确保留为产品/安全差异。
 
-Plan 57 将 corpus 扩至 **210 captures / 197 static evidence**；新增 10 组 deterministic pair，
+Plan 57 完成时 corpus 为 **210 captures / 197 static evidence**；新增 10 组 deterministic pair，
 覆盖 rich notebook read、replace/insert/delete、fallback ID、errors、stale、同轮 seriality 与
 `ENABLE_LSP_TOOL=1` 负注册。matrix 新增真实的 `notebook-read-adapter@clean-cli` 并把 LSP
 切到 `lsp@lsp-env-cli` 条件向量，共 62 行/496 单元：125 `compatible` / 160
@@ -294,7 +294,7 @@ stub 并重放 cleanup。因此 `lsp@lsp-env-cli` 八维继续为有条件向量
 没有新增推测性生产 LSP client。verifier 同时拒绝未过门的 `lsp.rs`、伪 cleanup、扩大随机
 normalization、CC Notebook schema 放宽、native report 场景/事件/资格/preview 漂移。
 
-Plan 58 将 corpus 收敛到 **218 captures / 211 static evidence**；matrix 为 62 行/496 单元：
+Plan 58 完成时 corpus 为 **218 captures / 211 static evidence**；matrix 为 62 行/496 单元：
 125 `compatible` / 170 `intentional-diff` / 24 `missing` / 129 `unknown` / 24 `n/a` /
 24 `same`，generated executable pair 增至 7 个，其中新增
 `scheduler-cron-schema`、`scheduler-cron-contract`、`scheduler-concurrency`。kloop 提供
@@ -307,6 +307,32 @@ single-flight delivery turn 投递；headless 关闭 scheduler 后保留 durable
 能力，不创建或修改 crontab、launchd、systemd timer 或登录项。精确 timed fire、DST/clock
 jump、effective recurring jitter、restart/re-arm 和 enabled dynamic-loop runtime 仍保持
 `unknown`，不由 native behavior 反推 exact same。
+
+Plan 59 最终验收已将 corpus 固定为 **218 captures / 65 个 determinism group（每组恰有两次 capture） / 214 static evidence**；
+matrix 为 62 行/496 单元：24 `same` / 141 `compatible` / 169 `intentional-diff` /
+5 `missing` / 133 `unknown` / 24 `n/a`。7 个 generated executable pair contract 精确覆盖全部
+24 个 `same`；新增 `profile-bridges.json`，以 108 个逐 cell/source-profile bridge 固定两侧完整
+condition vector、condition diff、与 matrix evidence 精确相等的 fixture 集合及 normalized hash、exact-binary evidence 与
+`same-binary-dimension-only-v1` projection。Static evidence 的 `covers` 现由 generator/verifier 全局
+校验；每条 bundle 证据还必须显式使用 exact locator 或另带 exact base64 byte anchor。executor/output/lifecycle
+的非 unknown/n-a cell 分别要求固定 normalized 协议路径上的 typed tool use/result/content/terminal witness；复合行还必须覆盖显式 required CC tool set，任意
+metadata `tool_result_ids` 不得冒充运行结果；compatible/intentional-diff 必须有双边证据；三个 kloop-only row
+还受 logical-id 精确白名单约束，不污染 CC gap/parity 统计。
+
+Plan 53 的 AskUserQuestion、EnterPlanMode 和 standalone Workflow 旧 missing 已由真实 kloop Rust
+report 纠正；Ask parser 使用 empty/type/null/options/unknown-field 正交负例，report 只按显式 row/dimension
+mapping 投影。StructuredOutput 因没有 CC nested schema-child calling fixture 而将运行维度退回
+`unknown`，没有新增伪 `same`。Plan 59 另以独立 core-dispatch Rust report 组合五条跨链，scope 明确区分
+CC `target_entrypoint=local-cli` 与 kloop `kloop_entrypoint=core-dispatch-test-harness`，不把测试 context 冒充
+CLI startup wiring；覆盖 worktree FileState/cwd 恢复及隔离 Git config、step-boundary 后台回灌精确计数、
+selective ToolSource generation refresh、共享 trace 的 approval-before-dispatch 与 deny 后零 source call、Ask/Plan/Workflow approve/reject/cancel，以及 Notebook/LSP 负边界。
+MCP transport、Monitor、PTY 和 LSP 的缺席明确标成 seam/surface/negative boundary，不冒充执行。
+
+最终结论只适用于 manifest 固定的 exact 2.1.220、darwin-arm64 local CLI、`team=false`、
+`remote=false` 已执行 profile：**受限行为兼容**。这不是全工具对齐、wire/schema/UI 同一，也不是
+drop-in replacement。5 个 SendMessage non-blocking missing、安全 intentional-diff、condition-bound
+unknown、profile/surface n/a 与 kloop-only 能力均继续显式保留。精确产物导读见
+`refs/claude-code-2.1.220/README.md`。
 
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
@@ -327,13 +353,14 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 运行 `build_matrix.py` 与 `build_matrix.py --check`。
 
 完整矩阵、fixture 方法和 Plan 49–59 拆分见
-`docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
+`docs/plan/48-claude-code-2.1.220-tool-parity.md`；各行为簇与最终验收见
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
 `docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md`、
 `docs/plan/55-web-remote-parity.md`、`docs/plan/56-worktree-parity.md`、
-`docs/plan/57-notebook-lsp-parity.md` 与 `docs/plan/58-scheduling-parity.md`。Plan 58
-已完成不表示 kloop 已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 59 逐簇实现与验收。
+`docs/plan/57-notebook-lsp-parity.md`、`docs/plan/58-scheduling-parity.md` 与
+`docs/plan/59-tool-parity-acceptance.md`。Plan 59 的通过只产生上述受限行为兼容结论，不产生
+“全工具已对齐”或“可替换 Claude Code”的产品声明。
 
 ## 调研结论(三轮调研的浓缩)
 

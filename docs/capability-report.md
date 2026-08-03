@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-03,plan 1–58 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、Plan 49–58 各工具簇闭环见对应计划。
+> 基线:2026-08-03,plan 1–59 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -59,7 +59,7 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；Plan 49–58 已完成 exact parity 分簇闭环
+### 4. 工具面——🟡 主干齐；固定条件下通过 Plan 59 受限行为兼容验收
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -79,7 +79,7 @@ Plan 49 已销账 Read/Write/Edit/Glob/Grep 的主干正确性：session-only �
 ignore/VCS/敏感路径策略均有 exact CC fixture + kloop golden。补强证据门后，descriptor-locked
 Pre/Post hook barrier 证明 Read/Glob/Grep 真并发，dependent Edit/Edit/Write/Write pair 证明 mutation
 串行；generated pair contract 再以相同规范化调用输入与真实 `dispatch_tools` Rust call/event report 比较，
-跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。当前 matrix 保留 237 个跨其他
+跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。Plan 49 当时的 matrix 保留 237 个跨其他
 工具簇或不可运行分支的 `unknown`；8 个 `same` 只覆盖上述并发/串行分类与 Glob/Grep 无孤儿
 lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门已进双平台 CI。
 
@@ -103,7 +103,7 @@ server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missin
 registry teardown；session active worktree 无 remove intent 时保留。
 自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
 
-Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，corpus 现为
+Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /
 23 missing / 207 unknown / 22 n/a / 10 same）。exact CC Agent 要求 description+prompt、默认后台；kloop
 保留原生 task 默认同步与参数面。Task lifecycle 已固定稳定 ID、owner/metadata、依赖、完成/删除，但产品
@@ -162,12 +162,35 @@ session/thread，其他 owner 不可 List/Delete/claim，late durable one-shot �
 headless/server 保持 pending，等待同 owner 在可交互 frontend 恢复。TUI idle Wake、
 plain stdin/Inbox select、server 单飞完整 turn lifecycle 均可投递；headless 主 turn 后先关
 scheduler，session-only 消失而 durable 保留。调度器不安装或修改 crontab、launchd、
-systemd timer 或登录项。最终 corpus 为 218 captures / 211 static evidence，matrix 为
+systemd timer 或登录项。Plan 58 完成时 corpus 为 218 captures / 211 static evidence，matrix 为
 62 行 × 8 维 = 496 cells（125 compatible / 170 intentional-diff / 24 missing /
 129 unknown / 24 n/a / 24 same），7 个 executable pair；其中新增
 `scheduler-cron-schema`、`scheduler-cron-contract`、`scheduler-concurrency`。timed fire、
 DST/clock jump、server-selected jitter、restart/re-arm 与 enabled dynamic-loop 成功路径仍为
 `unknown`。
+
+Plan 59 没有新增产品行为，而是对固定 SHA-256 的 Claude Code 2.1.220、darwin-arm64
+本地 CLI、`team=false`、`remote=false` 的 14 个已执行 profile 做总体验收。最终 generated
+snapshot 为 218 captures / 214 static evidence / 65 个两次采样 determinism group；matrix
+为 62 行 × 8 维 = 496 cells（24 same / 141 compatible / 169 intentional-diff / 5 missing /
+133 unknown / 24 n/a），7 个 executable pair 精确覆盖全部 24 个 `same`，108 个逐
+cell/source-profile exact-bundle bridge 固定跨 profile 投影。3 个 kloop-only row / 24 cells
+从 CC gap 与 parity-success 统计中排除；5 个 `missing` 都是已排除承诺的
+`send-message@clean-cli` registration/schema/parser/executor/output，因此 blocking missing/unknown
+均为 0。该结论仅为上述固定版本、平台、入口和已执行条件下的**受限行为兼容**，不表示
+全工具对齐、逐字节一致或 drop-in replacement；team/remote true、PowerShell、SendUserFile、
+Monitor、LSP、真实公网/MCP transport 仍不在兼容承诺内。最终证据门要求 bundle offset 的真实
+byte anchor、executor/output/lifecycle 分维度 typed witness（复合行覆盖显式 required CC tool set）、三个 kloop-only logical-id 白名单与
+bridge fixture/matrix refs 精确绑定。五条跨工具链 scenario 只按各自 `full`、`surface-gate`、
+`seam-only` 或 `negative-boundary` scope 裁决；报告分开记录 CC `target_entrypoint=local-cli` 与
+kloop `kloop_entrypoint=core-dispatch-test-harness`，不把 core test context 冒充 CLI startup wiring。
+回灌按 framing 精确计数，ToolSource 共享 trace 实测 approval-before-dispatch 和 deny 后零调用，
+worktree Git subprocess 不继承用户 Git config；负边界不冒充缺席 transport/process 的执行通过。
+
+Plan 59 同时纠正 Plan 53 的过度裁决：AskUserQuestion 为 C/C/C/C/D/C/D/D，EnterPlanMode
+为 C/C/U/C/C/C/D/C，ExitPlanMode 为 C/D/D/C/D/N/C/C，StructuredOutput 为
+D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/type/null/options/unknown-field 负例，report 只按显式 row/dimension mapping 投影。C/D/U/N 分别表示 `compatible`、
+`intentional-diff`、`unknown`、`n/a`，没有新增 `same`。
 
 ### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 
@@ -285,7 +308,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
 - **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
-- **T0 parity 余线**：Plan 58 已完成（2026-08-03）；仅 Plan 59 仍按其母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训

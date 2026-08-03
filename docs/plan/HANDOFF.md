@@ -8,13 +8,14 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–58 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59 已完成)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
 > fixture、43 行机器可读 parity matrix 与 fail-closed verifier。该提交当时的矩阵没有任何 `same`；这是
-> 对证据门的保守执行，不是“全工具已对齐”。Plan 49–58 后续闭环见下；仅 Plan 59 尚未完成，不得
-> 宣称 kloop 已可替换 Claude Code。
+> 对证据门的保守执行，不是“全工具已对齐”。Plan 49–59 后续闭环见下；Plan 59 的最终结论仅为
+> exact 2.1.220、darwin-arm64 本地已执行 profile 下的受限行为兼容，仍不得宣称全工具对齐或
+> drop-in replacement。
 >
 > **Plan 49 已完成（2026-07-29）**：`49-file-search-parity.md` 已闭环 Read/Write/Edit/Glob/Grep。
 > kloop 新增有界、非持久化的 session 文件 observation；只有最终成功且完整展示的 Read 建立 existing
@@ -66,7 +67,7 @@
 > inbox/wire 保持 task+run identity，stop/shutdown/resume hit-miss/edited script 均有测试。kloop `structured_output`
 > 只在 schema Workflow child 动态注入，本地 JSON Schema 复验、invalid/missing 有界重试，合法 JSON Value
 > 才结束 child并写 journal；普通 tool uses 在 structured response 中仍走一次真实并发 dispatcher 并按原位配对。
-> named/nested workflow、budget、remote 与 per-child provider effort 保留 intentional-diff。Plan 55–58 完成记录见下；仅 Plan 59 尚未执行。
+> named/nested workflow、budget、remote 与 per-child provider effort 保留 intentional-diff。Plan 54–59 完成记录见下。
 >
 > **Plan 54 已完成（2026-07-31）**：`54-discovery-extension-parity.md` 将 corpus 扩至 129 captures /
 > 164 static evidence，matrix 为 56 行/448 单元（89 compatible / 143 intentional-diff / 34 missing /
@@ -133,6 +134,24 @@
 > 分配真实 turn ID，headless 有界 shutdown。CC exact fixture 仅裁决 schema/store/gate；timed fire、
 > DST/clock jump、effective recurring jitter、restart/re-arm 与 enabled dynamic-loop path 仍为 `unknown`，
 > 不得以原生行为外推 exact runtime。
+>
+> **Plan 59 已完成（2026-08-03）**：`59-tool-parity-acceptance.md` 对 exact Claude Code 2.1.220、
+> darwin-arm64 local CLI、`team=false`、`remote=false` 的 14 个已执行 profile 做最终受限验收。
+> 生成快照为 218 captures / 65 个每组两次的 determinism group / 214 static evidence / 62 rows / 496 cells：
+> 24 same、141 compatible、169 intentional-diff、5 non-blocking missing、133 condition-bound unknown、
+> 24 n/a；7 个 executable pair 覆盖全部 same，108 个 generated exact-bundle profile bridge 覆盖全部
+> 跨 profile fixture。Plan 53 的 Ask/Enter/Workflow 陈旧 missing 已由真实 Rust report 纠正；StructuredOutput
+> 无 CC nested calling fixture 的运行维度退回 unknown。最终加固要求每条 bundle 证据 byte-anchor、每个 runtime
+> 维度使用固定协议路径的 typed witness（复合行须覆盖显式 required CC tool set）、kloop-only logical-id 白名单与 bridge fixture 精确绑定；Plan 53 Ask
+> parser 负例正交拆分并显式映射 report 维度。五条跨链在各自 full/seam/surface/negative scope 内通过，且
+> `target_entrypoint=local-cli` 与 `kloop_entrypoint=core-dispatch-test-harness` 分开记录，不把 core report 冒充
+> CLI startup 验收；回灌精确计数，ToolSource 共享 trace 实测 approval-before-dispatch 和 deny 后零调用，
+> worktree Git subprocess 隔离 HOME/XDG/global/system config。Monitor/PTY/LSP/真实 MCP transport 不以负边界
+> 冒充执行。最终术语固定为“受限行为兼容”，安全 intentional-diff、unknown/n-a、kloop-only 继续保留；
+> 非全工具对齐、非 drop-in。提交 SHA 以本条所在提交为准。
+>
+> **Plan 59 教训**：聚合统计、单个 `same` cell、跨链 pass 或 corpus-only CI 都不能扩展 profile scope；
+> 每个结论仍须绑定 exact binary、condition vector、逐维 evidence 和可执行 projection。
 >
 > **Plan 63 已立（未开工）**：`63-project-permission-lifecycle.md` 纠正 flat `Config` 混合
 > process/project/session/workspace/agent 生命周期，以及 `AllowAlways` 把项目批准写成全局授权的问题。用户已拍板
@@ -387,7 +406,7 @@
 - **plan 45(✅ 完成,2026-07-24)** 默认取消 sampling round 上限：回源确认 codex 主/子 agent 共用无计数 turn loop，限制深度/线程而非执行轮数；`Config.max_rounds` 改 `Option<usize>`，interactive/plain/TUI/server/headless/task/fork skill 默认不限，保留 headless `--max-rounds` 与显式 `task.max_rounds` guardrail、MaxRounds 终态及原中断/错误语义。主循环跨旧 30 轮、task 跨旧 15 轮自然完成的回归测试已补。详见 plan 45 完成记录。
 - **plan 46(✅ 完成,2026-07-24)** 唯一全局用户配置：删除 cwd `.kloop/config.toml` 自动配置层，provider/model/permissions/MCP/web/hooks/sandbox/agents/codemode 全部从一次解析的 `~/.kloop/config.toml` 进程快照构建；thread cwd 只留 workspace anchor。AllowAlways 改为私有原子写全局规则并同步进程内 snapshot；OAuth store 移到 `~/.kloop/mcp-oauth.json`，config/OAuth 同时纳入 sandbox deny-read。legacy cwd config 完全不探测、不警告、不合并；`--mock` 不解析 HOME/config/provider/runtime env，并有 clean-env 进程级回归。Unix 私有读写校验并锚定配置目录 descriptor，以 `O_NOFOLLOW` `openat` / `renameat` 消除叶文件和父目录替换窗口，`mkdirat` / `chmodat` / `fchmod` 保证严格 umask 下仍为目录 `0700`、文件 `0600`，`O_NONBLOCK` 保证 FIFO 等非普通文件立即拒绝；严格 schema、跨 cwd 一致性、secret-safe projection、symlink/开放目录拒绝回归已补。详见 plan 46 完成记录。
 - **plan 47(✅ 完成,2026-07-27)** grep 空过滤器兼容：`GrepArgs::parse` 将精确零长度的 `glob` / `type` 规范化为未提供，避免空 type 报错并让空 glob 正常搜索；纯空白字符串不裁剪。解析层与行为层回归测试、README 已同步，context/-o、glob 拆分、长行策略及独立 glob 工具不变。详见 plan 47 完成记录。
-- **plan 48(✅ 完成,2026-07-27)** Claude Code 2.1.220 工具 parity 基线：目标二进制按 version/size/SHA-256 精确钉死；`refs/claude-code-2.1.220/` 已提交 hermetic collector、本地 provider/Web/MCP/PTY stubs、6 profiles 下 38 组 raw/normalized fixtures、46 条 static evidence、43 行 machine-readable matrix、deterministic generator 与 fail-closed verifier。六个 anchor(Glob/ToolSearch/ExitPlanMode/WebFetch/Agent/Bash)已纵向探测；WebFetch loopback 仅得到 domain-safety ordering 负证据，不冒充 executor 成功。矩阵为 47 compatible / 43 intentional-diff / 20 missing / 215 unknown / 19 n/a / 0 same；kloop-only 三工具单列。**Plan 48 提交当时 Plan 49–59 均未执行；此后 Plan 49–58 已分别闭环，当前仅 Plan 59 未执行；任何阶段完成仍不得外推为全工具可替换。**详见 plan 48 完成记录与 `refs/README.md`。
+- **plan 48(✅ 完成,2026-07-27)** Claude Code 2.1.220 工具 parity 基线：目标二进制按 version/size/SHA-256 精确钉死；`refs/claude-code-2.1.220/` 已提交 hermetic collector、本地 provider/Web/MCP/PTY stubs、6 profiles 下 38 组 raw/normalized fixtures、46 条 static evidence、43 行 machine-readable matrix、deterministic generator 与 fail-closed verifier。六个 anchor(Glob/ToolSearch/ExitPlanMode/WebFetch/Agent/Bash)已纵向探测；WebFetch loopback 仅得到 domain-safety ordering 负证据，不冒充 executor 成功。矩阵为 47 compatible / 43 intentional-diff / 20 missing / 215 unknown / 19 n/a / 0 same；kloop-only 三工具单列。**以上数字只是在 Plan 48 提交时的历史快照；Plan 49–59 现已完成，Plan 59 的最终结论仍仅限 exact binary 和已执行 profile 下的受限行为兼容，不外推为全工具或 drop-in replacement。**详见 plan 48/59 完成记录与 `refs/README.md`。
 - **plan 49(✅ 完成,2026-07-29)** 文件/搜索工具 exact parity：session-only bounded file observations、成功完整 Read 才授权 existing mutation、fresh sub-agent/resume/worktree state；Write/Edit keyed path lock + stale final check + same-directory sync/atomic rename/parent sync，拒 symlink/非普通文件，失败清 authority；Read 7k UTF-8 安全文本/明确 PDF 与 binary 边界；Grep 补 context/-o/数字分页/单文件格式，Glob 精确 100 + 字符预算，搜索安全策略不降级。补强证据后 CC corpus 73 captures、static evidence 95、matrix 55 行/440 单元 = 70 compatible、83 intentional-diff、20 missing、237 unknown、22 n/a、8 same；3 个 generated pair contract 覆盖全部 same，固定 Rust report test 运行真实 dispatcher，由 full/corpus-only verifier 比较规范化调用输入、生命周期、result、偏序与 workspace，跨 profile cell 另由 exact-bundle bridge fail closed。Pre/Post hook barrier 证明 Read/Glob/Grep 并发，dependent Edit/Edit/Write/Write pair 证明 mutation 串行；Glob/Grep lifecycle 升 same。No/Esc 自然 continuation 证明先 omitted sampling、后 error-result settlement 再 final，订正旧强杀观察。corpus-only 门已进 macOS/Linux CI。详见 plan 49 完成记录。
 - **plan 50(✅ 完成,2026-07-30)** 前台 Bash exact parity：新增 schema/output/timeout-tree/cancel-tree determinism pairs 与 input-dependent concurrency singleton，精确 bundle anchors 走完 schema→parser→spawn/permission/sandbox→timeout/cancel→result/output→concurrency。kloop 保留原生参数/文案与严格安全策略，新增双 pipe 有界 drain（每 fd 150k bytes、模型合并文本 30k chars）、独立 process group、timeout/cancel 同步 SIGKILL + direct-child reap + residual-group 确认，dispatch 等清理后才返 interrupted。CC stubborn timeout 会转后台、SIGINT cancel 会 abort，fixture 均观察到结果后 TERM-ignoring descendants 存活，因此不追求字面一致。该提交时 corpus 82 captures/109 evidence/56 rows/448 cells = 70 compatible、90 intentional-diff、20 missing、236 unknown、22 n/a、10 same；4 个 executable contracts 覆盖全部 same，新 `bash-batching` 证明 read-only 并发与 opaque 串行。后台 lifecycle 已由 Plan 51 完成；自动后台化/stall/逐事件 Monitor 保留为产品边界。详见 plan 50 完成记录。
 - **plan 51(✅ 完成,2026-07-30)** 后台任务与 Monitor exact parity：corpus 扩至 83 captures/116 static evidence；`bash-background` + 新 `bash-background-failure` 固定 start→terminal update→notification→`origin:task-notification`。bundle 证明 Monitor 是 `tengu_amber_sentinel` 默认关闭、要求 Bash available 的 model-visible tool，command/WebSocket 二选一、逐 line/frame live notification、支持 persistent/TaskStop/session cleanup；true profile 无法由 harness 权威开启，matrix 八格保守为 unknown，kloop 不新增伪 Monitor。kloop 为 shell/agent/program 增加无 turn owner 的统一 `BackgroundTaskUpdated`，shell terminal pointer 进入 step-boundary inbox，TUI idle autowake、plain/server 下一 turn 交付；两套 registry 保持分离但各自原子裁决一次终态，shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再完成后台 registry teardown；session active worktree 无 remove intent 时保留。自动后台化、stall、逐事件 Monitor 明确保留。详见 plan 51 完成记录。

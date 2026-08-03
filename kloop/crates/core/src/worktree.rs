@@ -10,6 +10,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::LockResult;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
@@ -31,6 +35,58 @@ const WORKTREES_DIR: &str = ".claude/worktrees";
 const WORKTREE_BRANCH_PREFIX: &str = "worktree-";
 static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestGitEnvironment {
+    root: PathBuf,
+    home: PathBuf,
+    xdg_config_home: PathBuf,
+}
+
+#[cfg(test)]
+static TEST_GIT_ENVIRONMENTS: OnceLock<StdMutex<Vec<TestGitEnvironment>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TestGitEnvironmentGuard {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TestGitEnvironmentGuard {
+    fn drop(&mut self) {
+        let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
+        environments
+            .lock()
+            .unwrap()
+            .retain(|environment| environment.root != self.root);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn isolate_test_git_environment(
+    root: &Path,
+    home: &Path,
+    xdg_config_home: &Path,
+) -> TestGitEnvironmentGuard {
+    let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
+    let mut environments = environments.lock().unwrap();
+    assert!(
+        environments
+            .iter()
+            .all(|environment| environment.root != root),
+        "duplicate test Git environment for {}",
+        root.display()
+    );
+    environments.push(TestGitEnvironment {
+        root: root.to_path_buf(),
+        home: home.to_path_buf(),
+        xdg_config_home: xdg_config_home.to_path_buf(),
+    });
+    TestGitEnvironmentGuard {
+        root: root.to_path_buf(),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorktreeOwner {
@@ -733,11 +789,39 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
     std::fs::write(&exclude, next).context("updating git info exclude")
 }
 
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    #[cfg(test)]
+    {
+        let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
+        let environment = environments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|environment| dir.starts_with(&environment.root))
+            .max_by_key(|environment| environment.root.components().count())
+            .cloned();
+        if let Some(environment) = environment {
+            let path = std::env::var_os("PATH");
+            command.env_clear();
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            command
+                .env("HOME", environment.home)
+                .env("XDG_CONFIG_HOME", environment.xdg_config_home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("LC_ALL", "C");
+        }
+    }
+    command
+}
+
 async fn git_success(dir: &Path, args: &[&str]) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let output = git_command(dir, args)
         .output()
         .await
         .context("spawning git")?;
@@ -745,10 +829,7 @@ async fn git_success(dir: &Path, args: &[&str]) -> Result<bool> {
 }
 
 async fn git_text(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let output = git_command(dir, args)
         .output()
         .await
         .context("spawning git")?;

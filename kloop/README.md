@@ -29,58 +29,22 @@ gets an `is_error` `tool_result` so history stays legal.
 
 ## Claude Code 2.1.220 parity baseline
 
-Plan 48 pins the comparison target to one exact Claude Code 2.1.220 binary and
-commits auditable raw/normalized fixtures, static evidence, and a machine-readable
-per-dimension matrix under [`../refs/claude-code-2.1.220/`](../refs/claude-code-2.1.220/).
-The methodology, current counts, replay commands, and Plan 49–59 follow-up map
-are documented in [`../refs/README.md`](../refs/README.md) and
-[`../docs/plan/48-claude-code-2.1.220-tool-parity.md`](../docs/plan/48-claude-code-2.1.220-tool-parity.md).
-Plan 49 now adds an executable file/search gate on top of that corpus: generated
-`paired-parity.json` contracts cover every `same` matrix cell, CC fixtures carry
-per-call Pre/Post hook lifecycle evidence, and one fixed Rust test runs the real
-kloop dispatcher and emits the call/event report compared by `verify.py`. The
-comparison includes normalized inputs, lifecycle, results, ordering, and workspace;
-cross-profile cells additionally require exact-bundle profile-bridge evidence. The default
-verifier checks the pinned binary and bundle bytes; `verify.py --corpus-only`
-keeps all fixture/hash/tamper/matrix/pair/Rust checks for ordinary macOS/Linux
-CI runners that do not contain the target binary.
+Plans 48–59 pin comparison to one exact Claude Code 2.1.220 darwin-arm64 binary and publish the auditable corpus under [`../refs/claude-code-2.1.220/`](../refs/claude-code-2.1.220/). The final generated snapshot contains:
 
-Plan 50 closes the foreground Bash slice against the same exact binary. Its corpus had
-82 captures and 109 static-evidence records; the generated 56-row/448-cell matrix contained
-10 `same` cells, all covered by four executable contracts. The `bash-batching` contract
-compares the same read-only and opaque-redirection calls through CC's hook trace and kloop's
-real dispatcher report. Schema, output, timeout/cancellation trees and process survival are
-captured separately.
+- 14 executed local profiles, 218 captures, and 65 two-capture determinism groups;
+- 214 static-evidence records;
+- 62 matrix rows × 8 dimensions = 496 cells;
+- 24 `same`, 141 `compatible`, 169 `intentional-diff`, 5 `missing`, 133 `unknown`, and 24 `n/a` cells;
+- 7 executable pair contracts covering all 24 `same` cells;
+- 108 generated per-cell exact-bundle profile bridges.
 
-Plan 51 extends that corpus to 83 captures and 116 static-evidence records. Exact successful
-and failed background-Bash fixtures prove terminal task updates, one-shot notifications, and
-a following `task-notification` sampling step. kloop now emits session-scoped lifecycle events
-for background shells, agents, and programs; reinjects shell terminal status plus its output-file
-pointer at the next step boundary; and explicitly shuts background work down before worktree
-teardown. CC's auto-background, stall detection, and feature-gated model-visible Monitor remain
-deliberate product boundaries rather than unproven parity claims.
+The verifier requires every bundle record to be byte-anchored, static evidence to cover the cited dimension, dimension-specific typed CC runtime witnesses with explicit required-tool sets for composite rows, bilateral evidence for `compatible`/`intentional-diff`, an exact three-ID kloop-only allowlist, matrix-bound profile-bridge fixtures, byte-deterministic native reports, and fresh generated artifacts. It rejects metadata result spoofing, report/matrix/profile-bridge tampering, and unanchored descriptive locators. The default verifier checks the pinned executable and exact bundle bytes; `--corpus-only` retains corpus, matrix, pair, bridge, native Rust report, sensitive-data, and fail-closed checks without reading the target binary.
 
-Plan 52–55 continue the same evidence discipline. Agent/task/team, interaction/workflow,
-discovery/extension, and Web/remote controls remain explicit native-vs-CC adapters rather
-than name-based claims. Plan 55 grows the fixed corpus to **145 captures / 180 static
-evidence**; splitting WebSearch clean/allow execution profiles produces a conservative
-57-row/456-cell matrix at 92 compatible / 149 intentional-diff / 34 missing / 149 unknown /
-22 n/a / 10 same. CC WebFetch loopback cases still stop before transport with zero local
-requests; CC WebSearch success/empty/error does reach a hermetic local provider side query.
-True remote/cloud lifecycle and every unexecuted Web transport branch remain unknown.
+Plan 59 also runs five core-dispatch cross-tool scenarios: file/search→Bash→Worktree with isolated Git subprocess configuration; exact-count background Bash→Agent→scheduler reinjection and live shutdown; selective ToolSource/resource→local Web seam with observed approval-before-dispatch and denied-call isolation; Ask→Plan→Workflow; and Notebook→file mutation with LSP negative boundary. The report records `target_entrypoint=local-cli` separately from `kloop_entrypoint=core-dispatch-test-harness`, so it does not claim to execute CLI startup wiring. Seam-only, surface-gated, and negative-boundary branches are labeled as such and are not counted as execution of absent MCP transport, Monitor, PTY, or LSP surfaces.
 
-Plan 58 completes the native scheduler slice. The final corpus has **218 captures /
-211 static-evidence records** and a **62-row / 496-cell** matrix: 125 compatible /
-170 intentional-diff / 24 missing / 129 unknown / 24 n/a / 24 same. Seven executable
-pair contracts cover every `same` cell, including the new scheduler schema, cron-contract,
-and concurrency comparators. Exact timed fire, DST/clock-jump behavior, server-selected
-jitter, restart/re-arm, and enabled dynamic-loop execution remain `unknown`.
+The accepted scope is only exact 2.1.220, darwin-arm64 local CLI, `team=false`, `remote=false`, and the condition vectors recorded in `manifest.json`. The result is **limited behavioral compatibility**, not full-tool parity, wire/schema/UI identity, or a drop-in replacement claim. The five out-of-scope SendMessage `missing` cells, accepted safety differences, condition-bound `unknown`, profile/surface `n/a`, and three kloop-only rows remain explicit.
 
-This baseline is evidence and a roadmap, not a claim that all tools already
-match or that kloop can replace Claude Code. Plan 58 completes the scheduler
-cluster; product-level gaps and unknowns remain, including the Plan 59 cluster,
-and kloop-only capabilities stay intentionally separate.
-
+See the [exact corpus guide](../refs/claude-code-2.1.220/README.md), [methodology and history](../refs/README.md), [Plan 59 final acceptance](../docs/plan/59-tool-parity-acceptance.md), and [capability report](../docs/capability-report.md).
 
 ## Compaction (Phase 2, first slice)
 

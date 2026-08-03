@@ -16,11 +16,15 @@ mod plan50_parity_tests;
 #[cfg(test)]
 mod plan52_parity_tests;
 #[cfg(test)]
+mod plan53_parity_tests;
+#[cfg(test)]
 mod plan56_parity_tests;
 #[cfg(test)]
 mod plan57_parity_tests;
 #[cfg(test)]
 mod plan58_parity_tests;
+#[cfg(test)]
+mod plan59_acceptance_tests;
 mod plan_mode;
 mod question;
 mod run_store;
