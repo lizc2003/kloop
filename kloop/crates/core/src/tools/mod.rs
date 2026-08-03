@@ -14,6 +14,8 @@ mod plan49_parity_tests;
 mod plan50_parity_tests;
 #[cfg(test)]
 mod plan52_parity_tests;
+#[cfg(test)]
+mod plan56_parity_tests;
 mod plan_mode;
 mod question;
 mod run_store;
@@ -1112,7 +1114,9 @@ pub(crate) mod testutil {
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
-                active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                active_worktree: std::sync::Arc::new(
+                    crate::worktree::ActiveWorktreeState::default(),
+                ),
                 surface: Default::default(),
             }),
             ui: Arc::new(SilentUi),
@@ -2020,7 +2024,9 @@ mod tests {
                 background_tasks: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
-                active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                active_worktree: std::sync::Arc::new(
+                    crate::worktree::ActiveWorktreeState::default(),
+                ),
                 surface: Default::default(),
             }),
             ui: Arc::new(NullUi),

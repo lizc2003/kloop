@@ -1110,49 +1110,62 @@ Sub-agent transcripts are persisted in their own `{parent}-agent-N.jsonl` files 
 
 ### Worktree isolation
 
-Two entry points put an agent into a private git worktree — a separate checkout
-on its own branch — so edits to the *same relative path* don't race on the
-shared tree (`crates/core/src/worktree.rs`, plan 35; the shape cc and codex
-converged on). Both create `git worktree add --no-track -B
-kloop/worktree/<name> .kloop-worktrees/<name> HEAD` (the managed dir is added to
-`.git/info/exclude`) and rewire the **cwd anchor** onto the tree.
+kloop has two intentionally separate worktree lifecycles. Both use the shared
+provenance-aware Git implementation in `crates/core/src/worktree.rs`, but they
+do not share ownership, an active slot, or deletion rights:
 
-`Config.cwd` is that anchor: bash's working directory, relative file/search
-paths, the permission gate's acceptEdits check, and the OS sandbox's writable
-root all key off it (a fifth thing rewrites too — the system prompt's
-`Working directory:` line, or the model builds absolute paths from the old cwd
-and writes past the tree). The main agent's cwd is the process cwd, so nothing
-changes there; only a worktree agent diverges. `offload_dir` and `sessions_dir`
-deliberately do **not** follow — offload/session files stay in the main repo.
-Not under `.kloop/` (that's a protected sensitive path in both the permission
-gate and the sandbox); a sibling `.kloop-worktrees/` dodges both.
+- **Task isolation**: `task {"prompt":"...","isolation":"worktree"}` creates a
+  task-owned checkout from the current HEAD. A clean task tree is removed when
+  the task finishes; a tree with uncommitted changes, commits, or an uncertain
+  Git probe is retained and reported. Parallel task worktree mutations are
+  serialized per Git common directory.
+- **Session worktrees**: at depth zero, and only when the current frontend
+  enables the worktree surface, the model may create or enter a worktree and
+  move the whole session into it. `kloop --worktree[=<name>]` is the separate
+  CLI startup shortcut; its optional CLI value is not the model-tool schema.
 
-- **Sub-agent isolation** (slice 1): a `task` call adds `"isolation":
-  "worktree"`, so parallel sub-agents each get a throwaway tree. Parallel `git
-  worktree add`/`remove` are serialized under a process lock (concurrent ones
-  race on the repo's ref locks and silently lose a tree).
-- **Session worktrees** (slice 2): the model calls `enter_worktree {name}` to
-  move the *whole session* into a tree (its cwd switches immediately via a
-  mutable slot the `Config.effective_*` accessors read) and `exit_worktree` to
-  leave; `kloop --worktree[=<name>]` enters one at startup. One tree per
-  session; a sub-agent spawned while in it inherits the tree as its base cwd.
-  Works in every session but `--mock`, **including server threads** (each
-  thread has its own slot; a `thread/worktree` notification — `{cwd, branch,
-  active}` — reports each switch so an IDE can follow it, and an un-exited tree
-  is torn down when the thread ends). The `--worktree` startup flag stays
-  single-session (rejected with `--serve`).
+The session tools use strict inputs:
 
-Lifecycle (no auto-merge, both references stop here): an **untouched** tree
-(clean, no commits past HEAD) is torn down with its branch; a **changed** tree
-is kept, and the result names its branch + path so you can `git merge
-kloop/worktree/<name>` (commit first if uncommitted) or discard it.
-`exit_worktree {discard_changes:true}` force-removes even a dirty tree. The
-change probe is **fail-closed** (git untrusted → tree kept). Creation is
-fail-closed too — a non-git cwd, a name collision, or a git error is an error,
-never a silent fall back to the shared cwd.
+```json
+{"name": "feature/parser"}                        // enter_worktree
+{"path": "/absolute/registered/worktree"}        // enter_worktree
+{}                                                 // generated name
+{"action": "keep"}                               // exit_worktree
+{"action": "remove", "discard_changes": true}  // exit_worktree
+```
 
-Not yet (挂账): an `origin/HEAD` base ref for CI, and 30-day stale-tree pruning
-(`git worktree prune` by hand for now).
+`name` and `path` are optional but mutually exclusive. Explicit nulls, wrong
+types, and unknown fields are rejected. Names are at most 64 characters and
+may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
+encoded as `+`. Managed trees live at `.claude/worktrees/<encoded-name>` on
+`worktree-<encoded-name>`. An existing `path` must canonicalize to a registered
+worktree with the same Git common directory. Entering by path grants
+**External** custody only.
+
+`exit_worktree` always requires an explicit action. `keep` restores the base cwd
+and leaves the checkout and branch intact. `remove` may delete only the
+Managed tree created by this session. By default it refuses tracked, staged,
+untracked, or ignored changes and commits after the recorded base;
+`discard_changes:true` may override only those successfully observed content
+changes. It never overrides repository/path/registration/branch/base/owner
+provenance failures, and it cannot delete an External, task-owned, or
+previous-session tree. A refused/failed removal keeps the active handle and cwd
+so the operation can be retried or kept safely.
+
+Entering a session tree changes the complete effective workspace anchor:
+Read/Write/Edit, Glob/Grep, Bash, permissions, sandbox writable roots, fresh
+file-observation state, and the system prompt's `Working directory:` all follow
+the new cwd. Dynamic `AllowAlways` rules remain session-global across that
+rebase; only per-workspace session approvals start fresh. Successful enter and
+exit operations emit `CwdChanged`, which keeps the TUI header/search root and
+server cwd projection synchronized. A shared child agent inherits the active
+effective cwd; an isolated task gets its own task-owned tree.
+
+There is no automatic merge, rebase, commit, push, or discard. Session shutdown
+has no implicit remove intent, so an active session tree is retained even when
+clean. Task-owned clean trees still use their separate automatic cleanup rule.
+Use `git worktree list` to inspect retained trees and merge or remove them
+explicitly.
 
 ## OS sandbox (Phase 2, thirteenth slice)
 

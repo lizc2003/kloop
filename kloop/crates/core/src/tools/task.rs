@@ -174,14 +174,21 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
     let outcome = match handle.await {
         Ok(outcome) => outcome,
         Err(error) => {
-            if let Some(worktree) = worktree {
-                worktree::finish(worktree).await;
-            }
+            let cleanup_error = if let Some(worktree) = worktree {
+                worktree::finish(worktree).await.err()
+            } else {
+                None
+            };
             emit_agent_end(&ui, &agent, false);
-            return Err(anyhow!("workflow agent: sub-agent panicked: {error}"));
+            return match cleanup_error {
+                Some(cleanup) => Err(anyhow!(
+                    "workflow agent: sub-agent panicked: {error}; worktree cleanup failed: {cleanup:#}"
+                )),
+                None => Err(anyhow!("workflow agent: sub-agent panicked: {error}")),
+            };
         }
     };
-    let result = match outcome.reason {
+    let mut result = match outcome.reason {
         EndReason::Completed => outcome.structured_output.ok_or_else(|| {
             anyhow!("workflow agent: child completed without valid StructuredOutput")
         }),
@@ -192,8 +199,14 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
         EndReason::Error(error) => Err(anyhow!("workflow agent: child failed: {error}")),
     };
     if let Some(worktree) = worktree {
-        if let Some(note) = worktree::finish(worktree).await {
-            ui.emit(&Event::Note(note.trim().to_string()));
+        match worktree::finish(worktree).await {
+            Ok(Some(note)) => ui.emit(&Event::Note(note.trim().to_string())),
+            Ok(None) => {}
+            Err(error) => {
+                result = Err(anyhow!(
+                    "workflow agent: worktree cleanup failed: {error:#}"
+                ));
+            }
         }
     }
     emit_agent_end(&ui, &agent, result.is_ok());
@@ -317,12 +330,18 @@ async fn run_sub_agent_sync(
     let outcome = match handle.await {
         Ok(outcome) => outcome,
         Err(e) => {
-            // A panic still tears down the worktree (dirty ones are kept).
-            if let Some(wt) = worktree {
-                worktree::finish(wt).await;
-            }
+            let cleanup_error = if let Some(wt) = worktree {
+                worktree::finish(wt).await.err()
+            } else {
+                None
+            };
             emit_agent_end(&ui, &agent, false);
-            return Err(anyhow!("{who}: sub-agent panicked: {e}"));
+            return match cleanup_error {
+                Some(cleanup) => Err(anyhow!(
+                    "{who}: sub-agent panicked: {e}; worktree cleanup failed: {cleanup:#}"
+                )),
+                None => Err(anyhow!("{who}: sub-agent panicked: {e}")),
+            };
         }
     };
     let mut result = match outcome.reason {
@@ -338,9 +357,15 @@ async fn run_sub_agent_sync(
     // one lives (only on a success result — an error already routes to is_error
     // guidance; the changes still sit on the branch for the user).
     if let Some(wt) = worktree {
-        if let Some(note) = worktree::finish(wt).await {
-            if let Ok(text) = &mut result {
-                text.push_str(&note);
+        match worktree::finish(wt).await {
+            Ok(Some(note)) => {
+                if let Ok(text) = &mut result {
+                    text.push_str(&note);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                result = Err(anyhow!("{who}: worktree cleanup failed: {error:#}"));
             }
         }
     }
@@ -409,7 +434,9 @@ async fn spawn_background(
         // The slot couldn't be reserved: nothing will run, so undo the worktree
         // now instead of leaking an empty tree.
         if let Some(wt) = worktree {
-            worktree::finish(wt).await;
+            worktree::finish(wt)
+                .await
+                .map_err(|error| anyhow!("task: {msg}; worktree cleanup failed: {error:#}"))?;
         }
         return Err(anyhow!("task: {msg}"));
     }
@@ -445,7 +472,7 @@ async fn spawn_background(
         let ui = ui.clone();
         let description = description.clone();
         async move {
-            let (status, mut reinject) = match worker.await {
+            let (mut status, mut reinject) = match worker.await {
                 Ok(outcome) => classify_background(outcome),
                 Err(error) if error.is_cancelled() => (TaskStatus::Aborted, None),
                 Err(error) => (
@@ -460,11 +487,26 @@ async fn spawn_background(
             // session-scoped terminal event so the preserved tree is never hidden.
             let mut cleanup_detail = None;
             if let Some(wt) = worktree {
-                if let Some(note) = worktree::finish(wt).await {
-                    cleanup_detail = Some(note.trim().to_string());
-                    match &mut reinject {
-                        Some(summary) => summary.push_str(&note),
-                        None => reinject = Some(note.trim_start().to_string()),
+                match worktree::finish(wt).await {
+                    Ok(Some(note)) => {
+                        cleanup_detail = Some(note.trim().to_string());
+                        match &mut reinject {
+                            Some(summary) => summary.push_str(&note),
+                            None => reinject = Some(note.trim_start().to_string()),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        status = TaskStatus::Failed;
+                        let note = format!("[worktree cleanup failed] {error:#}");
+                        cleanup_detail = Some(note.clone());
+                        match &mut reinject {
+                            Some(summary) => {
+                                summary.push('\n');
+                                summary.push_str(&note);
+                            }
+                            None => reinject = Some(note),
+                        }
                     }
                 }
             }
@@ -623,7 +665,7 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -
         file_state: Arc::new(crate::file_state::FileState::default()),
         sandbox: ctx.cfg.effective_sandbox(),
         system: ctx.cfg.effective_system(),
-        active_worktree: Arc::new(std::sync::RwLock::new(None)),
+        active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
         ..(*ctx.cfg).clone()
     }
 }
@@ -779,7 +821,7 @@ mod tests {
             "carries the sub-agent result: {out}"
         );
         assert!(
-            out.contains("kloop/worktree/agent-"),
+            out.contains("worktree-agent-"),
             "the kept tree's branch is named: {out}"
         );
 
@@ -788,7 +830,7 @@ mod tests {
             !repo.join("isolated.txt").exists(),
             "main repo must be untouched"
         );
-        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".claude/worktrees"))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -834,7 +876,7 @@ mod tests {
         let reqs = seen.lock().unwrap();
         let system = &reqs[0].system;
         assert!(
-            system.contains(".kloop-worktrees/agent-"),
+            system.contains(".claude/worktrees/agent-"),
             "system points at the worktree: {system}"
         );
         assert!(
@@ -862,7 +904,7 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert_eq!(out, "looked around", "no branch note for a clean tree");
-        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".claude/worktrees"))
             .map(|d| d.filter_map(|e| e.ok()).collect())
             .unwrap_or_default();
         assert!(
@@ -872,7 +914,7 @@ mod tests {
         let branches = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["branch", "--list", "kloop/worktree/*"])
+            .args(["branch", "--list", "worktree-*"])
             .output()
             .unwrap();
         assert!(
@@ -920,7 +962,7 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         assert!(!repo.join("out.txt").exists(), "main repo stays clean");
-        let mut trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let mut trees: Vec<_> = std::fs::read_dir(repo.join(".claude/worktrees"))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())

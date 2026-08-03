@@ -148,8 +148,11 @@ pub async fn run(
     // catalog (built-ins then loaded skills/commands — the same set
     // `commands::run` dispatches, plan 38 slice 4). The `@` menu searches from
     // the project cwd.
+    let effective_cwd = cfg.effective_cwd();
+    let effective_branch = git_branch(&effective_cwd);
     let mut app = App::new(session_id)
         .with_commands(slash_catalog(&cfg))
+        .with_working_directory(display_cwd(&effective_cwd), effective_branch.clone())
         .with_context(
             cfg.model.clone(),
             cfg.context_window,
@@ -163,12 +166,12 @@ pub async fn run(
         0,
         Cell::SessionHeader {
             model: cfg.model.clone(),
-            cwd: display_cwd(&cfg.cwd),
-            branch: git_branch(&cfg.cwd),
+            cwd: display_cwd(&effective_cwd),
+            branch: effective_branch,
             mode: permissions.mode().label().to_string(),
         },
     );
-    let cwd = cfg.cwd.clone();
+    let cwd = effective_cwd;
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let worker = tokio::spawn(agent_worker(
@@ -607,6 +610,13 @@ fn autowake_ready(running: bool, inbox: &Inbox) -> bool {
     !running && !inbox.is_empty()
 }
 
+fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
+    match event {
+        AgentEvent::Core(CoreEvent::CwdChanged { cwd, .. }) => Some(std::path::PathBuf::from(cwd)),
+        _ => None,
+    }
+}
+
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
@@ -614,7 +624,7 @@ async fn ui_loop(
     inbox: Arc<Inbox>,
     permissions: Arc<kloop_core::permissions::Permissions>,
     mut app: App,
-    cwd: std::path::PathBuf,
+    mut cwd: std::path::PathBuf,
 ) -> Result<()> {
     // Seed the status-bar badge from the real starting mode (e.g. plan). The
     // App is built in `run` (transcript replay + `/` menu catalog); a resumed
@@ -780,6 +790,9 @@ async fn ui_loop(
                 // sees it.
                 let mut quit = matches!(event, AgentEvent::Quit);
                 if !quit {
+                    if let Some(next_cwd) = event_cwd(&event) {
+                        cwd = next_cwd;
+                    }
                     app.apply(event);
                 }
                 // Drain whatever else already arrived (streaming deltas come
@@ -788,6 +801,9 @@ async fn ui_loop(
                     if matches!(event, AgentEvent::Quit) {
                         quit = true;
                     } else {
+                        if let Some(next_cwd) = event_cwd(&event) {
+                            cwd = next_cwd;
+                        }
                         app.apply(event);
                     }
                 }

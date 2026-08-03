@@ -286,7 +286,7 @@ pub struct Permissions {
     /// Enter/Exit and the TUI mode cycle one atomic transition.
     mode: Arc<Mutex<ModeState>>,
     /// Mutable: `AllowAlways` appends at runtime.
-    allow: Mutex<Vec<Rule>>,
+    allow: Arc<Mutex<Vec<Rule>>>,
     deny: Vec<Rule>,
     ask: Vec<Rule>,
     session: Mutex<HashSet<String>>,
@@ -306,7 +306,7 @@ impl Permissions {
                 current: Mode::Bypass,
                 pre_plan: Mode::Manual,
             })),
-            allow: Mutex::new(Vec::new()),
+            allow: Arc::new(Mutex::new(Vec::new())),
             deny: Vec::new(),
             ask: Vec::new(),
             session: Mutex::new(HashSet::new()),
@@ -329,7 +329,7 @@ impl Permissions {
                 current: mode,
                 pre_plan: Mode::Manual,
             })),
-            allow: Mutex::new(parse_rules(&rules.allow)?),
+            allow: Arc::new(Mutex::new(parse_rules(&rules.allow)?)),
             deny: parse_rules(&rules.deny)?,
             ask: parse_rules(&rules.ask)?,
             session: Mutex::new(HashSet::new()),
@@ -352,7 +352,7 @@ impl Permissions {
             allow_everything: self.allow_everything,
             // Share the transition state: mode changes are session-global.
             mode: self.mode.clone(),
-            allow: Mutex::new(self.allow.lock().unwrap().clone()),
+            allow: self.allow.clone(),
             deny: self.deny.clone(),
             ask: self.ask.clone(),
             session: Mutex::new(HashSet::new()),
@@ -743,6 +743,8 @@ struct CallFacts {
     bash: Option<BashAnalysis>,
     path: Option<PathFacts>,
     sensitive_read: bool,
+    entering_existing_worktree: bool,
+    removing_worktree: bool,
 }
 
 struct PathFacts {
@@ -783,10 +785,26 @@ impl CallFacts {
             bash,
             path,
             sensitive_read,
+            entering_existing_worktree: name == "enter_worktree"
+                && input.get("path").is_some_and(Value::is_string),
+            removing_worktree: name == "exit_worktree"
+                && input["action"].as_str() == Some("remove"),
         }
     }
 
     fn hazard(&self, name: &str) -> Option<Hazard> {
+        if self.entering_existing_worktree {
+            return Some(Hazard {
+                tag: "existing worktree",
+                rememberable: false,
+            });
+        }
+        if self.removing_worktree {
+            return Some(Hazard {
+                tag: "destructive",
+                rememberable: false,
+            });
+        }
         if let Some(BashAnalysis::Commands(cmds)) = &self.bash {
             if cmds
                 .iter()
@@ -819,12 +837,11 @@ impl CallFacts {
             // task itself touches nothing; every tool call the sub-agent
             // makes passes through this same gate.
             "task" => true,
-            // enter/exit_worktree only manage the session's isolated worktree
-            // (create a tree under .kloop-worktrees/, or tear one down keeping
-            // dirty changes on its branch) — non-destructive workspace control,
-            // auto-allowed like task; the work done INSIDE the tree is gated
-            // per call as usual.
-            "enter_worktree" | "exit_worktree" => true,
+            // Creating a managed tree and keeping one are session controls. An
+            // existing-path Enter and remove action are intercepted as hazards
+            // above; remove is also mutating for the plan-mode gate.
+            "enter_worktree" => true,
+            "exit_worktree" => !self.removing_worktree,
             // exit_plan_mode only shows the plan and flips the session mode —
             // no system side effect. Read-only here so it passes the plan-mode
             // gate above and does its own approval (Permissions::confirm_exit_plan).
@@ -1784,6 +1801,20 @@ mod tests {
         assert_eq!(*persisted.lock().unwrap(), vec!["bash(cargo build *)"]);
         // the new rule is live immediately: same prefix no longer asks
         assert!(ok(&p, "bash", bash("cargo build --release")).await);
+        assert_eq!(approver.ask_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebased_allow_always_updates_the_base_gate() {
+        let approver = ScriptedApprover::new(vec![Decision::AllowAlways]);
+        let base = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let worktree = base.rebased(PathBuf::from("/work/tree"));
+
+        assert!(ok(&worktree, "bash", bash("cargo build")).await);
+        assert!(
+            ok(&base, "bash", bash("cargo build --release")).await,
+            "the base gate sees rules granted inside the worktree"
+        );
         assert_eq!(approver.ask_count(), 1);
     }
 

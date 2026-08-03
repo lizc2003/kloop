@@ -158,7 +158,7 @@ pub struct Config {
     /// mutable slot (not a plain field) because enter/exit flip it mid-session,
     /// immediately, without rebuilding the Config. Sub-agents get a FRESH empty
     /// slot — they can't enter/exit; see `clone_for_subagent`.
-    pub active_worktree: Arc<std::sync::RwLock<Option<crate::worktree::ActiveWorktree>>>,
+    pub active_worktree: Arc<crate::worktree::ActiveWorktreeState>,
     /// Session-control tools are capability-gated per frontend. The set is
     /// immutable for a Config so mode changes never churn the provider tool array.
     pub surface: SurfaceCapabilities,

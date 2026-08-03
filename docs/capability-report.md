@@ -1,7 +1,7 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-07-31,plan 1–55 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
-> parity corpus、Plan 49–55 各工具簇闭环见对应计划。
+> 基线:2026-07-31,plan 1–56 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> parity corpus、Plan 49–56 各工具簇闭环见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
@@ -59,7 +59,7 @@
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
 | Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
 
-### 4. 工具面——🟡 主干齐；Plan 49–55 已完成 exact parity 分簇闭环
+### 4. 工具面——🟡 主干齐；Plan 49–56 已完成 exact parity 分簇闭环
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -98,7 +98,8 @@ TaskStop/session cleanup 和 URL/Bash 权限分流。clean CLI 未暴露 Monitor
 server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missing`。kloop 不新增同名工具；
 它为 shell/agent/program 发无 turn owner 的统一 lifecycle event，后台 shell 终态只回灌状态和输出
 文件指针（不塞命令输出），TUI 空闲自动唤醒、plain/server 下一 turn 交付；两套 registry 各自原子
-裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再清 worktree。
+裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再完成后台
+registry teardown；session active worktree 无 remove intent 时保留。
 自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，corpus 现为
@@ -131,11 +132,23 @@ case 都是 zero request，executor 不越权升级。CC WebSearch allow profile
 SSRF/DNS/credential/redirect/5 MiB/50k 防线，以及按 Tavily/Brave key 条件注册的 bounded text search。
 remote 只证明 gate false 时 worktree/local fallback；remote=true/cloud lifecycle 继续 unknown。
 
+Plan 56 将 corpus 扩至 190 captures / 188 static evidence，并按 clean、worktree headless、
+worktree interactive 条件拆开 Enter/Exit 行；matrix 为 61 行/488 单元（112 compatible /
+157 intentional-diff / 34 missing / 151 unknown / 24 n/a / 10 same）。kloop 已落地 strict
+`{name?,path?}`、显式 `{action:"keep"|"remove",discard_changes?:bool}`、Managed/External 与
+Session/Task 所有权、provenance 复核、dirty/ignored/commit fail-closed、effective cwd 全链和
+shutdown retain。clean registration 继续是明确 intentional difference；no-active error、External
+不可删除、ignored/provenance 阻断与保守 shutdown 也不伪装 exact same。native Rust report 已接入
+full/corpus verifier 并有 mutation-negative 门；generated executable pair 仍为 4 个。
+
 ### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| worktree 隔离(并行写不互踩) | 双家 | **plan 35 已完成** | — |
+| task worktree 隔离（并行写不互踩） | 双家 | **✅ Plan 35 + Plan 56**：task-owned，clean 自动清理、changed/probe-failure 保留 | 已完成 |
+| session Enter/Exit worktree | CC 单家 + kloop 原生 | **✅ Plan 56（2026-07-31）**：strict name/path、显式 keep/remove/discard、effective cwd 全链切换 | 已完成 |
+| ownership/provenance-safe removal | 安全产品边界 | **✅ Plan 56**：仅当前 session Managed 可删，External/task/previous-session 与 provenance mismatch fail closed | 已完成 |
+| Worktree 条件注册 | 表面策略分歧 | kloop 保留 depth-0 + `SurfaceCapabilities.worktree` gate，matrix 记 `intentional-diff` | 有意保留 |
 | 独立 stable-ID Task registry | CC/CodeWhale 有独立状态层 | **Plan 52 拍板不实现**；todo 与执行 registry 分层保留 | 原生多 agent 共享任务分配成为产品需求时另立计划 |
 | send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **Plan 52 仅取证**；内部 Inbox 不暴露 | 需要向运行中子 agent 追加消息或横向协作时 |
 | ListAgents / team roster / remote | exact bundle 有 descriptor/gate；本机 true-profile 不权威 | 保持 `unknown`，不接真实团队/云 | 有 hermetic transport/profile 与明确产品需求时 |
@@ -240,7 +253,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
 - **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
-- **T0 parity 余线**：Plan 56–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
+- **T0 parity 余线**：Plan 56 已完成；Plan 57–59 仍按各自母计划与证据闸门推进，不因 Plan 63 的内部重构改写 exact CC 结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训

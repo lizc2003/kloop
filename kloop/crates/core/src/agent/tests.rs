@@ -329,7 +329,7 @@ async fn mock_end_to_end_three_rounds() {
         background_tasks: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
-        active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
         surface: Default::default(),
     });
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -505,7 +505,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         background_tasks: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
-        active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
         surface: Default::default(),
     })
 }

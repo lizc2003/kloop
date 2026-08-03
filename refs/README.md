@@ -252,6 +252,23 @@ kloop 保留按 Tavily/Brave key 条件注册和 bounded plain-text output；tim
 HTTP provider/CCR proxy 与 lifecycle 仍 `unknown`。remote 只证明 `remote=false` 时请求 remote isolation
 会回退 worktree/local async Agent；true cloud/team 和 remote lifecycle 没有被当前 hermetic profile 裁决。
 
+Plan 56 将 corpus 扩至 **190 captures / 188 static evidence**；其中 worktree 新增 45 组，
+raw/normalized 各一份。matrix 以真实条件向量拆出 clean registration、
+`worktree-scripted-allow-cli` 与 `worktree-scripted-manual-pty` 行，共 61 行/488 单元：
+112 `compatible` / 157 `intentional-diff` / 34 `missing` / 151 `unknown` / 24 `n/a` /
+10 `same`。clean 行只记录 kloop capability-gated registration 的 intentional difference，禁止再把
+worktree=true executor fixture 暗挂到 worktree=false 行。generated executable pair 仍为 4 个；没有把
+native report 或静态结构相似升级成无 comparator 的 `same`。
+
+45 组 exact fixture 固定 strict optional name/path、默认名、registered path、重复/switch Enter、显式
+keep/remove/discard、tracked/untracked/ignored/commit、interactive approve/reject/cancel、same-round/
+concurrent calls、no-active 与 shutdown。每例只操作独立临时 Git repo，并保存 registry、branch/base/HEAD、
+status 与 cleanup 审计。kloop 侧 `kloop-plan56-native-report` 真跑 Rust dispatcher，验证 strict schema/parser、
+managed/external ownership、provenance fail-closed、effective cwd 的文件/搜索/Bash/system 重锚、permission
+与动态 AllowAlways 共享；Python verifier 对缺场景、schema 篡改、cwd 事件重排、external 删除、主树泄漏和
+stale permission gate 做 negative mutation。no-active error、ignored/provenance removal blocker、External
+不可删、session shutdown retain 及条件注册均明确保留为产品/安全差异。
+
 重放入口（目标二进制必须仍与 manifest 的版本、大小和 SHA-256 精确一致）:
 
 ```bash
@@ -274,9 +291,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/48-claude-code-2.1.220-tool-parity.md`；文件/搜索簇的实现与裁决见
 `docs/plan/49-file-search-parity.md`、`docs/plan/50-bash-foreground-parity.md`、
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
-`docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md` 与
-`docs/plan/55-web-remote-parity.md`。Plan 55 的完成不表示 kloop 已全工具对齐或可替换 Claude Code；
-其余产品行为仍由 Plan 56–59 逐簇实现与验收。
+`docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md`、
+`docs/plan/55-web-remote-parity.md` 与 `docs/plan/56-worktree-parity.md`。Plan 56 的完成不表示 kloop
+已全工具对齐或可替换 Claude Code；其余产品行为仍由 Plan 57–59 逐簇实现与验收。
 
 ## 调研结论(三轮调研的浓缩)
 

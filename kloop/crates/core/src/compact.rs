@@ -188,7 +188,7 @@ mod tests {
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
-            active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
             surface: Default::default(),
         })
     }

@@ -5,33 +5,38 @@
 //! which isolates a throwaway sub-agent. The switch flips the session's active
 //! worktree slot; the `effective_*` accessors make it take effect immediately.
 
+use std::path::PathBuf;
+
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Result;
 use serde_json::json;
+use serde_json::Map;
 use serde_json::Value;
 
-use super::str_arg;
 use super::ToolCtx;
 use crate::worktree;
+use crate::worktree::ExitAction;
 use kloop_protocol::ToolDef;
 
 pub(super) fn enter_worktree_def() -> ToolDef {
     ToolDef {
         name: "enter_worktree".into(),
-        description:
-            "Move your session into a fresh isolated git worktree — a separate checkout \
-            on its own branch, created from HEAD — so you can make and test changes without \
-            touching the main working tree. Your working directory switches to the worktree \
-            immediately (relative paths, bash, and file edits all resolve there). Use it before a \
-            risky or exploratory change; call exit_worktree when done. Only one worktree at a time."
-                .into(),
+        description: "Create a managed git worktree and switch this session into it, or pass path to enter an existing registered worktree. name and path are optional but mutually exclusive; omitting both generates a name. Existing paths require approval unless they are managed by the current worktree session."
+            .into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Short task name; becomes the worktree dir and branch (letters, digits, '.', '_', '-')"}
+                "name": {
+                    "type": "string",
+                    "description": "Optional name. Each '/'-separated segment may contain letters, digits, dots, underscores, and dashes; max 64 chars total."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional path to an existing registered worktree. Mutually exclusive with name."
+                }
             },
-            "required": ["name"]
+            "additionalProperties": false
         }),
     }
 }
@@ -39,55 +44,57 @@ pub(super) fn enter_worktree_def() -> ToolDef {
 pub(super) fn exit_worktree_def() -> ToolDef {
     ToolDef {
         name: "exit_worktree".into(),
-        description: "Leave the current worktree and return to the main working tree. By default \
-            an unchanged worktree is removed and one with changes is kept on its branch for you or \
-            the user to merge; pass discard_changes:true to throw the worktree away even if it has \
-            changes."
+        description: "Leave the current worktree and return to the original working directory. action is required: keep preserves the tree and branch; remove deletes a current-session managed tree. remove refuses content changes or commits unless discard_changes is true."
             .into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "discard_changes": {"type": "boolean", "description": "Force-remove the worktree even if it has uncommitted changes or commits (default false)"}
-            }
+                "action": {
+                    "type": "string",
+                    "enum": ["keep", "remove"],
+                    "description": "keep preserves the worktree; remove deletes a current-session managed worktree"
+                },
+                "discard_changes": {
+                    "type": "boolean",
+                    "description": "Allow remove to discard observed content changes or commits"
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
         }),
     }
 }
 
 pub(super) async fn enter_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     guard(ctx, "enter_worktree")?;
-    let name = str_arg(input, "name", "enter_worktree")?;
-    validate_name(name)?;
-    let msg = worktree::enter(&ctx.cfg, name)
-        .await
-        .map_err(|e| anyhow!("enter_worktree: {e:#}"))?;
-    // Tell a cwd-tracking client (the server) the session moved into the tree.
-    if let Some(a) = ctx.cfg.active_worktree.read().unwrap().as_ref() {
+    let parsed = parse_enter(input)?;
+    let message = match parsed {
+        EnterInput::Create(name) => worktree::enter(&ctx.cfg, &name).await,
+        EnterInput::Existing(path) => worktree::enter_existing(&ctx.cfg, &path).await,
+    }
+    .map_err(|error| anyhow!("enter_worktree: {error:#}"))?;
+    if let Some(active) = ctx.cfg.active_worktree.read().unwrap().as_ref() {
         ctx.ui.emit(&crate::event::Event::CwdChanged {
-            cwd: a.cwd.display().to_string(),
-            branch: Some(a.branch.clone()),
+            cwd: active.cwd.display().to_string(),
+            branch: Some(active.branch.clone()),
         });
     }
-    Ok(msg)
+    Ok(message)
 }
 
 pub(super) async fn exit_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     guard(ctx, "exit_worktree")?;
-    let discard = input["discard_changes"].as_bool().unwrap_or(false);
-    let msg = worktree::exit(&ctx.cfg, discard)
+    let (action, discard_changes) = parse_exit(input)?;
+    let message = worktree::exit(&ctx.cfg, action, discard_changes)
         .await
-        .map_err(|e| anyhow!("exit_worktree: {e:#}"))?;
-    // Back in the main checkout (slot cleared) — announce the cwd is `cfg.cwd`.
+        .map_err(|error| anyhow!("exit_worktree: {error:#}"))?;
     ctx.ui.emit(&crate::event::Event::CwdChanged {
         cwd: ctx.cfg.cwd.display().to_string(),
         branch: None,
     });
-    Ok(msg)
+    Ok(message)
 }
 
-/// Both tools are top-level and session-scoped: a sub-agent gets isolation via
-/// `task {isolation:worktree}` instead, and a session without worktree mode
-/// (server threads, --mock) never advertises these — so a stray call is
-/// rejected rather than silently mutating state.
 fn guard(ctx: &ToolCtx, tool: &str) -> Result<()> {
     if ctx.depth >= 1 {
         bail!("{tool}: only the top-level agent manages the session worktree");
@@ -98,20 +105,66 @@ fn guard(ctx: &ToolCtx, tool: &str) -> Result<()> {
     Ok(())
 }
 
-/// A worktree name becomes a directory (`.kloop-worktrees/<name>`) and a branch
-/// (`kloop/worktree/<name>`), so restrict it to a safe leaf.
-fn validate_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
-        && !name.contains("..")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if !ok {
-        bail!(
-            "enter_worktree: invalid name '{name}' (use letters, digits, '.', '_', '-'; no '..')"
-        );
+#[derive(Debug, PartialEq, Eq)]
+enum EnterInput {
+    Create(String),
+    Existing(PathBuf),
+}
+
+fn strict_object<'a>(input: &'a Value, tool: &str) -> Result<&'a Map<String, Value>> {
+    input
+        .as_object()
+        .ok_or_else(|| anyhow!("{tool}: input must be an object"))
+}
+
+fn reject_unknown(object: &Map<String, Value>, allowed: &[&str], tool: &str) -> Result<()> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        bail!("{tool}: unexpected parameter `{key}`");
     }
     Ok(())
+}
+
+fn optional_string(object: &Map<String, Value>, key: &str, tool: &str) -> Result<Option<String>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{tool}: `{key}` must be a string"),
+    }
+}
+
+fn parse_enter(input: &Value) -> Result<EnterInput> {
+    let object = strict_object(input, "enter_worktree")?;
+    reject_unknown(object, &["name", "path"], "enter_worktree")?;
+    let name = optional_string(object, "name", "enter_worktree")?;
+    let path = optional_string(object, "path", "enter_worktree")?;
+    match (name, path) {
+        (Some(_), Some(_)) => bail!("Provide at most one of `name` or `path`, not both."),
+        (Some(name), None) => {
+            worktree::validate_name(&name)?;
+            Ok(EnterInput::Create(name))
+        }
+        (None, Some(path)) => Ok(EnterInput::Existing(PathBuf::from(path))),
+        (None, None) => Ok(EnterInput::Create(worktree::generated_name())),
+    }
+}
+
+fn parse_exit(input: &Value) -> Result<(ExitAction, bool)> {
+    let object = strict_object(input, "exit_worktree")?;
+    reject_unknown(object, &["action", "discard_changes"], "exit_worktree")?;
+    let action = match object.get("action") {
+        Some(Value::String(action)) if action == "keep" => ExitAction::Keep,
+        Some(Value::String(action)) if action == "remove" => ExitAction::Remove,
+        Some(Value::String(_)) | None => {
+            bail!("exit_worktree: `action` must be one of \"keep\" or \"remove\"")
+        }
+        Some(_) => bail!("exit_worktree: `action` must be a string"),
+    };
+    let discard_changes = match object.get("discard_changes") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => bail!("exit_worktree: `discard_changes` must be a boolean"),
+    };
+    Ok((action, discard_changes))
 }
 
 #[cfg(test)]
@@ -131,9 +184,9 @@ mod tests {
 
         let (out, is_error) = run_tool("enter_worktree", json!({"name": "feat"}), &base).await;
         assert!(!is_error, "{out}");
-        assert!(out.contains("Entered worktree"), "{out}");
+        assert!(out.contains("Created worktree"), "{out}");
         // The session's effective cwd is now the worktree.
-        let wt = repo.join(".kloop-worktrees/feat");
+        let wt = repo.join(".claude/worktrees/feat");
         assert_eq!(base.cfg.effective_cwd(), wt);
 
         // A relative write resolves against the worktree, not the main repo.
@@ -147,13 +200,10 @@ mod tests {
         assert!(wt.join("note.txt").exists(), "write landed in the worktree");
         assert!(!repo.join("note.txt").exists(), "main repo untouched");
 
-        let (out, is_error) = run_tool("exit_worktree", json!({}), &base).await;
+        let (out, is_error) = run_tool("exit_worktree", json!({"action": "keep"}), &base).await;
         assert!(!is_error, "{out}");
-        assert!(out.contains("Back in"), "{out}");
-        assert!(
-            out.contains("kloop/worktree/feat"),
-            "kept tree named: {out}"
-        );
+        assert!(out.contains("back in"), "{out}");
+        assert!(out.contains("worktree-feat"), "kept tree named: {out}");
         assert!(
             base.cfg.active_worktree.read().unwrap().is_none(),
             "slot cleared"
@@ -168,10 +218,13 @@ mod tests {
         let repo = temp_git_repo("clean");
         let ctx = git_ctx(test_ctx(0, "clean"), &repo, true);
         run_tool("enter_worktree", json!({"name": "look"}), &ctx).await;
-        let (out, is_error) = run_tool("exit_worktree", json!({}), &ctx).await;
+        let (out, is_error) = run_tool("exit_worktree", json!({"action": "remove"}), &ctx).await;
         assert!(!is_error, "{out}");
-        assert!(out.contains("no changes"), "{out}");
-        assert!(!repo.join(".kloop-worktrees/look").exists(), "tree removed");
+        assert!(out.contains("removed worktree"), "{out}");
+        assert!(
+            !repo.join(".claude/worktrees/look").exists(),
+            "tree removed"
+        );
         assert_eq!(ctx.cfg.effective_cwd(), repo, "back to the main repo");
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -185,12 +238,17 @@ mod tests {
         run_tool("enter_worktree", json!({"name": "a"}), &ctx).await;
         let (out, is_error) = run_tool("enter_worktree", json!({"name": "b"}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("already inside"), "{out}");
-        let _ = run_tool("exit_worktree", json!({}), &ctx).await;
+        assert!(out.contains("Already in a worktree session"), "{out}");
+        let _ = run_tool(
+            "exit_worktree",
+            json!({"action": "remove", "discard_changes": true}),
+            &ctx,
+        )
+        .await;
 
         let (out, is_error) = run_tool("enter_worktree", json!({"name": "../escape"}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("invalid name"), "{out}");
+        assert!(out.contains("Invalid worktree name"), "{out}");
 
         let nogit =
             std::env::temp_dir().join(format!("kloop-wt-enter-nogit-{}", std::process::id()));
@@ -237,11 +295,15 @@ mod tests {
         let ctx = git_ctx(test_ctx(0, "discard"), &repo, true);
         run_tool("enter_worktree", json!({"name": "d"}), &ctx).await;
         run_tool("write_file", json!({"path": "x.txt", "content": "y"}), &ctx).await;
-        let (out, is_error) =
-            run_tool("exit_worktree", json!({"discard_changes": true}), &ctx).await;
+        let (out, is_error) = run_tool(
+            "exit_worktree",
+            json!({"action": "remove", "discard_changes": true}),
+            &ctx,
+        )
+        .await;
         assert!(!is_error, "{out}");
-        assert!(out.contains("discarded"), "{out}");
-        assert!(!repo.join(".kloop-worktrees/d").exists(), "tree discarded");
+        assert!(out.contains("Discarded"), "{out}");
+        assert!(!repo.join(".claude/worktrees/d").exists(), "tree discarded");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -264,9 +326,14 @@ mod tests {
         let (out, is_error) = run_tool("task", json!({"prompt": "go"}), &ctx).await;
         assert!(!is_error, "{out}");
         // The sub-agent's relative write landed in the session's worktree.
-        assert!(repo.join(".kloop-worktrees/wt/sub.txt").exists());
+        assert!(repo.join(".claude/worktrees/wt/sub.txt").exists());
         assert!(!repo.join("sub.txt").exists());
-        let _ = run_tool("exit_worktree", json!({"discard_changes": true}), &ctx).await;
+        let _ = run_tool(
+            "exit_worktree",
+            json!({"action": "remove", "discard_changes": true}),
+            &ctx,
+        )
+        .await;
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

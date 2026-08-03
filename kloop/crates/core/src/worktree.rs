@@ -1,185 +1,85 @@
-//! git worktree isolation for parallel sub-agents (plan 35).
+//! Owned git-worktree resources shared by session switching and task isolation.
 //!
-//! A `task {isolation: "worktree"}` sub-agent runs in its own checkout so two
-//! agents can edit the same relative path at once without colliding. The shape
-//! is where claude-code and codex independently converged: a repo-local
-//! worktree dir + one branch per tree, created off HEAD, and a lifecycle that
-//! **never merges back** — an unchanged tree is torn down, a changed one is
-//! kept on its branch for the user (or parent) to reconcile. Nothing here is
-//! automatic beyond create/teardown; there is no PR or auto-merge path, by
-//! design (both references stop here too).
-//!
-//! Layering: this lives in core because the `task` tool (core) owns it and the
-//! cwd it rewires anchors core-owned types (permissions, sandbox). It shells
-//! out to `git` directly — the same subprocess dependency the bash tool
-//! already carries — rather than routing through a provider seam.
+//! A handle records repository provenance, custody, and owner. Deletion always
+//! revalidates that provenance under the process-wide Git mutation lock. Session
+//! and task handles use the same Git operations but never share lifecycle state.
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::LockResult;
+use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
+use std::sync::RwLockWriteGuard;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
 use crate::permissions::Permissions;
 use crate::sandbox::SandboxPolicy;
 
-/// Repo-relative directory holding managed worktrees, one subdir per sub-agent.
-/// Deliberately NOT under `.kloop/`: `.kloop` is a protected sensitive path in
-/// both the permission gate (`path_is_sensitive`) and the sandbox (`.kloop`
-/// read-only subpath), so a worktree there would make every write inside it
-/// look like a write to kloop's own config — the gate would ask on each one
-/// (bypass-immune) and headless runs would deny it. A sibling dir dodges both
-/// while staying repo-local and git-excluded.
-const WORKTREES_DIR: &str = ".kloop-worktrees";
+const WORKTREES_DIR: &str = ".claude/worktrees";
+const WORKTREE_BRANCH_PREFIX: &str = "worktree-";
+static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// Serializes worktree git *mutations* across parallel sub-agents. Concurrent
-/// `git worktree add` / branch-create / `worktree remove` on one repo race on
-/// the repo's ref + worktree-admin locks and one silently loses its tree
-/// (reproduced: two parallel isolated sub-agents, only one tree survives). The
-/// operations are brief, so a process-wide lock costs nothing and buys
-/// correctness. Read probes (`status`/`rev-list` inside a single worktree)
-/// don't take it — they don't touch shared repo state.
-static WORKTREE_LOCK: Mutex<()> = Mutex::const_new(());
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeOwner {
+    Session(String),
+    Task(String),
+}
 
-/// A live worktree the `task` tool created for a sub-agent. Dropping it does
-/// NOT clean up — the caller runs [`finish`] once the sub-agent ends, because
-/// teardown depends on whether the tree was left dirty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeCustody {
+    Managed,
+    External,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeLifecycle {
+    Active,
+    Kept,
+    Removed,
+    Orphaned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitAction {
+    Keep,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeChanges {
+    pub changed_files: usize,
+    pub commits: usize,
+}
+
 #[derive(Debug)]
 pub struct Worktree {
-    /// The sub-agent's cwd: `<repo>/.kloop-worktrees/<name>`.
     pub path: PathBuf,
-    /// The branch the tree checks out: `kloop/worktree/<name>`.
     pub branch: String,
-    /// The commit the tree was branched from (HEAD at creation); teardown
-    /// keeps the tree if any commit landed beyond it.
+    pub custody: WorktreeCustody,
+    pub owner: WorktreeOwner,
+    pub lifecycle: WorktreeLifecycle,
     base: String,
-    /// The main repository root (worktree registry + `.git` live here).
-    repo_root: PathBuf,
+    repository_root: PathBuf,
+    common_dir: PathBuf,
+    canonical_path: PathBuf,
 }
 
-/// Create an isolated worktree named `name` for a sub-agent whose parent cwd
-/// is `cwd`. Fail-closed (cc's shape): a non-git cwd, a name collision, or a
-/// git failure is an error — never a silent fall back to the shared cwd.
-pub async fn create(cwd: &Path, name: &str) -> Result<Worktree> {
-    let repo_root = repo_root(cwd)
-        .await
-        .context("worktree isolation requires a git repository")?;
-    let base = git(&repo_root, &["rev-parse", "HEAD"])
-        .await
-        .context("cannot read HEAD (repository has no commits yet?)")?
-        .trim()
-        .to_string();
-
-    let path = repo_root.join(WORKTREES_DIR).join(name);
-    if path.exists() {
-        bail!("worktree {} already exists", path.display());
-    }
-    let branch = format!("kloop/worktree/{name}");
-
-    let path_str = path.to_string_lossy().to_string();
-    {
-        let _guard = WORKTREE_LOCK.lock().await;
-        // Keep the managed worktrees dir out of the MAIN repo's status
-        // (codex's move); idempotent so repeated spawns don't duplicate the
-        // line, and under the lock so parallel spawns don't clobber the file.
-        exclude_worktrees_dir(&repo_root)?;
-        git(
-            &repo_root,
-            &[
-                "worktree",
-                "add",
-                "--no-track",
-                "-B",
-                &branch,
-                &path_str,
-                &base,
-            ],
-        )
-        .await
-        .with_context(|| format!("git worktree add for branch {branch}"))?;
-    }
-
-    Ok(Worktree {
-        path,
-        branch,
-        base,
-        repo_root,
-    })
-}
-
-/// End-of-life for a sub-agent's worktree: tear it down if untouched, keep it
-/// if the sub-agent left changes. Returns `Some(note)` naming the retained
-/// tree + branch for the parent's tool_result (so a human can merge or discard
-/// it), `None` when the tree was removed. **Fail-closed**: if the change probe
-/// errors, the tree is treated as changed and kept — never silently discarded.
-pub async fn finish(wt: Worktree) -> Option<String> {
-    if has_changes(&wt).await {
-        return Some(format!(
-            "\n\n[Changes were left in the worktree {path} (branch {branch}); they were NOT \
-             merged. Inspect them there — commit and `git merge {branch}` to bring them in, or \
-             `git worktree remove {path}` to discard.]",
-            branch = wt.branch,
-            path = wt.path.display(),
-        ));
-    }
-    // Untouched: remove the tree and its branch.
-    wt.remove().await;
-    None
-}
-
-impl Worktree {
-    /// Delete the tree and its (never-merged) branch. `--force` covers a tree
-    /// git still considers "in use"; under the lock so a remove racing a
-    /// sibling's `worktree add` can't corrupt the registry.
-    async fn remove(&self) {
-        let path_str = self.path.to_string_lossy().to_string();
-        let _guard = WORKTREE_LOCK.lock().await;
-        let _ = git(
-            &self.repo_root,
-            &["worktree", "remove", "--force", &path_str],
-        )
-        .await;
-        let _ = git(&self.repo_root, &["branch", "-D", &self.branch]).await;
-    }
-}
-
-/// The cwd-anchored overrides a worktree imposes, computed from a base (the
-/// agent's current effective state) — shared by the `task` sub-agent rewire
-/// (slice 1) and the session-level [`enter`] (slice 2). Rewriting the system
-/// prompt's working-directory line is what stops the model building absolute
-/// paths from the OLD cwd and writing past the tree. Returns everything but the
-/// cwd itself (which is just `wt_path`).
-pub(crate) fn compute_overrides(
-    base_cwd: &Path,
-    base_permissions: &Arc<Permissions>,
-    base_sandbox: &Option<Arc<SandboxPolicy>>,
-    base_system: &str,
-    wt_path: &Path,
-) -> (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String) {
-    let old = format!("- Working directory: {}", base_cwd.display());
-    let new = format!("- Working directory: {}", wt_path.display());
-    let system = base_system.replacen(&old, &new, 1);
-    let permissions = Arc::new(base_permissions.rebased(wt_path.to_path_buf()));
-    let sandbox = base_sandbox
-        .as_ref()
-        .map(|sb| Arc::new(sb.with_writable_root(wt_path)));
-    (permissions, sandbox, system)
-}
-
-/// A worktree the *session itself* has entered (slice 2: `enter_worktree` /
-/// `--worktree`), as opposed to a `task` sub-agent's throwaway tree. Held in a
-/// mutable slot on [`Config`] so `enter`/`exit` switch the session's cwd at
-/// runtime; the `effective_*` accessors read it. One per session at a time.
 pub struct ActiveWorktree {
     wt: Worktree,
     pub cwd: PathBuf,
-    /// The tree's branch (`kloop/worktree/<name>`), surfaced to a client that
-    /// tracks the session cwd (the server's `thread/cwd/updated` notification).
     pub branch: String,
     pub permissions: Arc<Permissions>,
     pub file_state: Arc<crate::file_state::FileState>,
@@ -187,290 +87,867 @@ pub struct ActiveWorktree {
     pub system: String,
 }
 
-/// Enter a fresh worktree named `name` for the whole session (mutates the
-/// active-worktree slot so the switch takes effect immediately). Errors if
-/// already inside one (one tree per session, codex's rule) or if creation
-/// fails (fail-closed). Returns the model-facing confirmation.
-pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
-    if cfg.active_worktree.read().unwrap().is_some() {
-        bail!("already inside a worktree; call exit_worktree before entering another");
+/// One session's active handle plus an async operation lock. The ordinary read
+/// and write methods preserve the old Config accessor seam; lifecycle operations
+/// take `operation` before inspecting or replacing the slot.
+pub struct ActiveWorktreeState {
+    current: RwLock<Option<ActiveWorktree>>,
+    operation: AsyncMutex<()>,
+}
+
+impl Default for ActiveWorktreeState {
+    fn default() -> Self {
+        Self {
+            current: RwLock::new(None),
+            operation: AsyncMutex::new(()),
+        }
     }
-    // The slot is empty, so the base is cfg.cwd (the main checkout).
-    let wt = create(&cfg.cwd, name).await?;
+}
+
+impl ActiveWorktreeState {
+    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, Option<ActiveWorktree>>> {
+        self.current.read()
+    }
+
+    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Option<ActiveWorktree>>> {
+        self.current.write()
+    }
+}
+
+#[derive(Debug)]
+struct Repository {
+    root: PathBuf,
+    common_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct RegisteredWorktree {
+    path: PathBuf,
+    head: String,
+    branch: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum BasePolicy {
+    Head,
+    Fresh,
+}
+
+/// Create an owned worktree for a task. Task isolation deliberately preserves
+/// its established HEAD base semantics; session creation uses the fresh policy.
+pub async fn create(cwd: &Path, name: &str) -> Result<Worktree> {
+    create_managed(
+        cwd,
+        name,
+        WorktreeOwner::Task(name.to_string()),
+        BasePolicy::Head,
+    )
+    .await
+}
+
+async fn create_managed(
+    cwd: &Path,
+    name: &str,
+    owner: WorktreeOwner,
+    base_policy: BasePolicy,
+) -> Result<Worktree> {
+    validate_name(name)?;
+    let repository = discover_repository(cwd)
+        .await
+        .context("worktree isolation requires a git repository")?;
+    let encoded_name = encode_name(name);
+    let path = repository.root.join(WORKTREES_DIR).join(&encoded_name);
+    let branch = format!("{WORKTREE_BRANCH_PREFIX}{encoded_name}");
+
+    let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
+    if path.symlink_metadata().is_ok() {
+        bail!("worktree {} already exists", path.display());
+    }
+    if git_success(
+        &repository.root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await?
+    {
+        bail!("worktree branch {branch} already exists");
+    }
+    let base = match base_policy {
+        BasePolicy::Head => git_text(&repository.root, &["rev-parse", "HEAD"])
+            .await
+            .context("cannot read HEAD (repository has no commits yet?)")?,
+        BasePolicy::Fresh => fresh_base(&repository.root).await?,
+    };
+    let base = base.trim().to_string();
+    std::fs::create_dir_all(repository.root.join(WORKTREES_DIR))
+        .context("creating managed worktree directory")?;
+    exclude_worktrees_dir(&repository.common_dir)?;
+
+    let path_text = path.to_string_lossy().to_string();
+    git_text(
+        &repository.root,
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            &branch,
+            &path_text,
+            &base,
+        ],
+    )
+    .await
+    .with_context(|| format!("git worktree add for branch {branch}"))?;
+
+    let created = async {
+        let canonical_path = std::fs::canonicalize(&path)
+            .with_context(|| format!("canonicalizing created worktree {}", path.display()))?;
+        let worktree = Worktree {
+            path: canonical_path.clone(),
+            branch: branch.clone(),
+            custody: WorktreeCustody::Managed,
+            owner,
+            lifecycle: WorktreeLifecycle::Active,
+            base,
+            repository_root: repository.root.clone(),
+            common_dir: repository.common_dir.clone(),
+            canonical_path,
+        };
+        verify_provenance(&worktree).await?;
+        Ok::<_, anyhow::Error>(worktree)
+    }
+    .await;
+    if created.is_err() {
+        let _ = git_text(
+            &repository.root,
+            &["worktree", "remove", "--force", &path_text],
+        )
+        .await;
+        let _ = git_text(&repository.root, &["branch", "-D", &branch]).await;
+    }
+    created
+}
+
+async fn fresh_base(repository_root: &Path) -> Result<String> {
+    if let Ok(reference) = git_text(
+        repository_root,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .await
+    {
+        return git_text(repository_root, &["rev-parse", reference.trim()]).await;
+    }
+    if let Ok(branch) = git_text(
+        repository_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .await
+    {
+        let remote = format!("origin/{}", branch.trim());
+        if git_success(
+            repository_root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}"),
+            ],
+        )
+        .await?
+        {
+            return git_text(repository_root, &["rev-parse", &remote]).await;
+        }
+    }
+    git_text(repository_root, &["rev-parse", "HEAD"])
+        .await
+        .context("cannot read HEAD (repository has no commits yet?)")
+}
+
+/// Task teardown: clean resources are removed, while any content or commit is
+/// retained. Probe/remove failures propagate and leave the resource in place.
+pub async fn finish(mut worktree: Worktree) -> Result<Option<String>> {
+    let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
+    verify_provenance(&worktree).await?;
+    let changes = inspect_changes(&worktree).await?;
+    if changes.changed_files > 0 || changes.commits > 0 {
+        worktree.lifecycle = WorktreeLifecycle::Kept;
+        return Ok(Some(retained_note(&worktree)));
+    }
+    remove_managed_locked(&mut worktree, /* force */ false).await?;
+    Ok(None)
+}
+
+pub(crate) fn compute_overrides(
+    base_cwd: &Path,
+    base_permissions: &Arc<Permissions>,
+    base_sandbox: &Option<Arc<SandboxPolicy>>,
+    base_system: &str,
+    worktree_path: &Path,
+) -> (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String) {
+    let old = format!("- Working directory: {}", base_cwd.display());
+    let new = format!("- Working directory: {}", worktree_path.display());
+    let system = base_system.replacen(&old, &new, 1);
+    let permissions = Arc::new(base_permissions.rebased(worktree_path.to_path_buf()));
+    let sandbox = base_sandbox
+        .as_ref()
+        .map(|sandbox| Arc::new(sandbox.with_writable_root(worktree_path)));
+    (permissions, sandbox, system)
+}
+
+pub fn generated_name() -> String {
+    const ADJECTIVES: &[&str] = &["bright", "calm", "gentle", "quiet", "swift", "wild"];
+    const VERBS: &[&str] = &[
+        "drifting", "flowing", "growing", "humming", "moving", "rising",
+    ];
+    const NOUNS: &[&str] = &["brook", "forest", "meadow", "mist", "river", "stone"];
+    let sequence = GENERATED_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let value = sequence ^ nanos.rotate_left(17) ^ u64::from(std::process::id());
+    let adjective = ADJECTIVES[(value as usize) % ADJECTIVES.len()];
+    let verb = VERBS[((value >> 8) as usize) % VERBS.len()];
+    let noun = NOUNS[((value >> 16) as usize) % NOUNS.len()];
+    format!("{adjective}-{verb}-{noun}")
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    if name.len() > 64 {
+        bail!(
+            "Invalid worktree name: must be 64 characters or fewer (got {})",
+            name.len()
+        );
+    }
+    let segments: Vec<_> = name.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "." | ".."))
+    {
+        bail!("Invalid worktree name \"{name}\": must not contain \".\" or \"..\" path segments");
+    }
+    if segments.iter().any(|segment| {
+        segment.is_empty()
+            || !segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    }) {
+        bail!(
+            "Invalid worktree name \"{name}\": each \"/\"-separated segment must be non-empty and contain only letters, digits, dots, underscores, and dashes"
+        );
+    }
+    Ok(())
+}
+
+fn encode_name(name: &str) -> String {
+    name.replace('/', "+")
+}
+
+pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
+    let _operation = cfg.active_worktree.operation.lock().await;
+    if cfg.active_worktree.read().unwrap().is_some() {
+        bail!(
+            "Already in a worktree session. Pass `path` to switch into another existing worktree, or use exit_worktree to leave this one before creating a new worktree."
+        );
+    }
+    let owner = WorktreeOwner::Session(cfg.session_id.clone());
+    let worktree = create_managed(&cfg.cwd, name, owner, BasePolicy::Fresh).await?;
+    let message = format!(
+        "Created worktree at {path} on branch {branch}. The session is now working in the worktree. Use exit_worktree to leave mid-session.",
+        path = worktree.path.display(),
+        branch = worktree.branch,
+    );
+    install_active(cfg, worktree);
+    Ok(message)
+}
+
+pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
+    let _operation = cfg.active_worktree.operation.lock().await;
+    let repository = discover_repository(&cfg.cwd)
+        .await
+        .context("cannot enter worktree outside a git repository")?;
+    let canonical_path = std::fs::canonicalize(path)
+        .with_context(|| format!("Cannot enter worktree: {}", path.display()))?;
+    let registered = registered_worktrees(&repository.root)
+        .await?
+        .into_iter()
+        .find(|entry| entry.path == canonical_path)
+        .ok_or_else(|| {
+            anyhow!(
+                "Cannot enter worktree: {} is not a registered worktree of {}. Run 'git -C {} worktree list' to see registered worktrees.",
+                canonical_path.display(),
+                repository.root.display(),
+                repository.root.display(),
+            )
+        })?;
+    let candidate_common = canonical_common_dir(&canonical_path).await?;
+    if candidate_common != repository.common_dir {
+        bail!(
+            "Cannot enter worktree: {} belongs to a different repository",
+            canonical_path.display()
+        );
+    }
+
+    let mut slot = cfg.active_worktree.write().unwrap();
+    if slot.is_some() {
+        let managed_root = repository.root.join(WORKTREES_DIR);
+        if !canonical_path.starts_with(&managed_root) {
+            bail!(
+                "Cannot enter worktree: {} is not under {}. Switching from this session is limited to worktrees managed under .claude/worktrees of this repository.",
+                canonical_path.display(),
+                managed_root.display(),
+            );
+        }
+        let mut previous = slot.take().expect("checked active slot");
+        previous.wt.lifecycle = WorktreeLifecycle::Kept;
+    }
+    drop(slot);
+
+    let branch = registered
+        .branch
+        .clone()
+        .unwrap_or_else(|| "detached".to_string());
+    let worktree = Worktree {
+        path: canonical_path.clone(),
+        branch: branch.clone(),
+        custody: WorktreeCustody::External,
+        owner: WorktreeOwner::Session(cfg.session_id.clone()),
+        lifecycle: WorktreeLifecycle::Active,
+        base: registered.head,
+        repository_root: repository.root,
+        common_dir: repository.common_dir,
+        canonical_path,
+    };
+    let message = format!(
+        "Entered worktree at {path} on branch {branch}. The session is now working in the worktree. Use exit_worktree to leave mid-session.",
+        path = worktree.path.display(),
+    );
+    install_active(cfg, worktree);
+    Ok(message)
+}
+
+fn install_active(cfg: &Config, worktree: Worktree) {
     let (permissions, sandbox, system) = compute_overrides(
         &cfg.cwd,
         &cfg.permissions,
         &cfg.sandbox,
         &cfg.system,
-        &wt.path,
-    );
-    let msg = format!(
-        "Entered worktree {path} on branch {branch}. Your working directory is now this tree; \
-         edits here are isolated from the main checkout until you exit_worktree.",
-        path = wt.path.display(),
-        branch = wt.branch,
+        &worktree.path,
     );
     *cfg.active_worktree.write().unwrap() = Some(ActiveWorktree {
-        cwd: wt.path.clone(),
-        branch: wt.branch.clone(),
+        cwd: worktree.path.clone(),
+        branch: worktree.branch.clone(),
         permissions,
         file_state: Arc::new(crate::file_state::FileState::default()),
         sandbox,
         system,
-        wt,
+        wt: worktree,
     });
-    Ok(msg)
 }
 
-/// Exit the session's active worktree. Without `discard` it follows the slice-1
-/// lifecycle (changes kept on the branch, a clean tree removed); `discard`
-/// force-removes even a dirty tree. A friendly no-op when not in one.
-pub async fn exit(cfg: &Config, discard: bool) -> Result<String> {
-    // Take out of the slot BEFORE any await — never hold the lock across one.
-    let active = cfg.active_worktree.write().unwrap().take();
-    let Some(active) = active else {
-        return Ok("Not currently in a worktree.".to_string());
+pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Result<String> {
+    let _operation = cfg.active_worktree.operation.lock().await;
+    let Some(mut active) = cfg.active_worktree.write().unwrap().take() else {
+        bail!(
+            "No-op: there is no active enter_worktree session to exit. This tool only operates on worktrees entered in the current session. No filesystem changes were made."
+        );
     };
-    // The session returns to `cfg.cwd`: enter only proceeds when the slot is
-    // empty (one tree, no nesting), so the pre-entry cwd was always `cfg.cwd`.
-    let back = cfg.cwd.display().to_string();
-    if discard {
-        let branch = active.wt.branch.clone();
-        active.wt.remove().await;
+    let original_cwd = cfg.cwd.display().to_string();
+    if action == ExitAction::Keep {
+        active.wt.lifecycle = WorktreeLifecycle::Kept;
         return Ok(format!(
-            "Exited and discarded the worktree (branch {branch} deleted). Back in {back}."
+            "Exited worktree. Your work is preserved at {path} on branch {branch}. Session is now back in {original_cwd}.",
+            path = active.wt.path.display(),
+            branch = active.wt.branch,
         ));
     }
-    match finish(active.wt).await {
-        Some(note) => Ok(format!("Exited worktree. Back in {back}.{note}")),
-        None => Ok(format!(
-            "Exited worktree (no changes; tree removed). Back in {back}."
-        )),
+    if active.wt.custody != WorktreeCustody::Managed
+        || !matches!(active.wt.owner, WorktreeOwner::Session(_))
+    {
+        let path = active.wt.path.display().to_string();
+        *cfg.active_worktree.write().unwrap() = Some(active);
+        bail!(
+            "This session is not the owner of the worktree at {path}, so exit_worktree will not remove it. Use action: \"keep\" to return to {original_cwd}."
+        );
+    }
+
+    let result = remove_for_session(&mut active.wt, discard_changes).await;
+    match result {
+        Ok(changes) => Ok(format_remove_message(&active.wt, &original_cwd, changes)),
+        Err(error) => {
+            if active.wt.path.exists() {
+                *cfg.active_worktree.write().unwrap() = Some(active);
+            }
+            Err(error)
+        }
     }
 }
 
-/// Tear down the session's active worktree at shutdown (dirty kept, clean
-/// removed), if any. Returns a note when a tree was kept, for the caller to
-/// surface. Safe to call when not in a worktree.
+async fn remove_for_session(
+    worktree: &mut Worktree,
+    discard_changes: bool,
+) -> Result<WorktreeChanges> {
+    let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
+    verify_provenance(worktree).await?;
+    let changes = inspect_changes(worktree).await?;
+    if !discard_changes && (changes.changed_files > 0 || changes.commits > 0) {
+        let mut parts = Vec::new();
+        if changes.changed_files > 0 {
+            let suffix = if changes.changed_files == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            parts.push(format!("{} uncommitted {suffix}", changes.changed_files));
+        }
+        if changes.commits > 0 {
+            let suffix = if changes.commits == 1 {
+                "commit"
+            } else {
+                "commits"
+            };
+            parts.push(format!(
+                "{} {suffix} on {}",
+                changes.commits, worktree.branch
+            ));
+        }
+        bail!(
+            "Worktree has {}. Removing will discard this work permanently. Confirm with the user, then re-invoke with discard_changes: true — or use action: \"keep\" to preserve the worktree.",
+            parts.join(" and ")
+        );
+    }
+    remove_managed_locked(worktree, discard_changes).await?;
+    Ok(changes)
+}
+
+fn format_remove_message(
+    worktree: &Worktree,
+    original_cwd: &str,
+    changes: WorktreeChanges,
+) -> String {
+    let mut discarded = Vec::new();
+    if changes.changed_files > 0 {
+        let suffix = if changes.changed_files == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        discarded.push(format!("{} uncommitted {suffix}", changes.changed_files));
+    }
+    if changes.commits > 0 {
+        let suffix = if changes.commits == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        discarded.push(format!("{} {suffix}", changes.commits));
+    }
+    let detail = if discarded.is_empty() {
+        String::new()
+    } else {
+        format!(" Discarded {}.", discarded.join(" and "))
+    };
+    format!(
+        "Exited and removed worktree at {}.{} Session is now back in {original_cwd}.",
+        worktree.path.display(),
+        detail,
+    )
+}
+
+/// Session shutdown is deliberately conservative: without an explicit remove
+/// action the active resource is retained, even when clean.
 pub async fn finish_active(cfg: &Config) -> Option<String> {
-    let active = cfg.active_worktree.write().unwrap().take()?;
-    finish(active.wt).await
+    let _operation = cfg.active_worktree.operation.lock().await;
+    let mut active = cfg.active_worktree.write().unwrap().take()?;
+    active.wt.lifecycle = WorktreeLifecycle::Kept;
+    Some(retained_note(&active.wt).trim().to_string())
 }
 
-/// Whether the sub-agent left anything worth keeping: an uncommitted change in
-/// the tree, or a commit past the base. Any git error counts as "changed"
-/// (fail-closed) — a probe we can't trust must not license deletion.
-async fn has_changes(wt: &Worktree) -> bool {
-    let Ok(status) = git(&wt.path, &["status", "--porcelain"]).await else {
-        return true;
-    };
-    if !status.trim().is_empty() {
-        return true;
+fn retained_note(worktree: &Worktree) -> String {
+    format!(
+        "\n\n[Worktree retained at {path} (branch {branch}); it was NOT merged or removed.]",
+        path = worktree.path.display(),
+        branch = worktree.branch,
+    )
+}
+
+async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
+    let status = git_text(
+        &worktree.path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )
+    .await
+    .context("probing worktree status")?;
+    let mut fields = status.split('\0').filter(|field| !field.is_empty());
+    let mut changed_files = 0;
+    while let Some(field) = fields.next() {
+        changed_files += 1;
+        let status = field.get(..2).unwrap_or_default();
+        if status.contains('R') || status.contains('C') {
+            let _ = fields.next();
+        }
     }
-    let range = format!("{}..HEAD", wt.base);
-    let Ok(commits) = git(&wt.path, &["rev-list", &range]).await else {
-        return true;
-    };
-    !commits.trim().is_empty()
+    let range = format!("{}..HEAD", worktree.base);
+    let commits = git_text(&worktree.path, &["rev-list", "--count", &range])
+        .await
+        .context("probing worktree commits")?
+        .trim()
+        .parse::<usize>()
+        .context("parsing worktree commit count")?;
+    Ok(WorktreeChanges {
+        changed_files,
+        commits,
+    })
 }
 
-/// The main repository root for `cwd`, or an error when `cwd` is not in a git
-/// repository.
-async fn repo_root(cwd: &Path) -> Result<PathBuf> {
-    let out = git(cwd, &["rev-parse", "--show-toplevel"]).await?;
-    Ok(PathBuf::from(out.trim()))
+async fn remove_managed_locked(worktree: &mut Worktree, force: bool) -> Result<()> {
+    if worktree.custody != WorktreeCustody::Managed {
+        bail!("refusing to remove an external worktree");
+    }
+    verify_provenance(worktree).await?;
+    let path = worktree.path.to_string_lossy().to_string();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path);
+    if let Err(error) = git_text(&worktree.repository_root, &args).await {
+        worktree.lifecycle = WorktreeLifecycle::Orphaned;
+        return Err(error).context("removing managed worktree");
+    }
+    if let Err(error) = git_text(
+        &worktree.repository_root,
+        &["branch", "-D", &worktree.branch],
+    )
+    .await
+    {
+        worktree.lifecycle = WorktreeLifecycle::Orphaned;
+        return Err(error).context("deleting managed worktree branch");
+    }
+    worktree.lifecycle = WorktreeLifecycle::Removed;
+    Ok(())
 }
 
-/// Append the managed worktrees dir to `.git/info/exclude` unless present.
-fn exclude_worktrees_dir(repo_root: &Path) -> Result<()> {
-    let exclude = repo_root.join(".git").join("info").join("exclude");
-    // A worktree checkout has a `.git` FILE, not this dir — but we only ever
-    // create from the main repo (sub-agents can't spawn sub-agents), so the
-    // info dir exists. Best-effort: a missing parent just skips the exclude.
+async fn verify_provenance(worktree: &Worktree) -> Result<()> {
+    let actual_path = std::fs::canonicalize(&worktree.path)
+        .with_context(|| format!("worktree path {} is unavailable", worktree.path.display()))?;
+    if actual_path != worktree.canonical_path {
+        bail!("worktree path identity changed; refusing lifecycle mutation");
+    }
+    let common_dir = canonical_common_dir(&actual_path).await?;
+    if common_dir != worktree.common_dir {
+        bail!("worktree repository identity changed; refusing lifecycle mutation");
+    }
+    let registered = registered_worktrees(&worktree.repository_root)
+        .await?
+        .into_iter()
+        .find(|entry| entry.path == actual_path)
+        .ok_or_else(|| anyhow!("worktree is no longer registered; refusing lifecycle mutation"))?;
+    if registered.branch.as_deref() != Some(worktree.branch.as_str()) {
+        bail!("worktree branch identity changed; refusing lifecycle mutation");
+    }
+    Ok(())
+}
+
+async fn discover_repository(cwd: &Path) -> Result<Repository> {
+    let common_dir = canonical_common_dir(cwd).await?;
+    let current_root = git_text(cwd, &["rev-parse", "--show-toplevel"]).await?;
+    let entries = registered_worktrees(Path::new(current_root.trim())).await?;
+    let root = entries
+        .first()
+        .map(|entry| entry.path.clone())
+        .ok_or_else(|| anyhow!("git worktree registry is empty"))?;
+    let root_common = canonical_common_dir(&root).await?;
+    if root_common != common_dir {
+        bail!("git worktree registry repository identity mismatch");
+    }
+    Ok(Repository { root, common_dir })
+}
+
+async fn canonical_common_dir(cwd: &Path) -> Result<PathBuf> {
+    let path = git_text(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    std::fs::canonicalize(path.trim()).context("canonicalizing git common directory")
+}
+
+async fn registered_worktrees(repository_root: &Path) -> Result<Vec<RegisteredWorktree>> {
+    let output = git_text(repository_root, &["worktree", "list", "--porcelain"]).await?;
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut head = String::new();
+    let mut branch = None;
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(raw_path) = path.take() {
+                let path = std::fs::canonicalize(&raw_path).with_context(|| {
+                    format!("canonicalizing registered worktree {}", raw_path.display())
+                })?;
+                entries.push(RegisteredWorktree {
+                    path,
+                    head: std::mem::take(&mut head),
+                    branch: branch.take(),
+                });
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("HEAD ") {
+            head = value.to_string();
+        } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(value.to_string());
+        }
+    }
+    Ok(entries)
+}
+
+fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
+    let exclude = common_dir.join("info").join("exclude");
     let Some(parent) = exclude.parent() else {
         return Ok(());
     };
-    if !parent.is_dir() {
-        return Ok(());
-    }
+    std::fs::create_dir_all(parent).context("creating git info directory")?;
     let line = format!("{WORKTREES_DIR}/");
-    let line = line.as_str();
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == line) {
+    if current.lines().any(|current| current.trim() == line) {
         return Ok(());
     }
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');
     }
-    next.push_str(line);
+    next.push_str(&line);
     next.push('\n');
-    std::fs::write(&exclude, next).context("updating .git/info/exclude")?;
-    Ok(())
+    std::fs::write(&exclude, next).context("updating git info exclude")
 }
 
-/// Run `git -C <dir> <args>` and return stdout on success, an error carrying
-/// stderr otherwise.
-async fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+async fn git_success(dir: &Path, args: &[&str]) -> Result<bool> {
+    let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
         .output()
         .await
         .context("spawning git")?;
-    if !out.status.success() {
+    Ok(output.status.success())
+}
+
+async fn git_text(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .context("spawning git")?;
+    if !output.status.success() {
         bail!(
             "git {}: {}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A throwaway git repo with one commit, so worktrees can branch off HEAD.
     async fn temp_repo(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("kloop-wt-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "kloop-wt-{tag}-{}-{}",
+            std::process::id(),
+            GENERATED_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         for args in [
-            vec!["init", "-q"],
+            vec!["init", "-q", "-b", "main"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
             vec!["commit", "--allow-empty", "-qm", "base"],
         ] {
-            git(&root, &args).await.unwrap();
+            git_text(&root, &args).await.unwrap();
         }
         root
     }
 
     #[tokio::test]
-    async fn create_makes_tree_branch_and_exclude_entry() {
+    async fn create_records_owned_provenance_and_removes_clean_tree() {
         let root = temp_repo("create").await;
-        let wt = create(&root, "agent-1").await.unwrap();
-        // `git rev-parse --show-toplevel` resolves symlinks (macOS /var →
-        // /private/var), so compare against the canonicalized root.
-        let canon = std::fs::canonicalize(&root).unwrap();
-        assert_eq!(wt.path, canon.join(".kloop-worktrees/agent-1"));
-        assert_eq!(wt.branch, "kloop/worktree/agent-1");
-        assert!(wt.path.join(".git").exists(), "the worktree is checked out");
-        let branches = git(&root, &["branch", "--list", "kloop/worktree/agent-1"])
-            .await
-            .unwrap();
-        assert!(branches.contains("kloop/worktree/agent-1"), "{branches}");
-        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap_or_default();
-        assert!(
-            exclude.lines().any(|l| l.trim() == ".kloop-worktrees/"),
-            "exclude injected: {exclude:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+        let worktree = create(&root, "agent-1").await.unwrap();
+        let path = worktree.path.clone();
+        assert_eq!(worktree.custody, WorktreeCustody::Managed);
+        assert_eq!(worktree.owner, WorktreeOwner::Task("agent-1".into()));
+        assert!(path.ends_with(".claude/worktrees/agent-1"));
+        assert_eq!(worktree.branch, "worktree-agent-1");
+        assert!(finish(worktree).await.unwrap().is_none());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn entered_worktree_starts_with_fresh_file_observations() {
-        use crate::file_state::FileObservation;
-        use crate::file_state::FileStateUpdate;
+    async fn finish_keeps_dirty_task_tree() {
+        let root = temp_repo("dirty").await;
+        let worktree = create(&root, "agent-2").await.unwrap();
+        std::fs::write(worktree.path.join("new.txt"), "work").unwrap();
+        let path = worktree.path.clone();
+        let note = finish(worktree).await.unwrap().unwrap();
+        assert!(note.contains("worktree-agent-2"));
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ignored_files_are_content_changes() {
+        let root = temp_repo("ignored").await;
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        git_text(&root, &["add", ".gitignore"]).await.unwrap();
+        git_text(&root, &["commit", "-qm", "ignore"]).await.unwrap();
+        let worktree = create(&root, "agent-ignored").await.unwrap();
+        std::fs::write(worktree.path.join("ignored.txt"), "work").unwrap();
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.changed_files, 1);
+        assert!(finish(worktree).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn names_allow_segments_but_reject_escapes() {
+        validate_name("feature/plan56").unwrap();
+        assert_eq!(encode_name("feature/plan56"), "feature+plan56");
+        for name in ["", ".", "..", "/absolute", "a//b", "a/../b", "a b"] {
+            assert!(validate_name(name).is_err(), "accepted {name:?}");
+        }
+        assert!(validate_name(&"x".repeat(65)).is_err());
+    }
+
+    #[tokio::test]
+    async fn external_handle_cannot_be_removed() {
         use crate::tools::testutil::test_ctx;
 
-        let root = temp_repo("fresh-state").await;
-        let observed = root.join("observed.txt");
-        std::fs::write(&observed, b"parent read\n").unwrap();
-        let observed = std::fs::canonicalize(observed).unwrap();
-        let metadata = std::fs::metadata(&observed).unwrap();
-        let mut cfg = (*test_ctx(0, "worktree-fresh-state").cfg).clone();
+        let root = temp_repo("external").await;
+        let external = root.join("external");
+        git_text(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "external-branch",
+                external.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .await
+        .unwrap();
+        let mut cfg = (*test_ctx(0, "external").cfg).clone();
         cfg.cwd = root.clone();
-        cfg.file_state.apply(FileStateUpdate::Replace {
-            path: observed.clone(),
-            observation: FileObservation::full(b"parent read\n", &metadata),
-        });
-
-        enter(&cfg, "agent-fresh").await.unwrap();
-        let active_state = cfg.effective_file_state();
-        assert!(!Arc::ptr_eq(&cfg.file_state, &active_state));
-        assert!(active_state.observation(&observed).is_none());
-        assert!(cfg.file_state.observation(&observed).is_some());
-
-        exit(&cfg, /* discard */ true).await.unwrap();
-        assert!(Arc::ptr_eq(&cfg.file_state, &cfg.effective_file_state()));
-        assert!(cfg.file_state.observation(&observed).is_some());
-        let _ = std::fs::remove_dir_all(&root);
+        enter_existing(&cfg, &external).await.unwrap();
+        let error = exit(&cfg, ExitAction::Remove, true).await.unwrap_err();
+        assert!(error.to_string().contains("not the owner"));
+        assert!(cfg.active_worktree.read().unwrap().is_some());
+        exit(&cfg, ExitAction::Keep, false).await.unwrap();
+        assert!(external.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn finish_removes_an_untouched_tree() {
-        let root = temp_repo("clean").await;
-        let wt = create(&root, "agent-1").await.unwrap();
-        let path = wt.path.clone();
-        let note = finish(wt).await;
-        assert!(note.is_none(), "untouched tree reports nothing to keep");
-        assert!(!path.exists(), "tree removed");
-        let branches = git(&root, &["branch", "--list", "kloop/worktree/agent-1"])
-            .await
-            .unwrap();
-        assert!(branches.trim().is_empty(), "branch deleted: {branches:?}");
-        let _ = std::fs::remove_dir_all(&root);
+    async fn remove_requires_discard_and_restores_active_on_refusal() {
+        use crate::tools::testutil::test_ctx;
+
+        let root = temp_repo("refuse").await;
+        let mut cfg = (*test_ctx(0, "refuse").cfg).clone();
+        cfg.cwd = root.clone();
+        enter(&cfg, "dirty").await.unwrap();
+        let path = cfg.effective_cwd();
+        std::fs::write(path.join("dirty.txt"), "dirty").unwrap();
+        let error = exit(&cfg, ExitAction::Remove, false).await.unwrap_err();
+        assert!(error.to_string().contains("1 uncommitted file"));
+        assert_eq!(cfg.effective_cwd(), path);
+        exit(&cfg, ExitAction::Remove, true).await.unwrap();
+        assert_eq!(cfg.effective_cwd(), root);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn finish_keeps_a_dirty_tree_and_names_it() {
-        let root = temp_repo("dirty").await;
-        let wt = create(&root, "agent-2").await.unwrap();
-        let path = wt.path.clone();
-        std::fs::write(path.join("new.txt"), "work").unwrap();
-        let note = finish(wt).await.expect("dirty tree is kept");
-        assert!(note.contains("kloop/worktree/agent-2"), "{note}");
-        assert!(note.contains(&path.display().to_string()), "{note}");
-        assert!(path.exists(), "tree preserved for the user");
-        let _ = std::fs::remove_dir_all(&root);
+    async fn shutdown_retains_even_clean_session_tree() {
+        use crate::tools::testutil::test_ctx;
+
+        let root = temp_repo("shutdown").await;
+        let mut cfg = (*test_ctx(0, "shutdown").cfg).clone();
+        cfg.cwd = root.clone();
+        enter(&cfg, "kept").await.unwrap();
+        let path = cfg.effective_cwd();
+        let note = finish_active(&cfg).await.unwrap();
+        assert!(note.contains("retained"));
+        assert!(path.exists());
+        assert_eq!(cfg.effective_cwd(), root);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn create_rejects_a_non_git_dir() {
-        let dir = std::env::temp_dir().join(format!("kloop-wt-nogit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = create(&dir, "agent-1").await.unwrap_err();
-        assert!(err.to_string().contains("git repository"), "{err:#}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    async fn session_remove_does_not_touch_task_owned_tree() {
+        use crate::tools::testutil::test_ctx;
 
-    /// Two worktrees created (and torn down) concurrently don't clobber each
-    /// other — the serialization lock keeps parallel `git worktree add` /
-    /// branch-create / remove off each other's repo locks. Each left dirty is
-    /// kept with its own file.
-    #[tokio::test]
-    async fn parallel_create_and_finish_keep_both_dirty_trees() {
-        let root = temp_repo("parconc").await;
-        let (a, b) = tokio::join!(create(&root, "agent-1"), create(&root, "agent-2"));
-        let a = a.unwrap();
-        let b = b.unwrap();
-        std::fs::write(a.path.join("a.txt"), "a").unwrap();
-        std::fs::write(b.path.join("b.txt"), "b").unwrap();
-        let (na, nb) = tokio::join!(finish(a), finish(b));
-        assert!(na.is_some() && nb.is_some(), "both dirty trees are kept");
-        assert!(root.join(".kloop-worktrees/agent-1/a.txt").exists());
-        assert!(root.join(".kloop-worktrees/agent-2/b.txt").exists());
-        let branches = git(&root, &["branch", "--list", "kloop/worktree/*"])
-            .await
-            .unwrap();
-        assert!(
-            branches.contains("agent-1") && branches.contains("agent-2"),
-            "{branches}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+        let root = temp_repo("owners").await;
+        let task = create(&root, "task-owner").await.unwrap();
+        let task_path = task.path.clone();
+        std::fs::write(task_path.join("task.txt"), "task").unwrap();
+
+        let mut cfg = (*test_ctx(0, "owners").cfg).clone();
+        cfg.cwd = root.clone();
+        enter(&cfg, "session-owner").await.unwrap();
+        let session_path = cfg.effective_cwd();
+        exit(&cfg, ExitAction::Remove, false).await.unwrap();
+        assert!(!session_path.exists());
+        assert!(task_path.join("task.txt").exists());
+        assert!(finish(task).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn create_rejects_a_name_collision() {
-        let root = temp_repo("collide").await;
-        let _first = create(&root, "agent-1").await.unwrap();
-        let err = create(&root, "agent-1").await.unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err:#}");
-        let _ = std::fs::remove_dir_all(&root);
+    async fn concurrent_session_enter_publishes_exactly_one_active_handle() {
+        use crate::tools::testutil::test_ctx;
+
+        let root = temp_repo("session-concurrent").await;
+        let mut cfg = (*test_ctx(0, "session-concurrent").cfg).clone();
+        cfg.cwd = root.clone();
+        let (first, second) = tokio::join!(enter(&cfg, "first"), enter(&cfg, "second"));
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let active_path = cfg.effective_cwd();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        assert!(active_path.starts_with(canonical_root.join(WORKTREES_DIR)));
+        exit(&cfg, ExitAction::Remove, true).await.unwrap();
+        assert_eq!(cfg.effective_cwd(), root);
+        let entries = registered_worktrees(&cfg.cwd).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&cfg.cwd);
+    }
+
+    #[tokio::test]
+    async fn parallel_task_create_and_finish_are_serialized() {
+        let root = temp_repo("parallel").await;
+        let (first, second) = tokio::join!(create(&root, "agent-a"), create(&root, "agent-b"));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(finish(first).await.unwrap().is_none());
+        assert!(finish(second).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

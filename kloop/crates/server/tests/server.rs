@@ -239,7 +239,9 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
-            active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_worktree: std::sync::Arc::new(
+                kloop_core::worktree::ActiveWorktreeState::default(),
+            ),
             surface: kloop_core::config::SurfaceCapabilities {
                 questions,
                 plan_control: true,
@@ -345,7 +347,9 @@ fn worktree_factory(
             background_tasks: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
-            active_worktree: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_worktree: std::sync::Arc::new(
+                kloop_core::worktree::ActiveWorktreeState::default(),
+            ),
             surface: kloop_core::config::SurfaceCapabilities {
                 questions,
                 plan_control: true,
@@ -919,7 +923,7 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
             "write_file",
             json!({"path": "s.txt", "content": "S"}),
         )],
-        vec![tool_use("t3", "exit_worktree", json!({}))],
+        vec![tool_use("t3", "exit_worktree", json!({"action": "keep"}))],
         vec![text("done")],
     ];
     let mut client = start_server(
@@ -939,26 +943,26 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
         .filter(|m| m["method"] == "thread/cwd/updated")
         .collect();
     assert_eq!(wt.len(), 2, "enter + exit notifications");
-    assert_eq!(wt[0]["params"]["branch"], "kloop/worktree/srv");
+    assert_eq!(wt[0]["params"]["branch"], "worktree-srv");
     assert!(wt[0]["params"]["cwd"]
         .as_str()
         .unwrap()
-        .ends_with(".kloop-worktrees/srv"));
+        .ends_with(".claude/worktrees/srv"));
     assert_eq!(wt[1]["params"]["branch"], Value::Null);
 
     // The write landed in the worktree, not the main repo; the dirty tree is
     // kept (model exited with default keep).
-    assert!(repo.join(".kloop-worktrees/srv/s.txt").exists());
+    assert!(repo.join(".claude/worktrees/srv/s.txt").exists());
     assert!(!repo.join("s.txt").exists());
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// A model that enters a worktree but never exits: the tree is torn down (or
-/// kept if dirty) when the thread ends on server shutdown, not leaked.
+/// A model that enters a worktree but never exits: shutdown retains the tree
+/// because no explicit remove intent was supplied.
 #[tokio::test]
-async fn unexited_worktree_is_cleaned_up_on_shutdown() {
+async fn unexited_worktree_is_retained_on_shutdown() {
     let dirs = test_dirs("wt-shutdown");
     let repo = temp_git_repo("noexit");
     let turns = vec![
@@ -975,15 +979,16 @@ async fn unexited_worktree_is_cleaned_up_on_shutdown() {
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(
-        repo.join(".kloop-worktrees/leak").exists(),
+        repo.join(".claude/worktrees/leak").exists(),
         "tree exists mid-session"
     );
 
-    // Shutdown closes the turn channel; the worker tears down the clean tree.
+    // Shutdown closes the turn channel; without explicit remove intent the
+    // worker restores the base cwd and retains the clean tree.
     client.shutdown().await;
     assert!(
-        !repo.join(".kloop-worktrees/leak").exists(),
-        "clean tree removed on shutdown"
+        repo.join(".claude/worktrees/leak").exists(),
+        "clean tree retained on shutdown"
     );
     let _ = std::fs::remove_dir_all(&repo);
 }

@@ -254,6 +254,10 @@ pub struct App {
     /// The slash-command catalog (built-ins + skills/commands), used to filter
     /// the `/` menu. Seeded once at startup via [`App::with_commands`].
     commands: Vec<menu::CommandInfo>,
+    /// Current session working-directory projection, refreshed by CwdChanged.
+    pub cwd: String,
+    /// Current worktree branch, or None in the original checkout.
+    pub branch: Option<String>,
     /// Model name shown in the footer's system status. Static per session.
     pub model: String,
     /// Estimated context tokens in use (footer gauge), refreshed by the worker's
@@ -284,6 +288,8 @@ impl App {
             ctrl_c_exit_armed: false,
             popup: None,
             commands: Vec::new(),
+            cwd: String::new(),
+            branch: None,
             model: String::new(),
             context_used: 0,
             context_window: None,
@@ -293,6 +299,12 @@ impl App {
     /// Seed the slash-command catalog for the `/` menu (built-ins + skills).
     pub fn with_commands(mut self, commands: Vec<menu::CommandInfo>) -> Self {
         self.commands = commands;
+        self
+    }
+
+    pub fn with_working_directory(mut self, cwd: String, branch: Option<String>) -> Self {
+        self.cwd = cwd;
+        self.branch = branch;
         self
     }
 
@@ -573,12 +585,12 @@ impl App {
                 self.cells.push(Cell::Note(n));
             }
             Event::CwdChanged { cwd, branch } => {
-                // The TUI showed the cwd switch as a plain note before plan 39
-                // (it never implemented the structured seam); keep that.
-                let note = match branch {
-                    Some(b) => format!("working directory → {cwd} (branch {b})"),
+                let note = match &branch {
+                    Some(branch) => format!("working directory → {cwd} (branch {branch})"),
                     None => format!("working directory → {cwd}"),
                 };
+                self.cwd = cwd;
+                self.branch = branch;
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.last_note = Some(note.clone());
@@ -2531,5 +2543,28 @@ mod tests {
                 seconds: Some(9),
             }
         );
+    }
+
+    #[test]
+    fn cwd_event_updates_current_projection_and_note() {
+        let mut app =
+            App::new("s".into()).with_working_directory("/repo".into(), Some("main".into()));
+        app.apply(AgentEvent::Core(Event::CwdChanged {
+            cwd: "/repo/.claude/worktrees/feature".into(),
+            branch: Some("worktree-feature".into()),
+        }));
+        assert_eq!(app.cwd, "/repo/.claude/worktrees/feature");
+        assert_eq!(app.branch.as_deref(), Some("worktree-feature"));
+        assert_eq!(
+            app.last_note.as_deref(),
+            Some("working directory → /repo/.claude/worktrees/feature (branch worktree-feature)")
+        );
+
+        app.apply(AgentEvent::Core(Event::CwdChanged {
+            cwd: "/repo".into(),
+            branch: None,
+        }));
+        assert_eq!(app.cwd, "/repo");
+        assert_eq!(app.branch, None);
     }
 }

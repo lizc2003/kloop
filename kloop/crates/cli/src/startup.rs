@@ -790,7 +790,7 @@ pub(crate) fn config_from_settings(
         inbox: Default::default(),
         program_limits: runtime.program_limits,
         skills,
-        active_worktree: Arc::new(std::sync::RwLock::new(None)),
+        active_worktree: Arc::new(kloop_core::worktree::ActiveWorktreeState::default()),
         surface: kloop_core::config::SurfaceCapabilities {
             questions: questions_enabled,
             plan_control: !args.headless,
