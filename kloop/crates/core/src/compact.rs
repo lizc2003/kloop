@@ -139,7 +139,9 @@ async fn sample_summary(
             _ = cancel.cancelled() => bail!("compaction interrupted"),
             event = rx.recv() => match event {
                 None => bail!("compaction stream closed early"),
-                Some(Err(e)) => return Err(e.context("compaction request failed")),
+                Some(Err(error)) => {
+                    return Err(anyhow::Error::new(error).context("compaction request failed"));
+                }
                 Some(Ok(StreamEvent::TextDelta(_))) => {}
                 // The summary is the text; reasoning about it is discarded.
                 Some(Ok(StreamEvent::ThinkingDelta(_))) => {}

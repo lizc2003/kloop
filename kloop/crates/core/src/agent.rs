@@ -369,6 +369,14 @@ async fn turn_rounds(
                     structured_output: None,
                 };
             }
+            Sampled::Terminal(error) => {
+                return TurnOutcome {
+                    reason: EndReason::Error(error),
+                    final_text: String::new(),
+                    rounds: round,
+                    structured_output: None,
+                };
+            }
             Sampled::Failed(e) => {
                 // Retries exhausted on the primary model: switch to the
                 // fallback (once) instead of surfacing the error.

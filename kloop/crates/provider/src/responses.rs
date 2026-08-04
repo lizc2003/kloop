@@ -9,22 +9,19 @@
 //! function calls they preceded — gpt-5-era models reject a function_call
 //! whose reasoning item is missing.
 
-use anyhow::anyhow;
-use anyhow::bail;
-use anyhow::Result;
-use futures::StreamExt;
 use serde_json::json;
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use super::is_overflow_message;
 use super::sse::SseParser;
+use super::GuardedBody;
+use super::ProviderFailure;
+use super::StreamCompletion;
+use super::StreamSink;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
-use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
 
@@ -181,7 +178,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
 
 /// One completed output item (from response.output_item.done) to a canonical
 /// block. Unknown item kinds map to None and are skipped.
-fn item_to_block(item: &Value) -> Option<ContentBlock> {
+fn item_to_block(item: &Value) -> Result<Option<ContentBlock>, ProviderFailure> {
     match item["type"].as_str().unwrap_or_default() {
         "message" => {
             let text: String = item["content"]
@@ -191,17 +188,19 @@ fn item_to_block(item: &Value) -> Option<ContentBlock> {
                 .filter(|part| part["type"] == "output_text")
                 .map(|part| part["text"].as_str().unwrap_or(""))
                 .collect();
-            Some(ContentBlock::Text { text })
+            Ok(Some(ContentBlock::Text { text }))
         }
-        "function_call" => Some(ContentBlock::ToolUse {
-            id: item["call_id"].as_str().unwrap_or_default().to_string(),
-            name: item["name"].as_str().unwrap_or_default().to_string(),
-            input: match item["arguments"].as_str().unwrap_or_default() {
-                "" => json!({}),
-                raw => serde_json::from_str(raw).unwrap_or(Value::String(raw.to_string())),
-            },
-        }),
-        "reasoning" => Some(ContentBlock::Thinking {
+        "function_call" => {
+            let name = item["name"].as_str().unwrap_or_default().to_string();
+            let raw = item["arguments"].as_str().unwrap_or_default();
+            let input = crate::parse_tool_input("openai-responses", &name, raw)?;
+            Ok(Some(ContentBlock::ToolUse {
+                id: item["call_id"].as_str().unwrap_or_default().to_string(),
+                name,
+                input,
+            }))
+        }
+        "reasoning" => Ok(Some(ContentBlock::Thinking {
             thinking: item["summary"]
                 .as_array()
                 .into_iter()
@@ -213,8 +212,8 @@ fn item_to_block(item: &Value) -> Option<ContentBlock> {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
-        }),
-        _ => None,
+        })),
+        _ => Ok(None),
     }
 }
 
@@ -241,25 +240,21 @@ pub(super) async fn stream(
     url: &str,
     key: &str,
     body: &Value,
-    tx: &mpsc::Sender<Result<StreamEvent>>,
-) -> Result<()> {
+    sink: &StreamSink,
+) -> Result<StreamCompletion, ProviderFailure> {
     let req = crate::http_client().post(url).bearer_auth(key).json(body);
     let resp = crate::send_checked(req, "openai-responses", key).await?;
 
     let mut parser = SseParser::default();
-    let mut byte_stream = resp.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk?;
-        for frame in parser.feed(&chunk) {
-            let v: Value = match serde_json::from_str(&frame.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+    let mut byte_stream = GuardedBody::new(resp.bytes_stream());
+    while let Some(chunk) = byte_stream.next().await? {
+        for frame in parser.feed(&chunk)? {
+            let v = crate::parse_sse_json("openai-responses", &frame.data)?;
             match v["type"].as_str().unwrap_or_default() {
                 "response.output_text.delta" => {
                     let piece = v["delta"].as_str().unwrap_or_default();
                     if !piece.is_empty() {
-                        let _ = tx.send(Ok(StreamEvent::TextDelta(piece.into()))).await;
+                        sink.text_delta(piece.into()).await?;
                     }
                 }
                 // Summarized and raw reasoning text respectively; backends
@@ -267,24 +262,18 @@ pub(super) async fn stream(
                 "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                     let piece = v["delta"].as_str().unwrap_or_default();
                     if !piece.is_empty() {
-                        let _ = tx.send(Ok(StreamEvent::ThinkingDelta(piece.into()))).await;
+                        sink.thinking_delta(piece.into()).await?;
                     }
                 }
                 // Complete items arrive whole here; the deltas above are for
                 // display only.
                 "response.output_item.done" => {
-                    if let Some(block) = item_to_block(&v["item"]) {
-                        let _ = tx.send(Ok(StreamEvent::BlockDone(block))).await;
+                    if let Some(block) = item_to_block(&v["item"])? {
+                        sink.block_done(block).await?;
                     }
                 }
                 "response.completed" => {
-                    let _ = tx
-                        .send(Ok(StreamEvent::Done {
-                            stop_reason: None,
-                            usage: usage_from(&v["response"]),
-                        }))
-                        .await;
-                    return Ok(());
+                    return Ok(StreamCompletion::new(None, usage_from(&v["response"])));
                 }
                 // The output cap cut the response short: surface it like the
                 // other rails' truncation stop_reasons so the agent's
@@ -298,34 +287,35 @@ pub(super) async fn stream(
                     } else {
                         Some(reason.to_string())
                     };
-                    let _ = tx
-                        .send(Ok(StreamEvent::Done {
-                            stop_reason,
-                            usage: usage_from(&v["response"]),
-                        }))
-                        .await;
-                    return Ok(());
+                    return Ok(StreamCompletion::new(
+                        stop_reason,
+                        usage_from(&v["response"]),
+                    ));
                 }
                 "response.failed" => {
                     let error = v["response"]["error"].to_string();
                     if is_overflow_message(&error) {
-                        return Err(anyhow::Error::new(OverflowError));
+                        return Err(ProviderFailure::context_overflow());
                     }
-                    bail!("openai-responses failed: {error}");
+                    return Err(ProviderFailure::protocol(format!(
+                        "openai-responses failed: {error}"
+                    )));
                 }
                 "error" => {
                     if is_overflow_message(&v.to_string()) {
-                        return Err(anyhow::Error::new(OverflowError));
+                        return Err(ProviderFailure::context_overflow());
                     }
-                    bail!("openai-responses stream error: {v}");
+                    return Err(ProviderFailure::protocol(format!(
+                        "openai-responses stream error: {v}"
+                    )));
                 }
                 _ => {}
             }
         }
     }
-    // Stream ended without a terminal event; the caller treats a closed
-    // channel without Done as retryable.
-    Err(anyhow!("openai-responses stream ended before completion"))
+    Err(ProviderFailure::incomplete_protocol(
+        "openai-responses stream ended before completion",
+    ))
 }
 
 #[cfg(test)]

@@ -49,6 +49,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+httpdate = "1"
 indexmap = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.46.10", default-features = false }
 # Global config/OAuth IO: macOS search-only directory descriptors plus safe
@@ -78,7 +79,7 @@ serde_json = "1"
 # archived serde_yaml; unknown frontmatter keys deserialize away for free.
 serde_yaml_ng = "0.10"
 similar = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "signal", "fs", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "signal", "fs", "time", "sync", "test-util"] }
 tokio-util = "0.7"
 toml = "0.9"
 tree-sitter = "0.25"

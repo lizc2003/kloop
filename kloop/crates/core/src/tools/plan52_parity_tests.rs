@@ -355,9 +355,10 @@ async fn stop_and_completion_arbitration_report() -> Value {
         .await
         .expect("cancelled child did not signal activity")
         .expect("cancel activity sender dropped");
-    release
-        .send(())
-        .expect("cancelled stream release receiver dropped");
+    assert!(
+        release.send(()).is_err(),
+        "cancelled sampling must drop the stream gate receiver"
+    );
     ui.wait_for_background(BackgroundTaskStatus::Cancelled)
         .await;
     assert_eq!(ctx.cfg.background_tasks.running_count(), 0);

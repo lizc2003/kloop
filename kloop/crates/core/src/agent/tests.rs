@@ -9,6 +9,7 @@ use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
 use kloop_provider::MockTurn;
 use kloop_provider::Provider;
+use kloop_provider::ProviderFailure;
 use serde_json::json;
 
 struct NullUi;
@@ -285,7 +286,11 @@ async fn structured_turn_cancellation_never_accepts_a_late_value() {
         .await
         .expect("structured child ignored cancellation")
         .expect("structured child panicked");
-    let _ = release_tx.send(());
+    tokio::task::yield_now().await;
+    assert!(
+        release_tx.send(()).is_err(),
+        "cancelled sampling must abort and drop the provider producer"
+    );
     assert_eq!(outcome.reason, EndReason::Aborted);
     assert_eq!(outcome.structured_output, None);
     assert_eq!(outcome.final_text, "");
@@ -839,6 +844,110 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         ]
     );
     let _ = std::fs::remove_file(session);
+}
+
+#[tokio::test]
+async fn complete_tool_block_seals_retry_without_dispatching_it() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::BlocksThenError(
+            vec![tool_use("t1", "echo must-not-run")],
+            ProviderFailure::transport("stream dropped after tool block"),
+        ),
+        MockTurn::Blocks(text("must not retry")),
+    ]);
+    let mut cfg = (*compaction_cfg(provider, 200_000, "tool-seals-retry")).clone();
+    cfg.fallback_model = Some("must-not-fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("run a tool"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(&outcome.reason, EndReason::Error(error) if error.contains("stream dropped after tool block"))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        history.messages(),
+        &[Message::user_text("run a tool")],
+        "the uncommitted tool block must be dropped, not executed or persisted"
+    );
+}
+
+#[tokio::test]
+async fn subagent_internal_delta_also_seals_retry() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::PartialError(text("private partial"), "child stream dropped".into()),
+        MockTurn::Blocks(text("must not retry")),
+    ]);
+    let mut cfg = (*compaction_cfg(provider, 200_000, "subagent-seals-retry")).clone();
+    cfg.fallback_model = Some("must-not-fallback".into());
+    cfg.agent_label = "agent-test".into();
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("child work"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
+
+    assert!(
+        matches!(&outcome.reason, EndReason::Error(error) if error.contains("child stream dropped"))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        history.messages(),
+        &[Message::user_text("child work")],
+        "an internal partial delta blocks replay but remains invisible to parent history"
+    );
+}
+
+#[tokio::test]
+async fn non_retryable_failure_does_not_retry_or_fallback() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Failure(ProviderFailure::protocol("malformed provider frame")),
+        MockTurn::Blocks(text("must not retry")),
+    ]);
+    let mut cfg = (*compaction_cfg(provider, 200_000, "terminal-failure")).clone();
+    cfg.fallback_model = Some("must-not-fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hello"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(&outcome.reason, EndReason::Error(error) if error.contains("malformed provider frame"))
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_overrides_local_backoff_without_real_waiting() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Failure(ProviderFailure::http(
+            429,
+            "rate limited",
+            Some(std::time::Duration::from_secs(60)),
+        )),
+        MockTurn::Blocks(text("recovered")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "retry-after");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hello"));
+    let started = tokio::time::Instant::now();
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "recovered");
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        std::time::Duration::from_secs(60)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
 /// Three failures with no fallback exhaust the retry budget and surface

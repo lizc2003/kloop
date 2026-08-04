@@ -196,20 +196,6 @@ impl Usage {
     }
 }
 
-/// The provider rejected the request for exceeding the context window.
-/// Detected via anyhow downcast so the agent can compact and retry instead
-/// of treating it as a transient error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OverflowError;
-
-impl std::fmt::Display for OverflowError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("context window exceeded")
-    }
-}
-
-impl std::error::Error for OverflowError {}
-
 /// Events emitted by a provider while one sampling request streams.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {

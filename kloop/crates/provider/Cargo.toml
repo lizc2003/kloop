@@ -6,8 +6,8 @@ edition.workspace = true
 [dependencies]
 kloop-protocol = { workspace = true }
 
-anyhow = { workspace = true }
 futures = { workspace = true }
+httpdate = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

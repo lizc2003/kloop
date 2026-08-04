@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
+use kloop_provider::ProviderFailureKind;
+use kloop_provider::StreamResult;
 use serde_json::json;
 use serde_json::Value;
 use wiremock::matchers::method;
@@ -37,7 +38,7 @@ async fn mount_sse(server: &MockServer, body: String) {
         .await;
 }
 
-async fn collect(provider: Provider) -> Vec<anyhow::Result<StreamEvent>> {
+async fn collect(provider: Provider) -> Vec<StreamResult> {
     let provider = Arc::new(provider);
     let mut rx = provider.stream("test-model", "system", &[Message::user_text("hi")], &[]);
     let mut events = Vec::new();
@@ -192,10 +193,9 @@ async fn cached_prompt_tokens_are_split_out_of_input() {
     );
 }
 
-/// Unparseable tool arguments degrade to a raw string, never a panic or a
-/// silent empty object (the model may want to see its own malformed output).
+/// Non-empty malformed tool arguments fail closed before a ToolUse or Done is emitted.
 #[tokio::test]
-async fn malformed_arguments_degrade_to_raw_string() {
+async fn malformed_arguments_fail_closed() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -211,16 +211,11 @@ async fn malformed_arguments_degrade_to_raw_string() {
     )
     .await;
 
-    let ok: Vec<StreamEvent> = collect(openai(&server))
-        .await
-        .into_iter()
-        .map(|e| e.unwrap())
-        .collect();
-    assert!(matches!(
-        &ok[0],
-        StreamEvent::BlockDone(ContentBlock::ToolUse { input, .. })
-            if input == &Value::String("{oops".into())
-    ));
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.to_string().contains("invalid JSON input"));
 }
 
 #[tokio::test]
@@ -236,11 +231,8 @@ async fn http_overflow_maps_to_overflow_error() {
 
     let events = collect(openai(&server)).await;
     assert_eq!(events.len(), 1);
-    let err = events.into_iter().next().unwrap().unwrap_err();
-    assert!(
-        err.downcast_ref::<OverflowError>().is_some(),
-        "expected OverflowError, got: {err:#}"
-    );
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
 /// A stream that dies before finish_reason/[DONE] yields an error event, not
@@ -263,6 +255,95 @@ async fn stream_dying_mid_flight_is_an_error() {
         events[0].as_ref().unwrap(),
         StreamEvent::TextDelta(t) if t == "par"
     ));
-    let err = events.into_iter().nth(1).unwrap().unwrap_err();
-    assert!(format!("{err:#}").contains("ended before finish"));
+    let error = events.into_iter().nth(1).unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("ended before finish_reason"));
+}
+
+#[tokio::test]
+async fn finish_reason_succeeds_without_done_sentinel() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"delta": {"content": "ok"}}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            ],
+            false,
+        ),
+    )
+    .await;
+
+    let events = collect(openai(&server)).await;
+    assert!(matches!(
+        events.last().unwrap().as_ref().unwrap(),
+        StreamEvent::Done { stop_reason: Some(reason), .. } if reason == "stop"
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Ok(StreamEvent::Done { .. }) | Err(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn done_without_finish_reason_is_not_completion() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[], true)).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+}
+
+#[tokio::test]
+async fn malformed_sse_json_is_a_terminal_protocol_error() {
+    let server = MockServer::start().await;
+    mount_sse(&server, "data: {oops\n\n".into()).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+}
+
+#[tokio::test]
+async fn http_status_and_retry_after_remain_typed() {
+    let limited = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "120")
+                .set_body_string("slow down"),
+        )
+        .mount(&limited)
+        .await;
+    let events = collect(openai(&limited)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Http { status: 429 });
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.retry_after(),
+        Some(std::time::Duration::from_secs(60))
+    );
+
+    let bad_request = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&bad_request)
+        .await;
+    let events = collect(openai(&bad_request)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Http { status: 400 });
+    assert!(!error.is_retryable());
+    assert_eq!(error.retry_after(), None);
 }

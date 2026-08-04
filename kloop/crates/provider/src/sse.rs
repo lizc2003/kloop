@@ -9,6 +9,7 @@
 #[derive(Default)]
 pub struct SseParser {
     buf: Vec<u8>,
+    scan_from: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18,11 +19,18 @@ pub struct SseFrame {
 }
 
 impl SseParser {
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, crate::ProviderFailure> {
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some(end) = frame_end(&self.buf) {
+        while let Some(end) = frame_end(&self.buf, self.scan_from) {
+            if end > crate::stream::STREAM_MAX_FRAME_BYTES {
+                return Err(crate::ProviderFailure::response_too_large(format!(
+                    "SSE frame exceeded {} bytes",
+                    crate::stream::STREAM_MAX_FRAME_BYTES
+                )));
+            }
             let raw: Vec<u8> = self.buf.drain(..end).collect();
+            self.scan_from = 0;
             let raw = String::from_utf8_lossy(&raw);
             let mut event = None;
             let mut data_lines = Vec::new();
@@ -41,15 +49,22 @@ impl SseParser {
                 });
             }
         }
-        frames
+        self.scan_from = self.buf.len().saturating_sub(2);
+        if self.buf.len() > crate::stream::STREAM_MAX_FRAME_BYTES {
+            return Err(crate::ProviderFailure::response_too_large(format!(
+                "unterminated SSE frame exceeded {} bytes",
+                crate::stream::STREAM_MAX_FRAME_BYTES
+            )));
+        }
+        Ok(frames)
     }
 }
 
 /// Byte index just past the first blank-line frame separator (`\n\n` or
 /// `\r\n\r\n`), or None if no complete frame is buffered yet. A blank line is
 /// an LF whose preceding line terminator is right in front of it.
-fn frame_end(buf: &[u8]) -> Option<usize> {
-    for i in 0..buf.len() {
+fn frame_end(buf: &[u8], scan_from: usize) -> Option<usize> {
+    for i in scan_from..buf.len() {
         if buf[i] != b'\n' {
             continue;
         }
@@ -71,8 +86,11 @@ mod tests {
     #[test]
     fn parses_frames_split_across_chunks() {
         let mut p = SseParser::default();
-        assert_eq!(p.feed(b"event: message_start\ndata: {\"a\""), vec![]);
-        let frames = p.feed(b":1}\n\ndata: [DONE]\n\n");
+        assert_eq!(
+            p.feed(b"event: message_start\ndata: {\"a\"").unwrap(),
+            vec![]
+        );
+        let frames = p.feed(b":1}\n\ndata: [DONE]\n\n").unwrap();
         assert_eq!(
             frames,
             vec![
@@ -91,7 +109,7 @@ mod tests {
     #[test]
     fn handles_crlf_and_comments() {
         let mut p = SseParser::default();
-        let frames = p.feed(b": keepalive\r\ndata: x\r\n\r\n");
+        let frames = p.feed(b": keepalive\r\ndata: x\r\n\r\n").unwrap();
         assert_eq!(
             frames,
             vec![SseFrame {
@@ -109,8 +127,8 @@ mod tests {
         let mut p = SseParser::default();
         let full = "data: 你好\n\n".as_bytes();
         let split = 8; // 'data: ' (6) + first byte of '你'
-        assert_eq!(p.feed(&full[..split]), vec![]);
-        let frames = p.feed(&full[split..]);
+        assert_eq!(p.feed(&full[..split]).unwrap(), vec![]);
+        let frames = p.feed(&full[split..]).unwrap();
         assert_eq!(
             frames,
             vec![SseFrame {
@@ -118,5 +136,37 @@ mod tests {
                 data: "你好".into()
             }]
         );
+    }
+
+    #[test]
+    fn one_byte_chunks_preserve_cross_chunk_separator_detection() {
+        let mut parser = SseParser::default();
+        let mut frames = Vec::new();
+        for byte in b"data: ok\r\n\r\n" {
+            frames.extend(parser.feed(&[*byte]).unwrap());
+        }
+        assert_eq!(
+            frames,
+            vec![SseFrame {
+                event: None,
+                data: "ok".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_complete_and_unterminated_oversized_frames() {
+        let mut complete = SseParser::default();
+        let complete_frame = format!(
+            "data: {}\n\n",
+            "x".repeat(crate::stream::STREAM_MAX_FRAME_BYTES)
+        );
+        let error = complete.feed(complete_frame.as_bytes()).unwrap_err();
+        assert_eq!(error.kind(), &crate::ProviderFailureKind::ResponseTooLarge);
+
+        let mut open = SseParser::default();
+        let open_frame = vec![b'x'; crate::stream::STREAM_MAX_FRAME_BYTES + 1];
+        let error = open.feed(&open_frame).unwrap_err();
+        assert_eq!(error.kind(), &crate::ProviderFailureKind::ResponseTooLarge);
     }
 }

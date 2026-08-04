@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
+use kloop_provider::ProviderFailureKind;
+use kloop_provider::StreamResult;
 use serde_json::json;
 use serde_json::Value;
 use wiremock::matchers::method;
@@ -45,7 +46,7 @@ fn responses(server: &MockServer) -> Provider {
     }
 }
 
-async fn collect(provider: Provider) -> Vec<anyhow::Result<StreamEvent>> {
+async fn collect(provider: Provider) -> Vec<StreamResult> {
     let provider = Arc::new(provider);
     let mut rx = provider.stream("test-model", "system", &[Message::user_text("hi")], &[]);
     let mut events = Vec::new();
@@ -279,11 +280,8 @@ async fn failed_with_context_error_maps_to_overflow() {
 
     let events = collect(responses(&server)).await;
     assert_eq!(events.len(), 1);
-    let err = events.into_iter().next().unwrap().unwrap_err();
-    assert!(
-        err.downcast_ref::<OverflowError>().is_some(),
-        "expected OverflowError, got: {err:#}"
-    );
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
 /// A stream that dies without a terminal event yields an error, not a
@@ -303,6 +301,47 @@ async fn stream_dying_mid_flight_is_an_error() {
         events[0].as_ref().unwrap(),
         StreamEvent::TextDelta(t) if t == "par"
     ));
-    let err = events.into_iter().nth(1).unwrap().unwrap_err();
-    assert!(format!("{err:#}").contains("ended before completion"));
+    let error = events.into_iter().nth(1).unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("ended before completion"));
+}
+
+#[tokio::test]
+async fn malformed_function_arguments_fail_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_1", "name": "bash",
+                "arguments": "{oops", "status": "completed",
+            }}),
+            json!({"type": "response.completed", "response": {}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "no ToolUse or Done may follow invalid JSON"
+    );
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("invalid JSON input"));
+}
+
+#[tokio::test]
+async fn malformed_sse_json_is_a_terminal_protocol_error() {
+    let server = MockServer::start().await;
+    mount_sse(&server, "data: {oops\n\n".into()).await;
+
+    let events = collect(responses(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
 }

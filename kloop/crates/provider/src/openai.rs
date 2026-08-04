@@ -1,22 +1,19 @@
 //! OpenAI-compat chat/completions adapter: translates the canonical history
 //! to chat messages and the tool_calls delta stream back into StreamEvents.
 
-use anyhow::anyhow;
-use anyhow::bail;
-use anyhow::Result;
-use futures::StreamExt;
 use serde_json::json;
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use super::is_overflow_message;
 use super::sse::SseParser;
+use super::GuardedBody;
+use super::ProviderFailure;
+use super::StreamCompletion;
+use super::StreamSink;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::Role;
-use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
 
@@ -191,41 +188,37 @@ pub(super) async fn stream(
     url: &str,
     key: &str,
     body: &Value,
-    tx: &mpsc::Sender<Result<StreamEvent>>,
-) -> Result<()> {
+    sink: &StreamSink,
+) -> Result<StreamCompletion, ProviderFailure> {
     let req = crate::http_client().post(url).bearer_auth(key).json(body);
     let resp = crate::send_checked(req, "openai-compat", key).await?;
 
     let mut parser = SseParser::default();
-    let mut byte_stream = resp.bytes_stream();
+    let mut byte_stream = GuardedBody::new(resp.bytes_stream());
     let mut text = String::new();
     let mut thinking = String::new();
     let mut calls: Vec<CallAcc> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<Usage> = None;
-    let mut finished = false;
 
-    'outer: while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk?;
-        for frame in parser.feed(&chunk) {
+    'outer: while let Some(chunk) = byte_stream.next().await? {
+        for frame in parser.feed(&chunk)? {
             if frame.data.trim() == "[DONE]" {
-                finished = true;
                 break 'outer;
             }
-            let v: Value = match serde_json::from_str(&frame.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let v = crate::parse_sse_json("openai-compat", &frame.data)?;
             if !v["error"].is_null() {
                 if is_overflow_message(&v["error"].to_string()) {
-                    return Err(anyhow::Error::new(OverflowError));
+                    return Err(ProviderFailure::context_overflow());
                 }
-                bail!("openai-compat stream error: {}", v["error"]);
+                return Err(ProviderFailure::protocol(format!(
+                    "openai-compat stream error: {}",
+                    v["error"]
+                )));
             }
-            // With include_usage the final pre-[DONE] chunk carries usage and
-            // empty choices. OpenAI reports cached prompt tokens INSIDE
-            // prompt_tokens (unlike Anthropic), so they are subtracted out to
-            // keep input_tokens = uncached remainder on both rails.
+            // With include_usage the final chunk carries usage and empty
+            // choices. OpenAI reports cached prompt tokens INSIDE
+            // prompt_tokens, so subtract them to keep the canonical split.
             if v["usage"].is_object() {
                 let prompt = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
                 let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"]
@@ -248,13 +241,13 @@ pub(super) async fn stream(
             if let Some(piece) = reasoning {
                 if !piece.is_empty() {
                     thinking.push_str(piece);
-                    let _ = tx.send(Ok(StreamEvent::ThinkingDelta(piece.into()))).await;
+                    sink.thinking_delta(piece.into()).await?;
                 }
             }
             if let Some(piece) = delta["content"].as_str() {
                 if !piece.is_empty() {
                     text.push_str(piece);
-                    let _ = tx.send(Ok(StreamEvent::TextDelta(piece.into()))).await;
+                    sink.text_delta(piece.into()).await?;
                 }
             }
             if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -275,49 +268,49 @@ pub(super) async fn stream(
                     }
                 }
             }
-            if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
-                stop_reason = Some(r.to_string());
-                // Keep reading: with include_usage the usage chunk arrives
-                // after finish_reason, before [DONE].
-                finished = true;
+            if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+                stop_reason = Some(reason.to_string());
             }
+        }
+        // finish_reason is the semantic terminal. Process every frame already
+        // coalesced in this body chunk (which commonly includes usage/[DONE]),
+        // but never wait on a separate optional transport-tail chunk.
+        if stop_reason.is_some() {
+            break;
         }
     }
 
-    if !finished {
-        // Connection died mid-stream; closing without Done signals retryable.
-        return Err(anyhow!("openai-compat stream ended before finish"));
+    if stop_reason.is_none() {
+        return Err(ProviderFailure::incomplete_protocol(
+            "openai-compat stream ended before finish_reason",
+        ));
     }
+
+    let mut parsed_calls = Vec::with_capacity(calls.len());
+    for acc in calls {
+        let input = crate::parse_tool_input("openai-compat", &acc.name, &acc.args)?;
+        parsed_calls.push(ContentBlock::ToolUse {
+            id: acc.id,
+            name: acc.name,
+            input,
+        });
+    }
+
     // Thinking precedes the answer on the wire, so it finalizes first too.
     if !thinking.is_empty() {
-        let _ = tx
-            .send(Ok(StreamEvent::BlockDone(ContentBlock::Thinking {
-                thinking,
-                signature: String::new(),
-            })))
-            .await;
+        sink.block_done(ContentBlock::Thinking {
+            thinking,
+            signature: String::new(),
+        })
+        .await?;
     }
     if !text.is_empty() {
-        let _ = tx
-            .send(Ok(StreamEvent::BlockDone(ContentBlock::Text { text })))
-            .await;
+        sink.block_done(ContentBlock::Text { text }).await?;
     }
-    for acc in calls {
-        let input = if acc.args.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&acc.args).unwrap_or(Value::String(acc.args))
-        };
-        let _ = tx
-            .send(Ok(StreamEvent::BlockDone(ContentBlock::ToolUse {
-                id: acc.id,
-                name: acc.name,
-                input,
-            })))
-            .await;
+    for block in parsed_calls {
+        sink.block_done(block).await?;
     }
-    let _ = tx.send(Ok(StreamEvent::Done { stop_reason, usage })).await;
-    Ok(())
+    Ok(StreamCompletion::new(stop_reason, usage))
 }
 
 #[cfg(test)]

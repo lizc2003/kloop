@@ -22,10 +22,13 @@ validate five architectural bets before committing to a larger agent design.
    into one `StreamEvent` enum. A Mock provider enables keyless end-to-end
    runs.
 
-Extras that came cheap: streaming retry (3 attempts, exponential backoff with
-clock-nanosecond jitter, no `rand` dependency), `CancellationToken`
-interruption, and orphan patching — on interrupt every unanswered `tool_use`
-gets an `is_error` `tool_result` so history stays legal.
+Provider sampling is bounded and typed: each attempt has one terminal outcome;
+open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE
+frame (1 MiB) guards apply on all three wires. Transport/open/read failures,
+HTTP 408/429/5xx, and incomplete EOF retry up to 3 total attempts only before
+any text, reasoning, or complete tool call arrives; `Retry-After` is honored up
+to 60s. Cancellation aborts the producer task, and orphan patching still keeps
+history legal after interruption.
 
 ## Claude Code 2.1.220 parity baseline
 
@@ -1961,6 +1964,12 @@ cargo run
 # chat or Responses according to KLOOP_PROVIDER. KLOOP_CACHE and KLOOP_THINKING
 # override Anthropic cache/thinking; KLOOP_EFFORT overrides Responses effort.
 # Provider/search keys are stripped from model-controlled shell environments.
+#
+# Stream guards are fixed provider-internal safety defaults, not user config:
+# 45s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
+# response, and 1 MiB per unfinished SSE frame. Anthropic requires message_stop;
+# Responses requires response.completed/incomplete; Chat requires finish_reason
+# ([DONE] only ends the transport). Non-empty invalid tool JSON fails closed.
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
@@ -2002,14 +2011,15 @@ session is saved and resumable — see Session persistence above.
 
 ## Verification
 
-`cargo test` runs 358 tests across the workspace:
+`cargo test` runs the full workspace suite:
 
 - **kloop-protocol** — wire-format contract (exact JSON shapes, `is_error`
   omission rule, role casing, serde round-trip).
 - **kloop-provider** — history-translation unit tests plus wiremock HTTP
-  contract tests for both adapters: scripted SSE event sequences in,
-  `StreamEvent` sequences asserted out — delta accumulation, usage capture,
-  overflow-error mapping, malformed-input fallbacks, mid-stream death.
+  contracts for Anthropic Messages, OpenAI Chat Completions, and OpenAI
+  Responses: delta/block accumulation, usage capture, typed HTTP/timeout/
+  protocol failures, fixed transport and SSE caps, Retry-After, exact terminal
+  markers, fail-closed tool JSON, producer cancellation, and mid-stream death.
 - **kloop-core** — every tool's execute path (output/exit capture, timeout
   kill, line numbering, parent-dir creation, edit ambiguity, offload id
   validation, depth guard), dispatch ordering + orphan patching +
@@ -2143,13 +2153,16 @@ web ← cli; codemode ← core):
 ```
 crates/protocol/    kloop-protocol — zero-dependency leaf
   src/lib.rs        canonical wire types (Anthropic Messages shape),
-                    StreamEvent, Usage, OverflowError, ToolDef
+                    StreamEvent, Usage, ToolDef
 
 crates/provider/    kloop-provider — the adapter seam; owns reqwest
   src/lib.rs        Provider enum + stream() dispatch; Mock with scripted turns
+  src/failure.rs    typed provider failures + retry metadata
+  src/stream.rs     single-terminal stream owner + open/read/size guards
   src/anthropic.rs  Anthropic native SSE adapter
   src/openai.rs     OpenAI-compat chat/completions translation
-  src/sse.rs        incremental SSE parser
+  src/responses.rs  OpenAI Responses translation
+  src/sse.rs        bounded incremental SSE parser
 
 crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)

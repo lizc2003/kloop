@@ -2,19 +2,17 @@
 
 use std::collections::HashMap;
 
-use anyhow::bail;
-use anyhow::Result;
-use futures::StreamExt;
 use serde_json::json;
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use super::is_overflow_message;
 use super::sse::SseParser;
+use super::GuardedBody;
+use super::ProviderFailure;
+use super::StreamCompletion;
+use super::StreamSink;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
-use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
 
@@ -109,8 +107,8 @@ pub(super) async fn stream(
     url: &str,
     key: &str,
     body: &Value,
-    tx: &mpsc::Sender<Result<StreamEvent>>,
-) -> Result<()> {
+    sink: &StreamSink,
+) -> Result<StreamCompletion, ProviderFailure> {
     let req = crate::http_client()
         .post(url)
         .header("x-api-key", key)
@@ -119,7 +117,7 @@ pub(super) async fn stream(
     let resp = crate::send_checked(req, "anthropic", key).await?;
 
     let mut parser = SseParser::default();
-    let mut byte_stream = resp.bytes_stream();
+    let mut byte_stream = GuardedBody::new(resp.bytes_stream());
     // Open blocks by stream index.
     let mut open: HashMap<u64, BlockAcc> = HashMap::new();
     let mut stop_reason: Option<String> = None;
@@ -128,13 +126,9 @@ pub(super) async fn stream(
     let mut cache_read: u64 = 0;
     let mut cache_creation: u64 = 0;
 
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk?;
-        for frame in parser.feed(&chunk) {
-            let v: Value = match serde_json::from_str(&frame.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+    while let Some(chunk) = byte_stream.next().await? {
+        for frame in parser.feed(&chunk)? {
+            let v = crate::parse_sse_json("anthropic", &frame.data)?;
             match v["type"].as_str().unwrap_or_default() {
                 "message_start" => {
                     let usage = &v["message"]["usage"];
@@ -182,7 +176,7 @@ pub(super) async fn stream(
                         ("text_delta", BlockAcc::Text { text }) => {
                             let piece = delta["text"].as_str().unwrap_or_default();
                             text.push_str(piece);
-                            let _ = tx.send(Ok(StreamEvent::TextDelta(piece.into()))).await;
+                            sink.text_delta(piece.into()).await?;
                         }
                         ("input_json_delta", BlockAcc::ToolUse { json, .. }) => {
                             json.push_str(delta["partial_json"].as_str().unwrap_or_default());
@@ -190,7 +184,7 @@ pub(super) async fn stream(
                         ("thinking_delta", BlockAcc::Thinking { thinking, .. }) => {
                             let piece = delta["thinking"].as_str().unwrap_or_default();
                             thinking.push_str(piece);
-                            let _ = tx.send(Ok(StreamEvent::ThinkingDelta(piece.into()))).await;
+                            sink.thinking_delta(piece.into()).await?;
                         }
                         ("signature_delta", BlockAcc::Thinking { signature, .. }) => {
                             signature.push_str(delta["signature"].as_str().unwrap_or_default());
@@ -207,12 +201,8 @@ pub(super) async fn stream(
                         BlockAcc::Text { text } => ContentBlock::Text { text },
                         BlockAcc::ToolUse { id, name, json } => ContentBlock::ToolUse {
                             id,
+                            input: crate::parse_tool_input("anthropic", &name, &json)?,
                             name,
-                            input: if json.trim().is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(&json).unwrap_or_else(|_| json!({}))
-                            },
                         },
                         BlockAcc::Thinking {
                             thinking,
@@ -225,7 +215,7 @@ pub(super) async fn stream(
                             ContentBlock::RedactedThinking { data }
                         }
                     };
-                    let _ = tx.send(Ok(StreamEvent::BlockDone(block))).await;
+                    sink.block_done(block).await?;
                 }
                 "message_delta" => {
                     if let Some(r) = v["delta"]["stop_reason"].as_str() {
@@ -237,33 +227,35 @@ pub(super) async fn stream(
                     }
                 }
                 "message_stop" => {
+                    if !open.is_empty() {
+                        return Err(ProviderFailure::protocol(
+                            "anthropic message_stop arrived with unfinished content blocks",
+                        ));
+                    }
                     let usage = input_tokens.map(|input| Usage {
                         input_tokens: input,
                         output_tokens: output_tokens.unwrap_or(0),
                         cache_read_input_tokens: cache_read,
                         cache_creation_input_tokens: cache_creation,
                     });
-                    let _ = tx
-                        .send(Ok(StreamEvent::Done {
-                            stop_reason: stop_reason.take(),
-                            usage,
-                        }))
-                        .await;
-                    return Ok(());
+                    return Ok(StreamCompletion::new(stop_reason.take(), usage));
                 }
                 "error" => {
                     if is_overflow_message(&v["error"].to_string()) {
-                        return Err(anyhow::Error::new(OverflowError));
+                        return Err(ProviderFailure::context_overflow());
                     }
-                    bail!("anthropic stream error: {}", v["error"]);
+                    return Err(ProviderFailure::protocol(format!(
+                        "anthropic stream error: {}",
+                        v["error"]
+                    )));
                 }
                 _ => {}
             }
         }
     }
-    // Stream ended without message_stop; the caller treats a closed channel
-    // without Done as retryable.
-    Ok(())
+    Err(ProviderFailure::incomplete_protocol(
+        "anthropic stream ended before message_stop",
+    ))
 }
 
 #[cfg(test)]

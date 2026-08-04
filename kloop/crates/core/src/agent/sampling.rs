@@ -20,10 +20,10 @@ use crate::event::Event;
 use crate::event::Item;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
+use kloop_provider::ProviderFailure;
 
 pub(super) struct SampleOk {
     pub(super) blocks: Vec<ContentBlock>,
@@ -37,7 +37,11 @@ pub(super) enum Sampled {
     Cancelled {
         partial: Vec<ContentBlock>,
     },
+    /// A retryable failure exhausted the primary model's attempt budget and may
+    /// proceed to the configured fallback model.
     Failed(String),
+    /// A non-retryable failure ends the turn without replay or model fallback.
+    Terminal(String),
     Partial {
         error: String,
         blocks: Vec<ContentBlock>,
@@ -49,8 +53,8 @@ enum SampleError {
         partial: Vec<ContentBlock>,
     },
     Overflow,
-    Retryable(String),
-    /// Retrying or falling back after visible deltas would duplicate output.
+    Provider(ProviderFailure),
+    /// Retrying or falling back after semantic content would replay output.
     AfterOutput {
         error: String,
         partial: Vec<ContentBlock>,
@@ -112,19 +116,23 @@ pub(super) async fn sample_with_retry(
                     blocks: partial,
                 }
             }
-            Err(SampleError::Retryable(e)) => {
+            Err(SampleError::Provider(error)) => {
+                if !error.is_retryable() {
+                    return Sampled::Terminal(error.to_string());
+                }
                 if attempt + 1 == MAX_ATTEMPTS {
-                    return Sampled::Failed(e);
+                    return Sampled::Failed(error.to_string());
                 }
                 // Exponential backoff with sub-ms jitter from the clock's
-                // nanoseconds — good enough without pulling in `rand`.
+                // nanoseconds. A bounded provider Retry-After takes precedence.
                 let jitter = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| u64::from(d.subsec_nanos()) % 250)
                     .unwrap_or(0);
-                let delay = Duration::from_millis((250 << attempt) + jitter);
+                let local_delay = Duration::from_millis((250 << attempt) + jitter);
+                let delay = error.retry_after().unwrap_or(local_delay);
                 ui.emit(&Event::Note(format!(
-                    "sampling failed (attempt {}/{MAX_ATTEMPTS}), retrying in {delay:?}: {e}",
+                    "sampling failed (attempt {}/{MAX_ATTEMPTS}), retrying in {delay:?}: {error}",
                     attempt + 1
                 )));
                 tokio::select! {
@@ -163,7 +171,6 @@ async fn sample_once(
     let mut think_item: Option<String> = None;
     let mut text_accum = String::new();
     let mut think_accum = String::new();
-    let mut visible_output = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -179,7 +186,11 @@ async fn sample_once(
                 });
             },
             event = rx.recv() => match event {
-                None => {
+                None => unreachable!(
+                    "ProviderStream materializes premature producer close as a typed failure"
+                ),
+                Some(Err(error)) => {
+                    let message = error.to_string();
                     complete_open_items(
                         ui,
                         &mut text_item,
@@ -187,40 +198,19 @@ async fn sample_once(
                         &text_accum,
                         &think_accum,
                     );
-                    let message = "stream closed early".to_string();
-                    return Err(if visible_output {
+                    return Err(if error.after_semantic_output() {
                         SampleError::AfterOutput {
                             error: message,
                             partial: replayable_partial(blocks, &text_accum),
                         }
-                    } else {
-                        SampleError::Retryable(message)
-                    });
-                }
-                Some(Err(e)) => {
-                    let overflow = e.downcast_ref::<OverflowError>().is_some();
-                    let message = format!("{e:#}");
-                    complete_open_items(
-                        ui,
-                        &mut text_item,
-                        &mut think_item,
-                        &text_accum,
-                        &think_accum,
-                    );
-                    return Err(if visible_output {
-                        SampleError::AfterOutput {
-                            error: message,
-                            partial: replayable_partial(blocks, &text_accum),
-                        }
-                    } else if overflow {
+                    } else if error.is_context_overflow() {
                         SampleError::Overflow
                     } else {
-                        SampleError::Retryable(message)
+                        SampleError::Provider(error)
                     });
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
                     if stream_text {
-                        visible_output = true;
                         text_accum.push_str(&t);
                         let id = open_item(&mut text_item, item_seq, "msg", ui, || {
                             Item::AssistantMessage { text: String::new() }
@@ -230,7 +220,6 @@ async fn sample_once(
                 }
                 Some(Ok(StreamEvent::ThinkingDelta(t))) => {
                     if stream_text {
-                        visible_output = true;
                         think_accum.push_str(&t);
                         let id = open_item(&mut think_item, item_seq, "reasoning", ui, || {
                             Item::Reasoning { text: String::new() }

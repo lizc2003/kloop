@@ -1230,6 +1230,20 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
         .recv_until(|message| message["method"] == "turn/completed")
         .await;
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "error");
+    assert_eq!(
+        log.iter()
+            .filter(|message| message["method"] == "turn/completed")
+            .count(),
+        1,
+        "the turn has exactly one terminal notification"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|message| message["method"] == "item/completed")
+            .count(),
+        1,
+        "the partial assistant item is completed exactly once"
+    );
 
     client
         .request("thread/read", json!({"threadId": thread_id}))
@@ -1243,7 +1257,7 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
         json!([{
             "afterMessage": 2,
             "status": "error",
-            "error": "stream dropped",
+            "error": "provider transport error: stream dropped",
         }])
     );
 

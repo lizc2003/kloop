@@ -165,7 +165,9 @@
 > **CodeWhale 调研已完成（2026-07-27）**：本地只读克隆固定在 `refs/codewhale`，当前 commit 为
 > `b494236312ef3ac36489c83706a0b11ab73935a1`；`60-codewhale-source-review.md` 区分已接通主路径、
 > 局部实现与 stub，并按 A–D 记录对 kloop 的候选借鉴项。它只是后续规划输入，未修改产品行为；
-> 新会话从该文档第七节讨论，当前首推候选是 provider stream guard。
+> 新会话从该文档第七节讨论；其首推候选 provider stream guard 已由 Plan 64 落地。
+>
+> **Plan 64 已完成（2026-08-04）**：`64-provider-stream-guard.md` 将三条 provider rail 收进 typed、单终态、consumer-drop 即 abort 的 stream seam；固定 open 45s / idle 15m / wall 30m / response 10MiB / unfinished frame 1MiB guard。Anthropic 只认 `message_stop`，Responses 只认 `response.completed|incomplete`，Chat 以 `finish_reason` 为语义终态、`[DONE]` 仅结束传输；非空非法 tool JSON 全部 fail closed。core 只在尚无任何 text/reasoning/完整 tool block 时，对 transport、open/idle/wall、HTTP 408/429/5xx、incomplete EOF 做总计 3 attempts，支持秒/HTTP-date `Retry-After`（60s cap）；non-retryable 不 fallback，partial semantic output 不 replay，protocol 1.0 仍只投影 `Error(String)`。确定性测试覆盖 guard、三 wire、tool/subagent retry seal、取消 producer 与 server 单 terminal；提交 SHA 以本条所在提交为准。
 
 **结构**:Cargo workspace,九 crate,到 core 为止严格单链,其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。

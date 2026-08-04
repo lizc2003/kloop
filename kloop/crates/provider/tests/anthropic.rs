@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::OverflowError;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
+use kloop_provider::ProviderFailureKind;
+use kloop_provider::StreamResult;
 use kloop_provider::ThinkingMode;
 use serde_json::json;
 use wiremock::matchers::method;
@@ -37,7 +38,7 @@ async fn mount_sse(server: &MockServer, body: String) {
         .await;
 }
 
-async fn collect(provider: Provider) -> Vec<anyhow::Result<StreamEvent>> {
+async fn collect(provider: Provider) -> Vec<StreamResult> {
     let provider = Arc::new(provider);
     let mut rx = provider.stream("test-model", "system", &[Message::user_text("hi")], &[]);
     let mut events = Vec::new();
@@ -403,7 +404,7 @@ async fn thinking_mode_field_shapes() {
 }
 
 #[tokio::test]
-async fn malformed_tool_input_falls_back_to_empty_object() {
+async fn malformed_tool_input_fails_closed() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -416,15 +417,15 @@ async fn malformed_tool_input_falls_back_to_empty_object() {
     )
     .await;
 
-    let ok: Vec<StreamEvent> = collect(anthropic(&server))
-        .await
-        .into_iter()
-        .map(|e| e.unwrap())
-        .collect();
-    assert!(matches!(
-        &ok[0],
-        StreamEvent::BlockDone(ContentBlock::ToolUse { input, .. }) if input == &json!({})
-    ));
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "no ToolUse or Done may follow invalid JSON"
+    );
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.to_string().contains("invalid JSON input"));
 }
 
 #[tokio::test]
@@ -440,11 +441,8 @@ async fn http_overflow_maps_to_overflow_error() {
 
     let events = collect(anthropic(&server)).await;
     assert_eq!(events.len(), 1);
-    let err = events.into_iter().next().unwrap().unwrap_err();
-    assert!(
-        err.downcast_ref::<OverflowError>().is_some(),
-        "expected OverflowError, got: {err:#}"
-    );
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
 #[tokio::test]
@@ -460,15 +458,15 @@ async fn stream_error_event_surfaces_as_error() {
 
     let events = collect(anthropic(&server)).await;
     assert_eq!(events.len(), 1);
-    let err = events.into_iter().next().unwrap().unwrap_err();
-    assert!(err.downcast_ref::<OverflowError>().is_none());
-    assert!(format!("{err:#}").contains("overloaded_error"));
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.to_string().contains("overloaded_error"));
 }
 
-/// A stream that dies without message_stop closes the channel with no Done —
-/// the agent treats that as retryable.
+/// A stream that dies without message_stop emits one typed incomplete error;
+/// an unfinished content block is never fabricated.
 #[tokio::test]
-async fn stream_without_message_stop_closes_channel_cleanly() {
+async fn stream_without_message_stop_is_an_error() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -480,10 +478,46 @@ async fn stream_without_message_stop_closes_channel_cleanly() {
     .await;
 
     let events = collect(anthropic(&server)).await;
-    // TextDelta only; no BlockDone (block never stopped), no Done, no error.
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert!(matches!(
         events[0].as_ref().unwrap(),
         StreamEvent::TextDelta(t) if t == "partial"
     ));
+    let error = events[1].as_ref().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("before message_stop"));
+}
+
+#[tokio::test]
+async fn malformed_sse_json_is_a_terminal_protocol_error() {
+    let server = MockServer::start().await;
+    mount_sse(&server, "event: message_start\ndata: {oops\n\n".into()).await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+}
+
+#[tokio::test]
+async fn message_stop_does_not_close_an_unfinished_block() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\":"}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1, "partial tool JSON must stay invisible");
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("unfinished content blocks"));
 }

@@ -1419,8 +1419,8 @@ dependencies = [
 name = "kloop-provider"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "futures",
+ "httpdate",
  "kloop-protocol",
  "reqwest",
  "serde_json",
