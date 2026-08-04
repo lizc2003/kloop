@@ -171,40 +171,38 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         if !selected_any {
             bail!("tool_search: select: requires at least one tool name");
         }
+    } else if let Some(def) = deferred
+        .iter()
+        .find(|def| def.name.eq_ignore_ascii_case(&query))
+    {
+        found.push(def.clone());
     } else {
-        if let Some(def) = deferred
+        let query_lower = query.to_lowercase();
+        let prefix_matches: Vec<ToolDef> = deferred
             .iter()
-            .find(|def| def.name.eq_ignore_ascii_case(&query))
-        {
-            found.push(def.clone());
+            .filter(|def| def.name.to_lowercase().starts_with(&query_lower))
+            .take(max_results)
+            .cloned()
+            .collect();
+        if query_lower.contains("__") && !prefix_matches.is_empty() {
+            found = prefix_matches;
         } else {
-            let query_lower = query.to_lowercase();
-            let prefix_matches: Vec<ToolDef> = deferred
-                .iter()
-                .filter(|def| def.name.to_lowercase().starts_with(&query_lower))
-                .take(max_results)
-                .cloned()
+            let terms: Vec<SearchTerm> = query
+                .split_whitespace()
+                .filter_map(SearchTerm::parse)
                 .collect();
-            if query_lower.contains("__") && !prefix_matches.is_empty() {
-                found = prefix_matches;
-            } else {
-                let terms: Vec<SearchTerm> = query
-                    .split_whitespace()
-                    .filter_map(SearchTerm::parse)
-                    .collect();
-                let mut scored: Vec<(u32, &ToolDef)> = deferred
-                    .iter()
-                    .filter_map(|def| keyword_score(def, &terms).map(|score| (score, def)))
-                    .filter(|(score, _)| *score > 0)
-                    .collect();
-                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-                found.extend(
-                    scored
-                        .into_iter()
-                        .take(max_results)
-                        .map(|(_, def)| def.clone()),
-                );
-            }
+            let mut scored: Vec<(u32, &ToolDef)> = deferred
+                .iter()
+                .filter_map(|def| keyword_score(def, &terms).map(|score| (score, def)))
+                .filter(|(score, _)| *score > 0)
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+            found.extend(
+                scored
+                    .into_iter()
+                    .take(max_results)
+                    .map(|(_, def)| def.clone()),
+            );
         }
     }
 

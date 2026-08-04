@@ -1,6 +1,5 @@
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -13,16 +12,26 @@ use anyhow::Result;
 use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
+#[cfg(windows)]
+#[path = "fs/windows.rs"]
+mod windows;
+
 use super::notebook;
 use super::resolve_path;
 use super::str_arg;
 use super::ToolCtx;
+use crate::file_io::file_contents_equal;
+use crate::file_io::fingerprint_file;
+use crate::file_io::read_bounded;
 use crate::file_state::normalize_absolute_path;
+use crate::file_state::FileIdentity;
 use crate::file_state::FileObservation;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
 use crate::image::detect_media_type;
 use crate::image::image_block_from_bytes;
+use crate::image::MAX_IMAGE_BYTES;
+use crate::text_edit::apply_text_edit;
 
 pub(super) struct ReadFileOutput {
     pub content: ToolResultContent,
@@ -49,6 +58,8 @@ pub(super) struct PreparedMutation {
     parent: std::fs::File,
     leaf: OsString,
     parent_identity: FileIdentity,
+    missing_parents: Vec<OsString>,
+    planned_parent_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -68,12 +79,6 @@ impl std::fmt::Display for UnsafeHardLink {
 
 impl std::error::Error for UnsafeHardLink {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const READ_CONTENT_CHARS: usize = 7_000;
 
@@ -92,16 +97,29 @@ enum Mutation {
     },
 }
 
+#[derive(Debug)]
 struct CommitOutcome {
     content: String,
     bytes: Vec<u8>,
     metadata: std::fs::Metadata,
+    identity: FileIdentity,
 }
 
-struct TargetSnapshot {
-    bytes: Vec<u8>,
+struct TargetFile {
+    file: std::fs::File,
     metadata: std::fs::Metadata,
+}
+
+struct ExpectedTarget {
     version: FileVersion,
+    identity: FileIdentity,
+}
+
+struct CreatedDirectory {
+    parent: std::fs::File,
+    name: OsString,
+    directory: std::fs::File,
+    identity: FileIdentity,
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +136,7 @@ enum CommitFault {
     None,
     #[cfg(test)]
     BeforeRename,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     ReplaceTempName,
 }
 
@@ -156,17 +174,11 @@ fn bind_read_target(
     // opened inode. A parent swap between canonicalize and open fails closed.
     let checked_path = std::fs::canonicalize(requested)
         .with_context(|| format!("read_file: path changed while preparing {display_path}"))?;
-    let checked_metadata = std::fs::metadata(&checked_path)
-        .with_context(|| format!("read_file: cannot inspect {display_path}"))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("read_file: cannot inspect opened {display_path}"))?;
-    if checked_path != resolved
-        || file_identity(&checked_metadata)? != file_identity(&opened_metadata)?
-    {
+    let checked_file = open_read_target(&parent, parent_path, leaf, display_path)?;
+    if checked_path != resolved || file_identity(&checked_file)? != file_identity(&file)? {
         bail!("read_file: path changed while preparing {display_path}; retry the call");
     }
-    if has_multiple_hard_links(&opened_metadata) {
+    if has_multiple_hard_links(&file)? {
         return Err(UnsafeHardLink {
             path: display_path.to_string(),
         }
@@ -216,23 +228,25 @@ fn open_read_target(
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn open_read_target(
-    _parent: &std::fs::File,
-    parent_path: &Path,
+    parent: &std::fs::File,
+    _parent_path: &Path,
     leaf: &OsStr,
     display_path: &str,
 ) -> Result<std::fs::File> {
-    let file = std::fs::File::open(parent_path.join(leaf))
-        .with_context(|| format!("read_file: cannot read {display_path}"))?;
-    if !file
-        .metadata()
-        .with_context(|| format!("read_file: cannot inspect {display_path}"))?
-        .is_file()
-    {
-        bail!("read_file: cannot read {display_path}: not a regular file");
-    }
-    Ok(file)
+    windows::open_child_regular_file(parent, leaf)?
+        .with_context(|| format!("read_file: cannot read {display_path}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_read_target(
+    _parent: &std::fs::File,
+    _parent_path: &Path,
+    _leaf: &OsStr,
+    _display_path: &str,
+) -> Result<std::fs::File> {
+    bail!("safe file reads are unsupported on this platform")
 }
 
 /// read_file reads any file the model points at — text or image (cc's Read is
@@ -249,21 +263,25 @@ pub(super) async fn read_file_tool(
         .file
         .try_clone()
         .with_context(|| format!("read_file: cannot retain {path}"))?;
+    let byte_limit = if key
+        .extension()
+        .is_some_and(|extension| extension == "ipynb")
+    {
+        notebook::MAX_NOTEBOOK_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    };
     let display_path = path.to_string();
-    let (before, bytes, after) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let before = file
-            .metadata()
-            .with_context(|| format!("read_file: cannot inspect {display_path}"))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("read_file: cannot read {display_path}"))?;
-        let after = file
-            .metadata()
-            .with_context(|| format!("read_file: cannot inspect {display_path} after reading"))?;
-        Ok((before, bytes, after))
+    let snapshot = tokio::task::spawn_blocking(move || {
+        read_bounded(&mut file, byte_limit)
+            .map_err(|error| anyhow::anyhow!("read_file: cannot read {display_path}: {error}"))
     })
     .await
     .with_context(|| format!("read_file: read worker failed for {path}"))??;
+    let bytes = snapshot.bytes;
+    let metadata = snapshot.metadata;
+    let identity = file_identity(&prepared.file)
+        .with_context(|| format!("read_file: cannot identify {path}"))?;
 
     // Notebook dispatch is extension-based: unlike image media sniffing, JSON
     // notebooks have no magic bytes. A cell-aware read must be complete before
@@ -279,21 +297,16 @@ pub(super) async fn read_file_tool(
         }
         let output = notebook::read_notebook(&bytes)?;
         let observation = if output.editable {
-            FileObservation::full_notebook(&bytes, &before)
+            FileObservation::full_notebook_with_identity(&bytes, &metadata, identity)
         } else {
-            FileObservation::full(&bytes, &before)
-        };
-        let state_update = if observation.version().metadata_matches(&after) {
-            FileStateUpdate::Observe {
-                path: key,
-                observation,
-            }
-        } else {
-            FileStateUpdate::Clear { path: key }
+            FileObservation::full_with_identity(&bytes, &metadata, identity)
         };
         return Ok(ReadFileOutput {
             content: output.content,
-            state_update,
+            state_update: FileStateUpdate::Observe {
+                path: key,
+                observation,
+            },
         });
     }
 
@@ -302,18 +315,13 @@ pub(super) async fn read_file_tool(
     if detect_media_type(&bytes).is_some() {
         let block = image_block_from_bytes(&bytes)
             .with_context(|| format!("read_file: cannot read image {path}"))?;
-        let observation = FileObservation::full(&bytes, &before);
-        let state_update = if observation.version().metadata_matches(&after) {
-            FileStateUpdate::Observe {
-                path: key,
-                observation,
-            }
-        } else {
-            FileStateUpdate::Clear { path: key }
-        };
+        let observation = FileObservation::full_with_identity(&bytes, &metadata, identity);
         return Ok(ReadFileOutput {
             content: ToolResultContent::Blocks(vec![block]),
-            state_update,
+            state_update: FileStateUpdate::Observe {
+                path: key,
+                observation,
+            },
         });
     }
 
@@ -334,8 +342,7 @@ pub(super) async fn read_file_tool(
     })?;
     let offset = integer_arg(input, "offset", "read_file")?.unwrap_or(1);
     let limit = integer_arg(input, "limit", "read_file")?;
-    let lines: Vec<&str> = content.split('\n').collect();
-    let total_lines = lines.len();
+    let total_lines = content.split('\n').count();
     let start = if offset == 0 { 0 } else { offset - 1 };
     let requested_end = match limit {
         Some(0) | None => total_lines,
@@ -356,26 +363,22 @@ pub(super) async fn read_file_tool(
             1,
         )
     } else {
-        numbered_text_page(&lines, start, requested_end, offset)
+        numbered_text_page(content, start, requested_end, offset)
     };
-    let observation = FileObservation::from_read(
+    let observation = FileObservation::from_read_with_identity(
         &bytes,
-        &before,
+        &metadata,
+        identity,
         total_lines as u64,
         start as u64..observed_end as u64,
         start == 0,
     );
-    let state_update = if observation.version().metadata_matches(&after) {
-        FileStateUpdate::Observe {
-            path: key,
-            observation,
-        }
-    } else {
-        FileStateUpdate::Clear { path: key }
-    };
     Ok(ReadFileOutput {
         content: ToolResultContent::Text(text),
-        state_update,
+        state_update: FileStateUpdate::Observe {
+            path: key,
+            observation,
+        },
     })
 }
 
@@ -409,7 +412,7 @@ fn integer_arg(input: &Value, key: &str, tool: &str) -> Result<Option<usize>> {
 }
 
 fn numbered_text_page(
-    lines: &[&str],
+    content: &str,
     start: usize,
     requested_end: usize,
     display_start: usize,
@@ -418,7 +421,12 @@ fn numbered_text_page(
     let mut chars = 0usize;
     let mut observed_end = start;
     let mut partial_line = None;
-    for (relative, line) in lines[start..requested_end].iter().enumerate() {
+    for (relative, line) in content
+        .split('\n')
+        .skip(start)
+        .take(requested_end - start)
+        .enumerate()
+    {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let rendered = format!("{}\t{line}", display_start + relative);
         let separator = usize::from(!out.is_empty());
@@ -585,24 +593,36 @@ async fn mutate_file(
         .parent
         .try_clone()
         .with_context(|| format!("{tool}: cannot retain parent directory for {path}"))?;
-    let parent_path = prepared.parent_path.clone();
+    let missing_parents = prepared.missing_parents.clone();
+    let parent_path = prepared
+        .path
+        .parent()
+        .expect("prepared mutation target has a parent")
+        .to_path_buf();
     let leaf = prepared.leaf.clone();
 
-    // From this point the executor may have created a temp file or committed a
-    // rename. Clear eagerly; only run_one's final successful tool_result stages
-    // the replacement observation back in. Cancellation or any error therefore
-    // leaves a conservative empty entry rather than stale write authority.
+    // From this point the executor may have created directories, a temp file, or
+    // committed a rename. Clear eagerly; only run_one's final successful
+    // tool_result stages replacement authority back in.
     state.apply(FileStateUpdate::Clear { path: key.clone() });
     let path_for_error = path.to_string();
     let (outcome, path_lock) = tokio::task::spawn_blocking(move || {
-        let target = CommitTarget {
-            parent: &parent,
-            parent_path: &parent_path,
-            leaf: &leaf,
-            display_path: &path_for_error,
-            tool,
-        };
-        let outcome = commit_mutation(target, expected.as_ref(), mutation, CommitFault::None);
+        let materialized = materialize_parent(parent, &missing_parents, tool, &path_for_error);
+        let outcome = materialized.and_then(|(parent, created)| {
+            let target = CommitTarget {
+                parent: &parent,
+                parent_path: &parent_path,
+                leaf: &leaf,
+                display_path: &path_for_error,
+                tool,
+            };
+            let outcome = commit_mutation(target, expected.as_ref(), mutation, CommitFault::None);
+            if outcome.is_err() {
+                drop(parent);
+                cleanup_created_directories(created);
+            }
+            outcome
+        });
         (outcome, path_lock)
     })
     .await
@@ -610,9 +630,13 @@ async fn mutate_file(
     let outcome = outcome?;
 
     let observation = if notebook_mutation {
-        FileObservation::full_notebook(&outcome.bytes, &outcome.metadata)
+        FileObservation::full_notebook_with_identity(
+            &outcome.bytes,
+            &outcome.metadata,
+            outcome.identity,
+        )
     } else {
-        FileObservation::full(&outcome.bytes, &outcome.metadata)
+        FileObservation::full_with_identity(&outcome.bytes, &outcome.metadata, outcome.identity)
     };
     Ok(FileMutationOutput {
         content: outcome.content,
@@ -634,17 +658,74 @@ fn prepare_mutation(
     let parent = lexical
         .parent()
         .with_context(|| format!("{tool}: {display_path} has no parent directory"))?;
-    let leaf = lexical
-        .file_name()
-        .with_context(|| format!("{tool}: {display_path} has no file name"))?
-        .to_os_string();
+    let leaf = validate_component_name(
+        lexical
+            .file_name()
+            .with_context(|| format!("{tool}: {display_path} has no file name"))?,
+        tool,
+        display_path,
+    )?;
 
-    // Only the leaf may be absent. Creating intermediate directories after an
-    // approval would let another process replace one with a symlink and retarget
-    // the already-approved write.
-    let parent_path = std::fs::canonicalize(parent).with_context(|| {
-        format!("{tool}: parent directory for {display_path} must already exist")
-    })?;
+    let (parent_path, parent_source, missing_parents) = match std::fs::canonicalize(parent) {
+        Ok(parent_path) => (parent_path, parent.to_path_buf(), Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && tool == "write_file" => {
+            let mut cursor = parent.to_path_buf();
+            let mut missing = Vec::new();
+            let (parent_path, parent_source) = loop {
+                match std::fs::canonicalize(&cursor) {
+                    Ok(path) => break (path, cursor),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::symlink_metadata(&cursor) {
+                            Ok(metadata) if metadata.file_type().is_symlink() => {
+                                bail!("{tool}: refuses symbolic-link parent component in {display_path}")
+                            }
+                            Ok(_) => {
+                                bail!(
+                                    "{tool}: parent component of {display_path} is not a directory"
+                                )
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!("{tool}: cannot inspect parent of {display_path}")
+                                });
+                            }
+                        }
+                        let component = cursor.file_name().with_context(|| {
+                            format!("{tool}: cannot find an existing ancestor for {display_path}")
+                        })?;
+                        missing.push(validate_component_name(component, tool, display_path)?);
+                        cursor = cursor
+                            .parent()
+                            .with_context(|| {
+                                format!(
+                                    "{tool}: cannot find an existing ancestor for {display_path}"
+                                )
+                            })?
+                            .to_path_buf();
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("{tool}: cannot inspect parent directory for {display_path}")
+                        });
+                    }
+                }
+            };
+            missing.reverse();
+            (parent_path, parent_source, missing)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| {
+                format!("{tool}: parent directory for {display_path} must already exist")
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("{tool}: cannot inspect parent directory for {display_path}")
+            });
+        }
+    };
+
     let canonical_cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("{tool}: cannot inspect working directory"))?;
     let lexical_cwd = normalize_absolute_path(cwd, cwd);
@@ -655,39 +736,27 @@ fn prepare_mutation(
     }
 
     let parent_file = open_parent_directory(&parent_path, tool, display_path)?;
-    let parent_identity = file_identity(
-        &parent_file
-            .metadata()
-            .with_context(|| format!("{tool}: cannot inspect parent of {display_path}"))?,
-    )?;
+    let parent_identity = file_identity(&parent_file)?;
 
     // Bind the canonical spelling used by permission to the directory object we
     // actually opened. Any rename/symlink swap during preparation fails closed.
-    let checked_parent = std::fs::canonicalize(parent)
+    let checked_parent = std::fs::canonicalize(&parent_source)
         .with_context(|| format!("{tool}: parent directory changed for {display_path}"))?;
-    let checked_metadata = std::fs::metadata(&checked_parent)
-        .with_context(|| format!("{tool}: cannot inspect parent of {display_path}"))?;
-    if checked_parent != parent_path
-        || file_identity(&checked_metadata)? != parent_identity
-        || !checked_metadata.is_dir()
-    {
+    let checked_file = open_parent_directory(&checked_parent, tool, display_path)?;
+    if checked_parent != parent_path || file_identity(&checked_file)? != parent_identity {
         bail!("{tool}: parent directory changed while preparing {display_path}; retry the call");
     }
 
-    let path = parent_path.join(&leaf);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("{tool}: refuses to replace symbolic link {display_path}");
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            bail!("{tool}: {display_path} is not a regular file");
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("{tool}: cannot inspect {display_path}"));
-        }
+    if missing_parents.is_empty() {
+        inspect_mutation_leaf(&parent_file, &parent_path, &leaf, tool, display_path)?;
     }
+    let mut effective_parent = parent_path.clone();
+    let mut planned_parent_paths = Vec::with_capacity(missing_parents.len());
+    for component in &missing_parents {
+        effective_parent.push(component);
+        planned_parent_paths.push(effective_parent.clone());
+    }
+    let path = effective_parent.join(&leaf);
 
     Ok(PreparedMutation {
         path,
@@ -695,7 +764,44 @@ fn prepare_mutation(
         parent: parent_file,
         leaf,
         parent_identity,
+        missing_parents,
+        planned_parent_paths,
     })
+}
+
+fn validate_component_name(component: &OsStr, tool: &str, display_path: &str) -> Result<OsString> {
+    let bytes = component.as_encoded_bytes();
+    if bytes.is_empty()
+        || component == OsStr::new(".")
+        || component == OsStr::new("..")
+        || bytes.contains(&0)
+    {
+        bail!("{tool}: invalid path component in {display_path}");
+    }
+    #[cfg(windows)]
+    {
+        let value = component.to_str().with_context(|| {
+            format!("{tool}: path component is not valid Unicode in {display_path}")
+        })?;
+        if value.contains(['/', '\\', ':']) || value.ends_with(['.', ' ']) {
+            bail!("{tool}: unsafe Windows path component in {display_path}");
+        }
+    }
+    Ok(component.to_os_string())
+}
+
+fn inspect_mutation_leaf(
+    parent: &std::fs::File,
+    parent_path: &Path,
+    leaf: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<()> {
+    let existing = open_regular_target(parent, parent_path, leaf, tool, display_path)?;
+    if tool != "write_file" && existing.is_none() {
+        bail!("{tool}: cannot read {display_path}");
+    }
+    Ok(())
 }
 
 impl PreparedMutation {
@@ -703,13 +809,15 @@ impl PreparedMutation {
         &self.path
     }
 
+    pub(super) fn preview_context(&self) -> Option<crate::diff::MutationPreviewContext> {
+        (!self.planned_parent_paths.is_empty()).then(|| crate::diff::MutationPreviewContext {
+            directories_to_create: self.planned_parent_paths.clone(),
+        })
+    }
+
     fn revalidate(&self, tool: &str, display_path: &str) -> Result<()> {
         verify_parent_binding(&self.parent, &self.parent_path, tool, display_path)?;
-        let retained = self
-            .parent
-            .metadata()
-            .with_context(|| format!("{tool}: cannot inspect parent of {display_path}"))?;
-        if file_identity(&retained)? != self.parent_identity {
+        if file_identity(&self.parent)? != self.parent_identity {
             bail!(
                 "{tool}: parent directory changed while approval was pending for {display_path}; retry the call"
             );
@@ -727,20 +835,189 @@ fn verify_parent_binding(
     let current_path = std::fs::canonicalize(parent_path).with_context(|| {
         format!("{tool}: parent directory changed while approval was pending for {display_path}")
     })?;
-    let current = std::fs::metadata(&current_path)
-        .with_context(|| format!("{tool}: cannot inspect parent directory for {display_path}"))?;
-    let retained = parent
-        .metadata()
-        .with_context(|| format!("{tool}: cannot inspect retained parent for {display_path}"))?;
-    if current_path != parent_path
-        || !current.is_dir()
-        || file_identity(&current)? != file_identity(&retained)?
-    {
+    let current = open_parent_directory(&current_path, tool, display_path)?;
+    if current_path != parent_path || file_identity(&current)? != file_identity(parent)? {
         bail!(
             "{tool}: parent directory changed while approval was pending for {display_path}; retry the call"
         );
     }
     Ok(())
+}
+
+fn materialize_parent(
+    mut parent: std::fs::File,
+    missing: &[OsString],
+    tool: &str,
+    display_path: &str,
+) -> Result<(std::fs::File, Vec<CreatedDirectory>)> {
+    let mut created = Vec::new();
+    for component in missing {
+        let opened = open_or_create_child_directory(&parent, component, tool, display_path);
+        let (child, created_now) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(parent);
+                cleanup_created_directories(created);
+                return Err(error);
+            }
+        };
+        if created_now {
+            let identity = match file_identity(&child) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    drop(child);
+                    drop(parent);
+                    cleanup_created_directories(created);
+                    return Err(error).with_context(|| {
+                        format!("{tool}: cannot identify created parent for {display_path}")
+                    });
+                }
+            };
+            let retained = (|| -> Result<CreatedDirectory> {
+                Ok(CreatedDirectory {
+                    parent: parent.try_clone()?,
+                    name: component.clone(),
+                    directory: child.try_clone()?,
+                    identity,
+                })
+            })();
+            match retained {
+                Ok(retained) => created.push(retained),
+                Err(error) => {
+                    created.push(CreatedDirectory {
+                        parent,
+                        name: component.clone(),
+                        directory: child,
+                        identity,
+                    });
+                    cleanup_created_directories(created);
+                    return Err(error).with_context(|| {
+                        format!("{tool}: cannot retain created parent for {display_path}")
+                    });
+                }
+            }
+            if let Err(error) = sync_parent(&parent, tool, display_path) {
+                drop(child);
+                drop(parent);
+                cleanup_created_directories(created);
+                return Err(error);
+            }
+        }
+        parent = child;
+    }
+    Ok((parent, created))
+}
+
+#[cfg(windows)]
+fn cleanup_created_directories(mut created: Vec<CreatedDirectory>) {
+    while let Some(created) = created.pop() {
+        let _ = remove_created_directory(created);
+    }
+}
+
+#[cfg(not(windows))]
+fn cleanup_created_directories(created: Vec<CreatedDirectory>) {
+    // POSIX has no portable handle-bound rmdir: checking the retained inode and
+    // then unlinking a name leaves a swap window that could delete a replacement.
+    // Conservatively retain the empty directories rather than touch an unbound name.
+    for CreatedDirectory {
+        parent,
+        name,
+        directory,
+        identity,
+    } in created
+    {
+        drop((parent, name, directory, identity));
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_child_directory(
+    parent: &std::fs::File,
+    name: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<(std::fs::File, bool)> {
+    use rustix::fs::Mode;
+
+    let mode = Mode::RUSR
+        | Mode::WUSR
+        | Mode::XUSR
+        | Mode::RGRP
+        | Mode::WGRP
+        | Mode::XGRP
+        | Mode::ROTH
+        | Mode::WOTH
+        | Mode::XOTH;
+    let created = match rustix::fs::mkdirat(parent, name, mode) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::EXIST) => false,
+        Err(error) => {
+            return Err(std::io::Error::from_raw_os_error(error.raw_os_error())).with_context(
+                || format!("{tool}: cannot create parent directory for {display_path}"),
+            );
+        }
+    };
+    let child = open_child_directory(parent, name, tool, display_path)?;
+    Ok((child, created))
+}
+
+#[cfg(unix)]
+fn open_child_directory(
+    parent: &std::fs::File,
+    name: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<std::fs::File> {
+    use rustix::fs::Mode;
+    use rustix::fs::OFlags;
+
+    let fd = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| {
+        format!("{tool}: parent component is not a safe directory for {display_path}")
+    })?;
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(windows)]
+fn open_or_create_child_directory(
+    parent: &std::fs::File,
+    name: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<(std::fs::File, bool)> {
+    windows::open_or_create_child_directory(parent, name)
+        .with_context(|| format!("{tool}: cannot create parent directory for {display_path}"))
+}
+
+#[cfg(windows)]
+fn remove_created_directory(created: CreatedDirectory) -> Result<()> {
+    let CreatedDirectory {
+        parent,
+        name,
+        directory,
+        identity,
+    } = created;
+    if file_identity(&directory)? != identity {
+        bail!("created directory identity changed before cleanup");
+    }
+    drop(directory);
+    windows::remove_created_directory(&parent, &name, identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_or_create_child_directory(
+    _parent: &std::fs::File,
+    _name: &OsStr,
+    _tool: &str,
+    _display_path: &str,
+) -> Result<(std::fs::File, bool)> {
+    bail!("safe recursive file mutation is unsupported on this platform")
 }
 
 #[cfg(unix)]
@@ -757,43 +1034,39 @@ fn open_parent_directory(path: &Path, tool: &str, display_path: &str) -> Result<
     Ok(std::fs::File::from(fd))
 }
 
-#[cfg(not(unix))]
-fn open_parent_directory(path: &Path, tool: &str, display_path: &str) -> Result<std::fs::File> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("{tool}: cannot open parent directory for {display_path}"))?;
-    if !file
-        .metadata()
-        .with_context(|| format!("{tool}: cannot inspect parent directory for {display_path}"))?
-        .is_dir()
-    {
-        bail!("{tool}: parent of {display_path} is not a directory");
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn has_multiple_hard_links(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-
-    metadata.nlink() > 1
-}
-
 #[cfg(windows)]
-fn has_multiple_hard_links(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    metadata.number_of_links().is_some_and(|links| links > 1)
+fn open_parent_directory(path: &Path, tool: &str, display_path: &str) -> Result<std::fs::File> {
+    windows::open_directory_absolute(path)
+        .with_context(|| format!("{tool}: cannot open parent directory for {display_path}"))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn has_multiple_hard_links(_metadata: &std::fs::Metadata) -> bool {
-    false
+fn open_parent_directory(_path: &Path, _tool: &str, _display_path: &str) -> Result<std::fs::File> {
+    bail!("safe file mutation is unsupported on this platform")
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> Result<FileIdentity> {
+fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
+    Ok(file.metadata()?.nlink() > 1)
+}
+
+#[cfg(windows)]
+fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
+    windows::has_multiple_hard_links(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_multiple_hard_links(_file: &std::fs::File) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
     Ok(FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -801,17 +1074,12 @@ fn file_identity(metadata: &std::fs::Metadata) -> Result<FileIdentity> {
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &std::fs::Metadata) -> Result<FileIdentity> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    Ok(FileIdentity {
-        device: u64::from(metadata.volume_serial_number().unwrap_or_default()),
-        inode: metadata.file_index().unwrap_or_default(),
-    })
+fn file_identity(file: &std::fs::File) -> Result<FileIdentity> {
+    windows::file_identity(file)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_metadata: &std::fs::Metadata) -> Result<FileIdentity> {
+fn file_identity(_file: &std::fs::File) -> Result<FileIdentity> {
     bail!("safe file mutation is unsupported on this platform")
 }
 
@@ -829,15 +1097,36 @@ fn commit_mutation(
         tool,
     } = target;
     verify_parent_binding(parent, parent_path, tool, display_path)?;
-    let current = read_regular_target(parent, parent_path, leaf, tool, display_path)?;
-    let (bytes, permissions, target_version, content) = match mutation {
+    let current = open_regular_target(parent, parent_path, leaf, tool, display_path)?;
+    let (bytes, permissions, expected_target, content) = match mutation {
         Mutation::Write { bytes } => {
-            let target_version = match current {
-                Some(snapshot) => {
-                    validate_observation(expected, &snapshot, tool, display_path, false)?;
-                    let permissions = snapshot.metadata.permissions();
-                    let version = snapshot.version;
-                    (Some(permissions), Some(version))
+            let target_state = match current {
+                Some(mut target) => {
+                    let expected = validate_observation_metadata(
+                        expected,
+                        &target.metadata,
+                        file_identity(&target.file)?,
+                        tool,
+                        display_path,
+                        false,
+                    )?;
+                    let snapshot = fingerprint_file(&mut target.file).with_context(|| {
+                        format!("{tool}: cannot read existing file {display_path}")
+                    })?;
+                    validate_observation_version(
+                        expected,
+                        &snapshot.version,
+                        tool,
+                        display_path,
+                        false,
+                    )?;
+                    (
+                        Some(snapshot.metadata.permissions()),
+                        Some(ExpectedTarget {
+                            version: snapshot.version,
+                            identity: file_identity(&target.file)?,
+                        }),
+                    )
                 }
                 None => {
                     if expected.is_some() {
@@ -847,74 +1136,106 @@ fn commit_mutation(
                 }
             };
             let content = format!("wrote {} bytes to {display_path}", bytes.len());
-            (bytes, target_version.0, target_version.1, content)
+            (bytes, target_state.0, target_state.1, content)
         }
         Mutation::Edit {
             old,
             new,
             replace_all,
         } => {
-            let snapshot =
+            let mut target =
                 current.with_context(|| format!("edit_file: cannot read {display_path}"))?;
-            validate_observation(expected, &snapshot, tool, display_path, false)?;
+            let expected = validate_observation_metadata(
+                expected,
+                &target.metadata,
+                file_identity(&target.file)?,
+                tool,
+                display_path,
+                false,
+            )?;
+            let snapshot = read_bounded(&mut target.file, MAX_IMAGE_BYTES)
+                .with_context(|| format!("edit_file: cannot read {display_path}"))?;
+            validate_observation_version(expected, &snapshot.version, tool, display_path, false)?;
             let current = String::from_utf8(snapshot.bytes).map_err(|_| {
                 anyhow::anyhow!("edit_file: {display_path} is not valid UTF-8 text")
             })?;
-            let count = current.matches(&old).count();
-            if count == 0 {
+            let edit = apply_text_edit(&current, &old, &new, replace_all);
+            if edit.match_count == 0 {
                 bail!("edit_file: old_string not found in {display_path}");
             }
-            if count > 1 && !replace_all {
+            if edit.match_count > 1 && !replace_all {
+                let count = edit.match_count;
                 bail!("edit_file: old_string matches {count} times in {display_path}; add surrounding context to disambiguate or set replace_all");
             }
-            let updated = if replace_all {
-                current.replace(&old, &new)
-            } else {
-                current.replacen(&old, &new, 1)
-            };
-            let replacements = if replace_all { count } else { 1 };
-            let content = format!("edited {display_path} ({replacements} replacement(s))");
+            let updated = edit
+                .updated
+                .expect("a unique or replace-all edit produces updated text");
+            let content = format!(
+                "edited {display_path} ({} replacement(s))",
+                edit.replacement_count
+            );
             (
                 updated.into_bytes(),
                 Some(snapshot.metadata.permissions()),
-                Some(snapshot.version),
+                Some(ExpectedTarget {
+                    version: snapshot.version,
+                    identity: file_identity(&target.file)?,
+                }),
                 content,
             )
         }
         Mutation::Notebook { request } => {
-            let snapshot = current
+            let mut target = current
                 .context("Notebook file is unavailable; read it again before editing it.")?;
-            validate_observation(expected, &snapshot, tool, display_path, true)?;
+            let expected = validate_observation_metadata(
+                expected,
+                &target.metadata,
+                file_identity(&target.file)?,
+                tool,
+                display_path,
+                true,
+            )?;
+            let snapshot = read_bounded(&mut target.file, notebook::MAX_NOTEBOOK_BYTES)
+                .context("Notebook file is unavailable; read it again before editing it.")?;
+            validate_observation_version(expected, &snapshot.version, tool, display_path, true)?;
             let mutation = notebook::apply_edit(&snapshot.bytes, &request)?;
             (
                 mutation.bytes,
                 Some(snapshot.metadata.permissions()),
-                Some(snapshot.version),
+                Some(ExpectedTarget {
+                    version: snapshot.version,
+                    identity: file_identity(&target.file)?,
+                }),
                 mutation.content,
             )
         }
     };
 
-    atomic_replace(target, &bytes, permissions, target_version.as_ref(), fault)?;
-    let committed = read_regular_target(parent, parent_path, leaf, tool, display_path)?
+    atomic_replace(target, &bytes, permissions, expected_target.as_ref(), fault)?;
+    let mut committed = open_regular_target(parent, parent_path, leaf, tool, display_path)?
         .with_context(|| format!("{tool}: committed file disappeared: {display_path}"))?;
-    if committed.bytes != bytes {
+    let (matches, metadata) = file_contents_equal(&mut committed.file, &bytes)
+        .with_context(|| format!("{tool}: cannot verify committed file {display_path}"))?;
+    let identity = file_identity(&committed.file)?;
+    if !matches {
         bail!("{tool}: {display_path} changed immediately after commit; read it again before modifying it");
     }
     Ok(CommitOutcome {
         content,
         bytes,
-        metadata: committed.metadata,
+        metadata,
+        identity,
     })
 }
 
-fn validate_observation(
-    expected: Option<&FileObservation>,
-    current: &TargetSnapshot,
+fn validate_observation_metadata<'a>(
+    expected: Option<&'a FileObservation>,
+    metadata: &std::fs::Metadata,
+    identity: FileIdentity,
     tool: &str,
     path: &str,
     require_notebook: bool,
-) -> Result<()> {
+) -> Result<&'a FileObservation> {
     let Some(expected) = expected else {
         if require_notebook {
             bail!("File has not been read yet. Read it first before writing to it.");
@@ -927,10 +1248,23 @@ fn validate_observation(
     if !expected.is_complete() {
         bail!("{tool}: must read the entire file {path} before modifying it");
     }
-    if !expected
-        .version()
-        .matches(&current.bytes, &current.metadata)
-    {
+    if expected.identity() != identity || !expected.version().metadata_matches(metadata) {
+        if require_notebook {
+            bail!("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.");
+        }
+        bail!("{tool}: {path} changed since it was read; read it again before modifying it");
+    }
+    Ok(expected)
+}
+
+fn validate_observation_version(
+    expected: &FileObservation,
+    current: &FileVersion,
+    tool: &str,
+    path: &str,
+    require_notebook: bool,
+) -> Result<()> {
+    if expected.version() != current {
         if require_notebook {
             bail!("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.");
         }
@@ -940,13 +1274,13 @@ fn validate_observation(
 }
 
 #[cfg(unix)]
-fn read_regular_target(
+fn open_regular_target(
     parent: &std::fs::File,
     _parent_path: &Path,
     leaf: &OsStr,
     tool: &str,
     display_path: &str,
-) -> Result<Option<TargetSnapshot>> {
+) -> Result<Option<TargetFile>> {
     use rustix::fs::Mode;
     use rustix::fs::OFlags;
 
@@ -966,69 +1300,44 @@ fn read_regular_target(
                 .with_context(|| format!("{tool}: cannot inspect {display_path}"));
         }
     };
-    let mut file = std::fs::File::from(fd);
-    let before = file
+    let file = std::fs::File::from(fd);
+    let metadata = file
         .metadata()
         .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
-    if !before.is_file() {
+    if !metadata.is_file() {
         bail!("{tool}: {display_path} is not a regular file");
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("{tool}: cannot read existing file {display_path}"))?;
-    let after = file
-        .metadata()
-        .with_context(|| format!("{tool}: cannot inspect {display_path} after reading"))?;
-    let version = FileVersion::new(&bytes, &before);
-    if !version.metadata_matches(&after) {
-        bail!(
-            "{tool}: {display_path} changed while it was being read; retry after reading it again"
-        );
-    }
-    Ok(Some(TargetSnapshot {
-        bytes,
-        metadata: after,
-        version,
-    }))
+    Ok(Some(TargetFile { file, metadata }))
 }
 
-#[cfg(not(unix))]
-fn read_regular_target(
-    _parent: &std::fs::File,
-    parent_path: &Path,
+#[cfg(windows)]
+fn open_regular_target(
+    parent: &std::fs::File,
+    _parent_path: &Path,
     leaf: &OsStr,
     tool: &str,
     display_path: &str,
-) -> Result<Option<TargetSnapshot>> {
-    let path = parent_path.join(leaf);
-    let before = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("{tool}: cannot inspect {display_path}"));
-        }
-    };
-    if before.file_type().is_symlink() {
-        bail!("{tool}: refuses to replace symbolic link {display_path}");
-    }
-    if !before.is_file() {
-        bail!("{tool}: {display_path} is not a regular file");
-    }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("{tool}: cannot read existing file {display_path}"))?;
-    let after = std::fs::symlink_metadata(&path)
-        .with_context(|| format!("{tool}: cannot inspect {display_path} after reading"))?;
-    let version = FileVersion::new(&bytes, &before);
-    if !version.metadata_matches(&after) {
-        bail!(
-            "{tool}: {display_path} changed while it was being read; retry after reading it again"
-        );
-    }
-    Ok(Some(TargetSnapshot {
-        bytes,
-        metadata: after,
-        version,
-    }))
+) -> Result<Option<TargetFile>> {
+    let file = windows::open_child_regular_file(parent, leaf)
+        .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
+    file.map(|file| {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
+        Ok(TargetFile { file, metadata })
+    })
+    .transpose()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_target(
+    _parent: &std::fs::File,
+    _parent_path: &Path,
+    _leaf: &OsStr,
+    _tool: &str,
+    _display_path: &str,
+) -> Result<Option<TargetFile>> {
+    bail!("safe file mutation is unsupported on this platform")
 }
 
 #[cfg(unix)]
@@ -1036,7 +1345,7 @@ fn atomic_replace(
     target: CommitTarget<'_>,
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
-    target_version: Option<&FileVersion>,
+    expected_target: Option<&ExpectedTarget>,
     fault: CommitFault,
 ) -> Result<()> {
     let CommitTarget {
@@ -1110,7 +1419,7 @@ fn atomic_replace(
                 leaf,
                 display_path,
                 tool,
-                target_version,
+                expected_target,
             )?;
             verify_parent_binding(parent, parent_path, tool, display_path)?;
             verify_temp_binding(
@@ -1141,12 +1450,12 @@ fn atomic_replace(
     .with_context(|| format!("{tool}: cannot create temporary file for {display_path}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn atomic_replace(
     target: CommitTarget<'_>,
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
-    target_version: Option<&FileVersion>,
+    expected_target: Option<&ExpectedTarget>,
     fault: CommitFault,
 ) -> Result<()> {
     let CommitTarget {
@@ -1156,19 +1465,20 @@ fn atomic_replace(
         display_path,
         tool,
     } = target;
-    let path = parent_path.join(leaf);
     let mut last_collision = None;
     for _ in 0..100 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = parent_path.join(format!(
+        let temp = OsString::from(format!(
             ".kloop-write-{}-{sequence}.tmp",
             std::process::id()
         ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = match options.open(&temp) {
+        let mut file = match windows::create_temp_file(parent, &temp) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
                 last_collision = Some(error);
                 continue;
             }
@@ -1194,16 +1504,6 @@ fn atomic_replace(
             if matches!(fault, CommitFault::BeforeRename) {
                 bail!("{tool}: injected failure before replacing {display_path}");
             }
-            #[cfg(test)]
-            if matches!(fault, CommitFault::ReplaceTempName) {
-                std::fs::remove_file(parent_path.join(&temp)).with_context(|| {
-                    format!("{tool}: cannot inject temporary replacement for {display_path}")
-                })?;
-                std::fs::write(parent_path.join(&temp), b"attacker-controlled bytes")
-                    .with_context(|| {
-                        format!("{tool}: cannot inject temporary replacement for {display_path}")
-                    })?;
-            }
             #[cfg(not(test))]
             let _ = fault;
             verify_target_unchanged(
@@ -1212,35 +1512,43 @@ fn atomic_replace(
                 leaf,
                 display_path,
                 tool,
-                target_version,
+                expected_target,
             )?;
             verify_parent_binding(parent, parent_path, tool, display_path)?;
-            verify_temp_binding(
-                parent,
-                parent_path,
-                temp.as_os_str(),
+            verify_temp_binding(parent, parent_path, &temp, &file, bytes, display_path, tool)?;
+            windows::rename_file_relative(
                 &file,
-                bytes,
-                display_path,
-                tool,
-            )?;
-            std::fs::rename(&temp, &path)
-                .with_context(|| format!("{tool}: cannot atomically replace {display_path}"))?;
+                parent,
+                leaf,
+                /* replace_existing */ expected_target.is_some(),
+            )
+            .with_context(|| format!("{tool}: cannot atomically replace {display_path}"))?;
             sync_parent(parent, tool, display_path)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
+            let _ = windows::delete_file_handle(&file);
         }
         return result;
     }
     Err(last_collision.unwrap_or_else(|| {
-        std::io::Error::new(
+        anyhow::anyhow!(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "temporary file name collision",
-        )
+        ))
     }))
     .with_context(|| format!("{tool}: cannot create temporary file for {display_path}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace(
+    _target: CommitTarget<'_>,
+    _bytes: &[u8],
+    _permissions: Option<std::fs::Permissions>,
+    _expected_target: Option<&ExpectedTarget>,
+    _fault: CommitFault,
+) -> Result<()> {
+    bail!("safe file mutation is unsupported on this platform")
 }
 
 fn verify_target_unchanged(
@@ -1249,15 +1557,29 @@ fn verify_target_unchanged(
     leaf: &OsStr,
     display_path: &str,
     tool: &str,
-    expected: Option<&FileVersion>,
+    expected: Option<&ExpectedTarget>,
 ) -> Result<()> {
     match (
         expected,
-        read_regular_target(parent, parent_path, leaf, tool, display_path)?,
+        open_regular_target(parent, parent_path, leaf, tool, display_path)?,
     ) {
         (None, None) => Ok(()),
-        (Some(expected), Some(current)) if expected.matches(&current.bytes, &current.metadata) => {
-            Ok(())
+        (Some(expected), Some(mut current)) => {
+            if file_identity(&current.file)? != expected.identity {
+                bail!(
+                    "{tool}: {display_path} changed immediately before commit; read it again and retry"
+                );
+            }
+            let current = fingerprint_file(&mut current.file).with_context(|| {
+                format!("{tool}: cannot verify {display_path} immediately before commit")
+            })?;
+            if expected.version == current.version {
+                Ok(())
+            } else {
+                bail!(
+                    "{tool}: {display_path} changed immediately before commit; read it again and retry"
+                )
+            }
         }
         _ => bail!(
             "{tool}: {display_path} changed immediately before commit; read it again and retry"
@@ -1274,14 +1596,12 @@ fn verify_temp_binding(
     display_path: &str,
     tool: &str,
 ) -> Result<()> {
-    let opened_metadata = opened
-        .metadata()
-        .with_context(|| format!("{tool}: cannot inspect temporary file for {display_path}"))?;
-    let named = read_regular_target(parent, parent_path, temp, tool, display_path)?
+    let mut named = open_regular_target(parent, parent_path, temp, tool, display_path)?
         .with_context(|| format!("{tool}: temporary file disappeared for {display_path}"))?;
-    if file_identity(&opened_metadata)? != file_identity(&named.metadata)?
-        || named.bytes != expected_bytes
-    {
+    let named_identity = file_identity(&named.file)?;
+    let (matches, _named_metadata) = file_contents_equal(&mut named.file, expected_bytes)
+        .with_context(|| format!("{tool}: cannot verify temporary file for {display_path}"))?;
+    if file_identity(opened)? != named_identity || !matches {
         bail!("{tool}: temporary file changed before replacing {display_path}; retry the call");
     }
     Ok(())
@@ -1294,10 +1614,15 @@ fn sync_parent(parent: &std::fs::File, tool: &str, display_path: &str) -> Result
         .with_context(|| format!("{tool}: cannot sync parent directory for {display_path}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn sync_parent(parent: &std::fs::File, _tool: &str, _display_path: &str) -> Result<()> {
     let _ = parent.sync_all();
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent(_parent: &std::fs::File, _tool: &str, _display_path: &str) -> Result<()> {
+    bail!("safe file mutation is unsupported on this platform")
 }
 
 pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -1397,6 +1722,13 @@ mod tests {
         }
     }
 
+    fn full_observation(path: &std::path::Path, bytes: &[u8]) -> super::FileObservation {
+        let file = std::fs::File::open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let identity = super::file_identity(&file).unwrap();
+        super::FileObservation::full_with_identity(bytes, &metadata, identity)
+    }
+
     async fn observe_whole(path: &std::path::Path, ctx: &crate::tools::ToolCtx) {
         let (out, is_error) =
             run_tool("read_file", json!({"path": path.to_str().unwrap()}), ctx).await;
@@ -1467,6 +1799,66 @@ mod tests {
             assert!(is_error, "{out}");
             assert!(out.contains("whole number"), "{out}");
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_file_enforces_format_specific_raw_byte_limits() {
+        let text_at_limit = temp_bytes("read-5m.txt", &vec![b'x'; super::MAX_IMAGE_BYTES]);
+        let text_over_limit = temp_bytes(
+            "read-5m-plus-one.txt",
+            &vec![b'x'; super::MAX_IMAGE_BYTES + 1],
+        );
+        let mut notebook =
+            br#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#.to_vec();
+        notebook.resize(super::notebook::MAX_NOTEBOOK_BYTES, b' ');
+        let notebook_at_limit = temp_bytes("read-10m.ipynb", &notebook);
+        notebook.push(b' ');
+        let notebook_over_limit = temp_bytes("read-10m-plus-one.ipynb", &notebook);
+        let text_over_key = std::fs::canonicalize(&text_over_limit).unwrap();
+        let notebook_over_key = std::fs::canonicalize(&notebook_over_limit).unwrap();
+        let ctx = test_ctx(0, "read-raw-limits");
+
+        for path in [&text_at_limit, &notebook_at_limit] {
+            let (out, is_error) =
+                run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+            assert!(!is_error, "{}: {out}", path.display());
+        }
+        for path in [&text_over_limit, &notebook_over_limit] {
+            let (out, is_error) =
+                run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+            assert!(is_error, "{}: {out}", path.display());
+            assert!(out.contains("over the"), "{out}");
+            assert!(out.contains("byte limit"), "{out}");
+        }
+        assert!(ctx.cfg.file_state.observation(&text_over_key).is_none());
+        assert!(ctx.cfg.file_state.observation(&notebook_over_key).is_none());
+
+        let _ = std::fs::remove_file(text_at_limit);
+        let _ = std::fs::remove_file(text_over_limit);
+        let _ = std::fs::remove_file(notebook_at_limit);
+        let _ = std::fs::remove_file(notebook_over_limit);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sparse_oversized_read_fails_without_observation() {
+        let path = temp_bytes("read-sparse.txt", b"");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((super::MAX_IMAGE_BYTES + 1) as u64)
+            .unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "read-sparse");
+
+        let (out, is_error) =
+            run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+
+        assert!(is_error, "{out}");
+        assert!(out.contains("byte limit"), "{out}");
+        assert!(ctx.cfg.file_state.observation(&key).is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -1583,6 +1975,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_cancelled_during_post_hook_does_not_commit_observation() {
         use crate::hooks::HookDef;
@@ -1751,28 +2144,177 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_refuses_missing_parent_before_approval() {
+    async fn write_file_creates_missing_parents_only_after_approval() {
         let dir = std::env::temp_dir().join(format!("kloop-write-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let effective_dir = std::fs::canonicalize(&dir).unwrap();
         let path = dir.join("deep/nested/file.txt");
+        let denied = dir.join("denied/parent/file.txt");
         let (ctx, mut approvals) = approval_ctx("write", &dir);
+
+        let call_ctx = ctx.clone();
+        let call_path = path.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": call_path, "content": "created"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (request, reply) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+                .await
+                .expect("write must reach approval")
+                .expect("approval channel remains open");
+        assert!(
+            !dir.join("deep").exists(),
+            "approval wait has no side effects"
+        );
+        let preview = request.preview.expect("new write carries a preview");
+        assert!(
+            preview.contains("will create parent directories"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains(&effective_dir.join("deep").display().to_string()),
+            "{preview}"
+        );
+        assert!(
+            preview.contains(&effective_dir.join("deep/nested").display().to_string()),
+            "{preview}"
+        );
+        reply
+            .send(crate::permissions::Decision::Allow)
+            .expect("approval receiver still waiting");
+        let (out, is_error) = task.await.unwrap();
+        assert!(!is_error, "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created");
+
+        let call_ctx = ctx.clone();
+        let call_path = denied.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": call_path, "content": "denied"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (_request, reply) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+                .await
+                .expect("second write must reach approval")
+                .expect("approval channel remains open");
+        reply
+            .send(crate::permissions::Decision::Deny)
+            .expect("approval receiver still waiting");
+        let (out, is_error) = task.await.unwrap();
+        assert!(is_error, "{out}");
+        assert!(!dir.join("denied").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_write_rejects_symlink_and_leaf_races_but_reuses_safe_directories() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-write-parent-races-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let (ctx, mut approvals) = approval_ctx("write-parent-races", &root);
+
+        let symlink_target = root.join("linked/nested/file.txt");
+        let call_ctx = ctx.clone();
+        let call_path = symlink_target.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": call_path, "content": "must-not-escape"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (_request, reply) = approvals.recv().await.unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        reply.send(crate::permissions::Decision::Allow).unwrap();
+        let (out, is_error) = task.await.unwrap();
+        assert!(is_error, "{out}");
+        assert!(!outside.join("nested/file.txt").exists());
+
+        let safe_target = root.join("safe/nested/file.txt");
+        let call_ctx = ctx.clone();
+        let call_path = safe_target.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": call_path, "content": "safe"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (_request, reply) = approvals.recv().await.unwrap();
+        std::fs::create_dir_all(root.join("safe/nested")).unwrap();
+        reply.send(crate::permissions::Decision::Allow).unwrap();
+        let (out, is_error) = task.await.unwrap();
+        assert!(!is_error, "{out}");
+        assert_eq!(std::fs::read_to_string(&safe_target).unwrap(), "safe");
+
+        let raced_target = root.join("raced/nested/file.txt");
+        let call_ctx = ctx.clone();
+        let call_path = raced_target.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": call_path, "content": "replacement"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (_request, reply) = approvals.recv().await.unwrap();
+        std::fs::create_dir_all(root.join("raced/nested")).unwrap();
+        std::fs::write(&raced_target, "competitor").unwrap();
+        reply.send(crate::permissions::Decision::Allow).unwrap();
+        let (out, is_error) = task.await.unwrap();
+        assert!(is_error, "{out}");
+        assert!(out.contains("must read"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&raced_target).unwrap(),
+            "competitor"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[tokio::test]
+    async fn edit_failure_never_creates_missing_parents() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-edit-no-parents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let edit_path = root.join("edit/nested/file.txt");
+        let ctx = test_ctx(0, "edit-no-parents");
+
         let (out, is_error) = run_tool(
-            "write_file",
-            json!({"path": path.to_str().unwrap(), "content": "created"}),
+            "edit_file",
+            json!({
+                "path": edit_path.to_str().unwrap(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
             &ctx,
         )
         .await;
+
         assert!(is_error, "{out}");
         assert!(out.contains("parent directory"), "{out}");
-        assert!(!dir.join("deep").exists());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), approvals.recv())
-                .await
-                .is_err(),
-            "permission approver must not be called"
-        );
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(!root.join("edit").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1844,6 +2386,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_write_content_over_text_read_limit_still_commits() {
+        let dir =
+            std::env::temp_dir().join(format!("kloop-large-explicit-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.txt");
+        let content = "x".repeat(super::MAX_IMAGE_BYTES + 1);
+        let ctx = test_ctx(0, "large-explicit-write");
+
+        let (out, is_error) = run_tool(
+            "write_file",
+            json!({"path": path.to_str().unwrap(), "content": content}),
+            &ctx,
+        )
+        .await;
+
+        assert!(!is_error, "{out}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (super::MAX_IMAGE_BYTES + 1) as u64
+        );
+        let key = std::fs::canonicalize(&path).unwrap();
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn edit_over_text_read_limit_fails_before_temp_and_clears_authority() {
+        let dir = std::env::temp_dir().join(format!("kloop-large-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.txt");
+        let bytes = vec![b'a'; super::MAX_IMAGE_BYTES + 1];
+        std::fs::write(&path, &bytes).unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "large-edit");
+        ctx.cfg
+            .file_state
+            .apply(crate::file_state::FileStateUpdate::Replace {
+                path: key.clone(),
+                observation: full_observation(&path, &bytes),
+            });
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": true
+            }),
+            &ctx,
+        )
+        .await;
+
+        assert!(is_error, "{out}");
+        assert!(out.contains("byte limit"), "{out}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kloop-write-")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn deleting_a_read_file_does_not_turn_overwrite_into_create() {
         let dir = std::env::temp_dir().join(format!("kloop-write-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1862,8 +2472,19 @@ mod tests {
         .await;
 
         assert!(is_error);
-        assert!(out.contains("parent directory"), "{out}");
-        assert!(!dir.exists(), "stale failure must not recreate parents");
+        assert!(out.contains("changed since it was read"), "{out}");
+        assert!(!path.exists(), "stale failure must not recreate the leaf");
+        #[cfg(windows)]
+        assert!(
+            !dir.exists(),
+            "Windows handle cleanup should remove the parent"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            dir.is_dir(),
+            "Unix conservatively retains the newly created parent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1901,8 +2522,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("target.txt");
         std::fs::write(&path, b"original").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let expected = super::FileObservation::full(b"original", &metadata);
+        let expected = full_observation(&path, b"original");
 
         let prepared =
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
@@ -1930,6 +2550,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recursive_parent_cleanup_is_conservative_on_unix() {
+        let root =
+            std::env::temp_dir().join(format!("kloop-recursive-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let root_handle =
+            super::open_parent_directory(&root, "write_file", "nested/file.txt").unwrap();
+
+        let missing = vec![std::ffi::OsString::from("a"), std::ffi::OsString::from("b")];
+        let (parent, created) = super::materialize_parent(
+            root_handle.try_clone().unwrap(),
+            &missing,
+            "write_file",
+            "nested/file.txt",
+        )
+        .unwrap();
+        let error = super::commit_mutation(
+            super::CommitTarget {
+                parent: &parent,
+                parent_path: &root.join("a/b"),
+                leaf: std::ffi::OsStr::new("file.txt"),
+                display_path: "nested/file.txt",
+                tool: "write_file",
+            },
+            None,
+            super::Mutation::Write {
+                bytes: b"replacement".to_vec(),
+            },
+            super::CommitFault::BeforeRename,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected failure"), "{error:#}");
+        super::cleanup_created_directories(created);
+        assert!(root.join("a/b").is_dir());
+
+        let missing = vec![std::ffi::OsString::from("nonempty")];
+        let (_parent, created) = super::materialize_parent(
+            root_handle.try_clone().unwrap(),
+            &missing,
+            "write_file",
+            "x",
+        )
+        .unwrap();
+        std::fs::write(root.join("nonempty/blocker"), "keep").unwrap();
+        super::cleanup_created_directories(created);
+        assert!(root.join("nonempty/blocker").exists());
+
+        let missing = vec![std::ffi::OsString::from("identity")];
+        let (_parent, created) =
+            super::materialize_parent(root_handle, &missing, "write_file", "x").unwrap();
+        std::fs::rename(root.join("identity"), root.join("moved")).unwrap();
+        std::fs::create_dir(root.join("identity")).unwrap();
+        super::cleanup_created_directories(created);
+        assert!(root.join("identity").is_dir());
+        assert!(root.join("moved").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replaced_temporary_name_never_reaches_target() {
         let dir =
             std::env::temp_dir().join(format!("kloop-atomic-temp-swap-{}", std::process::id()));
@@ -1937,8 +2619,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("target.txt");
         std::fs::write(&path, b"original").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let expected = super::FileObservation::full(b"original", &metadata);
+        let expected = full_observation(&path, b"original");
         let prepared =
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
 
@@ -1974,8 +2655,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("target.txt");
         std::fs::write(&path, b"original").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let expected = super::FileObservation::full(b"original", &metadata);
+        let expected = full_observation(&path, b"original");
 
         let prepared =
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
@@ -2302,6 +2982,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_post_hook_leaves_committed_write_unqualified() {
         use crate::hooks::HookDef;
@@ -2429,6 +3110,56 @@ mod tests {
         assert!(out.contains("must be different"), "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "1 2 2 three");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_lf_view_drives_crlf_edit_and_preview_matches_committed_bytes() {
+        let dir = std::env::temp_dir().join(format!("kloop-crlf-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, b"prefix\r\none\r\ntwo\r\nsuffix\r\n").unwrap();
+        let (ctx, mut approvals) = approval_ctx("crlf-edit", &dir);
+
+        let (read, is_error) =
+            run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+        assert!(!is_error, "{read}");
+        assert!(read.contains("2\tone\n3\ttwo"), "{read:?}");
+        assert!(!read.contains('\r'), "{read:?}");
+
+        let call_ctx = ctx.clone();
+        let call_path = path.to_string_lossy().to_string();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "edit_file",
+                json!({
+                    "path": call_path,
+                    "old_string": "one\ntwo",
+                    "new_string": "ONE\nTWO"
+                }),
+                &call_ctx,
+            )
+            .await
+        });
+        let (request, reply) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+                .await
+                .expect("edit must reach approval")
+                .expect("approval channel remains open");
+        let preview = request.preview.expect("edit approval carries preview");
+        assert!(preview.contains("-2  one"), "{preview}");
+        assert!(preview.contains("+2  ONE"), "{preview}");
+        reply
+            .send(crate::permissions::Decision::Allow)
+            .expect("approval receiver still waiting");
+
+        let (out, is_error) = task.await.unwrap();
+        assert!(!is_error, "{out}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"prefix\r\nONE\r\nTWO\r\nsuffix\r\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

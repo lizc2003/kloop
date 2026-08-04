@@ -11,7 +11,7 @@ jobs:
   ci:
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -27,5 +27,16 @@ jobs:
           workspaces: kloop
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: python3 -B ../refs/claude-code-2.1.220/verify.py --corpus-only
+      - if: runner.os == 'Windows'
+        run: |
+          cargo test -p kloop-core file_io::tests
+          cargo test -p kloop-core text_edit::tests
+          cargo test -p kloop-core tools::fs::tests
+          cargo test -p kloop-core tools::fs::windows::tests
+          cargo test -p kloop-core diff::tests
+          cargo test -p kloop-core file_state::tests
+          cargo test -p kloop-core scheduler::tests
+      - if: runner.os != 'Windows'
+        run: cargo test --workspace
+      - if: runner.os != 'Windows'
+        run: python3 -B ../refs/claude-code-2.1.220/verify.py --corpus-only

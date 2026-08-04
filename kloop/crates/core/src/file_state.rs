@@ -37,9 +37,28 @@ struct Entry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileObservation {
     version: FileVersion,
+    identity: FileIdentity,
     coverage: ReadCoverage,
     notebook_cells: bool,
 }
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    pub volume: u64,
+    pub file_id: [u8; 16],
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileVersion {
@@ -112,6 +131,7 @@ impl FileState {
             } => {
                 if let Some(existing) = inner.observations.get(&path) {
                     if existing.observation.version == observation.version
+                        && existing.observation.identity == observation.identity
                         && existing.observation.notebook_cells == observation.notebook_cells
                     {
                         if existing.observation.coverage.complete {
@@ -201,6 +221,42 @@ impl FileState {
 }
 
 impl FileObservation {
+    pub(crate) fn from_read_with_identity(
+        bytes: &[u8],
+        metadata: &std::fs::Metadata,
+        identity: FileIdentity,
+        total_units: u64,
+        range: Range<u64>,
+        empty_from_start: bool,
+    ) -> Self {
+        Self {
+            version: FileVersion::new(bytes, metadata),
+            identity,
+            coverage: ReadCoverage::new(total_units, range, empty_from_start),
+            notebook_cells: false,
+        }
+    }
+
+    pub(crate) fn full_with_identity(
+        bytes: &[u8],
+        metadata: &std::fs::Metadata,
+        identity: FileIdentity,
+    ) -> Self {
+        let len = bytes.len() as u64;
+        Self::from_read_with_identity(bytes, metadata, identity, len, 0..len, true)
+    }
+
+    pub(crate) fn full_notebook_with_identity(
+        bytes: &[u8],
+        metadata: &std::fs::Metadata,
+        identity: FileIdentity,
+    ) -> Self {
+        let mut observation = Self::full_with_identity(bytes, metadata, identity);
+        observation.notebook_cells = true;
+        observation
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_read(
         bytes: &[u8],
         metadata: &std::fs::Metadata,
@@ -208,22 +264,24 @@ impl FileObservation {
         range: Range<u64>,
         empty_from_start: bool,
     ) -> Self {
-        Self {
-            version: FileVersion::new(bytes, metadata),
-            coverage: ReadCoverage::new(total_units, range, empty_from_start),
-            notebook_cells: false,
-        }
+        Self::from_read_with_identity(
+            bytes,
+            metadata,
+            test_identity(metadata),
+            total_units,
+            range,
+            empty_from_start,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn full(bytes: &[u8], metadata: &std::fs::Metadata) -> Self {
-        let len = bytes.len() as u64;
-        Self::from_read(bytes, metadata, len, 0..len, true)
+        Self::full_with_identity(bytes, metadata, test_identity(metadata))
     }
 
+    #[cfg(test)]
     pub(crate) fn full_notebook(bytes: &[u8], metadata: &std::fs::Metadata) -> Self {
-        let mut observation = Self::full(bytes, metadata);
-        observation.notebook_cells = true;
-        observation
+        Self::full_notebook_with_identity(bytes, metadata, test_identity(metadata))
     }
 
     pub(crate) fn is_notebook(&self) -> bool {
@@ -234,13 +292,44 @@ impl FileObservation {
         &self.version
     }
 
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
         self.coverage.complete
     }
 }
 
+#[cfg(all(test, unix))]
+fn test_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(all(test, windows))]
+fn test_identity(_metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        volume: 0,
+        file_id: [0; 16],
+    }
+}
+
+#[cfg(all(test, not(any(unix, windows))))]
+fn test_identity(_metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity
+}
+
 impl FileVersion {
     pub(crate) fn new(bytes: &[u8], metadata: &std::fs::Metadata) -> Self {
+        Self::from_fingerprint(sha2::Sha256::digest(bytes).into(), metadata)
+    }
+
+    pub(crate) fn from_fingerprint(fingerprint: [u8; 32], metadata: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
 
@@ -255,10 +344,11 @@ impl FileVersion {
             inode: metadata.ino(),
             #[cfg(unix)]
             mode: metadata.mode(),
-            fingerprint: sha2::Sha256::digest(bytes).into(),
+            fingerprint,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn matches(&self, bytes: &[u8], metadata: &std::fs::Metadata) -> bool {
         self == &Self::new(bytes, metadata)
     }
@@ -438,6 +528,31 @@ mod tests {
                 false,
             ),
         });
+        assert!(!state.observation(&path).unwrap().is_complete());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_identity_never_inherits_old_read_coverage() {
+        let bytes = b"alpha\nbeta\n";
+        let (path, metadata) = temp_file("identity", bytes);
+        let state = FileState::default();
+        let first = FileObservation::from_read(bytes, &metadata, 2, 0..1, false);
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: first.clone(),
+        });
+        let mut replacement = FileObservation::from_read(bytes, &metadata, 2, 1..2, false);
+        replacement.identity = FileIdentity {
+            device: first.identity.device,
+            inode: first.identity.inode.wrapping_add(1),
+        };
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: replacement,
+        });
+
         assert!(!state.observation(&path).unwrap().is_complete());
         let _ = std::fs::remove_file(path);
     }

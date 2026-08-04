@@ -445,7 +445,7 @@ impl Permissions {
         depth: u8,
         sandbox_auto_allow: bool,
     ) -> Result<(), String> {
-        self.check_call_with_resolved_path(name, input, None, depth, sandbox_auto_allow)
+        self.check_call_with_resolved_path(name, input, None, None, depth, sandbox_auto_allow)
             .await
     }
 
@@ -457,6 +457,7 @@ impl Permissions {
         name: &str,
         input: &Value,
         resolved_path: Option<&Path>,
+        preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
         sandbox_auto_allow: bool,
     ) -> Result<(), String> {
@@ -513,13 +514,22 @@ impl Permissions {
                 .then(|| remember_payload(name, &call))
                 .flatten();
             return self
-                .ask_user(name, approval_input, depth, Some(hazard.tag), remember)
+                .ask_user(
+                    name,
+                    approval_input,
+                    preview_context,
+                    depth,
+                    Some(hazard.tag),
+                    remember,
+                )
                 .await;
         }
 
         // 5. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
-            return self.ask_user(name, approval_input, depth, None, None).await;
+            return self
+                .ask_user(name, approval_input, preview_context, depth, None, None)
+                .await;
         }
 
         // Safe session scheduler controls mutate only kloop's owner-scoped
@@ -576,7 +586,7 @@ impl Permissions {
         }
 
         // 12. Ask.
-        self.ask_user(name, approval_input, depth, None, remember)
+        self.ask_user(name, approval_input, preview_context, depth, None, remember)
             .await
     }
 
@@ -607,6 +617,7 @@ impl Permissions {
         &self,
         name: &str,
         input: &Value,
+        preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
         hazard_tag: Option<&str>,
         remember: Option<Remember>,
@@ -619,7 +630,8 @@ impl Permissions {
         let req = ConfirmRequest {
             description: describe(name, input, depth, hazard_tag),
             remember_rules: remember.as_ref().map(|r| r.rules.clone()),
-            preview: crate::diff::file_change_preview(name, input).await,
+            preview: crate::diff::file_change_preview_with_context(name, input, preview_context)
+                .await,
         };
         match approver.confirm(req).await {
             Decision::Allow => Ok(()),

@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-03,plan 1–59 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> 基线:2026-08-04,plan 1–59、61、64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -26,7 +26,7 @@
 | sandbox denial 判定含 DNS 失败 | codex 关键词表自身的洞 | 教训 15 |
 | grep/glob 路径级保护 | codex 完全没有(cc 有,已对齐) | plan 31 |
 | 前台 Bash timeout/cancel 无遗留进程 | cc stubborn timeout 转后台、cancel abort 后 fixture 仍有 descendants 存活 | plan 50 |
-| stale-safe 原子文件修改 | cc 接受 partial Write / unread-partial Edit 且可 stale-recover、会隐式创建缺失父目录；kloop 完整 fresh Read + keyed lock + 审批前 parent FD + descriptor-relative sync/rename fail closed | plan 49 |
+| stale-safe 原子文件修改 | cc 接受 partial Write / unread-partial Edit 且可 stale-recover，父目录用 pathname recursive mkdir；kloop 完整 fresh Read + keyed lock + 审批前 ancestor capability + 批准后 handle-relative mkdir/sync/rename fail closed | plan 49、61 |
 | 双轨 provider 对等 + 三线协议 | 两家各自单主轨 | plan 15 |
 | MCP 工具名消毒比 cc 严(`-`→`_`) | cc 规则语法不兼容风险 | 教训 10 |
 
@@ -48,7 +48,7 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | permission modes 全集（含 plan） | 概念双家 | **✅ Plan 37（2026-07-16）** | 已完成 |
-| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权 | **已立，且应先于 Plan 61/62 实施** |
+| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权；实施时迁移 Plan 61 已落地的窄 mutation-preview context seam | **未开工；不得与 Plan 62 并行** |
 | AI 分类器 auto 模式 / updatedInput 改写 | cc 单家 | 暂不做(plan 8 判) | 有小模型基建再议 |
 | execpolicy(execve 级 Starlark 规则) | codex 单家 | 暂不做 | 沙箱已有,重;痛感驱动 |
 
@@ -70,6 +70,7 @@
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
+| 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
 | model-visible LSP / language-server client | cc 条件分支 | **Plan 57 保留 unknown**：env gate 单独开启仍未注册，正常发现链还依赖 enabled plugin；kloop 不加推测性 client | 取得权威 hermetic enabled-plugin profile 与完整 stdio lifecycle 时 |
 | CC WebFetch `prompt` + 二级模型/cache/Markdown pipeline | cc 单家 | **Plan 55 intentional-diff**：kloop 保留 strict `{url}` 有界纯抓取与更强逐跳安全边界 | 出现必须“按指令读页并总结”的产品需求再另立 adapter |
 | WebSearch timeout/large/dynamic concurrency/CCR proxy、remote=true/cloud lifecycle | cc 条件分支 | **Plan 55 保留 unknown**：本地 fake provider 已闭合 success/empty/error；remote 仅证明 gate-false fallback | 取得合规 hermetic profile 或官方暴露入口 |
@@ -82,6 +83,19 @@ Pre/Post hook barrier 证明 Read/Glob/Grep 真并发，dependent Edit/Edit/Writ
 跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。Plan 49 当时的 matrix 保留 237 个跨其他
 工具簇或不可运行分支的 `unknown`；8 个 `same` 只覆盖上述并发/串行分类与 Glob/Grep 无孤儿
 lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门已进双平台 CI。
+
+Plan 61 在不改写 Plan 49 历史 parity 裁决的前提下补了资源与平台安全边界：普通
+Read/Edit 在同一已打开对象上执行 5 MiB metadata 预检、limit+1 与读后版本复核，Notebook
+保留 10 MiB，approval whole-file preview 为 1 MiB；Write 的显式 replacement 不受该 ceiling，
+旧 target、temp 与 committed verification 改为 chunked SHA-256/equality。Edit executor/preview
+共享 exact-first、CRLF logical-match/raw-preservation helper。新建 Write 在批准后才从 retained
+nearest-existing-ancestor capability 逐段建目录；Unix 使用 `mkdirat/openat/renameat`，Windows
+使用 stable volume/file ID、拒绝 reparse 的 `NtCreateFile(RootDirectory=...)` 与
+`NtSetInformationFile(FileRenameInformationEx)` handle-relative rename。Windows 失败路径会释放 retained
+child、相对 retained parent 重开 cleanup candidate、复核 identity，并只对匹配且为空的 handle 设置
+disposition；POSIX 没有 portable atomic handle-bound `rmdir`，inode check→`unlinkat(name)` 会留下同 UID name-swap
+窗口，因此 Unix 失败路径保守保留本次新建的空目录，不冒险删除替换对象。Windows 原生 CI 是
+持续门禁，不用 cross-compile 冒充运行验收。
 
 Plan 50 已销账前台 Bash：schema/output/timeout-tree/cancel-tree determinism pairs 与 hook-based
 concurrency singleton 将 exact corpus 扩至 82 captures/109 evidence，matrix 为 56 行/448 单元；
@@ -307,7 +321,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 架构与 correctness**：Plan 63（Project/Session 权限归属）→ Plan 61（文件工具纠偏）→ Plan 62（Windows shell，依赖 61）；三者修改面重叠，严格串行。
+- **T0 架构与 correctness**：Plan 61 已完成；当前严格串行顺序为 Plan 63（Project/Session 权限归属）→ Plan 62（Windows shell，依赖 61），两者修改面重叠。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。

@@ -463,7 +463,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Jupyter notebooks (`.ipynb`) return cell-aware `<cell id=\"…\">` content and code outputs, including image blocks. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp; up to 5 MiB) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
+            description: "Read a file. Raw input is limited to 5 MiB for text and images, or 10 MiB for lowercase `.ipynb` notebooks. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Jupyter notebooks return cell-aware `<cell id=\"…\">` content and code outputs, including image blocks. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -476,7 +476,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "write_file".into(),
-            description: "Write content to a file, creating parent directories as needed. Overwrites if the file exists.".into(),
+            description: "Write the provided full content to a file. A new file safely creates missing parent directories only after approval. Overwriting an existing file requires a complete, fresh read in this session, then replaces it atomically with the provided content exactly as given.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -488,7 +488,7 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "edit_file".into(),
-            description: "Replace old_string with new_string in a file. Fails if old_string is not found, or matches more than once without replace_all.".into(),
+            description: "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The entire file must have been freshly read in this session. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -839,6 +839,9 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         } else {
             None
         };
+        let mutation_preview_context = prepared_mutation
+            .as_ref()
+            .and_then(fs::PreparedMutation::preview_context);
         let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &ctx);
         // effective_*: gate on the active worktree's re-anchored permissions
         // when the session entered one (plan 35 slice 2), else the base gate.
@@ -852,6 +855,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                     .as_ref()
                     .map(fs::PreparedMutation::resolved_path)
                     .or(prepared_read.as_ref().map(fs::PreparedRead::resolved_path)),
+                mutation_preview_context.as_ref(),
                 ctx.depth,
                 sandbox_auto_allow,
             )
@@ -1412,6 +1416,35 @@ mod tests {
         };
         assert!(names(0).iter().any(|n| n == "task"));
         assert!(!names(1).iter().any(|n| n == "task"));
+    }
+
+    #[test]
+    fn file_tool_definitions_state_resource_and_freshness_contracts() {
+        let definitions = tool_defs(0);
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap()
+        };
+        assert_eq!(
+            definition("read_file").description,
+            "Read a file. Raw input is limited to 5 MiB for text and images, or 10 MiB for lowercase `.ipynb` notebooks. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Jupyter notebooks return cell-aware `<cell id=\"…\">` content and code outputs, including image blocks. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error."
+        );
+        assert_eq!(
+            definition("write_file").description,
+            "Write the provided full content to a file. A new file safely creates missing parent directories only after approval. Overwriting an existing file requires a complete, fresh read in this session, then replaces it atomically with the provided content exactly as given."
+        );
+        assert_eq!(
+            definition("edit_file").description,
+            "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The entire file must have been freshly read in this session. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory."
+        );
+        for name in ["read_file", "write_file", "edit_file"] {
+            assert!(
+                !definition(name).schema.to_string().contains("maxLength"),
+                "UTF-8 byte limits must not be modeled as JSON character limits"
+            );
+        }
     }
 
     #[tokio::test]

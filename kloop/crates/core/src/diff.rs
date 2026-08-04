@@ -25,9 +25,15 @@
 //! The preview is a plain string on [`crate::permissions::ConfirmRequest`];
 //! frontends render it (the TUI/plain color +/- lines, the server forwards it).
 
+use anyhow::Context as _;
 use serde_json::Value;
 use similar::ChangeTag;
 use similar::TextDiff;
+
+use crate::file_io::read_bounded;
+use crate::file_io::BoundedRead;
+use crate::file_io::FileReadError;
+use crate::text_edit::apply_text_edit;
 
 /// Cap on preview body lines before a `… (N more line(s))` marker. Generous:
 /// the popup scrolls now (plan 25), so this only bounds a runaway minified
@@ -40,10 +46,23 @@ const MAX_LINE_LEN: usize = 200;
 /// in a synchronous approval path.
 const MAX_DIFF_INPUT: usize = 1 << 20;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MutationPreviewContext {
+    pub directories_to_create: Vec<std::path::PathBuf>,
+}
+
 /// Build the change preview for a gated tool call, or `None` when there is
 /// nothing to show (a non-file tool, a malformed input, or a no-op edit).
 /// Async because it reads the target file to diff against its real contents.
 pub async fn file_change_preview(name: &str, input: &Value) -> Option<String> {
+    file_change_preview_with_context(name, input, None).await
+}
+
+pub(crate) async fn file_change_preview_with_context(
+    name: &str,
+    input: &Value,
+    context: Option<&MutationPreviewContext>,
+) -> Option<String> {
     let preview = match name {
         "edit_file" => {
             let old = input["old_string"].as_str()?;
@@ -60,35 +79,75 @@ pub async fn file_change_preview(name: &str, input: &Value) -> Option<String> {
         "write_file" => {
             let path = input["path"].as_str()?;
             let content = input["content"].as_str()?;
-            match tokio::fs::read_to_string(path).await {
-                // An oversized existing file: skip the whole-file diff rather
-                // than pay for it on the approval path.
-                Ok(existing) if existing.len() > MAX_DIFF_INPUT => {
-                    format!("(overwriting existing file, {} bytes)", existing.len())
-                }
-                Ok(existing) => numbered_diff(&existing, content),
-                // No existing file (or unreadable): show it as a fresh file.
-                Err(_) => new_file_preview(content),
+            match read_preview_file(path).await {
+                Ok(snapshot) => match String::from_utf8(snapshot.bytes) {
+                    Ok(existing) => numbered_diff(&existing, content),
+                    Err(_) => new_file_preview(content),
+                },
+                Err(error) => match oversized_file(&error) {
+                    Some(actual) => {
+                        format!("(overwriting existing file, {actual} bytes)")
+                    }
+                    None => new_file_preview(content),
+                },
             }
         }
         "notebook_edit" => {
             let path = input["notebook_path"].as_str()?;
-            let bytes = tokio::fs::read(path).await.ok()?;
-            if bytes.len() > MAX_DIFF_INPUT {
-                format!("(editing notebook cell; file is {} bytes)", bytes.len())
-            } else {
-                let preview = crate::tools::notebook::change_preview(&bytes, input).ok()?;
-                let diff = numbered_diff(&preview.old_source, &preview.new_source);
-                if diff.is_empty() {
-                    preview.header
-                } else {
-                    format!("{}\n{diff}", preview.header)
+            match read_preview_file(path).await {
+                Ok(snapshot) => {
+                    let preview =
+                        crate::tools::notebook::change_preview(&snapshot.bytes, input).ok()?;
+                    let diff = numbered_diff(&preview.old_source, &preview.new_source);
+                    if diff.is_empty() {
+                        preview.header
+                    } else {
+                        format!("{}\n{diff}", preview.header)
+                    }
                 }
+                Err(error) => match oversized_file(&error) {
+                    Some(actual) => format!("(editing notebook cell; file is {actual} bytes)"),
+                    None => return None,
+                },
             }
         }
         _ => return None,
     };
+    let preview = if name == "write_file" {
+        match context.filter(|context| !context.directories_to_create.is_empty()) {
+            Some(context) => {
+                let directories = context
+                    .directories_to_create
+                    .iter()
+                    .map(|path| format!("  - {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("(will create parent directories)\n{directories}\n\n{preview}")
+            }
+            None => preview,
+        }
+    } else {
+        preview
+    };
     (!preview.is_empty()).then_some(preview)
+}
+
+async fn read_preview_file(path: &str) -> anyhow::Result<BoundedRead> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("cannot open preview target {path}"))?;
+        read_bounded(&mut file, MAX_DIFF_INPUT).map_err(anyhow::Error::from)
+    })
+    .await
+    .context("file preview worker failed")?
+}
+
+fn oversized_file(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<FileReadError>()
+        .and_then(FileReadError::too_large)
+        .map(|(actual, _)| actual)
 }
 
 /// Apply the edit to the real file and diff old→new with file line numbers;
@@ -96,18 +155,10 @@ pub async fn file_change_preview(name: &str, input: &Value) -> Option<String> {
 /// large, or `old_string` doesn't uniquely match (the same degradation
 /// claude-code uses).
 async fn edit_preview(path: &str, old: &str, new: &str, replace_all: bool) -> String {
-    if let Ok(content) = tokio::fs::read_to_string(path).await {
-        if content.len() <= MAX_DIFF_INPUT {
-            let count = content.matches(old).count();
-            // Uniquely matched (or replace_all): apply it exactly as the tool
-            // will, and diff the whole file. Otherwise the edit itself would
-            // fail — fall back to showing the intended string swap.
-            if count == 1 || (replace_all && count >= 1) {
-                let updated = if replace_all {
-                    content.replace(old, new)
-                } else {
-                    content.replacen(old, new, 1)
-                };
+    if let Ok(snapshot) = read_preview_file(path).await {
+        if let Ok(content) = String::from_utf8(snapshot.bytes) {
+            let edit = apply_text_edit(&content, old, new, replace_all);
+            if let Some(updated) = edit.updated {
                 return numbered_diff(&content, &updated);
             }
         }
@@ -289,6 +340,68 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(preview, "(new file)\n(empty)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn preview_reads_are_bounded_before_whole_file_diffing() {
+        let dir = temp_dir("bounded");
+        let at_limit = dir.join("at-limit.txt");
+        let over_limit = dir.join("over-limit.txt");
+        let notebook_over_limit = dir.join("over-limit.ipynb");
+        std::fs::write(&at_limit, "x".repeat(MAX_DIFF_INPUT)).unwrap();
+        std::fs::write(&over_limit, "x".repeat(MAX_DIFF_INPUT + 1)).unwrap();
+        std::fs::write(&notebook_over_limit, vec![b' '; MAX_DIFF_INPUT + 1]).unwrap();
+
+        let preview = file_change_preview(
+            "write_file",
+            &json!({"path": at_limit.to_str().unwrap(), "content": "replacement"}),
+        )
+        .await
+        .unwrap();
+        assert!(!preview.contains("overwriting existing file"), "{preview}");
+
+        let preview = file_change_preview(
+            "write_file",
+            &json!({"path": over_limit.to_str().unwrap(), "content": "replacement"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            preview,
+            format!("(overwriting existing file, {} bytes)", MAX_DIFF_INPUT + 1)
+        );
+
+        let preview = file_change_preview(
+            "edit_file",
+            &json!({
+                "path": over_limit.to_str().unwrap(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview, "-1  old\n+1  new");
+
+        let preview = file_change_preview(
+            "notebook_edit",
+            &json!({
+                "notebook_path": notebook_over_limit.to_str().unwrap(),
+                "cell_id": "cell-1",
+                "new_source": "new"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            preview,
+            format!(
+                "(editing notebook cell; file is {} bytes)",
+                MAX_DIFF_INPUT + 1
+            )
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

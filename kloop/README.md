@@ -830,44 +830,68 @@ filesystem); the IO — file discovery, git commands — lives in
 server threads share one process-wide assembly. `--mock` stays hermetic:
 no file reads, no git commands, the pre-assembly hardcoded prompt.
 
-## File tools (Plans 49 and 57)
+## File tools (Plans 49, 57, and 61)
 
 `read_file`, `write_file`, `edit_file`, and `notebook_edit` share session-scoped
 file observations (`core/src/file_state.rs`) rather than trusting a path forever:
 
 - **read_file** resolves and opens a canonical no-follow regular-file descriptor
   before permission, so an approval wait cannot retarget a benign alias into a
-  sensitive file. It numbers UTF-8 text lines and accepts `offset`/`limit` as whole
-  numbers or numeric strings (`0` keeps the documented unbounded/from-start
-  behavior). Model-facing text is capped at 7,000 characters without splitting
-  UTF-8; empty files, past-EOF offsets, PDFs, and non-image binary data return
-  explicit results. PNG/JPEG/GIF/WebP continue as structured image blocks.
-  On Unix, regular files with multiple hard links are rejected because pathname
-  sensitivity cannot safely classify another name for the same inode.
-- Only a complete range that reaches the model in a final successful
-  `tool_result` qualifies an existing file for mutation. Preview reads, errors,
-  permission rejection, post-hook cancellation, restored sessions, sub-agents,
-  and separate worktrees do not inherit that authority. The bounded observation
-  table is process-memory only and deterministically evicts old entries.
-- **write_file** may create a new file only when its direct parent directory
-  already exists; it never creates missing intermediate directories. Replacing an
-  existing file, and every **edit_file**, requires a complete fresh read. A
-  partial, stale, or externally deleted observation fails closed; a successful
-  mutation refreshes the observation, while a failed or uncertain one clears it.
-- Mutations canonicalize the existing parent and open it as a directory handle
-  after pre-hooks but before permission checks; only the leaf may be absent. The
-  gate and approval preview see the canonical target. After an approval wait the
-  executor revalidates the parent identity, then performs target reads, temporary
-  creation, freshness checks, rename, cleanup, and parent sync relative to the
-  retained handle. Replacing a parent path with a symlink to `.git` or another
-  sensitive/denied location therefore rejects the call rather than retargeting
-  it. Internal parent aliases share one lock key, while a cwd-contained spelling
-  cannot escape through an ancestor symlink. Target opens are no-follow/nonblocking;
-  the commit preserves existing permissions (new files use conventional 0666
-  filtered by umask), checks the temporary name still denotes the opened inode,
-  and rejects symbolic-link leaves, FIFOs, or other non-regular targets.
+  sensitive file. Ordinary text/images are capped at 5 MiB raw input; lowercase
+  `.ipynb` keeps its 10 MiB Notebook limit. Each bounded read checks the opened
+  handle's length before allocation, reads at most limit + 1, and verifies metadata,
+  object identity, and content version afterward. Text lines are scanned without a
+  whole-file line index, numbered, and capped at 7,000 model-visible characters;
+  `offset`/`limit`, trailing empty lines, PDF/non-UTF-8 errors, and structured
+  PNG/JPEG/GIF/WebP blocks retain their prior behavior. CRLF is shown as logical LF,
+  while an isolated `\r` remains content. On Unix, regular files with multiple hard
+  links are rejected because pathname sensitivity cannot safely classify another
+  name for the same inode.
+- Only a complete range that reaches the model in a final successful `tool_result`
+  qualifies an existing file for mutation. Preview reads, errors, permission
+  rejection, post-hook cancellation, restored sessions, sub-agents, and separate
+  worktrees do not inherit authority. Observations include stable file identity, so
+  delete/recreate cannot inherit old coverage even when bytes and metadata resemble
+  the previous object. The bounded table is process-memory only and deterministically
+  evicts old entries.
+- **write_file** writes the model-provided full content exactly as supplied; it does
+  not inherit old line endings and its replacement content is not limited by the
+  5 MiB Read/Edit ceiling. For a new leaf it may plan missing parent directories,
+  show that plan during approval, and create them only after approval while holding
+  the effective-target path lock. Replacing an existing file still requires a
+  complete fresh read.
+- **edit_file** requires an existing, complete, fresh UTF-8 target of at most 5 MiB.
+  Raw exact matching wins. Only when raw matches are absent does LF input match CRLF
+  text; the helper maps logical offsets back to raw byte ranges, restores local (or
+  dominant) EOLs in replacement text, and leaves all unmatched bytes—including
+  mixed EOLs and isolated `\r`—unchanged. Executor and approval preview use this one
+  helper, so duplicate/`replace_all` decisions and shown bytes cannot drift.
+- Mutation preflight binds either the existing direct parent or the nearest existing
+  ancestor after pre-hooks but before permission. Original spelling and the frozen
+  effective target both reach the gate; approval itself has no directory side
+  effects. After approval, Unix walks missing components with
+  `mkdirat` + `openat(O_DIRECTORY|O_NOFOLLOW)`. Windows uses retained directory
+  HANDLEs, `NtCreateFile(RootDirectory=...)`, rejects every reparse point, and binds
+  volume + 128-bit file ID. No Windows pathname-open/rename fallback is used.
+- At the final parent, target reads, streaming fingerprints/equality checks,
+  same-directory exclusive temp creation, final freshness/identity checks, rename,
+  and cleanup stay capability-relative. Unix uses `renameat`/`unlinkat` plus file and
+  directory sync; Windows flushes the file handle and uses
+  `NtSetInformationFile(FileRenameInformationEx)` with a retained parent HANDLE for
+  handle-relative atomic visibility. Windows does not claim a portable
+  POSIX-equivalent directory-entry durability guarantee. On Windows, failed nested
+  writes release their retained child handles, reopen each cleanup candidate relative
+  to its retained parent, revalidate stable identity, and set disposition only on an
+  empty matching handle; existing, competitor-created, replaced, or non-empty
+  directories are not deleted. POSIX has no portable atomic handle-bound `rmdir`: an
+  inode check followed by `unlinkat(name)` can race with a same-UID name swap. Failed Unix
+  nested writes therefore conservatively leave their newly created empty
+  directories rather than risk deleting a replacement. Existing modes are
+  preserved; new Unix files/directories use 0666/0777 filtered by umask, while
+  Windows inherits parent ACLs. Symbolic/reparse leaves, FIFOs, other non-regular
+  targets, parent retargets, and leaf-appeared races fail closed.
 
-The descriptor boundary closes approval-time alias retargeting; it is not a
+The capability boundary closes approval-time alias retargeting; it is not a
 filesystem transaction against a hostile same-UID process. POSIX still leaves a
 small final identity-check-to-`renameat` namespace window, documented in Plan 49.
 

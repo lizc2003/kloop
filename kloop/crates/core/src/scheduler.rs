@@ -375,6 +375,86 @@ struct StoreFile {
     jobs: Vec<ScheduledJob>,
 }
 
+#[cfg(unix)]
+fn lock_store_file(file: &File) -> Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
+        .context("lock scheduler store")
+}
+
+#[cfg(unix)]
+fn unlock_store_file(file: &File) -> Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock).context("unlock scheduler store")
+}
+
+#[cfg(windows)]
+fn lock_store_file(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
+    use windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).context("lock scheduler store");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unlock_store_file(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).context("unlock scheduler store");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_store_file(_file: &File) -> Result<()> {
+    bail!("durable scheduler locking is unsupported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_store_file(_file: &File) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_store_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .context("sync scheduler store directory")
+}
+
+#[cfg(not(unix))]
+fn sync_store_directory(_path: &Path) -> Result<()> {
+    // Windows does not expose a portable directory-entry flush equivalent.
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct DurableStore {
     path: PathBuf,
@@ -432,11 +512,10 @@ impl DurableStore {
         ensure_private_dir(parent)?;
         reject_symlink(&self.lock_path)?;
         let lock = private_open(&self.lock_path, true, false)?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
-            .context("lock scheduler store")?;
+        lock_store_file(&lock)?;
         let mut store = self.read_locked()?;
         let result = operation(&mut store);
-        let _ = rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock);
+        let _ = unlock_store_file(&lock);
         result
     }
 
@@ -497,9 +576,7 @@ impl DurableStore {
                 .context("finish scheduler temp file")?;
             file.sync_all().context("sync scheduler temp file")?;
             fs::rename(&temp, &self.path).context("replace scheduler store")?;
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .context("sync scheduler store directory")?;
+            sync_store_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {

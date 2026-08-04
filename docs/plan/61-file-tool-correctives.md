@@ -1,6 +1,6 @@
 # Plan 61 — 文件工具纠偏：有界 I/O、CRLF Edit 与安全易用的 Write
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-08-04；提交 SHA 以本条所在提交为准）
 >
 > 母计划：Plan 49
 >
@@ -142,8 +142,8 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 3. 审批等待期间保留 ancestor handle。批准后进入 effective-target keyed lock，先复核已存在祖先的 pathname identity，再把“逐段创建/打开、leaf 检查、temp、rename、cleanup”全部交给同一平台 capability backend；中途不能重新从未绑定的绝对 pathname 开始遍历。
 4. **Unix**：每段用 `mkdirat` 创建，再用 `openat(O_DIRECTORY | O_NOFOLLOW)` 打开；`EEXIST` 只在同一 no-follow open 证明它是目录后接受。新目录使用 `0o777` 经进程 umask，identity 使用 dev/inode。最终 leaf 继续用 `openat`、same-directory exclusive temp、`renameat` 与 `unlinkat`。
 5. **Windows**：不能复用当前 `#[cfg(not(unix))]` 的 `parent_path.join(...)` fallback。已存在祖先用 `CreateFileW(OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)` 获得 directory handle，并查询 attributes/tag 拒绝任何 reparse point。每个单独 path component 用用户态 `NtCreateFile`，令 `OBJECT_ATTRIBUTES.RootDirectory` 指向 retained parent handle，使用 `FILE_OPEN_IF` + `FILE_DIRECTORY_FILE` + `FILE_OPEN_REPARSE_POINT`，从 `IO_STATUS_BLOCK.Information` 区分本调用新建与已存在，再验证 directory type、reparse tag 和 handle identity。identity 使用 volume serial + file ID；无法取得稳定 ID 时 fail closed。
-6. Windows 最终 leaf/temp 同样必须相对 retained parent handle 打开；提交使用 `SetFileInformationByHandle(FileRenameInfo/FileRenameInfoEx)`，以 `FILE_RENAME_INFO.RootDirectory` 绑定目标 parent，不能调用当前 pathname `std::fs::rename` fallback。临时文件和目录 handle 以明确 share/delete flags 打开，兼容 Windows sharing violation 并保持 leaf-appeared race fail closed。
-7. 记录本调用实际创建的目录及其 parent/child handle identity。竞争者已经创建且安全打开的目录可复用，但不计入 cleanup 集合。后续失败时按逆序只对“本调用创建、identity 仍匹配且为空”的目录做 handle-bound disposition；不按 pathname 删除 pre-existing、竞争者创建、已被替换或已有内容的目录。cleanup 失败不覆盖主错误，但必须清除 mutation authority。
+6. Windows 最终 leaf/temp 同样必须相对 retained parent handle 打开；提交使用 `NtSetInformationFile(FileRenameInformationEx)`，以 `FILE_RENAME_INFO.RootDirectory` 绑定目标 parent，不能调用 pathname `std::fs::rename` fallback。临时文件和目录 handle 以明确 share/delete flags 打开，兼容 Windows sharing violation 并保持 leaf-appeared race fail closed。
+7. 记录本调用实际创建的目录及其 parent/child handle identity。竞争者已经创建且安全打开的目录可复用，但不计入 cleanup 集合。Windows 后续失败时按逆序释放 retained child handle，再相对 retained parent 以 DELETE access 重开同名 cleanup candidate；只有 stable identity 仍匹配且目录为空时，才对新打开的匹配 handle 设置 disposition。因此不删除 pre-existing、竞争者创建、已被替换或已有内容的目录。POSIX 没有 portable atomic handle-bound `rmdir`，inode check 后再 `unlinkat(parent,name)` 会留下同 UID name-swap 窗口，因此 Unix 失败路径保守遗留本调用新建的空目录，不执行不安全的自动目录删除。cleanup/retention 不覆盖主错误，mutation authority 始终清除。
 8. Unix 新目录 durability 继续以 final parent 和承载新目录项的 parent FD 自底向上 sync。Windows 必须在 rename 前 `FlushFileBuffers` 写入文件 handle；目录/namespace flush 没有可移植的 POSIX 等价保证，后端应执行目标文件系统支持的 best-effort flush，并在 README 明确只承诺 handle-relative atomic visibility，不虚构断电后的目录项 durability。
 9. Windows 新目录继承 parent ACL/attributes，不套用 Unix mode/umask。两端到达最终 parent 后都复用 leaf absent check、最终 stale check 和 committed-content verification；leaf 在 preflight 后出现时绝不退化成未读 overwrite。只有最终成功并进入模型可见 `tool_result` 后才提交 Write observation。
 
@@ -186,7 +186,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 ### 切片 3：P3 安全父目录创建、工具契约与文档
 
 1. 先抽出 platform capability interface；实现 nearest-existing-ancestor 与共用状态机，再分别实现 Unix 的 `*at` backend 和 Windows 的 retained-HANDLE/native-relative backend。Windows FFI 集中在窄模块，不把 raw handle/NTSTATUS 泄漏到工具逻辑。
-2. 覆盖 descriptor/handle-relative directory walk、created-directory cleanup、sync/flush 与 race/identity 单元测试；Windows identity 或 reparse 能力不可用时明确 fail closed。
+2. 覆盖 descriptor/handle-relative directory walk、Windows created-directory cleanup、Unix conservative retention、sync/flush 与 race/identity 单元测试；Windows identity 或 reparse 能力不可用时明确 fail closed。
 3. 只接入新建 Write 的 preflight → permission preview → approval → keyed lock → commit 路径；existing Write/Edit 迁移到同一 capability backend，但保持既有产品语义。
 4. 修正三个模型可见 description，并加定义断言。
 5. 更新 README、capability report 和 HANDOFF。
@@ -234,7 +234,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 - deny、取消、pre-hook failure、sensitive effective target 均不创建目录，也不调用 mutation commit。
 - 已存在祖先在审批等待中 retarget 时拒绝；缺失段被创建为 symlink、普通文件或 FIFO 时拒绝且不跟随；安全竞争者目录可以 descriptor-bound 方式复用。
 - leaf 在审批等待或目录创建期间出现时按 stale/race 拒绝，不覆盖未读文件。
-- temp/write/rename/committed verification 故障后只逆序删除本调用创建且 identity 匹配的空目录；pre-existing、竞争者目录、非空目录和被替换目录不删除。成功与 cleanup 的 parent sync 均有故障注入回归。
+- temp/write/rename/committed verification 故障后，Windows 只逆序删除本调用创建且 identity 匹配的空目录，pre-existing、竞争者目录、非空目录和被替换目录不删除；Unix 明确保守保留本调用创建的空目录，回归证明不进入 check→pathname-rmdir 竞态。成功与 Windows cleanup 的 parent flush/sync 均有覆盖。
 - existing Write/Edit 的 stale、delete/recreate、symlink leaf、hardlink、parent retarget、FIFO、alias binding、same-path serialization、atomic cleanup、post-hook cancellation 全部继续通过。
 - Unix 覆盖 symlink/FIFO/dev+inode、`mkdirat/openat/renameat/unlinkat` 与 umask；Windows 覆盖 symlink/junction/其他 reparse point、volume+file ID、ACL inheritance、share violation、case-insensitive alias、handle-relative rename 和 leaf replacement。
 - Windows 回归必须在 `windows-latest` 原生运行，证明 mutation 路径不再进入 `parent_path.join(...)`/`std::fs::rename` fallback；macOS/Linux focused tests 不能代替该门。
@@ -252,10 +252,23 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 Plan 49 的完成记录与 Plan 59 均不改写。
 
+## 完成记录（2026-08-04）
+
+- 上限最终裁决：普通文本/图片 `read_file` 与普通 `edit_file` 为 5 MiB；lowercase `.ipynb` Read/Notebook mutation 保留 Plan 57 的 10 MiB；approval whole-file preview 为 1 MiB。模型输出预算与 raw I/O/分配预算在代码和文档中分别表述。
+- 新增 `file_io.rs`，把 metadata 预检、`cap+1` bounded read、读后 stable-identity/version 复核、chunked SHA-256 与 chunked equality 收成同一 descriptor/handle seam；Write 显式 replacement 不受 5 MiB 限制。
+- 新增 `text_edit.rs`，executor 与 preview 共用 raw-exact-first helper；仅 raw 零命中才折叠严格 CRLF 为 logical LF，duplicate protection 不绕过，未命中 raw bytes/孤立 `\r` 保真，replacement 使用局部或 dominant EOL。
+- 新建 Write 的 preflight 只绑定最近既有 ancestor capability 与计划目录；批准后才逐段 materialize。Unix 使用 `mkdirat/openat/renameat`，Windows 使用 retained HANDLE、volume + 128-bit file ID、全 reparse 拒绝、`NtCreateFile(RootDirectory=...)` 与 `NtSetInformationFile(FileRenameInformationEx)`，其他平台明确 unsupported。Windows 失败时释放 retained child、相对 retained parent 重开 cleanup candidate 并复核 identity，只逆序删除本调用创建、identity 仍匹配且为空的目录；Unix 因缺少 portable atomic handle-bound `rmdir` 而保守遗留本次新建空目录，避免误删 name-swap 替换对象。
+- `MutationPreviewContext` 只携 planned directories，保持为 Plan 63 可迁移的窄 seam；权限仍同时检查 original spelling 与 frozen effective target，deny/cancel/pre-hook/无 approver 在目录创建前结束。
+- README、capability report、HANDOFF、Read/Write/Edit definitions、Plan 49 kloop static locators 与 matrix notes 已同步；Claude Code 2.1.220 raw/normalized immutable capture 未重采、未改写，matrix 状态与 7 个 executable pair 数量不变。
+- Darwin 本机验证：五组 focused Plan 61 tests、workspace fmt/clippy/test、mock、matrix check、corpus-only/full verifier 与 `git diff --check` 全绿。
+- Windows 11/NTFS 原生验证：workspace all-targets clippy、六组 Plan 61 focused tests、Windows backend 7 项回归与 scheduler 12 项回归全绿；覆盖 relative junction/reparse 拒绝、volume/file ID、case-insensitive alias、临时文件拒绝第二 writer、单字符 `FileRenameInformationEx`、leaf 已存在时 no-replace、retarget binding 与 identity-aware cleanup。
+- Windows 全 workspace baseline 为 420 pass / 77 fail；失败集中在 Plan 62 尚未实现的 Windows shell/hook、既有 search/permission path 展示和 Git worktree 对 verbatim path 的兼容，不属于本计划文件 backend。CI 因此在 Windows 保持 workspace clippy + Plan 61 focused native gate，workspace 全量测试继续由 macOS/Linux 执行；不得把该 focused 结论外推成 Windows 全产品验收。真实 API 不属于本计划验收。
+
 ## 验证
 
 ```bash
 cd kloop
+cargo test -p kloop-core file_io::tests
 cargo test -p kloop-core text_edit::tests
 cargo test -p kloop-core tools::fs::tests
 cargo test -p kloop-core diff::tests
@@ -281,7 +294,7 @@ Windows 不是 cross-compile 即算通过：扩 `.github/workflows/ci.yml` 到 `
 - Read/Edit/preview 的完整内容读取都在分配前受正确字节边界约束，并有 metadata-after-growth 防线。
 - Write/target/temp/committed 验证不再依赖无界整文件 `Vec<u8>`，也不因 Read/Edit ceiling 错误限制显式 Write content。
 - executor 与 approval preview 共用唯一 Edit helper；CRLF fallback 不全局转换未修改区域。
-- Write 不继承旧文件行尾；新建 Write 在批准后可从绑定的最近已存在祖先 FD 安全创建缺失父目录，并在失败时只清理由本调用创建且仍安全可删的目录。
+- Write 不继承旧文件行尾；新建 Write 在批准后可从绑定的最近已存在祖先 FD/HANDLE 安全创建缺失父目录。Windows 失败时只清理由本调用创建且仍安全可删的目录；Unix 失败时保守遗留本次新建空目录，不执行无法原子绑定 identity 的 pathname `rmdir`。
 - Plan 49 的 observation、descriptor/handle、stale、atomicity、permission 与 cancellation 不变量全部回归通过；Windows native CI 证明没有退回 pathname fallback。
 - focused/full Rust、fmt、clippy、mock、matrix/verifier 与 diff check 全绿。
 - 本 plan、README、capability report、HANDOFF 完成闭环。

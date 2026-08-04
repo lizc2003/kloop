@@ -1017,13 +1017,18 @@ mod tests {
     use crate::inbox::InboxItem;
     use crate::tools::testutil::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
+    #[cfg(unix)]
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    #[cfg(unix)]
     static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Default)]
@@ -1044,10 +1049,12 @@ mod tests {
         (ctx, ui)
     }
 
+    #[cfg(unix)]
     struct ForegroundTree {
         root: PathBuf,
     }
 
+    #[cfg(unix)]
     impl ForegroundTree {
         fn new(tag: &str) -> Self {
             let sequence = FOREGROUND_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1087,6 +1094,7 @@ exec sleep 60
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ForegroundTree {
         fn drop(&mut self) {
             for name in ["child.pid", "grandchild.pid"] {
@@ -1104,6 +1112,7 @@ exec sleep 60
         }
     }
 
+    #[cfg(unix)]
     fn process_alive(raw: i32) -> bool {
         let Some(pid) = rustix::process::Pid::from_raw(raw) else {
             return false;
@@ -1115,6 +1124,7 @@ exec sleep 60
         }
     }
 
+    #[cfg(unix)]
     async fn wait_for_tree_pids(tree: &ForegroundTree) -> [i32; 2] {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
@@ -1134,6 +1144,7 @@ exec sleep 60
         }
     }
 
+    #[cfg(unix)]
     async fn assert_processes_dead(pids: [i32; 2]) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {

@@ -1077,8 +1077,8 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     fn native_skills_snapshot_omits_commands_and_bodies() {
         let base = std::env::temp_dir().join(format!("kloop-native-skills-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let skill_dir = base.join(".kloop/skills/review");
-        let command_dir = base.join(".kloop/commands");
+        let skill_dir = base.join(".kloop").join("skills").join("review");
+        let command_dir = base.join(".kloop").join("commands");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::create_dir_all(&command_dir).unwrap();
         std::fs::write(

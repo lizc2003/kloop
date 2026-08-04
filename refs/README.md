@@ -115,8 +115,10 @@ read、同目录 temp、最终复核、rename、cleanup 与 parent sync 全 desc
 因此 parent alias 不能隐藏或在等待中改指 `.git` 等目标。提交保留权限、sync 并拒绝 symlink/非普通
 leaf。Read 文本和 Grep/Glob 模型输出使用 UTF-8 安全的 7k 字符上限；PDF 与非 UTF-8 文本明确拒绝。
 Grep 每个 walker candidate 先以 canonical parent FD + no-follow leaf 绑定 inode，permission 同看 original + resolved path，再由 `search_reader` 搜 descriptor，消除 filter→pathname reopen 竞态；多 hard-link candidate 作为不可安全分类的 inode alias 隐藏并计数；Glob/Grep 继续尊重 `.gitignore`、跳 VCS，并在读取前过滤 deny/sensitive 路径。CC 会为新文件隐式
-创建缺失父目录，kloop 也不复制这一行为；它与 CC partial-read、Edit stale recovery、广义搜索可见性
+创建缺失父目录，kloop 在 Plan 49 当时也未复制这一行为；它与 CC partial-read、Edit stale recovery、广义搜索可见性
 均记为 `intentional-diff`，没有为字面一致降级。descriptor boundary 阻断审批等待中的常规 alias retarget，但不是 hostile same-UID 文件系统事务；最终 identity check→`renameat` 的微小 namespace window 仍明确保留。
+
+Plan 61 后续纠正了资源与父目录产品行为，但不改写上述 Plan 49 历史裁决：普通 Read/Edit raw 输入现为 5 MiB、Notebook 保留 10 MiB、preview 为 1 MiB，版本/committed-content 验证改为 streaming；Edit raw exact 零命中时才走 CRLF logical-match/raw-preservation helper。新建 Write 现可在批准后从 retained nearest-existing-ancestor capability 逐段创建缺失父目录，Unix 用 `*at`，Windows 用 stable file ID、reparse 拒绝与 handle-relative native API。Windows 可经 retained HANDLE 清理 identity-matching empty directories；POSIX 没有 portable atomic handle-bound `rmdir`，Unix 失败路径保守遗留本次新建空目录，避免 check→pathname-rmdir 误删 name-swap 替换对象。因此 matrix note 已更新，但原 fixture 未覆盖嵌套目录，cell status 不升级。
 
 Plan 49 完成时的 440 个矩阵单元为 70 个 `compatible`、83 个 `intentional-diff`、20 个 `missing`、
 237 个 `unknown`、22 个 `n/a`、8 个 `same`。`paired-parity.json` 由 matrix generator 同步生成，

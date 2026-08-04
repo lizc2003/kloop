@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::image::image_block_from_bytes;
 
-const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
 const MAX_NOTEBOOK_CELLS: usize = 10_000;
 const MAX_NOTEBOOK_TEXT_CHARS: usize = 7_000;
 const MAX_NOTEBOOK_IMAGES: usize = 16;

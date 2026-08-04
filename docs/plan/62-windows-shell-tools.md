@@ -29,7 +29,7 @@ kloop 当前只有 `bash`，执行器固定为 `sh -lc`。Unix 前后台路径�
 ## 证据与开工闸门
 
 - 固定参考证据：Claude Code 固定源码的 Windows Git Bash discovery、独立 `PowerShellTool`/provider、WSL 分流与 tree-kill 调用链。它们只解释设计收敛，不替代精确 Windows binary fixture。
-- 开工前复核 Plan 61 已完成，并确认 `windows-latest` 能运行 workspace clippy/tests；文件工具或 reparse-point blocker 回归 Plan 61，不在本计划降级安全边界。
+- 开工前复核 Plan 61 的 Windows filesystem focused tests 与 workspace clippy 持续全绿；Windows 全 workspace baseline 当前为 420 pass / 77 fail，其中 shell/hook 与依赖 Bash 的 parity failures 由本计划关闭，search/permission path 展示和 Git worktree verbatim-path 缺口须在开工时修复或显式拆出，最终恢复 Windows workspace test 门。
 - 改行为前建立 Windows 原生 baseline：Git for Windows 路径、`pwsh.exe`/`powershell.exe` 可用性、nested Job 环境、现有 Unix-only test helper 与 Python 命令差异。
 - 所有 Windows 生命周期结论必须来自 Windows 原生运行；cross-compile 只能证明可编译，不能证明 Job、handle、pipe 或无 orphan。
 

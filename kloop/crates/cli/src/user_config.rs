@@ -279,6 +279,7 @@ fn write_private_atomic_impl(path: &Path, label: &str, bytes: &[u8]) -> Result<(
     bail!("cannot create temporary {label}")
 }
 
+#[cfg(unix)]
 fn private_file_name<'a>(path: &'a Path, label: &str) -> Result<&'a std::ffi::OsStr> {
     path.file_name()
         .with_context(|| format!("{label} has no file name"))

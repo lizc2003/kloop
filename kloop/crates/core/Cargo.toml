@@ -32,3 +32,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

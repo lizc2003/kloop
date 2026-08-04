@@ -1387,6 +1387,7 @@ dependencies = [
  "tokio-util",
  "tree-sitter",
  "tree-sitter-bash",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
