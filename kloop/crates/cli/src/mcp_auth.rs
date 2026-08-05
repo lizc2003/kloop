@@ -213,11 +213,12 @@ fn open_browser(url: &str) {
     } else {
         ("xdg-open", vec![url])
     };
-    let _ = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let _ = kloop_process_spawn::spawn_std(&mut command);
 }
 
 #[cfg(test)]

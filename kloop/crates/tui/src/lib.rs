@@ -250,11 +250,11 @@ fn display_cwd(cwd: &std::path::Path) -> String {
 /// a repository (or git is unavailable). Best-effort and one-shot at startup —
 /// a display nicety, not a correctness path, so failure just omits the row.
 fn git_branch(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+        .current_dir(cwd);
+    let out = kloop_process_spawn::output_std(&mut command).ok()?;
     if !out.status.success() {
         return None;
     }

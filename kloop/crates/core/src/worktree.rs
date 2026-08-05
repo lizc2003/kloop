@@ -4,6 +4,12 @@
 //! revalidates that provenance under the process-wide Git mutation lock. Session
 //! and task handles use the same Git operations but never share lifecycle state.
 
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -243,7 +249,7 @@ async fn create_managed(
         .context("creating managed worktree directory")?;
     exclude_worktrees_dir(&repository.common_dir)?;
 
-    let path_text = path.to_string_lossy().to_string();
+    let path_text = git_compatible_path(&path).to_string_lossy().to_string();
     git_text(
         &repository.root,
         &[
@@ -791,7 +797,7 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
 
 fn git_command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args);
+    command.arg("-C").arg(git_compatible_path(dir)).args(args);
     #[cfg(test)]
     {
         let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
@@ -820,17 +826,43 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
     command
 }
 
+#[cfg(windows)]
+pub(crate) fn git_compatible_path(path: &Path) -> PathBuf {
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if !units.starts_with(VERBATIM) {
+        return path.to_path_buf();
+    }
+    let suffix = &units[VERBATIM.len()..];
+    let compatible = if suffix.starts_with(UNC) {
+        [b'\\' as u16, b'\\' as u16]
+            .into_iter()
+            .chain(suffix[UNC.len()..].iter().copied())
+            .collect()
+    } else {
+        suffix.to_vec()
+    };
+    PathBuf::from(OsString::from_wide(&compatible))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn git_compatible_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 async fn git_success(dir: &Path, args: &[&str]) -> Result<bool> {
-    let output = git_command(dir, args)
-        .output()
+    let mut command = git_command(dir, args);
+    let output = kloop_process_spawn::output(&mut command)
         .await
         .context("spawning git")?;
     Ok(output.status.success())
 }
 
 async fn git_text(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = git_command(dir, args)
-        .output()
+    let mut command = git_command(dir, args);
+    let output = kloop_process_spawn::output(&mut command)
         .await
         .context("spawning git")?;
     if !output.status.success() {

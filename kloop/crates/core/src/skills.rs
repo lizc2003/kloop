@@ -283,6 +283,7 @@ fn map_tool_name(name: &str) -> String {
         "Write" => "write_file",
         "Edit" => "edit_file",
         "Bash" => "bash",
+        "PowerShell" => "powershell",
         "BashOutput" => "bash_output",
         "KillShell" | "KillBash" => "kill_bash",
         "Grep" => "grep",

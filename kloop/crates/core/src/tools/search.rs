@@ -820,7 +820,9 @@ mod tests {
 
     /// Strip the tree root prefix so assertions read relative.
     fn rel(out: &str, tree: &Tree) -> String {
-        out.replace(&format!("{}/", tree.path()), "")
+        out.replace(&format!("{}\\", tree.path()), "")
+            .replace(&format!("{}/", tree.path()), "")
+            .replace('\\', "/")
     }
 
     #[tokio::test]
@@ -1230,7 +1232,7 @@ mod tests {
     async fn glob_truncates_past_100_files() {
         let t = Tree::new("glob-cap", &[]);
         for i in 0..105 {
-            t.write(&format!("f{i:03}.txt"), "x");
+            t.write(&format!("long-search-result-name-{i:03}.txt"), "x");
         }
         let out = glob(json!({"pattern": "*.txt", "path": t.path()}))
             .await

@@ -1325,6 +1325,7 @@ dependencies = [
  "anyhow",
  "kloop-core",
  "kloop-mcp",
+ "kloop-process-spawn",
  "kloop-protocol",
  "kloop-provider",
  "kloop-server",
@@ -1374,6 +1375,7 @@ dependencies = [
  "indexmap",
  "jsonschema",
  "kloop-codemode",
+ "kloop-process-spawn",
  "kloop-protocol",
  "kloop-provider",
  "libc",
@@ -1398,6 +1400,7 @@ dependencies = [
  "base64",
  "futures",
  "getrandom 0.2.17",
+ "kloop-process-spawn",
  "kloop-protocol",
  "reqwest",
  "serde",
@@ -1406,6 +1409,13 @@ dependencies = [
  "tokio",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "kloop-process-spawn"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -1451,6 +1461,7 @@ dependencies = [
  "arboard",
  "crossterm",
  "kloop-core",
+ "kloop-process-spawn",
  "kloop-protocol",
  "png 0.17.16",
  "pulldown-cmark",

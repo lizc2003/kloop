@@ -2,7 +2,8 @@
 //! cc: `run_in_background` returns immediately with an id and an output file
 //! (stdout/stderr interleaved at the fd level — no reader tasks, no pipe
 //! deadlock), `bash_output` blocks on completion by default, `kill_bash`
-//! kills the whole process group. Interrupting a turn never touches
+//! kills the whole owned process tree (Unix process group or Windows Job).
+//! Interrupting a turn never touches
 //! background shells; kill_bash, the size watchdog, and explicit session
 //! shutdown reap them. State changes emit session-scoped background-task
 //! events. cc's auto-backgrounding and model-visible Monitor tool are not ported.
@@ -10,8 +11,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::ExitStatus;
-use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -39,14 +38,21 @@ use crate::event::Event;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
 use crate::permissions::EscalationOutcome;
+use crate::process_tree;
+use crate::process_tree::ProcessExit;
+use crate::process_tree::ProcessSpec;
+use crate::process_tree::ProcessStdio;
+use crate::process_tree::ProcessTreeChild;
+use crate::process_tree::ProcessTreeKiller;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
+use crate::shell_programs::ShellProgram;
 
 /// Tail returned inline by bash_output; the rest stays in the output file
 /// (cc's BASH_MAX_OUTPUT_DEFAULT is 30k chars).
 const OUTPUT_TAIL_BYTES: u64 = 30_000;
 /// Watchdog cap on the output file — a runaway `yes`-style command gets its
-/// group killed instead of filling the disk (cc caps at 5GB; kloop is
+/// tree terminated instead of filling the disk (cc caps at 5GB; kloop is
 /// stingier).
 const OUTPUT_FILE_CAP: u64 = 1 << 30;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -74,46 +80,38 @@ const MODEL_SHELL_SECRET_ENV: &[&str] = &[
     "BRAVE_API_KEY",
 ];
 
-fn scrub_model_shell_env(cmd: &mut tokio::process::Command) {
+pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     for name in MODEL_SHELL_SECRET_ENV {
-        cmd.env_remove(name);
+        spec.env_remove(*name);
     }
 }
 
-/// The process for `sh -lc <command>`, wrapped in the OS sandbox when a
-/// policy applies. The env vars are hints only (codex's CODEX_SANDBOX
-/// shape): scripts get a way to detect the sandbox instead of failing
-/// mysteriously; enforcement is the profile.
-fn shell_command(
+/// The process spec for the frozen Bash-family executable's `-lc <command>`,
+/// wrapped in the OS sandbox when a policy applies. The env vars are hints only;
+/// enforcement is the profile.
+fn shell_spec(
     command: &str,
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
-) -> tokio::process::Command {
-    let mut cmd = match sandbox {
-        Some(policy) => {
-            let (program, args) = sandbox::seatbelt_command(policy, command);
-            let mut cmd = tokio::process::Command::new(program);
-            cmd.args(args);
-            cmd.env("KLOOP_SANDBOX", "seatbelt");
-            if !policy.allow_network {
-                cmd.env("KLOOP_SANDBOX_NETWORK_DISABLED", "1");
-            }
-            cmd
-        }
-        None => {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-lc").arg(command);
-            cmd
-        }
+    bash: &ShellProgram,
+) -> ProcessSpec {
+    let shell_args = vec!["-lc".into(), command.into()];
+    let (program, args) = match sandbox {
+        Some(policy) => sandbox::seatbelt_command(policy, bash.executable.as_os_str(), &shell_args),
+        None => (bash.executable.clone(), shell_args),
     };
+    let mut spec = ProcessSpec::new(program, cwd);
+    spec.args = args;
+    if let Some(policy) = sandbox {
+        spec.env("KLOOP_SANDBOX", "seatbelt");
+        if !policy.allow_network {
+            spec.env("KLOOP_SANDBOX_NETWORK_DISABLED", "1");
+        }
+    }
     // Provider/search credentials belong to the parent process, never to a
-    // model-controlled shell. This also protects the legacy env override path
-    // while daily provider settings live in ~/.kloop/config.toml.
-    scrub_model_shell_env(&mut cmd);
-    // Run in the agent's cwd — the process cwd for the main agent (unchanged),
-    // its private worktree for a `task {isolation: worktree}` sub-agent.
-    cmd.current_dir(cwd);
-    cmd
+    // model-controlled shell.
+    scrub_model_shell_env(&mut spec);
+    spec
 }
 
 /// The session sandbox policy for this call: disable_sandbox is the model's
@@ -140,26 +138,40 @@ pub(super) fn sandbox_auto_allowed(name: &str, input: &Value, ctx: &ToolCtx) -> 
 
 pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let command = str_arg(input, "command", "bash")?;
+    let bash = ctx
+        .cfg
+        .shell_programs
+        .bash
+        .as_ref()
+        .context("bash: Git for Windows Bash is unavailable in this session")?;
+    #[cfg(windows)]
+    if input.get("disable_sandbox").is_some() {
+        bail!("bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented");
+    }
     let sandbox = call_sandbox(input, ctx);
     // effective cwd: the active worktree's when the session entered one.
     let cwd = ctx.cfg.effective_cwd();
     if input["run_in_background"].as_bool().unwrap_or(false) {
         // No timeout in background mode (cc clears the timer too); the
         // watchdog and kill_bash are the safety net.
-        return ctx.cfg.background_shells.spawn_background(
-            command,
-            &cwd,
-            &ctx.cfg.offload_dir,
-            sandbox.as_deref(),
-            ctx.ui.clone(),
-            ctx.cfg.inbox.clone(),
-        );
+        return ctx
+            .cfg
+            .background_shells
+            .spawn_background(command, sandbox.as_deref(), bash, ctx);
     }
     if ctx.cancel.is_cancelled() {
         bail!("interrupted");
     }
     let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
-    let output = run_foreground(command, &cwd, sandbox.as_deref(), timeout_ms, &ctx.cancel).await?;
+    let output = run_foreground(
+        command,
+        &cwd,
+        sandbox.as_deref(),
+        bash,
+        timeout_ms,
+        &ctx.cancel,
+    )
+    .await?;
     let mut text = format_output(&output);
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
@@ -180,7 +192,8 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
                 {
                     EscalationOutcome::Approved => {
                         let raw =
-                            run_foreground(command, &cwd, None, timeout_ms, &ctx.cancel).await?;
+                            run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel)
+                                .await?;
                         return Ok(format!(
                             "{}{}",
                             sandbox::ESCALATED_PREFIX,
@@ -198,77 +211,93 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     Ok(text)
 }
 
-/// One foreground run of `sh -lc <command>`, wrapped in the OS sandbox per
-/// `sandbox`. The caller turns the bounded raw output into model-facing text.
+/// One foreground shell run. The root is awaited independently from pipe EOF:
+/// once it exits, residual tree members are killed before readers are joined.
 async fn run_foreground(
     command: &str,
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
+    bash: &ShellProgram,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<ForegroundOutput> {
-    let mut cmd = shell_command(command, cwd, sandbox);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group so a timeout or a cancelled turn can SIGKILL the
-    // whole tree, not just the `sh` leader: kill_on_drop reaps only the direct
-    // child, leaving `make`/`npm` grandchildren orphaned and still running.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = cmd.spawn().context("bash: failed to spawn sh")?;
-    let pid = child.id();
-    let stdout = child.stdout.take().context("bash: stdout pipe missing")?;
-    let stderr = child.stderr.take().context("bash: stderr pipe missing")?;
-    // This remains the synchronous fallback for a future drop caused by a
-    // panic or caller that does not participate in the cancellation protocol.
-    let mut guard = GroupKillGuard { pid };
+    let spec = shell_spec(command, cwd, sandbox, bash);
+    run_process_foreground(spec, timeout_ms, cancel, "bash").await
+}
+
+pub(super) async fn run_process_foreground(
+    mut spec: ProcessSpec,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+    tool: &'static str,
+) -> Result<ForegroundOutput> {
+    spec.stdin = ProcessStdio::Null;
+    spec.stdout = ProcessStdio::Pipe;
+    spec.stderr = ProcessStdio::Pipe;
+    let mut child =
+        process_tree::spawn(spec).with_context(|| format!("{tool}: failed to spawn shell"))?;
+    let stdout = child
+        .take_stdout()
+        .with_context(|| format!("{tool}: stdout pipe missing"))?;
+    let stderr = child
+        .take_stderr()
+        .with_context(|| format!("{tool}: stderr pipe missing"))?;
+    let stdout_task = tokio::spawn(read_bounded_stream(stdout));
+    let stderr_task = tokio::spawn(read_bounded_stream(stderr));
 
     enum Completion {
-        Finished(Result<ForegroundOutput>),
+        Finished(std::io::Result<ProcessExit>),
         TimedOut,
         Cancelled,
     }
     let completion = {
-        let output = collect_foreground_output(&mut child, stdout, stderr);
-        tokio::pin!(output);
+        let wait = child.wait();
+        tokio::pin!(wait);
         let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
         tokio::pin!(timeout);
         tokio::select! {
             biased;
-            result = &mut output => Completion::Finished(result),
+            result = &mut wait => Completion::Finished(result),
             _ = cancel.cancelled() => Completion::Cancelled,
             _ = &mut timeout => Completion::TimedOut,
         }
     };
 
     match completion {
-        Completion::Finished(result) => {
-            let output = result?;
-            // A foreground command may start a detached-from-pipes child and
-            // let its shell leader exit. Foreground mode promises no residual
-            // process group; callers that need persistence use run_in_background.
-            terminate_residual_group(pid).await?;
-            guard.disarm();
-            Ok(output)
+        Completion::Finished(status) => {
+            let status = status.with_context(|| format!("{tool}: failed to wait for shell"))?;
+            child
+                .cleanup_after_exit(FOREGROUND_REAP_TIMEOUT)
+                .await
+                .with_context(|| format!("{tool}: failed to clean residual process tree"))?;
+            collect_foreground_output(status, stdout_task, stderr_task, tool).await
         }
         Completion::TimedOut => {
-            terminate_and_reap(&mut child, pid).await?;
-            guard.disarm();
-            bail!("bash: command timed out after {timeout_ms}ms")
+            let cleanup = child
+                .terminate_and_wait(FOREGROUND_REAP_TIMEOUT)
+                .await
+                .with_context(|| format!("{tool}: failed to terminate timed-out process tree"));
+            let drain = drain_foreground_readers(stdout_task, stderr_task, tool).await;
+            cleanup?;
+            drain?;
+            bail!("{tool}: command timed out after {timeout_ms}ms")
         }
         Completion::Cancelled => {
-            terminate_and_reap(&mut child, pid).await?;
-            guard.disarm();
+            let cleanup = child
+                .terminate_and_wait(FOREGROUND_REAP_TIMEOUT)
+                .await
+                .with_context(|| format!("{tool}: failed to terminate interrupted process tree"));
+            let drain = drain_foreground_readers(stdout_task, stderr_task, tool).await;
+            cleanup?;
+            drain?;
             bail!("interrupted")
         }
     }
 }
 
 #[derive(Debug)]
-struct ForegroundOutput {
-    status: ExitStatus,
+pub(super) struct ForegroundOutput {
+    status: ProcessExit,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     omitted_bytes: usize,
@@ -280,15 +309,12 @@ struct BoundedStream {
 }
 
 async fn collect_foreground_output(
-    child: &mut tokio::process::Child,
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
+    status: ProcessExit,
+    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    tool: &'static str,
 ) -> Result<ForegroundOutput> {
-    let (status, stdout, stderr) = tokio::try_join!(
-        async { child.wait().await.context("bash: failed to wait for sh") },
-        read_bounded_stream(stdout),
-        read_bounded_stream(stderr),
-    )?;
+    let (stdout, stderr) = finish_foreground_readers(stdout_task, stderr_task, tool).await?;
     let omitted_bytes = stdout
         .total_bytes
         .saturating_sub(stdout.bytes.len())
@@ -301,15 +327,50 @@ async fn collect_foreground_output(
     })
 }
 
+async fn finish_foreground_readers(
+    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    tool: &'static str,
+) -> Result<(BoundedStream, BoundedStream)> {
+    let (stdout, stderr) = tokio::join!(
+        finish_reader(stdout_task, tool),
+        finish_reader(stderr_task, tool)
+    );
+    Ok((stdout?, stderr?))
+}
+
+async fn drain_foreground_readers(
+    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    tool: &'static str,
+) -> Result<()> {
+    finish_foreground_readers(stdout_task, stderr_task, tool)
+        .await
+        .map(|_| ())
+}
+
+async fn finish_reader(
+    mut task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    tool: &'static str,
+) -> Result<BoundedStream> {
+    match tokio::time::timeout(FOREGROUND_REAP_TIMEOUT, &mut task).await {
+        Ok(result) => result
+            .with_context(|| format!("{tool}: output reader task failed"))?
+            .with_context(|| format!("{tool}: failed to drain output pipe")),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            bail!("{tool}: timed out draining output pipe after process-tree cleanup")
+        }
+    }
+}
+
 async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<BoundedStream> {
     let mut bytes = Vec::with_capacity(FOREGROUND_STREAM_CAP_BYTES);
     let mut total_bytes = 0usize;
     let mut chunk = [0u8; 8192];
     loop {
-        let count = reader
-            .read(&mut chunk)
-            .await
-            .context("bash: failed to drain output pipe")?;
+        let count = reader.read(&mut chunk).await?;
         if count == 0 {
             break;
         }
@@ -320,69 +381,10 @@ async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<Bound
     Ok(BoundedStream { bytes, total_bytes })
 }
 
-async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) -> Result<()> {
-    let group_result = pid.map_or(Ok(()), kill_group);
-    let direct_result = child.start_kill();
-    tokio::time::timeout(FOREGROUND_REAP_TIMEOUT, child.wait())
-        .await
-        .context("bash: timed out reaping sh")?
-        .context("bash: failed to reap sh")?;
-    if let Err(error) = group_result {
-        return Err(error).context("bash: failed to kill process group");
-    }
-    if let Err(error) = direct_result {
-        // A successful group signal can race the leader's exit; only surface a
-        // direct-kill failure when the process group itself could not be used.
-        if pid.is_none() {
-            return Err(error).context("bash: failed to kill sh");
-        }
-    }
-    Ok(())
-}
-
-async fn terminate_residual_group(pid: Option<u32>) -> Result<()> {
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    if !process_group_alive(pid)? {
-        return Ok(());
-    }
-    kill_group(pid).context("bash: failed to kill residual process group")?;
-    let deadline = tokio::time::Instant::now() + FOREGROUND_REAP_TIMEOUT;
-    while process_group_alive(pid)? {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("bash: residual process group {pid} did not exit")
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(())
-}
-
-/// Group-kills a foreground shell's process tree if dropped before its child
-/// is explicitly reaped. Disarmed only after the normal or termination path
-/// has established that the foreground group is gone.
-struct GroupKillGuard {
-    pid: Option<u32>,
-}
-
-impl GroupKillGuard {
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
-}
-
-impl Drop for GroupKillGuard {
-    fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            let _ = kill_group(pid);
-        }
-    }
-}
-
 /// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
 /// placeholder when empty — the model-facing text for one run (denial
 /// annotation is the caller's job, so an escalated re-run reuses this).
-fn format_output(output: &ForegroundOutput) -> String {
+pub(super) fn format_output(output: &ForegroundOutput) -> String {
     let mut merged = Vec::with_capacity(output.stdout.len() + output.stderr.len());
     merged.extend_from_slice(&output.stdout);
     merged.extend_from_slice(&output.stderr);
@@ -518,7 +520,7 @@ struct BgShell {
     status: BgStatus,
     kill: CancellationToken,
     stop_reason: Arc<Mutex<Option<String>>>,
-    pid: Option<u32>,
+    killer: Option<ProcessTreeKiller>,
     /// Some = ran inside the OS sandbox.
     sandbox: Option<BgSandbox>,
 }
@@ -558,12 +560,12 @@ impl BackgroundShells {
     fn spawn_background(
         self: &Arc<Self>,
         command: &str,
-        cwd: &Path,
-        offload_dir: &Path,
         sandbox: Option<&SandboxPolicy>,
-        ui: Arc<dyn Ui>,
-        inbox: Arc<Inbox>,
+        bash: &ShellProgram,
+        ctx: &ToolCtx,
     ) -> Result<String> {
+        let cwd = ctx.cfg.effective_cwd();
+        let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
         let id = format!("bg-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
@@ -573,25 +575,20 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut cmd = shell_command(command, cwd, sandbox);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .kill_on_drop(true);
-        // Its own process group: turn interrupts (terminal signals) never
-        // reach it, and kill_bash can take down the whole tree at once.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        let (child, pid, kill) = {
+        let mut spec = shell_spec(command, &cwd, sandbox, bash);
+        spec.stdin = ProcessStdio::Null;
+        spec.stdout = ProcessStdio::File(stdout);
+        spec.stderr = ProcessStdio::File(stderr);
+        let (child, killer, kill) = {
             // Hold the registry lock across spawn+insert so shutdown cannot close
-            // the table between the process becoming real and its PID being
-            // tracked.
+            // the table between the process becoming real and its controller
+            // being tracked.
             let mut registry = self.state.lock().unwrap();
             if registry.closed {
                 bail!("bash: the session is closing; no new background commands may start");
             }
-            let child = cmd.spawn().context("bash: failed to spawn sh")?;
-            let pid = child.id();
+            let child = process_tree::spawn(spec).context("bash: failed to spawn sh")?;
+            let killer = child.killer();
             let kill = CancellationToken::new();
             let stop_reason = Arc::new(Mutex::new(None));
             registry.shells.insert(
@@ -602,15 +599,15 @@ impl BackgroundShells {
                     status: BgStatus::Running,
                     kill: kill.clone(),
                     stop_reason,
-                    pid,
+                    killer: Some(killer.clone()),
                     sandbox: sandbox.map(|policy| BgSandbox {
                         network_disabled: !policy.allow_network,
                     }),
                 },
             );
-            (child, pid, kill)
+            (child, killer, kill)
         };
-        ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+        ctx.ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
             id: id.clone(),
             run_id: None,
             kind: BackgroundTaskKind::Shell,
@@ -626,11 +623,11 @@ impl BackgroundShells {
             id: id.clone(),
             command: command.to_string(),
             child,
-            pid,
+            killer,
             kill,
             output_path: path.clone(),
-            ui,
-            inbox,
+            ui: ctx.ui.clone(),
+            inbox: ctx.cfg.inbox.clone(),
         }));
         Ok(format!(
             "Command running in background with ID: {id}. Output is being written to: {}. \
@@ -701,7 +698,7 @@ impl BackgroundShells {
             | BgStatus::Failed(_) => return None,
         };
         shell.status = BgStatus::Finishing;
-        shell.pid = None;
+        shell.killer = None;
         Some(terminal)
     }
 
@@ -771,17 +768,17 @@ impl BackgroundShells {
             }
         }
 
-        let pids = self
+        let killers = self
             .state
             .lock()
             .unwrap()
             .shells
             .values()
             .filter(|shell| shell.status.is_active())
-            .filter_map(|shell| shell.pid)
+            .filter_map(|shell| shell.killer.clone())
             .collect::<Vec<_>>();
-        for pid in pids {
-            let _ = kill_group(pid);
+        for killer in killers {
+            let _ = killer.terminate();
         }
 
         let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -816,47 +813,11 @@ impl Drop for BackgroundShells {
             if shell.status.is_active() {
                 *shell.stop_reason.lock().unwrap() = Some("session dropped".into());
                 shell.kill.cancel();
-                if let Some(pid) = shell.pid {
-                    let _ = kill_group(pid);
+                if let Some(killer) = &shell.killer {
+                    let _ = killer.terminate();
                 }
             }
         }
-    }
-}
-
-/// SIGKILL the whole process group (the child is its own group leader).
-fn kill_group(pid: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = rustix::process::Pid::from_raw(pid as _)
-            .context("process group id must be non-zero")?;
-        match rustix::process::kill_process_group(pid, rustix::process::Signal::Kill) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Ok(())
-    }
-}
-
-fn process_group_alive(pid: u32) -> Result<bool> {
-    #[cfg(unix)]
-    {
-        let pid = rustix::process::Pid::from_raw(pid as _)
-            .context("process group id must be non-zero")?;
-        match rustix::process::test_kill_process_group(pid) {
-            Ok(()) | Err(rustix::io::Errno::PERM) => Ok(true),
-            Err(rustix::io::Errno::SRCH) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Ok(false)
     }
 }
 
@@ -864,8 +825,8 @@ struct BackgroundMonitor {
     shells: Weak<BackgroundShells>,
     id: String,
     command: String,
-    child: tokio::process::Child,
-    pid: Option<u32>,
+    child: ProcessTreeChild,
+    killer: ProcessTreeKiller,
     kill: CancellationToken,
     output_path: PathBuf,
     ui: Arc<dyn Ui>,
@@ -881,7 +842,7 @@ async fn monitor(monitor: BackgroundMonitor) {
         id,
         command,
         mut child,
-        pid,
+        killer,
         kill,
         output_path,
         ui,
@@ -895,28 +856,30 @@ async fn monitor(monitor: BackgroundMonitor) {
         tokio::select! {
             status = child.wait() => break status,
             _ = kill.cancelled(), if !signal_sent => {
-                if let Some(pid) = pid {
-                    let _ = kill_group(pid);
+                if let Err(error) = killer.terminate() {
+                    failure_reason = Some(format!("failed to terminate process tree: {error}"));
                 }
-                let _ = child.start_kill();
                 signal_sent = true;
             }
             _ = watchdog.tick() => {
                 let size = std::fs::metadata(&output_path).map_or(0, |metadata| metadata.len());
                 if size > OUTPUT_FILE_CAP && !signal_sent {
                     let reason = format!("output file exceeded {OUTPUT_FILE_CAP} bytes");
-                    if let Some(pid) = pid {
-                        let _ = kill_group(pid);
+                    if let Err(error) = killer.terminate() {
+                        failure_reason = Some(format!("{reason}; failed to terminate process tree: {error}"));
+                    } else {
+                        failure_reason = Some(reason);
                     }
-                    let _ = child.start_kill();
-                    failure_reason = Some(reason);
                     signal_sent = true;
                 }
             }
         }
     };
+    let cleanup = child.cleanup_after_exit(FOREGROUND_REAP_TIMEOUT).await;
     let observed = if let Some(reason) = failure_reason {
         BgStatus::Failed(reason)
+    } else if let Err(error) = cleanup {
+        BgStatus::Failed(format!("process-tree cleanup failed: {error}"))
     } else {
         match exit {
             Ok(status) => BgStatus::Exited(status.code()),
@@ -1010,25 +973,26 @@ async fn read_tail(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::scrub_model_shell_env;
     use super::FOREGROUND_OUTPUT_CAP_CHARS;
     use crate::event::BackgroundTaskStatus;
     use crate::event::Event;
     use crate::inbox::InboxItem;
     use crate::tools::testutil::*;
+    #[cfg(windows)]
+    use base64::Engine as _;
     use serde_json::json;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::path::Path;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::path::PathBuf;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::sync::atomic::AtomicUsize;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Default)]
@@ -1112,6 +1076,162 @@ exec sleep 60
         }
     }
 
+    #[cfg(windows)]
+    struct WindowsBackgroundTree {
+        root: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl WindowsBackgroundTree {
+        fn new(tag: &str) -> Self {
+            let sequence = FOREGROUND_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "kloop-background-{tag}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn command(&self) -> String {
+            let root = self.root.to_string_lossy().replace('\'', "''");
+            let script = format!(
+                r#"$root = '{root}'
+$exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$grandchild = Start-Process -FilePath $exe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru
+[IO.File]::WriteAllText((Join-Path $root 'child.pid'), [string]$PID)
+[IO.File]::WriteAllText((Join-Path $root 'grandchild.pid'), [string]$grandchild.Id)
+Wait-Process -Id $grandchild.Id
+"#
+            );
+            let bytes = script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let executable = PathBuf::from(
+                std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+            )
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+            format!("'{executable}' -NoLogo -NoProfile -NonInteractive -EncodedCommand '{encoded}'")
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsBackgroundTree {
+        fn drop(&mut self) {
+            for name in ["child.pid", "grandchild.pid"] {
+                let Ok(text) = std::fs::read_to_string(self.root.join(name)) else {
+                    continue;
+                };
+                let Ok(pid) = text.trim().parse::<u32>() else {
+                    continue;
+                };
+                terminate_windows_process(pid);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_process_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if process == 0 {
+            return match unsafe { GetLastError() } {
+                ERROR_INVALID_PARAMETER => false,
+                ERROR_ACCESS_DENIED => true,
+                error => panic!("cannot probe pid {pid}: Windows error {error}"),
+            };
+        }
+        let wait = unsafe { WaitForSingleObject(process, 0) };
+        unsafe {
+            CloseHandle(process);
+        }
+        match wait {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            other => panic!("cannot probe pid {pid}: wait result {other}"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate_windows_process(pid: u32) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        use windows_sys::Win32::System::Threading::INFINITE;
+        use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+
+        let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        if process == 0 {
+            return;
+        }
+        unsafe {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, INFINITE);
+            CloseHandle(process);
+        }
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_windows_tree_pids(tree: &WindowsBackgroundTree) -> [u32; 2] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let parsed = ["child.pid", "grandchild.pid"].map(|name| {
+                std::fs::read_to_string(tree.path().join(name))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+            });
+            if let [Some(child), Some(grandchild)] = parsed {
+                return [child, grandchild];
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Windows runner did not publish both pids"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn assert_windows_processes_dead(pids: [u32; 2]) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive = pids.map(windows_process_alive);
+            if alive == [false, false] {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Windows background descendants survived: pids={pids:?}, alive={alive:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     #[cfg(unix)]
     fn process_alive(raw: i32) -> bool {
         let Some(pid) = rustix::process::Pid::from_raw(raw) else {
@@ -1172,15 +1292,32 @@ exec sleep 60
 
     #[tokio::test]
     async fn model_shell_environment_scrubs_provider_credentials() {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg("env");
-        cmd.env("OPENAI_API_KEY", "SENTINEL-OPENAI")
-            .env("ANTHROPIC_API_KEY", "SENTINEL-ANTHROPIC")
-            .env("TAVILY_API_KEY", "SENTINEL-TAVILY")
-            .env("KEEP_ME", "visible");
-        scrub_model_shell_env(&mut cmd);
-        let output = cmd.output().await.unwrap();
-        let text = String::from_utf8(output.stdout).unwrap();
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .expect("test shell is available");
+        let mut spec = super::ProcessSpec::new(shell.executable, std::env::current_dir().unwrap());
+        spec.arg("-lc");
+        spec.arg("env");
+        spec.env("OPENAI_API_KEY", "SENTINEL-OPENAI");
+        spec.env("ANTHROPIC_API_KEY", "SENTINEL-ANTHROPIC");
+        spec.env("TAVILY_API_KEY", "SENTINEL-TAVILY");
+        spec.env("KEEP_ME", "visible");
+        super::scrub_model_shell_env(&mut spec);
+        spec.stdout = super::ProcessStdio::Pipe;
+        spec.stderr = super::ProcessStdio::Pipe;
+        let mut child = crate::process_tree::spawn(spec).unwrap();
+        let mut stdout = child.take_stdout().unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut bytes)
+            .await
+            .unwrap();
+        let status = child.wait().await.unwrap();
+        child
+            .cleanup_after_exit(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(status.success());
+        let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("SENTINEL"), "{text}");
         assert!(text.contains("KEEP_ME=visible"), "{text}");
     }
@@ -1204,6 +1341,50 @@ exec sleep 60
 
         let (out, _) = run_tool("bash", bash_input("true"), &ctx).await;
         assert_eq!(out, "(no output)");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn git_bash_preserves_unicode_command_and_space_unicode_cwd() {
+        let cwd = std::env::temp_dir().join(format!("kloop git bash 空格 {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let bash = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .expect("Git Bash fixture is available");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let output = super::run_foreground(
+            "printf '你好' > marker.txt; printf stdout; printf stderr >&2",
+            &cwd,
+            None,
+            &bash,
+            10_000,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let text = super::format_output(&output);
+        assert!(text.contains("stdout"), "{text}");
+        assert!(text.contains("stderr"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("marker.txt")).unwrap(),
+            "你好"
+        );
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_bash_rejects_disable_sandbox_even_when_false() {
+        let ctx = test_ctx(0, "windows-disable-sandbox");
+        let (output, is_error) = run_tool(
+            "bash",
+            json!({"command": "true", "disable_sandbox": false}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error);
+        assert!(output.contains("unavailable on Windows"), "{output}");
     }
 
     #[tokio::test]
@@ -1556,6 +1737,64 @@ exec sleep 60
         .await;
         assert!(is_error);
         assert!(out.contains("session is closing"), "{out}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_session_shutdown_reaps_background_job_and_closes_registry() {
+        let tree = WindowsBackgroundTree::new("session-shutdown");
+        let (ctx, ui) = recording_ctx("windows-background-shutdown");
+        let command = tree.command();
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": command, "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        let id = bg_id(&out);
+        let pids = wait_for_windows_tree_pids(&tree).await;
+
+        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_windows_processes_dead(pids).await;
+        let (out, is_error) =
+            run_tool("bash_output", json!({"bash_id": id, "block": false}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("killed (session shutdown)"), "{out}");
+
+        let updates = ui
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::BackgroundTaskUpdated(task) if task.id == id => Some(task.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
+        assert_eq!(updates[1].status, BackgroundTaskStatus::Cancelled);
+        assert_eq!(updates[1].detail.as_deref(), Some("session shutdown"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_registry_drop_kills_monitor_owned_background_job() {
+        let tree = WindowsBackgroundTree::new("registry-drop");
+        let pids = {
+            let ctx = test_ctx(0, "windows-registry-drop");
+            let command = tree.command();
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({"command": command, "run_in_background": true}),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            wait_for_windows_tree_pids(&tree).await
+        };
+        assert_windows_processes_dead(pids).await;
     }
 
     #[tokio::test]

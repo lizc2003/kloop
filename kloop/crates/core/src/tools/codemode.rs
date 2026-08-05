@@ -65,8 +65,11 @@ fn is_program_callable(name: &str) -> bool {
 /// or not — so a `tools.<name>()` call never lands on a missing method; deferral
 /// only trims what the `run_program` *description* declares in full, never what
 /// the runtime exposes (a program call bypasses the deferred-tool lock gate).
-fn program_tool_names(sources: &[Arc<dyn super::ToolSource>]) -> Vec<String> {
-    let mut names: Vec<String> = super::builtin_defs(0)
+fn program_tool_names(
+    sources: &[Arc<dyn super::ToolSource>],
+    shell_programs: &crate::shell_programs::ShellPrograms,
+) -> Vec<String> {
+    let mut names: Vec<String> = super::builtin_defs(0, shell_programs)
         .into_iter()
         .filter(|d| is_program_callable(&d.name))
         .map(|d| d.name)
@@ -81,7 +84,7 @@ fn program_tool_names(sources: &[Arc<dyn super::ToolSource>]) -> Vec<String> {
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let source = super::str_arg(input, "source", "run_program")?.to_string();
-    let names = program_tool_names(&ctx.cfg.tool_sources);
+    let names = program_tool_names(&ctx.cfg.tool_sources, &ctx.cfg.shell_programs);
     let limits = ctx.cfg.program_limits;
     // Each run has a run_id and an agent()-call journal. A resume passes the old
     // run_id back, reusing the journal dir so completed agent() calls are

@@ -80,7 +80,9 @@ output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 
 **裁决边界**:上述三个 Claude Code 对齐架构参考库只解释独立收敛、分歧和移植成本;公开文档只帮助设计 probe。当前
 工具的注册条件、schema、空值/默认、权限层序、截断、后台通知和状态机最终只由精确 2.1.220
-bundle + 隔离黑盒 fixture 裁决。
+bundle + 隔离黑盒 fixture 裁决。固定 target 是 darwin-arm64；Windows 源码参考与 kloop 原生
+Windows 测试都不能把 `powershell@clean-cli` 的 `n/a` 八维升级成 `same`/`compatible`，除非另有
+目标 Windows binary identity、fixture 和 exact locator。
 
 Plan 48 已提交以下可重放基线:
 
@@ -173,6 +175,30 @@ plain/server 在下一 turn 交付。agent/program 的结果回灌语义不变�
 终态裁决和 generation signal；session shutdown 先关注册、协作取消，deadline 后 abort/SIGKILL
 process group，并在 active worktree teardown 前等待，防 orphan、重复通知和 server sender 挂账。
 自动后台化、stall policy 与逐事件 Monitor 保留为明确的产品边界。
+
+Plan 62 的 Windows shell 结论只使用固定逆向源码 `<redacted>`
+作架构参考：原生 Windows 的 Bash 仍是经 Git for Windows 布局验证的独立 `bash.exe -lc`，
+PowerShell 是另一个 foreground-only 工具，WSL 按 Linux 分流。kloop 将所有 model shell 收敛到
+跨平台 process-tree façade；Windows 采用 suspended `CreateProcessW`、value-lifetime 自持的 stdio
+handle list、Windows ordinal-case UTF-16 environment、assign-before-resume 的专属 Job Object，
+assign/resume 失败不裸 spawn、不设置 breakaway；唯一 blocking waiter 可在取消后继续 poll，不随后台
+watchdog tick 累积。临时 inheritable stdio 窗口与 hooks/MCP/Git 等生产 child creation 共享 workspace
+`kloop-process-spawn` gate，但这些其他 child 仍未迁入 Job ownership。正常 leader 先退、timeout/cancel、
+后台 kill/watchdog/session Drop 都显式清完整 Job，再有界收 pipe。PowerShell discovery 除 MSI roots 外，
+只接受 Windows package API 枚举到的官方 `Microsoft.PowerShell[_-LTS]_8wekyb3d8bbwe` MSIX roots，
+并以实际 `pwsh.exe` file version 与固定 `PowerShell\7` MSI root 统一排序，不信任任意 PATH alias。该 Job 只是 process-tree containment，不是 restricted token/AppContainer 或
+filesystem/network sandbox；PowerShell 原脚本经 UTF-16LE EncodedCommand 执行但原文留在
+hook/permission/UI/history，权限按 opaque 每次审批，不套 Bash AST。这是 kloop 的安全产品契约，不改
+pinned 2.1.220 darwin matrix 中 `powershell@clean-cli` 的 `platform=darwin-arm64`、`kloop_name=null` 与八维
+`n/a`。
+
+2026-08-05 原生 Windows 验收补充：官方 MSIX PowerShell 7 的 `Start-Process` 可产生不留在
+root Job 的 descendant，因此 PowerShell 专用 spawn 加 `DEBUG_PROCESS | CREATE_SUSPENDED` gate。
+root 仍先 assign 后 resume；每个 descendant create event 在继续前检查 membership，不在 root Job 者先
+assign 到第二个 kill-on-close Job。open/check/assign/continue 失败终止 event process 与两组 Job，
+timeout/cancel/normal exit/Drop 只操作这个固定 owner 集，不用 PID 扫描、裸 spawn、无控制 breakaway 或
+direct-child fallback。PowerShell 7/5.1 descendant no-survivor、pipe EOF、waiter reuse、handle growth 与
+nested-host-Job 均已在 Windows 10 x64 原生通过；这仍不产生 Claude Code Windows parity evidence。
 
 Plan 52 完成时 corpus 为 **96 captures / 137 static evidence**，matrix 仍为 56 行/448 单元，状态为
 67 `compatible` / 119 `intentional-diff` / 23 `missing` / 207 `unknown` / 22 `n/a` / 10 `same`。
@@ -347,7 +373,7 @@ python3 -B refs/claude-code-2.1.220/verify.py
 python3 -B refs/claude-code-2.1.220/verify.py --corpus-only
 ```
 
-默认 `verify.py` 读取并校验本机精确 target identity 与 bundle locator bytes；`--corpus-only` 只跳过这两项，仍执行 fixture/hash/normalization/tamper、matrix/pair 生成一致性、fake provider、敏感信息和 kloop Rust semantic report，供不含目标二进制的 macOS/Linux CI 使用。
+默认 `verify.py` 读取并校验本机精确 target identity 与 bundle locator bytes；`--corpus-only` 只跳过这两项，仍执行 fixture/hash/normalization/tamper、matrix/pair 生成一致性、fake provider、敏感信息和可在当前平台运行的 kloop Rust semantic report。POSIX descriptor/ctime/symlink/publication/PTY collector 自检只在 POSIX 执行；Windows 改验全部 case declaration、unsafe path rejection 与 collector/PTY fail-closed，并保留 immutable corpus/matrix/pair 门。Plan 59 native report 明确是 Darwin arm64-only，Windows 不伪造运行；这些平台边界都不能升级 pinned matrix 结论。
 
 `collect --all` 会采出带新临时路径/端口的 raw 文件，它是重放审计，不是改写 Plan 48 历史
 capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复 immutable legacy raw/manifest
@@ -360,8 +386,9 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/51-background-monitor-parity.md`、`docs/plan/52-agent-task-team-parity.md`、
 `docs/plan/53-interaction-control-parity.md`、`docs/plan/54-discovery-extension-parity.md`、
 `docs/plan/55-web-remote-parity.md`、`docs/plan/56-worktree-parity.md`、
-`docs/plan/57-notebook-lsp-parity.md`、`docs/plan/58-scheduling-parity.md` 与
-`docs/plan/59-tool-parity-acceptance.md`。Plan 59 的通过只产生上述受限行为兼容结论，不产生
+`docs/plan/57-notebook-lsp-parity.md`、`docs/plan/58-scheduling-parity.md`、
+`docs/plan/59-tool-parity-acceptance.md`、`docs/plan/61-file-tool-correctives.md` 与
+`docs/plan/62-windows-shell-tools.md`。Plan 59 的通过只产生上述受限行为兼容结论，不产生
 “全工具已对齐”或“可替换 Claude Code”的产品声明。
 
 ## 调研结论(三轮调研的浓缩)

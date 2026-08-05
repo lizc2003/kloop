@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61、64 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61、62、64 已完成)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -163,8 +163,8 @@
 > `NtSetInformationFile(FileRenameInformationEx)` handle-relative rename。Windows 失败路径会释放 retained child、
 > 相对 retained parent 重开 cleanup candidate 并复核 identity，只清理由本调用创建且仍为空的匹配目录；Unix 因无
 > portable atomic handle-bound `rmdir`，保守遗留失败调用新建的空目录，避免 inode check→`unlinkat(name)` 的替换竞态。
-> Windows 原生 Plan 61 focused + workspace clippy 门已加入 `windows-latest` CI；Windows 全 workspace 当前仍被 Plan 62
-> shell/hook 与既有 path/worktree 平台缺口阻塞，不得把 focused 结论外推成全产品验收。细节见 plan 完成记录。
+> Windows 原生 Plan 61 focused、Plan 62 process-tree/Bash/PowerShell/permissions focused、全 workspace、
+> mock 与 corpus-only 已在 Windows 10 x64 workstation 实际跑绿；workflow 继续在 `windows-latest` 保持同组门。
 > 提交 SHA 以本条所在提交为准。
 >
 > **Plan 61 教训**：模型输出预算不能替代 raw I/O/临时分配预算；文本展示的 logical newline 语义必须
@@ -178,7 +178,7 @@
 > 分区的 ProjectStore，仓库内容仍不能授权。native server 直接升 protocol 2.0，Desktop kloop adapter 同步；
 > Config 改用显式 Runtime/Project/Session/Agent + Workspace 构造，worktree sandbox 同时修复主 checkout root
 > 被隐式保留的问题。**当前产品行为在 Plan 63 实施前仍是 Plan 46 的 global allow + protocol 1.0**，不得把
-> 计划态写成已落地能力。Plan 61 已完成；Plan 63 实施时迁移其窄 mutation-preview context seam，且与 Plan 62 修改面重叠，必须串行。
+> 计划态写成已落地能力。Plan 61、62 已完成；Plan 63 实施时迁移其窄 mutation-preview context seam，可在后续独立会话开始。
 >
 > **CodeWhale 调研已完成（2026-07-27）**：本地只读克隆固定在 `refs/codewhale`，当前 commit 为
 > `b494236312ef3ac36489c83706a0b11ab73935a1`；`60-codewhale-source-review.md` 区分已接通主路径、
@@ -186,8 +186,56 @@
 > 新会话从该文档第七节讨论；其首推候选 provider stream guard 已由 Plan 64 落地。
 >
 > **Plan 64 已完成（2026-08-04）**：`64-provider-stream-guard.md` 将三条 provider rail 收进 typed、单终态、consumer-drop 即 abort 的 stream seam；固定 open 45s / idle 15m / wall 30m / response 10MiB / unfinished frame 1MiB guard。Anthropic 只认 `message_stop`，Responses 只认 `response.completed|incomplete`，Chat 以 `finish_reason` 为语义终态、`[DONE]` 仅结束传输；非空非法 tool JSON 全部 fail closed。core 只在尚无任何 text/reasoning/完整 tool block 时，对 transport、open/idle/wall、HTTP 408/429/5xx、incomplete EOF 做总计 3 attempts，支持秒/HTTP-date `Retry-After`（60s cap）；non-retryable 不 fallback，partial semantic output 不 replay，protocol 1.0 仍只投影 `Error(String)`。确定性测试覆盖 guard、三 wire、tool/subagent retry seal、取消 producer 与 server 单 terminal；提交 SHA 以本条所在提交为准。
-
-**结构**:Cargo workspace,九 crate,到 core 为止严格单链,其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
+>
+> **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
+> façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现
+> absolute `lpApplicationName`、Windows ordinal-case UTF-16 environment、stdio-only handle list、suspended
+> CreateProcessW → assign-before-resume，任何 attach/resume 失败都 terminate+wait、无裸 spawn/breakaway。
+> handle-list 自持 value array 到 attribute 删除；`Child` 复用唯一 blocking waiter，watchdog 反复取消/re-poll
+> 不再泄漏线程/handle；新 `kloop-process-spawn` gate 覆盖 shell、hooks、MCP、Git 与其余生产 child spawn，
+> 把 inheritable stdio 窗口限制在同一进程级临界区。前台正常 leader exit 先清 residual tree 再收 EOF；
+> timeout/cancel 先 terminate tree、reap root、确认 empty，再在短 deadline drain；后台沿用 Plan 51
+> registry/通知/回灌，但 controller 改为整树，kill/watchdog/session shutdown/Drop 都显式终止。
+> `ShellPrograms` 在 RuntimeSettings 启动时冻结，Windows Bash 只接受完整 Git for Windows 布局，PowerShell
+> 从版本化 MSI root 与 Windows package API 返回的官方 `Microsoft.PowerShell[_-LTS]_8wekyb3d8bbwe`
+> MSIX root 中按 `pwsh.exe` file version 选最高 v7（目录/package version 仅作无 resource fallback，兼容
+> MSI 固定 `PowerShell\7` 目录），再后退 5.1；catalog/code mode/defer/agent clone 都吃同一 snapshot，`--mock`
+> 注入确定 fixture。独立 foreground-only `powershell` 使用固定 no-profile/noninteractive UTF-16LE
+> EncodedCommand，原脚本留在 hook/permission/Event/history/TUI；PowerShellOpaque 不走 Bash AST，plan
+> 拒绝、manual/accept-edits/bypass 每次问、恒串行、无 remember，whole-tool allow/deny/ask 才生效。
+> Windows Job 不是 filesystem/network sandbox；hooks/MCP/git 仍未迁入 Job/process-tree ownership，只共享
+> 防临时 handle 外泄的 spawn gate。macOS 本机 fmt、all-target clippy、workspace tests、mock、corpus-only
+> 与 pinned darwin full exact-binary 已过；独立小 crate 对当前 Windows process-tree、package discovery 与
+> PowerShell native tests 做 target compile-check 已过，整 workspace cross-check 仍被本机缺 MSVC C headers
+> 的 `ring/assert.h` 阻塞。CI 已扩为三平台全 workspace/mock/corpus，Windows 加原生 Job/Git Bash/
+> PowerShell focused tests；在真实 Windows runner 跑绿 Job/pipe/handle/no-orphan、Git Bash、pwsh/5.1
+> 与旧 path/worktree blockers 前，只把当前实现视作可同步的验收基线，不标 ✅、不改 pinned darwin PowerShell
+> `n/a` matrix；Windows 修复与完成记录优先 amend 同一 `plan62` commit。
+>
+> **Plan 62 已完成原生 Windows 验收（2026-08-05）**：Windows 10 build 19045 x64 workstation
+> （测试宿主已在 Job 中）使用 Rust/Cargo 1.92.0、Git for Windows 2.52.0.windows.1 /
+> Bash 5.2.37、官方 Store/MSIX PowerShell 7.6.4（file version 7.6.4.500）与 Windows PowerShell
+> 5.1.19041.6456。Plan 61 七组 file-safety selector 共 62 tests；Plan 62 的
+> `kloop-process-spawn` 1、`shell_programs` 8、`process_tree` 15、Bash 16、PowerShell 9、
+> permissions 42 tests 全绿、0 ignored；workspace fmt/clippy/tests、mock、Windows corpus-only 与
+> `git diff --check` 同样通过。workspace 中 core 538、server 26、CLI 81、codemode 21 tests 全绿。
+>
+> 原生验收查实 PowerShell 7 MSIX 的 `Start-Process` 可产生不留在 root Job 的 descendant；
+> PowerShell 现使用 `DEBUG_PROCESS | CREATE_SUSPENDED` 专用 gate，root 仍 assign-before-resume，
+> 每个 descendant 在 create-process debug event 继续前复核 membership，不在 root Job 者先进入第二个
+> kill-on-close Job。open/check/assign/continue 失败均终止 event process 与两组 Job；timeout/cancel/
+> normal exit/Drop 只操作固定 Job owner，不做 PID 扫描、裸 spawn、无控制 breakaway 或 direct-child fallback。
+> pwsh 7 与 powershell 5.1 的 timeout/cancel 原生回归均确认 `Start-Process` descendants 无 survivor，
+> 普通/debugged handle-growth、waiter-ID reuse、inherited pipe EOF、后台 shutdown/registry Drop 同样通过。
+>
+> Windows corpus-only 保留 committed fixture/hash/normalization/tamper、matrix/pair/profile bridge、
+> Windows 可运行 Rust report 与 sensitive-data 门；POSIX descriptor/ctime/symlink/publication/PTY
+> self-test 在 Windows 改验 case declaration、unsafe path rejection 和 collector/PTY fail-closed。
+> Darwin-arm64-only Plan 59 report 不在 Windows 伪跑，pinned PowerShell `n/a` matrix 未修改；
+> hash-bound fixture JSON 以 `.gitattributes -text` 防 `core.autocrlf` 改写。Windows
+> filesystem/network sandbox 仍未实现，hooks/MCP/Git 仍只共享 process-creation gate。提交 SHA 以本条所在提交为准。
+>
+**结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
 
 **能力**(全部真实 API 验证过,除注明):
@@ -205,8 +253,9 @@
 - 搜索工具(plan 14 第一片 + plan 49 parity pass;`core/src/tools/search.rs`;双轨真 key 验收过 plan 14,Plan 49 由 exact 2.1.220 fixture + paired golden 闭环):内置 `grep`/`glob` 只读工具,ripgrep 同源 crate 族纯库实现。grep 三种 output_mode(files_with_matches 默认 mtime 新→旧 / content `path:line:text` / count),支持 `context`/`-A/-B/-C`/`-o`/`-n`/`-i`/multiline、glob/type、numeric-or-string head_limit/offset（最大值 saturating,不 panic/回绕）,单文件 content 省路径；500 字符行裁剪 + UTF-8 安全 7k 模型文本上限。glob 空 pattern 列树、新→旧后精确取 100,字符截断后按实际展示路径报告 shown/remaining,program 仍收 100 项数组。grep 每个 candidate 先以 canonical parent FD + no-follow leaf 绑定 inode,original+resolved 一起过滤 deny/sensitive,再用 `search_reader` 搜 descriptor,不留 filter→path reopen 窗口；多 hard-link candidate 按不可安全分类的 inode alias 隐藏计数。两者尊重 .gitignore、搜 hidden、跳 VCS/binary、20s 后返部分结果,并在读前过滤 deny/sensitive 路径且报告 hidden count；这些比 CC broader visibility 更安全,matrix 标 intentional-diff。Read/Glob/Grep 并发安全。
 - 文件工具（Plan 49 + Plan 61 corrective；`core/src/file_state.rs` + `file_io.rs` + `text_edit.rs` + `tools/fs.rs` + `tools/fs/`）：session-only observation 以规范化路径、stable file identity、内容/元数据版本、Read 覆盖范围和 adapter provenance 记忆，不进 rollout；只有最终成功且模型完整看见的 Read 建 existing mutation 资格，preview/失败/拒绝/取消不算。普通 Read/Edit raw 上限 5 MiB，lowercase notebook 为 10 MiB，approval whole-file preview 为 1 MiB；同一已打开对象做 metadata 预检、`cap+1` bounded read、读后版本复核，fingerprint/equality 用 chunked I/O，故显式 Write content 不受 5 MiB 限制。Read 文本仍是 7k 字符模型预算；CRLF 只在展示层逻辑化，Edit raw exact 优先、零命中才走共享 logical-LF fallback，未命中 raw bytes 保持不变。existing Write/Edit 仍须完整 fresh observation，在 keyed path lock 内以 parent capability/no-follow/stale final check/same-directory temp+sync/atomic rename/parent sync 提交；symlink/非普通目标、多 alias 不安全身份与 parent retarget 均 fail closed。新建 Write 可在审批后从冻结的最近既有 ancestor handle 逐段创建缺失父目录：Unix 走 `mkdirat/openat/renameat`，Windows 走 retained HANDLE、stable volume+file ID、reparse 拒绝、`NtCreateFile(RootDirectory)` 与 handle-relative rename；批准前零目录副作用，leaf race 不覆盖。Windows 失败时只逆序清理由本调用创建、identity 未变且仍为空的目录；Unix 无 portable atomic handle-bound `rmdir`，失败时保守遗留新建空目录，避免按名称误删替换对象。
 - notebook 文件工具（Plan 57；`core/src/tools/notebook.rs` + `tools/fs.rs`）：小写 `.ipynb` 由 `read_file` 内部 adapter 呈现 cell，不新增独立 `NotebookRead`；markdown/code/raw 保持顺序与 ID，missing ID 只显示 `cell-N`，code output 的 text/image/text 使用 canonical content blocks，输入 10 MiB、文本 7k chars、最多 16 图/5 MiB，paging 明确拒绝。CC 精确目标名为 `NotebookEdit`；kloop model-visible 原生名统一为 snake_case `notebook_edit`，使用 strict `{notebook_path,new_source,cell_id?,cell_type?,edit_mode?}`，支持 replace/insert/delete；局部 `IndexMap` ordered AST 保 untouched property order/unknown fields、一空格缩进/无尾换行，nbformat 4.5+ 插入时生成 8-hex ID。只有完整、未截断的 cell-aware Read 建 notebook-qualified observation；普通 raw Read、Write/Edit 不授予/保留，失败清资格，成功刷新。mutation 全复用 parent FD/no-follow/keyed lock/freshness/temp+sync+renameat+parent sync；permission 用 `notebook_path` 原始+resolved path、cell-aware preview、AcceptEdits/Plan/deny/sensitive，worktree 使用 fresh FileState。LSP 证据门未闭合，不存在生产 LSP client，matrix 八维保留 unknown。
-- 前台 bash(Plan 50 exact parity pass；`core/src/tools/bash.rs` + `tools/mod.rs`):精确 2.1.220 fixture 锁定 schema/parser、stdout/stderr/空/非 UTF-8/非零/signal/大输出、stubborn timeout/cancel tree 与输入依赖并发。kloop 保留原生 `timeout_ms`/结果文案与更严格 permission/sandbox；stdout/stderr 两 pipe 同时 drain，每 fd 只保留 150k bytes，合并后 UTF-8 lossy 文本最多 30k 字符并报告省略量。每个前台 shell 独立 process group；timeout/cancel 先 SIGKILL 全组、显式 reap direct child、再轮询确认 residual group 消失；正常 leader 先退但留 descendant 也补杀。dispatch 在审批/hook 取消时不 spawn，spawn 后则等 executor 清理完成再配对 interrupted result，同批只读 Bash 取消不串扰。CC 同类 stubborn command 会转后台或 abort 且 fixture 结果后 descendants 仍存活，因此 executor/output/lifecycle 为安全型 intentional-diff；Plan 51 已完成显式后台终态通知/回灌与 session 清理，自动后台化/stall/逐事件 Monitor 继续不做。
-- 后台 bash(plan 14 第三片 + Plan 51 lifecycle 补强;`core/src/tools/bash.rs`;双轨真 key 基础验收已过,exact 2.1.220 success/failure notification fixture 已固定):`bash` 加 `run_in_background`(后台忽略 timeout_ms),stdout/stderr 在 fd 层交织直写 `.kloop/offload/bg-N.out`,立即返回 ID + 输出文件路径;`bash_output`(block=true 默认阻塞到完成,上限 600s;状态 + 尾部 30k bytes)与 `kill_bash`(杀整个进程组)保留。Plan 51 后 `BackgroundShells` 具 closed registry + `Running→Stopping/Finishing→Exited/Killed/Failed` 原子终态:spawn+登记同一临界区,kill/watchdog/natural exit 只有 `begin_finish→publish→complete_finish` 胜者发一次 `Event::BackgroundTaskUpdated`;终态把 status/summary/output pointer 作为 `InboxItem::ShellResult` 在下一 sampling step 交付,不重复塞命令正文。activity 用 `watch` generation 防 lost wakeup;session shutdown 标 closed、拒新 spawn、cooperative cancel 后 deadline 强杀 process group/reap direct child，并在任何已授权的 worktree teardown 前等 monitor 收尾；session active tree 无显式 remove intent 时保留（Plan 56）；Drop 仅作同步补刀。事件是 session-scoped、无 turn owner,server/headless 投影 `thread/backgroundTask/updated` 不带 turnId,TUI note + idle autowake;plain/server 下一 turn drain。两套 registry 仍不合并:shell 是输出文件型,agent/program 是结果回灌型,只共享外部 lifecycle DTO。权限/sandbox 与前台一致;interrupt 不杀后台。自动后台化、stall detection 和 CC 的逐 stdout line/WebSocket frame Monitor 不抄。
+- 前台 bash(Plan 50 exact parity pass + Plan 62 process-tree；`core/src/tools/bash.rs` + `process_tree/` + `tools/mod.rs`):精确 2.1.220 fixture 锁定 schema/parser、stdout/stderr/空/非 UTF-8/非零/signal/大输出、stubborn timeout/cancel tree 与输入依赖并发。kloop 保留原生 `timeout_ms`/结果文案与更严格 permission/sandbox；stdout/stderr 两 pipe 同时 drain，每 fd 只保留 150k bytes，合并后 UTF-8 lossy 文本最多 30k 字符并报告省略量。启动时冻结 shell identity：普通 Unix 为 resolved POSIX sh、WSL 为 `/bin/bash`，原生 Windows 只接受完整 Git for Windows 布局的 `bin\bash.exe`。每次 spawn 都有强制 process-tree owner：Unix process group；Windows Job 在 root suspended 时 assign，成功后才 resume。timeout/cancel/normal leader exit 都先清整树、reap root、确认 empty，再有界收 pipe；dispatch 在审批/hook 取消时不 spawn，spawn 后则等 executor 清理完成再配对 interrupted result。CC 同类 stubborn command 会转后台或 abort 且 fixture 结果后 descendants 仍存活，因此 executor/output/lifecycle 为安全型 intentional-diff；Windows Job 不是 filesystem/network sandbox。Plan 51 已完成显式后台终态通知/回灌与 session 清理，自动后台化/stall/逐事件 Monitor 继续不做。
+- 后台 bash(plan 14 第三片 + Plan 51 lifecycle + Plan 62 process-tree;`core/src/tools/bash.rs`;双轨真 key 基础验收已过,exact 2.1.220 success/failure notification fixture 已固定):`bash` 加 `run_in_background`(后台忽略 timeout_ms),stdout/stderr 在 fd 层交织直写 `.kloop/offload/bg-N.out`,立即返回 ID + 输出文件路径;`bash_output`(block=true 默认阻塞到完成,上限 600s;状态 + 尾部 30k bytes)与 `kill_bash`(终止整个 Unix group/Windows Job)保留。Plan 51 后 `BackgroundShells` 具 closed registry + `Running→Stopping/Finishing→Exited/Killed/Failed` 原子终态:spawn+登记同一临界区,kill/watchdog/natural exit 只有 `begin_finish→publish→complete_finish` 胜者发一次 `Event::BackgroundTaskUpdated`;终态把 status/summary/output pointer 作为 `InboxItem::ShellResult` 在下一 sampling step 交付,不重复塞命令正文。activity 用 `watch` generation 防 lost wakeup;session shutdown 标 closed、拒新 spawn、cooperative cancel 后 deadline 显式 terminate tree/reap direct child，并在任何已授权的 worktree teardown 前等 monitor 收尾；Drop 同样显式 terminate，不依赖最后一个 controller handle close。事件是 session-scoped、无 turn owner,server/headless 投影 `thread/backgroundTask/updated` 不带 turnId,TUI note + idle autowake;plain/server 下一 turn drain。两套 registry 仍不合并:shell 是输出文件型,agent/program 是结果回灌型,只共享外部 lifecycle DTO。权限/sandbox 与前台一致;interrupt 不杀后台。自动后台化、stall detection 和 CC 的逐 stdout line/WebSocket frame Monitor 不抄。
+- 原生 Windows PowerShell（✅ Plan 62；`core/src/tools/powershell.rs` + `shell_programs.rs` + `permissions.rs`）：仅 Windows 且 foreground-only，标准 discovery 优先最高 PowerShell 7、后退 Windows PowerShell 5.1；固定 `-NoLogo -NoProfile -NonInteractive -EncodedCommand <UTF-16LE base64>`，无临时 ps1/Invoke-Expression/ExecutionPolicy bypass，原脚本留在 hook/permission/Event/history/TUI。共享 bounded output、credential env scrub、timeout/cancel 与 Job cleanup，不进 BackgroundShells。MSIX descendant 由 debug-event gate 在首线程继续前复核并装入固定 containment Job 集，失败即整组终止；7.6.4 与 5.1 原生 no-survivor 已过。`PowerShellOpaque` 永不调用 Bash AST：plan 直接拒绝，manual/accept-edits/bypass 每次问，恒串行，AllowSession/AllowAlways 不缓存/不持久化；只有 whole-tool allow/deny/ask 有效，prefix rule 拒绝。Windows filesystem/network sandbox、PowerShell background/PTY/stdin/session 均未实现。
 - web 工具(plan 14 第二片 + plan 44 + **Plan 55 exact parity pass**;`core/src/tools/web.rs` + `crates/web` + `cli/src/web.rs`;基础真 key 双轨验收已过):agent-facing 契约归 core、网络归 `kloop-web`、CLI 以静态 `ToolSource` 绑定。`web_fetch {url}` 是严格 url-only 纯抓取:拒未知字段、http→https、拒内嵌凭据/URL>2000、每跳 SSRF/DNS 守卫(环回/私网/link-local/CGNAT/元数据段)、同 site redirect≤5、跨 host 只报告、5 MiB 下载 + 50k 字符上限、HTML→text；下载/文本双截断各自报告。它不接收后忽略 CC 的必填 `prompt`，prompt+小模型处理/15 分钟 cache/turndown/preapproved 表明确 intentional-diff。`web_search {query,allowed_domains?,blocked_domains?}` strict query≥2、allow/block 互斥、只留合法 HTTP(S) URL，domain 用 exact host/子域边界且 blocked 兜底否决；provider JSON≤5 MiB、模型文本≤50k、内部固定 5 结果。backend 仍 Tavily 默认/Brave 可选，缺 key/未知 provider 不注册并警告，故 registration intentional-diff；两工具 readonly 进并发批，外部工具权限仍 manual ask。Plan 55 exact 证据证明 CC WebSearch 本地 side-query success/empty/error，但 CC WebFetch transport 与 true remote cloud lifecycle 继续 unknown。
 - provider 打磨(plan 15;三片提交 56efa17/dcefac7/6c3adf8,调研沉淀在 plan 文件):
   - **prompt caching**(Anthropic,默认开,`KLOOP_CACHE=off` 逃生口):三断点——tools 末尾(工具集比含日期/git 快照的 system 稳定,重启换 system 时 tools 前缀仍命中)+ system 末块 + 最后一条 message 末块(逐轮后挪,旧断点仍是读取点;跳过 thinking 块)。cache_control 是传输细节,只在 anthropic 适配器序列化时注入,protocol/rollout 零改动。`Usage` 四字段(input/output/cache_read/cache_creation),`total()`=上下文大小(缓存 token 仍占窗口,cc 公式),锚点数学不变;openai 轨 `prompt_tokens_details.cached_tokens` 拆出 cache_read 并从 input 扣减防双计。真 key 验收:同前缀复跑 cache_read=14450 全量命中。**排查 cache miss 先复跑**:缓存条目可读性有传播延迟(首跑第二轮 miss、复跑全中),别先怀疑断点位置。
@@ -349,6 +398,12 @@
 65. 来自 plan 61（CRLF Edit）。**展示层把 raw representation 逻辑化后，所有依赖模型回传展示文本的 mutation 必须共享同一 logical→raw 映射，而不是让 preview/executor 各复制一套 replace。**Read 去掉行尾 `\r` 后，模型自然给 LF `old_string`；Edit 应先尝试 raw exact，只有零命中才折叠严格 `\r\n→\n`，仍执行 duplicate protection，并只重建命中 raw range。replacement 取匹配区局部 EOL，否则取全文件 dominant EOL（CRLF 严格多数才胜，平局 LF）；孤立 `\r` 与未命中 bytes 原样保留。判据：展示语义与存储语义不同的格式，preview 和 executor 只能调用一个纯 helper，且测试既断言用户可见变更，也断言未修改 raw bytes 逐字节不漂移。
 
 66. 来自 plan 61（安全递归创建）。**批准后递归 mkdir 不是一个可先做后补安全检查的便利步骤，而是 namespace mutation transaction 的前半段。**preflight 只绑定最近既有 ancestor capability 与缺失 lexical components，批准前零副作用；批准后每段都相对 retained parent 创建并 no-follow 打开、记录 stable identity，最终 leaf/temp/rename 延续同一 capability 链。失败 rollback 还必须服从平台能提供的原子绑定：Windows 释放 retained child 后，相对 retained parent 以 DELETE access 重开同名 candidate，只有 identity 匹配且为空时才 disposition 这个已打开 handle；POSIX 的 inode check→`unlinkat(name)` 不能原子绑定，宁可遗留新空目录也不能误删竞态替换对象。竞争者创建、被替换或非空目录都不能碰；Windows 若拿不到 stable file ID、reparse 事实或 handle-relative rename 就 fail closed，不能退 pathname fallback。判据：凡审批后会创建多级 namespace 的操作，把 walk、identity、leaf race、commit、durability 与 rollback 一起设计，不能用 `create_dir_all` 加末尾 canonicalize 拼成安全性。
+
+67. 来自 Plan 62（跨平台 shell process tree，已由原生 Windows 验收）。**(a) 进程树所有权必须在 user code 开始前建立，不能 spawn 后补 attach 更不能 attach 失败回退 direct-child kill**：Windows 先建 kill-on-close Job、root suspended CreateProcessW、Assign 成功后才 Resume；Job/process/thread/attribute/stdio handle 都用 RAII，错误路径保留原 Win32 error 但先 terminate+wait。**(b) root exit 与 pipe EOF 是两件事**：descendant 可继承 stdout/stderr 并在 leader 退出后继续持 pipe；正确顺序是 normal exit 先清 residual tree、timeout/cancel 先 terminate tree + reap root + wait empty，最后对 reader 设短 drain deadline，绝不能把 root wait 与无限 EOF 放进一个 join。**(c) 进程 containment、shell identity 与命令语言权限是三层独立边界**：Job 永不被 `disable_sandbox` 关闭但不冒充 filesystem/network sandbox；Git Bash executable 只由完整布局冻结；PowerShell 不因共享 executor 就套 Bash AST，opaque script 在 plan 拒绝、bypass 仍问且不 remember。判据：新增执行语言时分别回答“谁拥有后代”“执行的是哪个被冻结的程序”“权限层真正理解多少语义”，任何一层未知都 fail closed，不用另一层的保证冒充。
+
+68. 来自 Plan 62 Windows 静态复审。**Win32 process creation 的安全边界包含“等待 future 的取消语义、attribute value 的 Rust lifetime、临时 inheritable bit 的全进程可见性、环境键的 OS 比较规则”，不能只看 CreateProcess/Job 调用顺序。**`spawn_blocking(WaitForSingleObject(INFINITE))` 一旦启动就不可由丢弃 async future 取消，故 `Child` 必须持唯一 JoinHandle 供后续 re-poll；`UpdateProcThreadAttribute` 记录的是 value 指针，不会复制 handle array，owner 必须活到 Delete；HANDLE_LIST 只限制目标 child，不能阻止同进程另一条 `CreateProcess(TRUE)` 偷继承临时 handle，因此所有生产 spawn 要共享从 inheritable handle 创建到关闭的短 gate；Windows env key 不能经 `to_string_lossy().to_lowercase()`，必须保留 raw UTF-16 并用 `CompareStringOrdinal(ignoreCase=TRUE)`。判据：任何跨 FFI 的“API 已返回成功”都逐项列 backing storage lifetime、取消后谁继续拥有 blocking work、资源 flag 对并发线程是否可见、排序/equality 是否由 OS 定义，并给 repeated-cancel/并发 spawn/ill-formed UTF-16 原生回归。
+
+69. 来自 Plan 62 原生 Windows 验收。**root 已在 Job 中不等于所有间接 descendant 必然留在该 Job，尤其 app-package/broker 参与的 PowerShell `Start-Process` 路径必须用真实 no-survivor 观察裁决。**PowerShell 采用 debug-process gate 后，每个 descendant 的 create event 在首线程继续前检查 root/descendant Job membership，未受控者先 assign，任一 open/check/assign/continue 失败就终止 event process 与固定 Job 集；cleanup 只持 Job owner，不用 PID 枚举猜树。另一个方法边界是 immutable corpus 验证与 POSIX collector publication/PTY 自测必须分层：Windows 可完整校 hash/matrix/pair/可运行 report，并验证 POSIX-only collector fail closed，但不能伪跑 Darwin-only Plan 59 report。判据：原生验收既检查“测试真的跑了”，也检查平台不适用部分是明确边界而非 skip 后冒充通过。
 
 **plan 1–13、15、16、18、20、21、23、25、26、27、28(片 1+2+3)、29(片 1+2+MCP 图:图片输入,用户顶层图 + 工具读图 `read_file` 判 MIME + `ToolResult` String→blocks 三轨 + MCP 工具图结果抬成 image 块)、31(grep/glob 路径级保护:read deny + 敏感路径统一过滤读类工具输出)、32(指令文件高级特性片 1+2:@import 递归展开 + `.kloop/rules/*.md` + `AGENTS.local.md`/`CLAUDE.local.md` 覆盖;片 3 子目录懒加载挂账)、33(非交互 headless `--headless`)、34(MCP 远程 streamable HTTP)+34b(MCP 远程 OAuth 2.1)、35(worktree 隔离切片 1+2:`task {isolation:worktree}` 子 agent 隔离 + `Config.cwd` 一级化穿全链工具[切片 1];`enter_worktree`/`exit_worktree` 模型工具 + `--worktree[=name]` CLI 会话级隔离,运行时可变 cwd 槽 + `effective_*` 收口[切片 2];**server 会话 worktree 已支持**——每 thread 独立槽 + `thread/worktree` 通知；shutdown 无 remove intent 时保留 session active tree，task-owned clean tree 才自动清理，显式 Managed remove 才 teardown)、36(用户自定义命令三片:`.kloop/commands/*.md` 单文件作 skills 第二发现根 `SkillSource::Command` 只 `/name` 可调[首片] + `!cmd`/`@file` 注入走 bash/read 权限门[二片] + 注入统一到 `skill` 工具模型路径[三片])全部完成;plan 22 完成机制 + 用户 steering(子 agent 回灌已由 plan 26 建异步派发承接);plan 26 完成异步派发引擎切片 1+2+3 + 轻量 interrupt(`task{background:true}` fire-and-forget + `BackgroundTasks` 注册表 + `wait`/`stop_agent` + TUI autowake;inbox 升级为类型化信号队列 `Inbox`;真 key anthropic 轨闭环已过;**无挂账**——注册表大泛化已收尾(2026-07-14 关成"不合并" + 回灌类改名 `BackgroundTasks`/`TaskStatus`)、切片 5 落盘已由 plan 17 片 3 完成);plan 23 完成内置 slash 面(`/help`/`/cost`/`/compact`/`/clear`,用户模板挂账,开工时用户转 scope);plan 24 code mode **全部完成**(`kloop-codemode` QuickJS 引擎 + `run_program` op 层重入权限 gate + `agent()` + pipeline/parallel + UI 观察 + MCP 暴露[plan 27] + 资源治理 caps/Limits 配置化 + 后台 program + journal resume,真 key 各片已过;**无挂账**;保存复用归 plan 23;budget/并发 pacing/富进度树"不做"附依据);**plan 27 彻底收尾**——code mode MCP 暴露全三片:切片 1(inline 暴露)+ 2(defer 紧凑清单,`from_program` 跳过 locked)+ 3(MCP 工具回结构化 `CallToolResult` 对象、glob 回 `string[]`),真 key anthropic 轨 inline/defer/结构化/glob 四侧验收全过,外加自发采用验证(不点名 run_program、给 MCP 扇出任务,sonnet-5 自发选它);plan 14 完成切片 1(grep+glob)、3(后台 bash)、2(web 工具);plan 17 **全部切片完成**——1(并行 task)+ 4(UI 呈现)+ 2(自定义 agent 类型)+ 3(子 agent 历史持久化,统一落所有子 agent)+ 5(hook agent 字段 + SubagentStart/Stop,Option B 对齐两家),片 6 由 plan 26 承接;plan 19 完成片 1(macOS seatbelt 执行原语 + 最小逃逸口)+ 片 2(auto-allow 双轴联动)+ 片 3(代码级 escalation 环);tools 已拆目录(缝在 `tools/mod.rs`,实现按领域一文件)**。plan 15 开工时用户扩了 scope(三线协议:/v1/messages、/chat/completions、/v1/responses 全支持),唯一挂账:Responses 加密 reasoning 往返仅 wiremock 锁定,真实锻炼需官方 OpenAI key。后续 plan(顺序是建议、可按用户意愿调换,取舍点都标了"开工时定/问用户"):
 - **plan 14(收尾)** 图片输入已由 plan 29(片 1+2)承接完成;grep/glob 路径级保护已由 **plan 31 完成**(read deny + 敏感路径统一过滤读类工具输出,cc `getFileReadIgnorePatterns` 精神)。write_stdin 已由 **plan 30 决定不做**(采 cc 取舍,见下)。切片 1/2/3 双轨验收全过。

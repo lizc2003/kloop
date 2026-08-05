@@ -1,18 +1,18 @@
 # Plan 62 — Windows 原生 Shell：Git Bash、PowerShell 与 Job Object
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-08-05；提交号以本条所在提交为准）
 >
-> 依赖：Plan 50、Plan 61
+> 依赖：Plan 50、Plan 51、Plan 61；与未开工 Plan 63 修改面重叠，收尾前不得并行
 >
 > 交界：Plan 51 已完成显式后台 lifecycle/通知/回灌与 session cleanup；自动后台化、stall 和逐事件 Monitor 仍为产品边界
 >
-> 调研基线：kloop `70eebfc`；Claude Code 固定源码 `<redacted>` 只作 Windows 架构参考，精确 2.1.220 target 是 darwin-arm64，不能充当 Windows 运行证据。
+> 调研/实现基线：kloop `4ab04b5`；Claude Code 固定源码 `<redacted>` 只作 Windows 架构参考，精确 2.1.220 target 是 darwin-arm64，不能充当 Windows 运行证据。
 
 ## 背景
 
 Claude Code 在原生 Windows 上不把 Bash 偷换成 PowerShell：Bash 使用 Git for Windows，PowerShell 是独立工具；从 PowerShell 启动程序只表示它是终端宿主。WSL 又是独立的 Linux 运行环境。
 
-kloop 当前只有 `bash`，执行器固定为 `sh -lc`。Unix 前后台路径依赖独立 process group；non-Unix 的 `kill_group` 是 no-op，`process_group_alive` 恒为 false。因此当前代码即使在 Windows 找到某个 `sh.exe`，timeout、cancel、`kill_bash`、watchdog 和 session Drop 也只能可靠处理直接子进程，不能兑现 Plan 50 的无遗留进程树保证。
+Plan 62 开工前 kloop 只有 `bash`，执行器固定为 `sh -lc`；Unix 前后台依赖独立 process group，non-Unix 的 group 操作不能兑现 Plan 50 的无遗留进程树保证。当前实现已把前后台 shell 迁入共享 process-tree façade：Unix 保持 process group，Windows 在 user code 执行前绑定专属 Job Object。本段保留为问题基线，不能拿实现后的 cross-compile 反推 Windows 生命周期已验证。
 
 本计划只闭环 **Windows 原生 shell execution**：Git Bash、独立 PowerShell、Job Object 进程树所有权、权限和原生 CI。Windows 文件 mutation/reparse-point/handle-relative safety 仍由 Plan 61 负责；Windows filesystem/network sandbox 仍未实现；Plan 51 已完成的显式后台 lifecycle 状态机在本计划只复用、不重新设计。
 
@@ -38,6 +38,7 @@ kloop 当前只有 `bash`，执行器固定为 `sh -lc`。Unix 前后台路径�
 关键文件：
 
 - 新增 `kloop/crates/core/src/process_tree/{mod.rs,unix.rs,windows.rs}`
+- 新增 `kloop/crates/process-spawn`，给所有生产 child creation 共用进程级 gate
 - 重构 `kloop/crates/core/src/tools/bash.rs`
 - 调整 `kloop/crates/core/src/tools/mod.rs`
 - target-specific 依赖：`kloop/Cargo.toml`、`kloop/crates/core/Cargo.toml`
@@ -81,7 +82,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'  # optional
 - Git Bash discovery：显式配置优先；否则从可信 `git.exe` 安装布局与 `%ProgramFiles%`/`%LocalAppData%` 标准 Git for Windows 位置推导，并验证 `cmd\git.exe`、`bin\bash.exe` 与 MSYS runtime 结构。不能仅凭文件名接受任意 PATH `bash.exe`。
 - PowerShell discovery：显式配置优先；否则选择标准安装位置中最高可用的 PowerShell 7 `pwsh.exe`，再 fallback 到 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`；不 fallback 到其他 shell。最终路径和 flavor 冻结。
 - discovery 拆成接受候选 roots/env snapshot 的纯函数，测试不得争用进程全局环境。
-- `--mock` 不读 `[shells]`、不扫描 PATH、不运行 `where.exe`；测试直接注入确定性 `ShellPrograms`。Windows keyless demo 只可使用受控标准路径，找不到 Git Bash 时给 actionable error，不能偷偷换语法。
+- `--mock` 不读 `[shells]`、不扫描 PATH、不运行 `where.exe`，直接注入确定性 `ShellPrograms::test_fixture()`。Windows mock fixture 固定 Git for Windows 与系统 PowerShell 标准路径；CI runner 承诺缺失时由真实 spawn/native gate 硬失败，不另行 discovery 或偷偷换语法。
 
 ## 3. Windows Git Bash 接入
 
@@ -204,7 +205,7 @@ Windows-only schema：
 - `refs/README.md`
 - `docs/plan/51-background-monitor-parity.md`、`docs/plan/61-file-tool-correctives.md` 只交叉引用边界
 
-- CI matrix 增 `windows-latest`，使用 `actions/setup-python` 后统一 corpus-only verifier 调用；Windows 原生运行 Job/Git Bash/PowerShell focused tests、workspace fmt/clippy/tests 和 mock。
+- 扩充 Plan 61 已有的 `windows-latest` matrix job，而非首次新增平台：三平台统一 `actions/setup-python`、workspace fmt/clippy/tests、mock 与 corpus-only；Windows 另跑既有 file safety 及 process_tree/Git Bash/PowerShell/permissions focused tests。
 - README 增平台表、`[shells]`、Git Bash requirement、PowerShell opaque 权限、Job containment 与 Windows sandbox 未实现说明。
 - capability report 只销账 Windows shell process-tree/PowerShell tool；Windows filesystem/network sandbox、Plan 61 文件安全之外的 hooks/MCP child-tree 等继续列缺口。
 - HANDOFF 记录 shell identity snapshot、Job owner/explicit terminate、pipe EOF 顺序和 PowerShell permission 不变量。
@@ -241,7 +242,7 @@ Windows-only schema：
 
 ### 切片 4：Windows CI、文档与验收
 
-1. 启用 `windows-latest` 全 workspace 门。
+1. 扩充既有 `windows-latest` job，并恢复 Windows 全 workspace 门。
 2. 同步 README、HANDOFF、capability report、refs/README 和 Plan 51/61 边界。
 3. 保持 CC PowerShell matrix 未证维度不变。
 4. 全量门绿后回填本 plan 完成记录，一次提交。
@@ -268,7 +269,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p kloop -- --mock
 
-# Windows 原生额外 focused gates
+# Windows 原生 Plan 61 file-safety focused gates
+cargo test -p kloop-core file_io::tests
+cargo test -p kloop-core text_edit::tests
+cargo test -p kloop-core tools::fs::tests
+cargo test -p kloop-core tools::fs::windows::tests
+cargo test -p kloop-core diff::tests
+cargo test -p kloop-core file_state::tests
+cargo test -p kloop-core scheduler::tests
+
+# Windows 原生 Plan 62 focused gates
+cargo test -p kloop-process-spawn
+cargo test -p kloop-core shell_programs::tests
 cargo test -p kloop-core process_tree
 cargo test -p kloop-core tools::bash::tests
 cargo test -p kloop-core tools::powershell::tests
@@ -281,7 +293,24 @@ python3 -B refs/claude-code-2.1.220/verify.py
 git diff --check
 ```
 
-## 完成标准
+## 2026-08-05 实施与原生 Windows 验收记录
+
+- 已实现 `process_tree/{mod,unix,windows}.rs`、前后台 Bash 迁移、Seatbelt program+argv wrapper、启动时 `ShellPrograms` snapshot、Git Bash/PowerShell discovery、条件 catalog/code mode，以及独立 PowerShellOpaque 工具/权限/UI/skills 接线。
+- Windows backend 已集中 RAII unsafe：Job/process/thread/attribute/stdin/stdout/stderr handle，absolute application、stdio handle list、Windows ordinal-case UTF-16 environment、suspended assign-before-resume、错误路径 terminate+wait；attribute list 自持 handle-value array，`Child` 复用唯一 blocking waiter，取消/re-poll 不再按 watchdog tick 泄漏。
+- 新增无业务依赖的 `kloop-process-spawn` workspace gate：process-tree 从创建 inheritable stdio 到关闭 parent-side inheritable handles 全程持锁，hooks、MCP、worktree Git 与 CLI/TUI 生产 child creation 走同一 gate，避免并发无关进程偷继承 pipe/file handle；gate 自身有 Windows 阻塞并发回归。
+- PowerShell discovery 除版本化 MSI roots 外，使用 Windows package API 仅枚举官方 `Microsoft.PowerShell_8wekyb3d8bbwe` / `Microsoft.PowerShell-LTS_8wekyb3d8bbwe` MSIX package roots；候选统一以 `pwsh.exe` 的 `VS_FIXEDFILEINFO` file version 排序，缺 version resource 才退目录/package metadata，避免固定 MSI `PowerShell\7` 被旧 MSIX 错压；不接受任意 PATH `pwsh.exe`。
+- Windows process-tree 测试源码新增真实 `AssignProcessToJobObject` active-process-limit failure、raw UTF-16 environment child round-trip、反复取消 waiter handle-count，以及 Windows Bash background session shutdown/registry Drop descendant no-survivor；既有覆盖 assign/resume 前 marker、leader-exit inherited pipes、幂等 terminate、Child Drop 与循环 handle-count。
+- 原生 PowerShell 测试源码硬门 PowerShell 7 与 Windows PowerShell 5.1，覆盖 Unicode/multiline/单双引号/here-string/尾 comment、空输出、native/cmdlet/显式 exit、Read-Host 非挂死、大双流与 Start-Process descendant timeout/cancel cleanup；Git Bash 的通用前后台 suite 在 Windows 使用标准 Git for Windows fixture。
+- 原生验收机为 Windows 10 build 19045、x64 的本地交互式 Windows workstation；测试宿主本身已位于一个 Job 中，nested Job 路径按 fail-closed 契约原生通过。Rust/Cargo 为 1.92.0 MSVC x64，Python 为 3.14.0。
+- Git for Windows 根为 `C:\Program Files\Git`：`cmd\git.exe` 2.52.0.windows.1、`bin\bash.exe` 5.2.37，且 `usr\bin\msys-2.0.dll` 存在。PowerShell 7 为官方 Store/MSIX `Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe`，实际 executable 为 `C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe`，产品版本 7.6.4、file version 7.6.4.500；Windows PowerShell 为 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` 5.1.19041.6456。
+- 原生 focused gates 全绿且没有 ignored：Plan 61 七组 file-safety selector 合计 62 tests；`kloop-process-spawn` 1、`shell_programs` 8、`process_tree` 15、Bash 16、PowerShell 9、permissions 42。并发 handle-inheritance gate、raw UTF-16 environment round-trip/ordinal comparison、真实 assign failure、waiter cancellation reuse、普通与 debugged spawn handle-growth 都实际运行。
+- 原生全 workspace 全绿：`kloop-core` 538 tests，server 26、CLI 81、codemode 21，其余 crate 与 doc tests 同样通过、0 ignored；workspace clippy `-D warnings`、mock 六轮、corpus-only 与 `git diff --check` 均通过。
+- 原生验收发现 PowerShell 7 MSIX 的 `Start-Process` 可产生不留在 root Job 的 descendant。PowerShell spawn 因此启用专用 `DEBUG_PROCESS | CREATE_SUSPENDED` gate：root 仍先 assign 后 resume；每个 descendant 的 create-process debug event 在首线程继续前复核 Job membership，不在 root Job 者先 assign 到第二个 kill-on-close containment Job。open/check/assign/continue 任一步失败都终止 event process 与两组 Job；timeout/cancel/normal completion/Drop 对固定 Job 集显式 terminate，不用 PID 扫描、裸 spawn、无控制 breakaway 或 direct-child fallback。PowerShell 7 与 5.1 的 timeout/cancel `Start-Process` 回归均确认无 survivor。
+- 既有 Windows blockers 以最窄修复关闭：Git verbatim path 转普通 Windows path，hooks/agent 使用已验证 Git Bash，search/permission/codemode/task/Plan 50/56/server parity report 只规范化报告或断言中的 Windows separator；waiter cancellation 改为精确比较同一个 Tokio blocking waiter ID，独立 handle-growth 回归仍保留。
+- corpus-only 在 Windows 保持 immutable corpus/hash/normalization/tamper、matrix/pair/profile bridge、可跨平台 Rust semantic reports 与敏感信息检查；POSIX descriptor/ctime/symlink/publication/PTY 自检仅在 POSIX 跑，Windows 验证其 case declarations、unsafe path rejection 及 collector/PTY fail-closed。Plan 59 native report 继续只在 Darwin arm64 跑，不伪造 Windows 证据。`.gitattributes` 将 436 个 hash-bound fixture JSON 固定为非 text，避免系统 `core.autocrlf=true` 改写内容；fixture、golden、manifest 和 pinned PowerShell matrix 均未修改。
+- 最终修改与本完成记录使用 `git commit --amend --no-edit` 合入现有 Plan 62 提交；提交号以本条所在提交为准。
+
+## 完成标准（均已满足）
 
 1. Windows model shell 在 user code 执行前已进入专属 Job；attach/resume 失败 fail closed。
 2. timeout/cancel/leader-exit/explicit kill/watchdog/future Drop/session Drop 后无 root 或 descendant，且无线性 handle leak。
@@ -290,9 +319,9 @@ git diff --check
 5. PowerShell 在 plan 阻断、bypass 仍问、恒串行、无自动 remember；仅用户手工 whole-tool allow 可授权。
 6. Job containment 不被 sandbox 配置或 `disable_sandbox` 关闭，且文档不冒充 Windows sandbox。
 7. macOS/Linux Plan 50 与 Seatbelt 行为、exact/corpus parity gate 无回退。
-8. Windows/macOS/Linux CI 全绿，README/HANDOFF/capability/refs 与 Plan 51/61 边界同步。
+8. 原生 Windows focused/workspace/mock/corpus 全绿，既有 macOS/Linux 回归与三平台 CI 门保持；README/HANDOFF/capability/refs 与 Plan 51/61 边界同步。
 9. 一次提交，提交信息含 `plan62`，本文件记录实际验证和提交号。
 
-## 开工时定 / 问用户
+## 后续边界
 
-本计划的安全与产品边界已经固定。开工时只需确认 Plan 61 与 Windows runner 已满足前置闸门；若不满足，先处理 blocker，不通过缩小 Windows 测试或放宽 Job/file safety 继续。
+Plan 62 已完成；后续不得把 Job containment 扩写为 filesystem/network sandbox，也不得因 hooks/MCP/Git 共享 process-creation gate 就宣称这些 helper 具有 shell Job ownership。PowerShell background/PTY/stdin/session 与 pinned Darwin PowerShell matrix 结论仍保持原边界。

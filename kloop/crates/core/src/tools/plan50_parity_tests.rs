@@ -109,8 +109,14 @@ fn project_events(events: Vec<Event>) -> Vec<Value> {
 
 fn normalize_text(text: &str, root: &Path) -> String {
     let resolved = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    text.replace(&resolved.display().to_string(), "<WORKSPACE>")
-        .replace(&root.display().to_string(), "<WORKSPACE>")
+    let normalized = text
+        .replace(&resolved.display().to_string(), "<WORKSPACE>")
+        .replace(&root.display().to_string(), "<WORKSPACE>");
+    if cfg!(windows) {
+        normalized.replace(r"<WORKSPACE>\", "<WORKSPACE>/")
+    } else {
+        normalized
+    }
 }
 
 fn project_calls(calls: &[(String, String, Value)], root: &Path) -> Vec<Value> {

@@ -1111,6 +1111,9 @@ mod tests {
                 agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: crate::tools::BackgroundShells::new(),
+                shell_programs: std::sync::Arc::new(
+                    crate::shell_programs::ShellPrograms::test_fixture(),
+                ),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
                 tool_allowlist: None,

@@ -227,19 +227,25 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
     (sections.join("\n"), params)
 }
 
-/// argv for running `sh -lc <shell_command>` under seatbelt: the wrapper is a
-/// command-line prefix, exactly how the unsandboxed spawn runs it otherwise.
-pub fn seatbelt_command(policy: &SandboxPolicy, shell_command: &str) -> (String, Vec<String>) {
+/// Wrap an already-resolved program + argv in macOS Seatbelt. Containment of
+/// the process tree remains the executor's responsibility; this function only
+/// adds the sandbox-exec prefix.
+pub fn seatbelt_command(
+    policy: &SandboxPolicy,
+    program: &std::ffi::OsStr,
+    command_args: &[std::ffi::OsString],
+) -> (PathBuf, Vec<std::ffi::OsString>) {
     let (profile, params) = seatbelt_profile(policy);
-    let mut args = vec!["-p".to_string(), profile];
+    let mut args = vec!["-p".into(), profile.into()];
     args.extend(
         params
             .into_iter()
-            .map(|(key, value)| format!("-D{key}={}", value.display())),
+            .map(|(key, value)| format!("-D{key}={}", value.display()).into()),
     );
     args.push("--".into());
-    args.extend(["sh".into(), "-lc".into(), shell_command.into()]);
-    (SEATBELT_EXE.into(), args)
+    args.push(program.to_os_string());
+    args.extend(command_args.iter().cloned());
+    (PathBuf::from(SEATBELT_EXE), args)
 }
 
 /// Err(reason) when bash cannot be sandboxed on this machine; the CLI turns
@@ -399,10 +405,11 @@ mod tests {
             }],
             false,
         );
-        let (program, args) = seatbelt_command(&policy, "echo hi");
-        assert_eq!(program, "/usr/bin/sandbox-exec");
+        let command_args = ["-lc".into(), "echo hi".into()];
+        let (program, args) = seatbelt_command(&policy, std::ffi::OsStr::new("sh"), &command_args);
+        assert_eq!(program, PathBuf::from("/usr/bin/sandbox-exec"));
         assert_eq!(args[0], "-p");
-        assert_eq!(args[1], seatbelt_profile(&policy).0);
+        assert_eq!(args[1].to_string_lossy(), seatbelt_profile(&policy).0);
         assert_eq!(
             &args[2..],
             ["-DWRITABLE_ROOT_0=/w", "--", "sh", "-lc", "echo hi"]

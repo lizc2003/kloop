@@ -49,6 +49,22 @@ The accepted scope is only exact 2.1.220, darwin-arm64 local CLI, `team=false`, 
 
 See the [exact corpus guide](../refs/claude-code-2.1.220/README.md), [methodology and history](../refs/README.md), [Plan 59 final acceptance](../docs/plan/59-tool-parity-acceptance.md), and [capability report](../docs/capability-report.md).
 
+## Platform shell support
+
+| Runtime | Bash-family tool | PowerShell tool | Process-tree ownership | OS filesystem/network sandbox |
+|---|---|---|---|---|
+| macOS | frozen POSIX `sh -lc` | not registered | dedicated process group | Seatbelt for Bash by default |
+| Linux | frozen POSIX `sh -lc`; WSL uses `/bin/bash -lc` | not registered | dedicated process group | not implemented |
+| Native Windows | validated Git for Windows `bin\bash.exe -lc`, registered only when available | highest trusted PowerShell 7 MSI/MSIX `pwsh.exe`, falling back to Windows PowerShell 5.1; foreground-only | kill-on-close Job ownership established before user code; PowerShell also recontains debugged descendants before their first thread continues | not implemented |
+
+Shell executables are resolved once at startup and inherited unchanged by server
+threads, sub-agents, worktrees, and code mode. On Windows, Job containment is
+mandatory even though restricted-token/AppContainer filesystem and network
+sandboxing are not implemented; no setting or per-call field disables the Job.
+The pinned Claude Code parity target is darwin-arm64, so this native Windows
+surface is a kloop contract, not a new `same`/`compatible` claim for the pinned
+PowerShell matrix row.
+
 ## Compaction (Phase 2, first slice)
 
 Two complementary defenses keep long sessions inside the context window
@@ -989,22 +1005,40 @@ bypass` included.
 
 ## Foreground bash lifecycle (Plan 50 parity pass)
 
-Foreground `bash` runs `sh -lc` in its own process group with stdin closed and stdout/stderr
-on separate pipes. Both pipes are drained concurrently to EOF, so a child filling one stream
-cannot deadlock behind an unread other stream. Each stream retains at most 150,000 bytes while
-continuing to drain discarded bytes; the merged model-facing result is UTF-8 lossy, capped at
-30,000 characters, and says how many captured characters and additional bytes were omitted.
-stdout precedes stderr in the canonical result, followed by `[exit status N]` or
-`[killed by signal]`; an empty successful run returns `(no output)`.
+Foreground `bash` runs the frozen shell identity with `-lc`: ordinary Unix uses
+its resolved POSIX `sh`, WSL uses `/bin/bash`, and native Windows uses only a
+validated Git for Windows `bin\bash.exe`. Windows never substitutes PowerShell,
+`cmd.exe`, WSL, Cygwin, BusyBox, or an arbitrary PATH `sh.exe`. stdin is closed
+and stdout/stderr use separate pipes. Both pipes are drained concurrently to
+EOF, so a child filling one stream cannot deadlock behind an unread other
+stream. Each stream retains at most 150,000 bytes while continuing to drain
+discarded bytes; the merged model-facing result is UTF-8 lossy, capped at 30,000
+characters, and says how many captured characters and additional bytes were
+omitted. stdout precedes stderr in the canonical result, followed by
+`[exit status N]` or `[killed by signal]`; an empty successful run returns
+`(no output)`.
 
-A timeout or turn cancellation SIGKILLs the entire process group, explicitly waits/reaps the
-direct shell child, and only then returns the error. If the shell leader exits normally while
-a descendant remains in its group, foreground completion kills and waits for that residual
-group too. A synchronous group-kill guard covers panic or a caller dropping outside the normal
-cancellation protocol. The dispatch layer preserves the boundary: cancellation during hooks or
-approval cannot spawn the command; once foreground Bash has spawned, dispatch waits for its
-cleanup path rather than dropping the future and returning early. Concurrent read-only Bash
-calls each finish their own cleanup before their paired interrupted results are returned.
+Every spawn owns a complete process tree: a dedicated process group on Unix or
+a dedicated Job Object on native Windows. Windows creates the root suspended,
+assigns it to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, and resumes it only
+after assignment succeeds; create/assign/resume failure is fail-closed and never
+falls back to a bare child. The stdio handle-list owns both its attribute storage
+and handle-value array until `CreateProcessW` completes. A workspace-wide child-
+creation gate serializes that short inheritable-handle window with hook, MCP, Git,
+and other kloop process spawns, so an unrelated child cannot steal a pipe writer.
+Environment keys retain raw UTF-16 and use Windows ordinal case-insensitive
+comparison; a cancellable wait future re-polls one persistent process waiter
+instead of leaking a blocking waiter on each watchdog tick. A timeout or turn
+cancellation terminates the entire tree, explicitly waits/reaps the direct shell
+child, confirms the tree is empty, and only then drains the pipes under a short
+deadline. If the shell leader exits normally while a descendant remains,
+foreground completion terminates that residual tree before waiting for EOF. A
+synchronous Drop guard covers panic or a caller dropping outside the normal
+cancellation protocol. The dispatch layer preserves the boundary: cancellation
+during hooks or approval cannot spawn the command; once foreground Bash has
+spawned, dispatch waits for cleanup rather than dropping the future and returning
+early. Concurrent read-only Bash calls each finish their own cleanup before
+paired interrupted results are returned.
 
 These are intentional safety differences from the pinned Claude Code 2.1.220 behavior: its
 stubborn timeout is promoted to a background task and its running SIGINT path reports a user
@@ -1015,8 +1049,9 @@ batching: read-only calls may overlap, while opaque/redirection calls execute se
 
 ## Background bash (Phase 2, tenth slice)
 
-`bash` takes `run_in_background`: the command starts in its own process
-group, stdout/stderr interleave straight into a file under `.kloop/offload/`
+`bash` takes `run_in_background`: the command starts in its own owned process
+tree (Unix process group or Windows Job), stdout/stderr interleave straight into
+a file under `.kloop/offload/`
 (`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
 returns immediately with the ID and the output path. Companions:
 
@@ -1025,8 +1060,8 @@ returns immediately with the ID and the output path. Companions:
   reports `running` / `completed (exit 0)` / `failed (exit N)` /
   `killed (reason)` plus the last 30k bytes of output (read the file with
   `read_file` for more). Read-only: skips the gate, joins concurrent batches.
-- **kill_bash** `{bash_id}` — SIGKILLs the whole process group and waits for
-  the registry to confirm. Auto-allowed: it can only signal processes this
+- **kill_bash** `{bash_id}` — terminates the whole owned process tree and waits
+  for the registry to confirm. Auto-allowed: it can only signal processes this
   agent itself started.
 
 Semantics: permission checks are identical to foreground bash (the command
@@ -1039,7 +1074,7 @@ only the status, summary, and output-file pointer — command output stays in th
 file. A running turn sees it at the next sampling boundary; the TUI autowakes
 when idle; plain/server deliver it on the next turn. `kill_bash`, a 1 GiB
 output-file watchdog, and explicit session shutdown reap the whole process
-group. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
+tree. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
 threads sharing one offload directory never collide.
 
 Session shutdown closes both background registries before worktree teardown,
@@ -1055,6 +1090,56 @@ policy, and model-visible `Monitor`. Exact 2.1.220 evidence shows Monitor is a
 different, server-flagged (`tengu_amber_sentinel`, default off) tool for
 streaming every command stdout line or WebSocket frame; the clean CLI profile
 does not expose it. See `docs/plan/51-background-monitor-parity.md`.
+
+## Native Windows PowerShell (Plan 62)
+
+Native Windows conditionally registers a separate foreground-only
+`powershell {command, timeout_ms?}` tool. Startup chooses the highest trusted
+PowerShell 7 installation: versioned MSI roots plus installed official
+`Microsoft.PowerShell[_-LTS]_8wekyb3d8bbwe` MSIX package roots resolved through
+the Windows package API. Candidates are ranked by the executable's file-version
+resource, with directory/package metadata only as a fallback; this handles MSI's
+fixed `PowerShell\7` directory without letting an older MSIX outrank a newer
+binary. Startup never trusts an arbitrary PATH `pwsh.exe`. It then falls back to
+Windows PowerShell 5.1. An explicit `[shells].powershell` absolute executable
+path takes precedence. PowerShell availability is independent of Git Bash, so a
+Windows session may expose one or both shell families. The resolved executable
+and flavor are frozen into the runtime snapshot.
+
+The executor passes a UTF-16LE `EncodedCommand` to a fixed
+`-NoLogo -NoProfile -NonInteractive -EncodedCommand` argv. It does not use a
+temporary script, `Invoke-Expression`, a profile, or `ExecutionPolicy Bypass`.
+The payload sets UTF-8 console/native output encoding, puts the original script
+in its own script block, and snapshots PowerShell success/error state and
+`$LASTEXITCODE` immediately afterward; multiline text, Unicode, here-strings,
+trailing comments, native exit codes, and explicit `exit N` retain their
+meaning. Hooks, permission prompts, events, history, and `PowerShell PS>` TUI
+rows always carry the original script, never the encoded payload.
+
+PowerShell v1 has no background mode, stdin/PTY/session channel, executable
+override, or sandbox escape field; unknown fields are rejected even if a caller
+bypasses the published schema. It reuses the bounded dual-pipe foreground
+executor, credential environment scrub, timeout/cancellation cleanup, and the
+mandatory Windows Job Object. The Job is process-tree containment only: Windows
+still has no restricted-token/AppContainer filesystem or network sandbox.
+PowerShell process creation also uses a fail-closed `DEBUG_PROCESS` gate because
+an MSIX-hosted `Start-Process` descendant may not remain in the root Job. The
+root is still assigned before resume; every descendant create event is checked
+before continuation and any non-member is assigned to a second kill-on-close
+Job. Open, membership, assignment, or debug-continuation failure terminates the
+event process and both Jobs. Cleanup owns this fixed Job set and never falls
+back to PID scanning, a bare child, uncontrolled breakaway, or direct-child
+kill.
+
+Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
+and read-only classifier are never applied. Plan mode rejects it without asking;
+manual, accept-edits, and bypass ask every time unless a whole-tool
+`allow = ["powershell"]` rule was configured. `deny` and `ask` whole-tool rules
+retain their usual precedence, `powershell(...)` prefix rules are rejected, and
+interactive session/permanent approval choices authorize only that one call —
+no opaque script is cached or persisted. Prompts are labeled
+`[unclassified PowerShell]` and an additional raw matcher keeps obvious Windows
+secret paths bypass-immune; this matcher is not a PowerShell data-flow analysis.
 
 ## Scheduler (Plan 58)
 
@@ -1304,11 +1389,15 @@ auto_allow = true         # default; false = ask first, then run sandboxed
 escalate = true           # default; false = model-driven disable_sandbox instead
 ```
 
-`KLOOP_SANDBOX=off` is the env escape hatch. Where sandboxing is unavailable
-(Linux/Windows for now — planned as future slices behind the same seam; or a
-missing `sandbox-run_program`), kloop warns at startup and runs commands bare:
-fail-open, because the permission gate remains the enforcement layer.
-Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
+`KLOOP_SANDBOX=off` is the env escape hatch. Linux currently has no OS
+filesystem/network sandbox and runs Bash without that containment, while the
+permission gate and Unix process-group ownership remain active. Native Windows
+also has no restricted-token/AppContainer filesystem/network sandbox, but every
+model-controlled Bash or PowerShell process is still assigned to a mandatory
+Job Object before user code runs; `[sandbox]`, `KLOOP_SANDBOX=off`, and
+`disable_sandbox` never disable process-tree ownership. A missing
+`sandbox-run_program` on macOS warns and falls back to the permission gate plus
+process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
@@ -1973,6 +2062,21 @@ cargo run -- --mock
 # openai-compat, and openai-responses infer it. Anthropic profiles use exactly
 # one x-api-key header; chat/responses profiles use Bearer Authorization.
 # kloop appends /v1/messages, /chat/completions, or /responses to the base.
+#
+# Native Windows shell overrides are optional. Each value is one absolute
+# executable path with no arguments; startup validates/canonicalizes it and
+# freezes one ShellPrograms snapshot for every thread/agent/worktree/code-mode
+# child. Git Bash must be the complete Git for Windows bin/bash.exe layout.
+# PowerShell discovery prefers the highest trusted v7 pwsh.exe across MSI and
+# official Microsoft MSIX package roots, then falls back to 5.1:
+#
+#   [shells]
+#   bash = 'C:\Program Files\Git\bin\bash.exe'
+#   powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
+#
+# --mock ignores [shells], HOME, and PATH discovery and injects a deterministic
+# test snapshot. On ordinary startup, a missing shell family is omitted from the
+# model catalog and warned once; PowerShell remains usable when Git Bash is absent.
 chmod 700 ~/.kloop
 chmod 600 ~/.kloop/config.toml
 cargo run
@@ -2024,8 +2128,9 @@ KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
 cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
-# OS sandbox (macOS seatbelt; see OS sandbox above)
-KLOOP_SANDBOX=off cargo run                        # run bash commands bare
+# OS sandbox (macOS Seatbelt; see OS sandbox above). This never disables Unix
+# process groups or Windows Job Objects.
+KLOOP_SANDBOX=off cargo run                        # remove OS fs/network sandbox only
 ```
 
 Interrupting a running turn patches history so it stays legal either way. In
@@ -2064,7 +2169,12 @@ session is saved and resumable — see Session persistence above.
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
   persistence, opaque never cacheable, `ConfirmRequest.preview` carrying an
-  edit/write diff while other calls carry none); change-preview generation
+  edit/write diff while other calls carry none); Windows shell contracts
+  (Git for Windows layout discovery, conditional catalog, CreateProcessW
+  suspended→Job assignment→resume fail-closed ordering, leader-exit/inherited-
+  pipe cleanup, idempotent terminate, Drop and handle-count checks, fixed
+  PowerShell EncodedCommand argv, PowerShell 7/5.1 native script/exit/error/
+  large-output/descendant cases, and opaque permission truth table); change-preview generation
   (line-numbered added/deleted/changed lines, distant-hunk splitting,
   long-line clipping, modest diffs uncut vs the 500-line ceiling marker,
   write-file existing-vs-new-file
@@ -2161,16 +2271,26 @@ exercising all five bets), and with a real key both adapters have been
 exercised live including offload round-trips, mid-session predictive
 compaction, and truncation recovery.
 
-CI (`.github/workflows/ci.yml`, at the repo root) enforces the same gate on
-every push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets
--- -D warnings`, `cargo test --workspace`, on macOS and Linux.
+CI (`.github/workflows/ci.yml`, at the repo root) runs macOS, Linux, and native
+Windows on every push/PR: `cargo fmt --check`, all-target workspace clippy,
+workspace tests, the keyless mock smoke, and the corpus-only verifier after an
+explicit Python setup. Windows additionally keeps the Plan 61 file-safety gates
+and focused process-tree, Bash, PowerShell, and permission selectors. The full
+exact-binary verifier remains a pinned darwin-host check; Windows native tests
+do not create Claude Code Windows parity evidence. On Windows, corpus-only still
+checks immutable fixture hashes, normalization/tamper gates, generated
+matrix/pairs/bridges, cross-platform native reports, and sensitive-data rules.
+POSIX descriptor/ctime/symlink/publication/PTY self-tests and the Darwin-arm64-
+only Plan 59 report remain platform-gated rather than being presented as
+Windows execution.
 
 ## Layout
 
-Cargo workspace, nine crates; the dependency graph is a strict line up to
-core, then two sibling frontends under the cli, with the MCP wire client, Web
-network operations, and the QuickJS code-mode engine kept behind explicit
-seams
+Cargo workspace, ten crates; the main dependency graph remains a strict line up
+to core, then two sibling frontends under the cli, with the MCP wire client, Web
+network operations, and the QuickJS code-mode engine kept behind explicit seams.
+The small `kloop-process-spawn` utility is shared by core/MCP/CLI/TUI solely for
+process-wide child-creation serialization
 (protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli;
 web ← cli; codemode ← core):
 
@@ -2188,16 +2308,24 @@ crates/provider/    kloop-provider — the adapter seam; owns reqwest
   src/responses.rs  OpenAI Responses translation
   src/sse.rs        bounded incremental SSE parser
 
+crates/process-spawn/ process-wide child-creation gate shared across crates
+
 crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
   src/history.rs    append-only history, record-time offloading,
                     usage-anchored token estimation
+  src/process_tree/ cross-platform owned shell process trees
+    mod.rs          ProcessSpec/Child/Killer façade and lifecycle tests
+    unix.rs         process-group spawn, kill, reap, and residual checks
+    windows.rs      suspended CreateProcessW, stdio handle list, Job Object RAII
+  src/shell_programs.rs frozen shell identities and Windows trusted discovery
   src/tools/        the tool seam and the built-in tools
     mod.rs          tool defs, concurrency-safety classification, batched
                     dispatch with hook+permission gating; ToolSource seam
                     for external (MCP) tools
-    bash.rs         foreground + background shell execution, the
+    bash.rs         foreground + background Bash execution, the
                     BackgroundShells registry, bash_output/kill_bash
+    powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
     fs.rs           read/write/edit file, read_offloaded
     web.rs          web_fetch/web_search agent contracts: names, descriptions,
                     input schemas (network execution stays in kloop-web)
@@ -2247,7 +2375,8 @@ crates/cli/         kloop — the binary
                     app-server/--serve), StdoutUi, CliApprover, --mock demo,
                     session selection (--continue, --resume, --list-sessions)
   src/user_config.rs one global TOML read, strict root schema, private atomic writes
-  src/startup.rs    typed runtime policy snapshot + cwd-bound session wiring
+  src/startup.rs    typed runtime policy + frozen ShellPrograms snapshot and
+                    cwd-bound session wiring
   src/web.rs        [web] config + ToolSource adapter binding core contracts
                     to kloop-web network operations
   src/mcp.rs        [mcp.servers] config, startup connection with

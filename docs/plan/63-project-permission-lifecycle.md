@@ -4,9 +4,9 @@
 >
 > 依赖：Plan 8、35、37、39、46、49、51
 >
-> 施工关系：与 Plan 61、62 的 `Config`、permission、sandbox、startup 修改面高度重叠，不得并行；推荐先完成本计划，再按新 seam 实施 Plan 61/62。
+> 施工关系：Plan 61 已完成；Plan 62 实现已到原生 Windows 闸门。三者的 `Config`、permission、sandbox、startup 修改面高度重叠，Plan 63 不得在 Plan 62 未收尾工作树上并行；开工时基于届时已提交的新 seam 重新盘点迁移面。
 >
-> 规划基线：kloop `a42f1b8`
+> 原规划基线：kloop `a42f1b8`；实际开工必须重读 Plan 61 与 Plan 62 完成提交后的 Config/permission seam。
 
 ## 背景
 
@@ -358,7 +358,7 @@ pub enum Decision {
 - 不引入 repo trust、项目 TOML、permission editor或 global allow。
 - 不把 ProjectStore变成所有持久化状态的杂物箱。
 - 不重构 MCP connection、background registries或 Team/Task control plane。
-- 不顺带实施 Plan 61文件纠偏或 Plan 62 Windows shell；三者必须串行。
+- 不在本计划重做或放宽 Plan 61 文件纠偏与 Plan 62 Windows shell/Job 安全边界；只把它们已落地的窄 seam 迁入新的生命周期所有权。
 
 ## 9. 实施切片
 
@@ -366,7 +366,7 @@ pub enum Decision {
 
 ### 切片 0：基线与安全契约
 
-- 复核 Plan 61/62尚未实施且工作树无冲突修改。
+- 复核 Plan 61 已完成、Plan 62 已提交且原生 Windows 闸门全绿，工作树无冲突修改。
 - 固定 permission gate顺序、prepared target、AllowAlways/global persistence、sub-agent clone、server approval和 sandbox root现状测试。
 - 新测试先表达目标 breaking contract，不用中间兼容 adapter过渡。
 

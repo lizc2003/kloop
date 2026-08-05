@@ -547,7 +547,7 @@ fn ts_type_covers_common_shapes() {
 
 #[test]
 fn program_surface_excludes_run_program_and_task() {
-    let names = program_tool_names(&[]);
+    let names = program_tool_names(&[], &crate::shell_programs::ShellPrograms::test_fixture());
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
@@ -673,7 +673,10 @@ async fn program_calls_a_deferred_mcp_tool_that_top_level_cannot() {
 /// The program's callable surface always includes source tools, deferred or not.
 #[test]
 fn program_surface_includes_source_tools() {
-    let names = program_tool_names(&[srv()]);
+    let names = program_tool_names(
+        &[srv()],
+        &crate::shell_programs::ShellPrograms::test_fixture(),
+    );
     assert!(names.iter().any(|n| n == "srv__echo"));
     assert!(names.iter().any(|n| n == "srv__danger"));
     assert!(names.iter().any(|n| n == "bash"));

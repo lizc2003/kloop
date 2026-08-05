@@ -30,7 +30,9 @@
 //! Bash content decisions run on the tree-sitter analysis in [`crate::shell`]:
 //! a script the parser cannot fully vouch for is *opaque* — it can never be
 //! auto-approved, never match an allow rule, and never enter the session
-//! cache; outside a contained sandbox it always goes to the user.
+//! cache; outside a contained sandbox it always goes to the user. Native
+//! Windows PowerShell is always opaque: it never enters the Bash parser,
+//! bypass still asks, and only an explicit whole-tool rule can auto-decide it.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -67,7 +69,7 @@ pub enum Decision {
 
 /// One confirmation request. `remember_rules` carries the suggested
 /// persistent rules when the call is remember-able; `None` means only
-/// allow-once / deny apply (opaque bash, sensitive paths, explicit ask
+/// allow-once / deny apply (opaque bash/PowerShell, sensitive paths, explicit ask
 /// rules, sandbox escalation). `preview` carries a file-change diff for
 /// `write_file`/`edit_file` so the human sees the change before approving;
 /// `None` for everything else.
@@ -239,6 +241,9 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                     bail!("rule 'bash({inner})': empty command pattern");
                 }
                 Ok(Rule::BashPrefix { tokens, wildcard })
+            }
+            "powershell" => {
+                bail!("rule '{entry}': powershell(...) prefix rules are unsupported; PowerShell v1 only accepts the whole-tool rule 'powershell'")
             }
             "write_file" | "edit_file" | "read_file" | "notebook_edit" => {
                 // Match case-insensitively on case-folding filesystems so a
@@ -543,7 +548,7 @@ impl Permissions {
         // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
-        if sandbox_auto_allow {
+        if sandbox_auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
             return Ok(());
         }
 
@@ -554,7 +559,12 @@ impl Permissions {
         // user like everywhere else opaque scripts are refused an auto-verdict
         // (deny/allow/cache all skip Opaque; the sandbox layer above may still
         // auto-allow it because the sandbox *contains* it — this layer can't).
-        if self.mode() == Mode::Bypass && !matches!(call.bash, Some(BashAnalysis::Opaque)) {
+        if self.mode() == Mode::Bypass
+            && !matches!(
+                call.shell,
+                Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque)
+            )
+        {
             return Ok(());
         }
 
@@ -603,11 +613,14 @@ impl Permissions {
     /// bash never matches.
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
         let allow = self.allow.lock().unwrap();
-        match (&call.bash, &call.path) {
-            (Some(BashAnalysis::Commands(cmds)), _) => cmds
+        match (&call.shell, &call.path) {
+            (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => cmds
                 .iter()
                 .all(|argv| argv_is_readonly(argv) || allow.iter().any(|r| r.matches_argv(argv))),
-            (Some(BashAnalysis::Opaque), _) => false,
+            (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
+            (Some(ShellFacts::PowerShellOpaque), _) => {
+                allow.iter().any(|rule| rule.matches_tool(name))
+            }
             (None, Some(path)) => allow.iter().any(|r| r.matches_path(name, path)),
             (None, None) => allow.iter().any(|r| r.matches_tool(name)),
         }
@@ -735,8 +748,8 @@ fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts, strip_for_match: bool
     if rules.iter().any(|r| r.matches_tool(name)) {
         return true;
     }
-    match (&call.bash, &call.path) {
-        (Some(BashAnalysis::Commands(cmds)), _) => cmds.iter().any(|argv| {
+    match (&call.shell, &call.path) {
+        (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => cmds.iter().any(|argv| {
             let stripped;
             let target: &[String] = if strip_for_match {
                 stripped = strip_wrappers(argv);
@@ -748,9 +761,9 @@ fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts, strip_for_match: bool
                 .iter()
                 .any(|r| r.matches_argv(target) || r.matches_argv(argv))
         }),
-        // Opaque scripts can't be inspected; they never auto-run, so the
-        // human sees them at the ask step instead of a rule deciding here.
-        (Some(BashAnalysis::Opaque), _) => false,
+        // Opaque scripts cannot be inspected. Whole-tool deny/ask rules were
+        // handled above; content-level Bash/PowerShell rules never decide here.
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque), _) => false,
         (None, Some(path)) => rules.iter().any(|r| r.matches_path(name, path)),
         (None, None) => false,
     }
@@ -763,11 +776,17 @@ struct Hazard {
     rememberable: bool,
 }
 
+enum ShellFacts {
+    Bash(BashAnalysis),
+    PowerShellOpaque,
+}
+
 struct CallFacts {
-    bash: Option<BashAnalysis>,
+    shell: Option<ShellFacts>,
     path: Option<PathFacts>,
     path_key: Option<&'static str>,
     sensitive_read: bool,
+    powershell_sensitive: bool,
     entering_existing_worktree: bool,
     removing_worktree: bool,
 }
@@ -787,10 +806,14 @@ struct PathFacts {
 
 impl CallFacts {
     fn gather(name: &str, input: &Value, cwd: &Path, resolved_path: Option<&Path>) -> Self {
-        let bash_command = (name == "bash")
+        let shell_command = matches!(name, "bash" | "powershell")
             .then(|| input["command"].as_str())
             .flatten();
-        let bash = bash_command.map_or_else(|| None, |command| Some(analyze_bash(command)));
+        let shell = match (name, shell_command) {
+            ("bash", Some(command)) => Some(ShellFacts::Bash(analyze_bash(command))),
+            ("powershell", Some(_)) => Some(ShellFacts::PowerShellOpaque),
+            _ => None,
+        };
         let path_key = match name {
             "write_file" | "edit_file" | "read_file" => Some("path"),
             "notebook_edit" => Some("notebook_path"),
@@ -802,16 +825,22 @@ impl CallFacts {
         let sensitive_read = (name == "read_file"
             && path.as_ref().is_some_and(|path| path.sensitive))
             || (name == "bash"
-                && bash_command
-                    .zip(bash.as_ref())
-                    .is_some_and(|(command, analysis)| {
+                && shell_command
+                    .zip(shell.as_ref())
+                    .is_some_and(|(command, facts)| {
+                        let ShellFacts::Bash(analysis) = facts else {
+                            return false;
+                        };
                         bash_reads_sensitive_path(command, analysis, cwd)
                     }));
+        let powershell_sensitive =
+            name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
         CallFacts {
-            bash,
+            shell,
             path,
             path_key,
             sensitive_read,
+            powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),
             removing_worktree: name == "exit_worktree"
@@ -832,7 +861,13 @@ impl CallFacts {
                 rememberable: false,
             });
         }
-        if let Some(BashAnalysis::Commands(cmds)) = &self.bash {
+        if self.powershell_sensitive {
+            return Some(Hazard {
+                tag: "sensitive PowerShell path",
+                rememberable: false,
+            });
+        }
+        if let Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))) = &self.shell {
             if cmds
                 .iter()
                 .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
@@ -895,7 +930,8 @@ impl CallFacts {
             // normal external-tool approval; read-only here would bypass it.
             "list_mcp_resources" => true,
             "skill" => true,
-            "bash" => matches!(&self.bash, Some(BashAnalysis::Commands(cmds))
+            "powershell" => false,
+            "bash" => matches!(&self.shell, Some(ShellFacts::Bash(BashAnalysis::Commands(cmds)))
                 if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c))),
             _ => false,
         }
@@ -928,6 +964,40 @@ fn raw_mentions_sensitive_path(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| command.contains(needle))
+}
+
+fn powershell_mentions_sensitive_path(command: &str) -> bool {
+    let normalized = command.to_lowercase().replace('\\', "/");
+    [".kloop", ".ssh", ".gnupg", ".aws", ".env"]
+        .into_iter()
+        .any(|needle| {
+            normalized.match_indices(needle).any(|(index, _)| {
+                let before = normalized[..index].chars().next_back();
+                let after = normalized[index + needle.len()..].chars().next();
+                let boundary = |character: Option<char>| {
+                    character.is_none_or(|character| {
+                        character == '/'
+                            || character.is_whitespace()
+                            || matches!(
+                                character,
+                                '\'' | '"'
+                                    | '`'
+                                    | '('
+                                    | ')'
+                                    | '['
+                                    | ']'
+                                    | '{'
+                                    | '}'
+                                    | '='
+                                    | ':'
+                                    | ';'
+                                    | ','
+                            )
+                    })
+                };
+                boundary(before) && (needle == ".env" || boundary(after))
+            })
+        })
 }
 
 fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
@@ -1133,8 +1203,8 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
     if matches!(name, "read_mcp_resource" | "read_mcp_resource_dir") {
         return None;
     }
-    match (&call.bash, &call.path) {
-        (Some(BashAnalysis::Commands(cmds)), _) => {
+    match (&call.shell, &call.path) {
+        (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => {
             let mut rules = Vec::new();
             let mut signatures = Vec::new();
             for argv in cmds {
@@ -1160,7 +1230,7 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
             }
             Some(Remember { rules, signatures })
         }
-        (Some(BashAnalysis::Opaque), _) => None,
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque), _) => None,
         (None, Some(path)) => {
             let scope = path
                 .relative
@@ -1197,7 +1267,7 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
         ""
     };
     let detail: String = match name {
-        "bash" => input["command"].as_str().unwrap_or("?").to_string(),
+        "bash" | "powershell" => input["command"].as_str().unwrap_or("?").to_string(),
         "write_file" | "edit_file" | "read_file" => {
             input["path"].as_str().unwrap_or("?").to_string()
         }
@@ -1207,7 +1277,12 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
     .chars()
     .take(200)
     .collect();
-    format!("{agent}{hazard}{no_sandbox}{name}: {detail}")
+    let shell_class = if name == "powershell" {
+        "[unclassified PowerShell] "
+    } else {
+        ""
+    };
+    format!("{agent}{hazard}{no_sandbox}{shell_class}{name}: {detail}")
 }
 
 /// The escalation prompt: single-line (the TUI popup renders one line) with
@@ -1279,8 +1354,12 @@ mod tests {
         }
     }
 
+    fn test_cwd() -> PathBuf {
+        std::env::current_dir().expect("test process has a current directory")
+    }
+
     fn gate(mode: Mode, r: PermissionRules, approver: Arc<ScriptedApprover>) -> Permissions {
-        Permissions::new(mode, &r, PathBuf::from("/work/proj"), Some(approver), None).unwrap()
+        Permissions::new(mode, &r, test_cwd(), Some(approver), None).unwrap()
     }
 
     async fn ok(p: &Permissions, name: &str, input: Value) -> bool {
@@ -1717,9 +1796,15 @@ mod tests {
     async fn rebased_reanchors_accept_edits_onto_the_new_cwd() {
         let approver = ScriptedApprover::new(vec![]);
         let parent = gate(Mode::AcceptEdits, rules(&[], &[], &[]), approver.clone());
-        let sub = parent.rebased(PathBuf::from("/work/tree"));
+        let worktree = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let sub = parent.rebased(worktree.clone());
         assert!(
-            ok(&sub, "write_file", file("/work/tree/src/main.rs")).await,
+            ok(
+                &sub,
+                "write_file",
+                file(&worktree.join("src/main.rs").to_string_lossy())
+            )
+            .await,
             "a write inside the worktree auto-allows"
         );
         assert!(
@@ -1727,7 +1812,12 @@ mod tests {
             "a relative write resolves against the worktree and auto-allows"
         );
         assert!(
-            !ok(&sub, "write_file", file("/work/proj/src/main.rs")).await,
+            !ok(
+                &sub,
+                "write_file",
+                file(&test_cwd().join("src/main.rs").to_string_lossy())
+            )
+            .await,
             "the parent's tree is now outside cwd and asks"
         );
         assert_eq!(approver.ask_count(), 1);
@@ -1921,7 +2011,11 @@ mod tests {
             asked[0].description,
             "[sub-agent] [destructive] bash: rm -rf x"
         );
-        assert_eq!(asked[1].description, "write_file: /work/proj/a.txt");
+        let path = std::fs::canonicalize(test_cwd()).unwrap().join("a.txt");
+        assert_eq!(
+            asked[1].description,
+            format!("write_file: {}", path.display())
+        );
     }
 
     /// The approval request carries a file-change diff for edit/write so the
@@ -2259,6 +2353,119 @@ mod tests {
         );
         assert!(ok(&p2, "memory__create_entities", json!({})).await);
         assert_eq!(approver2.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn powershell_opaque_permission_truth_table_is_fail_closed() {
+        let input = json!({"command": "Get-ChildItem"});
+
+        let approver = ScriptedApprover::new(vec![]);
+        let plan = gate(Mode::Plan, rules(&[], &[], &[]), approver.clone());
+        let error = plan.check("powershell", &input, 0).await.unwrap_err();
+        assert!(error.contains("plan mode"), "{error}");
+        assert_eq!(approver.ask_count(), 0);
+
+        for mode in [Mode::Manual, Mode::AcceptEdits, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow]);
+            let permissions = gate(mode, rules(&[], &[], &[]), approver.clone());
+            assert!(permissions.check("powershell", &input, 0).await.is_ok());
+            assert_eq!(approver.ask_count(), 1, "{mode:?} must ask");
+            let request = &approver.asked()[0];
+            assert_eq!(request.remember_rules, None);
+            assert!(request
+                .description
+                .contains("[unclassified PowerShell] powershell: Get-ChildItem"));
+        }
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(permissions
+            .check_call("powershell", &input, 0, /*sandbox_auto_allow*/ true)
+            .await
+            .is_ok());
+        assert_eq!(approver.ask_count(), 1, "sandbox auto-allow never applies");
+    }
+
+    #[tokio::test]
+    async fn powershell_whole_tool_rules_and_nonremembering_decisions() {
+        let input = json!({"command": "Set-Content x y"});
+
+        let approver = ScriptedApprover::new(vec![]);
+        let denied = gate(
+            Mode::Manual,
+            rules(&[], &["powershell"], &[]),
+            approver.clone(),
+        );
+        assert!(denied.check("powershell", &input, 0).await.is_err());
+        assert_eq!(approver.ask_count(), 0);
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let asked = gate(
+            Mode::Manual,
+            rules(&["powershell"], &[], &["powershell"]),
+            approver.clone(),
+        );
+        assert!(asked.check("powershell", &input, 0).await.is_ok());
+        assert_eq!(approver.ask_count(), 1, "ask outranks whole-tool allow");
+
+        let approver = ScriptedApprover::new(vec![]);
+        let allowed = gate(
+            Mode::Manual,
+            rules(&["powershell"], &[], &[]),
+            approver.clone(),
+        );
+        assert!(allowed.check("powershell", &input, 0).await.is_ok());
+        assert_eq!(approver.ask_count(), 0);
+
+        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::AllowAlways]);
+        let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(permissions.check("powershell", &input, 0).await.is_ok());
+        assert!(permissions.check("powershell", &input, 0).await.is_ok());
+        assert_eq!(
+            approver.ask_count(),
+            2,
+            "opaque PowerShell is neither cached nor persisted"
+        );
+        assert!(approver
+            .asked()
+            .iter()
+            .all(|request| request.remember_rules.is_none()));
+    }
+
+    #[tokio::test]
+    async fn powershell_sensitive_windows_paths_force_bypass_immune_confirmation() {
+        for command in [
+            r"Get-Content $env:USERPROFILE\.ssh\id_rsa",
+            r"Get-Content $HOME/.aws/credentials",
+            r"Get-Content C:\Users\me\.env.production",
+            r"Get-Content ${env:USERPROFILE}/.kloop/config.toml",
+            r"Get-Content .ssh/id_rsa",
+            r"Get-Content .env.local",
+        ] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow]);
+            let permissions = gate(
+                Mode::Bypass,
+                rules(&["powershell"], &[], &[]),
+                approver.clone(),
+            );
+            assert!(permissions
+                .check("powershell", &json!({"command": command}), 0)
+                .await
+                .is_ok());
+            assert_eq!(approver.ask_count(), 1, "{command}");
+            let request = &approver.asked()[0];
+            assert!(request.description.contains("[sensitive PowerShell path]"));
+            assert_eq!(request.remember_rules, None);
+        }
+    }
+
+    #[test]
+    fn powershell_prefix_rules_are_rejected_explicitly() {
+        let error = parse_rule("powershell(Get-ChildItem *)")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PowerShell v1"), "{error}");
+        assert!(parse_rule("powershell").is_ok());
     }
 
     #[test]

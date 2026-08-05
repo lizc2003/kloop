@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kloop-codemode = { workspace = true }
+kloop-process-spawn = { workspace = true }
 kloop-protocol = { workspace = true }
 kloop-provider = { workspace = true }
 

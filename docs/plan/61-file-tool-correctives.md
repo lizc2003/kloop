@@ -262,7 +262,8 @@ Plan 49 的完成记录与 Plan 59 均不改写。
 - README、capability report、HANDOFF、Read/Write/Edit definitions、Plan 49 kloop static locators 与 matrix notes 已同步；Claude Code 2.1.220 raw/normalized immutable capture 未重采、未改写，matrix 状态与 7 个 executable pair 数量不变。
 - Darwin 本机验证：五组 focused Plan 61 tests、workspace fmt/clippy/test、mock、matrix check、corpus-only/full verifier 与 `git diff --check` 全绿。
 - Windows 11/NTFS 原生验证：workspace all-targets clippy、六组 Plan 61 focused tests、Windows backend 7 项回归与 scheduler 12 项回归全绿；覆盖 relative junction/reparse 拒绝、volume/file ID、case-insensitive alias、临时文件拒绝第二 writer、单字符 `FileRenameInformationEx`、leaf 已存在时 no-replace、retarget binding 与 identity-aware cleanup。
-- Windows 全 workspace baseline 为 420 pass / 77 fail；失败集中在 Plan 62 尚未实现的 Windows shell/hook、既有 search/permission path 展示和 Git worktree 对 verbatim path 的兼容，不属于本计划文件 backend。CI 因此在 Windows 保持 workspace clippy + Plan 61 focused native gate，workspace 全量测试继续由 macOS/Linux 执行；不得把该 focused 结论外推成 Windows 全产品验收。真实 API 不属于本计划验收。
+- Windows 全 workspace baseline 为 420 pass / 77 fail；失败集中在当时尚未实现的 Plan 62 Windows shell/hook、既有 search/permission path 展示和 Git worktree 对 verbatim path 的兼容，不属于本计划文件 backend。CI 因此在 Plan 61 完成提交中保持 Windows workspace clippy + focused native gate，workspace 全量测试继续由 macOS/Linux 执行；不得把该 focused 结论外推成 Windows 全产品验收。真实 API 不属于本计划验收。
+- 2026-08-05 交叉记录：Plan 62 已实现并把 Windows 全 workspace/mock/corpus 与 shell focused gates 接回 workflow，但尚无原生 Windows runner 实跑；在真实结果关闭上述 77 项基线前，本条历史证据不改写，也不宣称 Plan 61/62 合并后的 Windows 全产品门已绿。
 
 ## 验证
 

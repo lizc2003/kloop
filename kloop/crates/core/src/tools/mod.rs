@@ -26,6 +26,7 @@ mod plan58_parity_tests;
 #[cfg(test)]
 mod plan59_acceptance_tests;
 mod plan_mode;
+mod powershell;
 mod question;
 mod run_store;
 mod scheduler;
@@ -73,6 +74,7 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
+use crate::shell_programs::ShellPrograms;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 use kloop_protocol::ToolResultContent;
@@ -240,9 +242,25 @@ pub fn all_tool_defs(
     defer_threshold: usize,
     surface: crate::config::SurfaceCapabilities,
 ) -> Vec<ToolDef> {
-    let mut defs = builtin_defs(depth);
+    all_tool_defs_with_shells(
+        depth,
+        sources,
+        defer_threshold,
+        surface,
+        &ShellPrograms::native_posix(),
+    )
+}
+
+pub fn all_tool_defs_with_shells(
+    depth: u8,
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    surface: crate::config::SurfaceCapabilities,
+    shell_programs: &ShellPrograms,
+) -> Vec<ToolDef> {
+    let mut defs = builtin_defs(depth, shell_programs);
     let merged = merged_source_defs(sources);
-    let deferred = deferred_tool_defs(sources, defer_threshold);
+    let deferred = deferred_tool_defs_with_shells(sources, defer_threshold, shell_programs);
     let deferred_names: std::collections::HashSet<&str> =
         deferred.iter().map(|def| def.name.as_str()).collect();
     if !deferred.is_empty() {
@@ -260,7 +278,7 @@ pub fn all_tool_defs(
     // ones — both callable at runtime.
     if depth == 0 {
         defs.push(codemode::run_program_def(
-            &builtin_defs(0),
+            &builtin_defs(0, shell_programs),
             &inline_sources,
             &deferred,
         ));
@@ -301,15 +319,31 @@ pub fn all_tool_defs(
 /// sub-agents use the same threshold; a dynamic source refresh may change the
 /// verdict at the next sampling round.
 pub fn defer_active(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> bool {
-    !deferred_tool_defs(sources, defer_threshold).is_empty()
+    defer_active_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
+}
+
+pub fn defer_active_with_shells(
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    shell_programs: &ShellPrograms,
+) -> bool {
+    !deferred_tool_defs_with_shells(sources, defer_threshold, shell_programs).is_empty()
 }
 
 /// The source tools hidden behind tool_search. An oversized catalog defers all
 /// merged source tools; a source may also force selected helpers to remain
 /// deferred even below the global threshold.
 pub fn deferred_tool_defs(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<ToolDef> {
+    deferred_tool_defs_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
+}
+
+pub fn deferred_tool_defs_with_shells(
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    shell_programs: &ShellPrograms,
+) -> Vec<ToolDef> {
     let merged = merged_source_defs(sources);
-    if tool_defs(0).len() + merged.len() > defer_threshold {
+    if tool_defs_with_shells(0, shell_programs).len() + merged.len() > defer_threshold {
         return merged;
     }
     merged
@@ -343,9 +377,33 @@ fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
     );
 }
 
+fn reserved_builtin_names() -> std::collections::HashSet<String> {
+    let mut names: std::collections::HashSet<String> = tool_defs_with_shells(
+        0,
+        &ShellPrograms {
+            bash: Some(crate::shell_programs::ShellProgram {
+                executable: "reserved-bash".into(),
+                flavor: crate::shell_programs::ShellFlavor::GitBash,
+            }),
+            powershell: Some(crate::shell_programs::ShellProgram {
+                executable: "reserved-powershell".into(),
+                flavor: crate::shell_programs::ShellFlavor::PowerShell7,
+            }),
+        },
+    )
+    .into_iter()
+    .map(|definition| definition.name)
+    .collect();
+    names.extend(
+        ["bash", "bash_output", "kill_bash", "powershell"]
+            .into_iter()
+            .map(String::from),
+    );
+    names
+}
+
 fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
-    let mut seen: std::collections::HashSet<String> =
-        tool_defs(0).into_iter().map(|d| d.name).collect();
+    let mut seen = reserved_builtin_names();
     reserve_surface_names(&mut seen);
     let mut defs = Vec::new();
     for source in sources {
@@ -363,9 +421,16 @@ fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
 /// definition is skipped) and a note when the deferred-tools regime kicked
 /// in. Depth 0 is the authoritative view (it has the most built-ins).
 pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<String> {
+    tool_merge_warnings_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
+}
+
+pub fn tool_merge_warnings_with_shells(
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    shell_programs: &ShellPrograms,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut seen: std::collections::HashSet<String> =
-        tool_defs(0).into_iter().map(|d| d.name).collect();
+    let mut seen = reserved_builtin_names();
     reserve_surface_names(&mut seen);
     for source in sources {
         let source_defs = source.defs();
@@ -378,7 +443,7 @@ pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usi
             }
         }
     }
-    let total = tool_defs(0).len() + merged_source_defs(sources).len();
+    let total = tool_defs_with_shells(0, shell_programs).len() + merged_source_defs(sources).len();
     if total > defer_threshold {
         warnings.push(format!(
             "{total} tools registered (> {defer_threshold}); MCP tool definitions are deferred — the model loads them on demand via tool_search"
@@ -391,8 +456,7 @@ fn find_source<'a>(
     sources: &'a [Arc<dyn ToolSource>],
     name: &str,
 ) -> Option<&'a Arc<dyn ToolSource>> {
-    let mut reserved: std::collections::HashSet<String> =
-        tool_defs(0).into_iter().map(|def| def.name).collect();
+    let mut reserved = reserved_builtin_names();
     reserve_surface_names(&mut reserved);
     if reserved.contains(name) {
         return None;
@@ -421,7 +485,7 @@ pub(super) fn source_definition_generation(
 /// `task`). This is the set `run_program` derives its TypeScript API from, so
 /// it deliberately excludes `run_program` itself: no self-reference, and no
 /// throwaway description regeneration when only counting is needed.
-fn builtin_defs(depth: u8) -> Vec<ToolDef> {
+fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
@@ -452,13 +516,26 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "kill_bash".into(),
-            description: "Stop a running background bash command by ID; kills its whole process group.".into(),
+            description: "Stop a running background bash command by ID; kills its whole process tree.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "bash_id": {"type": "string", "description": "ID from a run_in_background bash call, e.g. bg-1"}
                 },
                 "required": ["bash_id"]
+            }),
+        },
+        ToolDef {
+            name: "powershell".into(),
+            description: "Run a foreground PowerShell command on native Windows with a fixed non-interactive, no-profile encoded invocation. PowerShell is treated as opaque and normally requires approval. Default timeout 60s; background execution and Windows shell sandboxing are unavailable.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The original PowerShell script to run"},
+                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000)"}
+                },
+                "required": ["command"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
@@ -582,6 +659,19 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
             }),
         },
     ];
+    defs.retain(|definition| match definition.name.as_str() {
+        "bash" | "bash_output" | "kill_bash" => shell_programs.bash_available(),
+        "powershell" => cfg!(windows) && shell_programs.powershell_available(),
+        _ => true,
+    });
+    #[cfg(windows)]
+    if let Some(bash) = defs.iter_mut().find(|definition| definition.name == "bash") {
+        bash.description = "Run a command with the validated Git for Windows `bash.exe -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands set run_in_background. Windows Job Object containment owns the full process tree; filesystem/network sandboxing is not implemented. Prefer forward slashes inside Bash commands.".into();
+        bash.schema["properties"]
+            .as_object_mut()
+            .expect("bash properties are an object")
+            .remove("disable_sandbox");
+    }
     // Available at every depth (sub-agents plan too); task is depth-0 only.
     defs.push(todo::todo_write_def());
     if depth == 0 {
@@ -631,7 +721,11 @@ fn builtin_defs(depth: u8) -> Vec<ToolDef> {
 /// the model — whose TypeScript API also lists the external source tools — is
 /// built in [`all_tool_defs`], which can see the sources.
 pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
-    let mut defs = builtin_defs(depth);
+    tool_defs_with_shells(depth, &ShellPrograms::native_posix())
+}
+
+pub fn tool_defs_with_shells(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
+    let mut defs = builtin_defs(depth, shell_programs);
     if depth == 0 {
         defs.push(codemode::run_program_def(&defs, &[], &[]));
     }
@@ -679,7 +773,7 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         // run alone (batching it would stall its siblings behind the deadline).
         "stop_agent" => true,
         "wait" => false,
-        "write_file" | "edit_file" | "notebook_edit" => false,
+        "powershell" | "write_file" | "edit_file" | "notebook_edit" => false,
         other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
 }
@@ -773,11 +867,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         });
     }
     let event_input = input.clone();
-    // Once a foreground Bash has spawned, its own cancellation branch must
-    // finish the group-kill and direct-child reap before we emit interrupted.
-    // Earlier cancellation (hooks/permission) still drops the gated future and
-    // therefore cannot spawn anything after the turn was cancelled.
-    let foreground_bash_started = AtomicBool::new(false);
+    // Once a foreground shell has spawned, its own cancellation branch must
+    // finish process-tree cleanup before we emit interrupted. Earlier
+    // cancellation (hooks/permission) still drops the gated future, so no
+    // process can appear after the turn was cancelled.
+    let foreground_shell_started = AtomicBool::new(false);
     let gated = async {
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -785,6 +879,16 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // (The main agent has no allowlist, so this never fires for it.)
         if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
             bail!("tool '{name}' is not available to this agent type");
+        }
+        if matches!(name.as_str(), "bash" | "bash_output" | "kill_bash")
+            && !ctx.cfg.shell_programs.bash_available()
+        {
+            bail!("tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session");
+        }
+        if name == "powershell"
+            && (!cfg!(windows) || !ctx.cfg.shell_programs.powershell_available())
+        {
+            bail!("tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session");
         }
         // Locked deferred tools bounce before hooks and permissions: the
         // model skipped tool_search, and neither automation policy nor the
@@ -863,10 +967,10 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         {
             bail!(reason);
         }
-        let foreground_bash =
-            name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false);
-        if foreground_bash {
-            foreground_bash_started.store(true, Ordering::Release);
+        let foreground_shell = name == "powershell"
+            || (name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false));
+        if foreground_shell {
+            foreground_shell_started.store(true, Ordering::Release);
         }
         let execution = execute_tool(
             &name,
@@ -877,8 +981,8 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             &ctx,
         )
         .await;
-        if foreground_bash {
-            foreground_bash_started.store(false, Ordering::Release);
+        if foreground_shell {
+            foreground_shell_started.store(false, Ordering::Release);
         }
         // post_tool hooks (and other text-only surfaces) see the flattened
         // text; an image result renders as an `[image: <media_type>]` tag.
@@ -903,7 +1007,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let mut gated = Box::pin(gated);
     let gated_result = tokio::select! {
         _ = ctx.cancel.cancelled() => {
-            if foreground_bash_started.load(Ordering::Acquire) {
+            if foreground_shell_started.load(Ordering::Acquire) {
                 Some(gated.await)
             } else {
                 None
@@ -1055,6 +1159,7 @@ fn execute_tool<'a>(
         }
         let text: Result<String> = match name {
             "bash" => bash::bash_tool(input, ctx).await,
+            "powershell" => powershell::powershell_tool(input, ctx).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
             "grep" => {
@@ -1176,6 +1281,9 @@ pub(crate) mod testutil {
                 agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                shell_programs: std::sync::Arc::new(
+                    crate::shell_programs::ShellPrograms::test_fixture(),
+                ),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
                 tool_allowlist: None,
@@ -1404,6 +1512,57 @@ mod tests {
                 Ok(SourceOutput::text(format!("completed {tool}")))
             })
         }
+    }
+
+    #[test]
+    fn shell_catalog_follows_the_frozen_availability_snapshot() {
+        assert!(!is_concurrency_safe(
+            "powershell",
+            &json!({"command": "Get-ChildItem"}),
+            &[]
+        ));
+
+        let unavailable = ShellPrograms {
+            bash: None,
+            powershell: None,
+        };
+        let names = tool_defs_with_shells(0, &unavailable)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        for name in ["bash", "bash_output", "kill_bash", "powershell"] {
+            assert!(!names.iter().any(|candidate| candidate == name), "{name}");
+        }
+
+        let available = ShellPrograms::test_fixture();
+        let definitions = tool_defs_with_shells(0, &available);
+        for name in ["bash", "bash_output", "kill_bash"] {
+            assert!(definitions.iter().any(|definition| definition.name == name));
+        }
+        #[cfg(windows)]
+        {
+            let powershell = definitions
+                .iter()
+                .find(|definition| definition.name == "powershell")
+                .expect("PowerShell is registered when its frozen executable is available");
+            let bash = definitions
+                .iter()
+                .find(|definition| definition.name == "bash")
+                .expect("Git Bash is registered when available");
+            assert!(bash.schema["properties"].get("disable_sandbox").is_none());
+            assert!(powershell
+                .description
+                .contains("background execution and Windows shell sandboxing are unavailable"));
+            let run_program = definitions
+                .iter()
+                .find(|definition| definition.name == "run_program")
+                .expect("depth-zero catalog contains run_program");
+            assert!(run_program.description.contains("powershell"));
+        }
+        #[cfg(not(windows))]
+        assert!(!definitions
+            .iter()
+            .any(|definition| definition.name == "powershell"));
     }
 
     #[test]
@@ -2134,6 +2293,9 @@ mod tests {
                 agent_label: String::new(),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
+                shell_programs: std::sync::Arc::new(
+                    crate::shell_programs::ShellPrograms::test_fixture(),
+                ),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
                 tool_allowlist: None,

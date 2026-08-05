@@ -876,7 +876,9 @@ mod tests {
         let reqs = seen.lock().unwrap();
         let system = &reqs[0].system;
         assert!(
-            system.contains(".claude/worktrees/agent-"),
+            system
+                .replace('\\', "/")
+                .contains(".claude/worktrees/agent-"),
             "system points at the worktree: {system}"
         );
         assert!(
@@ -1044,10 +1046,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kloop-partask-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let shell_dir = dir.to_string_lossy().replace('\\', "/");
         let barrier = |create: &str, wait: &str| {
             format!(
                 "touch {dir}/{create}; for i in $(seq 60); do [ -f {dir}/{wait} ] && exit 0; sleep 0.05; done; exit 1",
-                dir = dir.display()
+                dir = shell_dir
             )
         };
         let tool_use = |id: &str, cmd: String| ContentBlock::ToolUse {

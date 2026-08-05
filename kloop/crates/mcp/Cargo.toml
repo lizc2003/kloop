@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kloop-process-spawn = { workspace = true }
 kloop-protocol = { workspace = true }
 anyhow = { workspace = true }
 # Streamable HTTP transport (plan 34): POST per request, SSE responses. reqwest

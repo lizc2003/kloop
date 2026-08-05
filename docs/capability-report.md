@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-04,plan 1–59、61、64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> 基线:2026-08-05,plan 1–59、61、62、64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -48,7 +48,7 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | permission modes 全集（含 plan） | 概念双家 | **✅ Plan 37（2026-07-16）** | 已完成 |
-| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权；实施时迁移 Plan 61 已落地的窄 mutation-preview context seam | **未开工；不得与 Plan 62 并行** |
+| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权；实施时迁移 Plan 61 已落地的窄 mutation-preview context seam | **未开工；Plan 62 已收尾，可开始** |
 | AI 分类器 auto 模式 / updatedInput 改写 | cc 单家 | 暂不做(plan 8 判) | 有小模型基建再议 |
 | execpolicy(execve 级 Starlark 规则) | codex 单家 | 暂不做 | 沙箱已有,重;痛感驱动 |
 
@@ -57,7 +57,8 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
-| Windows(spawn-owning trait 改缝) | cc 单家 | plan 19 更后 | 有 Windows 用户 |
+| Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；PowerShell debug-event descendant recontainment；timeout/cancel/Drop no-survivor | 已完成；原生 Windows CI 持续门禁 |
+| Windows filesystem/network sandbox（restricted token/AppContainer） | cc 单家 | plan 19 更后；Job containment 不销此账 | 有 Windows sandbox 需求 |
 
 ### 4. 工具面——🟡 主干齐；固定条件下通过 Plan 59 受限行为兼容验收
 
@@ -68,6 +69,7 @@
 | 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
+| Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）**：冻结可信 executable（含官方 MSI/MSIX PowerShell roots）、条件 catalog、PowerShellOpaque 权限、whole-tree cleanup | 已完成；Windows filesystem/network sandbox 仍未实现 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
 | 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
@@ -116,6 +118,23 @@ server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missin
 裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再完成后台
 registry teardown；session active worktree 无 remove intent 时保留。
 自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
+
+Plan 62 已把 Plan 50/51 的 shell lifecycle 收进共享 `ProcessSpec` /
+`ProcessTreeChild` / `ProcessTreeKiller`。Unix 保持独立 process group；原生 Windows 用 RAII
+Job Object、lifetime-owned stdio handle allowlist、Windows ordinal-case UTF-16 environment 与 suspended
+CreateProcessW，在任何用户代码执行前完成 assign，失败不 breakaway、不 fallback。单一持久 waiter 防
+watchdog re-poll 泄漏；workspace 共用 `kloop-process-spawn` gate 串行 shell inheritable-handle 窗口与
+hooks/MCP/Git/其他生产 child spawn。ShellPrograms 只在启动解析一次：Windows Bash 必须通过完整 Git
+for Windows 布局；PowerShell 7 同时发现版本化 MSI roots 与 Windows package API 验证的官方 Microsoft
+MSIX family，并以 `pwsh.exe` file version 统一排序（目录/package version 仅作 fallback），5.1 是最后 fallback；PowerShell 是独立 foreground-only catalog 项，使用固定
+EncodedCommand，权限为 opaque、plan 拒绝、bypass 仍问且不可 remember。Job 只销 process-tree
+containment，不销 Windows filesystem/network sandbox；spawn gate 也不把 hooks/MCP/git 自动升级成 Job
+ownership。原生 Windows 10 x64 已实际跑绿 Plan 61 file-safety 62 tests、Plan 62 process-spawn/
+shell discovery/process-tree/Bash/PowerShell/permissions focused gates、全 workspace、fmt/clippy、mock 与
+corpus-only，且 0 ignored。验收修复了 PowerShell 7 MSIX `Start-Process` descendant 可离开 root Job：
+PowerShell 专用 debug gate 在 descendant 首线程继续前复核并装入第二个 containment Job，失败即终止固定
+Job 集；pwsh 7 与 powershell 5.1 timeout/cancel、pipe EOF、waiter reuse 和 handle-growth 均有原生
+no-survivor 证据。pinned darwin PowerShell `n/a` matrix 保持不变。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /
@@ -300,8 +319,9 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 
 | 差距项 | 补齐路径 | 触发条件 |
 |---|---|---|
-| 远端 CI 首次实跑(workflow 只做过本地等价验证) | 不占编号小事 | 用户解除暂缓、推远端 |
-| Linux 平台测试(连带沙箱 Linux 片) | 同上 | 同上 |
+| 远端 CI 首次实跑(workflow 只做过本地等价验证) | workflow 已扩为 macOS/Linux/Windows 全 workspace + mock + corpus-only；仍待可用远端执行 | 用户提供/启用 runner |
+| Windows Plan 62 原生 lifecycle gate | **✅ 2026-08-05 本地 Windows 10 x64 全门通过**；focused selectors 继续进 workflow | 已完成；远端 CI 持续门禁 |
+| Linux 平台测试(连带沙箱 Linux 片) | Plan 19 余片 | 可用远端 Linux runner |
 | 自审遗留:低危项与重复代码清理 | 教训 25 尾注挂账 | 顺手 |
 
 ### 16. 实战里程——**最大差距,唯一抄不来**
@@ -321,7 +341,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 架构与 correctness**：Plan 61 已完成；当前严格串行顺序为 Plan 63（Project/Session 权限归属）→ Plan 62（Windows shell，依赖 61），两者修改面重叠。
+- **T0 架构与 correctness**：Plan 61、62 已完成；Plan 63（Project/Session 权限归属）仍未开工，可在后续独立会话开始。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。

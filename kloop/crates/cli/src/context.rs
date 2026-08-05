@@ -349,11 +349,9 @@ fn find_git_root(cwd: &Path) -> Option<PathBuf> {
 /// commits) drops the whole block rather than injecting a partial one.
 fn git_info(cwd: &Path) -> Option<GitInfo> {
     let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(cwd);
+        let out = kloop_process_spawn::output_std(&mut command).ok()?;
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())

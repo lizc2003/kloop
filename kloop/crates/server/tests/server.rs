@@ -230,6 +230,9 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             agent_label: String::new(),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
+            shell_programs: std::sync::Arc::new(
+                kloop_core::shell_programs::ShellPrograms::test_fixture(),
+            ),
             sandbox: None,
             agent_types: std::sync::Arc::new(Vec::new()),
             tool_allowlist: None,
@@ -362,6 +365,9 @@ fn worktree_factory(
             agent_label: String::new(),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
+            shell_programs: std::sync::Arc::new(
+                kloop_core::shell_programs::ShellPrograms::test_fixture(),
+            ),
             sandbox: None,
             agent_types: std::sync::Arc::new(Vec::new()),
             tool_allowlist: None,
@@ -971,10 +977,8 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
         .collect();
     assert_eq!(wt.len(), 2, "enter + exit notifications");
     assert_eq!(wt[0]["params"]["branch"], "worktree-srv");
-    assert!(wt[0]["params"]["cwd"]
-        .as_str()
-        .unwrap()
-        .ends_with(".claude/worktrees/srv"));
+    let entered_cwd = wt[0]["params"]["cwd"].as_str().unwrap().replace('\\', "/");
+    assert!(entered_cwd.ends_with(".claude/worktrees/srv"));
     assert_eq!(wt[1]["params"]["branch"], Value::Null);
 
     // The write landed in the worktree, not the main repo; the dirty tree is

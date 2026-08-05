@@ -298,6 +298,27 @@ impl Hooks {
 /// cc's convention: the one exit code that means "deliberately blocked".
 pub const BLOCK_EXIT_CODE: i32 = 2;
 
+#[cfg(test)]
+pub(crate) fn test_shell_command(script: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let (programs, _) = crate::shell_programs::resolve_shell_programs(Default::default())
+            .expect("native Windows shell discovery succeeds");
+        let bash = programs
+            .bash
+            .expect("hook tests require a validated Git for Windows Bash");
+        vec![
+            bash.executable.to_string_lossy().into_owned(),
+            "-lc".into(),
+            script.replace('\\', "/"),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["sh".into(), "-c".into(), script.into()]
+    }
+}
+
 enum HookRun {
     Allow {
         stdout: String,
@@ -328,13 +349,14 @@ fn block_reason(stderr: &str, stdout: &str) -> String {
 
 async fn run_hook(def: &HookDef, payload: &Value) -> HookRun {
     let run = async {
-        let mut child = tokio::process::Command::new(&def.command[0])
+        let mut command = tokio::process::Command::new(&def.command[0]);
+        command
             .args(&def.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        let mut child = kloop_process_spawn::spawn(&mut command)
             .map_err(|e| format!("failed to spawn: {e}"))?;
         // The payload is tiny, so write-then-wait cannot deadlock on a full
         // stdout pipe. A hook that closed stdin early is not an error.
@@ -384,7 +406,7 @@ mod tests {
     fn sh(event: HookEvent, script: &str) -> HookDef {
         HookDef {
             event,
-            command: vec!["sh".into(), "-c".into(), script.into()],
+            command: test_shell_command(script),
             matcher: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }

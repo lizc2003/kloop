@@ -294,6 +294,9 @@ mod tests {
             agent_label: String::new(),
             hooks: Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
+            shell_programs: std::sync::Arc::new(
+                kloop_core::shell_programs::ShellPrograms::test_fixture(),
+            ),
             background_tasks: kloop_core::tools::BackgroundTasks::new(),
             sandbox: None,
             agent_types: Arc::new(Vec::new()),

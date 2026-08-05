@@ -102,6 +102,7 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
             };
             ("Bash".into(), detail)
         }
+        "powershell" => ("PowerShell".into(), format!("PS> {}", s("command"))),
         "read_file" => ("Read".into(), path_of(&v)),
         "write_file" => {
             let n = v
@@ -291,6 +292,18 @@ mod tests {
             .style
             .add_modifier
             .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn powershell_row_keeps_the_original_script() {
+        let lines = tool_cell_lines(
+            "powershell",
+            r#"{"command":"Write-Output '你好'"}"#,
+            ToolStatus::Running,
+            None,
+            60,
+        );
+        assert_eq!(texts(&lines), vec!["● PowerShell PS> Write-Output '你好'"]);
     }
 
     #[test]

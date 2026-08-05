@@ -8,6 +8,7 @@ use crate::file_state::FileState;
 use crate::hooks::Hooks;
 use crate::inbox::Inbox;
 use crate::permissions::Permissions;
+use crate::shell_programs::ShellPrograms;
 use crate::tools::BackgroundShells;
 use crate::tools::BackgroundTasks;
 use crate::tools::ToolSource;
@@ -88,6 +89,10 @@ pub struct Config {
     /// Sub-agents share the parent's through the Config clone; server mode
     /// builds one per thread.
     pub background_shells: Arc<BackgroundShells>,
+    /// Process-wide shell identities resolved once at CLI startup. Config clones
+    /// preserve the same executable paths across server threads, sub-agents,
+    /// worktrees and code-mode calls.
+    pub shell_programs: Arc<ShellPrograms>,
     /// OS sandbox policy for bash execution; None runs commands bare
     /// (sandbox disabled, platform unsupported, --mock). The permission gate
     /// is independent — approved commands still run inside this sandbox, and

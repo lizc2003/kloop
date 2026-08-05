@@ -324,6 +324,7 @@ async fn mock_end_to_end_three_rounds() {
         agent_label: String::new(),
         hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         background_shells: crate::tools::BackgroundShells::new(),
+        shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
         sandbox: None,
         agent_types: Arc::new(Vec::new()),
         tool_allowlist: None,
@@ -419,7 +420,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
     std::fs::create_dir_all(&dir).unwrap();
     let hook = |event, script: String| HookDef {
         event,
-        command: vec!["sh".into(), "-c".into(), script],
+        command: crate::hooks::test_shell_command(&script),
         matcher: None,
         timeout_ms: DEFAULT_TIMEOUT_MS,
     };
@@ -501,6 +502,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         agent_label: String::new(),
         hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         background_shells: crate::tools::BackgroundShells::new(),
+        shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
         sandbox: None,
         agent_types: Arc::new(Vec::new()),
         tool_allowlist: None,
@@ -1122,7 +1124,7 @@ fn hooked_cfg(provider: Provider, defs: Vec<crate::hooks::HookDef>, tag: &str) -
 fn hook(event: crate::hooks::HookEvent, script: &str) -> crate::hooks::HookDef {
     crate::hooks::HookDef {
         event,
-        command: vec!["sh".into(), "-c".into(), script.into()],
+        command: crate::hooks::test_shell_command(script),
         matcher: None,
         timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
     }

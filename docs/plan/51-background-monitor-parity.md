@@ -150,3 +150,4 @@ git diff --check
 - README、HANDOFF、capability report、refs 导读、raw/normalized fixture、manifest、static evidence 与 matrix 已同步。
 - 自动后台化、stall 与逐事件 Monitor 明确保留为产品边界，不用无证据实现制造伪 parity。
 - 提交：本次（plan 51，见 git log）。
+- Plan 62 当前实现只替换 shell process controller，不改本计划 lifecycle/通知/回灌契约：Unix 仍用 process group，原生 Windows 用 assign-before-resume Job Object；kill/watchdog/session Drop 终止整树。PowerShell v1 不进入 BackgroundShells，自动后台化/stall/Monitor 边界不变。Plan 62 当前仍待原生 Windows 闸门，不能反向改写本计划的 pinned parity 结论。

@@ -524,14 +524,15 @@ impl StdioTransport {
         let (program, args) = command
             .split_first()
             .context("mcp server command must not be empty")?;
-        let mut child = tokio::process::Command::new(program)
+        let mut process = tokio::process::Command::new(program);
+        process
             .args(args)
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        let mut child = kloop_process_spawn::spawn(&mut process)
             .with_context(|| format!("cannot spawn mcp server '{program}'"))?;
         let stdin = child.stdin.take().context("mcp child stdin unavailable")?;
         let stdout = child

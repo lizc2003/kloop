@@ -90,7 +90,7 @@ impl Approver for ScriptedApprover {
 fn git(repository: &std::path::Path, arguments: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
-        .arg(repository)
+        .arg(crate::worktree::git_compatible_path(repository))
         .args(arguments)
         .output()
         .unwrap();
@@ -104,7 +104,12 @@ fn git(repository: &std::path::Path, arguments: &[&str]) -> String {
 }
 
 fn normalized(text: &str, repository: &std::path::Path) -> String {
-    text.replace(repository.to_string_lossy().as_ref(), "<REPO>")
+    let normalized = text.replace(repository.to_string_lossy().as_ref(), "<REPO>");
+    if cfg!(windows) {
+        normalized.replace(std::path::MAIN_SEPARATOR, "/")
+    } else {
+        normalized
+    }
 }
 
 fn result_values(results: Vec<ContentBlock>, repository: &std::path::Path) -> Vec<Value> {
@@ -334,6 +339,7 @@ async fn lifecycle_report() -> Value {
 async fn ownership_report() -> Value {
     let repository = temp_git_repo("plan56-owner");
     let external = repository.join("external");
+    let external_git = crate::worktree::git_compatible_path(&external);
     git(
         &repository,
         &[
@@ -342,7 +348,7 @@ async fn ownership_report() -> Value {
             "-q",
             "-b",
             "external-branch",
-            external.to_str().unwrap(),
+            external_git.to_str().unwrap(),
             "HEAD",
         ],
     );
@@ -526,16 +532,18 @@ async fn effective_context_report() -> Value {
     .await;
     assert!(!is_error && output.contains("context.txt"), "{output}");
     successful_tools.push("grep");
+    let pwd_command = if cfg!(windows) { "pwd -W" } else { "pwd" };
     let (output, is_error) = run_tool(
         "bash",
-        json!({"command": "pwd", "description": "Print worktree cwd"}),
+        json!({"command": pwd_command, "description": "Print worktree cwd"}),
         &context,
     )
     .await;
-    assert!(
-        !is_error && output.contains(worktree.to_string_lossy().as_ref()),
-        "{output}"
-    );
+    let output = output.replace('\\', "/");
+    let expected = crate::worktree::git_compatible_path(&worktree)
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(!is_error && output.contains(&expected), "{output}");
     successful_tools.push("bash");
     assert!(!repository.join("context.txt").exists());
 

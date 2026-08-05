@@ -22,6 +22,8 @@ use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
+use kloop_core::shell_programs::ShellOverrides;
+use kloop_core::shell_programs::ShellPrograms;
 use kloop_core::skills::Skill;
 use kloop_core::skills::SkillContext as CoreSkillContext;
 use kloop_core::skills::SkillSource;
@@ -55,11 +57,14 @@ pub(crate) struct RuntimeSettings {
     context_window: Option<u64>,
     fallback_model: Option<String>,
     defer_threshold: usize,
+    shell_programs: Arc<ShellPrograms>,
+    shell_warnings: Vec<String>,
 }
 
 impl RuntimeSettings {
     pub(crate) fn load(config: &UserConfig, mock_mode: bool) -> Result<Self> {
         if mock_mode {
+            let (shell_programs, shell_warnings) = mock_shell_programs()?;
             return Ok(Self {
                 config_path: PathBuf::new(),
                 oauth_store_path: PathBuf::new(),
@@ -72,6 +77,8 @@ impl RuntimeSettings {
                 context_window: Some(200_000),
                 fallback_model: None,
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
+                shell_programs: Arc::new(shell_programs),
+                shell_warnings,
             });
         }
         let table = config.table();
@@ -80,6 +87,8 @@ impl RuntimeSettings {
             .parent()
             .expect("global config always has a parent")
             .join(crate::user_config::OAUTH_STORE);
+        let (shell_programs, shell_warnings) =
+            kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
         Ok(Self {
             config_path,
             oauth_store_path,
@@ -94,12 +103,53 @@ impl RuntimeSettings {
             context_window: context_window_from_env()?,
             fallback_model: std::env::var("KLOOP_FALLBACK_MODEL").ok(),
             defer_threshold: defer_threshold_from_env()?,
+            shell_programs: Arc::new(shell_programs),
+            shell_warnings,
         })
     }
 
     pub(crate) fn defer_threshold(&self) -> usize {
         self.defer_threshold
     }
+
+    pub(crate) fn shell_programs(&self) -> &Arc<ShellPrograms> {
+        &self.shell_programs
+    }
+
+    pub(crate) fn shell_warnings(&self) -> &[String] {
+        &self.shell_warnings
+    }
+}
+
+fn load_shell_overrides(root: &toml::Table) -> Result<ShellOverrides> {
+    let Some(section) = root.get("shells") else {
+        return Ok(ShellOverrides::default());
+    };
+    let section = section.as_table().context("[shells] must be a table")?;
+    for key in section.keys() {
+        if !matches!(key.as_str(), "bash" | "powershell") {
+            bail!("[shells] has unknown key '{key}' (bash | powershell)");
+        }
+    }
+    let path = |key: &str| -> Result<Option<PathBuf>> {
+        section
+            .get(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(PathBuf::from)
+                    .with_context(|| format!("shells.{key} must be an absolute path string"))
+            })
+            .transpose()
+    };
+    Ok(ShellOverrides {
+        bash: path("bash")?,
+        powershell: path("powershell")?,
+    })
+}
+
+fn mock_shell_programs() -> Result<(ShellPrograms, Vec<String>)> {
+    Ok((ShellPrograms::test_fixture(), Vec::new()))
 }
 
 /// Parse `[[hooks]]` tables from the global user config. A missing section is
@@ -743,11 +793,13 @@ fn scheduler_project_identity(cwd: &Path) -> Result<PathBuf> {
     let canonical = cwd
         .canonicalize()
         .with_context(|| format!("canonicalize scheduler project root {}", cwd.display()))?;
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&canonical)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output();
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(&canonical).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]);
+    let output = kloop_process_spawn::output_std(&mut command);
     let Ok(output) = output else {
         return Ok(canonical);
     };
@@ -836,6 +888,7 @@ pub(crate) fn config_from_settings(
         agent_label: String::new(),
         hooks: Arc::clone(&runtime.hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
+        shell_programs: Arc::clone(&runtime.shell_programs),
         background_tasks: kloop_core::tools::BackgroundTasks::new(),
         sandbox,
         agent_types: Arc::clone(&runtime.agent_types),
@@ -924,6 +977,46 @@ mod tests {
 
     fn config(raw: &str) -> toml::Table {
         raw.parse().unwrap()
+    }
+
+    #[test]
+    fn shells_section_parses_only_path_overrides() {
+        let root = config(
+            r#"
+[shells]
+bash = 'C:\Program Files\Git\bin\bash.exe'
+powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
+"#,
+        );
+        let overrides = load_shell_overrides(&root).unwrap();
+        assert_eq!(
+            overrides.bash,
+            Some(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"))
+        );
+        assert_eq!(
+            overrides.powershell,
+            Some(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
+        );
+
+        let error = load_shell_overrides(&config("[shells]\nbash = ['bash.exe', '-lc']"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("absolute path string"), "{error}");
+        let error = load_shell_overrides(&config("[shells]\ncmd = 'cmd.exe'"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown key 'cmd'"), "{error}");
+    }
+
+    #[test]
+    fn mock_runtime_uses_a_frozen_shell_snapshot() {
+        let user = UserConfig::from_parts(PathBuf::new(), toml::Table::new());
+        let runtime = RuntimeSettings::load(&user, /*mock_mode=*/ true).unwrap();
+        assert_eq!(
+            runtime.shell_programs().as_ref(),
+            &ShellPrograms::test_fixture()
+        );
+        assert!(runtime.shell_warnings().is_empty());
     }
 
     #[test]

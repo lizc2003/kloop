@@ -90,6 +90,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
                 | "web"
                 | "hooks"
                 | "sandbox"
+                | "shells"
                 | "agents"
                 | "codemode"
         ) {
@@ -523,6 +524,8 @@ event = "pre_turn"
 command = ["true"]
 [sandbox]
 enabled = true
+[shells]
+bash = "/trusted/bash.exe"
 [agents.reviewer]
 description = "review"
 [codemode]

@@ -8,7 +8,6 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::history::History;
 use crate::inbox::Inbox;
-use crate::tools::all_tool_defs;
 use crate::tools::dispatch_tools;
 use crate::tools::ToolCtx;
 use kloop_protocol::ContentBlock;
@@ -171,7 +170,13 @@ async fn turn_rounds(
     options: &TurnOptions,
 ) -> TurnOutcome {
     let build_tools = || {
-        let mut tools = all_tool_defs(depth, &cfg.tool_sources, cfg.defer_threshold, cfg.surface);
+        let mut tools = crate::tools::all_tool_defs_with_shells(
+            depth,
+            &cfg.tool_sources,
+            cfg.defer_threshold,
+            cfg.surface,
+            &cfg.shell_programs,
+        );
         // The `skill` tool exists only at depth 0 (like `task`) and only when a
         // model-invocable skill is loaded — user commands (`SkillSource::Command`)
         // are `/name`-only and don't warrant the tool on their own. Skills are a

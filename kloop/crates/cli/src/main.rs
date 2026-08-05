@@ -33,7 +33,7 @@ use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
 use kloop_core::skills::Skill;
-use kloop_core::tools::tool_merge_warnings;
+use kloop_core::tools::tool_merge_warnings_with_shells;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -122,6 +122,9 @@ async fn main() -> Result<ExitCode> {
     let user_config = user_config::UserConfig::load(args.mock)?;
     let provider = Arc::new(provider_config::load(args.mock, user_config.table())?);
     let runtime = Arc::new(RuntimeSettings::load(&user_config, args.mock)?);
+    for warning in runtime.shell_warnings() {
+        eprintln!("\x1b[2m[{warning}]\x1b[0m");
+    }
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
     // --mock stays hermetic: no child processes or web-key reads.
@@ -137,7 +140,11 @@ async fn main() -> Result<ExitCode> {
         let servers = mcp::load_mcp_servers(user_config.table())?;
         let mcp = mcp::connect_servers(servers, &warn).await?;
         sources.extend(mcp.sources);
-        for warning in tool_merge_warnings(&sources, runtime.defer_threshold()) {
+        for warning in tool_merge_warnings_with_shells(
+            &sources,
+            runtime.defer_threshold(),
+            runtime.shell_programs(),
+        ) {
             warn(&warning);
         }
         (sources, mcp.statuses)
