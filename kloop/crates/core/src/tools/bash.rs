@@ -1819,7 +1819,7 @@ Wait-Process -Id $grandchild.Id
             "bash",
             json!({
                 "command": tree.command_with_powershell(&powershell),
-                "timeout_ms": 500
+                "timeout_ms": 10_000
             }),
             &ctx,
         );

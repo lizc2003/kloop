@@ -266,6 +266,19 @@ mod windows_tests {
         count
     }
 
+    // Native integration tests share this process and may briefly hold unrelated handles.
+    async fn settled_handle_count(before: u32, allowance: u32) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let after = handle_count();
+            if after <= before.saturating_add(allowance) || tokio::time::Instant::now() >= deadline
+            {
+                return after;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     fn process_has_exited(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -544,7 +557,7 @@ mod windows_tests {
                 .await
                 .unwrap();
         }
-        let after = handle_count();
+        let after = settled_handle_count(before, 4).await;
         assert!(
             after <= before.saturating_add(4),
             "handle count grew from {before} to {after}"
@@ -573,7 +586,7 @@ mod windows_tests {
                 .await
                 .unwrap();
         }
-        let after = handle_count();
+        let after = settled_handle_count(before, 8).await;
         assert!(
             after <= before.saturating_add(8),
             "debugged spawns grew the handle count from {before} to {after}"

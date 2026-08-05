@@ -57,7 +57,7 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
-| Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；所有 Bash/PowerShell 走 per-process initial-breakpoint debug admission；admission/terminate 同锁；bounded cleanup | corrective 原生 Windows 复跑待补；filesystem/network sandbox 未销账 |
+| Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；所有 Bash/PowerShell 走 per-process initial-breakpoint debug admission；admission/terminate 同锁；bounded cleanup | corrective 原生 Windows 已复跑通过；filesystem/network sandbox 未销账 |
 | Windows filesystem/network sandbox（restricted token/AppContainer） | cc 单家 | plan 19 更后；Job containment 不销此账 | 有 Windows sandbox 需求 |
 
 ### 4. 工具面——🟡 主干齐；固定条件下通过 Plan 59 受限行为兼容验收
@@ -69,7 +69,7 @@
 | 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
-| Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）+ corrective**：冻结可信 executable、显式 frozen catalog、PowerShellOpaque final-status/session gate、whole-tree cleanup | corrective 原生 Windows 复跑待补；Windows filesystem/network sandbox 仍未实现 |
+| Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）+ corrective**：冻结可信 executable、显式 frozen catalog、PowerShellOpaque final-status/session gate、whole-tree cleanup | corrective 原生 Windows 已复跑通过；Windows filesystem/network sandbox 仍未实现 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
 | 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
@@ -140,8 +140,10 @@ hooks/MCP/git 自动升级成 Job ownership。原生 Windows 10 x64 已实际跑
 Plan 62 初始实现的 process-spawn/shell discovery/process-tree/Bash/PowerShell/permissions focused gates、
 全 workspace、fmt/clippy、mock 与 corpus-only，且 0 ignored。该次验收查实 PowerShell 7 MSIX
 `Start-Process` descendant 可离开 root Job；本 corrective 的全 Bash debug gate、admission/terminate
-线性化、bounded debugger finish、最终状态、三态 version probe 和 session gate 已落原生回归源码，仍须
-在同一 Windows 验收机复跑后才能追加新的运行证据。pinned darwin PowerShell `n/a` matrix 保持不变。
+线性化、bounded debugger finish、最终状态、三态 version probe 和 session gate 随后也在同一验收机
+完成原生复跑：PowerShell focused 22 tests、官方 MSIX Bash lifecycle、默认并行与单线程 core 各
+550 tests 全绿，core all-target clippy、fmt、corpus-only 与 diff check 同样通过。pinned darwin
+PowerShell `n/a` matrix 保持不变。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /

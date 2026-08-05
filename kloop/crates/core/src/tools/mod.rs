@@ -2278,8 +2278,9 @@ mod tests {
         let mutex = format!("Local\\kloop-powershell-gate-{}", std::process::id());
         let command = format!(
             "$mutex = [Threading.Mutex]::new($false, '{mutex}'); \
-             if (-not $mutex.WaitOne(0)) {{ Write-Output overlap }} else {{ \
-             try {{ Start-Sleep -Seconds 2; Write-Output done }} finally {{ $mutex.ReleaseMutex() }} }}"
+             if (-not $mutex.WaitOne(0)) {{ [Console]::Out.Write('overlap') }} else {{ \
+             try {{ [Threading.Thread]::Sleep(2000); [Console]::Out.Write('done') }} \
+             finally {{ $mutex.ReleaseMutex() }} }}"
         );
         let first = run_tool("powershell", json!({"command": command.clone()}), &ctx);
         let second = run_tool("powershell", json!({"command": command}), &ctx);

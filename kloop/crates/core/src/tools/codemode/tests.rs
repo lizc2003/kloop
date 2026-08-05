@@ -241,8 +241,9 @@ async fn background_program_returns_immediately_and_reinjects() {
 fn powershell_overlap_probe(name: &str) -> String {
     format!(
         "$mutex = [Threading.Mutex]::new($false, 'Local\\{name}'); \
-         try {{ if (-not $mutex.WaitOne(0)) {{ Write-Output overlap }} else {{ \
-         try {{ Start-Sleep -Milliseconds 750; Write-Output done }} finally {{ $mutex.ReleaseMutex() }} }} \
+         try {{ if (-not $mutex.WaitOne(0)) {{ [Console]::Out.Write('overlap') }} else {{ \
+         try {{ [Threading.Thread]::Sleep(750); [Console]::Out.Write('done') }} \
+         finally {{ $mutex.ReleaseMutex() }} }} \
          }} finally {{ $mutex.Dispose() }}"
     )
 }
@@ -308,8 +309,10 @@ async fn powershell_gate_spans_direct_foreground_and_background_program_bridges(
     let _ = std::fs::remove_file(&marker);
     let marker_literal = marker.to_string_lossy().replace('\'', "''");
     let background_command = powershell_overlap_probe(&mutex_name).replacen(
-        "try { Start-Sleep",
-        &format!("try {{ [IO.File]::WriteAllText('{marker_literal}', 'started'); Start-Sleep"),
+        "try { [Threading.Thread]::Sleep",
+        &format!(
+            "try {{ [IO.File]::WriteAllText('{marker_literal}', 'started'); [Threading.Thread]::Sleep"
+        ),
         1,
     );
     let source = format!(
