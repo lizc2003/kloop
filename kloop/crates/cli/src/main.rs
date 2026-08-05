@@ -33,7 +33,7 @@ use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::history::History;
 use kloop_core::skills::Skill;
-use kloop_core::tools::tool_merge_warnings_with_shells;
+use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -140,7 +140,7 @@ async fn main() -> Result<ExitCode> {
         let servers = mcp::load_mcp_servers(user_config.table())?;
         let mcp = mcp::connect_servers(servers, &warn).await?;
         sources.extend(mcp.sources);
-        for warning in tool_merge_warnings_with_shells(
+        for warning in tool_merge_warnings(
             &sources,
             runtime.defer_threshold(),
             runtime.shell_programs(),

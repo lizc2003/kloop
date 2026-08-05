@@ -1,6 +1,6 @@
 # Plan 62 — Windows 原生 Shell：Git Bash、PowerShell 与 Job Object
 
-> 状态：✅ 已完成（2026-08-05；提交号以本条所在提交为准）
+> 状态：✅ 已完成（2026-08-05；初始提交 `ef61d9c`，审查纠偏提交以本条所在提交为准）
 >
 > 依赖：Plan 50、Plan 51、Plan 61；与未开工 Plan 63 修改面重叠，收尾前不得并行
 >
@@ -308,7 +308,19 @@ git diff --check
 - 原生验收发现 PowerShell 7 MSIX 的 `Start-Process` 可产生不留在 root Job 的 descendant。PowerShell spawn 因此启用专用 `DEBUG_PROCESS | CREATE_SUSPENDED` gate：root 仍先 assign 后 resume；每个 descendant 的 create-process debug event 在首线程继续前复核 Job membership，不在 root Job 者先 assign 到第二个 kill-on-close containment Job。open/check/assign/continue 任一步失败都终止 event process 与两组 Job；timeout/cancel/normal completion/Drop 对固定 Job 集显式 terminate，不用 PID 扫描、裸 spawn、无控制 breakaway 或 direct-child fallback。PowerShell 7 与 5.1 的 timeout/cancel `Start-Process` 回归均确认无 survivor。
 - 既有 Windows blockers 以最窄修复关闭：Git verbatim path 转普通 Windows path，hooks/agent 使用已验证 Git Bash，search/permission/codemode/task/Plan 50/56/server parity report 只规范化报告或断言中的 Windows separator；waiter cancellation 改为精确比较同一个 Tokio blocking waiter ID，独立 handle-growth 回归仍保留。
 - corpus-only 在 Windows 保持 immutable corpus/hash/normalization/tamper、matrix/pair/profile bridge、可跨平台 Rust semantic reports 与敏感信息检查；POSIX descriptor/ctime/symlink/publication/PTY 自检仅在 POSIX 跑，Windows 验证其 case declarations、unsafe path rejection 及 collector/PTY fail-closed。Plan 59 native report 继续只在 Darwin arm64 跑，不伪造 Windows 证据。`.gitattributes` 将 436 个 hash-bound fixture JSON 固定为非 text，避免系统 `core.autocrlf=true` 改写内容；fixture、golden、manifest 和 pinned PowerShell matrix 均未修改。
-- 最终修改与本完成记录使用 `git commit --amend --no-edit` 合入现有 Plan 62 提交；提交号以本条所在提交为准。
+- 最终修改与本完成记录使用 `git commit --amend --no-edit` 合入当时尚未公开的 Plan 62 提交；该历史步骤产出后来公开的 `ef61d9c`，本次纠偏不再改写它。
+
+## 2026-08-05 `ef61d9c` 审查纠偏
+
+- 对公开提交 `ef61d9c` 的逐项审查确认：debugger 把 initial breakpoint 交给被调试进程、descendant admission 可与 terminate 交错、只给 PowerShell 开 debug gate 使 Git Bash→MSIX PowerShell 可逃出 root Job；因此保留历史并另做一个 follow-up corrective commit，不 amend/rebase/force-push。`ef61d9c` body 中“native Windows execution remains pending”是合并前旧文字，实际原生验收记录仍以上一节为准。
+- debugger 现在按 PID 登记 pending initial breakpoint，只消费该进程第一次 first-chance `EXCEPTION_BREAKPOINT`；错误异常、second-chance 与后续 breakpoint 均保持 `DBG_EXCEPTION_NOT_HANDLED`。create-process/load-dll 的 image/DLL file handle 显式关闭；process/thread debug handles 遵守 Win32 契约，由系统在相应 exit event continue 后关闭。
+- `JobSet` 用一个 lifecycle mutex 线性化 descendant open/membership/assign 与 termination。terminate 先永久关闭 admission，再终止 descendants/root 两个 Job；只有两者都成功才标记 complete，部分失败可重试但 admission 不重开。所有 Windows Bash 与 PowerShell 都使用此 debug path，late event process 在继续前被终止。
+- root reap、Job-empty wait 与 debugger finish 共用一次 absolute deadline；debug thread 只有已结束才 join，timeout 保留 handle 供后续 finish，Drop 只关 admission/terminate、不 sleep/join。Windows regression 源码覆盖 per-process breakpoint、两种 admission/terminate 顺序、bounded finish、官方 MSIX Bash 前台 timeout/cancel 与后台 kill/shutdown no-survivor。
+- PowerShell wrapper 在脚本前清 `$LASTEXITCODE`，脚本后立即快照 final `$?`、native code 与新 `$Error`：新 error→1，final PowerShell success→0，final native failure→该 code，其余 failure→1。version probe 改成 `Version`/`MissingResource`/`Invalid`；只有 missing resource 才采信标准 MSI 目录或官方 MSIX metadata，明确 non-v7 与其他 probe 错误拒绝 fallback。Unix/WSL shell discovery 同时要求最终 regular file 具 executable bit。
+- `Config` 新增 session-scoped PowerShell exclusive mutex；普通 clone/sub-agent/direct/不同 foreground/background code-mode bridge 共享，不同 server session 独立。锁只在 hook/permission 后、spawn 前获取，等待时 cancellation 不 spawn，executor 后、post-hook 前释放；`run_program`/task/skill/wait 等 orchestration 不持锁。
+- public catalog API 删除隐式 `ShellPrograms::native_posix()` wrappers；`all_tool_defs`、`tool_defs`、`defer_active`、`deferred_tool_defs`、`tool_merge_warnings` 均显式接收 frozen snapshot，empty/Bash-only/PowerShell-only/both 的 catalog/defer/warning 共用同一输入。
+- 旧 `core.autocrlf=true` Windows worktree 不会因后来加入 `.gitattributes -text` 自动迁移。verifier 只把“实际含 CRLF 且替换为 LF 后 hash 精确命中”分类为 CRLF-only，仍 fail closed，并警告确认 fixture 无需保留后执行 `git restore --source=HEAD --worktree -- refs/claude-code-2.1.220/fixtures`；普通 tamper、bare CR 或 mixed drift 不给 destructive guidance。fixture、manifest、golden、matrix 与 `.gitattributes` 本身不改。
+- macOS 本机最终门已通过：`cargo fmt --check`、workspace all-target `clippy -D warnings`、workspace tests、`--mock`、corpus-only 与 pinned darwin full verifier、build-matrix check、`git diff --check`；独立小 crate 对当前 Windows process-tree/discovery 单测做 MSVC target `clippy -D warnings` 也通过。`.gitattributes`、manifest 与 436 个 fixture 文件无 diff。首次并行 workspace run 仅有一个 server test 等待行超时；focused rerun通过，随后无并行负载的完整 workspace rerun全绿。上述新增 native lifecycle/MSIX/session-gate regression 尚待既有 Windows 10 x64 验收机执行，不以 cross-compile 冒充运行证据。
 
 ## 完成标准（均已满足）
 
@@ -320,7 +332,7 @@ git diff --check
 6. Job containment 不被 sandbox 配置或 `disable_sandbox` 关闭，且文档不冒充 Windows sandbox。
 7. macOS/Linux Plan 50 与 Seatbelt 行为、exact/corpus parity gate 无回退。
 8. 原生 Windows focused/workspace/mock/corpus 全绿，既有 macOS/Linux 回归与三平台 CI 门保持；README/HANDOFF/capability/refs 与 Plan 51/61 边界同步。
-9. 一次提交，提交信息含 `plan62`，本文件记录实际验证和提交号。
+9. 初始实现与审查纠偏各自一个 `plan62` 提交；公开的 `ef61d9c` 不改写，纠偏提交信息与本文件记录验证边界。
 
 ## 后续边界
 

@@ -115,9 +115,9 @@ pub fn resolve_shell_programs(overrides: ShellOverrides) -> Result<(ShellProgram
             bail!("[shells] executable overrides are only supported on native Windows");
         }
         let executable = if is_wsl() {
-            PathBuf::from("/bin/bash")
+            canonical_posix_executable(Path::new("/bin/bash"), "WSL Bash")?
         } else {
-            resolve_posix_sh()
+            resolve_posix_sh(std::env::var_os("PATH").as_deref(), Path::new("/bin/sh"))?
         };
         Ok((
             ShellPrograms {
@@ -164,6 +164,14 @@ fn discover_powershell_msix_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn official_msix_powershell_for_test() -> Option<ShellProgram> {
+    discover_powershell(&ShellDiscoveryEnv {
+        powershell_msix_roots: discover_powershell_msix_roots(),
+        ..Default::default()
+    })
 }
 
 #[cfg(windows)]
@@ -256,15 +264,46 @@ fn package_roots_for_family(family: &str) -> std::io::Result<Vec<PathBuf>> {
 }
 
 #[cfg(not(windows))]
-fn resolve_posix_sh() -> PathBuf {
-    std::env::var_os("PATH")
-        .as_ref()
+fn resolve_posix_sh(path: Option<&std::ffi::OsStr>, fallback: &Path) -> Result<PathBuf> {
+    if let Some(resolved) = path
         .into_iter()
         .flat_map(std::env::split_paths)
         .map(|dir| dir.join("sh"))
-        .find(|path| path.is_file())
-        .and_then(|path| path.canonicalize().ok())
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+        .find_map(|candidate| {
+            is_posix_executable(&candidate)
+                .then(|| candidate.canonicalize().ok())
+                .flatten()
+        })
+    {
+        return Ok(resolved);
+    }
+    canonical_posix_executable(fallback, "POSIX shell").with_context(|| {
+        format!(
+            "no executable sh was found on PATH and fallback '{}' is unavailable",
+            fallback.display()
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn canonical_posix_executable(path: &Path, label: &str) -> Result<PathBuf> {
+    if !is_posix_executable(path) {
+        bail!(
+            "{label} '{}' is not an executable regular file",
+            path.display()
+        );
+    }
+    path.canonicalize()
+        .with_context(|| format!("cannot canonicalize {label} '{}'", path.display()))
+}
+
+#[cfg(not(windows))]
+fn is_posix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    path.metadata().is_ok_and(|metadata| {
+        metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+    })
 }
 
 #[cfg(all(target_os = "linux", not(windows)))]
@@ -399,13 +438,21 @@ fn validate_git_root(root: &Path) -> Result<ShellProgram> {
     })
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PowerShellVersionProbe {
+    Version(Vec<u32>),
+    MissingResource,
+    Invalid,
+}
+
 fn discover_powershell(env: &ShellDiscoveryEnv) -> Option<ShellProgram> {
     discover_powershell_with_version_probe(env, powershell_executable_version)
 }
 
 fn discover_powershell_with_version_probe(
     env: &ShellDiscoveryEnv,
-    version_probe: impl Fn(&Path) -> Option<Vec<u32>>,
+    version_probe: impl Fn(&Path) -> PowerShellVersionProbe,
 ) -> Option<ShellProgram> {
     let mut candidates = Vec::new();
     for (base, local_install) in [
@@ -423,11 +470,18 @@ fn discover_powershell_with_version_probe(
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if powershell_major(&name) == Some(7) {
-                    let path = entry.path().join("pwsh.exe");
-                    let version = version_probe(&path)
-                        .filter(|version| version.first() == Some(&7))
-                        .unwrap_or_else(|| powershell_version_key(&name));
+                if powershell_major(&name) != Some(7) {
+                    continue;
+                }
+                let path = entry.path().join("pwsh.exe");
+                let version = match version_probe(&path) {
+                    PowerShellVersionProbe::Version(version) if version.first() == Some(&7) => {
+                        Some(version)
+                    }
+                    PowerShellVersionProbe::MissingResource => Some(powershell_version_key(&name)),
+                    PowerShellVersionProbe::Version(_) | PowerShellVersionProbe::Invalid => None,
+                };
+                if let Some(version) = version {
                     candidates.push((version, path));
                 }
             }
@@ -435,10 +489,14 @@ fn discover_powershell_with_version_probe(
     }
     for root in &env.powershell_msix_roots {
         let path = root.join("pwsh.exe");
-        if let Some(version) = version_probe(&path)
-            .filter(|version| version.first() == Some(&7))
-            .or_else(|| powershell_msix_version_key(root))
-        {
+        let version = match version_probe(&path) {
+            PowerShellVersionProbe::Version(version) if version.first() == Some(&7) => {
+                Some(version)
+            }
+            PowerShellVersionProbe::MissingResource => powershell_msix_version_key(root),
+            PowerShellVersionProbe::Version(_) | PowerShellVersionProbe::Invalid => None,
+        };
+        if let Some(version) = version {
             candidates.push((version, path));
         }
     }
@@ -494,9 +552,14 @@ fn validate_absolute_regular(path: &Path, label: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn powershell_executable_version(path: &Path) -> Option<Vec<u32>> {
+fn powershell_executable_version(path: &Path) -> PowerShellVersionProbe {
     use std::os::windows::ffi::OsStrExt as _;
 
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::ERROR_RESOURCE_DATA_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_RESOURCE_LANG_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_RESOURCE_NAME_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_RESOURCE_TYPE_NOT_FOUND;
     use windows_sys::Win32::Storage::FileSystem::GetFileVersionInfoSizeW;
     use windows_sys::Win32::Storage::FileSystem::GetFileVersionInfoW;
     use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
@@ -506,12 +569,18 @@ fn powershell_executable_version(path: &Path) -> Option<Vec<u32>> {
     let mut ignored = 0u32;
     let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), &mut ignored) };
     if size == 0 {
-        return None;
+        return match unsafe { GetLastError() } {
+            ERROR_RESOURCE_DATA_NOT_FOUND
+            | ERROR_RESOURCE_LANG_NOT_FOUND
+            | ERROR_RESOURCE_NAME_NOT_FOUND
+            | ERROR_RESOURCE_TYPE_NOT_FOUND => PowerShellVersionProbe::MissingResource,
+            _ => PowerShellVersionProbe::Invalid,
+        };
     }
     let words = (size as usize).div_ceil(std::mem::size_of::<usize>());
     let mut data = vec![0usize; words];
     if unsafe { GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) } == 0 {
-        return None;
+        return PowerShellVersionProbe::Invalid;
     }
     let query = [b'\\' as u16, 0];
     let mut value = std::ptr::null_mut();
@@ -526,13 +595,13 @@ fn powershell_executable_version(path: &Path) -> Option<Vec<u32>> {
     } == 0
         || value_len < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
     {
-        return None;
+        return PowerShellVersionProbe::Invalid;
     }
     let info = unsafe { std::ptr::read_unaligned(value.cast::<VS_FIXEDFILEINFO>()) };
     if info.dwSignature != 0xFEEF04BD {
-        return None;
+        return PowerShellVersionProbe::Invalid;
     }
-    Some(vec![
+    PowerShellVersionProbe::Version(vec![
         info.dwFileVersionMS >> 16,
         info.dwFileVersionMS & 0xffff,
         info.dwFileVersionLS >> 16,
@@ -541,8 +610,8 @@ fn powershell_executable_version(path: &Path) -> Option<Vec<u32>> {
 }
 
 #[cfg(not(windows))]
-fn powershell_executable_version(_path: &Path) -> Option<Vec<u32>> {
-    None
+fn powershell_executable_version(_path: &Path) -> PowerShellVersionProbe {
+    PowerShellVersionProbe::MissingResource
 }
 
 fn powershell_msix_version_key(root: &Path) -> Option<Vec<u32>> {
@@ -668,6 +737,55 @@ mod tests {
         assert!(error.contains("regular executable"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn posix_shell_search_skips_non_executable_candidates() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TestDir::new("posix-executable");
+        let first = temp.path().join("first/sh");
+        let second = temp.path().join("second/sh");
+        touch(&first);
+        touch(&second);
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path =
+            std::env::join_paths([first.parent().unwrap(), second.parent().unwrap()]).unwrap();
+        let resolved = resolve_posix_sh(Some(&path), &temp.path().join("missing-sh")).unwrap();
+        assert_eq!(resolved, second.canonicalize().unwrap());
+
+        let first_only = std::env::join_paths([first.parent().unwrap()]).unwrap();
+        let error = resolve_posix_sh(Some(&first_only), &temp.path().join("missing-sh"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no executable sh"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_shell_search_validates_and_canonicalizes_symlink_targets() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TestDir::new("posix-symlink");
+        let target = temp.path().join("real-shell");
+        touch(&target);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = temp.path().join("bin/sh");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let path = std::env::join_paths([alias.parent().unwrap()]).unwrap();
+        assert_eq!(
+            resolve_posix_sh(Some(&path), &temp.path().join("missing-sh")).unwrap(),
+            target.canonicalize().unwrap()
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = resolve_posix_sh(Some(&path), &temp.path().join("missing-sh"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no executable sh"), "{error}");
+    }
+
     #[test]
     fn powershell_discovery_prefers_highest_standard_v7_then_desktop() {
         let temp = TestDir::new("powershell");
@@ -738,10 +856,52 @@ mod tests {
         };
 
         let program = discover_powershell_with_version_probe(&env, |path| {
-            (path == msi.as_path()).then(|| vec![7, 10, 0, 0])
+            if path == msi.as_path() {
+                PowerShellVersionProbe::Version(vec![7, 10, 0, 0])
+            } else {
+                PowerShellVersionProbe::MissingResource
+            }
         })
         .unwrap();
         assert_eq!(program.executable, msi.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn powershell_version_probe_distinguishes_non_v7_missing_and_invalid() {
+        let temp = TestDir::new("powershell-probe-states");
+        let program_files = temp.path().join("Program Files");
+        let msi = program_files.join("PowerShell/7/pwsh.exe");
+        touch(&msi);
+        let msix_root = temp
+            .path()
+            .join("Microsoft.PowerShell_7.11.0.0_x64__8wekyb3d8bbwe");
+        let msix = msix_root.join("pwsh.exe");
+        touch(&msix);
+        let system_root = temp.path().join("Windows");
+        let desktop = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        touch(&desktop);
+        let env = ShellDiscoveryEnv {
+            program_files: Some(program_files),
+            powershell_msix_roots: vec![msix_root],
+            system_root: Some(system_root),
+            ..Default::default()
+        };
+
+        for probe in [
+            PowerShellVersionProbe::Version(vec![8, 0, 0, 0]),
+            PowerShellVersionProbe::Invalid,
+        ] {
+            let program = discover_powershell_with_version_probe(&env, |_| probe.clone()).unwrap();
+            assert_eq!(program.executable, desktop.canonicalize().unwrap());
+            assert_eq!(program.flavor, ShellFlavor::WindowsPowerShell);
+        }
+
+        let program = discover_powershell_with_version_probe(&env, |_| {
+            PowerShellVersionProbe::MissingResource
+        })
+        .unwrap();
+        assert_eq!(program.executable, msix.canonicalize().unwrap());
+        assert_eq!(program.flavor, ShellFlavor::PowerShell7);
     }
 
     #[test]

@@ -57,7 +57,7 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
-| Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；PowerShell debug-event descendant recontainment；timeout/cancel/Drop no-survivor | 已完成；原生 Windows CI 持续门禁 |
+| Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；所有 Bash/PowerShell 走 per-process initial-breakpoint debug admission；admission/terminate 同锁；bounded cleanup | corrective 原生 Windows 复跑待补；filesystem/network sandbox 未销账 |
 | Windows filesystem/network sandbox（restricted token/AppContainer） | cc 单家 | plan 19 更后；Job containment 不销此账 | 有 Windows sandbox 需求 |
 
 ### 4. 工具面——🟡 主干齐；固定条件下通过 Plan 59 受限行为兼容验收
@@ -69,7 +69,7 @@
 | 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
-| Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）**：冻结可信 executable（含官方 MSI/MSIX PowerShell roots）、条件 catalog、PowerShellOpaque 权限、whole-tree cleanup | 已完成；Windows filesystem/network sandbox 仍未实现 |
+| Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）+ corrective**：冻结可信 executable、显式 frozen catalog、PowerShellOpaque final-status/session gate、whole-tree cleanup | corrective 原生 Windows 复跑待补；Windows filesystem/network sandbox 仍未实现 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
 | 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
@@ -122,19 +122,26 @@ registry teardown；session active worktree 无 remove intent 时保留。
 Plan 62 已把 Plan 50/51 的 shell lifecycle 收进共享 `ProcessSpec` /
 `ProcessTreeChild` / `ProcessTreeKiller`。Unix 保持独立 process group；原生 Windows 用 RAII
 Job Object、lifetime-owned stdio handle allowlist、Windows ordinal-case UTF-16 environment 与 suspended
-CreateProcessW，在任何用户代码执行前完成 assign，失败不 breakaway、不 fallback。单一持久 waiter 防
-watchdog re-poll 泄漏；workspace 共用 `kloop-process-spawn` gate 串行 shell inheritable-handle 窗口与
-hooks/MCP/Git/其他生产 child spawn。ShellPrograms 只在启动解析一次：Windows Bash 必须通过完整 Git
-for Windows 布局；PowerShell 7 同时发现版本化 MSI roots 与 Windows package API 验证的官方 Microsoft
-MSIX family，并以 `pwsh.exe` file version 统一排序（目录/package version 仅作 fallback），5.1 是最后 fallback；PowerShell 是独立 foreground-only catalog 项，使用固定
-EncodedCommand，权限为 opaque、plan 拒绝、bypass 仍问且不可 remember。Job 只销 process-tree
-containment，不销 Windows filesystem/network sandbox；spawn gate 也不把 hooks/MCP/git 自动升级成 Job
-ownership。原生 Windows 10 x64 已实际跑绿 Plan 61 file-safety 62 tests、Plan 62 process-spawn/
-shell discovery/process-tree/Bash/PowerShell/permissions focused gates、全 workspace、fmt/clippy、mock 与
-corpus-only，且 0 ignored。验收修复了 PowerShell 7 MSIX `Start-Process` descendant 可离开 root Job：
-PowerShell 专用 debug gate 在 descendant 首线程继续前复核并装入第二个 containment Job，失败即终止固定
-Job 集；pwsh 7 与 powershell 5.1 timeout/cancel、pipe EOF、waiter reuse 和 handle-growth 均有原生
-no-survivor 证据。pinned darwin PowerShell `n/a` matrix 保持不变。
+CreateProcessW，在 user code 前 assign root；所有 Bash/PowerShell spawn 再用 `DEBUG_PROCESS` 收紧
+MSIX/silent-breakaway descendant。debugger 只消费每 PID 一次 first-chance initial breakpoint，其他异常
+保持 unhandled；descendant admission 与 Job termination 共用 lifecycle mutex，terminate 永久关 admission
+后再清两组 Job。cleanup 全阶段共用一个 absolute deadline，debugger join 只在线程已结束后执行，Drop
+不 sleep/join。ShellPrograms 只在启动解析一次：Unix `sh`/WSL fallback 必须解析为 executable regular
+file；Windows Bash 必须通过完整 Git for Windows 布局；PowerShell 7 同时发现版本化 MSI roots 与 Windows
+package API 验证的官方 Microsoft MSIX family，并以 `pwsh.exe` file version 统一排序。只有 Win32 明确报告
+missing version resource 时才用可信目录/package metadata；明确 non-v7 resource 或 access/query/signature/
+format 错误均拒绝 fallback，5.1 是最后 fallback。PowerShell wrapper 以 final `$?`、新 `$Error` 与清零后
+的 `$LASTEXITCODE` 判最终状态，不传播较早 native command 的陈旧非零 code。每个 session 的 Config
+另共享一个 PowerShell exclusive gate，覆盖 direct 与不同 foreground/background code-mode bridge；等待锁
+时取消不 spawn，orchestration 外壳不持锁。catalog/defer/warning API 全部显式吃同一 frozen
+`ShellPrograms` snapshot，不在 helper 内重新 discovery。Job 只销 process-tree containment，不销 Windows
+filesystem/network sandbox，也不承诺对抗 protected process/自建 debugger；spawn gate 也不把
+hooks/MCP/git 自动升级成 Job ownership。原生 Windows 10 x64 已实际跑绿 Plan 61 file-safety 62 tests、
+Plan 62 初始实现的 process-spawn/shell discovery/process-tree/Bash/PowerShell/permissions focused gates、
+全 workspace、fmt/clippy、mock 与 corpus-only，且 0 ignored。该次验收查实 PowerShell 7 MSIX
+`Start-Process` descendant 可离开 root Job；本 corrective 的全 Bash debug gate、admission/terminate
+线性化、bounded debugger finish、最终状态、三态 version probe 和 session gate 已落原生回归源码，仍须
+在同一 Windows 验收机复跑后才能追加新的运行证据。pinned darwin PowerShell `n/a` matrix 保持不变。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /

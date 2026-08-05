@@ -70,6 +70,11 @@ impl ProcessSpec {
     pub(crate) fn require_windows_descendant_debugging(&mut self) {
         self.windows_debug_descendants = true;
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn windows_debug_descendants(&self) -> bool {
+        self.windows_debug_descendants
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

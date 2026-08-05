@@ -241,26 +241,11 @@ pub fn all_tool_defs(
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
     surface: crate::config::SurfaceCapabilities,
-) -> Vec<ToolDef> {
-    all_tool_defs_with_shells(
-        depth,
-        sources,
-        defer_threshold,
-        surface,
-        &ShellPrograms::native_posix(),
-    )
-}
-
-pub fn all_tool_defs_with_shells(
-    depth: u8,
-    sources: &[Arc<dyn ToolSource>],
-    defer_threshold: usize,
-    surface: crate::config::SurfaceCapabilities,
     shell_programs: &ShellPrograms,
 ) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth, shell_programs);
     let merged = merged_source_defs(sources);
-    let deferred = deferred_tool_defs_with_shells(sources, defer_threshold, shell_programs);
+    let deferred = deferred_tool_defs(sources, defer_threshold, shell_programs);
     let deferred_names: std::collections::HashSet<&str> =
         deferred.iter().map(|def| def.name.as_str()).collect();
     if !deferred.is_empty() {
@@ -318,32 +303,24 @@ pub fn all_tool_defs_with_shells(
 /// Whether the current depth-0 source snapshot has deferred tools. Parent and
 /// sub-agents use the same threshold; a dynamic source refresh may change the
 /// verdict at the next sampling round.
-pub fn defer_active(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> bool {
-    defer_active_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
-}
-
-pub fn defer_active_with_shells(
+pub fn defer_active(
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
     shell_programs: &ShellPrograms,
 ) -> bool {
-    !deferred_tool_defs_with_shells(sources, defer_threshold, shell_programs).is_empty()
+    !deferred_tool_defs(sources, defer_threshold, shell_programs).is_empty()
 }
 
 /// The source tools hidden behind tool_search. An oversized catalog defers all
 /// merged source tools; a source may also force selected helpers to remain
 /// deferred even below the global threshold.
-pub fn deferred_tool_defs(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<ToolDef> {
-    deferred_tool_defs_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
-}
-
-pub fn deferred_tool_defs_with_shells(
+pub fn deferred_tool_defs(
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
     shell_programs: &ShellPrograms,
 ) -> Vec<ToolDef> {
     let merged = merged_source_defs(sources);
-    if tool_defs_with_shells(0, shell_programs).len() + merged.len() > defer_threshold {
+    if tool_defs(0, shell_programs).len() + merged.len() > defer_threshold {
         return merged;
     }
     merged
@@ -378,7 +355,7 @@ fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
 }
 
 fn reserved_builtin_names() -> std::collections::HashSet<String> {
-    let mut names: std::collections::HashSet<String> = tool_defs_with_shells(
+    let mut names: std::collections::HashSet<String> = tool_defs(
         0,
         &ShellPrograms {
             bash: Some(crate::shell_programs::ShellProgram {
@@ -420,11 +397,7 @@ fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
 /// Startup diagnostics for the merged tool set: name collisions (the later
 /// definition is skipped) and a note when the deferred-tools regime kicked
 /// in. Depth 0 is the authoritative view (it has the most built-ins).
-pub fn tool_merge_warnings(sources: &[Arc<dyn ToolSource>], defer_threshold: usize) -> Vec<String> {
-    tool_merge_warnings_with_shells(sources, defer_threshold, &ShellPrograms::native_posix())
-}
-
-pub fn tool_merge_warnings_with_shells(
+pub fn tool_merge_warnings(
     sources: &[Arc<dyn ToolSource>],
     defer_threshold: usize,
     shell_programs: &ShellPrograms,
@@ -443,7 +416,7 @@ pub fn tool_merge_warnings_with_shells(
             }
         }
     }
-    let total = tool_defs_with_shells(0, shell_programs).len() + merged_source_defs(sources).len();
+    let total = tool_defs(0, shell_programs).len() + merged_source_defs(sources).len();
     if total > defer_threshold {
         warnings.push(format!(
             "{total} tools registered (> {defer_threshold}); MCP tool definitions are deferred — the model loads them on demand via tool_search"
@@ -720,11 +693,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
 /// the defer threshold like any other built-in. The definition actually sent to
 /// the model — whose TypeScript API also lists the external source tools — is
 /// built in [`all_tool_defs`], which can see the sources.
-pub fn tool_defs(depth: u8) -> Vec<ToolDef> {
-    tool_defs_with_shells(depth, &ShellPrograms::native_posix())
-}
-
-pub fn tool_defs_with_shells(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
+pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth, shell_programs);
     if depth == 0 {
         defs.push(codemode::run_program_def(&defs, &[], &[]));
@@ -967,6 +936,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         {
             bail!(reason);
         }
+        let powershell_guard = if name == "powershell" {
+            Some(ctx.cfg.powershell_execution_gate.lock().await)
+        } else {
+            None
+        };
         let foreground_shell = name == "powershell"
             || (name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false));
         if foreground_shell {
@@ -984,6 +958,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if foreground_shell {
             foreground_shell_started.store(false, Ordering::Release);
         }
+        drop(powershell_guard);
         // post_tool hooks (and other text-only surfaces) see the flattened
         // text; an image result renders as an `[image: <media_type>]` tag.
         let (text, is_error) = match &execution.result {
@@ -1284,6 +1259,7 @@ pub(crate) mod testutil {
                 shell_programs: std::sync::Arc::new(
                     crate::shell_programs::ShellPrograms::test_fixture(),
                 ),
+                powershell_execution_gate: Default::default(),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
                 tool_allowlist: None,
@@ -1526,7 +1502,7 @@ mod tests {
             bash: None,
             powershell: None,
         };
-        let names = tool_defs_with_shells(0, &unavailable)
+        let names = tool_defs(0, &unavailable)
             .into_iter()
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
@@ -1535,7 +1511,7 @@ mod tests {
         }
 
         let available = ShellPrograms::test_fixture();
-        let definitions = tool_defs_with_shells(0, &available);
+        let definitions = tool_defs(0, &available);
         for name in ["bash", "bash_output", "kill_bash"] {
             assert!(definitions.iter().any(|definition| definition.name == name));
         }
@@ -1565,10 +1541,90 @@ mod tests {
             .any(|definition| definition.name == "powershell"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn catalog_deferral_and_warnings_share_each_frozen_shell_snapshot() {
+        use crate::shell_programs::ShellFlavor;
+        use crate::shell_programs::ShellProgram;
+
+        let bash = ShellProgram {
+            executable: "frozen-bash.exe".into(),
+            flavor: ShellFlavor::GitBash,
+        };
+        let powershell = ShellProgram {
+            executable: "frozen-pwsh.exe".into(),
+            flavor: ShellFlavor::PowerShell7,
+        };
+        let cases = [
+            (
+                ShellPrograms {
+                    bash: None,
+                    powershell: None,
+                },
+                0usize,
+            ),
+            (
+                ShellPrograms {
+                    bash: Some(bash.clone()),
+                    powershell: None,
+                },
+                3,
+            ),
+            (
+                ShellPrograms {
+                    bash: None,
+                    powershell: Some(powershell.clone()),
+                },
+                1,
+            ),
+            (
+                ShellPrograms {
+                    bash: Some(bash),
+                    powershell: Some(powershell),
+                },
+                4,
+            ),
+        ];
+        let source: Arc<dyn ToolSource> = StubSource::new("snapshot");
+        let sources = vec![source];
+        for (shells, shell_tool_count) in cases {
+            let builtins = tool_defs(0, &shells);
+            assert_eq!(
+                builtins
+                    .iter()
+                    .filter(|definition| matches!(
+                        definition.name.as_str(),
+                        "bash" | "bash_output" | "kill_bash" | "powershell"
+                    ))
+                    .count(),
+                shell_tool_count
+            );
+            let threshold = builtins.len();
+            assert!(defer_active(&sources, threshold, &shells));
+            assert_eq!(
+                deferred_tool_defs(&sources, threshold, &shells),
+                StubSource::new("snapshot").defs.clone()
+            );
+            let warnings = tool_merge_warnings(&sources, threshold, &shells);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains(&(builtins.len() + 3).to_string()),
+                "{warnings:?}"
+            );
+            let names = all_tool_defs(0, &sources, threshold, interactive_surface(), &shells)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>();
+            assert!(names.iter().any(|name| name == "tool_search"));
+            assert!(names.iter().any(|name| name == "call_tool"));
+            assert!(!names.iter().any(|name| name.starts_with("snapshot__")));
+        }
+    }
+
     #[test]
     fn tool_defs_expose_task_only_at_depth_zero() {
         let names = |depth| {
-            tool_defs(depth)
+            tool_defs(depth, &ShellPrograms::native_posix())
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
@@ -1579,7 +1635,7 @@ mod tests {
 
     #[test]
     fn file_tool_definitions_state_resource_and_freshness_contracts() {
-        let definitions = tool_defs(0);
+        let definitions = tool_defs(0, &ShellPrograms::native_posix());
         let definition = |name: &str| {
             definitions
                 .iter()
@@ -1661,11 +1717,16 @@ mod tests {
     fn all_tool_defs_appends_sources_and_skips_collisions() {
         let sources: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let names: Vec<String> =
-            all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, interactive_surface())
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
+        let names: Vec<String> = all_tool_defs(
+            0,
+            &sources,
+            TOOL_DEFER_THRESHOLD,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        )
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
         // Built-ins first, then the first source; the duplicate source's
         // identical names are dropped. run_program comes last: its TypeScript
         // API is generated from the built-ins AND the source tools, so it is
@@ -1711,6 +1772,7 @@ mod tests {
             &builtin_clash,
             TOOL_DEFER_THRESHOLD,
             interactive_surface(),
+            &ShellPrograms::native_posix(),
         );
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
@@ -1719,7 +1781,13 @@ mod tests {
 
     #[test]
     fn kloop_owned_tool_names_use_snake_case() {
-        let mut definitions = all_tool_defs(0, &[], TOOL_DEFER_THRESHOLD, interactive_surface());
+        let mut definitions = all_tool_defs(
+            0,
+            &[],
+            TOOL_DEFER_THRESHOLD,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         definitions.push(skill_tool_def());
         definitions.push(crate::structured_output::tool_def(&json!({"type": "null"})));
         for definition in definitions {
@@ -1772,14 +1840,20 @@ mod tests {
             ],
         });
         let sources = vec![source];
-        let defs = all_tool_defs(0, &sources, usize::MAX, interactive_surface());
+        let defs = all_tool_defs(
+            0,
+            &sources,
+            usize::MAX,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         let names: Vec<&str> = defs.iter().map(|def| def.name.as_str()).collect();
         assert!(names.contains(&"srv__inline"));
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
         assert!(!names.contains(&"srv__resource_helper"));
         assert_eq!(
-            deferred_tool_defs(&sources, usize::MAX),
+            deferred_tool_defs(&sources, usize::MAX, &ShellPrograms::native_posix()),
             vec![ToolDef {
                 name: "srv__resource_helper".into(),
                 description: "deferred".into(),
@@ -1820,13 +1894,17 @@ mod tests {
     #[test]
     fn tool_merge_warnings_flags_collisions_and_oversized_lists() {
         assert_eq!(
-            tool_merge_warnings(&[], TOOL_DEFER_THRESHOLD),
+            tool_merge_warnings(&[], TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix(),),
             Vec::<String>::new()
         );
 
         let colliding: Vec<Arc<dyn ToolSource>> =
             vec![StubSource::new("srv"), StubSource::new("srv")];
-        let warnings = tool_merge_warnings(&colliding, TOOL_DEFER_THRESHOLD);
+        let warnings = tool_merge_warnings(
+            &colliding,
+            TOOL_DEFER_THRESHOLD,
+            &ShellPrograms::native_posix(),
+        );
         assert_eq!(warnings.len(), 3, "one per duplicated name: {warnings:?}");
         assert!(warnings[0].contains("srv__echo"));
         assert!(warnings[1].contains("srv__fail"));
@@ -1843,7 +1921,8 @@ mod tests {
             defs: many,
             readonly: String::new(),
         })];
-        let warnings = tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD);
+        let warnings =
+            tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("55 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
@@ -1856,19 +1935,34 @@ mod tests {
     #[test]
     fn defer_kicks_in_past_threshold() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
-        let builtin_count = tool_defs(0).len();
+        let builtin_count = tool_defs(0, &ShellPrograms::native_posix()).len();
 
         // Exactly at the threshold (built-ins + the stub's 3 tools): everything
         // inline, no tool_search.
-        let inline = all_tool_defs(0, &sources, builtin_count + 3, interactive_surface());
+        let inline = all_tool_defs(
+            0,
+            &sources,
+            builtin_count + 3,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         assert!(inline.iter().any(|d| d.name == "srv__echo"));
         assert!(inline.iter().all(|d| d.name != "tool_search"));
-        assert!(deferred_tool_defs(&sources, builtin_count + 3).is_empty());
+        assert!(
+            deferred_tool_defs(&sources, builtin_count + 3, &ShellPrograms::native_posix(),)
+                .is_empty()
+        );
 
         // One past it: built-ins + tool_search + call_tool only; sources
         // deferred. The three always-present depth-0 interaction controls are
         // appended after run_program and do not count toward the threshold.
-        let deferred_regime = all_tool_defs(0, &sources, builtin_count + 2, interactive_surface());
+        let deferred_regime = all_tool_defs(
+            0,
+            &sources,
+            builtin_count + 2,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         let names: Vec<&str> = deferred_regime.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"call_tool"));
@@ -1877,10 +1971,11 @@ mod tests {
         assert!(names.contains(&"exit_plan_mode"));
         assert!(!names.contains(&"srv__echo"));
         assert_eq!(deferred_regime.len(), builtin_count + 5);
-        let deferred: Vec<String> = deferred_tool_defs(&sources, builtin_count + 2)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let deferred: Vec<String> =
+            deferred_tool_defs(&sources, builtin_count + 2, &ShellPrograms::native_posix())
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
         assert_eq!(deferred, vec!["srv__echo", "srv__fail", "srv__image"]);
     }
 
@@ -1889,7 +1984,13 @@ mod tests {
     #[test]
     fn run_program_def_declares_inline_source_tools() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
-        let defs = all_tool_defs(0, &sources, TOOL_DEFER_THRESHOLD, interactive_surface());
+        let defs = all_tool_defs(
+            0,
+            &sources,
+            TOOL_DEFER_THRESHOLD,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("srv__echo(args:"),
@@ -1910,7 +2011,13 @@ mod tests {
     fn run_program_def_lists_deferred_source_tools_as_a_manifest() {
         let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
         // One source (2 tools) past the built-in count forces the defer regime.
-        let defs = all_tool_defs(0, &sources, tool_defs(0).len(), interactive_surface());
+        let defs = all_tool_defs(
+            0,
+            &sources,
+            tool_defs(0, &ShellPrograms::native_posix()).len(),
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         assert!(
             rp.description.contains("- tools.srv__echo:"),
@@ -1942,7 +2049,7 @@ mod tests {
             }],
             readonly: String::new(),
         })];
-        assert!(deferred_tool_defs(&clash, 0).is_empty());
+        assert!(deferred_tool_defs(&clash, 0, &ShellPrograms::native_posix()).is_empty());
     }
 
     #[tokio::test]
@@ -2164,6 +2271,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn concurrent_powershell_calls_share_the_session_gate() {
+        let ctx = test_ctx(0, "powershell-session-gate");
+        let mutex = format!("Local\\kloop-powershell-gate-{}", std::process::id());
+        let command = format!(
+            "$mutex = [Threading.Mutex]::new($false, '{mutex}'); \
+             if (-not $mutex.WaitOne(0)) {{ Write-Output overlap }} else {{ \
+             try {{ Start-Sleep -Seconds 2; Write-Output done }} finally {{ $mutex.ReleaseMutex() }} }}"
+        );
+        let first = run_tool("powershell", json!({"command": command.clone()}), &ctx);
+        let second = run_tool("powershell", json!({"command": command}), &ctx);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first, ("done".into(), false));
+        assert_eq!(second, ("done".into(), false));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_while_waiting_for_powershell_gate_never_spawns() {
+        let ctx = test_ctx(0, "powershell-gate-cancel");
+        let marker = std::env::temp_dir().join(format!(
+            "kloop-powershell-gate-cancel-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let marker_literal = marker.to_string_lossy().replace('\'', "''");
+        let command = format!("[IO.File]::WriteAllText('{marker_literal}', 'spawned')");
+        let guard = ctx.cfg.powershell_execution_gate.lock().await;
+        let worker_ctx = ctx.clone();
+        let worker = tokio::spawn(async move {
+            run_tool("powershell", json!({"command": command}), &worker_ctx).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ctx.cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await
+            .expect("gate waiter ignored cancellation")
+            .unwrap();
+        assert_eq!(result, ("interrupted".into(), true));
+        assert!(!marker.exists(), "cancelled gate waiter spawned PowerShell");
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn dispatch_preserves_request_order_across_mixed_batches() {
         let ctx = test_ctx(0, "order");
@@ -2296,6 +2447,7 @@ mod tests {
                 shell_programs: std::sync::Arc::new(
                     crate::shell_programs::ShellPrograms::test_fixture(),
                 ),
+                powershell_execution_gate: Default::default(),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
                 tool_allowlist: None,

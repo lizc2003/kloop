@@ -12,8 +12,6 @@ use std::os::windows::io::FromRawHandle as _;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,6 +25,7 @@ use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::DBG_CONTINUE;
 use windows_sys::Win32::Foundation::DBG_EXCEPTION_NOT_HANDLED;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+use windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT;
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -142,13 +141,104 @@ struct Job {
 struct JobSet {
     root: Job,
     descendants: Job,
-    terminated: AtomicBool,
+    lifecycle: Mutex<JobLifecycle>,
+}
+
+struct JobLifecycle {
+    admission_open: bool,
+    termination_complete: bool,
 }
 
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 unsafe impl Send for JobSet {}
 unsafe impl Sync for JobSet {}
+
+impl JobSet {
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, JobLifecycle> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn admit_descendant(&self, process_id: u32) -> io::Result<bool> {
+        let lifecycle = self.lifecycle();
+        let process = OwnedHandle::new(unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                0,
+                process_id,
+            )
+        })
+        .map_err(|error| {
+            io::Error::other(format!(
+                "cannot open suspended Windows descendant for Job admission: {error}"
+            ))
+        })?;
+        if !lifecycle.admission_open {
+            if unsafe { TerminateProcess(process.raw(), 1) } == 0 {
+                return Err(io::Error::other(format!(
+                    "cannot terminate Windows descendant after Job admission closed: {}",
+                    last_error()
+                )));
+            }
+            return Ok(false);
+        }
+        let in_job = match process_in_job(process.raw(), &self.root).and_then(|in_root| {
+            if in_root {
+                Ok(true)
+            } else {
+                process_in_job(process.raw(), &self.descendants)
+            }
+        }) {
+            Ok(in_job) => in_job,
+            Err(error) => {
+                return Err(terminate_after_admission_failure(process.raw(), error));
+            }
+        };
+        if !in_job
+            && unsafe { AssignProcessToJobObject(self.descendants.handle.raw(), process.raw()) }
+                == 0
+        {
+            let error = io::Error::other(format!(
+                "cannot assign suspended Windows descendant to containment Job: {}",
+                last_error()
+            ));
+            return Err(terminate_after_admission_failure(process.raw(), error));
+        }
+        Ok(true)
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        let mut lifecycle = self.lifecycle();
+        if lifecycle.termination_complete {
+            return Ok(());
+        }
+        lifecycle.admission_open = false;
+        let mut first_error = None;
+        for job in [&self.descendants, &self.root] {
+            if unsafe { TerminateJobObject(job.handle.raw(), 1) } == 0 && first_error.is_none() {
+                first_error = Some(last_error());
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        lifecycle.termination_complete = true;
+        Ok(())
+    }
+}
+
+fn terminate_after_admission_failure(process: HANDLE, error: io::Error) -> io::Error {
+    if unsafe { TerminateProcess(process, 1) } == 0 {
+        io::Error::other(format!(
+            "{error}; additionally failed to terminate the unadmitted descendant: {}",
+            last_error()
+        ))
+    } else {
+        error
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Killer {
@@ -609,25 +699,19 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
     }
     #[cfg(test)]
     if fault == SpawnFault::RealAssignFailure {
-        unsafe {
-            TerminateJobObject(jobs.root.handle.raw(), 1);
-        }
+        terminate_jobs(&jobs);
         return Err(io::Error::other(
             "expected active-process limit to reject Job assignment",
         ));
     }
     #[cfg(test)]
     if fault == SpawnFault::BeforeResume {
-        unsafe {
-            TerminateJobObject(jobs.root.handle.raw(), 1);
-        }
+        terminate_jobs(&jobs);
         return Err(io::Error::other("injected failure before root resume"));
     }
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
         let error = last_error();
-        unsafe {
-            TerminateJobObject(jobs.root.handle.raw(), 1);
-        }
+        terminate_jobs(&jobs);
         return Err(error);
     }
     drop(thread);
@@ -647,7 +731,23 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
 }
 
 impl Debugger {
-    fn finish(&mut self) -> io::Result<()> {
+    async fn finish(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        while self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for Windows descendant debugger",
+                ));
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+            )
+            .await;
+        }
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
@@ -696,6 +796,7 @@ fn record_debug_failure(failure: &Mutex<Option<DebugFailure>>, error: &io::Error
 
 fn debug_descendants(root_pid: u32, jobs: &JobSet) -> io::Result<()> {
     let mut processes = HashSet::new();
+    let mut pending_initial_breakpoints = HashSet::new();
     loop {
         let mut event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
         if unsafe { WaitForDebugEvent(&mut event, INFINITE) } == 0 {
@@ -712,46 +813,12 @@ fn debug_descendants(root_pid: u32, jobs: &JobSet) -> io::Result<()> {
                 let info = unsafe { event.u.CreateProcessInfo };
                 close_debug_file(info.hFile);
                 processes.insert(event.dwProcessId);
+                pending_initial_breakpoints.insert(event.dwProcessId);
                 if event.dwProcessId != root_pid {
-                    match OwnedHandle::new(unsafe {
-                        OpenProcess(
-                            PROCESS_QUERY_LIMITED_INFORMATION
-                                | PROCESS_SET_QUOTA
-                                | PROCESS_TERMINATE,
-                            0,
-                            event.dwProcessId,
-                        )
-                    }) {
-                        Err(error) => {
-                            event_failure = Some(io::Error::other(format!(
-                                "cannot open suspended Windows descendant for Job assignment: {error}"
-                            )));
-                        }
-                        Ok(process) => {
-                            let in_job =
-                                process_in_job(process.raw(), &jobs.root).and_then(|in_root| {
-                                    if in_root {
-                                        Ok(true)
-                                    } else {
-                                        process_in_job(process.raw(), &jobs.descendants)
-                                    }
-                                });
-                            if let Err(error) = in_job {
-                                event_failure = Some(error);
-                            } else if !in_job.expect("Job membership was checked")
-                                && unsafe {
-                                    AssignProcessToJobObject(
-                                        jobs.descendants.handle.raw(),
-                                        process.raw(),
-                                    )
-                                } == 0
-                            {
-                                event_failure = Some(io::Error::other(format!(
-                                    "cannot assign suspended Windows descendant to containment Job: {}",
-                                    last_error()
-                                )));
-                            }
-                        }
+                    match jobs.admit_descendant(event.dwProcessId) {
+                        Ok(true) => {}
+                        Ok(false) => {}
+                        Err(error) => event_failure = Some(error),
                     }
                     if event_failure.is_some() {
                         unsafe {
@@ -766,13 +833,20 @@ fn debug_descendants(root_pid: u32, jobs: &JobSet) -> io::Result<()> {
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 processes.remove(&event.dwProcessId);
+                pending_initial_breakpoints.remove(&event.dwProcessId);
                 all_exited = processes.is_empty();
             }
             _ => {}
         }
 
         let status = if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
-            DBG_EXCEPTION_NOT_HANDLED
+            let exception = unsafe { event.u.Exception };
+            exception_continue_status(
+                &mut pending_initial_breakpoints,
+                event.dwProcessId,
+                exception.ExceptionRecord.ExceptionCode,
+                exception.dwFirstChance,
+            )
         } else {
             DBG_CONTINUE
         };
@@ -788,6 +862,22 @@ fn debug_descendants(root_pid: u32, jobs: &JobSet) -> io::Result<()> {
         if all_exited {
             return Ok(());
         }
+    }
+}
+
+fn exception_continue_status(
+    pending_initial_breakpoints: &mut HashSet<u32>,
+    process_id: u32,
+    exception_code: i32,
+    first_chance: u32,
+) -> i32 {
+    if first_chance != 0
+        && exception_code == EXCEPTION_BREAKPOINT
+        && pending_initial_breakpoints.remove(&process_id)
+    {
+        DBG_CONTINUE
+    } else {
+        DBG_EXCEPTION_NOT_HANDLED
     }
 }
 
@@ -818,17 +908,17 @@ fn terminate_job_and_wait(job: &Job, process: &OwnedHandle) {
 }
 
 fn terminate_jobs(jobs: &JobSet) {
-    unsafe {
-        TerminateJobObject(jobs.descendants.handle.raw(), 1);
-        TerminateJobObject(jobs.root.handle.raw(), 1);
-    }
+    let _ = jobs.terminate();
 }
 
 fn create_job_set() -> io::Result<JobSet> {
     Ok(JobSet {
         root: create_job()?,
         descendants: create_job()?,
-        terminated: AtomicBool::new(false),
+        lifecycle: Mutex::new(JobLifecycle {
+            admission_open: true,
+            termination_complete: false,
+        }),
     })
 }
 
@@ -890,6 +980,20 @@ fn fill_job_to_active_process_limit(
         return Err(last_error());
     }
 
+    let (process, thread) = create_suspended_test_process(cwd)?;
+    if unsafe { AssignProcessToJobObject(job.handle.raw(), process.raw()) } == 0 {
+        let error = last_error();
+        unsafe {
+            TerminateProcess(process.raw(), 1);
+            WaitForSingleObject(process.raw(), INFINITE);
+        }
+        return Err(error);
+    }
+    Ok((process, thread))
+}
+
+#[cfg(test)]
+fn create_suspended_test_process(cwd: &std::path::Path) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let executable =
         PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
             .join("System32")
@@ -920,17 +1024,10 @@ fn fill_job_to_active_process_limit(
     {
         return Err(last_error());
     }
-    let process = OwnedHandle::new(info.hProcess)?;
-    let thread = OwnedHandle::new(info.hThread)?;
-    if unsafe { AssignProcessToJobObject(job.handle.raw(), process.raw()) } == 0 {
-        let error = last_error();
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-            WaitForSingleObject(process.raw(), INFINITE);
-        }
-        return Err(error);
-    }
-    Ok((process, thread))
+    Ok((
+        OwnedHandle::new(info.hProcess)?,
+        OwnedHandle::new(info.hThread)?,
+    ))
 }
 
 fn prepare_stdio(stdout: ProcessStdio, stderr: ProcessStdio) -> io::Result<ChildStdio> {
@@ -1213,31 +1310,70 @@ impl Child {
     }
 
     pub(super) async fn cleanup_after_exit(&mut self, timeout: Duration) -> io::Result<()> {
-        if self.killer.is_alive()? {
-            self.killer.terminate()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut first_error = self.killer.terminate().err();
+        if let Err(error) = wait_tree_empty(&self.killer, deadline).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
-        wait_tree_empty(&self.killer, timeout).await?;
-        self.finish_debugger()
+        if let Err(error) = self.finish_debugger(deadline).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(super) async fn terminate_and_wait(
         &mut self,
         timeout: Duration,
     ) -> io::Result<ProcessExit> {
-        self.killer.terminate()?;
-        let exit = tokio::time::timeout(timeout, self.wait())
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "timed out reaping process root")
-            })??;
-        wait_tree_empty(&self.killer, timeout).await?;
-        self.finish_debugger()?;
-        Ok(exit)
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut first_error = self.killer.terminate().err();
+        let exit = match tokio::time::timeout_at(deadline, self.wait()).await {
+            Ok(Ok(exit)) => Some(exit),
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                None
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out reaping process root",
+                    ));
+                }
+                None
+            }
+        };
+        if let Err(error) = wait_tree_empty(&self.killer, deadline).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = self.finish_debugger(deadline).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        match (first_error, exit) {
+            (Some(error), _) => Err(error),
+            (None, Some(exit)) => Ok(exit),
+            (None, None) => Err(io::Error::other(
+                "process root did not produce an exit status",
+            )),
+        }
     }
 
-    fn finish_debugger(&mut self) -> io::Result<()> {
+    async fn finish_debugger(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
         match self.debugger.as_mut() {
-            Some(debugger) => debugger.finish(),
+            Some(debugger) => debugger.finish(deadline).await,
             None => Ok(()),
         }
     }
@@ -1251,20 +1387,7 @@ impl Drop for Child {
 
 impl Killer {
     pub(super) fn terminate(&self) -> io::Result<()> {
-        if self.jobs.terminated.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut first_error = None;
-        for job in [&self.jobs.descendants, &self.jobs.root] {
-            if unsafe { TerminateJobObject(job.handle.raw(), 1) } == 0 && first_error.is_none() {
-                first_error = Some(last_error());
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        self.jobs.terminated.store(true, Ordering::Release);
-        Ok(())
+        self.jobs.terminate()
     }
 
     pub(super) fn is_alive(&self) -> io::Result<bool> {
@@ -1299,8 +1422,7 @@ fn wait_process(handle: &OwnedHandle) -> io::Result<()> {
     }
 }
 
-async fn wait_tree_empty(killer: &Killer, timeout: Duration) -> io::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
+async fn wait_tree_empty(killer: &Killer, deadline: tokio::time::Instant) -> io::Result<()> {
     while killer.is_alive()? {
         if tokio::time::Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -1308,7 +1430,10 @@ async fn wait_tree_empty(killer: &Killer, timeout: Duration) -> io::Result<()> {
                 "Windows Job Object did not become empty",
             ));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
     }
     Ok(())
 }
@@ -1334,6 +1459,92 @@ mod tests {
         assert_eq!(quote("a b"), "\"a b\"");
         assert_eq!(quote("a\\\"b"), "\"a\\\\\\\"b\"");
         assert_eq!(quote("a b\\"), "\"a b\\\\\"");
+    }
+
+    #[test]
+    fn initial_breakpoint_is_consumed_once_per_process() {
+        let mut pending = HashSet::from([7, 9]);
+        assert_eq!(
+            exception_continue_status(&mut pending, 7, 1, 1),
+            DBG_EXCEPTION_NOT_HANDLED
+        );
+        assert!(pending.contains(&7));
+        assert_eq!(
+            exception_continue_status(&mut pending, 7, EXCEPTION_BREAKPOINT, 0),
+            DBG_EXCEPTION_NOT_HANDLED
+        );
+        assert!(pending.contains(&7));
+        assert_eq!(
+            exception_continue_status(&mut pending, 7, EXCEPTION_BREAKPOINT, 1),
+            DBG_CONTINUE
+        );
+        assert!(!pending.contains(&7));
+        assert_eq!(
+            exception_continue_status(&mut pending, 7, EXCEPTION_BREAKPOINT, 1),
+            DBG_EXCEPTION_NOT_HANDLED
+        );
+        assert_eq!(
+            exception_continue_status(&mut pending, 9, EXCEPTION_BREAKPOINT, 1),
+            DBG_CONTINUE
+        );
+    }
+
+    #[test]
+    fn job_admission_and_termination_are_linearized_in_both_orders() {
+        let cwd = std::env::current_dir().unwrap();
+
+        let jobs = create_job_set().unwrap();
+        let (process, _thread) = create_suspended_test_process(&cwd).unwrap();
+        let process_id =
+            unsafe { windows_sys::Win32::System::Threading::GetProcessId(process.raw()) };
+        assert_ne!(process_id, 0);
+        assert!(jobs.admit_descendant(process_id).unwrap());
+        jobs.terminate().unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.raw(), 2_000) },
+            WAIT_OBJECT_0
+        );
+        assert!(!job_is_alive(&jobs.descendants).unwrap());
+
+        let jobs = create_job_set().unwrap();
+        let (process, _thread) = create_suspended_test_process(&cwd).unwrap();
+        let process_id =
+            unsafe { windows_sys::Win32::System::Threading::GetProcessId(process.raw()) };
+        assert_ne!(process_id, 0);
+        jobs.terminate().unwrap();
+        assert!(!jobs.admit_descendant(process_id).unwrap());
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.raw(), 2_000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[tokio::test]
+    async fn debugger_finish_never_joins_past_its_deadline() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut debugger = Debugger {
+            thread: Some(std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+            })),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        let started = tokio::time::Instant::now();
+        let error = debugger
+            .finish(started + Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            debugger.thread.is_some(),
+            "timed-out finish must retain the join handle"
+        );
+        release_tx.send(()).unwrap();
+        debugger
+            .finish(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(debugger.thread.is_none());
     }
 
     #[test]

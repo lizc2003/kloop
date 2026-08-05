@@ -212,6 +212,7 @@ mod tests {
             shell_programs: std::sync::Arc::new(
                 crate::shell_programs::ShellPrograms::test_fixture(),
             ),
+            powershell_execution_gate: Default::default(),
             sandbox: None,
             agent_types: Arc::new(Vec::new()),
             tool_allowlist: None,

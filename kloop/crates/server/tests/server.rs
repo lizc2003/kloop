@@ -233,6 +233,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
             shell_programs: std::sync::Arc::new(
                 kloop_core::shell_programs::ShellPrograms::test_fixture(),
             ),
+            powershell_execution_gate: Default::default(),
             sandbox: None,
             agent_types: std::sync::Arc::new(Vec::new()),
             tool_allowlist: None,
@@ -368,6 +369,7 @@ fn worktree_factory(
             shell_programs: std::sync::Arc::new(
                 kloop_core::shell_programs::ShellPrograms::test_fixture(),
             ),
+            powershell_execution_gate: Default::default(),
             sandbox: None,
             agent_types: std::sync::Arc::new(Vec::new()),
             tool_allowlist: None,

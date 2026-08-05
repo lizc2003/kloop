@@ -101,6 +101,8 @@ fn shell_spec(
         None => (bash.executable.clone(), shell_args),
     };
     let mut spec = ProcessSpec::new(program, cwd);
+    #[cfg(windows)]
+    spec.require_windows_descendant_debugging();
     spec.args = args;
     if let Some(policy) = sandbox {
         spec.env("KLOOP_SANDBOX", "seatbelt");
@@ -1013,6 +1015,16 @@ mod tests {
         (ctx, ui)
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_bash_spec_requires_descendant_debugging() {
+        let bash = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .unwrap();
+        let spec = super::shell_spec("exit 0", &std::env::current_dir().unwrap(), None, &bash);
+        assert!(spec.windows_debug_descendants());
+    }
+
     #[cfg(unix)]
     struct ForegroundTree {
         root: PathBuf,
@@ -1095,11 +1107,27 @@ exec sleep 60
         }
 
         fn command(&self) -> String {
+            let (programs, _) = crate::shell_programs::resolve_shell_programs(Default::default())
+                .expect("native Windows shell discovery succeeds");
+            let powershell = programs
+                .powershell
+                .expect("Windows Bash lifecycle tests require PowerShell 7");
+            assert_eq!(
+                powershell.flavor,
+                crate::shell_programs::ShellFlavor::PowerShell7,
+                "Windows Bash lifecycle tests require PowerShell 7"
+            );
+            self.command_with_powershell(&powershell)
+        }
+
+        fn command_with_powershell(
+            &self,
+            powershell: &crate::shell_programs::ShellProgram,
+        ) -> String {
             let root = self.root.to_string_lossy().replace('\'', "''");
             let script = format!(
                 r#"$root = '{root}'
-$exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$grandchild = Start-Process -FilePath $exe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru
+$grandchild = Start-Process -FilePath $env:ComSpec -ArgumentList @('/D', '/C', 'ping 127.0.0.1 -n 60 > NUL') -PassThru
 [IO.File]::WriteAllText((Join-Path $root 'child.pid'), [string]$PID)
 [IO.File]::WriteAllText((Join-Path $root 'grandchild.pid'), [string]$grandchild.Id)
 Wait-Process -Id $grandchild.Id
@@ -1110,16 +1138,11 @@ Wait-Process -Id $grandchild.Id
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>();
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let executable = PathBuf::from(
-                std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
-            )
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe")
-            .to_string_lossy()
-            .replace('\\', "/")
-            .replace('\'', "'\\''");
+            let executable = powershell
+                .executable
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "'\\''");
             format!("'{executable}' -NoLogo -NoProfile -NonInteractive -EncodedCommand '{encoded}'")
         }
 
@@ -1776,6 +1799,87 @@ Wait-Process -Id $grandchild.Id
         assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
         assert_eq!(updates[1].status, BackgroundTaskStatus::Cancelled);
         assert_eq!(updates[1].detail.as_deref(), Some("session shutdown"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle() {
+        let Some(powershell) = crate::shell_programs::official_msix_powershell_for_test() else {
+            eprintln!("skipped: no official PowerShell MSIX package is installed");
+            return;
+        };
+        assert_eq!(
+            powershell.flavor,
+            crate::shell_programs::ShellFlavor::PowerShell7
+        );
+
+        let tree = WindowsBackgroundTree::new("msix-timeout");
+        let ctx = test_ctx(0, "windows-msix-timeout");
+        let execution = run_tool(
+            "bash",
+            json!({
+                "command": tree.command_with_powershell(&powershell),
+                "timeout_ms": 500
+            }),
+            &ctx,
+        );
+        let (result, pids) = tokio::join!(execution, wait_for_windows_tree_pids(&tree));
+        let (output, is_error) = result;
+        assert!(is_error && output.contains("timed out"), "{output}");
+        assert_windows_processes_dead(pids).await;
+
+        let tree = WindowsBackgroundTree::new("msix-cancel");
+        let ctx = test_ctx(0, "windows-msix-cancel");
+        let execution = run_tool(
+            "bash",
+            json!({
+                "command": tree.command_with_powershell(&powershell),
+                "timeout_ms": 60_000
+            }),
+            &ctx,
+        );
+        let cancellation = async {
+            let pids = wait_for_windows_tree_pids(&tree).await;
+            ctx.cancel.cancel();
+            pids
+        };
+        let (result, pids) = tokio::join!(execution, cancellation);
+        assert_eq!(result, ("interrupted".into(), true));
+        assert_windows_processes_dead(pids).await;
+
+        let tree = WindowsBackgroundTree::new("msix-background-kill");
+        let ctx = test_ctx(0, "windows-msix-background-kill");
+        let (output, is_error) = run_tool(
+            "bash",
+            json!({
+                "command": tree.command_with_powershell(&powershell),
+                "run_in_background": true
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        let id = bg_id(&output);
+        let pids = wait_for_windows_tree_pids(&tree).await;
+        let (output, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
+        assert!(!is_error, "{output}");
+        assert_windows_processes_dead(pids).await;
+
+        let tree = WindowsBackgroundTree::new("msix-session-shutdown");
+        let ctx = test_ctx(0, "windows-msix-session-shutdown");
+        let (output, is_error) = run_tool(
+            "bash",
+            json!({
+                "command": tree.command_with_powershell(&powershell),
+                "run_in_background": true
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        let pids = wait_for_windows_tree_pids(&tree).await;
+        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_windows_processes_dead(pids).await;
     }
 
     #[cfg(windows)]

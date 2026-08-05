@@ -53,17 +53,20 @@ See the [exact corpus guide](../refs/claude-code-2.1.220/README.md), [methodolog
 
 | Runtime | Bash-family tool | PowerShell tool | Process-tree ownership | OS filesystem/network sandbox |
 |---|---|---|---|---|
-| macOS | frozen POSIX `sh -lc` | not registered | dedicated process group | Seatbelt for Bash by default |
-| Linux | frozen POSIX `sh -lc`; WSL uses `/bin/bash -lc` | not registered | dedicated process group | not implemented |
-| Native Windows | validated Git for Windows `bin\bash.exe -lc`, registered only when available | highest trusted PowerShell 7 MSI/MSIX `pwsh.exe`, falling back to Windows PowerShell 5.1; foreground-only | kill-on-close Job ownership established before user code; PowerShell also recontains debugged descendants before their first thread continues | not implemented |
+| macOS | frozen executable POSIX `sh -lc` | not registered | dedicated process group | Seatbelt for Bash by default |
+| Linux | frozen executable POSIX `sh -lc`; WSL uses an executable `/bin/bash -lc` | not registered | dedicated process group | not implemented |
+| Native Windows | validated Git for Windows `bin\bash.exe -lc`, registered only when available | highest trusted PowerShell 7 MSI/MSIX `pwsh.exe`, falling back to Windows PowerShell 5.1; foreground-only | kill-on-close root Job established before user code; every Bash/PowerShell spawn also debug-gates descendants into a fixed containment Job set | not implemented |
 
 Shell executables are resolved once at startup and inherited unchanged by server
-threads, sub-agents, worktrees, and code mode. On Windows, Job containment is
-mandatory even though restricted-token/AppContainer filesystem and network
-sandboxing are not implemented; no setting or per-call field disables the Job.
-The pinned Claude Code parity target is darwin-arm64, so this native Windows
-surface is a kloop contract, not a new `same`/`compatible` claim for the pinned
-PowerShell matrix row.
+threads, sub-agents, worktrees, and code mode. Unix discovery skips non-executable
+`sh` candidates and validates the final regular-file executable, including the
+fallback and a symlink's target. On Windows, Job containment is mandatory even
+though restricted-token/AppContainer filesystem and network sandboxing are not
+implemented; no setting or per-call field disables the Job. The debug gate is a
+process-tree ownership boundary, not a defense against protected processes or a
+child that installs its own debugger. The pinned Claude Code parity target is
+darwin-arm64, so this native Windows surface is a kloop contract, not a new
+`same`/`compatible` claim for the pinned PowerShell matrix row.
 
 ## Compaction (Phase 2, first slice)
 
@@ -1005,9 +1008,10 @@ bypass` included.
 
 ## Foreground bash lifecycle (Plan 50 parity pass)
 
-Foreground `bash` runs the frozen shell identity with `-lc`: ordinary Unix uses
-its resolved POSIX `sh`, WSL uses `/bin/bash`, and native Windows uses only a
-validated Git for Windows `bin\bash.exe`. Windows never substitutes PowerShell,
+Foreground `bash` runs the frozen shell identity with `-lc`: ordinary Unix resolves
+an executable regular-file POSIX `sh` (skipping non-executable PATH entries and
+validating the fallback/symlink target), WSL validates `/bin/bash`, and native
+Windows uses only a validated Git for Windows `bin\bash.exe`. Windows never substitutes PowerShell,
 `cmd.exe`, WSL, Cygwin, BusyBox, or an arbitrary PATH `sh.exe`. stdin is closed
 and stdout/stderr use separate pipes. Both pipes are drained concurrently to
 EOF, so a child filling one stream cannot deadlock behind an unread other
@@ -1019,26 +1023,37 @@ omitted. stdout precedes stderr in the canonical result, followed by
 `(no output)`.
 
 Every spawn owns a complete process tree: a dedicated process group on Unix or
-a dedicated Job Object on native Windows. Windows creates the root suspended,
-assigns it to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, and resumes it only
-after assignment succeeds; create/assign/resume failure is fail-closed and never
-falls back to a bare child. The stdio handle-list owns both its attribute storage
-and handle-value array until `CreateProcessW` completes. A workspace-wide child-
-creation gate serializes that short inheritable-handle window with hook, MCP, Git,
-and other kloop process spawns, so an unrelated child cannot steal a pipe writer.
-Environment keys retain raw UTF-16 and use Windows ordinal case-insensitive
-comparison; a cancellable wait future re-polls one persistent process waiter
-instead of leaking a blocking waiter on each watchdog tick. A timeout or turn
-cancellation terminates the entire tree, explicitly waits/reaps the direct shell
-child, confirms the tree is empty, and only then drains the pipes under a short
-deadline. If the shell leader exits normally while a descendant remains,
-foreground completion terminates that residual tree before waiting for EOF. A
-synchronous Drop guard covers panic or a caller dropping outside the normal
-cancellation protocol. The dispatch layer preserves the boundary: cancellation
-during hooks or approval cannot spawn the command; once foreground Bash has
-spawned, dispatch waits for cleanup rather than dropping the future and returning
-early. Concurrent read-only Bash calls each finish their own cleanup before
-paired interrupted results are returned.
+a fixed pair of dedicated Job Objects on native Windows. Windows creates the root
+suspended, assigns it to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, and resumes it
+only after assignment succeeds; create/assign/resume failure is fail-closed and
+never falls back to a bare child. Every Windows Bash and PowerShell root also runs
+under `DEBUG_PROCESS`: each process gets exactly one first-chance initial
+breakpoint consumed by the debugger, while later breakpoints and all other
+exceptions remain unhandled. A descendant create event is admitted to the root or
+containment Job before its first thread continues. Admission and termination use
+one lifecycle mutex, so termination permanently closes admission before killing
+both Jobs and a late event process cannot escape. Debug image/DLL file handles are
+closed explicitly; process/thread debug handles remain owned by the debugger
+contract and are closed by the system after their exit events are continued.
+
+The stdio handle-list owns both its attribute storage and handle-value array until
+`CreateProcessW` completes. A workspace-wide child-creation gate serializes that
+short inheritable-handle window with hook, MCP, Git, and other kloop process
+spawns, so an unrelated child cannot steal a pipe writer. Environment keys retain
+raw UTF-16 and use Windows ordinal case-insensitive comparison; a cancellable wait
+future re-polls one persistent process waiter instead of leaking a blocking waiter
+on each watchdog tick. A timeout or turn cancellation terminates the entire tree,
+explicitly waits/reaps the direct shell child, confirms the tree is empty, and
+finishes the debugger within one shared absolute cleanup deadline; it never stacks
+separate phase timeouts or performs an unbounded thread join. Only then are pipes
+drained under their own short bound. If the shell leader exits normally while a
+descendant remains, foreground completion terminates that residual tree before
+waiting for EOF. A synchronous Drop guard closes admission and terminates the Jobs
+without sleeping or joining. The dispatch layer preserves the boundary:
+cancellation during hooks or approval cannot spawn the command; once foreground
+Bash has spawned, dispatch waits for cleanup rather than dropping the future and
+returning early. Concurrent read-only Bash calls each finish their own cleanup
+before paired interrupted results are returned.
 
 These are intentional safety differences from the pinned Claude Code 2.1.220 behavior: its
 stubborn timeout is promoted to a background task and its running SIGINT path reports a user
@@ -1098,7 +1113,10 @@ Native Windows conditionally registers a separate foreground-only
 PowerShell 7 installation: versioned MSI roots plus installed official
 `Microsoft.PowerShell[_-LTS]_8wekyb3d8bbwe` MSIX package roots resolved through
 the Windows package API. Candidates are ranked by the executable's file-version
-resource, with directory/package metadata only as a fallback; this handles MSI's
+resource. A reported v7 resource is authoritative and a reported non-v7 resource
+is rejected; only the Win32 "version resource missing" result may fall back to
+trusted MSI directory or official package metadata. Access, query, signature, and
+format failures are invalid rather than metadata fallbacks. This handles MSI's
 fixed `PowerShell\7` directory without letting an older MSIX outrank a newer
 binary. Startup never trusts an arbitrary PATH `pwsh.exe`. It then falls back to
 Windows PowerShell 5.1. An explicit `[shells].powershell` absolute executable
@@ -1109,27 +1127,41 @@ and flavor are frozen into the runtime snapshot.
 The executor passes a UTF-16LE `EncodedCommand` to a fixed
 `-NoLogo -NoProfile -NonInteractive -EncodedCommand` argv. It does not use a
 temporary script, `Invoke-Expression`, a profile, or `ExecutionPolicy Bypass`.
-The payload sets UTF-8 console/native output encoding, puts the original script
-in its own script block, and snapshots PowerShell success/error state and
-`$LASTEXITCODE` immediately afterward; multiline text, Unicode, here-strings,
-trailing comments, native exit codes, and explicit `exit N` retain their
-meaning. Hooks, permission prompts, events, history, and `PowerShell PS>` TUI
-rows always carry the original script, never the encoded payload.
+The payload sets UTF-8 console/native output encoding, clears `$LASTEXITCODE`
+before the original script, runs that script in its own script block, and
+immediately snapshots final `$?`, `$LASTEXITCODE`, and newly-added `$Error`
+entries. New PowerShell errors return 1; a successful final PowerShell operation
+returns 0 even if an earlier native command left a stale nonzero code; an
+otherwise-failed final native command propagates its nonzero code; all other
+failures return 1. Multiline text, Unicode, here-strings, trailing comments, and
+explicit `exit N` retain their meaning. Hooks, permission prompts, events,
+history, and `PowerShell PS>` TUI rows always carry the original script, never
+the encoded payload.
 
 PowerShell v1 has no background mode, stdin/PTY/session channel, executable
 override, or sandbox escape field; unknown fields are rejected even if a caller
 bypasses the published schema. It reuses the bounded dual-pipe foreground
 executor, credential environment scrub, timeout/cancellation cleanup, and the
-mandatory Windows Job Object. The Job is process-tree containment only: Windows
-still has no restricted-token/AppContainer filesystem or network sandbox.
-PowerShell process creation also uses a fail-closed `DEBUG_PROCESS` gate because
-an MSIX-hosted `Start-Process` descendant may not remain in the root Job. The
-root is still assigned before resume; every descendant create event is checked
-before continuation and any non-member is assigned to a second kill-on-close
-Job. Open, membership, assignment, or debug-continuation failure terminates the
-event process and both Jobs. Cleanup owns this fixed Job set and never falls
-back to PID scanning, a bare child, uncontrolled breakaway, or direct-child
-kill.
+mandatory Windows Job set. The Jobs are process-tree containment only: Windows
+still has no restricted-token/AppContainer filesystem or network sandbox. Every
+Windows Bash and PowerShell process uses the fail-closed debug gate because an
+MSIX-hosted `Start-Process` descendant may not remain in the root Job. The root
+is still assigned before resume; each descendant create event is admitted under
+the same lifecycle lock that permanently closes admission during termination,
+then any non-member is assigned to the second kill-on-close Job before its first
+thread continues. Open, membership, assignment, or debug-continuation failure
+terminates the event process and both Jobs. Cleanup owns this fixed Job set and
+never falls back to PID scanning, a bare child, uncontrolled breakaway, or
+direct-child kill.
+
+All PowerShell execution in one session also shares one exclusive async gate.
+Direct calls and foreground/background code-mode programs therefore cannot
+overlap even when they use separate dispatch rounds or `CoreBridge` instances;
+Config clones and sub-agents share the gate, while independent server sessions do
+not. The gate is acquired after hooks and permission approval but before spawn,
+so cancellation while waiting creates no process. It is released before
+post-tool hooks and is never held around `run_program`, task, skill, wait, or
+other orchestration wrappers.
 
 Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
 and read-only classifier are never applied. Plan mode rejects it without asking;

@@ -232,8 +232,30 @@
 > Windows 可运行 Rust report 与 sensitive-data 门；POSIX descriptor/ctime/symlink/publication/PTY
 > self-test 在 Windows 改验 case declaration、unsafe path rejection 和 collector/PTY fail-closed。
 > Darwin-arm64-only Plan 59 report 不在 Windows 伪跑，pinned PowerShell `n/a` matrix 未修改；
-> hash-bound fixture JSON 以 `.gitattributes -text` 防 `core.autocrlf` 改写。Windows
+> hash-bound fixture JSON 以 `.gitattributes -text` 防新 checkout 被 `core.autocrlf` 改写；既有 checkout 不会自动迁移。Windows
 > filesystem/network sandbox 仍未实现，hooks/MCP/Git 仍只共享 process-creation gate。提交 SHA 以本条所在提交为准。
+>
+> **Plan 62 `ef61d9c` 审查纠偏（2026-08-05）**：所有 Windows Bash 与 PowerShell spawn 都必须进
+> `DEBUG_PROCESS` descendant gate，不能按命令文本/PATH/pwsh 名称选择性开启；每 PID 只消费一次
+> first-chance initial breakpoint，其他异常交回进程。descendant open/check/assign 与 terminate 必须共用
+> lifecycle mutex；terminate 永久关闭 admission 后即使部分失败也不能重开，后到 create event 在 continue
+> 前终止。root reap、Job-empty 与 debugger finish 必须消费同一 absolute deadline；只 join 已结束线程，Drop
+> 不 join/sleep。debug create-process/load-dll 的 image/DLL file handle 要显式关闭；process/thread debug
+> handles 不得擅自 CloseHandle，系统会在相应 exit event continue 后关闭。
+>
+> PowerShell final status 不能把 earlier native `$LASTEXITCODE` 当最终结果：脚本前清空，脚本后立即同时看
+> final `$?`、新 `$Error` 和 native code。版本探测必须是 Version/MissingResource/Invalid 三态；只有 Win32
+> 明确缺 version resource 才可信目录/package metadata，明确 non-v7 或 query/access/signature/format 错误都
+> fail closed。PowerShell 串行化是 session Config 的独立 Arc mutex，只包 hook/approval 后到 executor 结束，
+> 不包 run_program/task/skill/wait 等 orchestration；等待锁时取消必须零 spawn。public catalog helper 必须显式
+> 接收 frozen `ShellPrograms`，不能内部重新 discovery/伪造 POSIX snapshot。Unix frozen `sh`/WSL fallback
+> 必须验证最终 regular-file executable（symlink 看 target），不可执行候选继续搜索。
+>
+> `.gitattributes` 只约束未来 checkout，不修已有 `core.autocrlf=true` worktree。hash verifier 可精确诊断
+> CRLF-only expansion，但仍必须失败，不能自动 normalize；只有 `actual.replace(CRLF, LF)` 精确命中 expected
+> 才给 restore 提示，普通 tamper/bare CR/mixed drift 不能收到 destructive guidance。用户确认 fixture 无需保留
+> 后才手工执行 `git restore --source=HEAD --worktree -- refs/claude-code-2.1.220/fixtures`。corrective 原生
+> Windows regression 已落源码，尚须在既有 Windows 10 x64 验收机复跑；cross-compile 只算编译证据。
 >
 **结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。

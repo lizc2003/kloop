@@ -151,7 +151,13 @@ fn schema_report() -> Value {
         scheduler: true,
         ..Default::default()
     };
-    let definitions = all_tool_defs(0, &[], 30, surface);
+    let definitions = all_tool_defs(
+        0,
+        &[],
+        30,
+        surface,
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     let names = ["cron_create", "cron_delete", "cron_list", "schedule_wakeup"];
     let scheduler = names
         .iter()
@@ -169,11 +175,23 @@ fn schema_report() -> Value {
     assert!(scheduler
         .iter()
         .all(|definition| definition.schema["additionalProperties"] == false));
-    let depth_one = all_tool_defs(1, &[], 30, surface);
+    let depth_one = all_tool_defs(
+        1,
+        &[],
+        30,
+        surface,
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     assert!(names
         .iter()
         .all(|name| !depth_one.iter().any(|definition| definition.name == *name)));
-    let disabled = all_tool_defs(0, &[], 30, Default::default());
+    let disabled = all_tool_defs(
+        0,
+        &[],
+        30,
+        Default::default(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     assert!(names
         .iter()
         .all(|name| !disabled.iter().any(|definition| definition.name == *name)));

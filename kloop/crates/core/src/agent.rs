@@ -170,7 +170,7 @@ async fn turn_rounds(
     options: &TurnOptions,
 ) -> TurnOutcome {
     let build_tools = || {
-        let mut tools = crate::tools::all_tool_defs_with_shells(
+        let mut tools = crate::tools::all_tool_defs(
             depth,
             &cfg.tool_sources,
             cfg.defer_threshold,

@@ -275,10 +275,17 @@ mod tests {
                 worktree: true,
                 ..Default::default()
             },
+            &crate::shell_programs::ShellPrograms::native_posix(),
         );
         assert!(on.iter().any(|d| d.name == "enter_worktree"));
         assert!(on.iter().any(|d| d.name == "exit_worktree"));
-        let off = all_tool_defs(0, &[], 30, Default::default());
+        let off = all_tool_defs(
+            0,
+            &[],
+            30,
+            Default::default(),
+            &crate::shell_programs::ShellPrograms::native_posix(),
+        );
         assert!(!off.iter().any(|d| d.name == "enter_worktree"));
 
         // Even if a model somehow calls it, a mode-off session refuses.

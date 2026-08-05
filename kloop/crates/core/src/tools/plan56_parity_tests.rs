@@ -142,6 +142,7 @@ fn schema_report() -> Value {
             worktree: true,
             ..Default::default()
         },
+        &crate::shell_programs::ShellPrograms::native_posix(),
     );
     let enter = definitions
         .iter()

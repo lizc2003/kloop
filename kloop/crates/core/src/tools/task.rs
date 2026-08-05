@@ -733,6 +733,10 @@ mod tests {
 
         let sub = clone_for_subagent(&ctx, None, "agent-fresh".into());
         assert!(!Arc::ptr_eq(&ctx.cfg.file_state, &sub.file_state));
+        assert!(Arc::ptr_eq(
+            &ctx.cfg.powershell_execution_gate,
+            &sub.powershell_execution_gate
+        ));
         assert!(sub.file_state.observation(&path).is_none());
         assert!(ctx.cfg.file_state.observation(&path).is_some());
         let _ = std::fs::remove_file(path);

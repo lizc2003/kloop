@@ -522,15 +522,33 @@ mod tests {
             workflow: true,
             ..Default::default()
         };
-        assert!(super::super::all_tool_defs(0, &[], 30, enabled)
-            .iter()
-            .any(|definition| definition.name == "workflow"));
-        assert!(!super::super::all_tool_defs(1, &[], 30, enabled)
-            .iter()
-            .any(|definition| definition.name == "workflow"));
-        assert!(!super::super::all_tool_defs(0, &[], 30, Default::default())
-            .iter()
-            .any(|definition| definition.name == "workflow"));
+        assert!(super::super::all_tool_defs(
+            0,
+            &[],
+            30,
+            enabled,
+            &crate::shell_programs::ShellPrograms::native_posix(),
+        )
+        .iter()
+        .any(|definition| definition.name == "workflow"));
+        assert!(!super::super::all_tool_defs(
+            1,
+            &[],
+            30,
+            enabled,
+            &crate::shell_programs::ShellPrograms::native_posix(),
+        )
+        .iter()
+        .any(|definition| definition.name == "workflow"));
+        assert!(!super::super::all_tool_defs(
+            0,
+            &[],
+            30,
+            Default::default(),
+            &crate::shell_programs::ShellPrograms::native_posix(),
+        )
+        .iter()
+        .any(|definition| definition.name == "workflow"));
     }
 
     #[tokio::test]

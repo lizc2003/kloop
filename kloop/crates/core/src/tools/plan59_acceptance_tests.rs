@@ -285,10 +285,16 @@ fn init_repo(root: &Path) {
 }
 
 fn names(surface: SurfaceCapabilities) -> Vec<String> {
-    all_tool_defs(0, &[], 30, surface)
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect()
+    all_tool_defs(
+        0,
+        &[],
+        30,
+        surface,
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    )
+    .into_iter()
+    .map(|definition| definition.name)
+    .collect()
 }
 
 async fn file_search_bash_worktree_report() -> Value {
@@ -671,6 +677,7 @@ async fn mcp_web_toolsource_report() -> Value {
         &context.cfg.tool_sources,
         context.cfg.defer_threshold,
         context.cfg.surface,
+        &context.cfg.shell_programs,
     );
     assert!(definitions
         .iter()

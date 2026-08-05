@@ -93,6 +93,10 @@ pub struct Config {
     /// preserve the same executable paths across server threads, sub-agents,
     /// worktrees and code-mode calls.
     pub shell_programs: Arc<ShellPrograms>,
+    /// Session-wide PowerShell exclusivity. Direct calls and foreground/background
+    /// code-mode programs share this gate through Config clones; independent
+    /// server threads build independent Configs and therefore do not serialize.
+    pub powershell_execution_gate: Arc<tokio::sync::Mutex<()>>,
     /// OS sandbox policy for bash execution; None runs commands bare
     /// (sandbox disabled, platform unsupported, --mock). The permission gate
     /// is independent — approved commands still run inside this sandbox, and

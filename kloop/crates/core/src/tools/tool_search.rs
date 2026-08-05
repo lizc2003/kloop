@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
 
-use super::deferred_tool_defs_with_shells;
+use super::deferred_tool_defs;
 use super::str_arg;
 use super::ToolCtx;
 use crate::config::Config;
@@ -80,8 +80,7 @@ pub(super) fn unwrap_call_tool(name: String, input: Value) -> (String, Value) {
 /// refresh may replace the list at the next sampling round. None when deferral
 /// is inactive.
 pub fn deferred_notice(cfg: &Config) -> Option<String> {
-    let defs =
-        deferred_tool_defs_with_shells(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs);
+    let defs = deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs);
     if defs.is_empty() {
         return None;
     }
@@ -97,8 +96,7 @@ pub fn deferred_notice(cfg: &Config) -> Option<String> {
 /// a locked call is a protocol error to bounce back at the model, not
 /// something to ask the human about.
 pub(super) fn locked(name: &str, cfg: &Config) -> bool {
-    let deferred =
-        deferred_tool_defs_with_shells(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs);
+    let deferred = deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs);
     if !deferred.iter().any(|def| def.name == name) {
         return false;
     }
@@ -109,7 +107,7 @@ pub(super) fn locked(name: &str, cfg: &Config) -> bool {
 }
 
 pub(super) fn unlocked_generation_for_dispatch(name: &str, cfg: &Config) -> Option<u64> {
-    deferred_tool_defs_with_shells(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs)
+    deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs)
         .iter()
         .any(|def| def.name == name)
         .then(|| cfg.unlocked_tools.read().unwrap().get(name).copied())
@@ -133,7 +131,7 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     if query.is_empty() {
         bail!("tool_search: query must not be empty");
     }
-    let deferred = deferred_tool_defs_with_shells(
+    let deferred = deferred_tool_defs(
         &ctx.cfg.tool_sources,
         ctx.cfg.defer_threshold,
         &ctx.cfg.shell_programs,
@@ -147,7 +145,7 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select:"))
     {
         let rest = &query["select:".len()..];
-        let loaded = super::all_tool_defs_with_shells(
+        let loaded = super::all_tool_defs(
             ctx.depth,
             &ctx.cfg.tool_sources,
             ctx.cfg.defer_threshold,
@@ -761,6 +759,20 @@ mod tests {
             ..(*ctx.cfg).clone()
         };
         assert!(Arc::ptr_eq(&ctx.cfg.unlocked_tools, &sub.unlocked_tools));
+        assert!(Arc::ptr_eq(
+            &ctx.cfg.powershell_execution_gate,
+            &sub.powershell_execution_gate
+        ));
+    }
+
+    #[test]
+    fn independent_sessions_do_not_share_the_powershell_gate() {
+        let first = deferred_ctx("powershell-gate-first");
+        let second = deferred_ctx("powershell-gate-second");
+        assert!(!Arc::ptr_eq(
+            &first.cfg.powershell_execution_gate,
+            &second.cfg.powershell_execution_gate
+        ));
     }
 
     #[test]

@@ -237,6 +237,120 @@ async fn background_program_returns_immediately_and_reinjects() {
     );
 }
 
+#[cfg(windows)]
+fn powershell_overlap_probe(name: &str) -> String {
+    format!(
+        "$mutex = [Threading.Mutex]::new($false, 'Local\\{name}'); \
+         try {{ if (-not $mutex.WaitOne(0)) {{ Write-Output overlap }} else {{ \
+         try {{ Start-Sleep -Milliseconds 750; Write-Output done }} finally {{ $mutex.ReleaseMutex() }} }} \
+         }} finally {{ $mutex.Dispose() }}"
+    )
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_gate_spans_direct_foreground_and_background_program_bridges() {
+    let ctx = test_ctx(0, "powershell-cross-bridge");
+    let command = powershell_overlap_probe(&format!(
+        "kloop-powershell-direct-program-{}",
+        std::process::id()
+    ));
+    let source = format!(
+        "return await tools.powershell({{ command: {} }});",
+        serde_json::to_string(&command).unwrap()
+    );
+    let direct = run_tool("powershell", json!({"command": command}), &ctx);
+    let foreground_program = run(&source, &ctx);
+    let (direct, foreground_program) = tokio::join!(direct, foreground_program);
+    assert_eq!(direct, ("done".into(), false));
+    assert_eq!(foreground_program, ("done".into(), false));
+
+    let command = powershell_overlap_probe(&format!(
+        "kloop-powershell-background-programs-{}",
+        std::process::id()
+    ));
+    let source = format!(
+        "return await tools.powershell({{ command: {} }});",
+        serde_json::to_string(&command).unwrap()
+    );
+    for _ in 0..2 {
+        let (output, is_error) = run_tool(
+            "run_program",
+            json!({"source": source.clone(), "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert!(output.contains("started in the background"), "{output}");
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ctx.cfg.background_tasks.running_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background PowerShell programs did not finish");
+    let results = ctx.cfg.inbox.drain();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results.iter().all(|item| matches!(
+            item,
+            crate::inbox::InboxItem::ProgramResult { summary, .. } if summary == "done"
+        )),
+        "{results:?}"
+    );
+
+    let mutex_name = format!("kloop-powershell-direct-background-{}", std::process::id());
+    let marker = std::env::temp_dir().join(format!(
+        "kloop-powershell-direct-background-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_literal = marker.to_string_lossy().replace('\'', "''");
+    let background_command = powershell_overlap_probe(&mutex_name).replacen(
+        "try { Start-Sleep",
+        &format!("try {{ [IO.File]::WriteAllText('{marker_literal}', 'started'); Start-Sleep"),
+        1,
+    );
+    let source = format!(
+        "return await tools.powershell({{ command: {} }});",
+        serde_json::to_string(&background_command).unwrap()
+    );
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({"source": source, "background": true}),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{output}");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background PowerShell did not enter its probe");
+    let direct = run_tool(
+        "powershell",
+        json!({"command": powershell_overlap_probe(&mutex_name)}),
+        &ctx,
+    )
+    .await;
+    assert_eq!(direct, ("done".into(), false));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ctx.cfg.background_tasks.running_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background PowerShell program did not finish");
+    assert!(matches!(
+        ctx.cfg.inbox.drain().as_slice(),
+        [crate::inbox::InboxItem::ProgramResult { summary, .. }] if summary == "done"
+    ));
+    let _ = std::fs::remove_file(marker);
+}
+
 /// A background program cancelled via stop_agent ends Aborted and reinjects
 /// NOTHING (codex's is_final) — only a wake so a blocked wait re-evaluates.
 #[tokio::test]

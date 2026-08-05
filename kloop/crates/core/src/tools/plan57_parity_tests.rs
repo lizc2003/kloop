@@ -170,7 +170,13 @@ fn result_parts(result: ContentBlock) -> (ToolResultContent, bool) {
 }
 
 fn schema_report() -> Value {
-    let definitions = all_tool_defs(0, &[], 30, Default::default());
+    let definitions = all_tool_defs(
+        0,
+        &[],
+        30,
+        Default::default(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     let notebook = definitions
         .iter()
         .find(|definition| definition.name == "notebook_edit")
@@ -188,7 +194,13 @@ fn schema_report() -> Value {
         notebook.schema["properties"]["edit_mode"]["enum"],
         json!(["replace", "insert", "delete"])
     );
-    let depth_one = all_tool_defs(1, &[], 30, Default::default());
+    let depth_one = all_tool_defs(
+        1,
+        &[],
+        30,
+        Default::default(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     assert!(depth_one
         .iter()
         .any(|definition| definition.name == "notebook_edit"));

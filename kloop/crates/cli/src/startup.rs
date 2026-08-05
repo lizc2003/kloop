@@ -889,6 +889,7 @@ pub(crate) fn config_from_settings(
         hooks: Arc::clone(&runtime.hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         shell_programs: Arc::clone(&runtime.shell_programs),
+        powershell_execution_gate: Default::default(),
         background_tasks: kloop_core::tools::BackgroundTasks::new(),
         sandbox,
         agent_types: Arc::clone(&runtime.agent_types),

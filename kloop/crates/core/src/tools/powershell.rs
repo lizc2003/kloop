@@ -90,13 +90,15 @@ fn encoded_payload(command: &str) -> String {
          try {{ [Console]::OutputEncoding = $__kloopUtf8 }} catch {{}}\n\
          $OutputEncoding = $__kloopUtf8\n\
          $__kloopErrorCountBefore = $Error.Count\n\
+         $LASTEXITCODE = $null\n\
          & {{\n{command}\n}}\n\
          $__kloopPowerShellSucceeded = $?\n\
          $__kloopNativeExitCode = $LASTEXITCODE\n\
          $__kloopHadNewError = $Error.Count -gt $__kloopErrorCountBefore\n\
+         if ($__kloopHadNewError) {{ exit 1 }}\n\
+         if ($__kloopPowerShellSucceeded) {{ exit 0 }}\n\
          if ($null -ne $__kloopNativeExitCode -and $__kloopNativeExitCode -ne 0) {{ exit [int]$__kloopNativeExitCode }}\n\
-         if (-not $__kloopPowerShellSucceeded -or $__kloopHadNewError) {{ exit 1 }}\n\
-         exit 0\n"
+         exit 1\n"
     )
 }
 
@@ -134,6 +136,22 @@ mod tests {
     fn wrapper_puts_exit_snapshot_after_a_fresh_line() {
         let payload = encoded_payload("native.exe # keep comment");
         assert!(payload.contains("native.exe # keep comment\n}\n$__kloopPowerShellSucceeded = $?"));
+    }
+
+    #[test]
+    fn wrapper_uses_final_powershell_status_before_native_exit_code() {
+        let payload = encoded_payload("Write-Output ok");
+        let reset = payload.find("$LASTEXITCODE = $null").unwrap();
+        let command = payload.find("Write-Output ok").unwrap();
+        let error = payload.find("if ($__kloopHadNewError) { exit 1 }").unwrap();
+        let success = payload
+            .find("if ($__kloopPowerShellSucceeded) { exit 0 }")
+            .unwrap();
+        let native = payload
+            .find("if ($null -ne $__kloopNativeExitCode")
+            .unwrap();
+        assert!(reset < command);
+        assert!(error < success && success < native);
     }
 
     #[test]
@@ -322,6 +340,34 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(output.contains("[exit status 9]"), "{label}: {output}");
+
+                let output = run(&program, "& $env:ComSpec /D /C 'exit 9'; $null", 10_000)
+                    .await
+                    .unwrap();
+                assert_eq!(output, "(no output)", "{label}");
+
+                let output = run(
+                    &program,
+                    "& $env:ComSpec /D /C 'exit 9'; Write-Output ok",
+                    10_000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(output, "ok", "{label}");
+
+                let output = run(
+                    &program,
+                    "& $env:ComSpec /D /C 'exit 9'; Write-Error 'later-powershell-error' -ErrorAction Continue",
+                    10_000,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    output.contains("later-powershell-error"),
+                    "{label}: {output}"
+                );
+                assert!(output.contains("[exit status 1]"), "{label}: {output}");
+                assert!(!output.contains("[exit status 9]"), "{label}: {output}");
 
                 let output = run(
                     &program,

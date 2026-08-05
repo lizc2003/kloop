@@ -185,9 +185,27 @@ fn context_with_permissions(
 }
 
 fn native_surface_report() -> Value {
-    let enabled = all_tool_defs(0, &[], 30, enabled_surface());
-    let disabled = all_tool_defs(0, &[], 30, Default::default());
-    let depth_one = all_tool_defs(1, &[], 30, enabled_surface());
+    let enabled = all_tool_defs(
+        0,
+        &[],
+        30,
+        enabled_surface(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
+    let disabled = all_tool_defs(
+        0,
+        &[],
+        30,
+        Default::default(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
+    let depth_one = all_tool_defs(
+        1,
+        &[],
+        30,
+        enabled_surface(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
     let names = [
         "ask_user_question",
         "enter_plan_mode",
@@ -223,10 +241,16 @@ fn native_surface_report() -> Value {
 }
 
 async fn question_report() -> Value {
-    let definition = all_tool_defs(0, &[], 30, enabled_surface())
-        .into_iter()
-        .find(|definition| definition.name == "ask_user_question")
-        .unwrap();
+    let definition = all_tool_defs(
+        0,
+        &[],
+        30,
+        enabled_surface(),
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    )
+    .into_iter()
+    .find(|definition| definition.name == "ask_user_question")
+    .unwrap();
     assert_eq!(definition.schema["required"], json!(["questions"]));
     assert_eq!(definition.schema["properties"]["questions"]["minItems"], 1);
     assert_eq!(definition.schema["properties"]["questions"]["maxItems"], 4);
@@ -326,10 +350,11 @@ async fn question_report() -> Value {
 async fn plan_control_report() -> Value {
     let approver = ScriptedApprover::new([Decision::Allow]);
     let (context, ui) = context_with_permissions("plan", Mode::AcceptEdits, approver.clone());
-    let names_before: Vec<String> = all_tool_defs(0, &[], 30, context.cfg.surface)
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect();
+    let names_before: Vec<String> =
+        all_tool_defs(0, &[], 30, context.cfg.surface, &context.cfg.shell_programs)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
     let (entered, entered_error) = run_tool("enter_plan_mode", json!({}), &context).await;
     assert!(!entered_error && entered.contains("Entered plan mode"));
     assert_eq!(context.cfg.permissions.mode(), Mode::Plan);
@@ -346,10 +371,11 @@ async fn plan_control_report() -> Value {
         approver.previews.lock().unwrap().as_slice(),
         &[Some(plan.to_string())]
     );
-    let names_after: Vec<String> = all_tool_defs(0, &[], 30, context.cfg.surface)
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect();
+    let names_after: Vec<String> =
+        all_tool_defs(0, &[], 30, context.cfg.surface, &context.cfg.shell_programs)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
     assert_eq!(names_before, names_after);
     assert!(!is_concurrency_safe("enter_plan_mode", &json!({}), &[]));
     assert!(!is_concurrency_safe(
