@@ -198,6 +198,7 @@ mod windows_tests {
     const HELPER_ENV: &str = "KLOOP_PROCESS_TREE_WINDOWS_HELPER";
     const HELPER_MARKER_ENV: &str = "KLOOP_PROCESS_TREE_WINDOWS_MARKER";
     const HELPER_ENV_ROUNDTRIP_MARKER: &str = "KLOOP_PROCESS_TREE_WINDOWS_ENV_ROUNDTRIP_MARKER";
+    const HELPER_HANDLE_MODE: &str = "KLOOP_PROCESS_TREE_WINDOWS_HANDLE_MODE";
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     struct TestDir(PathBuf);
@@ -266,17 +267,95 @@ mod windows_tests {
         count
     }
 
-    // Native integration tests share this process and may briefly hold unrelated handles.
-    async fn settled_handle_count(before: u32, allowance: u32) -> u32 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let after = handle_count();
-            if after <= before.saturating_add(allowance) || tokio::time::Instant::now() >= deadline
-            {
-                return after;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    #[derive(Clone, Copy, Debug)]
+    struct HandleSample {
+        before_spawn: u32,
+        spawn_peak: u32,
+        post_drop: u32,
+    }
+
+    fn median(values: impl IntoIterator<Item = u32>) -> u32 {
+        let mut values = values.into_iter().collect::<Vec<_>>();
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn assert_handle_samples_do_not_grow(mode: &str, samples: &[HandleSample], allowance: u32) {
+        let midpoint = samples.len() / 2;
+        assert!(midpoint > 0 && samples.len() % 2 == 0);
+        let (early, late) = samples.split_at(midpoint);
+        let early_before = median(early.iter().map(|sample| sample.before_spawn));
+        let late_before = median(late.iter().map(|sample| sample.before_spawn));
+        let early_peak = median(early.iter().map(|sample| sample.spawn_peak));
+        let late_peak = median(late.iter().map(|sample| sample.spawn_peak));
+        let early_post_drop = median(early.iter().map(|sample| sample.post_drop));
+        let late_post_drop = median(late.iter().map(|sample| sample.post_drop));
+        assert!(
+            late_before <= early_before.saturating_add(allowance),
+            "{mode} pre-spawn handles grew from median {early_before} to {late_before}: {samples:?}"
+        );
+        assert!(
+            late_peak <= early_peak.saturating_add(allowance),
+            "{mode} spawn-peak handles grew from median {early_peak} to {late_peak}: {samples:?}"
+        );
+        assert!(
+            late_post_drop <= early_post_drop.saturating_add(allowance),
+            "{mode} post-drop handles grew from median {early_post_drop} to {late_post_drop}: {samples:?}"
+        );
+    }
+
+    async fn collect_handle_sample(debug_descendants: bool) -> HandleSample {
+        let before_spawn = handle_count();
+        let mut spec = cmd_spec("exit 0");
+        if debug_descendants {
+            spec.require_windows_descendant_debugging();
         }
+        let mut child = spawn(spec).unwrap();
+        let spawn_peak = handle_count();
+        assert!(child.wait().await.unwrap().success());
+        child
+            .cleanup_after_exit(Duration::from_secs(2))
+            .await
+            .unwrap();
+        drop(child);
+        HandleSample {
+            before_spawn,
+            spawn_peak,
+            post_drop: handle_count(),
+        }
+    }
+
+    async fn assert_isolated_handle_growth(mode: &str) {
+        let (debug_descendants, allowance) = match mode {
+            "normal" => (false, 4),
+            "debug" => (true, 6),
+            other => panic!("unknown handle-growth mode {other}"),
+        };
+        let _warmup = collect_handle_sample(debug_descendants).await;
+        let mut samples = Vec::with_capacity(24);
+        for _ in 0..24 {
+            samples.push(collect_handle_sample(debug_descendants).await);
+        }
+        assert_handle_samples_do_not_grow(mode, &samples, allowance);
+    }
+
+    fn run_handle_growth_helper(mode: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_tree::windows_tests::windows_handle_growth_helper",
+                "--nocapture",
+            ])
+            .env(HELPER_HANDLE_MODE, mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode} handle-growth helper failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn process_has_exited(pid: u32) -> bool {
@@ -333,6 +412,14 @@ mod windows_tests {
             Some(roundtrip_env_value())
         );
         std::fs::write(marker, b"ok").unwrap();
+    }
+
+    #[tokio::test]
+    async fn windows_handle_growth_helper() {
+        let Some(mode) = std::env::var_os(HELPER_HANDLE_MODE) else {
+            return;
+        };
+        assert_isolated_handle_growth(&mode.to_string_lossy()).await;
     }
 
     #[tokio::test]
@@ -546,50 +633,13 @@ mod windows_tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn process_job_thread_and_pipe_handles_do_not_grow_linearly() {
-        let before = handle_count();
-        for _ in 0..32 {
-            let mut child = spawn(cmd_spec("exit 0")).unwrap();
-            assert!(child.wait().await.unwrap().success());
-            child
-                .cleanup_after_exit(Duration::from_secs(2))
-                .await
-                .unwrap();
-        }
-        let after = settled_handle_count(before, 4).await;
-        assert!(
-            after <= before.saturating_add(4),
-            "handle count grew from {before} to {after}"
-        );
+    #[test]
+    fn process_job_thread_and_pipe_handles_do_not_grow_linearly() {
+        run_handle_growth_helper("normal");
     }
 
-    #[tokio::test]
-    async fn debugged_process_job_thread_and_pipe_handles_do_not_grow_linearly() {
-        let mut warmup = cmd_spec("exit 0");
-        warmup.require_windows_descendant_debugging();
-        let mut child = spawn(warmup).unwrap();
-        assert!(child.wait().await.unwrap().success());
-        child
-            .cleanup_after_exit(Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        let before = handle_count();
-        for _ in 0..16 {
-            let mut spec = cmd_spec("exit 0");
-            spec.require_windows_descendant_debugging();
-            let mut child = spawn(spec).unwrap();
-            assert!(child.wait().await.unwrap().success());
-            child
-                .cleanup_after_exit(Duration::from_secs(2))
-                .await
-                .unwrap();
-        }
-        let after = settled_handle_count(before, 8).await;
-        assert!(
-            after <= before.saturating_add(8),
-            "debugged spawns grew the handle count from {before} to {after}"
-        );
+    #[test]
+    fn debugged_process_job_thread_and_pipe_handles_do_not_grow_linearly() {
+        run_handle_growth_helper("debug");
     }
 }

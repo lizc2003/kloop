@@ -244,8 +244,8 @@
 > handles 不得擅自 CloseHandle，系统会在相应 exit event continue 后关闭。
 >
 > PowerShell final status 不能把 earlier native `$LASTEXITCODE` 当最终结果：脚本前清空，并在用户
-> script block 内紧随用户脚本快照 final `$?` 与 native code，block 返回后再结合新 `$Error`。版本探测
-> 必须是 Version/MissingResource/Invalid 三态；只有 Win32
+> script block 的 `finally` 中首先快照 final `$?` 与 native code，使顶层 `return` 也必经状态采集；block
+> 返回后再结合新 `$Error`。版本探测必须是 Version/MissingResource/Invalid 三态；只有 Win32
 > 明确缺 version resource 才可信目录/package metadata，明确 non-v7 或 query/access/signature/format 错误都
 > fail closed。PowerShell 串行化是 session Config 的独立 Arc mutex，只包 hook/approval 后到 executor 结束，
 > 不包 run_program/task/skill/wait 等 orchestration；等待锁时取消必须零 spawn。public catalog helper 必须显式
@@ -255,10 +255,18 @@
 > `.gitattributes` 只约束未来 checkout，不修已有 `core.autocrlf=true` worktree。hash verifier 可精确诊断
 > CRLF-only expansion，但仍必须失败，不能自动 normalize；只有 `actual.replace(CRLF, LF)` 精确命中 expected
 > 才给 restore 提示，普通 tamper/bare CR/mixed drift 不能收到 destructive guidance。用户确认 fixture 无需保留
-> 后才手工执行 `git restore --source=HEAD --worktree -- refs/claude-code-2.1.220/fixtures`。corrective 已在
-> 既有 Windows 10 x64 验收机完成原生复跑：PowerShell focused 22 tests、官方 MSIX Bash lifecycle、
-> 默认并行与单线程 core 各 550 tests，以及 core clippy、fmt、corpus-only、diff check 全绿。
+> 后才手工执行 `git restore --source=HEAD --worktree -- refs/claude-code-2.1.220/fixtures`。`fe6a20d`
+> 的既有 Windows 10 x64 验收报告记录了默认并行/单线程 core 各 550 tests、clippy、fmt、corpus-only
+> 与 diff check 全绿，但“PowerShell focused 22 tests”没有保存 exact selector/`--list` 分类，不得用来证明
+> 后续新增回归。2026-08-06 follow-up 改成 `cargo test -p kloop-core powershell -- --list` 后运行同
+> selector，并把官方 MSIX lifecycle 作为显式 provisioned acceptance；必须用 `cargo test -p kloop-core tools::bash::tests::official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle -- --exact --ignored --nocapture`
+> 运行，缺 fixture 时失败。当前原生复跑 pending。
 >
+> **测试教训**：shell wrapper 的 final status 必须在 `finally` 捕获，普通尾随语句会被 `return` 跳过；
+> exclusive gate 必须用 session 私有 central-seam probe 记录 attempt/entry/max-active，不能用 named mutex
+> 与 sleep 猜测进程是否重叠；handle leak 回归应在隔离 test process 中逐轮观察 cleanup/drop 后趋势，不能
+> 等 30 秒 settle 后只看一个终值。
+
 **结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
 

@@ -14,6 +14,8 @@ use crate::tools::testutil::run_tool;
 use crate::tools::testutil::test_ctx;
 use crate::tools::testutil::test_ctx_with_sources;
 use crate::tools::testutil::with_defer_threshold;
+#[cfg(windows)]
+use crate::tools::testutil::with_powershell_gate_probe;
 use crate::tools::testutil::with_provider;
 use crate::tools::ToolCtx;
 use crate::tools::ToolSource;
@@ -238,120 +240,176 @@ async fn background_program_returns_immediately_and_reinjects() {
 }
 
 #[cfg(windows)]
-fn powershell_overlap_probe(name: &str) -> String {
-    format!(
-        "$mutex = [Threading.Mutex]::new($false, 'Local\\{name}'); \
-         try {{ if (-not $mutex.WaitOne(0)) {{ [Console]::Out.Write('overlap') }} else {{ \
-         try {{ [Threading.Thread]::Sleep(750); [Console]::Out.Write('done') }} \
-         finally {{ $mutex.ReleaseMutex() }} }} \
-         }} finally {{ $mutex.Dispose() }}"
+fn assert_serial_powershell_gate(
+    gate: &crate::config::PowerShellGateController,
+    active: usize,
+    entries: usize,
+) {
+    assert_eq!(
+        gate.snapshot(),
+        crate::config::PowerShellGateSnapshot {
+            active,
+            max_active: 1,
+            entries,
+        }
+    );
+}
+
+#[cfg(windows)]
+async fn start_background_powershell_program(ctx: &ToolCtx) {
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({
+            "source": "return await tools.powershell({ command: 'Write-Output done' });",
+            "background": true
+        }),
+        ctx,
     )
+    .await;
+    assert!(!is_error, "{output}");
+    assert!(output.contains("started in the background"), "{output}");
+}
+
+#[cfg(windows)]
+async fn wait_for_background_program_results(
+    ctx: &ToolCtx,
+    activity: &mut tokio::sync::watch::Receiver<u64>,
+    expected: usize,
+) -> Vec<crate::inbox::InboxItem> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut results = Vec::new();
+    loop {
+        results.extend(ctx.cfg.inbox.drain());
+        if results.len() >= expected {
+            assert_eq!(results.len(), expected, "{results:?}");
+            return results;
+        }
+        tokio::time::timeout_at(deadline, activity.changed())
+            .await
+            .expect("background PowerShell program did not finish")
+            .expect("inbox activity sender stays open");
+    }
 }
 
 #[cfg(windows)]
 #[tokio::test]
-async fn powershell_gate_spans_direct_foreground_and_background_program_bridges() {
-    let ctx = test_ctx(0, "powershell-cross-bridge");
-    let command = powershell_overlap_probe(&format!(
-        "kloop-powershell-direct-program-{}",
-        std::process::id()
-    ));
-    let source = format!(
-        "return await tools.powershell({{ command: {} }});",
-        serde_json::to_string(&command).unwrap()
-    );
-    let direct = run_tool("powershell", json!({"command": command}), &ctx);
-    let foreground_program = run(&source, &ctx);
-    let (direct, foreground_program) = tokio::join!(direct, foreground_program);
-    assert_eq!(direct, ("done".into(), false));
-    assert_eq!(foreground_program, ("done".into(), false));
+async fn powershell_gate_serializes_direct_and_foreground_program_executor_entry() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (ctx, mut gate) =
+            with_powershell_gate_probe(test_ctx(0, "powershell-direct-foreground"));
+        let direct_ctx = ctx.clone();
+        let direct = tokio::spawn(async move {
+            run_tool(
+                "powershell",
+                json!({"command": "Write-Output done"}),
+                &direct_ctx,
+            )
+            .await
+        });
+        gate.wait_attempted().await;
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
 
-    let command = powershell_overlap_probe(&format!(
-        "kloop-powershell-background-programs-{}",
-        std::process::id()
-    ));
-    let source = format!(
-        "return await tools.powershell({{ command: {} }});",
-        serde_json::to_string(&command).unwrap()
-    );
-    for _ in 0..2 {
-        let (output, is_error) = run_tool(
-            "run_program",
-            json!({"source": source.clone(), "background": true}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error, "{output}");
-        assert!(output.contains("started in the background"), "{output}");
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while ctx.cfg.background_tasks.running_count() != 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background PowerShell programs did not finish");
-    let results = ctx.cfg.inbox.drain();
-    assert_eq!(results.len(), 2, "{results:?}");
-    assert!(
-        results.iter().all(|item| matches!(
-            item,
-            crate::inbox::InboxItem::ProgramResult { summary, .. } if summary == "done"
-        )),
-        "{results:?}"
-    );
+        let program_ctx = ctx.clone();
+        let program = tokio::spawn(async move {
+            run(
+                "return await tools.powershell({ command: 'Write-Output done' });",
+                &program_ctx,
+            )
+            .await
+        });
+        gate.wait_attempted().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
 
-    let mutex_name = format!("kloop-powershell-direct-background-{}", std::process::id());
-    let marker = std::env::temp_dir().join(format!(
-        "kloop-powershell-direct-background-{}.txt",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&marker);
-    let marker_literal = marker.to_string_lossy().replace('\'', "''");
-    let background_command = powershell_overlap_probe(&mutex_name).replacen(
-        "try { [Threading.Thread]::Sleep",
-        &format!(
-            "try {{ [IO.File]::WriteAllText('{marker_literal}', 'started'); [Threading.Thread]::Sleep"
-        ),
-        1,
-    );
-    let source = format!(
-        "return await tools.powershell({{ command: {} }});",
-        serde_json::to_string(&background_command).unwrap()
-    );
-    let (output, is_error) = run_tool(
-        "run_program",
-        json!({"source": source, "background": true}),
-        &ctx,
-    )
-    .await;
-    assert!(!is_error, "{output}");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !marker.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        gate.release_one();
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 2);
+        gate.release_one();
+
+        let (direct, program) = tokio::join!(direct, program);
+        assert_eq!(direct.unwrap(), ("done".into(), false));
+        assert_eq!(program.unwrap(), ("done".into(), false));
+        assert_serial_powershell_gate(&gate, 0, 2);
     })
     .await
-    .expect("background PowerShell did not enter its probe");
-    let direct = run_tool(
-        "powershell",
-        json!({"command": powershell_overlap_probe(&mutex_name)}),
-        &ctx,
-    )
-    .await;
-    assert_eq!(direct, ("done".into(), false));
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while ctx.cfg.background_tasks.running_count() != 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+    .expect("direct/foreground PowerShell gate test stalled");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_gate_serializes_two_background_program_executor_entries() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (ctx, mut gate) =
+            with_powershell_gate_probe(test_ctx(0, "powershell-background-programs"));
+        let mut activity = ctx.cfg.inbox.subscribe_activity();
+
+        start_background_powershell_program(&ctx).await;
+        gate.wait_attempted().await;
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
+
+        start_background_powershell_program(&ctx).await;
+        gate.wait_attempted().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
+
+        gate.release_one();
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 2);
+        gate.release_one();
+
+        let results = wait_for_background_program_results(&ctx, &mut activity, 2).await;
+        assert!(
+            results.iter().all(|item| matches!(
+                item,
+                crate::inbox::InboxItem::ProgramResult { summary, .. } if summary == "done"
+            )),
+            "{results:?}"
+        );
+        assert_serial_powershell_gate(&gate, 0, 2);
     })
     .await
-    .expect("background PowerShell program did not finish");
-    assert!(matches!(
-        ctx.cfg.inbox.drain().as_slice(),
-        [crate::inbox::InboxItem::ProgramResult { summary, .. }] if summary == "done"
-    ));
-    let _ = std::fs::remove_file(marker);
+    .expect("background/background PowerShell gate test stalled");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_gate_serializes_direct_and_background_program_executor_entry() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (ctx, mut gate) =
+            with_powershell_gate_probe(test_ctx(0, "powershell-direct-background"));
+        let mut activity = ctx.cfg.inbox.subscribe_activity();
+        let direct_ctx = ctx.clone();
+        let direct = tokio::spawn(async move {
+            run_tool(
+                "powershell",
+                json!({"command": "Write-Output done"}),
+                &direct_ctx,
+            )
+            .await
+        });
+        gate.wait_attempted().await;
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
+
+        start_background_powershell_program(&ctx).await;
+        gate.wait_attempted().await;
+        assert_serial_powershell_gate(&gate, 1, 1);
+
+        gate.release_one();
+        gate.wait_entered().await;
+        assert_serial_powershell_gate(&gate, 1, 2);
+        gate.release_one();
+
+        assert_eq!(direct.await.unwrap(), ("done".into(), false));
+        let results = wait_for_background_program_results(&ctx, &mut activity, 1).await;
+        assert!(matches!(
+            results.as_slice(),
+            [crate::inbox::InboxItem::ProgramResult { summary, .. }] if summary == "done"
+        ));
+        assert_serial_powershell_gate(&gate, 0, 2);
+    })
+    .await
+    .expect("direct/background PowerShell gate test stalled");
 }
 
 /// A background program cancelled via stop_agent ends Aborted and reinjects

@@ -13,6 +13,158 @@ use crate::tools::BackgroundShells;
 use crate::tools::BackgroundTasks;
 use crate::tools::ToolSource;
 
+#[cfg(not(all(test, windows)))]
+pub type PowerShellExecutionGate = tokio::sync::Mutex<()>;
+
+#[cfg(all(test, windows))]
+pub struct PowerShellExecutionGate {
+    mutex: tokio::sync::Mutex<()>,
+    probe: Option<Arc<PowerShellGateProbe>>,
+}
+
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PowerShellGateSnapshot {
+    pub(crate) active: usize,
+    pub(crate) max_active: usize,
+    pub(crate) entries: usize,
+}
+
+#[cfg(all(test, windows))]
+struct PowerShellGateProbe {
+    attempted: tokio::sync::mpsc::UnboundedSender<()>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<tokio::sync::Semaphore>,
+    state: std::sync::Mutex<PowerShellGateSnapshot>,
+}
+
+#[cfg(all(test, windows))]
+pub(crate) struct PowerShellGateController {
+    attempted: tokio::sync::mpsc::UnboundedReceiver<()>,
+    entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: Arc<tokio::sync::Semaphore>,
+    probe: Arc<PowerShellGateProbe>,
+}
+
+#[cfg(all(test, windows))]
+struct PowerShellProbeEntry {
+    probe: Arc<PowerShellGateProbe>,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for PowerShellProbeEntry {
+    fn drop(&mut self) {
+        let mut state = self.probe.state.lock().unwrap();
+        state.active -= 1;
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) struct PowerShellExecutionGuard<'a> {
+    // Fields drop in declaration order: end the observed entry before the mutex
+    // unlock lets the next waiter enter.
+    _probe_entry: Option<PowerShellProbeEntry>,
+    _mutex: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(all(test, windows))]
+impl Default for PowerShellExecutionGate {
+    fn default() -> Self {
+        Self {
+            mutex: tokio::sync::Mutex::new(()),
+            probe: None,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+impl PowerShellExecutionGate {
+    pub(crate) fn instrumented() -> (Self, PowerShellGateController) {
+        let (attempted_tx, attempted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let probe = Arc::new(PowerShellGateProbe {
+            attempted: attempted_tx,
+            entered: entered_tx,
+            release: Arc::clone(&release),
+            state: std::sync::Mutex::new(PowerShellGateSnapshot::default()),
+        });
+        (
+            Self {
+                mutex: tokio::sync::Mutex::new(()),
+                probe: Some(Arc::clone(&probe)),
+            },
+            PowerShellGateController {
+                attempted: attempted_rx,
+                entered: entered_rx,
+                release,
+                probe,
+            },
+        )
+    }
+
+    pub(crate) async fn lock(&self) -> PowerShellExecutionGuard<'_> {
+        if let Some(probe) = &self.probe {
+            let _ = probe.attempted.send(());
+        }
+        let mutex = self.mutex.lock().await;
+        let probe_entry = if let Some(probe) = &self.probe {
+            {
+                let mut state = probe.state.lock().unwrap();
+                state.active += 1;
+                state.max_active = state.max_active.max(state.active);
+                state.entries += 1;
+            }
+            let entry = PowerShellProbeEntry {
+                probe: Arc::clone(probe),
+            };
+            let _ = probe.entered.send(());
+            probe
+                .release
+                .acquire()
+                .await
+                .expect("PowerShell gate probe release semaphore stays open")
+                .forget();
+            Some(entry)
+        } else {
+            None
+        };
+        PowerShellExecutionGuard {
+            _mutex: mutex,
+            _probe_entry: probe_entry,
+        }
+    }
+
+    pub(crate) async fn lock_without_probe(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutex.lock().await
+    }
+}
+
+#[cfg(all(test, windows))]
+impl PowerShellGateController {
+    pub(crate) async fn wait_attempted(&mut self) {
+        self.attempted
+            .recv()
+            .await
+            .expect("PowerShell gate attempt sender stays open");
+    }
+
+    pub(crate) async fn wait_entered(&mut self) {
+        self.entered
+            .recv()
+            .await
+            .expect("PowerShell gate entry sender stays open");
+    }
+
+    pub(crate) fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    pub(crate) fn snapshot(&self) -> PowerShellGateSnapshot {
+        *self.probe.state.lock().unwrap()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SurfaceCapabilities {
     pub questions: bool,
@@ -96,7 +248,7 @@ pub struct Config {
     /// Session-wide PowerShell exclusivity. Direct calls and foreground/background
     /// code-mode programs share this gate through Config clones; independent
     /// server threads build independent Configs and therefore do not serialize.
-    pub powershell_execution_gate: Arc<tokio::sync::Mutex<()>>,
+    pub powershell_execution_gate: Arc<PowerShellExecutionGate>,
     /// OS sandbox policy for bash execution; None runs commands bare
     /// (sandbox disabled, platform unsupported, --mock). The permission gate
     /// is independent — approved commands still run inside this sandbox, and

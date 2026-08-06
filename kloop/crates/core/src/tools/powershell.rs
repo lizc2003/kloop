@@ -93,9 +93,12 @@ fn encoded_payload(command: &str) -> String {
          $LASTEXITCODE = $null\n\
          $__kloopPowerShellSucceeded = $true\n\
          $__kloopNativeExitCode = $null\n\
-         & {{\n{command}\n\
+         & {{\n\
+         try {{\n{command}\n\
+         }} finally {{\n\
          $script:__kloopPowerShellSucceeded = $?\n\
          $script:__kloopNativeExitCode = $LASTEXITCODE\n\
+         }}\n\
          }}\n\
          $__kloopHadNewError = $Error.Count -gt $__kloopErrorCountBefore\n\
          if ($__kloopHadNewError) {{ exit 1 }}\n\
@@ -131,7 +134,7 @@ mod tests {
         let decoded = String::from_utf16(&units).unwrap();
         assert_eq!(decoded, payload);
         assert!(decoded.contains(
-            "Write-Output '你好'\n# trailing comment\n$script:__kloopPowerShellSucceeded = $?"
+            "Write-Output '你好'\n# trailing comment\n} finally {\n$script:__kloopPowerShellSucceeded = $?"
         ));
         assert!(decoded.contains("$LASTEXITCODE"));
         assert!(decoded.contains("[System.Text.UTF8Encoding]::new($false)"));
@@ -140,9 +143,9 @@ mod tests {
     #[test]
     fn wrapper_puts_exit_snapshot_after_a_fresh_line() {
         let payload = encoded_payload("native.exe # keep comment");
-        assert!(
-            payload.contains("native.exe # keep comment\n$script:__kloopPowerShellSucceeded = $?")
-        );
+        assert!(payload.contains(
+            "native.exe # keep comment\n} finally {\n$script:__kloopPowerShellSucceeded = $?"
+        ));
     }
 
     #[test]
@@ -150,8 +153,12 @@ mod tests {
         let payload = encoded_payload("Write-Output ok");
         let reset = payload.find("$LASTEXITCODE = $null").unwrap();
         let command = payload.find("Write-Output ok").unwrap();
+        let finally = payload.find("} finally {").unwrap();
         let snapshot = payload
             .find("$script:__kloopPowerShellSucceeded = $?")
+            .unwrap();
+        let native_snapshot = payload
+            .find("$script:__kloopNativeExitCode = $LASTEXITCODE")
             .unwrap();
         let error = payload.find("if ($__kloopHadNewError) { exit 1 }").unwrap();
         let success = payload
@@ -161,7 +168,8 @@ mod tests {
             .find("if ($null -ne $__kloopNativeExitCode")
             .unwrap();
         assert!(reset < command);
-        assert!(command < snapshot && snapshot < error);
+        assert!(command < finally && finally < snapshot);
+        assert!(snapshot < native_snapshot && native_snapshot < error);
         assert!(error < success && success < native);
     }
 
@@ -352,6 +360,20 @@ mod tests {
                     .unwrap();
                 assert!(output.contains("[exit status 9]"), "{label}: {output}");
 
+                let output = run(&program, "& $env:ComSpec /D /C 'exit 9'; return", 10_000)
+                    .await
+                    .unwrap();
+                assert!(output.contains("[exit status 9]"), "{label}: {output}");
+
+                let output = run(
+                    &program,
+                    "& $env:ComSpec /D /C 'exit 9'; $null; return",
+                    10_000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(output, "(no output)", "{label}");
+
                 let output = run(&program, "& $env:ComSpec /D /C 'exit 9'; $null", 10_000)
                     .await
                     .unwrap();
@@ -360,6 +382,19 @@ mod tests {
                 let output = run(
                     &program,
                     "& $env:ComSpec /D /C 'exit 9'; Write-Output ok",
+                    10_000,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    output.lines().any(|line| line.trim_end() == "ok"),
+                    "{label}: {output}"
+                );
+                assert!(!output.contains("[exit status 9]"), "{label}: {output}");
+
+                let output = run(
+                    &program,
+                    "& $env:ComSpec /D /C 'exit 9'; Write-Output ok; return",
                     10_000,
                 )
                 .await
@@ -393,6 +428,27 @@ mod tests {
                 .unwrap();
                 assert!(output.contains("kloop-nonterm"), "{label}: {output}");
                 assert!(output.contains("[exit status 1]"), "{label}: {output}");
+
+                let output = run(
+                    &program,
+                    "Write-Error 'kloop-return-error' -ErrorAction Continue; return",
+                    10_000,
+                )
+                .await
+                .unwrap();
+                assert!(output.contains("kloop-return-error"), "{label}: {output}");
+                assert!(output.contains("[exit status 1]"), "{label}: {output}");
+
+                let output = run(&program, "return 'returned-value'", 10_000)
+                    .await
+                    .unwrap();
+                assert!(
+                    output
+                        .lines()
+                        .any(|line| line.trim_end() == "returned-value"),
+                    "{label}: {output}"
+                );
+                assert!(!output.contains("[exit status"), "{label}: {output}");
 
                 let output = run(&program, "throw 'kloop-terminating'", 10_000)
                     .await

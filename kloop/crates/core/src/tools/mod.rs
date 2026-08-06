@@ -1286,6 +1286,17 @@ pub(crate) mod testutil {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn with_powershell_gate_probe(
+        mut ctx: ToolCtx,
+    ) -> (ToolCtx, crate::config::PowerShellGateController) {
+        let mut cfg = (*ctx.cfg).clone();
+        let (gate, controller) = crate::config::PowerShellExecutionGate::instrumented();
+        cfg.powershell_execution_gate = Arc::new(gate);
+        ctx.cfg = Arc::new(cfg);
+        (ctx, controller)
+    }
+
     /// Rebuild the ctx with a different defer threshold (Config is behind an
     /// Arc, so tests clone-and-swap instead of mutating).
     pub(crate) fn with_defer_threshold(mut ctx: ToolCtx, threshold: usize) -> ToolCtx {
@@ -2274,46 +2285,102 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn concurrent_powershell_calls_share_the_session_gate() {
-        let ctx = test_ctx(0, "powershell-session-gate");
-        let mutex = format!("Local\\kloop-powershell-gate-{}", std::process::id());
-        let command = format!(
-            "$mutex = [Threading.Mutex]::new($false, '{mutex}'); \
-             if (-not $mutex.WaitOne(0)) {{ [Console]::Out.Write('overlap') }} else {{ \
-             try {{ [Threading.Thread]::Sleep(2000); [Console]::Out.Write('done') }} \
-             finally {{ $mutex.ReleaseMutex() }} }}"
-        );
-        let first = run_tool("powershell", json!({"command": command.clone()}), &ctx);
-        let second = run_tool("powershell", json!({"command": command}), &ctx);
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first, ("done".into(), false));
-        assert_eq!(second, ("done".into(), false));
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (ctx, mut gate) =
+                with_powershell_gate_probe(test_ctx(0, "powershell-session-gate"));
+            let first_ctx = ctx.clone();
+            let first = tokio::spawn(async move {
+                run_tool(
+                    "powershell",
+                    json!({"command": "Write-Output done"}),
+                    &first_ctx,
+                )
+                .await
+            });
+            gate.wait_attempted().await;
+            gate.wait_entered().await;
+            assert_eq!(
+                gate.snapshot(),
+                crate::config::PowerShellGateSnapshot {
+                    active: 1,
+                    max_active: 1,
+                    entries: 1,
+                }
+            );
+
+            let second_ctx = ctx.clone();
+            let second = tokio::spawn(async move {
+                run_tool(
+                    "powershell",
+                    json!({"command": "Write-Output done"}),
+                    &second_ctx,
+                )
+                .await
+            });
+            gate.wait_attempted().await;
+            assert_eq!(
+                gate.snapshot(),
+                crate::config::PowerShellGateSnapshot {
+                    active: 1,
+                    max_active: 1,
+                    entries: 1,
+                }
+            );
+
+            gate.release_one();
+            gate.wait_entered().await;
+            assert_eq!(
+                gate.snapshot(),
+                crate::config::PowerShellGateSnapshot {
+                    active: 1,
+                    max_active: 1,
+                    entries: 2,
+                }
+            );
+            gate.release_one();
+
+            let (first, second) = tokio::join!(first, second);
+            assert_eq!(first.unwrap(), ("done".into(), false));
+            assert_eq!(second.unwrap(), ("done".into(), false));
+            assert_eq!(
+                gate.snapshot(),
+                crate::config::PowerShellGateSnapshot {
+                    active: 0,
+                    max_active: 1,
+                    entries: 2,
+                }
+            );
+        })
+        .await
+        .expect("PowerShell session gate test stalled");
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn cancelling_while_waiting_for_powershell_gate_never_spawns() {
-        let ctx = test_ctx(0, "powershell-gate-cancel");
-        let marker = std::env::temp_dir().join(format!(
-            "kloop-powershell-gate-cancel-{}.txt",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&marker);
-        let marker_literal = marker.to_string_lossy().replace('\'', "''");
-        let command = format!("[IO.File]::WriteAllText('{marker_literal}', 'spawned')");
-        let guard = ctx.cfg.powershell_execution_gate.lock().await;
-        let worker_ctx = ctx.clone();
-        let worker = tokio::spawn(async move {
-            run_tool("powershell", json!({"command": command}), &worker_ctx).await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        ctx.cancel.cancel();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), worker)
-            .await
-            .expect("gate waiter ignored cancellation")
-            .unwrap();
-        assert_eq!(result, ("interrupted".into(), true));
-        assert!(!marker.exists(), "cancelled gate waiter spawned PowerShell");
-        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (ctx, mut gate) = with_powershell_gate_probe(test_ctx(0, "powershell-gate-cancel"));
+            let guard = ctx.cfg.powershell_execution_gate.lock_without_probe().await;
+            let worker_ctx = ctx.clone();
+            let worker = tokio::spawn(async move {
+                run_tool(
+                    "powershell",
+                    json!({"command": "Write-Output should-not-spawn"}),
+                    &worker_ctx,
+                )
+                .await
+            });
+            gate.wait_attempted().await;
+            assert_eq!(gate.snapshot(), Default::default());
+
+            ctx.cancel.cancel();
+            let result = worker.await.unwrap();
+            assert_eq!(result, ("interrupted".into(), true));
+            assert_eq!(gate.snapshot(), Default::default());
+            drop(guard);
+        })
+        .await
+        .expect("PowerShell gate waiter ignored cancellation");
     }
 
     #[tokio::test]

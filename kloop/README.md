@@ -1128,15 +1128,16 @@ The executor passes a UTF-16LE `EncodedCommand` to a fixed
 `-NoLogo -NoProfile -NonInteractive -EncodedCommand` argv. It does not use a
 temporary script, `Invoke-Expression`, a profile, or `ExecutionPolicy Bypass`.
 The payload sets UTF-8 console/native output encoding, clears `$LASTEXITCODE`
-before the original script, runs that script in its own script block, and
-immediately snapshots final `$?`, `$LASTEXITCODE`, and newly-added `$Error`
-entries. New PowerShell errors return 1; a successful final PowerShell operation
-returns 0 even if an earlier native command left a stale nonzero code; an
-otherwise-failed final native command propagates its nonzero code; all other
-failures return 1. Multiline text, Unicode, here-strings, trailing comments, and
-explicit `exit N` retain their meaning. Hooks, permission prompts, events,
-history, and `PowerShell PS>` TUI rows always carry the original script, never
-the encoded payload.
+before the original script, and runs that script in a `try` inside its own
+script block. A `finally` immediately snapshots final `$?` and `$LASTEXITCODE`,
+so a top-level `return` cannot bypass status capture; the wrapper then compares
+newly-added `$Error` entries. New PowerShell errors return 1; a successful final
+PowerShell operation returns 0 even if an earlier native command left a stale
+nonzero code; an otherwise-failed final native command propagates its nonzero
+code; all other failures return 1. Multiline text, Unicode, here-strings,
+trailing comments, `return` output, and explicit `exit N` retain their meaning.
+Hooks, permission prompts, events, history, and `PowerShell PS>` TUI rows always
+carry the original script, never the encoded payload.
 
 PowerShell v1 has no background mode, stdin/PTY/session channel, executable
 override, or sandbox escape field; unknown fields are rejected even if a caller

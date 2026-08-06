@@ -130,20 +130,21 @@ MSIX/silent-breakaway descendant。debugger 只消费每 PID 一次 first-chance
 file；Windows Bash 必须通过完整 Git for Windows 布局；PowerShell 7 同时发现版本化 MSI roots 与 Windows
 package API 验证的官方 Microsoft MSIX family，并以 `pwsh.exe` file version 统一排序。只有 Win32 明确报告
 missing version resource 时才用可信目录/package metadata；明确 non-v7 resource 或 access/query/signature/
-format 错误均拒绝 fallback，5.1 是最后 fallback。PowerShell wrapper 以 final `$?`、新 `$Error` 与清零后
-的 `$LASTEXITCODE` 判最终状态，不传播较早 native command 的陈旧非零 code。每个 session 的 Config
+format 错误均拒绝 fallback，5.1 是最后 fallback。PowerShell wrapper 在用户 block 的 `finally` 中首先
+快照 final `$?` 与清零后的 `$LASTEXITCODE`，因此顶层 `return` 也不能跳过状态采集；再结合新
+`$Error` 判最终状态，不传播较早 native command 的陈旧非零 code。每个 session 的 Config
 另共享一个 PowerShell exclusive gate，覆盖 direct 与不同 foreground/background code-mode bridge；等待锁
 时取消不 spawn，orchestration 外壳不持锁。catalog/defer/warning API 全部显式吃同一 frozen
 `ShellPrograms` snapshot，不在 helper 内重新 discovery。Job 只销 process-tree containment，不销 Windows
 filesystem/network sandbox，也不承诺对抗 protected process/自建 debugger；spawn gate 也不把
 hooks/MCP/git 自动升级成 Job ownership。原生 Windows 10 x64 已实际跑绿 Plan 61 file-safety 62 tests、
 Plan 62 初始实现的 process-spawn/shell discovery/process-tree/Bash/PowerShell/permissions focused gates、
-全 workspace、fmt/clippy、mock 与 corpus-only，且 0 ignored。该次验收查实 PowerShell 7 MSIX
-`Start-Process` descendant 可离开 root Job；本 corrective 的全 Bash debug gate、admission/terminate
-线性化、bounded debugger finish、最终状态、三态 version probe 和 session gate 随后也在同一验收机
-完成原生复跑：PowerShell focused 22 tests、官方 MSIX Bash lifecycle、默认并行与单线程 core 各
-550 tests 全绿，core all-target clippy、fmt、corpus-only 与 diff check 同样通过。pinned darwin
-PowerShell `n/a` matrix 保持不变。
+全 workspace、fmt/clippy、mock 与 corpus-only；该次验收查实 PowerShell 7 MSIX `Start-Process`
+descendant 可离开 root Job。`fe6a20d` 的后续验收报告记录默认并行/单线程 core 各 550 tests、core
+all-target clippy、fmt、corpus-only 与 diff check 全绿，但“PowerShell focused 22 tests”没有保存 exact
+selector/`--list` 分类，不能证明 2026-08-06 新增回归。当前 follow-up 要求先运行
+`cargo test -p kloop-core powershell -- --list` 再运行同 selector；官方 MSIX 四 lifecycle 改为显式
+ignored provisioned acceptance，必须用 `cargo test -p kloop-core tools::bash::tests::official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle -- --exact --ignored --nocapture` 运行且缺 fixture 时 fail closed。新原生复跑当前 pending；pinned darwin PowerShell `n/a` matrix 保持不变。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /

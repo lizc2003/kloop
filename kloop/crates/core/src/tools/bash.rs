@@ -1803,11 +1803,11 @@ Wait-Process -Id $grandchild.Id
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "requires a registered official Microsoft PowerShell MSIX fixture"]
     async fn official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle() {
-        let Some(powershell) = crate::shell_programs::official_msix_powershell_for_test() else {
-            eprintln!("skipped: no official PowerShell MSIX package is installed");
-            return;
-        };
+        let powershell = crate::shell_programs::official_msix_powershell_for_test().expect(
+            "the provisioned acceptance host must expose a valid Microsoft.PowerShell_8wekyb3d8bbwe or Microsoft.PowerShell-LTS_8wekyb3d8bbwe MSIX package",
+        );
         assert_eq!(
             powershell.flavor,
             crate::shell_programs::ShellFlavor::PowerShell7
