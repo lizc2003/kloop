@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61、62、64 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–64 已完成；Plan 65 已规划待实施)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -194,6 +194,8 @@
 > 新会话从该文档第七节讨论；其首推候选 provider stream guard 已由 Plan 64 落地。
 >
 > **Plan 64 已完成（2026-08-04）**：`64-provider-stream-guard.md` 将三条 provider rail 收进 typed、单终态、consumer-drop 即 abort 的 stream seam；固定 open 45s / idle 15m / wall 30m / response 10MiB / unfinished frame 1MiB guard。Anthropic 只认 `message_stop`，Responses 只认 `response.completed|incomplete`，Chat 以 `finish_reason` 为语义终态、`[DONE]` 仅结束传输；非空非法 tool JSON 全部 fail closed。core 只在尚无任何 text/reasoning/完整 tool block 时，对 transport、open/idle/wall、HTTP 408/429/5xx、incomplete EOF 做总计 3 attempts，支持秒/HTTP-date `Retry-After`（60s cap）；non-retryable 不 fallback，partial semantic output 不 replay，protocol 1.0 仍只投影 `Error(String)`。确定性测试覆盖 guard、三 wire、tool/subagent retry seal、取消 producer 与 server 单 terminal；提交 SHA 以本条所在提交为准。
+>
+> **Plan 65 已规划（待实施）**：`65-provider-message-semantics.md` 在 Plan 64 transport seam 上引入窄 assistant output block 与 mandatory typed outcome，三 adapter 必须证明 block/output item closure并严格验证 tool identity/object arguments、stop/status映射和 UTF-8；refusal/filter/incomplete与恢复用尽的output-limit不再标 completed，provider path不写空assistant，Responses delta不能脱离`output_item.done`进入成功history。native protocol保持exact 1.0 shape，open partial item只复用现有`status:"failed"`收口，typed public terminal/独立partial状态留给未来显式版本升级。开工前直接按该计划的切片0 fixtures固定缺口，不要重做Plan 64 guard或提前设计2.0双栈。
 >
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现
