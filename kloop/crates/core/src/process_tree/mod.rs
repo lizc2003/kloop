@@ -282,7 +282,7 @@ mod windows_tests {
 
     fn assert_handle_samples_do_not_grow(mode: &str, samples: &[HandleSample], allowance: u32) {
         let midpoint = samples.len() / 2;
-        assert!(midpoint > 0 && samples.len() % 2 == 0);
+        assert!(midpoint > 0 && samples.len().is_multiple_of(2));
         let (early, late) = samples.split_at(midpoint);
         let early_before = median(early.iter().map(|sample| sample.before_spawn));
         let late_before = median(late.iter().map(|sample| sample.before_spawn));

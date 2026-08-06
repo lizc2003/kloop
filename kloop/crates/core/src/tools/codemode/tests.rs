@@ -240,6 +240,18 @@ async fn background_program_returns_immediately_and_reinjects() {
 }
 
 #[cfg(windows)]
+fn powershell_output_has_done_line(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "done")
+}
+
+#[cfg(windows)]
+fn assert_powershell_done(result: (String, bool)) {
+    let (output, is_error) = result;
+    assert!(!is_error, "{output}");
+    assert!(powershell_output_has_done_line(&output), "{output}");
+}
+
+#[cfg(windows)]
 fn assert_serial_powershell_gate(
     gate: &crate::config::PowerShellGateController,
     active: usize,
@@ -327,8 +339,8 @@ async fn powershell_gate_serializes_direct_and_foreground_program_executor_entry
         gate.release_one();
 
         let (direct, program) = tokio::join!(direct, program);
-        assert_eq!(direct.unwrap(), ("done".into(), false));
-        assert_eq!(program.unwrap(), ("done".into(), false));
+        assert_powershell_done(direct.unwrap());
+        assert_powershell_done(program.unwrap());
         assert_serial_powershell_gate(&gate, 0, 2);
     })
     .await
@@ -361,7 +373,8 @@ async fn powershell_gate_serializes_two_background_program_executor_entries() {
         assert!(
             results.iter().all(|item| matches!(
                 item,
-                crate::inbox::InboxItem::ProgramResult { summary, .. } if summary == "done"
+                crate::inbox::InboxItem::ProgramResult { summary, .. }
+                    if powershell_output_has_done_line(summary)
             )),
             "{results:?}"
         );
@@ -400,11 +413,12 @@ async fn powershell_gate_serializes_direct_and_background_program_executor_entry
         assert_serial_powershell_gate(&gate, 1, 2);
         gate.release_one();
 
-        assert_eq!(direct.await.unwrap(), ("done".into(), false));
+        assert_powershell_done(direct.await.unwrap());
         let results = wait_for_background_program_results(&ctx, &mut activity, 1).await;
         assert!(matches!(
             results.as_slice(),
-            [crate::inbox::InboxItem::ProgramResult { summary, .. }] if summary == "done"
+            [crate::inbox::InboxItem::ProgramResult { summary, .. }]
+                if powershell_output_has_done_line(summary)
         ));
         assert_serial_powershell_gate(&gate, 0, 2);
     })

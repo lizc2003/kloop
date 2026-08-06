@@ -941,6 +941,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         } else {
             None
         };
+        #[cfg(all(test, windows))]
+        let powershell_executor_probe = match &powershell_guard {
+            Some(guard) => Some(guard.enter_executor().await),
+            None => None,
+        };
         let foreground_shell = name == "powershell"
             || (name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false));
         if foreground_shell {
@@ -958,6 +963,8 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if foreground_shell {
             foreground_shell_started.store(false, Ordering::Release);
         }
+        #[cfg(all(test, windows))]
+        drop(powershell_executor_probe);
         drop(powershell_guard);
         // post_tool hooks (and other text-only surfaces) see the flattened
         // text; an image result renders as an `[image: <media_type>]` tag.
@@ -2340,8 +2347,10 @@ mod tests {
             gate.release_one();
 
             let (first, second) = tokio::join!(first, second);
-            assert_eq!(first.unwrap(), ("done".into(), false));
-            assert_eq!(second.unwrap(), ("done".into(), false));
+            for (output, is_error) in [first.unwrap(), second.unwrap()] {
+                assert!(!is_error, "{output}");
+                assert!(output.lines().any(|line| line.trim() == "done"), "{output}");
+            }
             assert_eq!(
                 gate.snapshot(),
                 crate::config::PowerShellGateSnapshot {

@@ -61,10 +61,13 @@ impl Drop for PowerShellProbeEntry {
 
 #[cfg(all(test, windows))]
 pub(crate) struct PowerShellExecutionGuard<'a> {
-    // Fields drop in declaration order: end the observed entry before the mutex
-    // unlock lets the next waiter enter.
-    _probe_entry: Option<PowerShellProbeEntry>,
+    probe: Option<Arc<PowerShellGateProbe>>,
     _mutex: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(all(test, windows))]
+pub(crate) struct PowerShellExecutorProbeGuard {
+    _probe_entry: Option<PowerShellProbeEntry>,
 }
 
 #[cfg(all(test, windows))]
@@ -108,6 +111,20 @@ impl PowerShellExecutionGate {
             let _ = probe.attempted.send(());
         }
         let mutex = self.mutex.lock().await;
+        PowerShellExecutionGuard {
+            probe: self.probe.clone(),
+            _mutex: mutex,
+        }
+    }
+
+    pub(crate) async fn lock_without_probe(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutex.lock().await
+    }
+}
+
+#[cfg(all(test, windows))]
+impl PowerShellExecutionGuard<'_> {
+    pub(crate) async fn enter_executor(&self) -> PowerShellExecutorProbeGuard {
         let probe_entry = if let Some(probe) = &self.probe {
             {
                 let mut state = probe.state.lock().unwrap();
@@ -129,14 +146,9 @@ impl PowerShellExecutionGate {
         } else {
             None
         };
-        PowerShellExecutionGuard {
-            _mutex: mutex,
+        PowerShellExecutorProbeGuard {
             _probe_entry: probe_entry,
         }
-    }
-
-    pub(crate) async fn lock_without_probe(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.mutex.lock().await
     }
 }
 
@@ -162,6 +174,57 @@ impl PowerShellGateController {
 
     pub(crate) fn snapshot(&self) -> PowerShellGateSnapshot {
         *self.probe.state.lock().unwrap()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod powershell_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn probe_tracks_executor_scope_independently_of_the_mutex_guard() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (gate, mut controller) = PowerShellExecutionGate::instrumented();
+
+            let first_gate = gate.lock().await;
+            controller.wait_attempted().await;
+            let (first_executor, ()) = tokio::join!(first_gate.enter_executor(), async {
+                controller.wait_entered().await;
+                assert_eq!(
+                    controller.snapshot(),
+                    PowerShellGateSnapshot {
+                        active: 1,
+                        max_active: 1,
+                        entries: 1,
+                    }
+                );
+                controller.release_one();
+            });
+            drop(first_gate);
+
+            let second_gate = gate.lock().await;
+            controller.wait_attempted().await;
+            let (second_executor, ()) = tokio::join!(second_gate.enter_executor(), async {
+                controller.wait_entered().await;
+                assert_eq!(
+                    controller.snapshot(),
+                    PowerShellGateSnapshot {
+                        active: 2,
+                        max_active: 2,
+                        entries: 2,
+                    }
+                );
+                controller.release_one();
+            });
+
+            drop(second_executor);
+            drop(second_gate);
+            assert_eq!(controller.snapshot().active, 1);
+            drop(first_executor);
+            assert_eq!(controller.snapshot().active, 0);
+        })
+        .await
+        .expect("PowerShell executor probe test stalled");
     }
 }
 
