@@ -1228,6 +1228,26 @@ pub(crate) mod testutil {
         json!({"command": cmd})
     }
 
+    #[cfg(windows)]
+    pub(crate) fn powershell_output_is_done_and_successful(output: &str) -> bool {
+        let has_done_line = output.lines().any(|line| line.trim() == "done");
+        let has_failure_status = output.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("[exit status ") || line == "[killed by signal]"
+        });
+        has_done_line && !has_failure_status
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn assert_powershell_done(result: (String, bool)) {
+        let (output, is_error) = result;
+        assert!(!is_error, "{output}");
+        assert!(
+            powershell_output_is_done_and_successful(&output),
+            "{output}"
+        );
+    }
+
     pub(crate) struct SilentUi;
     impl Ui for SilentUi {
         fn emit(&self, _: &Event) {}
@@ -1401,6 +1421,23 @@ mod tests {
             plan_control: true,
             ..Default::default()
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_done_check_accepts_progress_but_rejects_failure_status() {
+        assert!(powershell_output_is_done_and_successful(
+            "done\r\n#< CLIXML\r\n<Objs>progress</Objs>"
+        ));
+        assert!(!powershell_output_is_done_and_successful(
+            "done\r\n[exit status 9]"
+        ));
+        assert!(!powershell_output_is_done_and_successful(
+            "done\r\n[killed by signal]"
+        ));
+        assert!(!powershell_output_is_done_and_successful(
+            "#< CLIXML\r\n<Objs>progress</Objs>"
+        ));
     }
 
     /// External source stub: `{prefix}__echo` (marked read-only) and
@@ -2347,10 +2384,8 @@ mod tests {
             gate.release_one();
 
             let (first, second) = tokio::join!(first, second);
-            for (output, is_error) in [first.unwrap(), second.unwrap()] {
-                assert!(!is_error, "{output}");
-                assert!(output.lines().any(|line| line.trim() == "done"), "{output}");
-            }
+            assert_powershell_done(first.unwrap());
+            assert_powershell_done(second.unwrap());
             assert_eq!(
                 gate.snapshot(),
                 crate::config::PowerShellGateSnapshot {

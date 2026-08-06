@@ -10,6 +10,10 @@ use crate::event::ItemStatus;
 use crate::permissions::Mode;
 use crate::permissions::PermissionRules;
 use crate::permissions::Permissions;
+#[cfg(windows)]
+use crate::tools::testutil::assert_powershell_done;
+#[cfg(windows)]
+use crate::tools::testutil::powershell_output_is_done_and_successful;
 use crate::tools::testutil::run_tool;
 use crate::tools::testutil::test_ctx;
 use crate::tools::testutil::test_ctx_with_sources;
@@ -240,18 +244,6 @@ async fn background_program_returns_immediately_and_reinjects() {
 }
 
 #[cfg(windows)]
-fn powershell_output_has_done_line(output: &str) -> bool {
-    output.lines().any(|line| line.trim() == "done")
-}
-
-#[cfg(windows)]
-fn assert_powershell_done(result: (String, bool)) {
-    let (output, is_error) = result;
-    assert!(!is_error, "{output}");
-    assert!(powershell_output_has_done_line(&output), "{output}");
-}
-
-#[cfg(windows)]
 fn assert_serial_powershell_gate(
     gate: &crate::config::PowerShellGateController,
     active: usize,
@@ -374,7 +366,7 @@ async fn powershell_gate_serializes_two_background_program_executor_entries() {
             results.iter().all(|item| matches!(
                 item,
                 crate::inbox::InboxItem::ProgramResult { summary, .. }
-                    if powershell_output_has_done_line(summary)
+                    if powershell_output_is_done_and_successful(summary)
             )),
             "{results:?}"
         );
@@ -418,7 +410,7 @@ async fn powershell_gate_serializes_direct_and_background_program_executor_entry
         assert!(matches!(
             results.as_slice(),
             [crate::inbox::InboxItem::ProgramResult { summary, .. }]
-                if powershell_output_has_done_line(summary)
+                if powershell_output_is_done_and_successful(summary)
         ));
         assert_serial_powershell_gate(&gate, 0, 2);
     })
