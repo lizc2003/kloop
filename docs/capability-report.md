@@ -142,9 +142,15 @@ Plan 62 初始实现的 process-spawn/shell discovery/process-tree/Bash/PowerShe
 全 workspace、fmt/clippy、mock 与 corpus-only；该次验收查实 PowerShell 7 MSIX `Start-Process`
 descendant 可离开 root Job。`fe6a20d` 的后续验收报告记录默认并行/单线程 core 各 550 tests、core
 all-target clippy、fmt、corpus-only 与 diff check 全绿，但“PowerShell focused 22 tests”没有保存 exact
-selector/`--list` 分类，不能证明 2026-08-06 新增回归。当前 follow-up 要求先运行
-`cargo test -p kloop-core powershell -- --list` 再运行同 selector；官方 MSIX 四 lifecycle 改为显式
-ignored provisioned acceptance，必须用 `cargo test -p kloop-core tools::bash::tests::official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle -- --exact --ignored --nocapture` 运行且缺 fixture 时 fail closed。新原生复跑当前 pending；pinned darwin PowerShell `n/a` matrix 保持不变。
+selector/`--list` 分类，不能证明 2026-08-06 新增回归。`d350eb8` follow-up 后，`5599705` 把 gate
+probe 的 active/entry 生命周期移入真实 executor scope，`064bfac` 又明确拒绝含 `[exit status N]` 或
+`[killed by signal]` 的 probe 输出。当前 HEAD 已在上述 Windows 原生环境先用 `--list` 精确列出
+PowerShell 26 tests，再实跑 26/26；process-tree 19/19、普通 Bash 17 passed / 1 provisioned ignored、
+code-mode 26/26，官方 MSIX 四 lifecycle 的显式 `--exact --ignored` acceptance 1/1。首次并行 workspace
+run 唯一 cleanup timeout 的 exact test 随即通过；停止并行构建负载后的完整复跑为 core 554 passed /
+1 provisioned ignored，其余 crates 与 doc tests 全绿；fmt、workspace all-target clippy、mock 6 rounds、
+corpus-only 与 diff check 也通过。普通 ignored 与显式 provisioned pass 分开记录；pinned Darwin
+PowerShell `n/a` matrix 保持不变。
 
 Plan 52 将 Agent、Task registry、Team mailbox/ListAgents 与 remote/cloud 拆开取证，当时 corpus 为
 96 captures/137 static evidence，matrix 为 56 行/448 单元（67 compatible / 119 intentional-diff /

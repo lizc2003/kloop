@@ -258,9 +258,14 @@
 > 后才手工执行 `git restore --source=HEAD --worktree -- refs/claude-code-2.1.220/fixtures`。`fe6a20d`
 > 的既有 Windows 10 x64 验收报告记录了默认并行/单线程 core 各 550 tests、clippy、fmt、corpus-only
 > 与 diff check 全绿，但“PowerShell focused 22 tests”没有保存 exact selector/`--list` 分类，不得用来证明
-> 后续新增回归。2026-08-06 follow-up 改成 `cargo test -p kloop-core powershell -- --list` 后运行同
-> selector，并把官方 MSIX lifecycle 作为显式 provisioned acceptance；必须用 `cargo test -p kloop-core tools::bash::tests::official_msix_pwsh_breakaways_are_contained_for_every_bash_lifecycle -- --exact --ignored --nocapture`
-> 运行，缺 fixture 时失败。当前原生复跑 pending。
+> 后续新增回归。2026-08-06 follow-up 已在当前 HEAD 先用 `cargo test -p kloop-core powershell -- --list`
+> 精确列出 26 tests，再运行同 selector 得到 26/26；process-tree 19/19、普通 Bash 17 passed / 1
+> provisioned ignored、code-mode 26/26。官方 MSIX lifecycle 的显式 `--exact --ignored` acceptance
+> 也已 1/1 通过。`5599705` 把 gate probe 的 active/entry 生命周期移入真实 executor scope；`064bfac`
+> 明确拒绝含 `[exit status N]`/`[killed by signal]` 的输出，避免 `done` 后失败假绿。完整 workspace
+> 无并行构建负载复跑为 core 554 passed / 1 provisioned ignored，其余 crates/doc tests 全绿；fmt、
+> workspace all-target clippy、mock 6 rounds、corpus-only 与 diff check 均通过。首次并行 workspace
+> run 的唯一 cleanup timeout 及其 exact rerun pass 仍如实保留，不用 focused pass 冒充完整结果。
 >
 > **测试教训**：shell wrapper 的 final status 必须在 `finally` 捕获，普通尾随语句会被 `return` 跳过；
 > exclusive gate 必须用 session 私有 central-seam probe 记录 attempt/entry/max-active，不能用 named mutex

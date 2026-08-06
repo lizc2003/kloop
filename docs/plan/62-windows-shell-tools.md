@@ -1,6 +1,6 @@
 # Plan 62 — Windows 原生 Shell：Git Bash、PowerShell 与 Job Object
 
-> 状态：✅ 已完成（2026-08-05；初始提交 `ef61d9c`，审查纠偏提交以本条所在提交为准）
+> 状态：✅ 已完成（2026-08-06；初始提交 `ef61d9c`、纠偏 `fe6a20d`、审查 follow-up `d350eb8`、Windows 原生修复 `5599705`/`064bfac`，最终验收以本记录为准）
 >
 > 依赖：Plan 50、Plan 51、Plan 61；与未开工 Plan 63 修改面重叠，收尾前不得并行
 >
@@ -324,7 +324,7 @@ git diff --check
 
 ## 2026-08-06 `fe6a20d` 审查 follow-up
 
-- 审查确认用户 script block 的顶层 `return` 会跳过普通尾随快照；wrapper 改为在同一 block 的 `finally` 中先保存 `$?` 与 `$LASTEXITCODE`。PowerShell 7/Windows PowerShell 5.1 原生真值表新增 native 9 后 `return`、stale-native success、`Write-Error; return` 与返回值输出；Darwin 只运行结构测试，双 flavor 行为待 Windows 原生复跑。
+- 审查确认用户 script block 的顶层 `return` 会跳过普通尾随快照；wrapper 改为在同一 block 的 `finally` 中先保存 `$?` 与 `$LASTEXITCODE`。PowerShell 7/Windows PowerShell 5.1 原生真值表新增 native 9 后 `return`、stale-native success、`Write-Error; return` 与返回值输出；`d350eb8` 落地时 Darwin 只运行结构测试，双 flavor 行为仍待 Windows 原生复跑，现已由下一节补齐。
 - PowerShell exclusive gate 的测试不再以 named mutex、750ms/2s sleep、marker 文件或进程冷启动推断串行化。每个测试 session 使用私有 central-gate probe，确定性记录 attempt、executor entry、active/max-active，并用 permit 逐个放行；覆盖 direct/direct、direct/foreground program、background/background、direct/background，以及 gate waiter 已 attempt 后取消仍为零 entry。
 - 官方 MSIX Bash lifecycle 改为带原因的 ignored provisioned acceptance；普通 CI 不执行它。验收必须显式运行：
 
@@ -335,20 +335,28 @@ git diff --check
   selector 内继续复用 Package API，只接受 `Microsoft.PowerShell_8wekyb3d8bbwe` / `Microsoft.PowerShell-LTS_8wekyb3d8bbwe`；fixture 缺失时 `expect` fail closed。它覆盖 foreground timeout/cancel、background kill/session shutdown。历史验收 fixture 是 Windows 10 build 19045 x64、Git Bash 5.2.37、`Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe`，file version 7.6.4.500；该 identity 不冒充当前 rerun。
 - normal/debug process-tree handle-growth 回归改在各自的 exact helper test process 中逐轮采样 spawn peak 与 `cleanup_after_exit + drop` 后计数，以前后半中位数约束趋势；删除整批完成后最多等待 30 秒的 eventual-success 路径。隔离进程避免其他并行 core test 的临时 handles，不要求把普通 workspace tests 串行化。
 - 2026-08-06 Darwin 本机门已通过：`cargo fmt --all --check`、workspace all-target `clippy -D warnings`、workspace tests（core 550）、`cargo test -p kloop-core powershell -- --list` 与同 selector 实跑、PowerShell module/code-mode/process-tree focused tests、`--mock`、corpus-only/full exact-binary verifier、build-matrix check 和 `git diff --check`。MSVC target 的整 core test cross-check 仍被本机缺 Windows C headers 的 `ring`/`assert.h` 阻塞，不冒充 Windows compile/run 证据。
-- 新 Windows 证据必须先运行 `cargo test -p kloop-core powershell -- --list` 再运行同 selector，并单列 process-tree、普通 Bash/code-mode 与上面的 ignored MSIX acceptance。记录必须区分 passed、ignored、`cfg` 未编译和 provisioned 未运行；当前 follow-up 的 Windows 原生状态为 **pending**，收到真实验收机输出前不得改写为通过。
+- 新 Windows 证据必须先运行 `cargo test -p kloop-core powershell -- --list` 再运行同 selector，并单列 process-tree、普通 Bash/code-mode 与上面的 ignored MSIX acceptance。记录必须区分 passed、ignored、`cfg` 未编译和 provisioned 未运行；`d350eb8` 落地时 follow-up 的 Windows 原生状态为 **pending**，该门现已由下一节的当前 HEAD 原生记录关闭。
 
-## 完成标准（Plan 62 历史功能已满足；2026-08-06 follow-up 原生复跑 pending）
+## 2026-08-06 Windows 原生复跑与审查收尾
+
+- 原生复跑使用上一节记录的 Windows 10 x64 验收机、Git for Windows 5.2.37、官方 `Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe` MSIX 与 Windows PowerShell 5.1；运行对象为包含 `d350eb8`、`5599705`、`064bfac` 的当前 HEAD。`5599705` 把 gate probe 的 active/entry 生命周期从 mutex acquisition 移到真实 executor scope，并用独立回归证明 mutex 提前释放时可观测 `max_active = 2`；同时允许 Windows PowerShell 5.1 合法的 `Preparing modules for first use` CLIXML progress。`064bfac` 继续要求结果无 `[exit status N]`/`[killed by signal]`，避免 `done` 后非零退出假绿。
+- 先运行 `cargo test -p kloop-core powershell -- --list`，精确列出 26 tests / 0 benchmarks；随后同 selector 实跑 26 passed / 0 failed / 0 ignored。它实际覆盖 PowerShell 7 与 Windows PowerShell 5.1 的 `return` 真值表、direct/direct、direct/foreground program、background/background、direct/background、waiter cancellation，以及 CLIXML 可接受但非零 process status 必须拒绝。
+- focused selectors 原生结果：`process_tree` 19 passed / 0 ignored，包含 normal/debug 两个隔离 handle-growth helper；普通 `tools::bash::tests` 17 passed / 1 provisioned ignored；`tools::codemode::tests` 26 passed / 0 ignored。官方 MSIX 四 lifecycle 随后用文档给出的 `--exact --ignored --nocapture` selector 显式运行，1 passed / 0 ignored，覆盖 foreground timeout/cancel 与 background kill/session shutdown。
+- 当前 HEAD 的 `cargo fmt --all -- --check` 与 workspace all-target `clippy -D warnings` 通过。首次默认并行 workspace run 为 core 553 passed / 1 failed / 1 ignored，唯一失败是 `background_failure_reports_exit_code` 等待 Windows descendant debugger cleanup 超时；该 exact test 随即通过，停止并行构建负载后的完整 workspace 复跑全绿，core 554 passed / 1 provisioned ignored，其余 crates 与 doc tests 全绿。记录保留首次失败，不把 focused rerun 冒充完整 workspace 结果。
+- `cargo run -p kloop -- --mock` 完成 6 rounds；Windows corpus-only verifier 通过 immutable corpus/hash、scripted provider 7 tests 与跨平台边界检查，并继续明确 Plan 59 native report 仅为 Darwin arm64。`git diff --check` 通过；普通 workspace tests 中的 1 ignored 与显式 provisioned acceptance 的 1 passed 已分开记录。
+
+## 完成标准（均已满足）
 
 1. Windows model shell 在 user code 执行前已进入专属 Job；attach/resume 失败 fail closed。
 2. timeout/cancel/leader-exit/explicit kill/watchdog/future Drop/session Drop 后无 root 或 descendant，且无线性 handle leak。
 3. Windows Bash 只执行已验证 Git for Windows；缺失时不注册且无 fallback。
-4. PowerShell 只在 Windows 注册、仅前台、使用固定 encoded invocation；既有 PowerShell 7/5.1 原生能力已通过，2026-08-06 新增 `return` 真值表待复跑。
+4. PowerShell 只在 Windows 注册、仅前台、使用固定 encoded invocation；PowerShell 7/5.1 原生能力与 2026-08-06 新增 `return` 真值表均已通过。
 5. PowerShell 在 plan 阻断、bypass 仍问、恒串行、无自动 remember；仅用户手工 whole-tool allow 可授权。
 6. Job containment 不被 sandbox 配置或 `disable_sandbox` 关闭，且文档不冒充 Windows sandbox。
 7. macOS/Linux Plan 50 与 Seatbelt 行为、exact/corpus parity gate 无回退。
-8. `fe6a20d` 前的原生 Windows focused/workspace/mock/corpus 记录全绿；2026-08-06 follow-up 必须按上节 exact selectors 另行复跑，既有 macOS/Linux 回归与三平台普通 CI 门保持。
-9. 初始实现、第一次审查纠偏和本次 review follow-up 各自一个 `plan62` 提交；公开历史不改写，提交信息与本文件记录各自验证边界。
+8. `fe6a20d` 前的原生 Windows focused/workspace/mock/corpus 记录保持；2026-08-06 follow-up 已按上节 exact selectors 另行复跑，普通 CI ignored 与 provisioned acceptance 明确分开，既有 macOS/Linux 回归与三平台普通 CI 门保持。
+9. 初始实现、第一次审查纠偏、review follow-up 与两次 Windows 原生修复各自独立提交；公开历史不改写，提交信息与本文件记录各自验证边界。
 
 ## 后续边界
 
-Plan 62 的产品能力已完成；2026-08-06 review follow-up 仍待 Windows 原生验收后收尾。后续不得把 Job containment扩写为 filesystem/network sandbox，也不得因 hooks/MCP/Git 共享 process-creation gate 就宣称这些 helper 具有 shell Job ownership。PowerShell background/PTY/stdin/session 与 pinned Darwin PowerShell matrix 结论仍保持原边界。
+Plan 62 的产品能力与 2026-08-06 review follow-up 原生验收均已完成。后续不得把 Job containment 扩写为 filesystem/network sandbox，也不得因 hooks/MCP/Git 共享 process-creation gate 就宣称这些 helper 具有 shell Job ownership。PowerShell background/PTY/stdin/session 与 pinned Darwin PowerShell matrix 结论仍保持原边界。
