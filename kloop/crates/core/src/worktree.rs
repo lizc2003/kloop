@@ -239,7 +239,7 @@ async fn create_managed(
         bail!("worktree branch {branch} already exists");
     }
     let base = match base_policy {
-        BasePolicy::Head => git_text(&repository.root, &["rev-parse", "HEAD"])
+        BasePolicy::Head => git_text(cwd, &["rev-parse", "HEAD"])
             .await
             .context("cannot read HEAD (repository has no commits yet?)")?,
         BasePolicy::Fresh => fresh_base(&repository.root).await?,
@@ -349,15 +349,24 @@ pub(crate) fn compute_overrides(
     base_sandbox: &Option<Arc<SandboxPolicy>>,
     base_system: &str,
     worktree_path: &Path,
-) -> (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String) {
+) -> Result<(Arc<Permissions>, Option<Arc<SandboxPolicy>>, String)> {
+    let expected_project = base_permissions.identity().project_id();
+    let parent_identity = crate::project::WorkspaceIdentity::resolve(base_cwd);
+    let worktree_identity = crate::project::WorkspaceIdentity::resolve(worktree_path);
+    if expected_project.is_none()
+        || parent_identity.project_id() != expected_project
+        || worktree_identity.project_id() != expected_project
+    {
+        bail!("worktree project identity is unavailable or does not match the permission policy's project");
+    }
     let old = format!("- Working directory: {}", base_cwd.display());
     let new = format!("- Working directory: {}", worktree_path.display());
     let system = base_system.replacen(&old, &new, 1);
-    let permissions = Arc::new(base_permissions.rebased(worktree_path.to_path_buf()));
+    let permissions = Arc::new(base_permissions.for_workspace(worktree_identity));
     let sandbox = base_sandbox
         .as_ref()
-        .map(|sandbox| Arc::new(sandbox.with_writable_root(worktree_path)));
-    (permissions, sandbox, system)
+        .map(|sandbox| Arc::new(sandbox.for_workspace(worktree_path)));
+    Ok((permissions, sandbox, system))
 }
 
 pub fn generated_name() -> String {
@@ -422,7 +431,18 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
         path = worktree.path.display(),
         branch = worktree.branch,
     );
-    install_active(cfg, worktree);
+    let overrides = match active_overrides(cfg, &worktree) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            return match finish(worktree).await {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "cleaning up worktree after identity validation failed: {cleanup:#}"
+                ))),
+            };
+        }
+    };
+    install_active(cfg, worktree, overrides);
     Ok(message)
 }
 
@@ -453,8 +473,7 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
         );
     }
 
-    let mut slot = cfg.active_worktree.write().unwrap();
-    if slot.is_some() {
+    if cfg.active_worktree.read().unwrap().is_some() {
         let managed_root = repository.root.join(WORKTREES_DIR);
         if !canonical_path.starts_with(&managed_root) {
             bail!(
@@ -463,10 +482,7 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
                 managed_root.display(),
             );
         }
-        let mut previous = slot.take().expect("checked active slot");
-        previous.wt.lifecycle = WorktreeLifecycle::Kept;
     }
-    drop(slot);
 
     let branch = registered
         .branch
@@ -487,19 +503,26 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
         "Entered worktree at {path} on branch {branch}. The session is now working in the worktree. Use exit_worktree to leave mid-session.",
         path = worktree.path.display(),
     );
-    install_active(cfg, worktree);
+    let overrides = active_overrides(cfg, &worktree)?;
+    install_active(cfg, worktree, overrides);
     Ok(message)
 }
 
-fn install_active(cfg: &Config, worktree: Worktree) {
-    let (permissions, sandbox, system) = compute_overrides(
+type WorktreeOverrides = (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String);
+
+fn active_overrides(cfg: &Config, worktree: &Worktree) -> Result<WorktreeOverrides> {
+    compute_overrides(
         &cfg.cwd,
         &cfg.permissions,
         &cfg.sandbox,
         &cfg.system,
         &worktree.path,
-    );
-    *cfg.active_worktree.write().unwrap() = Some(ActiveWorktree {
+    )
+}
+
+fn install_active(cfg: &Config, worktree: Worktree, overrides: WorktreeOverrides) {
+    let (permissions, sandbox, system) = overrides;
+    let active = ActiveWorktree {
         cwd: worktree.path.clone(),
         branch: worktree.branch.clone(),
         permissions,
@@ -507,7 +530,10 @@ fn install_active(cfg: &Config, worktree: Worktree) {
         sandbox,
         system,
         wt: worktree,
-    });
+    };
+    if let Some(mut previous) = cfg.active_worktree.write().unwrap().replace(active) {
+        previous.wt.lifecycle = WorktreeLifecycle::Kept;
+    }
 }
 
 pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Result<String> {
@@ -898,6 +924,22 @@ mod tests {
         root
     }
 
+    fn config_for_repo(root: &Path, tag: &str) -> Config {
+        let mut cfg = crate::tools::testutil::test_ctx(0, tag).cfg.test_clone();
+        cfg.cwd = root.to_path_buf();
+        cfg.system = format!("- Working directory: {}", root.display());
+        cfg.permissions = Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &Default::default(),
+                root.to_path_buf(),
+                None,
+            )
+            .unwrap(),
+        );
+        cfg
+    }
+
     #[tokio::test]
     async fn create_records_owned_provenance_and_removes_clean_tree() {
         let root = temp_repo("create").await;
@@ -938,6 +980,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn workspace_overrides_reject_project_drift_from_loaded_permissions() {
+        let trusted = temp_repo("trusted-policy").await;
+        let changed = temp_repo("changed-policy").await;
+        let candidate = create(&changed, "candidate").await.unwrap();
+        let permissions = Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &Default::default(),
+                trusted.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let system = format!("- Working directory: {}", changed.display());
+        let error = match compute_overrides(&changed, &permissions, &None, &system, &candidate.path)
+        {
+            Ok(_) => panic!("project drift reused the loaded permission policy"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("permission policy's project"));
+        assert!(finish(candidate).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(trusted);
+        let _ = std::fs::remove_dir_all(changed);
+    }
+
     #[test]
     fn names_allow_segments_but_reject_escapes() {
         validate_name("feature/plan56").unwrap();
@@ -950,8 +1018,6 @@ mod tests {
 
     #[tokio::test]
     async fn external_handle_cannot_be_removed() {
-        use crate::tools::testutil::test_ctx;
-
         let root = temp_repo("external").await;
         let external = root.join("external");
         git_text(
@@ -968,8 +1034,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut cfg = (*test_ctx(0, "external").cfg).clone();
-        cfg.cwd = root.clone();
+        let cfg = config_for_repo(&root, "external");
         enter_existing(&cfg, &external).await.unwrap();
         let error = exit(&cfg, ExitAction::Remove, true).await.unwrap_err();
         assert!(error.to_string().contains("not the owner"));
@@ -981,11 +1046,8 @@ mod tests {
 
     #[tokio::test]
     async fn remove_requires_discard_and_restores_active_on_refusal() {
-        use crate::tools::testutil::test_ctx;
-
         let root = temp_repo("refuse").await;
-        let mut cfg = (*test_ctx(0, "refuse").cfg).clone();
-        cfg.cwd = root.clone();
+        let cfg = config_for_repo(&root, "refuse");
         enter(&cfg, "dirty").await.unwrap();
         let path = cfg.effective_cwd();
         std::fs::write(path.join("dirty.txt"), "dirty").unwrap();
@@ -1000,11 +1062,8 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_retains_even_clean_session_tree() {
-        use crate::tools::testutil::test_ctx;
-
         let root = temp_repo("shutdown").await;
-        let mut cfg = (*test_ctx(0, "shutdown").cfg).clone();
-        cfg.cwd = root.clone();
+        let cfg = config_for_repo(&root, "shutdown");
         enter(&cfg, "kept").await.unwrap();
         let path = cfg.effective_cwd();
         let note = finish_active(&cfg).await.unwrap();
@@ -1016,15 +1075,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_remove_does_not_touch_task_owned_tree() {
-        use crate::tools::testutil::test_ctx;
-
         let root = temp_repo("owners").await;
         let task = create(&root, "task-owner").await.unwrap();
         let task_path = task.path.clone();
         std::fs::write(task_path.join("task.txt"), "task").unwrap();
 
-        let mut cfg = (*test_ctx(0, "owners").cfg).clone();
-        cfg.cwd = root.clone();
+        let cfg = config_for_repo(&root, "owners");
         enter(&cfg, "session-owner").await.unwrap();
         let session_path = cfg.effective_cwd();
         exit(&cfg, ExitAction::Remove, false).await.unwrap();
@@ -1036,11 +1092,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_session_enter_publishes_exactly_one_active_handle() {
-        use crate::tools::testutil::test_ctx;
-
         let root = temp_repo("session-concurrent").await;
-        let mut cfg = (*test_ctx(0, "session-concurrent").cfg).clone();
-        cfg.cwd = root.clone();
+        let cfg = config_for_repo(&root, "session-concurrent");
         let (first, second) = tokio::join!(enter(&cfg, "first"), enter(&cfg, "second"));
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
         let active_path = cfg.effective_cwd();

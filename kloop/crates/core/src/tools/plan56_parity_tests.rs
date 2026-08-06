@@ -379,13 +379,15 @@ async fn ownership_report() -> Value {
 }
 
 async fn permission_report() -> Value {
-    let approver = ScriptedApprover::new([Decision::Allow, Decision::Allow]);
+    let approver = ScriptedApprover::new([
+        Decision::Allow(crate::permissions::ApprovalScope::Once),
+        Decision::Allow(crate::permissions::ApprovalScope::Once),
+    ]);
     let permissions = Permissions::new(
         Mode::Manual,
         &PermissionRules::default(),
         std::path::PathBuf::from("/work"),
         Some(approver.clone()),
-        None,
     )
     .unwrap();
     permissions
@@ -409,16 +411,20 @@ async fn permission_report() -> Value {
     assert!(requests[0].description.contains("existing worktree"));
     assert!(requests[1].description.contains("destructive"));
 
-    let shared_approver = ScriptedApprover::new([Decision::AllowAlways]);
+    let shared_approver = ScriptedApprover::new([
+        Decision::Allow(crate::permissions::ApprovalScope::WorkspaceSession),
+        Decision::Allow(crate::permissions::ApprovalScope::Once),
+    ]);
     let base = Permissions::new(
         Mode::Manual,
         &PermissionRules::default(),
         std::path::PathBuf::from("/work"),
         Some(shared_approver.clone()),
-        None,
     )
     .unwrap();
-    let rebased = base.rebased(std::path::PathBuf::from("/work/tree"));
+    let rebased = base.for_workspace(crate::project::WorkspaceIdentity::resolve(
+        std::path::Path::new("/work/tree"),
+    ));
     rebased
         .check("bash", &json!({"command": "cargo build"}), 0)
         .await
@@ -426,12 +432,12 @@ async fn permission_report() -> Value {
     base.check("bash", &json!({"command": "cargo build --release"}), 0)
         .await
         .unwrap();
-    assert_eq!(shared_approver.requests().len(), 1);
+    assert_eq!(shared_approver.requests().len(), 2);
 
     json!({
         "automatic": ["enter_name", "exit_keep"],
         "asked": requests.into_iter().map(|request| request.description).collect::<Vec<_>>(),
-        "allow_always_shared_after_rebase": true,
+        "workspace_session_isolated_after_rebase": true,
     })
 }
 
@@ -486,7 +492,7 @@ async fn no_active_report() -> Value {
 async fn effective_context_report() -> Value {
     let repository = temp_git_repo("plan56-context");
     let mut context = git_ctx(test_ctx(0, "plan56-context"), &repository, true);
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.system = format!(
         "# Environment\n- Working directory: {}",
         repository.display()

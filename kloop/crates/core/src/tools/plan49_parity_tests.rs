@@ -65,7 +65,7 @@ impl Ui for RecordingUi {
 
 fn ctx_at(root: &Path, ui: Arc<RecordingUi>, tag: &str) -> ToolCtx {
     let mut ctx = test_ctx(0, tag);
-    let mut config = (*ctx.cfg).clone();
+    let mut config = ctx.cfg.test_clone();
     config.cwd = root.to_path_buf();
     ctx.cfg = Arc::new(config);
     ctx.ui = ui;

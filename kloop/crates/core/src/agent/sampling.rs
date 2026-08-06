@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use super::injected_context;
 use super::Ui;
 use crate::config::Config;
+use crate::config::EffectiveWorkspace;
 use crate::event::Delta;
 use crate::event::Event;
 use crate::event::Item;
@@ -73,13 +74,14 @@ pub(super) async fn sample_with_retry(
     cancel: &CancellationToken,
     stream_text: bool,
     depth: u8,
+    workspace: &EffectiveWorkspace,
     item_seq: &mut u64,
 ) -> Sampled {
     // Project instructions, the (depth-0) skills catalog, and the deferred-tools
     // notice ride every request as a synthetic first user message. Never
     // recorded: resume rereads fresh files, and compaction cannot swallow it.
     let injected;
-    let messages = match injected_context(cfg, depth) {
+    let messages = match injected_context(cfg, workspace, depth) {
         Some(context) => {
             let mut with_context = Vec::with_capacity(messages.len() + 1);
             with_context.push(Message::user_text(context));
@@ -101,6 +103,7 @@ pub(super) async fn sample_with_retry(
             ui,
             cancel,
             stream_text,
+            workspace,
             &mut *item_seq,
         )
         .await
@@ -154,12 +157,11 @@ async fn sample_once(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
+    workspace: &EffectiveWorkspace,
     item_seq: &mut u64,
 ) -> Result<SampleOk, SampleError> {
-    // effective_system: working-directory line rewritten to the active
-    // worktree when the session entered one (plan 35 slice 2).
-    let system = cfg.effective_system();
-    let mut rx = cfg.provider.stream(model, &system, messages, tools);
+    let system = &workspace.system;
+    let mut rx = cfg.provider.stream(model, system, messages, tools);
     let mut blocks = Vec::new();
     // Open assistant/reasoning items, one of each at a time: a delta opens the
     // item (front-ends see `ItemStarted`), later deltas stream into it, and its

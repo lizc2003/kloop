@@ -10,13 +10,18 @@ use serde_json::Value;
 use super::bash;
 use super::str_arg;
 use super::ToolCtx;
+use crate::config::EffectiveWorkspace;
 use crate::process_tree::ProcessSpec;
 use crate::shell_programs::ShellFlavor;
 use crate::shell_programs::ShellProgram;
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
-pub(super) async fn powershell_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn powershell_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     validate_input(input)?;
     let command = str_arg(input, "command", "powershell")?;
     let timeout_ms = timeout_ms(input)?;
@@ -36,7 +41,7 @@ pub(super) async fn powershell_tool(input: &Value, ctx: &ToolCtx) -> Result<Stri
         bail!("interrupted");
     }
 
-    let spec = powershell_spec(program, command, &ctx.cfg.effective_cwd());
+    let spec = powershell_spec(program, command, &workspace.cwd);
     let output = bash::run_process_foreground(spec, timeout_ms, &ctx.cancel, "powershell").await?;
     Ok(bash::format_output(&output))
 }

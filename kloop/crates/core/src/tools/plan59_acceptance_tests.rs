@@ -93,7 +93,7 @@ impl Approver for AllowApprover {
         &self,
         _request: ConfirmRequest,
     ) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
-        Box::pin(async { Decision::Allow })
+        Box::pin(async { Decision::Allow(crate::permissions::ApprovalScope::Once) })
     }
 }
 
@@ -306,7 +306,7 @@ async fn file_search_bash_worktree_report() -> Value {
     let _git_environment =
         crate::worktree::isolate_test_git_environment(root.path(), &isolated_home, &isolated_xdg);
     let mut context = test_ctx(0, "plan59-file-worktree");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.cwd = root.path().to_path_buf();
     config.permissions = Arc::new(
         Permissions::new(
@@ -314,7 +314,6 @@ async fn file_search_bash_worktree_report() -> Value {
             &PermissionRules::default(),
             root.path().to_path_buf(),
             Some(Arc::new(AllowApprover)),
-            None,
         )
         .unwrap(),
     );
@@ -456,7 +455,7 @@ async fn background_agent_scheduler_report() -> Value {
         },
     ]);
     let mut context = test_ctx(0, "plan59-background-agent-scheduler");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.cwd = root.path().to_path_buf();
     config.offload_dir = root.path().join("offload");
     config.inbox = Arc::clone(&inbox);
@@ -655,19 +654,21 @@ async fn mcp_web_toolsource_report() -> Value {
     let trace: PermissionTrace = Arc::new(Mutex::new(Vec::new()));
     let source = Arc::new(SeamSource::new(Arc::clone(&trace)));
     let erased: Arc<dyn ToolSource> = source.clone();
-    let approver = Arc::new(RecordingApprover::new(Arc::clone(&trace), Decision::Allow));
+    let approver = Arc::new(RecordingApprover::new(
+        Arc::clone(&trace),
+        Decision::Allow(crate::permissions::ApprovalScope::Once),
+    ));
     let mut context = with_defer_threshold(
         test_ctx_with_sources(0, "plan59-mcp-web", vec![erased]),
         usize::MAX,
     );
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.permissions = Arc::new(
         Permissions::new(
             Mode::Manual,
             &PermissionRules::default(),
             root.path().to_path_buf(),
             Some(approver.clone()),
-            None,
         )
         .unwrap(),
     );
@@ -817,14 +818,13 @@ async fn mcp_web_toolsource_report() -> Value {
         test_ctx_with_sources(0, "plan59-mcp-web-denied", vec![denied_erased]),
         usize::MAX,
     );
-    let mut denied_config = (*denied_context.cfg).clone();
+    let mut denied_config = denied_context.cfg.test_clone();
     denied_config.permissions = Arc::new(
         Permissions::new(
             Mode::Manual,
             &PermissionRules::default(),
             root.path().to_path_buf(),
             Some(denied_approver.clone()),
-            None,
         )
         .unwrap(),
     );
@@ -889,11 +889,10 @@ async fn ask_plan_workflow_headless_report() -> Value {
         &PermissionRules::default(),
         root.path().to_path_buf(),
         Some(Arc::new(AllowApprover)),
-        None,
     )
     .unwrap();
     let mut context = test_ctx(0, "plan59-ask-plan-workflow");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.cwd = root.path().to_path_buf();
     config.offload_dir = root.path().join("offload");
     config.provider = Arc::new(workflow_provider);
@@ -963,7 +962,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     assert_eq!(context.cfg.permissions.mode(), Mode::AcceptEdits);
 
     let mut cancelled_context = context.clone();
-    let mut cancelled_config = (*cancelled_context.cfg).clone();
+    let mut cancelled_config = cancelled_context.cfg.test_clone();
     cancelled_config.questioner = Some(ScriptedQuestioner::cancelled());
     cancelled_context.cfg = Arc::new(cancelled_config);
     let (cancelled, cancelled_error) =
@@ -975,11 +974,10 @@ async fn ask_plan_workflow_headless_report() -> Value {
         &PermissionRules::default(),
         root.path().to_path_buf(),
         Some(Arc::new(DenyApprover)),
-        None,
     )
     .unwrap();
     let mut rejected_context = test_ctx(0, "plan59-plan-rejected");
-    let mut rejected_config = (*rejected_context.cfg).clone();
+    let mut rejected_config = rejected_context.cfg.test_clone();
     rejected_config.permissions = Arc::new(rejected_permissions);
     rejected_config.surface.plan_control = true;
     rejected_context.cfg = Arc::new(rejected_config);
@@ -1060,14 +1058,13 @@ async fn notebook_lsp_file_report() -> Value {
     });
     std::fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
     let mut context = test_ctx(0, "plan59-notebook-lsp-file");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.cwd = root.path().to_path_buf();
     config.permissions = Arc::new(
         Permissions::new(
             Mode::AcceptEdits,
             &PermissionRules::default(),
             root.path().to_path_buf(),
-            None,
             None,
         )
         .unwrap(),

@@ -46,11 +46,23 @@ pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside 
     Do not retry with disable_sandbox; take a different approach — write within the workspace or a \
     temp directory, or ask the user how to proceed.]";
 
+/// Why one root remains writable when the active workspace changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritableRootOrigin {
+    Workspace,
+    Temporary,
+    Extra,
+}
+
 /// One directory the sandboxed command may write, minus its protected
 /// subpaths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WritableRoot {
     pub root: PathBuf,
+    /// A canonical/literal spelling can have more than one origin. In
+    /// particular, an explicitly configured old checkout must remain writable
+    /// after the workspace-derived contribution is replaced.
+    pub origins: Vec<WritableRootOrigin>,
     /// Kept read-only inside a writable root: privilege-escalation surfaces,
     /// not ordinary data. cc's granularity for `.git` (hooks and config run
     /// code; the rest stays writable so `git commit` works in the sandbox —
@@ -65,6 +77,9 @@ pub struct SandboxPolicy {
     /// Credential-bearing files that sandboxed model shell commands may never
     /// read. The parent kloop process loads them before spawning a command.
     pub denied_read_paths: Vec<PathBuf>,
+    /// Private application state that remains read-only even when it overlaps a
+    /// workspace or an explicitly configured writable root.
+    pub denied_write_paths: Vec<PathBuf>,
     pub allow_network: bool,
     /// The sandbox/approval coupling knob (cc's autoAllowBashIfSandboxed,
     /// default on): a bash call this sandbox will contain skips the asking
@@ -83,68 +98,53 @@ pub struct SandboxPolicy {
 
 impl SandboxPolicy {
     /// The workspace-write policy both references converged on: writable =
-    /// cwd + `/tmp` + `$TMPDIR` + configured extras, everything else
-    /// read-only, network per config. Roots are canonicalized (macOS `/tmp`
-    /// is a symlink to `/private/tmp` and seatbelt matches resolved paths);
-    /// the literal spelling is kept too when it differs, so both ways of
-    /// naming the path match.
+    /// workspace + `/tmp` + `$TMPDIR` + configured extras, everything else
+    /// read-only, network per config. Roots retain their provenance so a
+    /// worktree transition replaces only the workspace contribution.
     pub fn workspace(cwd: &Path, extra_roots: &[PathBuf], allow_network: bool) -> Self {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        let mut push = |path: &Path| {
-            for p in [
-                path.to_path_buf(),
-                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-            ] {
-                if !roots.contains(&p) {
-                    roots.push(p);
-                }
-            }
-        };
-        push(cwd);
+        let mut writable_roots = Vec::new();
+        push_root_aliases(&mut writable_roots, cwd, WritableRootOrigin::Workspace);
         let tmp = Path::new("/tmp");
         if tmp.is_dir() {
-            push(tmp);
+            push_root_aliases(&mut writable_roots, tmp, WritableRootOrigin::Temporary);
         }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR").filter(|v| !v.is_empty()) {
-            push(Path::new(&tmpdir));
+        if let Some(tmpdir) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
+            push_root_aliases(
+                &mut writable_roots,
+                Path::new(&tmpdir),
+                WritableRootOrigin::Temporary,
+            );
         }
         for extra in extra_roots {
-            push(extra);
+            push_root_aliases(&mut writable_roots, extra, WritableRootOrigin::Extra);
         }
         SandboxPolicy {
-            writable_roots: roots
-                .into_iter()
-                .map(|root| WritableRoot {
-                    read_only_subpaths: protected_subpaths(&root),
-                    root,
-                })
-                .collect(),
+            writable_roots,
             denied_read_paths: Vec::new(),
+            denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,
             escalate: true,
         }
     }
 
-    /// A copy of this policy with one more writable root (its literal and
-    /// canonical spellings), for a sub-agent whose cwd is a git worktree (plan
-    /// 35): the sandbox must let its bash write the worktree. The parent's
-    /// roots are kept — a worktree sub-agent's writes land in the worktree via
-    /// its cwd (relative paths + bash `current_dir`), so the extra root only
-    /// needs to *permit* the worktree, not fence off the main tree.
-    pub fn with_writable_root(&self, path: &Path) -> Self {
+    /// Replace the workspace-derived root while preserving temporary roots and
+    /// configured extras. An old workspace that was also configured explicitly
+    /// remains writable through its independent `Extra` origin.
+    pub fn for_workspace(&self, path: &Path) -> Self {
         let mut policy = self.clone();
-        for p in [
-            path.to_path_buf(),
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        ] {
-            if !policy.writable_roots.iter().any(|r| r.root == p) {
-                policy.writable_roots.push(WritableRoot {
-                    read_only_subpaths: protected_subpaths(&p),
-                    root: p,
-                });
-            }
+        for root in &mut policy.writable_roots {
+            root.origins
+                .retain(|origin| *origin != WritableRootOrigin::Workspace);
         }
+        policy
+            .writable_roots
+            .retain(|root| !root.origins.is_empty());
+        push_root_aliases(
+            &mut policy.writable_roots,
+            path,
+            WritableRootOrigin::Workspace,
+        );
         policy
     }
 
@@ -153,15 +153,46 @@ impl SandboxPolicy {
     /// leave a second name for the same credential file.
     pub fn with_denied_read_path(&self, path: &Path) -> Self {
         let mut policy = self.clone();
-        for candidate in [
-            path.to_path_buf(),
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        ] {
-            if !policy.denied_read_paths.contains(&candidate) {
-                policy.denied_read_paths.push(candidate);
-            }
-        }
+        push_path_aliases(&mut policy.denied_read_paths, path);
         policy
+    }
+
+    /// Add application-owned state that sandboxed model shell commands may
+    /// never modify, even when the path overlaps a writable root.
+    pub fn with_denied_write_path(&self, path: &Path) -> Self {
+        let mut policy = self.clone();
+        push_path_aliases(&mut policy.denied_write_paths, path);
+        policy
+    }
+}
+
+fn push_path_aliases(paths: &mut Vec<PathBuf>, path: &Path) {
+    for candidate in [
+        path.to_path_buf(),
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ] {
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+}
+
+fn push_root_aliases(roots: &mut Vec<WritableRoot>, path: &Path, origin: WritableRootOrigin) {
+    for candidate in [
+        path.to_path_buf(),
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ] {
+        if let Some(existing) = roots.iter_mut().find(|root| root.root == candidate) {
+            if !existing.origins.contains(&origin) {
+                existing.origins.push(origin);
+            }
+        } else {
+            roots.push(WritableRoot {
+                read_only_subpaths: protected_subpaths(&candidate),
+                root: candidate,
+                origins: vec![origin],
+            });
+        }
     }
 }
 
@@ -200,7 +231,9 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
     for (i, path) in policy.denied_read_paths.iter().enumerate() {
         let key = format!("DENIED_READ_{i}");
         params.push((key.clone(), path.clone()));
-        read_denies.push(format!("(literal (param \"{key}\"))"));
+        read_denies.push(format!(
+            "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
+        ));
     }
     let file_read = if read_denies.is_empty() {
         "(allow file-read*)".to_string()
@@ -210,7 +243,23 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
             read_denies.join(" ")
         )
     };
-    let file_write = format!("(allow file-write*\n{}\n)", write_parts.join("\n"));
+    let mut write_denies = Vec::new();
+    for (i, path) in policy.denied_write_paths.iter().enumerate() {
+        let key = format!("DENIED_WRITE_{i}");
+        params.push((key.clone(), path.clone()));
+        write_denies.push(format!(
+            "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
+        ));
+    }
+    let file_write = if write_denies.is_empty() {
+        format!("(allow file-write*\n{}\n)", write_parts.join("\n"))
+    } else {
+        format!(
+            "(allow file-write*\n{}\n)\n(deny file-write* {})",
+            write_parts.join("\n"),
+            write_denies.join(" ")
+        )
+    };
     // Reads are full-disk except explicit credential files; network is denied
     // by the base policy's (deny default) unless allow rules are appended.
     let mut sections = vec![
@@ -317,6 +366,7 @@ mod tests {
         SandboxPolicy {
             writable_roots: roots,
             denied_read_paths: Vec::new(),
+            denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,
             escalate: true,
@@ -331,6 +381,7 @@ mod tests {
         let policy = policy_with(
             vec![WritableRoot {
                 root: PathBuf::from("/work/proj"),
+                origins: vec![WritableRootOrigin::Workspace],
                 read_only_subpaths: vec![PathBuf::from("/work/proj/.kloop")],
             }],
             false,
@@ -363,18 +414,27 @@ mod tests {
     }
 
     #[test]
-    fn denied_read_paths_are_parameterized_after_full_disk_allow() {
+    fn denied_state_tree_is_parameterized_for_reads_and_writes() {
+        let private_root = Path::new("/home/u/.kloop");
         let policy = policy_with(Vec::new(), false)
-            .with_denied_read_path(Path::new("/home/u/.kloop/config.toml"));
+            .with_denied_read_path(private_root)
+            .with_denied_write_path(private_root);
         let (profile, params) = seatbelt_profile(&policy);
-        assert!(profile
-            .contains("(allow file-read*)\n(deny file-read* (literal (param \"DENIED_READ_0\")))"));
+        assert!(profile.contains(
+            "(allow file-read*)\n(deny file-read* (literal (param \"DENIED_READ_0\")) (subpath (param \"DENIED_READ_0\")))"
+        ));
+        assert!(profile.contains(
+            "(deny file-write* (literal (param \"DENIED_WRITE_0\")) (subpath (param \"DENIED_WRITE_0\")))"
+        ));
         assert_eq!(
             params,
-            vec![(
-                "DENIED_READ_0".to_string(),
-                PathBuf::from("/home/u/.kloop/config.toml")
-            )]
+            vec![
+                ("DENIED_READ_0".to_string(), PathBuf::from("/home/u/.kloop")),
+                (
+                    "DENIED_WRITE_0".to_string(),
+                    PathBuf::from("/home/u/.kloop")
+                ),
+            ]
         );
     }
 
@@ -383,6 +443,7 @@ mod tests {
         let root = || {
             vec![WritableRoot {
                 root: PathBuf::from("/w"),
+                origins: vec![WritableRootOrigin::Workspace],
                 read_only_subpaths: vec![],
             }]
         };
@@ -401,6 +462,7 @@ mod tests {
         let policy = policy_with(
             vec![WritableRoot {
                 root: PathBuf::from("/w"),
+                origins: vec![WritableRootOrigin::Workspace],
                 read_only_subpaths: vec![],
             }],
             false,
@@ -454,33 +516,67 @@ mod tests {
     }
 
     #[test]
-    fn with_writable_root_adds_the_worktree_keeping_the_originals() {
-        let cwd = std::env::temp_dir().join("kloop-sbx-base");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let base = SandboxPolicy::workspace(&cwd, &[], false);
-        let tree = std::env::temp_dir().join("kloop-sbx-tree");
-        std::fs::create_dir_all(&tree).unwrap();
-
-        let policy = base.with_writable_root(&tree);
-        let roots: Vec<&Path> = policy
-            .writable_roots
-            .iter()
-            .map(|w| w.root.as_path())
-            .collect();
-        assert!(roots.contains(&tree.as_path()), "worktree is writable");
-        assert!(roots.contains(&cwd.as_path()), "original roots kept");
-        // The added root protects the same escalation surfaces as the rest.
-        let added = policy
-            .writable_roots
-            .iter()
-            .find(|w| w.root == tree)
-            .unwrap();
-        assert_eq!(added.read_only_subpaths, protected_subpaths(&tree));
-        // Adding the same root twice is a no-op (idempotent).
-        assert_eq!(
-            policy.with_writable_root(&tree).writable_roots.len(),
-            policy.writable_roots.len()
+    fn for_workspace_replaces_only_the_workspace_derived_root() {
+        let base_root = PathBuf::from("/work/base");
+        let tree = PathBuf::from("/work/tree");
+        let next = PathBuf::from("/work/next");
+        let extra = PathBuf::from("/opt/data");
+        let base = SandboxPolicy::workspace(
+            &base_root,
+            std::slice::from_ref(&extra),
+            /*allow_network*/ false,
         );
+
+        let tree_policy = base.for_workspace(&tree);
+        let roots = |policy: &SandboxPolicy| {
+            policy
+                .writable_roots
+                .iter()
+                .map(|root| root.root.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(roots(&tree_policy).contains(&tree));
+        assert!(!roots(&tree_policy).contains(&base_root));
+        assert!(roots(&tree_policy).contains(&extra));
+        assert!(roots(&tree_policy).contains(&PathBuf::from("/tmp")));
+        assert_eq!(
+            tree_policy
+                .writable_roots
+                .iter()
+                .find(|root| root.root == tree)
+                .unwrap()
+                .read_only_subpaths,
+            protected_subpaths(&tree)
+        );
+
+        let next_policy = tree_policy.for_workspace(&next);
+        assert!(roots(&next_policy).contains(&next));
+        assert!(!roots(&next_policy).contains(&tree));
+        assert!(!roots(&next_policy).contains(&base_root));
+        assert!(roots(&next_policy).contains(&extra));
+        assert_eq!(next_policy.allow_network, base.allow_network);
+        assert_eq!(next_policy.auto_allow, base.auto_allow);
+        assert_eq!(next_policy.escalate, base.escalate);
+    }
+
+    #[test]
+    fn for_workspace_preserves_an_explicit_old_workspace_root() {
+        let base_root = PathBuf::from("/work/base-explicit");
+        let tree = PathBuf::from("/work/tree-explicit");
+        let base = SandboxPolicy::workspace(
+            &base_root,
+            std::slice::from_ref(&base_root),
+            /*allow_network*/ false,
+        );
+
+        let policy = base.for_workspace(&tree);
+        let old = policy
+            .writable_roots
+            .iter()
+            .find(|root| root.root == base_root)
+            .unwrap();
+        assert_eq!(old.origins, vec![WritableRootOrigin::Extra]);
+        assert!(policy.writable_roots.iter().any(|root| root.root == tree));
     }
 
     #[test]

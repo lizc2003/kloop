@@ -756,7 +756,7 @@ mod tests {
         let ctx = deferred_ctx("shared");
         let sub = Config {
             max_rounds: Some(1),
-            ..(*ctx.cfg).clone()
+            ..ctx.cfg.test_clone()
         };
         assert!(Arc::ptr_eq(&ctx.cfg.unlocked_tools, &sub.unlocked_tools));
         assert!(Arc::ptr_eq(

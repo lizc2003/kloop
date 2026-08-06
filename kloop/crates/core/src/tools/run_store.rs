@@ -368,6 +368,15 @@ pub(super) struct RunLease {
     path: PathBuf,
 }
 
+#[cfg(unix)]
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit the CLOEXEC descriptor. Unlock
+        // explicitly so that inherited copies cannot extend the released lease.
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 #[cfg(not(unix))]
 impl Drop for RunLease {
     fn drop(&mut self) {

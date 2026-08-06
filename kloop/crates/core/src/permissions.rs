@@ -34,6 +34,7 @@
 //! Windows PowerShell is always opaque: it never enters the Bash parser,
 //! bypass still asks, and only an explicit whole-tool rule can auto-decide it.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Component;
@@ -42,6 +43,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 use anyhow::bail;
 use anyhow::Context as _;
@@ -55,27 +57,32 @@ use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
 use crate::shell::BashAnalysis;
 
+/// The scope a human may grant to one approval request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalScope {
+    Once,
+    WorkspaceSession,
+    Project,
+}
+
 /// An approver's answer to one confirmation request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// Allow this call only.
-    Allow,
-    /// Allow and cache the call's signatures for the rest of the session.
-    AllowSession,
-    /// Allow and persist the suggested allow rules (via the persist sink).
-    AllowAlways,
+    Allow(ApprovalScope),
     Deny,
 }
 
-/// One confirmation request. `remember_rules` carries the suggested
-/// persistent rules when the call is remember-able; `None` means only
-/// allow-once / deny apply (opaque bash/PowerShell, sensitive paths, explicit ask
-/// rules, sandbox escalation). `preview` carries a file-change diff for
-/// `write_file`/`edit_file` so the human sees the change before approving;
-/// `None` for everything else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionNotice {
+    pub message: String,
+}
+
+/// One confirmation request. `approval_scopes` is authoritative: frontends
+/// render only those choices and core rejects any answer outside the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmRequest {
     pub description: String,
+    pub approval_scopes: Vec<ApprovalScope>,
     pub remember_rules: Option<Vec<String>>,
     pub preview: Option<String>,
 }
@@ -100,11 +107,6 @@ pub enum EscalationOutcome {
 pub trait Approver: Send + Sync {
     fn confirm(&self, req: ConfirmRequest) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
 }
-
-/// Sink invoked on [`Decision::AllowAlways`] with the rule strings to
-/// persist; the CLI writes them to global `~/.kloop/config.toml`. Errors are
-/// the sink's problem to report (the gate has no UI).
-pub type PersistFn = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 /// Gating mode, after cc's permission modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -171,6 +173,95 @@ pub struct PermissionRules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub ask: Vec<String>,
+}
+
+/// Parsed durable allow rules. Construction always goes through the same parser
+/// the runtime gate uses, so the CLI store cannot publish syntax the gate would
+/// interpret differently after restart.
+#[derive(Clone, Debug)]
+pub struct ProjectAllowRules {
+    raw: Vec<String>,
+    parsed: Vec<Rule>,
+}
+
+impl ProjectAllowRules {
+    pub fn parse(entries: &[String]) -> Result<Self> {
+        Ok(Self {
+            raw: entries.to_vec(),
+            parsed: parse_rules(entries)?,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            raw: Vec::new(),
+            parsed: Vec::new(),
+        }
+    }
+
+    pub fn raw(&self) -> &[String] {
+        &self.raw
+    }
+
+    fn parsed(&self) -> &[Rule] {
+        &self.parsed
+    }
+}
+
+impl PartialEq for ProjectAllowRules {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for ProjectAllowRules {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectPolicySnapshot {
+    pub revision: u64,
+    pub allow: ProjectAllowRules,
+}
+
+impl ProjectPolicySnapshot {
+    pub fn empty() -> Self {
+        Self {
+            revision: 0,
+            allow: ProjectAllowRules::empty(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectPolicyStoreError {
+    Unavailable,
+    Invalid,
+    PersistenceFailed,
+}
+
+impl std::fmt::Display for ProjectPolicyStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "project permission storage is unavailable",
+            Self::Invalid => "project permission storage is invalid",
+            Self::PersistenceFailed => "project permission storage could not be updated",
+        })
+    }
+}
+
+impl std::error::Error for ProjectPolicyStoreError {}
+
+pub trait ProjectPermissionWriter: Send + Sync {
+    fn append_allow(
+        &self,
+        project_id: crate::project::ProjectId,
+        additions: ProjectAllowRules,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = std::result::Result<ProjectPolicySnapshot, ProjectPolicyStoreError>>
+                + Send
+                + '_,
+        >,
+    >;
 }
 
 #[derive(Clone, Debug)]
@@ -283,100 +374,249 @@ struct ModeState {
     pre_plan: Mode,
 }
 
+pub struct GlobalPermissionPolicy {
+    deny: Vec<Rule>,
+    ask: Vec<Rule>,
+}
+
+impl GlobalPermissionPolicy {
+    pub fn new(deny: &[String], ask: &[String]) -> Result<Self> {
+        Ok(Self {
+            deny: parse_rules(deny)?,
+            ask: parse_rules(ask)?,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            deny: Vec::new(),
+            ask: Vec::new(),
+        }
+    }
+}
+
+pub struct ProjectPermissionPolicy {
+    project_id: Option<crate::project::ProjectId>,
+    snapshot: RwLock<ProjectPolicySnapshot>,
+    writer: Option<Arc<dyn ProjectPermissionWriter>>,
+}
+
+impl ProjectPermissionPolicy {
+    pub fn available(
+        project_id: crate::project::ProjectId,
+        snapshot: ProjectPolicySnapshot,
+        writer: Option<Arc<dyn ProjectPermissionWriter>>,
+    ) -> Self {
+        Self {
+            project_id: Some(project_id),
+            snapshot: RwLock::new(snapshot),
+            writer,
+        }
+    }
+
+    pub fn unavailable() -> Self {
+        Self {
+            project_id: None,
+            snapshot: RwLock::new(ProjectPolicySnapshot::empty()),
+            writer: None,
+        }
+    }
+
+    pub fn snapshot(&self) -> ProjectPolicySnapshot {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
+        let snapshot = self.snapshot.read().unwrap();
+        allow_rules_match(snapshot.allow.parsed(), name, call)
+    }
+
+    fn can_persist(&self) -> bool {
+        self.project_id.is_some() && self.writer.is_some()
+    }
+
+    fn refresh_from_store(&self, snapshot: ProjectPolicySnapshot) {
+        let mut current = self.snapshot.write().unwrap();
+        // Store loads can race durable writes. Only a snapshot at least as new
+        // as the live policy may refresh it; explicit invalidation is separate.
+        if snapshot.revision >= current.revision {
+            *current = snapshot;
+        }
+    }
+
+    fn invalidate_from_store(&self) {
+        *self.snapshot.write().unwrap() = ProjectPolicySnapshot::empty();
+    }
+
+    async fn persist(
+        &self,
+        additions: ProjectAllowRules,
+    ) -> std::result::Result<ProjectPolicySnapshot, ProjectPolicyStoreError> {
+        let project_id = self
+            .project_id
+            .clone()
+            .ok_or(ProjectPolicyStoreError::Unavailable)?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or(ProjectPolicyStoreError::Unavailable)?;
+        let published = writer.append_allow(project_id, additions).await?;
+        let mut current = self.snapshot.write().unwrap();
+        if published.revision < current.revision {
+            return Err(ProjectPolicyStoreError::Invalid);
+        }
+        *current = published.clone();
+        Ok(published)
+    }
+}
+
+#[derive(Default)]
+pub struct ProjectPolicyRegistry {
+    policies: Mutex<HashMap<crate::project::ProjectId, Arc<ProjectPermissionPolicy>>>,
+}
+
+impl ProjectPolicyRegistry {
+    pub fn get_or_insert(
+        &self,
+        project_id: crate::project::ProjectId,
+        snapshot: ProjectPolicySnapshot,
+        writer: Arc<dyn ProjectPermissionWriter>,
+    ) -> Arc<ProjectPermissionPolicy> {
+        let mut policies = self.policies.lock().unwrap();
+        match policies.entry(project_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let policy = Arc::clone(entry.get());
+                policy.refresh_from_store(snapshot);
+                policy
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let policy = Arc::new(ProjectPermissionPolicy::available(
+                    project_id,
+                    snapshot,
+                    Some(writer),
+                ));
+                entry.insert(Arc::clone(&policy));
+                policy
+            }
+        }
+    }
+    pub fn invalidate(&self, project_id: &crate::project::ProjectId) {
+        let policy = self.policies.lock().unwrap().get(project_id).cloned();
+        if let Some(policy) = policy {
+            policy.invalidate_from_store();
+        }
+    }
+}
+
+pub struct PermissionSession {
+    mode: Mutex<ModeState>,
+    cache: Mutex<HashMap<crate::project::WorkspaceId, HashSet<String>>>,
+    approver: Option<Arc<dyn Approver>>,
+}
+
+impl PermissionSession {
+    pub fn new(mode: Mode, approver: Option<Arc<dyn Approver>>) -> Self {
+        Self {
+            mode: Mutex::new(ModeState {
+                current: mode,
+                pre_plan: Mode::Manual,
+            }),
+            cache: Mutex::new(HashMap::new()),
+            approver,
+        }
+    }
+}
+
 pub struct Permissions {
     /// Tests and `--mock` only: skip every layer including deny.
     allow_everything: bool,
-    /// Session-global mode state shared by the base gate, worktrees and
-    /// sub-agents. Keeping current + pre-plan in one critical section makes
-    /// Enter/Exit and the TUI mode cycle one atomic transition.
-    mode: Arc<Mutex<ModeState>>,
-    /// Mutable: `AllowAlways` appends at runtime.
-    allow: Arc<Mutex<Vec<Rule>>>,
-    deny: Vec<Rule>,
-    ask: Vec<Rule>,
-    session: Mutex<HashSet<String>>,
-    approver: Option<Arc<dyn Approver>>,
-    cwd: PathBuf,
-    persist: Option<PersistFn>,
+    global: Arc<GlobalPermissionPolicy>,
+    project: Arc<ProjectPermissionPolicy>,
+    session: Arc<PermissionSession>,
+    identity: crate::project::WorkspaceIdentity,
 }
 
 impl Permissions {
     /// No gating at all — for tests and the keyless `--mock` demo, where
-    /// nobody is at the keyboard. The CLI's `--permission-mode bypass` is NOT this; it is
-    /// [`Mode::Bypass`], which deny rules and safety checks survive.
+    /// nobody is at the keyboard. The CLI's bypass mode is not this escape.
     pub fn allow_all() -> Self {
-        Permissions {
+        Self {
             allow_everything: true,
-            mode: Arc::new(Mutex::new(ModeState {
-                current: Mode::Bypass,
-                pre_plan: Mode::Manual,
-            })),
-            allow: Arc::new(Mutex::new(Vec::new())),
-            deny: Vec::new(),
-            ask: Vec::new(),
-            session: Mutex::new(HashSet::new()),
-            approver: None,
-            cwd: PathBuf::from("/"),
-            persist: None,
+            global: Arc::new(GlobalPermissionPolicy::empty()),
+            project: Arc::new(ProjectPermissionPolicy::unavailable()),
+            session: Arc::new(PermissionSession::new(Mode::Bypass, None)),
+            identity: crate::project::WorkspaceIdentity::ephemeral(PathBuf::from("/")),
         }
     }
 
+    /// Compatibility constructor for focused gates and test fixtures. `allow`
+    /// entries seed the project layer, never the global layer.
     pub fn new(
         mode: Mode,
         rules: &PermissionRules,
         cwd: PathBuf,
         approver: Option<Arc<dyn Approver>>,
-        persist: Option<PersistFn>,
     ) -> Result<Self> {
-        Ok(Permissions {
+        let identity = crate::project::WorkspaceIdentity::resolve(&cwd);
+        let project = match identity.project_id().cloned() {
+            Some(project_id) => ProjectPermissionPolicy::available(
+                project_id,
+                ProjectPolicySnapshot {
+                    revision: 0,
+                    allow: ProjectAllowRules::parse(&rules.allow)?,
+                },
+                None,
+            ),
+            None => ProjectPermissionPolicy::unavailable(),
+        };
+        Ok(Self {
             allow_everything: false,
-            mode: Arc::new(Mutex::new(ModeState {
-                current: mode,
-                pre_plan: Mode::Manual,
-            })),
-            allow: Arc::new(Mutex::new(parse_rules(&rules.allow)?)),
-            deny: parse_rules(&rules.deny)?,
-            ask: parse_rules(&rules.ask)?,
-            session: Mutex::new(HashSet::new()),
-            approver,
-            cwd: lexical_normalize(Path::new("/"), &cwd),
-            persist,
+            global: Arc::new(GlobalPermissionPolicy::new(&rules.deny, &rules.ask)?),
+            project: Arc::new(project),
+            session: Arc::new(PermissionSession::new(mode, approver)),
+            identity,
         })
     }
 
-    /// A copy of this gate anchored at a different `cwd` — for a sub-agent
-    /// running in its own git worktree (plan 35), where acceptEdits and every
-    /// relative-path check must key off the worktree, not the parent's cwd.
-    /// Rules, mode, the approver and the persist sink are shared (so the
-    /// sub-agent's prompts still reach the user and its `AllowAlways` still
-    /// persists); only the session-approval cache starts fresh — an isolated
-    /// worktree gets its own cache rather than inheriting parent-dir-scoped
-    /// file approvals that wouldn't apply to worktree paths anyway.
-    pub fn rebased(&self, cwd: PathBuf) -> Self {
-        Permissions {
+    pub fn from_layers(
+        global: Arc<GlobalPermissionPolicy>,
+        project: Arc<ProjectPermissionPolicy>,
+        session: Arc<PermissionSession>,
+        identity: crate::project::WorkspaceIdentity,
+    ) -> Self {
+        Self {
+            allow_everything: false,
+            global,
+            project,
+            session,
+            identity,
+        }
+    }
+
+    pub fn identity(&self) -> &crate::project::WorkspaceIdentity {
+        &self.identity
+    }
+
+    pub fn for_workspace(&self, identity: crate::project::WorkspaceIdentity) -> Self {
+        Self {
             allow_everything: self.allow_everything,
-            // Share the transition state: mode changes are session-global.
-            mode: self.mode.clone(),
-            allow: self.allow.clone(),
-            deny: self.deny.clone(),
-            ask: self.ask.clone(),
-            session: Mutex::new(HashSet::new()),
-            approver: self.approver.clone(),
-            cwd: lexical_normalize(Path::new("/"), &cwd),
-            persist: self.persist.clone(),
+            global: Arc::clone(&self.global),
+            project: Arc::clone(&self.project),
+            session: Arc::clone(&self.session),
+            identity,
         }
     }
 
     /// The gating mode in effect right now.
     pub fn mode(&self) -> Mode {
-        self.mode.lock().unwrap().current
+        self.session.mode.lock().unwrap().current
     }
 
     /// Change the gating mode at runtime (the TUI's shift+Tab cycle). Entering
     /// plan mode from a non-plan mode records what to restore on a later
     /// `exit_plan_mode` approval.
     pub fn set_mode(&self, mode: Mode) {
-        let mut state = self.mode.lock().unwrap();
+        let mut state = self.session.mode.lock().unwrap();
         if mode == Mode::Plan && state.current != Mode::Plan {
             state.pre_plan = state.current;
         }
@@ -387,7 +627,7 @@ impl Permissions {
     /// mode changed; repeated EnterPlanMode calls are idempotent and preserve
     /// the original pre-plan mode.
     pub fn enter_plan(&self) -> bool {
-        let mut state = self.mode.lock().unwrap();
+        let mut state = self.session.mode.lock().unwrap();
         if state.current == Mode::Plan {
             return false;
         }
@@ -399,7 +639,7 @@ impl Permissions {
     /// Leave plan mode, restoring the mode active when it was entered (manual
     /// if none was recorded); returns the restored mode.
     fn exit_plan(&self) -> Mode {
-        let mut state = self.mode.lock().unwrap();
+        let mut state = self.session.mode.lock().unwrap();
         let restore = state.pre_plan;
         state.current = restore;
         restore
@@ -414,27 +654,33 @@ impl Permissions {
         if self.allow_everything {
             return PlanExitOutcome::Approved(self.exit_plan());
         }
-        let Some(approver) = &self.approver else {
+        let Some(approver) = &self.session.approver else {
             return PlanExitOutcome::NoApprover;
         };
         let req = ConfirmRequest {
             description: describe_plan_exit(depth),
+            approval_scopes: vec![ApprovalScope::Once],
             remember_rules: None,
             preview: Some(plan.to_string()),
         };
         match approver.confirm(req).await {
-            Decision::Allow | Decision::AllowSession | Decision::AllowAlways => {
-                PlanExitOutcome::Approved(self.exit_plan())
-            }
-            Decision::Deny => PlanExitOutcome::Declined,
+            Decision::Allow(ApprovalScope::Once) => PlanExitOutcome::Approved(self.exit_plan()),
+            Decision::Allow(ApprovalScope::WorkspaceSession | ApprovalScope::Project)
+            | Decision::Deny => PlanExitOutcome::Declined,
         }
     }
 
-    /// Whether this tool call may run: `Ok(())` to proceed, `Err(reason)`
-    /// with the message the model receives as an is_error tool_result.
+    /// Whether this tool call may run. A successful result may carry a safe,
+    /// user-visible notice (for example, a project grant that ran once because
+    /// durable persistence failed).
     /// The sandbox-blind form (no auto-allow layer); dispatch uses
     /// [`Permissions::check_call`] with the per-call sandbox verdict.
-    pub async fn check(&self, name: &str, input: &Value, depth: u8) -> Result<(), String> {
+    pub async fn check(
+        &self,
+        name: &str,
+        input: &Value,
+        depth: u8,
+    ) -> Result<Option<PermissionNotice>, String> {
         self.check_call(name, input, depth, /*sandbox_auto_allow*/ false)
             .await
     }
@@ -449,7 +695,7 @@ impl Permissions {
         input: &Value,
         depth: u8,
         sandbox_auto_allow: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PermissionNotice>, String> {
         self.check_call_with_resolved_path(name, input, None, None, depth, sandbox_auto_allow)
             .await
     }
@@ -465,11 +711,11 @@ impl Permissions {
         preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
         sandbox_auto_allow: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PermissionNotice>, String> {
         if self.allow_everything {
-            return Ok(());
+            return Ok(None);
         }
-        let call = CallFacts::gather(name, input, &self.cwd, resolved_path);
+        let call = CallFacts::gather(name, input, self.identity.cwd(), resolved_path);
         let resolved_input = call
             .path
             .as_ref()
@@ -514,10 +760,6 @@ impl Permissions {
 
         // 4. Safety checks — bypass-immune, straight to the user.
         if let Some(hazard) = call.hazard(name) {
-            let remember = hazard
-                .rememberable
-                .then(|| remember_payload(name, &call))
-                .flatten();
             return self
                 .ask_user(
                     name,
@@ -525,7 +767,7 @@ impl Permissions {
                     preview_context,
                     depth,
                     Some(hazard.tag),
-                    remember,
+                    None,
                 )
                 .await;
         }
@@ -542,14 +784,14 @@ impl Permissions {
         // rules above retain priority; ordinary manual/accept/bypass modes do
         // not prompt for these controls.
         if matches!(name, "cron_create" | "cron_delete" | "schedule_wakeup") {
-            return Ok(());
+            return Ok(None);
         }
 
         // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
         if sandbox_auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
-            return Ok(());
+            return Ok(None);
         }
 
         // 7. Bypass mode — auto-run, but NOT an opaque bash script. Bypass
@@ -565,12 +807,12 @@ impl Permissions {
                 Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque)
             )
         {
-            return Ok(());
+            return Ok(None);
         }
 
         // 8. Read-only self-verdict.
         if call.is_readonly(name) {
-            return Ok(());
+            return Ok(None);
         }
 
         // 9. acceptEdits: file writes inside the working directory.
@@ -578,20 +820,28 @@ impl Permissions {
             && matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         // 10. Allow rules.
         if self.matches_allow(name, &call) {
-            return Ok(());
+            return Ok(None);
         }
 
         // 11. Session cache.
         let remember = remember_payload(name, &call);
         if let Some(remember) = &remember {
-            let session = self.session.lock().unwrap();
-            if remember.signatures.iter().all(|s| session.contains(s)) {
-                return Ok(());
+            let caches = self.session.cache.lock().unwrap();
+            if caches
+                .get(self.identity.workspace_id())
+                .is_some_and(|cache| {
+                    remember
+                        .signatures
+                        .iter()
+                        .all(|signature| cache.contains(signature))
+                })
+            {
+                return Ok(None);
             }
         }
 
@@ -601,29 +851,18 @@ impl Permissions {
     }
 
     fn matches_deny(&self, name: &str, call: &CallFacts) -> bool {
-        rules_hit(&self.deny, name, call, /*strip_for_match*/ true)
+        rules_hit(&self.global.deny, name, call, /*strip_for_match*/ true)
     }
 
     fn matches_ask(&self, name: &str, call: &CallFacts) -> bool {
-        rules_hit(&self.ask, name, call, /*strip_for_match*/ true)
+        rules_hit(&self.global.ask, name, call, /*strip_for_match*/ true)
     }
 
     /// Allow is the strict direction: every bash argv must be read-only or
     /// rule-matched (un-stripped — wrappers must be spelled out), and opaque
     /// bash never matches.
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
-        let allow = self.allow.lock().unwrap();
-        match (&call.shell, &call.path) {
-            (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => cmds
-                .iter()
-                .all(|argv| argv_is_readonly(argv) || allow.iter().any(|r| r.matches_argv(argv))),
-            (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
-            (Some(ShellFacts::PowerShellOpaque), _) => {
-                allow.iter().any(|rule| rule.matches_tool(name))
-            }
-            (None, Some(path)) => allow.iter().any(|r| r.matches_path(name, path)),
-            (None, None) => allow.iter().any(|r| r.matches_tool(name)),
-        }
+        self.project.matches_allow(name, call)
     }
 
     async fn ask_user(
@@ -634,41 +873,62 @@ impl Permissions {
         depth: u8,
         hazard_tag: Option<&str>,
         remember: Option<Remember>,
-    ) -> Result<(), String> {
-        let Some(approver) = &self.approver else {
+    ) -> Result<Option<PermissionNotice>, String> {
+        let Some(approver) = &self.session.approver else {
             return Err(format!(
                 "{name}: approval required but no approver is available in this mode; denied."
             ));
         };
+        let mut approval_scopes = vec![ApprovalScope::Once];
+        if remember.is_some() {
+            approval_scopes.push(ApprovalScope::WorkspaceSession);
+            if self.project.can_persist() {
+                approval_scopes.push(ApprovalScope::Project);
+            }
+        }
         let req = ConfirmRequest {
             description: describe(name, input, depth, hazard_tag),
-            remember_rules: remember.as_ref().map(|r| r.rules.clone()),
+            approval_scopes: approval_scopes.clone(),
+            remember_rules: remember.as_ref().map(|remember| remember.rules.clone()),
             preview: crate::diff::file_change_preview_with_context(name, input, preview_context)
                 .await,
         };
-        match approver.confirm(req).await {
-            Decision::Allow => Ok(()),
-            Decision::AllowSession => {
-                if let Some(remember) = remember {
-                    self.session.lock().unwrap().extend(remember.signatures);
-                }
-                Ok(())
+        let decision = approver.confirm(req).await;
+        let Decision::Allow(scope) = decision else {
+            return Err(user_denial(name));
+        };
+        if !approval_scopes.contains(&scope) {
+            return Err(user_denial(name));
+        }
+        match scope {
+            ApprovalScope::Once => Ok(None),
+            ApprovalScope::WorkspaceSession => {
+                let Some(remember) = remember else {
+                    return Err(user_denial(name));
+                };
+                self.session
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .entry(self.identity.workspace_id().clone())
+                    .or_default()
+                    .extend(remember.signatures);
+                Ok(None)
             }
-            Decision::AllowAlways => {
-                if let Some(remember) = remember {
-                    if let Ok(parsed) = parse_rules(&remember.rules) {
-                        self.allow.lock().unwrap().extend(parsed);
-                    }
-                    if let Some(persist) = &self.persist {
-                        persist(&remember.rules);
-                    }
+            ApprovalScope::Project => {
+                let Some(remember) = remember else {
+                    return Err(user_denial(name));
+                };
+                let additions =
+                    ProjectAllowRules::parse(&remember.rules).map_err(|_| user_denial(name))?;
+                match self.project.persist(additions).await {
+                    Ok(_) => Ok(None),
+                    Err(_) => Ok(Some(PermissionNotice {
+                        message: "project approval applied to this call only; the durable project rule was not saved"
+                            .into(),
+                    })),
                 }
-                Ok(())
             }
-            Decision::Deny => Err(format!(
-                "The user declined this {name} call. Do not retry the same call; take a \
-                 different approach, or ask the user how to proceed."
-            )),
         }
     }
 
@@ -698,9 +958,10 @@ impl Permissions {
         if self.allow_everything {
             return false;
         }
-        let facts = PathFacts::gather_with_resolved(path, &self.cwd, resolved_path);
+        let facts = PathFacts::gather_with_resolved(path, self.identity.cwd(), resolved_path);
         facts.sensitive
             || self
+                .global
                 .deny
                 .iter()
                 .any(|r| r.matches_path("read_file", &facts))
@@ -724,20 +985,38 @@ impl Permissions {
         if self.mode() == Mode::Bypass {
             return EscalationOutcome::Approved;
         }
-        let Some(approver) = &self.approver else {
+        let Some(approver) = &self.session.approver else {
             return EscalationOutcome::NotAttempted;
         };
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
+            approval_scopes: vec![ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         };
         match approver.confirm(req).await {
-            Decision::Allow | Decision::AllowSession | Decision::AllowAlways => {
-                EscalationOutcome::Approved
-            }
-            Decision::Deny => EscalationOutcome::Declined,
+            Decision::Allow(ApprovalScope::Once) => EscalationOutcome::Approved,
+            Decision::Allow(ApprovalScope::WorkspaceSession | ApprovalScope::Project)
+            | Decision::Deny => EscalationOutcome::Declined,
         }
+    }
+}
+
+fn user_denial(name: &str) -> String {
+    format!(
+        "The user declined this {name} call. Do not retry the same call; take a different approach, or ask the user how to proceed."
+    )
+}
+
+fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) -> bool {
+    match (&call.shell, &call.path) {
+        (Some(ShellFacts::Bash(BashAnalysis::Commands(commands))), _) => commands
+            .iter()
+            .all(|argv| argv_is_readonly(argv) || allow.iter().any(|rule| rule.matches_argv(argv))),
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
+        (Some(ShellFacts::PowerShellOpaque), _) => allow.iter().any(|rule| rule.matches_tool(name)),
+        (None, Some(path)) => allow.iter().any(|rule| rule.matches_path(name, path)),
+        (None, None) => allow.iter().any(|rule| rule.matches_tool(name)),
     }
 }
 
@@ -771,9 +1050,6 @@ fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts, strip_for_match: bool
 
 struct Hazard {
     tag: &'static str,
-    /// Destructive commands may be remembered (precise signature);
-    /// sensitive paths must be confirmed every time.
-    rememberable: bool,
 }
 
 enum ShellFacts {
@@ -852,19 +1128,14 @@ impl CallFacts {
         if self.entering_existing_worktree {
             return Some(Hazard {
                 tag: "existing worktree",
-                rememberable: false,
             });
         }
         if self.removing_worktree {
-            return Some(Hazard {
-                tag: "destructive",
-                rememberable: false,
-            });
+            return Some(Hazard { tag: "destructive" });
         }
         if self.powershell_sensitive {
             return Some(Hazard {
                 tag: "sensitive PowerShell path",
-                rememberable: false,
             });
         }
         if let Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))) = &self.shell {
@@ -872,10 +1143,7 @@ impl CallFacts {
                 .iter()
                 .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
             {
-                return Some(Hazard {
-                    tag: "destructive",
-                    rememberable: true,
-                });
+                return Some(Hazard { tag: "destructive" });
             }
         }
         if matches!(name, "write_file" | "edit_file" | "notebook_edit")
@@ -883,7 +1151,6 @@ impl CallFacts {
         {
             return Some(Hazard {
                 tag: "sensitive path",
-                rememberable: false,
             });
         }
         None
@@ -1345,6 +1612,84 @@ mod tests {
         }
     }
 
+    struct ScriptedWriter {
+        snapshot: Mutex<ProjectPolicySnapshot>,
+        fail: bool,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedWriter {
+        fn succeeding() -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(ProjectPolicySnapshot::empty()),
+                fail: false,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(ProjectPolicySnapshot::empty()),
+                fail: true,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ProjectPermissionWriter for ScriptedWriter {
+        fn append_allow(
+            &self,
+            _project_id: crate::project::ProjectId,
+            additions: ProjectAllowRules,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            ProjectPolicySnapshot,
+                            ProjectPolicyStoreError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.calls.lock().unwrap().push(additions.raw().to_vec());
+            if self.fail {
+                return Box::pin(async { Err(ProjectPolicyStoreError::PersistenceFailed) });
+            }
+            let mut snapshot = self.snapshot.lock().unwrap();
+            let mut allow = snapshot.allow.raw().to_vec();
+            for rule in additions.raw() {
+                if !allow.contains(rule) {
+                    allow.push(rule.clone());
+                }
+            }
+            snapshot.revision += 1;
+            snapshot.allow = ProjectAllowRules::parse(&allow).unwrap();
+            let published = snapshot.clone();
+            Box::pin(async move { Ok(published) })
+        }
+    }
+
+    fn gate_with_writer(
+        mode: Mode,
+        approver: Arc<ScriptedApprover>,
+        writer: Arc<ScriptedWriter>,
+    ) -> Permissions {
+        let identity = crate::project::WorkspaceIdentity::resolve(&test_cwd());
+        let project_id = identity.project_id().unwrap().clone();
+        let writer: Arc<dyn ProjectPermissionWriter> = writer;
+        Permissions::from_layers(
+            Arc::new(GlobalPermissionPolicy::empty()),
+            Arc::new(ProjectPermissionPolicy::available(
+                project_id,
+                ProjectPolicySnapshot::empty(),
+                Some(writer),
+            )),
+            Arc::new(PermissionSession::new(mode, Some(approver))),
+            identity,
+        )
+    }
+
     fn rules(allow: &[&str], deny: &[&str], ask: &[&str]) -> PermissionRules {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect();
         PermissionRules {
@@ -1359,7 +1704,7 @@ mod tests {
     }
 
     fn gate(mode: Mode, r: PermissionRules, approver: Arc<ScriptedApprover>) -> Permissions {
-        Permissions::new(mode, &r, test_cwd(), Some(approver), None).unwrap()
+        Permissions::new(mode, &r, test_cwd(), Some(approver)).unwrap()
     }
 
     async fn ok(p: &Permissions, name: &str, input: Value) -> bool {
@@ -1401,13 +1746,17 @@ mod tests {
         let read = json!({"server": "fixture", "uri": "fixture://note"});
         let directory = json!({"server": "fixture", "uri": "fixture://root"});
 
-        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
         let manual = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&manual, "read_mcp_resource", read.clone()).await);
         assert!(!ok(&manual, "read_mcp_resource_dir", directory.clone()).await);
         assert_eq!(approver.ask_count(), 2);
 
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let no_cache = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&no_cache, "read_mcp_resource", read.clone()).await);
         assert!(
@@ -1534,7 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn destructive_commands_ask_even_in_bypass_and_over_allowlist() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(
             Mode::Bypass,
             rules(&["bash(rm *)"], &[], &[]),
@@ -1548,6 +1897,8 @@ mod tests {
             "allow rule and bypass must not silence the check"
         );
         assert!(asked[0].description.contains("[destructive]"));
+        assert_eq!(asked[0].approval_scopes, vec![ApprovalScope::Once]);
+        assert_eq!(asked[0].remember_rules, None);
 
         // second time: deny (script exhausted) → the call is refused
         assert!(!ok(&p, "bash", bash("rm -rf build")).await);
@@ -1586,7 +1937,10 @@ mod tests {
 
     #[tokio::test]
     async fn sensitive_paths_ask_every_time_and_never_remember() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let p = gate(
             Mode::AcceptEdits,
             rules(&["write_file"], &[], &[]),
@@ -1626,7 +1980,7 @@ mod tests {
 
     #[tokio::test]
     async fn sensitive_reads_are_hard_blocked_before_sandbox_and_bypass() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow; 8]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 8]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
         assert!(!ok(&p, "read_file", json!({"path": ".kloop/config.toml"})).await);
         for command in [
@@ -1663,13 +2017,12 @@ mod tests {
         let alias = root.join("innocent.toml");
         std::os::unix::fs::symlink(&secret, &alias).unwrap();
 
-        let approver = ScriptedApprover::new(vec![Decision::Allow; 2]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 2]);
         let permissions = Permissions::new(
             Mode::Bypass,
             &rules(&[], &[], &[]),
             root.clone(),
             Some(approver.clone()),
-            None,
         )
         .unwrap();
         assert!(permissions
@@ -1707,7 +2060,6 @@ mod tests {
             &rules(&[], &[], &[]),
             root.clone(),
             Some(approver.clone()),
-            None,
         )
         .unwrap();
         assert!(permissions
@@ -1723,7 +2075,6 @@ mod tests {
             Mode::AcceptEdits,
             &rules(&[], &["write_file(.git/**)"], &[]),
             root.clone(),
-            None,
             None,
         )
         .unwrap();
@@ -1742,7 +2093,10 @@ mod tests {
 
     #[tokio::test]
     async fn ask_rules_override_allow_and_are_not_cached() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let p = gate(
             Mode::Manual,
             rules(&["bash(cargo *)"], &[], &["bash(cargo publish *)"]),
@@ -1797,7 +2151,7 @@ mod tests {
         let approver = ScriptedApprover::new(vec![]);
         let parent = gate(Mode::AcceptEdits, rules(&[], &[], &[]), approver.clone());
         let worktree = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let sub = parent.rebased(worktree.clone());
+        let sub = parent.for_workspace(crate::project::WorkspaceIdentity::resolve(&worktree));
         assert!(
             ok(
                 &sub,
@@ -1883,7 +2237,8 @@ mod tests {
 
     #[tokio::test]
     async fn allow_session_caches_two_word_prefix() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "bash", bash("git commit -m one")).await);
         assert!(
@@ -1896,49 +2251,114 @@ mod tests {
         assert_eq!(approver.ask_count(), 2);
     }
 
-    #[tokio::test]
-    async fn allow_always_extends_rules_and_persists() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        let persisted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = persisted.clone();
-        let approver = ScriptedApprover::new(vec![Decision::AllowAlways]);
-        let p = Permissions::new(
-            Mode::Manual,
-            &rules(&[], &[], &[]),
-            PathBuf::from("/work/proj"),
-            Some(approver.clone()),
-            Some(Arc::new(move |rules| {
-                CALLS.fetch_add(1, Ordering::SeqCst);
-                sink.lock().unwrap().extend(rules.iter().cloned());
-            })),
-        )
-        .unwrap();
+    #[test]
+    fn project_registry_refreshes_authoritative_store_snapshots() {
+        let project_id = crate::project::WorkspaceIdentity::resolve(&test_cwd())
+            .project_id()
+            .unwrap()
+            .clone();
+        let writer: Arc<dyn ProjectPermissionWriter> = ScriptedWriter::succeeding();
+        let registry = ProjectPolicyRegistry::default();
+        let first = registry.get_or_insert(
+            project_id.clone(),
+            ProjectPolicySnapshot::empty(),
+            Arc::clone(&writer),
+        );
+        let revision_one = ProjectPolicySnapshot {
+            revision: 1,
+            allow: ProjectAllowRules::parse(&["bash(cargo *)".to_string()]).unwrap(),
+        };
+        let refreshed = registry.get_or_insert(
+            project_id.clone(),
+            revision_one.clone(),
+            Arc::clone(&writer),
+        );
+        assert!(Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(first.snapshot(), revision_one);
 
-        assert!(ok(&p, "bash", bash("cargo build")).await);
-        assert_eq!(*persisted.lock().unwrap(), vec!["bash(cargo build *)"]);
-        // the new rule is live immediately: same prefix no longer asks
-        assert!(ok(&p, "bash", bash("cargo build --release")).await);
-        assert_eq!(approver.ask_count(), 1);
+        let revision_two = ProjectPolicySnapshot {
+            revision: 2,
+            allow: ProjectAllowRules::parse(&["write_file(src/**)".to_string()]).unwrap(),
+        };
+        registry.get_or_insert(
+            project_id.clone(),
+            revision_two.clone(),
+            Arc::clone(&writer),
+        );
+        registry.get_or_insert(project_id.clone(), revision_one, Arc::clone(&writer));
+        registry.get_or_insert(
+            project_id.clone(),
+            ProjectPolicySnapshot::empty(),
+            Arc::clone(&writer),
+        );
+        assert_eq!(
+            first.snapshot(),
+            revision_two,
+            "an older or missing-store load rolled policy back"
+        );
+
+        registry.invalidate(&project_id);
+        assert_eq!(
+            first.snapshot(),
+            ProjectPolicySnapshot::empty(),
+            "a removed store did not revoke cached grants"
+        );
     }
 
     #[tokio::test]
-    async fn rebased_allow_always_updates_the_base_gate() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowAlways]);
-        let base = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        let worktree = base.rebased(PathBuf::from("/work/tree"));
+    async fn project_grant_is_durable_first_and_live_across_workspace_views() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let base = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        let worktree = base.for_workspace(crate::project::WorkspaceIdentity::ephemeral(
+            PathBuf::from("/work/tree"),
+        ));
 
         assert!(ok(&worktree, "bash", bash("cargo build")).await);
+        assert_eq!(
+            writer.calls.lock().unwrap().as_slice(),
+            &[vec!["bash(cargo build *)".to_string()]]
+        );
+        assert_eq!(base.project.snapshot().revision, 1);
         assert!(
             ok(&base, "bash", bash("cargo build --release")).await,
-            "the base gate sees rules granted inside the worktree"
+            "the base workspace sees a successfully published project rule"
         );
         assert_eq!(approver.ask_count(), 1);
     }
 
     #[tokio::test]
+    async fn failed_project_persistence_allows_once_without_publishing() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::failing();
+        let permissions = gate_with_writer(Mode::Manual, approver.clone(), writer);
+
+        let notice = permissions
+            .check("bash", &bash("cargo build"), 0)
+            .await
+            .unwrap()
+            .expect("persistence failure must be visible");
+        assert!(notice.message.contains("not saved"));
+        assert_eq!(
+            permissions.project.snapshot(),
+            ProjectPolicySnapshot::empty()
+        );
+        assert!(
+            permissions
+                .check("bash", &bash("cargo build --release"), 0)
+                .await
+                .is_err(),
+            "the failed grant must not enter project policy or session cache"
+        );
+        assert_eq!(approver.ask_count(), 2);
+    }
+
+    #[tokio::test]
     async fn opaque_bash_is_never_cacheable() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::AllowSession]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::WorkspaceSession),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "bash", bash("cargo build")).await);
         assert!(
@@ -1954,7 +2374,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_remembers_parent_directory_scope() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "write_file", file("src/a.rs")).await);
         assert!(
@@ -1989,7 +2410,6 @@ mod tests {
             Mode::Manual,
             &rules(&[], &[], &[]),
             PathBuf::from("/work/proj"),
-            None,
             None,
         )
         .unwrap();
@@ -2103,7 +2523,7 @@ mod tests {
             .is_err());
         assert!(approver.asked()[0].description.contains("[destructive]"));
 
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(
             Mode::Manual,
             rules(&[], &[], &["bash(cargo publish *)"]),
@@ -2125,7 +2545,8 @@ mod tests {
     /// mock) reports NotAttempted so the caller falls back to the hint.
     #[tokio::test]
     async fn escalate_sandbox_maps_decision_and_mode() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("npm install", 0).await,
@@ -2160,7 +2581,6 @@ mod tests {
             Mode::Manual,
             &PermissionRules::default(),
             PathBuf::from("/"),
-            None,
             None,
         )
         .unwrap();
@@ -2228,7 +2648,7 @@ mod tests {
     /// "[destructive] approve?" prompt. A deny rule still wins over the mode.
     #[tokio::test]
     async fn plan_mode_blocks_destructive_before_asking_but_deny_still_wins() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(
             Mode::Plan,
             rules(&[], &["bash(git push *)"], &[]),
@@ -2254,7 +2674,8 @@ mod tests {
     /// was entered from.
     #[tokio::test]
     async fn confirm_exit_plan_switches_back_or_stays() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow, Decision::Deny]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         // Enter plan from accept-edits: that becomes the restore target.
         p.set_mode(Mode::AcceptEdits);
@@ -2281,7 +2702,7 @@ mod tests {
     /// A construction-time plan mode restores to manual on exit (no prior mode).
     #[tokio::test]
     async fn confirm_exit_plan_restores_manual_when_started_in_plan() {
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Plan, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.confirm_exit_plan("plan", 0).await,
@@ -2296,7 +2717,6 @@ mod tests {
             Mode::Plan,
             &PermissionRules::default(),
             PathBuf::from("/work/proj"),
-            None,
             None,
         )
         .unwrap();
@@ -2313,7 +2733,9 @@ mod tests {
     fn rebased_shares_the_session_mode() {
         let approver = ScriptedApprover::new(vec![]);
         let base = gate(Mode::Manual, rules(&[], &[], &[]), approver);
-        let sub = base.rebased(PathBuf::from("/work/tree"));
+        let sub = base.for_workspace(crate::project::WorkspaceIdentity::resolve(Path::new(
+            "/work/tree",
+        )));
         base.set_mode(Mode::Plan);
         assert_eq!(
             sub.mode(),
@@ -2329,7 +2751,8 @@ mod tests {
     /// name; the suggested persistent rule is the tool name and parses back.
     #[tokio::test]
     async fn mcp_style_tools_ask_by_default_and_remember_by_name() {
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession]);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "memory__create_entities", json!({"k": "v"})).await);
         let asked = approver.asked();
@@ -2366,7 +2789,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 0);
 
         for mode in [Mode::Manual, Mode::AcceptEdits, Mode::Bypass] {
-            let approver = ScriptedApprover::new(vec![Decision::Allow]);
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
             let permissions = gate(mode, rules(&[], &[], &[]), approver.clone());
             assert!(permissions.check("powershell", &input, 0).await.is_ok());
             assert_eq!(approver.ask_count(), 1, "{mode:?} must ask");
@@ -2377,7 +2800,7 @@ mod tests {
                 .contains("[unclassified PowerShell] powershell: Get-ChildItem"));
         }
 
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(permissions
             .check_call("powershell", &input, 0, /*sandbox_auto_allow*/ true)
@@ -2399,7 +2822,7 @@ mod tests {
         assert!(denied.check("powershell", &input, 0).await.is_err());
         assert_eq!(approver.ask_count(), 0);
 
-        let approver = ScriptedApprover::new(vec![Decision::Allow]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let asked = gate(
             Mode::Manual,
             rules(&["powershell"], &[], &["powershell"]),
@@ -2417,7 +2840,10 @@ mod tests {
         assert!(allowed.check("powershell", &input, 0).await.is_ok());
         assert_eq!(approver.ask_count(), 0);
 
-        let approver = ScriptedApprover::new(vec![Decision::AllowSession, Decision::AllowAlways]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(permissions.check("powershell", &input, 0).await.is_ok());
         assert!(permissions.check("powershell", &input, 0).await.is_ok());
@@ -2442,7 +2868,7 @@ mod tests {
             r"Get-Content .ssh/id_rsa",
             r"Get-Content .env.local",
         ] {
-            let approver = ScriptedApprover::new(vec![Decision::Allow]);
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
             let permissions = gate(
                 Mode::Bypass,
                 rules(&["powershell"], &[], &[]),

@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use super::str_arg;
 use super::ToolCtx;
 use crate::agent::Ui;
+use crate::config::EffectiveWorkspace;
 use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
@@ -120,13 +121,11 @@ fn shell_spec(
 /// per-call escape hatch (cc's dangerouslyDisableSandbox shape). The call
 /// still went through the permission gate like any other — escaping changes
 /// the execution wrapper, never the asking.
-fn call_sandbox(input: &Value, ctx: &ToolCtx) -> Option<Arc<SandboxPolicy>> {
+fn call_sandbox(input: &Value, workspace: &EffectiveWorkspace) -> Option<Arc<SandboxPolicy>> {
     if input["disable_sandbox"].as_bool().unwrap_or(false) {
         None
     } else {
-        // effective_*: the active worktree's policy when the session entered
-        // one (plan 35 slice 2), else the base policy.
-        ctx.cfg.effective_sandbox()
+        workspace.sandbox.clone()
     }
 }
 
@@ -134,11 +133,19 @@ fn call_sandbox(input: &Value, ctx: &ToolCtx) -> Option<Arc<SandboxPolicy>> {
 /// auto-allow layer: bash, not escaped, and the active policy opts in.
 /// Foreground and background take the same wrapper, so one verdict covers
 /// both.
-pub(super) fn sandbox_auto_allowed(name: &str, input: &Value, ctx: &ToolCtx) -> bool {
-    name == "bash" && call_sandbox(input, ctx).is_some_and(|p| p.auto_allow)
+pub(super) fn sandbox_auto_allowed(
+    name: &str,
+    input: &Value,
+    workspace: &EffectiveWorkspace,
+) -> bool {
+    name == "bash" && call_sandbox(input, workspace).is_some_and(|policy| policy.auto_allow)
 }
 
-pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn bash_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     let command = str_arg(input, "command", "bash")?;
     let bash = ctx
         .cfg
@@ -150,16 +157,18 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     if input.get("disable_sandbox").is_some() {
         bail!("bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented");
     }
-    let sandbox = call_sandbox(input, ctx);
-    // effective cwd: the active worktree's when the session entered one.
-    let cwd = ctx.cfg.effective_cwd();
+    let sandbox = call_sandbox(input, workspace);
+    let cwd = workspace.cwd.clone();
     if input["run_in_background"].as_bool().unwrap_or(false) {
         // No timeout in background mode (cc clears the timer too); the
         // watchdog and kill_bash are the safety net.
-        return ctx
-            .cfg
-            .background_shells
-            .spawn_background(command, sandbox.as_deref(), bash, ctx);
+        return ctx.cfg.background_shells.spawn_background(
+            command,
+            &cwd,
+            sandbox.as_deref(),
+            bash,
+            ctx,
+        );
     }
     if ctx.cancel.is_cancelled() {
         bail!("interrupted");
@@ -186,9 +195,8 @@ pub(super) async fn bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
                 // The code-level escalation loop (codex's retry-on-denial):
                 // ask once, and on approval re-run the command unsandboxed —
                 // one fewer model round-trip than the disable_sandbox hint.
-                match ctx
-                    .cfg
-                    .effective_permissions()
+                match workspace
+                    .permissions
                     .escalate_sandbox(command, ctx.depth)
                     .await
                 {
@@ -562,11 +570,11 @@ impl BackgroundShells {
     fn spawn_background(
         self: &Arc<Self>,
         command: &str,
+        cwd: &Path,
         sandbox: Option<&SandboxPolicy>,
         bash: &ShellProgram,
         ctx: &ToolCtx,
     ) -> Result<String> {
-        let cwd = ctx.cfg.effective_cwd();
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
@@ -577,7 +585,7 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut spec = shell_spec(command, &cwd, sandbox, bash);
+        let mut spec = shell_spec(command, cwd, sandbox, bash);
         spec.stdin = ProcessStdio::Null;
         spec.stdout = ProcessStdio::File(stdout);
         spec.stderr = ProcessStdio::File(stderr);
@@ -1969,9 +1977,11 @@ Wait-Process -Id $grandchild.Id
             let policy = SandboxPolicy {
                 writable_roots: vec![WritableRoot {
                     root: root.clone(),
+                    origins: vec![crate::sandbox::WritableRootOrigin::Workspace],
                     read_only_subpaths: vec![root.join(".kloop")],
                 }],
                 denied_read_paths: Vec::new(),
+                denied_write_paths: Vec::new(),
                 allow_network: false,
                 auto_allow: true,
                 // No approver in test_ctx (allow_all), so escalation always
@@ -2023,21 +2033,22 @@ Wait-Process -Id $grandchild.Id
                 &Default::default(),
                 root.clone(),
                 Some(approver),
-                None,
             )
             .unwrap();
             let policy = SandboxPolicy {
                 writable_roots: vec![WritableRoot {
                     root,
+                    origins: vec![crate::sandbox::WritableRootOrigin::Workspace],
                     read_only_subpaths: vec![],
                 }],
                 denied_read_paths: Vec::new(),
+                denied_write_paths: Vec::new(),
                 allow_network: false,
                 auto_allow: true,
                 escalate: true,
             };
             let base = test_ctx(0, tag);
-            let mut cfg = (*base.cfg).clone();
+            let mut cfg = base.cfg.test_clone();
             cfg.permissions = Arc::new(perms);
             cfg.sandbox = Some(Arc::new(policy));
             let ctx = crate::tools::ToolCtx {
@@ -2065,7 +2076,7 @@ Wait-Process -Id $grandchild.Id
             let _ = std::fs::remove_file(&alias);
             std::os::unix::fs::symlink(&secret, &alias).unwrap();
 
-            let mut cfg = (*ctx.cfg).clone();
+            let mut cfg = ctx.cfg.test_clone();
             let policy = cfg.sandbox.take().unwrap();
             cfg.sandbox = Some(Arc::new(policy.with_denied_read_path(&secret)));
             let ctx = crate::tools::ToolCtx {
@@ -2116,6 +2127,65 @@ Wait-Process -Id $grandchild.Id
                 "hint teaches the escape: {out}"
             );
             assert!(!blocked.exists());
+        }
+
+        #[tokio::test]
+        async fn private_state_stays_unwritable_when_it_is_the_workspace_root() {
+            let (ctx, root) = sandbox_ctx("private-state-overlap");
+            let mut cfg = ctx.cfg.test_clone();
+            let policy = cfg.sandbox.take().unwrap();
+            cfg.sandbox = Some(Arc::new(policy.with_denied_write_path(&root)));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+            let target = root.join("permissions.json");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo forged > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "a denied write is content, not a tool error");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(!target.exists());
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn worktree_policy_cannot_write_the_previous_workspace() {
+            let (ctx, previous) = sandbox_ctx("workspace-replace");
+            let worktree = outside_dir("workspace-replace-tree");
+            let mut cfg = ctx.cfg.test_clone();
+            let policy = cfg.sandbox.take().unwrap();
+            cfg.sandbox = Some(Arc::new(policy.for_workspace(&worktree)));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+
+            let worktree_file = worktree.join("allowed.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo tree > {}", worktree_file.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(std::fs::read_to_string(&worktree_file).unwrap(), "tree\n");
+
+            let previous_file = previous.join("blocked.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo base > {}", previous_file.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "a denied write is content, not a tool error");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(!previous_file.exists());
+            let _ = std::fs::remove_dir_all(previous);
+            let _ = std::fs::remove_dir_all(worktree);
         }
 
         #[tokio::test]
@@ -2172,7 +2242,10 @@ Wait-Process -Id $grandchild.Id
         /// is flagged as escalated, with no denial hint left dangling.
         #[tokio::test]
         async fn escalation_reruns_unsandboxed_on_approval() {
-            let (ctx, asked) = escalating_ctx("esc-yes", crate::permissions::Decision::Allow);
+            let (ctx, asked) = escalating_ctx(
+                "esc-yes",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
             let target = outside_dir("esc-yes").join("climbed.txt");
             let _ = std::fs::remove_file(&target);
             let (out, is_error) = run_tool(
@@ -2230,12 +2303,11 @@ Wait-Process -Id $grandchild.Id
                         &Default::default(),
                         root.clone(),
                         None,
-                        None,
                     )
                     .unwrap(),
                 )
             };
-            let mut cfg = (*ctx.cfg).clone();
+            let mut cfg = ctx.cfg.test_clone();
             cfg.permissions = no_approver();
             let ctx = crate::tools::ToolCtx {
                 cfg: Arc::new(cfg),
@@ -2264,7 +2336,7 @@ Wait-Process -Id $grandchild.Id
 
             // auto_allow = false reverts to slice-1: contained or not, the
             // call asks.
-            let mut cfg = (*ctx.cfg).clone();
+            let mut cfg = ctx.cfg.test_clone();
             let mut policy = (*cfg.sandbox.take().unwrap()).clone();
             policy.auto_allow = false;
             cfg.sandbox = Some(Arc::new(policy));

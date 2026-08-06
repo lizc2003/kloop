@@ -432,7 +432,8 @@ impl HostBridge for CoreBridge {
                     task_input[k] = v.clone();
                 }
             }
-            let result = super::task::task_tool(&task_input, &ctx)
+            let workspace = ctx.cfg.effective_workspace();
+            let result = super::task::task_tool(&task_input, &ctx, &workspace)
                 .await
                 .map(Value::String)
                 .map_err(|e| format!("{e:#}"));

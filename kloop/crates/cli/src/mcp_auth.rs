@@ -68,7 +68,7 @@ impl CredentialStore {
     }
 
     fn read(&self) -> Result<StoreFile> {
-        match crate::user_config::read_private_string(&self.path, OAUTH_STORE_LABEL)? {
+        match crate::private_store::read_private_string(&self.path, OAUTH_STORE_LABEL)? {
             Some(raw) => serde_json::from_str(&raw).context("cannot parse ~/.kloop/mcp-oauth.json"),
             None => Ok(StoreFile::default()),
         }
@@ -76,7 +76,7 @@ impl CredentialStore {
 
     fn write(&self, file: &StoreFile) -> Result<()> {
         let json = serde_json::to_string_pretty(file)?;
-        crate::user_config::write_private_atomic(&self.path, OAUTH_STORE_LABEL, json.as_bytes())
+        crate::private_store::write_private_atomic(&self.path, OAUTH_STORE_LABEL, json.as_bytes())
     }
 
     /// Persist a fresh login, replacing any prior credential for this server.

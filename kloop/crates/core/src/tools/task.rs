@@ -17,6 +17,7 @@ use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
 use crate::agent_type::AgentType;
 use crate::config::Config;
+use crate::config::EffectiveWorkspace;
 use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
@@ -24,7 +25,6 @@ use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
 use crate::history::History;
-use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
 use crate::rollout::session_path;
 use crate::rollout::Rollout;
@@ -41,7 +41,11 @@ const MAX_REINJECT_ERROR_CHARS: usize = 3600;
 /// out the same label — same reasoning as the offload counter (lesson 2).
 static AGENT_SEQ: AtomicUsize = AtomicUsize::new(1);
 
-pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn task_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     if ctx.depth >= 1 {
         bail!("task: sub-agents cannot spawn further sub-agents");
     }
@@ -77,7 +81,7 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
         Some(other) => bail!("task: unknown isolation '{other}' (expected \"worktree\")"),
     };
     let agent = next_agent_label();
-    let mut sub = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
+    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
     // The label shown next to the running agent carries its type, if any.
@@ -90,11 +94,10 @@ pub(super) async fn task_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     // anchors onto it. Fail-closed: a creation error is the tool's error, never
     // a fall back to the shared cwd (cc's shape).
     let worktree = if isolate {
-        let wt = worktree::create(&ctx.cfg.cwd, &agent)
+        let wt = worktree::create(&workspace.cwd, &agent)
             .await
             .map_err(|e| anyhow!("task: {e:#}"))?;
-        rewire_for_worktree(&mut sub, &wt);
-        Some(wt)
+        Some(bind_subagent_worktree(&mut sub, wt, "task").await?)
     } else {
         None
     };
@@ -139,7 +142,8 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
         Some(other) => bail!("workflow agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
     let agent = next_agent_label();
-    let mut sub = build_sub_config(ctx, max_rounds, agent.clone(), agent_type);
+    let workspace = ctx.cfg.effective_workspace();
+    let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type);
     if let Some(model) = input["model"].as_str() {
         sub.model = model.to_string();
     }
@@ -148,11 +152,10 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
         None => task_preview(&prompt),
     };
     let worktree = if isolate {
-        let worktree = worktree::create(&ctx.cfg.cwd, &agent)
+        let worktree = worktree::create(&workspace.cwd, &agent)
             .await
             .map_err(|error| anyhow!("workflow agent: {error:#}"))?;
-        rewire_for_worktree(&mut sub, &worktree);
-        Some(worktree)
+        Some(bind_subagent_worktree(&mut sub, worktree, "workflow agent").await?)
     } else {
         None
     };
@@ -223,18 +226,35 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
 /// inherited: a HEAD-based worktree has byte-identical instruction files, and
 /// re-discovering them (plus a fresh worktree git snapshot) needs the CLI's IO
 /// and is left for a later slice.
-fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) {
+fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) -> Result<()> {
     let (permissions, sandbox, system) = worktree::compute_overrides(
         &sub.cwd,
         &sub.permissions,
         &sub.sandbox,
         &sub.system,
         &wt.path,
-    );
+    )?;
     sub.cwd = wt.path.clone();
     sub.permissions = permissions;
     sub.sandbox = sandbox;
     sub.system = system;
+    Ok(())
+}
+
+async fn bind_subagent_worktree(
+    sub: &mut Config,
+    worktree: worktree::Worktree,
+    who: &str,
+) -> Result<worktree::Worktree> {
+    if let Err(error) = rewire_for_worktree(sub, &worktree) {
+        return match worktree::finish(worktree).await {
+            Ok(_) => Err(anyhow!("{who}: {error:#}")),
+            Err(cleanup) => Err(anyhow!(
+                "{who}: {error:#}; worktree cleanup failed: {cleanup:#}"
+            )),
+        };
+    }
+    Ok(worktree)
 }
 
 /// Process-global monotonic agent label, so parallel spawners never collide.
@@ -379,12 +399,17 @@ async fn run_sub_agent_sync(
 /// stays out of the delegating model's context. A sub-agent cannot spawn one
 /// (depth ≥ 1), so it there degrades to inline (returns the body), matching the
 /// `task` depth rule without dead-ending the skill.
-pub(crate) async fn fork_skill(ctx: &ToolCtx, skill: &Skill, body: String) -> Result<String> {
+pub(crate) async fn fork_skill(
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+    skill: &Skill,
+    body: String,
+) -> Result<String> {
     if ctx.depth >= 1 {
         return Ok(body);
     }
     let agent = next_agent_label();
-    let mut sub = clone_for_subagent(ctx, None, agent.clone());
+    let mut sub = clone_for_subagent(ctx, workspace, None, agent.clone());
     if let Some(model) = &skill.model {
         sub.model = model.clone();
     }
@@ -641,33 +666,15 @@ fn truncate_error(e: &str) -> String {
     format!("{truncated}… (error truncated)")
 }
 
-/// Clone the parent's Config for a sub-agent, with a fresh todo list and inbox
-/// (a running sub-agent must never drain the parent's steering, and its own
-/// todo_write must not touch the parent's list — the Config clone would
-/// otherwise share both Arcs). Callers layer their own overrides on top
-/// (agent_type for `task`, model for a `fork` skill).
-fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -> Config {
-    Config {
-        max_rounds,
-        agent_label: agent,
-        todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-        inbox: Arc::new(Inbox::default()),
-        // Freeze the parent's CURRENT effective state (it may be inside an
-        // entered worktree, plan 35 slice 2) as this sub-agent's base, and give
-        // it a FRESH empty worktree slot — a sub-agent can't enter/exit, and
-        // must not alias the parent's active-worktree Arc (the clone otherwise
-        // would). A `task {isolation:worktree}` sub-agent then rewires this base
-        // onto its own tree.
-        cwd: ctx.cfg.effective_cwd(),
-        permissions: ctx.cfg.effective_permissions(),
-        questioner: None,
-        surface: Default::default(),
-        file_state: Arc::new(crate::file_state::FileState::default()),
-        sandbox: ctx.cfg.effective_sandbox(),
-        system: ctx.cfg.effective_system(),
-        active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
-        ..(*ctx.cfg).clone()
-    }
+/// Build a child through Config's lifecycle constructor, freezing the one
+/// workspace generation selected by the parent call.
+fn clone_for_subagent(
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+    max_rounds: Option<usize>,
+    agent: String,
+) -> Config {
+    ctx.cfg.subagent_from(workspace, max_rounds, agent)
 }
 
 /// Build the `task` sub-agent's Config: the shared clone plus any agent_type
@@ -675,11 +682,12 @@ fn clone_for_subagent(ctx: &ToolCtx, max_rounds: Option<usize>, agent: String) -
 /// caller can still rewire it (worktree isolation) before sharing the Arc.
 fn build_sub_config(
     ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
     max_rounds: Option<usize>,
     agent: String,
     agent_type: Option<&AgentType>,
 ) -> Config {
-    let mut sub = clone_for_subagent(ctx, max_rounds, agent);
+    let mut sub = clone_for_subagent(ctx, workspace, max_rounds, agent);
     if let Some(at) = agent_type {
         if let Some(system) = &at.system {
             sub.system = system.clone();
@@ -731,7 +739,8 @@ mod tests {
             observation: FileObservation::full(b"parent read\n", &metadata),
         });
 
-        let sub = clone_for_subagent(&ctx, None, "agent-fresh".into());
+        let workspace = ctx.cfg.effective_workspace();
+        let sub = clone_for_subagent(&ctx, &workspace, None, "agent-fresh".into());
         assert!(!Arc::ptr_eq(&ctx.cfg.file_state, &sub.file_state));
         assert!(Arc::ptr_eq(
             &ctx.cfg.powershell_execution_gate,
@@ -847,6 +856,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    #[tokio::test]
+    async fn isolated_subagent_branches_from_the_active_workspace_head() {
+        let repo = temp_git_repo("active-base");
+        let provider = Provider::mock(vec![
+            vec![ContentBlock::ToolUse {
+                id: "w1".into(),
+                name: "write_file".into(),
+                input: json!({"path": "child.txt", "content": "child"}),
+            }],
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ]);
+        let ctx = git_ctx(
+            with_provider(test_ctx(0, "active-base"), provider),
+            &repo,
+            true,
+        );
+        worktree::enter(&ctx.cfg, "active-parent").await.unwrap();
+        let active = ctx.cfg.effective_workspace().cwd;
+        std::fs::write(active.join("active-only.txt"), "active\n").unwrap();
+        for args in [
+            &["add", "active-only.txt"][..],
+            &["commit", "-qm", "active-only"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&active)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let (out, is_error) = run_tool(
+            "task",
+            json!({"prompt": "go", "isolation": "worktree"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        let children: Vec<_> = std::fs::read_dir(repo.join(".claude/worktrees"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path != &active)
+            .collect();
+        assert_eq!(children.len(), 1, "one child worktree: {children:?}");
+        assert_eq!(
+            std::fs::read_to_string(children[0].join("active-only.txt")).unwrap(),
+            "active\n",
+            "child did not branch from the active workspace HEAD"
+        );
+
+        worktree::exit(&ctx.cfg, worktree::ExitAction::Keep, false)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The worktree sub-agent's system prompt reports ITS cwd, not the
     /// parent's — otherwise the model builds absolute paths from the parent's
     /// working directory and writes straight past the worktree.
@@ -859,7 +928,7 @@ mod tests {
                 text: "ok".into(),
             }])]);
         let base = ctx_in(with_provider(test_ctx(0, "sys"), provider), &repo);
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.system = format!(
             "You are a coding agent.\n\n# Environment\n- Working directory: {}\n- Platform: macos",
             repo.display()
@@ -1182,7 +1251,7 @@ mod tests {
             tools: Some(vec!["grep".into(), "read_file".into()]),
         }];
         let base = with_provider(test_ctx(0, "atype"), provider);
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.agent_types = Arc::new(types);
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
@@ -1225,7 +1294,7 @@ mod tests {
             tools: None,
         }];
         let base = test_ctx(0, "atype-bad");
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.agent_types = Arc::new(types);
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
@@ -1456,7 +1525,7 @@ mod tests {
             text: "sub result".into(),
         }]]);
         let base = with_provider(test_ctx(0, "subpersist"), provider);
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.session_id = "20260714-000000".into();
         cfg.sessions_dir = sessions.clone();
         let ctx = ToolCtx {
@@ -1510,7 +1579,7 @@ mod tests {
             text: "bg result".into(),
         }]]);
         let base = with_provider(test_ctx(0, "bgpersist"), provider);
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.session_id = "20260714-111111".into();
         cfg.sessions_dir = sessions.clone();
         let ctx = ToolCtx {

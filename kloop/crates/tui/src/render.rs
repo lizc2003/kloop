@@ -980,13 +980,27 @@ fn confirm_option_lines(
     req: &kloop_core::permissions::ConfirmRequest,
     inner_w: usize,
 ) -> Vec<Line<'static>> {
-    let options = match &req.remember_rules {
-        Some(rules) => format!(
-            "y allow once · a allow this session · p always, global for all workspaces ({}) · n deny",
-            rules.join(", ")
-        ),
-        None => "y allow once · n deny".to_string(),
-    };
+    let mut options = Vec::new();
+    if req
+        .approval_scopes
+        .contains(&kloop_core::permissions::ApprovalScope::Once)
+    {
+        options.push("y allow once");
+    }
+    if req
+        .approval_scopes
+        .contains(&kloop_core::permissions::ApprovalScope::WorkspaceSession)
+    {
+        options.push("a allow this workspace session");
+    }
+    if req
+        .approval_scopes
+        .contains(&kloop_core::permissions::ApprovalScope::Project)
+    {
+        options.push("p allow this project across sessions and linked worktrees");
+    }
+    options.push("n deny");
+    let options = options.join(" · ");
     // Cyan action bar — an input tip prompting the choice (styles.md), not yellow.
     wrap(&options, inner_w)
         .into_iter()
@@ -1116,6 +1130,7 @@ mod tests {
         use kloop_core::permissions::ConfirmRequest;
         let req = ConfirmRequest {
             description: "write_file: notes.txt".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: Some("+1  hello\n+2  world".into()),
         };
@@ -1139,6 +1154,23 @@ mod tests {
         );
         // Options are cyan (an input-tip action bar, styles.md), not yellow.
         assert_eq!(opts[0].spans[0].style, Style::new().fg(Color::Cyan));
+
+        let all = ConfirmRequest {
+            approval_scopes: vec![
+                kloop_core::permissions::ApprovalScope::Once,
+                kloop_core::permissions::ApprovalScope::WorkspaceSession,
+                kloop_core::permissions::ApprovalScope::Project,
+            ],
+            remember_rules: Some(vec!["write_file(src/**)".into()]),
+            ..req
+        };
+        assert_eq!(
+            confirm_option_lines(&all, 200)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["y allow once · a allow this workspace session · p allow this project across sessions and linked worktrees · n deny"]
+        );
     }
 
     /// End-to-end through a real ratatui frame (TestBackend, no TTY): a diff
@@ -1174,6 +1206,7 @@ mod tests {
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "write_file: big.txt".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: Some(preview),
             },

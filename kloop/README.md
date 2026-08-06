@@ -217,9 +217,9 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-deny rules → sensitive-read hard block → plan-mode read-only gate → safety checks →
-ask rules → sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
-allow rules → session cache → ask the user
+global deny → sensitive-read hard block → plan-mode read-only gate → safety checks →
+global ask → sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
+project allow → WorkspaceId-scoped session cache → ask the user
 ```
 
 Two invariants carried over from claude-code: **deny always beats allow**,
@@ -227,9 +227,12 @@ and **safety checks are immune to bypass mode**. Credential-bearing/read-sensiti
 paths (`.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
 boundary: `read_file` refuses them, grep/glob filter them before reading, and
 Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
-macOS sandbox also denies reads of `~/.kloop/config.toml` and
-`~/.kloop/mcp-oauth.json`, including through a
-symlink, and provider/search key env vars are removed from model shell children.
+macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
+state tree, including `config.toml`, `mcp-oauth.json`, and
+`projects/v1/<ProjectId>/permissions.json` plus its lock, even through symlinks.
+Private-store directory and leaf checks also reject open permissions, symlinks,
+and non-regular entries. Provider/search key env vars are removed from model
+shell children.
 The direct file tools bind canonical descriptors to their permission facts; this
 is stronger than a pathname-only check. Unsandboxed Bash remains a policy check,
 not a filesystem transaction: a hostile same-UID process can race a checked
@@ -256,15 +259,22 @@ allow rule or bypass mode would otherwise pass — wrappers (`sudo`, `env`,
 `timeout`, `nice`, `xargs`) are stripped before deny/danger matching so they
 can't smuggle a command past a rule.
 
-**Rules** live in global `~/.kloop/config.toml` and env vars (comma-separated
-`KLOOP_ALLOW` / `KLOOP_DENY` / `KLOOP_ASK` append on top):
+**Rules** are split by lifetime. Global `~/.kloop/config.toml` and the
+comma-separated `KLOOP_DENY` / `KLOOP_ASK` env vars provide only process-wide
+constraints:
 
 ```toml
 [permissions]
-allow = ["bash(cargo *)", "write_file(src/**)", "edit_file", "notebook_edit(notebooks/**)"]
-deny  = ["bash(git push *)", "read_file(**/*.pem)"]
-ask   = ["bash(cargo publish *)"]   # always confirm, even if allowed
+deny = ["bash(git push *)", "read_file(**/*.pem)"]
+ask = ["bash(cargo publish *)"]   # always confirm, even if project-approved
 ```
+
+Durable allow rules live instead in the user-private, per-project
+`~/.kloop/projects/v1/<ProjectId>/permissions.json` store. Legacy
+`[permissions].allow` and non-empty `KLOOP_ALLOW` fail startup with a
+secret-safe migration error: kloop neither applies, silently ignores, rewrites,
+nor automatically migrates them. Remove the legacy entry and approve again in
+each project.
 
 `tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
 leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
@@ -279,14 +289,18 @@ directories, shell/git rc files, and `.env*` are sensitive — confirmed every
 time, immune to allow rules, acceptEdits, and bypass. Writes escaping the
 working directory never auto-pass in acceptEdits.
 
-**Asking**: `y` allow once · `a` allow for this session (cached per two-word
-bash prefix — approving `git commit` never covers `git rebase` — or per
-parent directory for file writes) · `p` allow always (appends the suggested
-rule, e.g. `bash(cargo build *)`, to global `~/.kloop/config.toml`, affecting
-all workspaces) · `n` deny. A
-denial is not a turn abort: the model receives an `is_error` `tool_result`
-and is told to take another approach. Sub-agents share the parent's rules
-and cache and prompt through the same seam, tagged `[sub-agent]`.
+**Asking**: `y` allows once. `a` allows for this session in the current
+workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
+approving `git commit` never covers `git rebase` — or parent directory for file
+writes). `p` allows for the current `ProjectId` across sessions and linked
+worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
+`~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
+the current call runs and the UI says the grant was not saved. `n` denies. A
+shared child in the same workspace sees its parent's cache; an isolated
+worktree starts with an empty WorkspaceId partition, while the base partition
+survives the transition. Sub-agents share the session mode/approver and project
+policy. A denial is not a turn abort: the model receives an `is_error`
+`tool_result` and is told to take another approach.
 
 **Change previews**: when a `write_file`/`edit_file`/`notebook_edit` reaches
 the prompt, the request carries a line-numbered diff (`crates/core/src/diff.rs`,
@@ -479,10 +493,12 @@ stream) project it onto the wire below via one shared `project_event`, so both
 speak one item vocabulary by construction.
 
 **Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
-`{serverInfo, protocolVersion, capabilities}` negotiates the version (from
-`"1.0"`; a version the engine doesn't speak is a hard error, not a silent
-downgrade) and gates every other method until it succeeds. Capabilities are
-structured: `{streaming, subagents, mcp, images, approvals, questions,
+`{serverInfo, protocolVersion, capabilities}` accepts exactly protocol `"1.0"`
+and gates every other method until it succeeds. Plan 63 changes the scoped
+approval schema in place because the native protocol had no external users; it
+does not add a compatibility adapter, fallback, alias, or silent downgrade.
+Capabilities are structured: `{streaming, subagents, mcp,
+images, approvals:{scopes:["once","workspaceSession","project"]}, questions,
 threads:{list,
 read,resume,fork}, models:{list}, config:{read}, skills:{list},
 mcpServers:{status}}`.
@@ -512,10 +528,15 @@ canonicalize cwd before invoking their reader.
 
 Every thread is its own tokio task owning a History (persisted to the same
 `.kloop/sessions/` files the interactive frontends use — sessions are
-interchangeable) and its own permission gate, so approval session caches never
-leak across threads. A missing `thread/start.cwd` defaults to the app-server
-launch directory; an explicit relative path is resolved from that directory,
-canonicalized, and rejected unless it is an accessible directory. The CLI builds project instructions, skills, permissions, sandbox,
+interchangeable) and a fresh `PermissionSession`: mode, WorkspaceId-partitioned
+cache, approver, and background registries never leak across threads. Threads
+with the same `ProjectId` obtain one live `ProjectPermissionPolicy` from the
+process registry, so a successfully persisted project grant is immediately
+visible to sibling threads; different projects remain isolated. A missing
+`thread/start.cwd` defaults to the app-server launch directory; an explicit
+relative path is resolved from that directory, canonicalized, and rejected
+unless it is an accessible directory. The CLI builds project instructions,
+skills, permissions, sandbox,
 hooks, agent types, and program limits from that thread cwd without ever
 changing the process cwd. `thread/start.model`, when present, overrides the
 provider/env default only for that thread; otherwise the factory-resolved
@@ -547,9 +568,14 @@ model: its output comes back as a `system` notification, `/clear` also emits
 
 **Interactions use two independent reverse requests.** Permission decisions use
 `approval/request {threadId, turnId, kind:"command"|"fileChange",
-description, preview?, rememberRules?}` (server ids are integers in the
-server's own counter space), answered `{"decision": "accept" |
-"acceptForSession" | "acceptAlways" | "decline"}`. General model questions use
+description, preview?, rememberRules?, approvalScopes}` (server ids are integers
+in the server's own counter space), answered `{"decision": "accept" |
+"acceptForSession" | "acceptForProject" | "decline"}`. The request is
+authoritative: the client must offer only its advertised scopes, and core rejects
+a response outside that set. `acceptAlways`, cancel, unknown, missing, late, and
+EOF/disconnect replies all fail closed to deny. Approval payloads never contain
+the ProjectId, raw identity anchor, state path, policy body, or revision.
+General model questions use
 `question/request {threadId, turnId, questionIndex, question}` only when the
 client advertised `capabilities.questions: true`; each question is answered
 `{"outcome":"answered","selected":[...],"other"?,"notes"?}` or
@@ -559,14 +585,14 @@ turn is interrupted.
 
 ```jsonc
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":true,"questions":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":{"scopes":["once","workspaceSession","project"]},"questions":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
 → {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
 ← {"jsonrpc":"2.0","id":3,"result":{"turn":{"id":1}}}
 ← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","turn":{"id":1}}}
-← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"threadId":"…","turnId":1,"kind":"fileChange","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"preview":"(new file)\n+1  hello"}}
-→ {"jsonrpc":"2.0","id":1,"result":{"decision":"accept"}}
+← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"threadId":"…","turnId":1,"kind":"fileChange","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"approvalScopes":["once","workspaceSession","project"],"preview":"(new file)\n+1  hello"}}
+→ {"jsonrpc":"2.0","id":1,"result":{"decision":"acceptForProject"}}
 ← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
 ← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","turn":{"id":1,"status":"completed"}}}
 ```
@@ -574,8 +600,11 @@ turn is interrupted.
 ### Codex Desktop adapter (plan 39 slices 2–4)
 
 The `桌面前端仓库` repository's dedicated `kloop` branch launches this
-server through `ENGINE_BIN` and consumes v1 directly (it does not emulate
-the old Codex app-server wire):
+server through `ENGINE_BIN` and consumes native protocol 1.0 directly (it
+does not emulate the old Codex app-server wire). Its adapter requires the structured
+approval capability, validates each `approvalScopes` payload, offers only the
+advertised Once / Workspace session / Project actions, sends
+`acceptForProject`, and rejects a mismatched handshake or malformed/unknown approval:
 
 ```sh
 cargo build -p kloop
@@ -682,9 +711,9 @@ supported image blocks are lifted into canonical model image blocks, while
 unsupported binary/audio content degrades to explicit text tags. `isError: true`
 surfaces as an is_error tool_result — the same shape as a failing built-in. MCP
 tools run serially unless listed in `readonly`, and always ask for permission
-unless covered by an allow rule (`memory__create_entities` in
-`[permissions].allow`) or the session cache — the `a`/`p` answers work on
-whole-tool granularity for ordinary MCP tools. Resource reads are the exception below.
+unless covered by the current project's durable whole-tool rule or the
+WorkspaceId-scoped session cache — the `a`/`p` answers remember ordinary MCP
+tools at workspace-session/project granularity. Resource reads are the exception below.
 
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (protocol layer transport-agnostic behind a
@@ -709,9 +738,9 @@ ordinary tool count is below the threshold:
   It refreshes `resources/list` first and accepts only a URI the server currently
   advertises; the model-selected server/URI goes through normal external-tool
   approval instead of being treated as intrinsically safe because the operation
-  is read-only. `AllowSession`/`AllowAlways` is deliberately not remembered for
-  a dynamic URI; use an explicit configured allow rule or bypass mode only when
-  broad server/resource access is intentional.
+  is read-only. Dynamic URI requests advertise Once only and deliberately do not
+  produce WorkspaceSession or Project grants; use bypass mode only when broad
+  server/resource access is intentional.
 - **read_mcp_resource_dir** `{server, uri}` lists direct children through the
   `io.modelcontextprotocol/skills` `directoryRead` extension. It has the same
   current-catalog and approval rule and fails clearly when the capability or URI
@@ -1166,11 +1195,11 @@ other orchestration wrappers.
 
 Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
 and read-only classifier are never applied. Plan mode rejects it without asking;
-manual, accept-edits, and bypass ask every time unless a whole-tool
-`allow = ["powershell"]` rule was configured. `deny` and `ask` whole-tool rules
+manual, accept-edits, and bypass ask every time unless the current project policy
+already contains a whole-tool `powershell` allow rule. `deny` and `ask` whole-tool rules
 retain their usual precedence, `powershell(...)` prefix rules are rejected, and
-interactive session/permanent approval choices authorize only that one call —
-no opaque script is cached or persisted. Prompts are labeled
+interactive approvals authorize only that one call — no opaque script is cached or
+persisted by a PowerShell prompt. Prompts are labeled
 `[unclassified PowerShell]` and an additional raw matcher keeps obvious Windows
 secret paths bypass-immune; this matcher is not a PowerShell data-flow analysis.
 
@@ -1243,8 +1272,9 @@ network-free, reqwest lives only in provider and web):
   `~/.kloop/config.toml` selects the backend.
 
 Both are read-only for concurrency; the permission gate treats them like any
-external tool (ask by default, `web_fetch`/`web_search` allow rules or session
-approvals apply). Deliberately not ported from CC 2.1.220: WebFetch's mandatory
+external tool (ask by default, with ordinary durable grants scoped to the
+current project and temporary grants scoped to the current WorkspaceId
+session). Deliberately not ported from CC 2.1.220: WebFetch's mandatory
 `prompt` plus secondary small-model processing, the 15-minute fetch cache,
 turndown-style HTML→Markdown, and the preapproved-domain list. Exact Plan 55
 evidence proves CC WebSearch success/empty/server-tool error through a hermetic
@@ -1359,11 +1389,14 @@ so the operation can be retried or kept safely.
 Entering a session tree changes the complete effective workspace anchor:
 Read/Write/Edit, Glob/Grep, Bash, permissions, sandbox writable roots, fresh
 file-observation state, and the system prompt's `Working directory:` all follow
-the new cwd. Dynamic `AllowAlways` rules remain session-global across that
-rebase; only per-workspace session approvals start fresh. Successful enter and
-exit operations emit `CwdChanged`, which keeps the TUI header/search root and
-server cwd projection synchronized. A shared child agent inherits the active
-effective cwd; an isolated task gets its own task-owned tree.
+the new cwd. Main checkout and linked worktrees with the same `ProjectId` share
+one live durable project policy; their `WorkspaceId` session-cache partitions do
+not. An isolated worktree starts with an empty partition, and exiting restores
+the still-live base partition. Successful enter and exit operations emit
+`CwdChanged`, which keeps the TUI header/search root and server cwd projection
+synchronized. A shared child agent inherits the active effective cwd; an
+isolated task branches from that workspace's current HEAD into its own
+task-owned tree.
 
 There is no automatic merge, rebase, commit, push, or discard. Session shutdown
 has no implicit remove intent, so an active session tree is retained even when
@@ -1377,11 +1410,16 @@ On macOS, bash commands run inside a seatbelt sandbox by default
 (`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-run_program` with a
 deny-by-default SBPL profile — the shape cc and codex converged on):
 
-- **Writes** are allow-listed: cwd + `/tmp` + `$TMPDIR` + configured extras.
-  Inside a writable root, `.git/hooks`, `.git/config` and `.kloop` stay
-  read-only (they are privilege-escalation surfaces — hooks and git config
-  run code, and project `.kloop` contains agent instructions/state; the rest of `.git` stays
-  writable so `git commit` works sandboxed).
+- **Writes** are allow-listed: the current workspace-derived root + `/tmp` +
+  `$TMPDIR` + configured explicit extras. Entering or creating a worktree
+  **replaces** the derived root rather than appending to the old policy; tmp roots
+  and explicit extras survive, and the old main checkout remains writable only
+  when the user explicitly listed it as an extra. Inside a writable root,
+  `.git/hooks`, `.git/config` and `.kloop` stay read-only (they are
+  privilege-escalation surfaces — hooks and git config run code, and project
+  `.kloop` contains agent instructions/state; the rest of `.git` stays writable
+  so `git commit` works sandboxed). The user-private `~/.kloop` state tree is a
+  separate recursive deny-read/deny-write boundary.
 - **Reads** are full-disk; **network** is off unless configured.
 - **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate —
@@ -1393,6 +1431,11 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   recovery path. `auto_allow = false` reverts to pure containment (approve
   first, then run sandboxed). `--permission-mode bypass` bypasses approvals but
   not the sandbox.
+
+On platforms without an OS shell sandbox, worktree separation still anchors
+ordinary relative paths and parallel edits, but it cannot contain a model that
+deliberately writes the old checkout by absolute path. Windows process Job
+Objects contain process lifetime, not filesystem access.
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
@@ -2038,9 +2081,9 @@ kloop --mock --headless --json
   vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
-  deny"). Loosen with `--permission-mode accept-edits`/`bypass` or `KLOOP_ALLOW`
-  — these act before the approver, so they still open the gate. (Sandbox
-  auto-allow still covers safe bash without asking.)
+  deny"). Existing project grants, `--permission-mode accept-edits`/`bypass`,
+  and sandbox auto-allow still act before the approver. Non-empty `KLOOP_ALLOW`
+  is a startup error, not a headless override.
 - **Interactive control surfaces are absent.** Headless installs neither a
   `Questioner` nor detached Workflow lifecycle, so `ask_user_question`,
   `enter_plan_mode`, and `workflow` are not advertised. It never reads stdin
@@ -2071,10 +2114,11 @@ cargo run -- --help
 cargo run -- --mock
 
 # The only automatically discovered TOML config is ~/.kloop/config.toml. It
-# contains provider/model plus permissions, MCP, web, hooks, sandbox, agents,
-# and codemode. A cwd .kloop/config.toml is never read or merged; cwd remains
-# the workspace anchor for project instructions, skills, tools, permissions,
-# and sandbox paths.
+# contains provider/model plus global permission deny/ask constraints, MCP, web,
+# hooks, sandbox, agents, and codemode. Durable allow is separate user-private
+# ProjectStore state. A cwd .kloop/config.toml is never read or merged; cwd
+# remains the workspace anchor for project instructions, skills, tools,
+# permissions, and sandbox paths.
 #
 # Daily provider/model configuration lives in that process-global file. The
 # directory must have no group/other access (kloop creates it as 0700), and the
@@ -2155,9 +2199,10 @@ cargo run -- --fork <id>       # branch off a session at its end
 # (default 30 total tools; lower it to exercise deferral with a small server,
 # raise it to effectively disable)
 
-# permissions (persistent rules live in global ~/.kloop/config.toml)
-KLOOP_ALLOW='write_file,bash(cargo *)' cargo run   # pre-approve rules
+# permissions: global constraints come from TOML/KLOOP_DENY/KLOOP_ASK;
+# project approvals persist in ~/.kloop/projects/v1/<ProjectId>/permissions.json
 KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
+KLOOP_ASK='bash(cargo publish *)' cargo run        # force confirmation
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
 cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
@@ -2200,8 +2245,9 @@ session is saved and resumable — see Session persistence above.
   vetting, git option-injection, dangerous-through-wrappers); permission
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
   safety checks, sensitive paths never cached, ask-rules-over-allow,
-  acceptEdits cwd boundary, glob rules, two-word session cache, AllowAlways
-  persistence, opaque never cacheable, `ConfirmRequest.preview` carrying an
+  acceptEdits cwd boundary, glob rules, WorkspaceId-partitioned session cache,
+  ProjectId identity and durable ProjectStore publication/RMW, legacy
+  `[permissions].allow`/`KLOOP_ALLOW` rejection, opaque never cacheable, `ConfirmRequest.preview` carrying an
   edit/write diff while other calls carry none); Windows shell contracts
   (Git for Windows layout discovery, conditional catalog, CreateProcessW
   suspended→Job assignment→resume fail-closed ordering, leader-exit/inherited-
@@ -2228,8 +2274,10 @@ session is saved and resumable — see Session persistence above.
   append independently, illegal cuts rejected with nearby legal points,
   cuts before/at a compacted marker replay each side, fork-of-a-fork,
   branches share the offload dir without clobbering); sandbox contracts
-  (exact SBPL profile assembly and `-D` param list, workspace-root
-  computation with canonical/literal dedup, denial-detection table incl. the
+  (exact SBPL profile assembly and `-D` param list, workspace-derived root
+  replacement across worktrees while preserving tmp/explicit extras, recursive
+  private-state read/write denial, canonical/literal dedup, denial-detection
+  table incl. the
   network-off DNS extension, `[no sandbox]` approval tag, auto-allow
   layering: contained calls skip asking while deny/safety/ask-rules
   outrank the sandbox; escalation-consent decision/mode mapping) plus
@@ -2251,8 +2299,9 @@ session is saved and resumable — see Session persistence above.
   end-to-end through a TestBackend frame).
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
-  plus duplex-driven protocol tests against the real serve loop with a
-  scripted provider: delta streaming and completion, approval deny/allow
+  plus duplex-driven exact native protocol 1.0 tests against the real serve loop:
+  structured approval scopes, `acceptForProject`, protocol 2.0/`acceptAlways` rejection,
+  delta streaming and completion, approval deny/allow
   round-trips (file provably not/created, the change `preview` reaching the
   client), parallel threads with no event
   cross-tagging and no same-second id collisions, busy-thread rejection,
@@ -2294,15 +2343,20 @@ session is saved and resumable — see Session persistence above.
   request carries only the program's return value, never the content it read
   internally.
 - **kloop (cli)** — argument parsing, UTC timestamp session ids (epoch,
-  known dates, leap day), permission-config round-trip (load/persist/merge,
-  unrelated-section preservation, malformed rejection), `[mcp.servers]`
+  known dates, leap day), strict global deny/ask parsing with legacy allow
+  rejection, private config/OAuth/ProjectStore I/O, per-ProjectId schema and
+  lock-protected multi-process RMW, `[mcp.servers]`
   parsing (round-trip, malformed rejection), rule-safe name sanitization,
   and `[[hooks]]` parsing (round-trip, defaults, malformed rejection).
 
-Beyond the suite: `cargo run -p kloop -- --mock` (six scripted rounds
-exercising all five bets), and with a real key both adapters have been
-exercised live including offload round-trips, mid-session predictive
-compaction, and truncation recovery.
+Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
+rounds. Plan 63 acceptance also runs the real stdio binary for an exact native
+protocol 1.0 handshake and protocol 2.0 refusal, plus the Desktop companion's Bun,
+production-build, Rust test/clippy/fmt gates. Those deterministic gates cover
+Once/WorkspaceSession/Project wire decisions and persistence-failure behavior;
+they do not claim a manual GUI click-through or native Windows runtime where it
+was not run. Earlier real-key adapter runs cover offload round-trips,
+mid-session predictive compaction, and truncation recovery.
 
 CI (`.github/workflows/ci.yml`, at the repo root) runs macOS, Linux, and native
 Windows on every push/PR: `cargo fmt --check`, all-target workspace clippy,
@@ -2369,8 +2423,10 @@ crates/core/        kloop-core — the agent, network-free
                     TypeScript API generation; engine is the codemode crate
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
-  src/permissions.rs the layered execution gate: deny/ask/allow rules,
-                    safety checks, modes, session cache, Approver seam
+  src/project.rs   machine-local ProjectId/WorkspaceId resolution
+  src/permissions.rs the layered execution gate: global deny/ask,
+                    ProjectStore durable allow, WorkspaceId session cache,
+                    scoped approvals, safety checks, and modes
   src/diff.rs       write/edit change previews for the approval prompt
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,
@@ -2407,9 +2463,12 @@ crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
                     app-server/--serve), StdoutUi, CliApprover, --mock demo,
                     session selection (--continue, --resume, --list-sessions)
-  src/user_config.rs one global TOML read, strict root schema, private atomic writes
+  src/user_config.rs one global TOML read and strict root schema
+  src/private_store.rs descriptor/handle-relative private I/O, atomic replace,
+                    directory durability, reparse/symlink rejection, file locks
+  src/project_store.rs per-ProjectId allow-only policy schema and RMW
   src/startup.rs    typed runtime policy + frozen ShellPrograms snapshot and
-                    cwd-bound session wiring
+                    cwd-bound Project/Session/Workspace wiring
   src/web.rs        [web] config + ToolSource adapter binding core contracts
                     to kloop-web network operations
   src/mcp.rs        [mcp.servers] config, startup connection with

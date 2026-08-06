@@ -353,7 +353,7 @@ mod tests {
                 dir: "/skills/greet".into(),
                 ..Default::default()
             }]),
-            ..(*base).clone()
+            ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
 
@@ -391,7 +391,7 @@ mod tests {
                 source: crate::skills::SkillSource::Command,
                 ..Default::default()
             }]),
-            ..(*base).clone()
+            ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
 
@@ -427,7 +427,7 @@ mod tests {
                 source: crate::skills::SkillSource::Command,
                 ..Default::default()
             }]),
-            ..(*base).clone()
+            ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
         let result = run(
@@ -458,7 +458,7 @@ mod tests {
                 source: crate::skills::SkillSource::Command,
                 ..Default::default()
             }]),
-            ..(*base).clone()
+            ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
         let prompt = run("/ctx", &mut history, &cfg, &CancellationToken::new())
@@ -487,7 +487,6 @@ mod tests {
             },
             std::env::current_dir().unwrap(),
             None,
-            None,
         )
         .unwrap();
         let cfg = Arc::new(Config {
@@ -499,7 +498,7 @@ mod tests {
                 source: crate::skills::SkillSource::Command,
                 ..Default::default()
             }]),
-            ..(*base).clone()
+            ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
         let result = run("/danger", &mut history, &cfg, &CancellationToken::new()).await;

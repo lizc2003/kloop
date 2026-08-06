@@ -237,9 +237,22 @@ pub struct SurfaceCapabilities {
     pub scheduler: bool,
 }
 
+/// One coherent workspace generation selected for an operation. The contained
+/// permission session and file observations stay live; cwd-coupled ownership
+/// cannot be mixed with a later worktree transition after this value is cloned.
+#[derive(Clone)]
+pub struct EffectiveWorkspace {
+    pub identity: crate::project::WorkspaceIdentity,
+    pub cwd: PathBuf,
+    pub permissions: Arc<Permissions>,
+    pub file_state: Arc<FileState>,
+    pub sandbox: Option<Arc<crate::sandbox::SandboxPolicy>>,
+    pub system: String,
+    pub branch: Option<String>,
+}
+
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
-#[derive(Clone)]
 pub struct Config {
     pub provider: Arc<Provider>,
     pub model: String,
@@ -394,6 +407,133 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn base_workspace(&self) -> EffectiveWorkspace {
+        EffectiveWorkspace {
+            identity: self.permissions.identity().clone(),
+            cwd: self.cwd.clone(),
+            permissions: Arc::clone(&self.permissions),
+            file_state: Arc::clone(&self.file_state),
+            sandbox: self.sandbox.clone(),
+            system: self.system.clone(),
+            branch: None,
+        }
+    }
+
+    pub fn effective_workspace(&self) -> EffectiveWorkspace {
+        let active = self.active_worktree.read().unwrap();
+        match active.as_ref() {
+            Some(active) => EffectiveWorkspace {
+                identity: active.permissions.identity().clone(),
+                cwd: active.cwd.clone(),
+                permissions: Arc::clone(&active.permissions),
+                file_state: Arc::clone(&active.file_state),
+                sandbox: active.sandbox.clone(),
+                system: active.system.clone(),
+                branch: Some(active.branch.clone()),
+            },
+            None => self.base_workspace(),
+        }
+    }
+
+    /// Build one child agent from a single parent workspace generation. Runtime
+    /// and session services remain shared; agent-local and workspace-mutable state
+    /// starts fresh.
+    pub(crate) fn subagent_from(
+        &self,
+        workspace: &EffectiveWorkspace,
+        max_rounds: Option<usize>,
+        agent_label: String,
+    ) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            system: workspace.system.clone(),
+            cwd: workspace.cwd.clone(),
+            project_instructions: self.project_instructions.clone(),
+            max_rounds,
+            offload_dir: self.offload_dir.clone(),
+            sessions_dir: self.sessions_dir.clone(),
+            context_window: self.context_window,
+            fallback_model: self.fallback_model.clone(),
+            permissions: Arc::clone(&workspace.permissions),
+            questioner: None,
+            file_state: Arc::new(FileState::default()),
+            tool_sources: self.tool_sources.clone(),
+            session_id: self.session_id.clone(),
+            agent_label,
+            hooks: Arc::clone(&self.hooks),
+            background_shells: Arc::clone(&self.background_shells),
+            shell_programs: Arc::clone(&self.shell_programs),
+            powershell_execution_gate: Arc::clone(&self.powershell_execution_gate),
+            sandbox: workspace.sandbox.clone(),
+            agent_types: Arc::clone(&self.agent_types),
+            tool_allowlist: self.tool_allowlist.clone(),
+            defer_threshold: self.defer_threshold,
+            unlocked_tools: Arc::clone(&self.unlocked_tools),
+            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            inbox: Arc::new(Inbox::default()),
+            scheduler: Arc::clone(&self.scheduler),
+            background_tasks: Arc::clone(&self.background_tasks),
+            program_limits: self.program_limits,
+            skills: Arc::clone(&self.skills),
+            active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
+            surface: SurfaceCapabilities::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clone(&self) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            system: self.system.clone(),
+            cwd: self.cwd.clone(),
+            project_instructions: self.project_instructions.clone(),
+            max_rounds: self.max_rounds,
+            offload_dir: self.offload_dir.clone(),
+            sessions_dir: self.sessions_dir.clone(),
+            context_window: self.context_window,
+            fallback_model: self.fallback_model.clone(),
+            permissions: Arc::clone(&self.permissions),
+            questioner: self.questioner.clone(),
+            file_state: Arc::clone(&self.file_state),
+            tool_sources: self.tool_sources.clone(),
+            session_id: self.session_id.clone(),
+            agent_label: self.agent_label.clone(),
+            hooks: Arc::clone(&self.hooks),
+            background_shells: Arc::clone(&self.background_shells),
+            shell_programs: Arc::clone(&self.shell_programs),
+            powershell_execution_gate: Arc::clone(&self.powershell_execution_gate),
+            sandbox: self.sandbox.clone(),
+            agent_types: Arc::clone(&self.agent_types),
+            tool_allowlist: self.tool_allowlist.clone(),
+            defer_threshold: self.defer_threshold,
+            unlocked_tools: Arc::clone(&self.unlocked_tools),
+            todos: Arc::clone(&self.todos),
+            inbox: Arc::clone(&self.inbox),
+            scheduler: Arc::clone(&self.scheduler),
+            background_tasks: Arc::clone(&self.background_tasks),
+            program_limits: self.program_limits,
+            skills: Arc::clone(&self.skills),
+            active_worktree: Arc::clone(&self.active_worktree),
+            surface: self.surface,
+        }
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
+    pub fn set_max_rounds(&mut self, max_rounds: Option<usize>) {
+        self.max_rounds = max_rounds;
+    }
+
+    pub fn bind_session(&mut self, session_id: String) -> anyhow::Result<()> {
+        self.scheduler.bind_owner(session_id.clone())?;
+        self.session_id = session_id;
+        Ok(())
+    }
+
     /// Stop every session-scoped detached worker before its frontend/runtime is
     /// torn down. Returns the number that missed the bounded reap deadline.
     pub async fn shutdown_background_work(&self) -> usize {
@@ -411,53 +551,30 @@ impl Config {
     /// resolves a relative path (or picks a git/search root) reads this, so
     /// `enter_worktree` takes effect immediately.
     pub fn effective_cwd(&self) -> PathBuf {
-        self.active_worktree
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.cwd.clone())
-            .unwrap_or_else(|| self.cwd.clone())
+        self.effective_workspace().cwd
     }
 
     /// The permission gate in effect now — re-anchored at the active worktree
     /// when in one (so acceptEdits keys off the tree), else the base gate.
     pub fn effective_permissions(&self) -> Arc<Permissions> {
-        self.active_worktree
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.permissions.clone())
-            .unwrap_or_else(|| self.permissions.clone())
+        self.effective_workspace().permissions
     }
 
     /// File-observation state in effect now. An entered worktree starts fresh
     /// and does not inherit observations from the main checkout.
     pub fn effective_file_state(&self) -> Arc<FileState> {
-        self.active_worktree
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.file_state.clone())
-            .unwrap_or_else(|| self.file_state.clone())
+        self.effective_workspace().file_state
     }
 
     /// The OS sandbox policy in effect now — with the active worktree added as
     /// a writable root when in one, else the base policy.
     pub fn effective_sandbox(&self) -> Option<Arc<crate::sandbox::SandboxPolicy>> {
-        match self.active_worktree.read().unwrap().as_ref() {
-            Some(a) => a.sandbox.clone(),
-            None => self.sandbox.clone(),
-        }
+        self.effective_workspace().sandbox
     }
 
     /// The system prompt in effect now — its working-directory line rewritten
     /// to the active worktree when in one, else the base system.
     pub fn effective_system(&self) -> String {
-        self.active_worktree
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.system.clone())
-            .unwrap_or_else(|| self.system.clone())
+        self.effective_workspace().system
     }
 }

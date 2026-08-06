@@ -141,14 +141,15 @@ pub async fn run(
     // can apply shift+Tab mode changes to it and seed the status-bar badge from
     // the real starting mode (--permission-mode). effective_permissions covers
     // a session started in a worktree, whose gate shares the mode cell anyway.
-    let permissions = cfg.effective_permissions();
+    let workspace = cfg.effective_workspace();
+    let permissions = Arc::clone(&workspace.permissions);
 
     // Build the UI state before the worker takes History: a resumed session
     // replays into the transcript, and the `/` menu is seeded with the command
     // catalog (built-ins then loaded skills/commands — the same set
     // `commands::run` dispatches, plan 38 slice 4). The `@` menu searches from
     // the project cwd.
-    let effective_cwd = cfg.effective_cwd();
+    let effective_cwd = workspace.cwd.clone();
     let effective_branch = git_branch(&effective_cwd);
     let mut app = App::new(session_id)
         .with_commands(slash_catalog(&cfg))

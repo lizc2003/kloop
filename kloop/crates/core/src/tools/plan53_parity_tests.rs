@@ -153,7 +153,7 @@ fn question_input() -> Value {
 
 fn context_with_questioner(tag: &str, questioner: Arc<dyn Questioner>) -> ToolCtx {
     let mut context = test_ctx(0, tag);
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.questioner = Some(questioner);
     config.surface = enabled_surface();
     context.cfg = Arc::new(config);
@@ -166,17 +166,11 @@ fn context_with_permissions(
     approver: Arc<dyn Approver>,
 ) -> (ToolCtx, Arc<RecordingUi>) {
     let root = std::env::temp_dir().join(format!("kloop-plan53-permissions-{tag}"));
-    let permissions = Permissions::new(
-        mode,
-        &PermissionRules::default(),
-        root,
-        Some(approver),
-        None,
-    )
-    .unwrap();
+    let permissions =
+        Permissions::new(mode, &PermissionRules::default(), root, Some(approver)).unwrap();
     let ui = Arc::new(RecordingUi::default());
     let mut context = test_ctx(0, tag);
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.permissions = Arc::new(permissions);
     config.surface = enabled_surface();
     context.cfg = Arc::new(config);
@@ -348,7 +342,8 @@ async fn question_report() -> Value {
 }
 
 async fn plan_control_report() -> Value {
-    let approver = ScriptedApprover::new([Decision::Allow]);
+    let approver =
+        ScriptedApprover::new([Decision::Allow(crate::permissions::ApprovalScope::Once)]);
     let (context, ui) = context_with_permissions("plan", Mode::AcceptEdits, approver.clone());
     let names_before: Vec<String> =
         all_tool_defs(0, &[], 30, context.cfg.surface, &context.cfg.shell_programs)
@@ -424,7 +419,7 @@ async fn workflow_report() -> Value {
     let root = TempRoot::new("workflow");
     let ui = Arc::new(RecordingUi::default());
     let mut context = test_ctx(0, "plan53-workflow");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.offload_dir = root.path().join("offload");
     config.surface.workflow = true;
     context.cfg = Arc::new(config);
@@ -528,7 +523,7 @@ fn structured_config(
 ) {
     let (provider, seen) = Provider::mock_recording(turns);
     let context = test_ctx(1, "plan53-structured");
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.provider = Arc::new(provider);
     config.max_rounds = Some(10);
     config.offload_dir = root.join("offload");

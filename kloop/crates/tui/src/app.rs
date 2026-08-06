@@ -1011,20 +1011,37 @@ impl App {
             _ => {}
         }
         let decision = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Decision::Allow,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Decision::Deny,
-            KeyCode::Char('a') | KeyCode::Char('A') => Decision::AllowSession,
-            KeyCode::Char('p') | KeyCode::Char('P') => Decision::AllowAlways,
-            _ => return Command::None,
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::Once,
+            )),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Decision::Deny),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::WorkspaceSession,
+            )),
+            KeyCode::Char('p') | KeyCode::Char('P') => Some(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::Project,
+            )),
+            _ => None,
         };
+        let Some(decision) = decision else {
+            return Command::None;
+        };
+        if let Decision::Allow(scope) = decision {
+            let advertised = matches!(
+                self.interactions.front(),
+                Some(PendingInteraction::Confirm { req, .. })
+                    if req.approval_scopes.contains(&scope)
+            );
+            if !advertised {
+                return Command::None;
+            }
+        }
         let pending = self.interactions.pop_front().expect("checked non-empty");
         let PendingInteraction::Confirm { reply, .. } = pending else {
             unreachable!("interaction type changed while handling approval")
         };
         // The next queued prompt (if any) starts unscrolled.
         self.confirm_scroll = 0;
-        // a/p degrade to allow-once in the gate when the call isn't
-        // remember-able, same as the plain REPL.
         let _ = reply.send(decision);
         Command::None
     }
@@ -2036,6 +2053,7 @@ mod tests {
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "bash: rm x".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
             },
@@ -2073,6 +2091,11 @@ mod tests {
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "bash: git push".into(),
+                approval_scopes: vec![
+                    kloop_core::permissions::ApprovalScope::Once,
+                    kloop_core::permissions::ApprovalScope::WorkspaceSession,
+                    kloop_core::permissions::ApprovalScope::Project,
+                ],
                 remember_rules: Some(vec!["bash(git push *)".into()]),
                 preview: None,
             },
@@ -2085,7 +2108,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(rx.try_recv().unwrap(), Decision::AllowSession);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Decision::Allow(kloop_core::permissions::ApprovalScope::WorkspaceSession)
+        );
         assert!(app.interactions.is_empty());
     }
 
@@ -2099,6 +2125,7 @@ mod tests {
         let (r2, _rx2) = oneshot::channel();
         let req = |d: &str| ConfirmRequest {
             description: d.into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         };
@@ -2143,6 +2170,7 @@ mod tests {
         let (r2, mut rx2) = oneshot::channel();
         let req = |d: &str| ConfirmRequest {
             description: d.into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         };
@@ -2155,8 +2183,14 @@ mod tests {
             reply: r2,
         });
 
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(rx1.try_recv().is_err());
+        assert_eq!(front_confirm_description(&app), "first");
         app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            Decision::Allow(kloop_core::permissions::ApprovalScope::Once)
+        );
         assert_eq!(front_confirm_description(&app), "second");
         app.on_key(key(KeyCode::Char('n')));
         assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
@@ -2207,6 +2241,7 @@ mod tests {
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "first approval".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
             },
@@ -2218,7 +2253,10 @@ mod tests {
         });
 
         app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(confirm_rx.try_recv().unwrap(), Decision::Allow);
+        assert_eq!(
+            confirm_rx.try_recv().unwrap(),
+            Decision::Allow(kloop_core::permissions::ApprovalScope::Once)
+        );
         assert!(matches!(
             app.interactions.front(),
             Some(PendingInteraction::Question(_))
@@ -2365,6 +2403,7 @@ mod tests {
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "x".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
             },

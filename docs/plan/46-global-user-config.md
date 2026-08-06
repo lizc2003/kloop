@@ -69,3 +69,7 @@ Plan 40 把 provider/model/credential 放在 `~/.kloop/config.toml`，同时保�
 - clean-env TUI 可从含 malformed legacy config 的 cwd 正常启动；app-server 对两个含不同 legacy config 的 cwd 执行 `initialize` + `config/read`，除 canonical cwd 外返回相同进程级 policy，且未暴露 cwd sentinel。
 - 私有配置迁移结构、mode 与 legacy 文件删除状态复核通过；`git diff --check` 通过。
 - 提交：本次（见 git log）。
+
+## Plan 63 supersession（2026-08-06）
+
+本页保留 Plan 46 当时的历史事实；其 durable permission 部分已由 Plan 63 替代。当前 `[permissions]` 只接受全局 `deny` / `ask`，legacy `allow` 与非空 `KLOOP_ALLOW` 会在启动时被明确拒绝，不迁移也不作为授权来源。项目批准写入用户私有的 `~/.kloop/projects/v1/<project-id>/permissions.json`，按 ProjectId 共享于同一项目的 session/linked worktree；WorkspaceSession 批准只存在当前 PermissionSession 的 WorkspaceId 分区。`acceptAlways` 已从 native protocol 1.0 删除，由 `acceptForProject` 原位取代；此前协议无人使用，因此不升版本、不保留 alias或双栈。ProjectStore、global config 与 OAuth store 继续共用私有 descriptor/handle-relative I/O 边界，并整体纳入 sandbox private-state deny-read/deny-write。

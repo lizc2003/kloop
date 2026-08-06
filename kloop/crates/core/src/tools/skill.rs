@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::fork_skill;
 use super::str_arg;
 use super::ToolCtx;
+use crate::config::EffectiveWorkspace;
 use crate::skills::expand_body;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
@@ -45,7 +46,11 @@ pub(crate) fn skill_tool_def() -> ToolDef {
 /// itself is read-only (auto-allowed, see `CallFacts::is_readonly`): a fork's
 /// sub-agent and any tool the inline instructions later prompt are each gated
 /// on their own.
-pub(super) async fn skill_tool(input: &Value, ctx: &ToolCtx) -> anyhow::Result<String> {
+pub(super) async fn skill_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> anyhow::Result<String> {
     let name = str_arg(input, "name", "skill")?;
     let args = input.get("arguments").and_then(Value::as_str).unwrap_or("");
     // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is
@@ -61,10 +66,10 @@ pub(super) async fn skill_tool(input: &Value, ctx: &ToolCtx) -> anyhow::Result<S
     // like a bash/read call. A `fork` skill expands before forking, so its
     // sub-agent sees the resolved output; a blocked/failed `!cmd` propagates as
     // an is_error tool_result. This is the same expansion the slash path runs.
-    let body = super::inject::expand(&body, ctx).await?;
+    let body = super::inject::expand(&body, ctx, workspace).await?;
     match skill.context {
         SkillContext::Inline => Ok(body),
-        SkillContext::Fork => fork_skill(ctx, skill, body).await,
+        SkillContext::Fork => fork_skill(ctx, workspace, skill, body).await,
     }
 }
 
@@ -78,7 +83,7 @@ mod tests {
     /// Config is behind an Arc, so tests clone-and-swap the skill registry (the
     /// same pattern as `with_provider`).
     fn with_skills(mut ctx: ToolCtx, skills: Vec<Skill>) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.skills = std::sync::Arc::new(skills);
         ctx.cfg = std::sync::Arc::new(cfg);
         ctx
@@ -152,7 +157,7 @@ mod tests {
             ..Default::default()
         }];
         let mut ctx = test_ctx(0, "skill-inject-deny");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.permissions = std::sync::Arc::new(
             crate::permissions::Permissions::new(
                 crate::permissions::Mode::Manual,
@@ -162,7 +167,6 @@ mod tests {
                     ask: Vec::new(),
                 },
                 std::env::current_dir().unwrap(),
-                None,
                 None,
             )
             .unwrap(),

@@ -7,8 +7,9 @@
 //! `exec` crate:
 //! - **No approver is installed** ([`DenyApprover`]): any permission ask is
 //!   auto-denied (fail-safe, like server mode's "reply lost = deny"). Loosen
-//!   with `--permission-mode accept-edits|bypass` / `KLOOP_ALLOW`, which act at earlier
-//!   gate layers and never reach the approver.
+//!   with `--permission-mode accept-edits|bypass` or previously persisted
+//!   current-project allows, which act at earlier gate layers and never reach
+//!   the approver.
 //! - **`--json` reuses the server's wire shapes** verbatim (method + params,
 //!   `threadId` and all) — one event vocabulary, two front-ends.
 
@@ -215,6 +216,7 @@ mod tests {
     async fn deny_approver_refuses() {
         let req = ConfirmRequest {
             description: "bash: rm x".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         };

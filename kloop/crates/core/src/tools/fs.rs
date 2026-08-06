@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -20,6 +21,7 @@ use super::notebook;
 use super::resolve_path;
 use super::str_arg;
 use super::ToolCtx;
+use crate::config::EffectiveWorkspace;
 use crate::file_io::file_contents_equal;
 use crate::file_io::fingerprint_file;
 use crate::file_io::read_bounded;
@@ -140,9 +142,12 @@ enum CommitFault {
     ReplaceTempName,
 }
 
-pub(super) async fn prepare_read(input: &Value, ctx: &ToolCtx) -> Result<PreparedRead> {
+pub(super) async fn prepare_read(
+    input: &Value,
+    workspace: &EffectiveWorkspace,
+) -> Result<PreparedRead> {
     let path = str_arg(input, "path", "read_file")?.to_string();
-    let requested = resolve_path(&ctx.cfg.effective_cwd(), &path);
+    let requested = resolve_path(&workspace.cwd, &path);
     let path_for_worker = path.clone();
     tokio::task::spawn_blocking(move || prepare_read_target(&requested, &path_for_worker))
         .await
@@ -464,14 +469,14 @@ fn numbered_text_page(
 pub(super) async fn prepare_mutation_input(
     tool: &str,
     input: &Value,
-    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<PreparedMutation> {
-    prepare_mutation_input_with_key(tool, input, "path", ctx).await
+    prepare_mutation_input_with_key(tool, input, "path", workspace).await
 }
 
 pub(super) async fn prepare_notebook_mutation_input(
     input: &Value,
-    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<PreparedMutation> {
     let path = str_arg(input, "notebook_path", "notebook_edit")?;
     if Path::new(path)
@@ -480,20 +485,20 @@ pub(super) async fn prepare_notebook_mutation_input(
     {
         bail!("File must be a Jupyter notebook (.ipynb file). For editing other file types, use edit_file.");
     }
-    prepare_mutation_input_with_key("notebook_edit", input, "notebook_path", ctx).await
+    prepare_mutation_input_with_key("notebook_edit", input, "notebook_path", workspace).await
 }
 
 async fn prepare_mutation_input_with_key(
     tool: &str,
     input: &Value,
     path_key: &str,
-    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<PreparedMutation> {
     let path = str_arg(input, path_key, tool)?.to_string();
     if tool == "notebook_edit" && !Path::new(&path).is_absolute() {
         bail!("notebook_edit: notebook_path must be an absolute path");
     }
-    let cwd = ctx.cfg.effective_cwd();
+    let cwd = workspace.cwd.clone();
     let requested = resolve_path(&cwd, &path);
     let tool_for_worker = tool.to_string();
     let path_for_worker = path.clone();
@@ -509,6 +514,7 @@ pub(super) async fn write_file_tool(
     input: &Value,
     prepared: &PreparedMutation,
     ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<FileMutationOutput> {
     let path = str_arg(input, "path", "write_file")?;
     let content = str_arg(input, "content", "write_file")?;
@@ -520,6 +526,7 @@ pub(super) async fn write_file_tool(
             bytes: content.as_bytes().to_vec(),
         },
         ctx,
+        workspace,
     )
     .await
 }
@@ -528,6 +535,7 @@ pub(super) async fn edit_file_tool(
     input: &Value,
     prepared: &PreparedMutation,
     ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<FileMutationOutput> {
     let path = str_arg(input, "path", "edit_file")?;
     let old = str_arg(input, "old_string", "edit_file")?;
@@ -549,6 +557,7 @@ pub(super) async fn edit_file_tool(
             replace_all,
         },
         ctx,
+        workspace,
     )
     .await
 }
@@ -557,6 +566,7 @@ pub(super) async fn notebook_edit_tool(
     input: &Value,
     prepared: &PreparedMutation,
     ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<FileMutationOutput> {
     let path = str_arg(input, "notebook_path", "notebook_edit")?;
     let request = notebook::request_from_input(input)?;
@@ -566,6 +576,7 @@ pub(super) async fn notebook_edit_tool(
         prepared,
         Mutation::Notebook { request },
         ctx,
+        workspace,
     )
     .await
 }
@@ -576,9 +587,10 @@ async fn mutate_file(
     prepared: &PreparedMutation,
     mutation: Mutation,
     ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
 ) -> Result<FileMutationOutput> {
     let key = prepared.path.clone();
-    let state = ctx.cfg.effective_file_state();
+    let state = Arc::clone(&workspace.file_state);
     let notebook_mutation = matches!(&mutation, Mutation::Notebook { .. });
     // Capture the qualification before waiting. Two concurrent mutations based
     // on one Read must not let the second inherit the first mutation's refresh.
@@ -1686,11 +1698,10 @@ mod tests {
             &crate::permissions::PermissionRules::default(),
             cwd.to_path_buf(),
             Some(Arc::new(ChannelApprover { tx })),
-            None,
         )
         .unwrap();
         let mut ctx = test_ctx(0, tag);
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.cwd = cwd.to_path_buf();
         cfg.permissions = Arc::new(permissions);
         ctx.cfg = Arc::new(cfg);
@@ -1988,7 +1999,7 @@ mod tests {
         let marker = temp_file("observe-cancel-marker", "");
         let _ = std::fs::remove_file(&marker);
         let mut ctx = test_ctx(0, "observe-cancel");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.hooks = Arc::new(Hooks {
             defs: vec![HookDef {
                 event: HookEvent::PostTool,
@@ -2061,11 +2072,10 @@ mod tests {
             &rules,
             root.clone(),
             Some(Arc::new(ChannelApprover { tx })),
-            None,
         )
         .unwrap();
         let mut ctx = test_ctx(0, "read-approval-swap");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.cwd = root.clone();
         cfg.permissions = Arc::new(permissions);
         ctx.cfg = Arc::new(cfg);
@@ -2081,7 +2091,9 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&secret, &alias).unwrap();
         reply
-            .send(crate::permissions::Decision::Allow)
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
             .expect("approval receiver still waiting");
 
         let (out, is_error) = task.await.unwrap();
@@ -2186,7 +2198,9 @@ mod tests {
             "{preview}"
         );
         reply
-            .send(crate::permissions::Decision::Allow)
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
             .expect("approval receiver still waiting");
         let (out, is_error) = task.await.unwrap();
         assert!(!is_error, "{out}");
@@ -2241,7 +2255,11 @@ mod tests {
         });
         let (_request, reply) = approvals.recv().await.unwrap();
         std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
-        reply.send(crate::permissions::Decision::Allow).unwrap();
+        reply
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
+            .unwrap();
         let (out, is_error) = task.await.unwrap();
         assert!(is_error, "{out}");
         assert!(!outside.join("nested/file.txt").exists());
@@ -2259,7 +2277,11 @@ mod tests {
         });
         let (_request, reply) = approvals.recv().await.unwrap();
         std::fs::create_dir_all(root.join("safe/nested")).unwrap();
-        reply.send(crate::permissions::Decision::Allow).unwrap();
+        reply
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
+            .unwrap();
         let (out, is_error) = task.await.unwrap();
         assert!(!is_error, "{out}");
         assert_eq!(std::fs::read_to_string(&safe_target).unwrap(), "safe");
@@ -2278,7 +2300,11 @@ mod tests {
         let (_request, reply) = approvals.recv().await.unwrap();
         std::fs::create_dir_all(root.join("raced/nested")).unwrap();
         std::fs::write(&raced_target, "competitor").unwrap();
-        reply.send(crate::permissions::Decision::Allow).unwrap();
+        reply
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
+            .unwrap();
         let (out, is_error) = task.await.unwrap();
         assert!(is_error, "{out}");
         assert!(out.contains("must read"), "{out}");
@@ -2779,17 +2805,18 @@ mod tests {
         assert_eq!(alias.path, direct.path);
 
         let mut ctx = test_ctx(0, "write-parent-link");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.cwd = workspace.clone();
         ctx.cfg = std::sync::Arc::new(cfg);
 
         let frozen = json!({"path": "inside-link/frozen.txt", "content": "frozen"});
-        let prepared = super::prepare_mutation_input("write_file", &frozen, &ctx)
+        let effective = ctx.cfg.effective_workspace();
+        let prepared = super::prepare_mutation_input("write_file", &frozen, &effective)
             .await
             .unwrap();
         std::fs::remove_file(workspace.join("inside-link")).unwrap();
         std::os::unix::fs::symlink(&outside, workspace.join("inside-link")).unwrap();
-        let output = super::write_file_tool(&frozen, &prepared, &ctx)
+        let output = super::write_file_tool(&frozen, &prepared, &ctx, &effective)
             .await
             .unwrap();
         drop(output.path_lock);
@@ -2830,11 +2857,10 @@ mod tests {
             &deny,
             root.clone(),
             None,
-            None,
         )
         .unwrap();
         let mut deny_ctx = test_ctx(0, "write-alias-deny");
-        let mut cfg = (*deny_ctx.cfg).clone();
+        let mut cfg = deny_ctx.cfg.test_clone();
         cfg.cwd = root.clone();
         cfg.permissions = Arc::new(permissions);
         deny_ctx.cfg = Arc::new(cfg);
@@ -2858,11 +2884,10 @@ mod tests {
             &ask,
             root.clone(),
             Some(Arc::new(ChannelApprover { tx })),
-            None,
         )
         .unwrap();
         let mut ask_ctx = test_ctx(0, "write-alias-ask");
-        let mut cfg = (*ask_ctx.cfg).clone();
+        let mut cfg = ask_ctx.cfg.test_clone();
         cfg.cwd = root.clone();
         cfg.permissions = Arc::new(permissions);
         ask_ctx.cfg = Arc::new(cfg);
@@ -2930,7 +2955,9 @@ mod tests {
         std::fs::rename(&parent, &moved_parent).unwrap();
         std::os::unix::fs::symlink(&hooks, &parent).unwrap();
         reply
-            .send(crate::permissions::Decision::Allow)
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
             .expect("approval receiver still waiting");
 
         let (out, is_error) = task.await.unwrap();
@@ -2970,7 +2997,9 @@ mod tests {
             .expect("mkfifo is available on Unix");
         assert!(status.success());
         reply
-            .send(crate::permissions::Decision::Allow)
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
             .expect("approval receiver still waiting");
 
         let (out, is_error) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
@@ -2996,7 +3025,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let mut ctx = test_ctx(0, "write-cancel");
         observe_whole(&path, &ctx).await;
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.hooks = Arc::new(Hooks {
             defs: vec![HookDef {
                 event: HookEvent::PostTool,
@@ -3150,7 +3179,9 @@ mod tests {
         assert!(preview.contains("-2  one"), "{preview}");
         assert!(preview.contains("+2  ONE"), "{preview}");
         reply
-            .send(crate::permissions::Decision::Allow)
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
             .expect("approval receiver still waiting");
 
         let (out, is_error) = task.await.unwrap();
@@ -3160,6 +3191,52 @@ mod tests {
             b"prefix\r\nONE\r\nTWO\r\nsuffix\r\n"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn approval_wait_pins_one_workspace_generation_through_commit() {
+        let repository = temp_git_repo("workspace-snapshot-race");
+        let target = repository.join("base-only.txt");
+        let (ctx, mut approvals) = approval_ctx("workspace-snapshot-race", &repository);
+        let base_state = Arc::clone(&ctx.cfg.file_state);
+        let call_ctx = ctx.clone();
+        let task = tokio::spawn(async move {
+            run_tool(
+                "write_file",
+                json!({"path": "base-only.txt", "content": "base generation"}),
+                &call_ctx,
+            )
+            .await
+        });
+        let (_request, reply) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+                .await
+                .expect("write must reach approval")
+                .expect("approval channel remains open");
+
+        crate::worktree::enter(&ctx.cfg, "snapshot-race")
+            .await
+            .unwrap();
+        let active = ctx.cfg.effective_workspace();
+        assert_ne!(active.cwd, repository);
+        assert!(!Arc::ptr_eq(&base_state, &active.file_state));
+        reply
+            .send(crate::permissions::Decision::Allow(
+                crate::permissions::ApprovalScope::Once,
+            ))
+            .expect("approval receiver still waiting");
+
+        let (out, is_error) = task.await.unwrap();
+        assert!(!is_error, "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "base generation");
+        assert!(!active.cwd.join("base-only.txt").exists());
+        assert!(base_state.observation(&target).is_some());
+        assert!(active.file_state.observation(&target).is_none());
+
+        crate::worktree::exit(&ctx.cfg, crate::worktree::ExitAction::Remove, false)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(repository);
     }
 
     #[tokio::test]

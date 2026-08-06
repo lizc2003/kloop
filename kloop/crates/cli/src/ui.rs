@@ -12,6 +12,7 @@ use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
 use kloop_core::interaction::Questioner;
+use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -49,13 +50,7 @@ impl Approver for CliApprover {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
         Box::pin(async move {
             let _one_at_a_time = self.prompting.lock().await;
-            let options = match &req.remember_rules {
-                Some(rules) => format!(
-                    "y = allow once / a = allow for this session / p = allow always (saves {} globally for all workspaces in ~/.kloop/config.toml) / n = deny",
-                    rules.join(", ")
-                ),
-                None => "y = allow once / n = deny".to_string(),
-            };
+            let options = approval_options(&req);
             let preview = req
                 .preview
                 .as_deref()
@@ -69,19 +64,42 @@ impl Approver for CliApprover {
             })
             .await;
             match line {
-                // 'a'/'p' on a non-remember-able call degrade to allow-once
-                // in the gate (it ignores the remember part), matching the
-                // user's evident intent to allow.
-                Ok(Ok(answer)) => match answer.trim().to_lowercase().as_str() {
-                    "y" | "yes" => Decision::Allow,
-                    "a" | "always" => Decision::AllowSession,
-                    "p" | "persist" => Decision::AllowAlways,
-                    _ => Decision::Deny,
-                },
+                Ok(Ok(answer)) => approval_decision(answer.trim(), &req),
                 // Reader died or stdin closed: the safe answer is no.
                 _ => Decision::Deny,
             }
         })
+    }
+}
+
+fn approval_options(request: &ConfirmRequest) -> String {
+    let mut options = Vec::new();
+    if request.approval_scopes.contains(&ApprovalScope::Once) {
+        options.push("y = allow once");
+    }
+    if request
+        .approval_scopes
+        .contains(&ApprovalScope::WorkspaceSession)
+    {
+        options.push("a = allow for this workspace session");
+    }
+    if request.approval_scopes.contains(&ApprovalScope::Project) {
+        options.push("p = allow for this project across sessions and linked worktrees");
+    }
+    options.push("n = deny");
+    options.join(" / ")
+}
+
+fn approval_decision(answer: &str, request: &ConfirmRequest) -> Decision {
+    let scope = match answer.to_ascii_lowercase().as_str() {
+        "y" => Some(ApprovalScope::Once),
+        "a" => Some(ApprovalScope::WorkspaceSession),
+        "p" => Some(ApprovalScope::Project),
+        _ => None,
+    };
+    match scope.filter(|scope| request.approval_scopes.contains(scope)) {
+        Some(scope) => Decision::Allow(scope),
+        None => Decision::Deny,
     }
 }
 
@@ -316,6 +334,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approval_prompt_and_answers_follow_advertised_scopes() {
+        let once = ConfirmRequest {
+            description: "x".into(),
+            approval_scopes: vec![ApprovalScope::Once],
+            remember_rules: Some(vec!["write_file(src/**)".into()]),
+            preview: None,
+        };
+        assert_eq!(approval_options(&once), "y = allow once / n = deny");
+        assert_eq!(approval_decision("a", &once), Decision::Deny);
+        assert_eq!(
+            approval_decision("y", &once),
+            Decision::Allow(ApprovalScope::Once)
+        );
+
+        let all = ConfirmRequest {
+            approval_scopes: vec![
+                ApprovalScope::Once,
+                ApprovalScope::WorkspaceSession,
+                ApprovalScope::Project,
+            ],
+            ..once
+        };
+        assert_eq!(
+            approval_options(&all),
+            "y = allow once / a = allow for this workspace session / p = allow for this project across sessions and linked worktrees / n = deny"
+        );
+        assert_eq!(
+            approval_decision("p", &all),
+            Decision::Allow(ApprovalScope::Project)
+        );
+        assert_eq!(approval_decision("always", &all), Decision::Deny);
+    }
     #[test]
     fn selection_parser_handles_single_multi_other_and_rejects_bad_input() {
         assert_eq!(parse_selection("2", 2, false), Some(vec![1]));

@@ -260,7 +260,9 @@ async fn turn_rounds(
         // The injected context is outside history and a dynamic MCP refresh may
         // replace its deferred-tool notice between rounds, so account for the
         // current version rather than pinning the turn's first estimate.
-        let instructions_tokens = injected_context(cfg, depth).map_or(0, |s| s.len() as u64 / 4);
+        let workspace = cfg.effective_workspace();
+        let instructions_tokens =
+            injected_context(cfg, &workspace, depth).map_or(0, |s| s.len() as u64 / 4);
         // Predictive: compact BEFORE sampling when this round's estimated
         // growth would overflow the window — don't wait to be rejected.
         if let Some(window) = cfg.context_window {
@@ -309,6 +311,7 @@ async fn turn_rounds(
             cancel,
             stream_text,
             depth,
+            &workspace,
             &mut item_seq,
         )
         .await
@@ -676,8 +679,12 @@ approval before making any changes.\n</plan-mode>";
 /// boundary, while the mode reminder changes only on explicit mode toggles. The
 /// skills catalog rides only depth-0 requests (skills are a top-level feature;
 /// see the `skill` tool registration in `turn_rounds`).
-fn injected_context(cfg: &Config, depth: u8) -> Option<String> {
-    let plan_reminder = (cfg.effective_permissions().mode() == crate::permissions::Mode::Plan)
+fn injected_context(
+    cfg: &Config,
+    workspace: &crate::config::EffectiveWorkspace,
+    depth: u8,
+) -> Option<String> {
+    let plan_reminder = (workspace.permissions.mode() == crate::permissions::Mode::Plan)
         .then(|| PLAN_MODE_REMINDER.to_string());
     let skills_catalog = (depth == 0)
         .then(|| crate::skills::skills_catalog(&cfg.skills))

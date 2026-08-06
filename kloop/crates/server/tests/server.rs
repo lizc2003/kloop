@@ -202,7 +202,6 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
                 &PermissionRules::default(),
                 std::env::temp_dir(),
                 Some(approver),
-                None,
             )?
         } else {
             Permissions::allow_all()
@@ -338,7 +337,7 @@ fn temp_git_repo(tag: &str) -> PathBuf {
 }
 
 /// Like `factory` but with worktree mode ON and cwd pointed at a real git repo
-/// (allow_all gate — the worktree tools auto-allow anyway).
+/// (a bypass gate bound to the same project identity).
 fn worktree_factory(
     turns: Vec<Vec<ContentBlock>>,
     offload: PathBuf,
@@ -358,7 +357,12 @@ fn worktree_factory(
             sessions_dir: offload.with_file_name("sessions"),
             context_window: None,
             fallback_model: None,
-            permissions: Arc::new(Permissions::allow_all()),
+            permissions: Arc::new(Permissions::new(
+                Mode::Bypass,
+                &PermissionRules::default(),
+                cwd.clone(),
+                None,
+            )?),
             questioner,
             file_state: Default::default(),
             tool_sources: Vec::new(),
@@ -424,7 +428,7 @@ async fn handshake_gates_and_negotiates() {
     client
         .request(
             "initialize",
-            json!({"protocolVersion": "0.9", "capabilities": {}}),
+            json!({"protocolVersion": "2.0", "capabilities": {}}),
         )
         .await;
     let err = client.recv().await;
@@ -437,7 +441,10 @@ async fn handshake_gates_and_negotiates() {
     // A good handshake reports capabilities and unlocks the rest.
     let caps = client.initialize().await;
     assert_eq!(caps["streaming"], true);
-    assert_eq!(caps["approvals"], true);
+    assert_eq!(
+        caps["approvals"],
+        json!({"scopes": ["once", "workspaceSession", "project"]})
+    );
     assert_eq!(caps["models"], json!({"list": true}));
     assert_eq!(caps["config"], json!({"read": true}));
     assert_eq!(caps["skills"], json!({"list": true}));
@@ -545,7 +552,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
     assert_eq!(
         caps,
         json!({
-            "approvals": true,
+            "approvals": {"scopes": ["once", "workspaceSession", "project"]},
             "config": {"read": true},
             "images": true,
             "mcp": true,
@@ -939,6 +946,70 @@ async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
         kloop_core::rollout::load_session_snapshot(&dirs.sessions.join("legacy.jsonl")).unwrap();
     assert_eq!(
         snapshot.runtime.unwrap().cwd,
+        std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn early_prefix_fork_keeps_runtime_written_after_the_cut() {
+    let dirs = test_dirs("fork-runtime-prefix");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let source_id = "legacy-two-turns";
+    let source_path = dirs.sessions.join(format!("{source_id}.jsonl"));
+    let mut rollout = Rollout::new(source_path.clone());
+    for message in [
+        Message::user_text("q1"),
+        Message::assistant(vec![text("a1")]),
+        Message::user_text("q2"),
+        Message::assistant(vec![text("a2")]),
+    ] {
+        rollout.append_message(&message).unwrap();
+    }
+    drop(rollout);
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request(
+            "thread/resume",
+            json!({"threadId": source_id, "cwd": dirs.root}),
+        )
+        .await;
+    assert!(client.recv().await.get("error").is_none());
+    client.shutdown().await;
+
+    let source = kloop_core::rollout::load_session_snapshot(&source_path).unwrap();
+    assert!(
+        source.runtime.is_some(),
+        "resume did not migrate source runtime"
+    );
+    let cut = kloop_core::rollout::fork_points(&source_path)
+        .unwrap()
+        .first()
+        .expect("two-turn source has an early fork point")
+        .seq;
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    let request = client
+        .request("thread/fork", json!({"threadId": source_id, "cut": cut}))
+        .await;
+    let response = client.recv_until(|message| message["id"] == request).await;
+    let fork_id = response
+        .iter()
+        .find(|message| message["id"] == request)
+        .unwrap()["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.shutdown().await;
+
+    let fork =
+        kloop_core::rollout::load_session_snapshot(&dirs.sessions.join(format!("{fork_id}.jsonl")))
+            .unwrap();
+    assert_eq!(
+        fork.runtime.unwrap().cwd,
         std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
     );
     let _ = std::fs::remove_dir_all(&dirs.root);
@@ -1370,6 +1441,10 @@ async fn approval_declined_then_accepted() {
         .as_str()
         .unwrap()
         .contains("write_file"));
+    assert_eq!(
+        request["params"]["approvalScopes"],
+        json!(["once", "workspaceSession"])
+    );
     assert!(request["params"]["rememberRules"].is_array());
     // The change preview reaches the client (a fresh path is a new file).
     assert_eq!(request["params"]["preview"], "(new file)\n+1  x");

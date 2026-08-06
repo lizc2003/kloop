@@ -37,7 +37,7 @@ fn structured_config(
 ) {
     let (provider, seen) = Provider::mock_recording(turns);
     let ctx = crate::tools::testutil::test_ctx(1, "structured-agent");
-    let mut cfg = (*ctx.cfg).clone();
+    let mut cfg = ctx.cfg.test_clone();
     cfg.provider = Arc::new(provider);
     cfg.max_rounds = Some(10);
     cfg.agent_label = "agent-structured".into();
@@ -193,7 +193,7 @@ async fn structured_turn_batches_ordinary_tools_and_preserves_response_order() {
         tool_use_named("s1", "structured_output", json!([1, 2])),
         tool_use_named("o2", "test__blocking_read", json!({"value": "second"})),
     ])]);
-    let mut cfg = (*base).clone();
+    let mut cfg = base.test_clone();
     cfg.tool_sources = vec![BarrierSource::new(Arc::new(tokio::sync::Barrier::new(2)))];
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -441,7 +441,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
     let provider = Provider::mock(vec![vec![ContentBlock::Text {
         text: "sub answer".into(),
     }]]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "subhook")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "subhook").test_clone();
     cfg.agent_label = "agent-7".into();
     cfg.session_id = "parent-sess".into();
     cfg.hooks = Arc::new(hooks);
@@ -725,7 +725,7 @@ async fn fallback_model_takes_over_after_retries() {
         MockTurn::Error("boom 3".into()),
         MockTurn::Blocks(text("answer from fallback")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "fallback")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "fallback").test_clone();
     cfg.fallback_model = Some("mock-fallback".into());
     let cfg = Arc::new(cfg);
     let note_ui = Arc::new(NoteUi(std::sync::Mutex::new(Vec::new())));
@@ -785,7 +785,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         MockTurn::PartialError(text("half answer"), "stream dropped".into()),
         MockTurn::Blocks(text("must not retry")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "partial-stream")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "partial-stream").test_clone();
     cfg.fallback_model = Some("must-not-run-after-visible-output".into());
     let cfg = Arc::new(cfg);
     let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
@@ -859,7 +859,7 @@ async fn complete_tool_block_seals_retry_without_dispatching_it() {
         ),
         MockTurn::Blocks(text("must not retry")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "tool-seals-retry")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "tool-seals-retry").test_clone();
     cfg.fallback_model = Some("must-not-fallback".into());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -885,7 +885,7 @@ async fn subagent_internal_delta_also_seals_retry() {
         MockTurn::PartialError(text("private partial"), "child stream dropped".into()),
         MockTurn::Blocks(text("must not retry")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "subagent-seals-retry")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "subagent-seals-retry").test_clone();
     cfg.fallback_model = Some("must-not-fallback".into());
     cfg.agent_label = "agent-test".into();
     let cfg = Arc::new(cfg);
@@ -912,7 +912,7 @@ async fn non_retryable_failure_does_not_retry_or_fallback() {
         MockTurn::Failure(ProviderFailure::protocol("malformed provider frame")),
         MockTurn::Blocks(text("must not retry")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "terminal-failure")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "terminal-failure").test_clone();
     cfg.fallback_model = Some("must-not-fallback".into());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -988,7 +988,7 @@ async fn endless_tool_calls_hit_max_rounds() {
         vec![tool_use("t3", "echo 3")],
         vec![tool_use("t4", "echo 4")],
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "maxrounds")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "maxrounds").test_clone();
     cfg.max_rounds = Some(3);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -1020,7 +1020,7 @@ async fn no_round_limit_runs_until_completed() {
         text: "finished after a long run".into(),
     }]);
     let provider = Provider::mock(turns);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "unbounded")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "unbounded").test_clone();
     cfg.max_rounds = None;
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -1083,14 +1083,13 @@ async fn denied_tool_call_continues_the_turn() {
             text: "understood, taking another approach".into(),
         }],
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "denied")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "denied").test_clone();
     cfg.permissions = Arc::new(
         Permissions::new(
             Mode::Manual,
             &PermissionRules::default(),
             std::env::temp_dir(),
             Some(Arc::new(DenyAll)),
-            None,
         )
         .unwrap(),
     );
@@ -1117,7 +1116,7 @@ async fn denied_tool_call_continues_the_turn() {
 }
 
 fn hooked_cfg(provider: Provider, defs: Vec<crate::hooks::HookDef>, tag: &str) -> Arc<Config> {
-    let mut cfg = (*compaction_cfg(provider, 200_000, tag)).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, tag).test_clone();
     cfg.session_id = format!("session-{tag}");
     cfg.hooks = Arc::new(crate::hooks::Hooks { defs });
     Arc::new(cfg)
@@ -1284,7 +1283,7 @@ async fn project_instructions_injected_per_request_not_recorded() {
         MockTurn::Blocks(text("done")),
     ]);
     let instructions = "<project-instructions>reply in haiku</project-instructions>";
-    let mut cfg = (*compaction_cfg(provider, 200_000, "instructions")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "instructions").test_clone();
     cfg.project_instructions = Some(instructions.into());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -1328,7 +1327,7 @@ async fn skill_catalog_injected_and_tool_expands_body_inline() {
         )]),
         MockTurn::Blocks(text("greeted")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "skills-e2e")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "skills-e2e").test_clone();
     cfg.skills = Arc::new(vec![crate::skills::Skill {
         name: "greet".into(),
         description: "Greet a person by name.".into(),
@@ -1389,7 +1388,7 @@ async fn fork_skill_runs_as_isolated_subagent() {
         MockTurn::Blocks(text("FORKED_RESULT")), // the forked sub-agent's turn
         MockTurn::Blocks(text("done")),          // parent wraps up
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "skills-fork")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "skills-fork").test_clone();
     cfg.skills = Arc::new(vec![crate::skills::Skill {
         name: "research".into(),
         description: "Research something in isolation.".into(),
@@ -1491,7 +1490,7 @@ async fn fork_skill_allowed_tools_restricts_subagent() {
         MockTurn::Blocks(text("found")), // sub-agent
         MockTurn::Blocks(text("done")),  // parent
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "skills-allowed")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "skills-allowed").test_clone();
     cfg.skills = Arc::new(vec![crate::skills::Skill {
         name: "search".into(),
         description: "Search, read-only.".into(),
@@ -1640,7 +1639,7 @@ async fn deferred_tools_shrink_defs_inject_notice_and_gate_dispatch() {
         )]),
         MockTurn::Blocks(text("done")),
     ]);
-    let mut cfg = (*compaction_cfg(provider, 200_000, "deferred")).clone();
+    let mut cfg = compaction_cfg(provider, 200_000, "deferred").test_clone();
     cfg.project_instructions = Some("INSTR".into());
     cfg.tool_sources = vec![source];
     cfg.defer_threshold = 0;
@@ -1714,7 +1713,7 @@ async fn instructions_count_toward_predictive_compaction() {
     // window 30_000, growth 23_192 → threshold ≈ 6_808 tokens. History
     // alone estimates ~6_500; the 8_000-char instructions add ~2_000 and
     // push it over, so compaction must fire before sampling.
-    let mut cfg = (*compaction_cfg(provider, 30_000, "instr-predict")).clone();
+    let mut cfg = compaction_cfg(provider, 30_000, "instr-predict").test_clone();
     cfg.project_instructions = Some("r".repeat(8_000));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);

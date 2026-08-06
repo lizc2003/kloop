@@ -1,12 +1,12 @@
 # Plan 63 — Project 作用域、Config 生命周期与权限归属
 
-> 状态：未开工
+> 状态：✅ 已完成（2026-08-06）
 >
 > 依赖：Plan 8、35、37、39、46、49、51
 >
-> 施工关系：Plan 61 已完成；Plan 62 实现已到原生 Windows 闸门。三者的 `Config`、permission、sandbox、startup 修改面高度重叠，Plan 63 不得在 Plan 62 未收尾工作树上并行；开工时基于届时已提交的新 seam 重新盘点迁移面。
+> 施工关系：Plan 61、62 已在开工前完成并固定安全 seam；Plan 63 以 `13d0772` 为唯一实现基线，在同一 kloop main 工作树完成。Desktop companion 只在 `~/work/桌面前端仓库/.claude/worktrees/kloop-plan63` 的独立 `kloop` worktree 修改。
 >
-> 原规划基线：kloop `a42f1b8`；实际开工必须重读 Plan 61 与 Plan 62 完成提交后的 Config/permission seam。
+> 实际开工基线：kloop `13d0772`；Desktop local `kloop` 基线 `934e325d`。两仓库保持两个提交，不 push。
 
 ## 背景
 
@@ -31,7 +31,7 @@ Plan 46 删除仓库内项目 TOML 是正确的信任边界：仓库内容不能
 4. legacy `[permissions].allow` 与非空 `KLOOP_ALLOW` 不自动迁移、不静默忽略、不改写用户配置；启动时以不回显规则内容的 actionable error 拒绝，用户删除后在各项目重新批准。
 5. 所有交互式 durable grant 都归当前 ProjectId；不再提供 global/always 批准。
 6. 仓库内 TOML、AGENTS/CLAUDE、`.kloop/rules`、Git config、branch、remote URL 均不能成为授权来源。
-7. server approval contract 直接升级为 protocol 2.0；删除 `acceptAlways`，不做 v1/v2 双栈。
+7. server approval contract在现有native protocol 1.0内原位替换；删除`acceptAlways`，此前版本无人使用，因此不升version、不做兼容双栈或alias。
 8. session/offload/program-run 不迁入 ProjectStore；本计划只迁 permission ownership。
 9. worktree sandbox root corrective 同计划完成，因为它是 Project/Workspace 作用域混淆造成的直接安全缺陷。
 
@@ -52,17 +52,20 @@ Plan 46 删除仓库内项目 TOML 是正确的信任边界：仓库内容不能
 新增 `kloop/crates/core/src/project.rs`，定义不可混用的强类型：
 
 ```rust
-pub struct ProjectId(/* opaque digest */);
-pub struct WorkspaceId(/* opaque digest */);
+pub struct ProjectId(/* private opaque digest */);
+pub struct WorkspaceId(/* private opaque digest */);
 
 pub struct WorkspaceIdentity {
-    pub project_id: ProjectId,
-    pub workspace_id: WorkspaceId,
-    pub cwd: PathBuf,
-    pub workspace_root: PathBuf,
-    project_anchor: PathBuf,
+    project_id: Option<ProjectId>,
+    workspace_id: WorkspaceId,
+    cwd: PathBuf,
+    workspace_root: PathBuf,
+    project_anchor: Option<PathBuf>,
+    status: ProjectIdentityStatus,
 }
 ```
+
+字段保持私有，通过 accessor 暴露最窄视图；`project_id: None` 与 unavailable status 表达 Git probe/canonicalization 失败时 project scope不可用，而 WorkspaceId仍可维持Once/WorkspaceSession语义。
 
 ### Git workspace
 
@@ -97,9 +100,20 @@ git -C <cwd> rev-parse --path-format=absolute \
 - Git executable/probe/canonicalization 异常时，会话仍可使用 once/session approval，但 project policy 标记 unavailable，不读取或写入 durable grant。
 - 新建 linked worktree 后必须重新解析 identity，并断言 ProjectId 与父项目一致；异常或不一致时 worktree 操作 fail closed，clean 新树按既有安全清理规则撤销。
 
-## 2. Config 的目标所有权
+## 2. Config 所有权蓝图与实际落点
 
-保留 `Config` 作为 agent loop 和 `ToolCtx` 的窄 composition façade，但取消公开 blanket `Clone` 与 struct-update 派生。目标由四层对象组成，Workspace 作为 agent 的执行视图单独建模。
+原蓝图保留 `Config` 作为 agent loop 和 `ToolCtx` 的 composition façade，并建议把五层所有权分别实体化。实际实现选择了更小的迁移：`Config` 仍是聚合 façade，没有新增独立公开的 `RuntimeServices`、`ProjectContext`、`SessionRuntime`、`AgentContext` 或 `WorkspaceState` 类型；但生产构造路径已经显式决定共享/隔离，权限对象与一次调用的 workspace snapshot 不再依赖 `Config { ..clone() }` 的隐式约定。
+
+实际存在并承担边界的类型是：
+
+- `RuntimeSettings`：进程级配置快照与 composition 输入；
+- `GlobalPermissionPolicy` / `ProjectPermissionPolicy` / `ProjectPolicyRegistry`：global/project policy；
+- `PermissionSession`：mode、pre-plan、approver 与 WorkspaceId cache；
+- `WorkspaceIdentity`：ProjectId、WorkspaceId、canonical cwd/root 与 policy availability；
+- `EffectiveWorkspace`：单次调用冻结的 cwd、identity、permissions、sandbox、file state 与 system view；
+- `Config` 的显式 main/sub-agent/worktree 构造与 transition API：编码 fresh agent-local state、shared session policy 和 active-worktree ownership。
+
+以下 `RuntimeServices` / `ProjectContext` / `SessionRuntime` / `AgentContext` / `WorkspaceState` 小节是设计分层名称，不代表代码中均有同名实体类型；后续若继续拆 façade，应保持现有行为契约，而不是为类型名重做功能。
 
 ### `RuntimeServices` — process scope
 
@@ -167,15 +181,18 @@ MCP connection 和其他 process resources 继续由 composition root 拥有，�
 
 ## 3. Permission 分层
 
-`Permissions` 可保留为调用 façade，但内部拆成：
+`Permissions` 保留为调用 façade。实际实现的所有权层是：
 
 ```text
 GlobalPermissionPolicy   immutable global deny/ask
 ProjectPermissionPolicy  shared durable allow snapshot + writer
 PermissionSession        mode/pre-plan/approver/workspace caches
-PermissionWorkspace      project + session + WorkspaceIdentity
-PermissionCall           tool/input/depth/resolved target/sandbox fact
+WorkspaceIdentity        ProjectId + WorkspaceId + canonical workspace facts
+EffectiveWorkspace       one-call immutable workspace view
+Permissions              binds policy/session/identity for call evaluation
 ```
+
+原蓝图中的 `PermissionWorkspace` / `PermissionCall` 没有作为独立同名类型落地；它们的语义分别由 identity-bound `Permissions` 和 `run_one` 持有的 prepared facts + `EffectiveWorkspace` 表达。
 
 ### Policy 规则
 
@@ -237,7 +254,7 @@ v1 只保存 allow，使 malformed/unavailable store可以安全降级为“没�
 - leaf/lock必须 regular file、0600，拒绝 symlink/FIFO/device/socket；
 - same-directory exclusive temp、显式权限、file sync、atomic rename、directory sync；
 - 错误不回显配置或规则原文；
-- non-Unix保持现有安全边界，不借本计划实现 Plan 61/62 的 Windows文件 capability改造。
+- Windows 同样使用 directory HANDLE、`NtCreateFile(RootDirectory=...)`、reparse-point拒绝、handle-relative rename和 `LockFileEx`；顶层 config/OAuth 与 ProjectStore 共用这一边界。
 
 ### 并发与发布
 
@@ -261,7 +278,7 @@ blocking lock/RMW走 `spawn_blocking`。不同 ProjectId 使用不同 lock并可
 - headless不能修复或创建 policy；需要项目规则才能放行的调用按现有无 approver语义拒绝。
 - ProjectStore不拥有 rollout/offload、MCP、background worker、thread或 worktree lease。
 
-## 5. Approval UI 与 native protocol 2.0
+## 5. Approval UI 与 native protocol 1.0
 
 ### Core decision
 
@@ -291,7 +308,7 @@ pub enum Decision {
 
 ### Server breaking wire
 
-- `PROTOCOL_VERSION` 从 `1.0` 升为 `2.0`；握手继续 exact-match。
+- `PROTOCOL_VERSION` 保持 `1.0`；握手继续 exact-match。Plan 63 的 approval schema原位替换，因为此前native protocol没有外部用户。
 - initialize capability把 approval从 bool改为包含 scopes的结构化 capability。
 - `approval/request` 保留 `rememberRules`，新增 `approvalScopes`。
 - response只接受：
@@ -300,9 +317,9 @@ pub enum Decision {
   - `acceptForProject` → Project；
   - `decline` → Deny。
 - 删除 `acceptAlways`；旧值、unknown、missing、cancel、EOF全部 deny。
-- 不实现 protocol v1兼容或 token alias。
+- 不实现旧approval token兼容、版本双栈或token alias；protocol `2.0`握手作为mismatch拒绝。
 
-同步更新 `~/work/桌面前端仓库/app` 的 kloop专用分支：握手 v2、approval scopes、`acceptForProject`和对应前端文案。kloop main最终一次 Plan 63 commit；app仓库按其分支纪律做独立 companion commit。
+同步更新 `~/work/桌面前端仓库/app` 的 kloop专用分支：native protocol 1.0 scoped approval capability、`approvalScopes`、`acceptForProject`和对应前端文案。kloop main最终一次 Plan 63 commit；app仓库按其分支纪律做独立 companion commit。
 
 ## 6. Server、resume、sub-agent 与 worktree
 
@@ -395,7 +412,7 @@ pub enum Decision {
 
 - 重写 `RuntimeSettings`/`config_from_settings` composition；global只解析 deny/ask。
 - 接 plain/TUI scoped decision和 ProjectStore通知。
-- server升级 protocol 2.0，接 per-thread identity/policy/session和 resume重解析。
+- server在native protocol 1.0内接入scoped approval、per-thread identity/policy/session和resume重解析。
 - sandbox workspace root从 append改成 replace；补 task/session worktree回归。
 
 ### 切片 5：Desktop companion、文档与验收
@@ -465,7 +482,7 @@ pub enum Decision {
 ### UI、wire、headless
 
 - plain/TUI只对 rememberable request显示 y/a/p/n并使用准确scope文案。
-- server只接受 protocol 2.0与 `acceptForProject`；v1 handshake失败，`acceptAlways`按 unknown deny。
+- server只接受native protocol 1.0与`acceptForProject`；protocol 2.0 handshake失败，`acceptAlways`按unknown deny。
 - approval request广告 once/workspaceSession/project scopes，不泄漏 ProjectId/path/policy内容。
 - disconnect/cancel/unknown/missing response仍 deny。
 - headless不能写 ProjectStore；existing project allow可命中，其余需要审批的调用deny。
@@ -476,7 +493,7 @@ pub enum Decision {
 - 两项目 thread策略隔离；同项目 thread live policy共享、session state隔离。
 - resume按 stored cwd重新解析并读取当前 policy，不序列化 rule/mode/cache。
 - invalid restored cwd拒绝。
-- Desktop kloop adapter完成 v2握手、project approval与错误路径E2E；旧v1明确不连接。
+- Desktop kloop adapter完成native protocol 1.0握手、project approval与错误路径E2E；mismatched version明确不连接。
 
 ## 11. 关键文件
 
@@ -539,16 +556,42 @@ git diff --check
 
 - temporary Git repositories + linked worktrees identity测试；
 - 多进程 ProjectStore lock/RMW测试；
-- server protocol 2.0 duplex E2E；
+- server native protocol 1.0 scoped-approval duplex E2E；
 - app kloop分支 handshake/project approval E2E；
 - 人工检查真实用户 config不会被实现代码静默迁移或改写。
 
 ## 完成标准
 
-- Project/Workspace/Session/Agent作用域由类型和显式 constructor表达，不再依赖 Config clone约定。
+- Project/Workspace/Session/Agent作用域由 policy/session/identity/snapshot 对象和显式 constructor表达；`Config` 仍是聚合 façade，独立 context 类型的进一步拆分不是本次完成声明。
 - durable allow只按 ProjectId存于用户私有 state；global allow与旧 `acceptAlways`完全移除。
 - 同项目 live policy共享、WorkspaceId cache隔离、server thread session状态隔离均有确定性测试。
 - permission gate顺序、prepared-target安全和 sandbox/approval coupling无回退。
 - worktree sandbox不再隐式保留主 checkout writable root。
-- server protocol 2.0与 Desktop adapter同步完成，不保留双栈。
+- server native protocol 1.0与Desktop adapter同步完成，不保留旧approval schema、双栈或alias。
 - 所有门禁全绿，kloop一次提交，提交信息含 `plan63`；不推送远端。
+
+## 完成记录 ✅（2026-08-06）
+
+### 实现事实
+
+- 新增 `ProjectId`、`WorkspaceId` 与 `WorkspaceIdentity`。Git identity 绑定 canonical common-dir/top-level，non-Git 使用独立 domain；Git probe、marker root、canonicalization或输出异常时 project scope fail closed，不猜 cwd fallback，digest不泄 raw anchor。
+- 新增用户私有 ProjectStore：`~/.kloop/projects/v1/<ProjectId>/permissions.json|permissions.lock`。JSON v1 strict validate，锁内 reload/merge/dedup/revision/atomic replace，跨线程与跨进程 RMW 无 lost update；live snapshot monotonic refresh与显式 deletion invalidation分开。
+- private-store seam 被 global config、OAuth与ProjectStore共用。Unix区分 search-only lookup descriptor与sync-capable descriptor；Windows使用directory HANDLE、relative `NtCreateFile`、reparse拒绝、handle-relative rename与`LockFileEx`。
+- permission ownership实际由 `GlobalPermissionPolicy`、`ProjectPermissionPolicy`、`ProjectPolicyRegistry`、`PermissionSession`、identity-bound `Permissions`组成；WorkspaceSession cache按WorkspaceId分区，same-project thread只共享durable policy。Project persist失败不假发布，只让本 call按Once执行并发安全提示。
+- `Config`仍是聚合façade；没有虚构同名的`RuntimeServices`/`ProjectContext`/`SessionRuntime`/`AgentContext`/`WorkspaceState`实体。生产构造路径显式决定共享/隔离，`EffectiveWorkspace`则把一次调用的cwd、identity、permission、sandbox、file state和system view冻结到同一snapshot。
+- worktree task/workflow从active workspace cwd的HEAD分叉；child ProjectId必须等于parent。sandbox transition替换workspace-derived root，保留tmp与用户explicit extras，不再隐式保留主checkout writable root。
+- native server保持exact native protocol 1.0并原位采用scoped approval capability；response只接受`accept`、`acceptForSession`、`acceptForProject`、`decline`。core复核未广告scope；protocol 2.0 mismatch、`acceptAlways`、malformed、unknown、late、EOF/disconnect全部fail closed。
+- Desktop companion commit `54056dc5`；独立`kloop` worktree完成exact JSON-RPC 2.0 envelope、native protocol 1.0 scoped payload校验、scope-aware UI、`acceptForProject`与14个locale；未修改app脏main或`codex` gitlink。
+
+### 验证
+
+- kloop：`cargo fmt --all --check`、workspace all-target clippy `-D warnings`、`cargo test --workspace`全绿（core 565、CLI 103及其余crate/integration/doc tests均零失败）；`cargo run -p kloop -- --mock`在6 rounds完成。
+- focused identity/permission/worktree/sandbox/task/private-store/ProjectStore/startup/mock/server approval/resume regressions包含在最终workspace run；另有temporary Git linked-worktree、multiprocess ProjectStore、policy deletion revocation、active-worktree HEAD与snapshot race覆盖。
+- 真实kloop binary：native protocol 1.0 initialize返回structured approval scopes；protocol 2.0 initialize返回`-32602` refusal。
+- Desktop：Bun `887 pass / 52 skip / 0 fail`，`vue-tsc`、production Vite build、Tauri fmt与clippy全绿；Rust最终全量`229 passed / 0 failed`。首次Rust全量运行中一个既有worktree临时目录测试瞬时失败，exact rerun与随后完整rerun均通过；未用focused结果冒充最终全量。
+- 用户在收尾后确认此前native protocol无人使用，因此不需要version bump；最终实现保留`1.0`并原位替换approval schema。该修正后复跑kloop handshake/approval tests、server clippy、真实binary v1成功/v2拒绝，以及Desktop initialize/reader tests、两组Bun contract tests、Tauri fmt/clippy，均通过；JSON-RPC envelope仍严格为`"2.0"`。
+- Windows private-store代码以独立最小检查crate完成Windows target check/clippy；本次没有原生Windows runtime，因此不把该静态门写成原生运行验收。Plan 61/62既有Windows 10 x64原生门记录不被改写。
+- 所有本次运行时验证使用`--mock`或temporary HOME/store；没有命令读取或改写真实`~/.kloop/config.toml`。环境拒绝了对该私有文件的结构检查，因此“真实文件仍含哪些legacy key”留给用户本地确认；实现层的non-migration由startup/private-store regressions覆盖。
+- 本次没有启动真实Tauri GUI窗口；Desktop与engine的边界由真实binary handshake、adapter contract tests、Bun store/component tests和Tauri Rust tests覆盖。project approval的真实模型/UI点击闭环仍属于发布前人工smoke，不冒充已执行。
+
+kloop提交SHA以本条所在提交为准；两个仓库均未push。

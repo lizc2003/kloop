@@ -71,6 +71,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::Ui;
 use crate::config::Config;
+use crate::config::EffectiveWorkspace;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
@@ -890,6 +891,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 ctx.hook_context.lock().unwrap().extend(context);
             }
         }
+        let workspace = ctx.cfg.effective_workspace();
         // Prepare mutations after pre-hooks but before permission. The gate sees
         // the canonical effective target, while the executor retains an open
         // parent directory handle across any approval wait.
@@ -900,27 +902,24 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         let prepared_mutation =
             if matches!(name.as_str(), "write_file" | "edit_file" | "notebook_edit") {
                 Some(if name == "notebook_edit" {
-                    fs::prepare_notebook_mutation_input(&input, &ctx).await?
+                    fs::prepare_notebook_mutation_input(&input, &workspace).await?
                 } else {
-                    fs::prepare_mutation_input(&name, &input, &ctx).await?
+                    fs::prepare_mutation_input(&name, &input, &workspace).await?
                 })
             } else {
                 None
             };
         let prepared_read = if name == "read_file" {
-            Some(fs::prepare_read(&input, &ctx).await?)
+            Some(fs::prepare_read(&input, &workspace).await?)
         } else {
             None
         };
         let mutation_preview_context = prepared_mutation
             .as_ref()
             .and_then(fs::PreparedMutation::preview_context);
-        let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &ctx);
-        // effective_*: gate on the active worktree's re-anchored permissions
-        // when the session entered one (plan 35 slice 2), else the base gate.
-        if let Err(reason) = ctx
-            .cfg
-            .effective_permissions()
+        let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &workspace);
+        let permission = workspace
+            .permissions
             .check_call_with_resolved_path(
                 &name,
                 &input,
@@ -932,9 +931,11 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 ctx.depth,
                 sandbox_auto_allow,
             )
-            .await
-        {
-            bail!(reason);
+            .await;
+        match permission {
+            Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
+            Ok(None) => {}
+            Err(reason) => bail!(reason),
         }
         let powershell_guard = if name == "powershell" {
             Some(ctx.cfg.powershell_execution_gate.lock().await)
@@ -958,6 +959,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             prepared_mutation.as_ref(),
             expected_source_generation,
             &ctx,
+            &workspace,
         )
         .await;
         if foreground_shell {
@@ -1079,6 +1081,7 @@ fn execute_tool<'a>(
     prepared_mutation: Option<&'a fs::PreparedMutation>,
     expected_source_generation: Option<u64>,
     ctx: &'a ToolCtx,
+    workspace: &'a EffectiveWorkspace,
 ) -> Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>> {
     Box::pin(async move {
         // read_file is the sole BUILT-IN that can return non-text: on an image
@@ -1089,7 +1092,7 @@ fn execute_tool<'a>(
                     "read_file: target was not prepared"
                 )));
             };
-            let state = ctx.cfg.effective_file_state();
+            let state = Arc::clone(&workspace.file_state);
             return match fs::read_file_tool(input, prepared).await {
                 Ok(output) => ToolExecution {
                     result: Ok(output.content),
@@ -1105,11 +1108,11 @@ fn execute_tool<'a>(
                     "{name}: mutation target was not prepared"
                 )));
             };
-            let state = ctx.cfg.effective_file_state();
+            let state = Arc::clone(&workspace.file_state);
             let output = match name {
-                "write_file" => fs::write_file_tool(input, prepared, ctx).await,
-                "edit_file" => fs::edit_file_tool(input, prepared, ctx).await,
-                "notebook_edit" => fs::notebook_edit_tool(input, prepared, ctx).await,
+                "write_file" => fs::write_file_tool(input, prepared, ctx, workspace).await,
+                "edit_file" => fs::edit_file_tool(input, prepared, ctx, workspace).await,
+                "notebook_edit" => fs::notebook_edit_tool(input, prepared, ctx, workspace).await,
                 _ => unreachable!("matched file mutation tool"),
             };
             return match output {
@@ -1140,38 +1143,37 @@ fn execute_tool<'a>(
             };
         }
         let text: Result<String> = match name {
-            "bash" => bash::bash_tool(input, ctx).await,
-            "powershell" => powershell::powershell_tool(input, ctx).await,
+            "bash" => bash::bash_tool(input, ctx, workspace).await,
+            "powershell" => powershell::powershell_tool(input, ctx, workspace).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
             "kill_bash" => bash::kill_bash_tool(input, ctx).await,
             "grep" => {
-                search::grep_tool(input, &ctx.cfg.effective_cwd(), ctx.cfg.effective_permissions())
-                    .await
+                search::grep_tool(input, &workspace.cwd, Arc::clone(&workspace.permissions)).await
             }
             // glob hands a program its path list as a string[] (built-ins are
             // otherwise strings); the model-facing text is unchanged.
             "glob" => {
                 search::glob_tool(
                     input,
-                    &ctx.cfg.effective_cwd(),
+                    &workspace.cwd,
                     ctx.program_result.as_ref(),
-                    ctx.cfg.effective_permissions(),
+                    Arc::clone(&workspace.permissions),
                 )
                 .await
             }
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "todo_write" => todo::todo_write_tool(input, ctx).await,
-            "skill" => skill::skill_tool(input, ctx).await,
+            "skill" => skill::skill_tool(input, ctx, workspace).await,
             "tool_search" => tool_search::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
             "call_tool" => Err(anyhow!(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
-            "task" => task::task_tool(input, ctx).await,
+            "task" => task::task_tool(input, ctx, workspace).await,
             "ask_user_question" => question::ask_user_question_tool(input, ctx).await,
-            "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx).await,
-            "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx).await,
+            "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx, workspace).await,
+            "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
             "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
             "wait" => background_tasks::wait_tool(input, ctx).await,
@@ -1317,7 +1319,7 @@ pub(crate) mod testutil {
     pub(crate) fn with_powershell_gate_probe(
         mut ctx: ToolCtx,
     ) -> (ToolCtx, crate::config::PowerShellGateController) {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         let (gate, controller) = crate::config::PowerShellExecutionGate::instrumented();
         cfg.powershell_execution_gate = Arc::new(gate);
         ctx.cfg = Arc::new(cfg);
@@ -1327,7 +1329,7 @@ pub(crate) mod testutil {
     /// Rebuild the ctx with a different defer threshold (Config is behind an
     /// Arc, so tests clone-and-swap instead of mutating).
     pub(crate) fn with_defer_threshold(mut ctx: ToolCtx, threshold: usize) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.defer_threshold = threshold;
         ctx.cfg = Arc::new(cfg);
         ctx
@@ -1336,7 +1338,7 @@ pub(crate) mod testutil {
     /// Rebuild the ctx with a scripted provider, for tests whose tools spawn
     /// sub-agents that sample.
     pub(crate) fn with_provider(mut ctx: ToolCtx, provider: Provider) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(provider);
         ctx.cfg = Arc::new(cfg);
         ctx
@@ -1345,7 +1347,7 @@ pub(crate) mod testutil {
     /// Rebuild the ctx with an OS sandbox policy for bash.
     #[allow(dead_code)] // used by the macOS-only sandbox integration tests
     pub(crate) fn with_sandbox(mut ctx: ToolCtx, policy: crate::sandbox::SandboxPolicy) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.sandbox = Some(Arc::new(policy));
         ctx.cfg = Arc::new(cfg);
         ctx
@@ -1388,7 +1390,20 @@ pub(crate) mod testutil {
         repo: &std::path::Path,
         worktree_enabled: bool,
     ) -> ToolCtx {
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
+        let old_cwd = cfg.cwd.clone();
+        let identity = crate::project::WorkspaceIdentity::resolve(repo);
+        cfg.permissions = Arc::new(cfg.permissions.for_workspace(identity));
+        cfg.sandbox = cfg
+            .sandbox
+            .as_ref()
+            .map(|sandbox| Arc::new(sandbox.for_workspace(repo)));
+        cfg.file_state = Arc::new(crate::file_state::FileState::default());
+        cfg.system = cfg.system.replacen(
+            &format!("- Working directory: {}", old_cwd.display()),
+            &format!("- Working directory: {}", repo.display()),
+            1,
+        );
         cfg.cwd = repo.to_path_buf();
         cfg.surface.worktree = worktree_enabled;
         ctx.cfg = Arc::new(cfg);
@@ -2157,7 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn tool_allowlist_rejects_tools_outside_the_set() {
         let base = test_ctx(1, "allowlist");
-        let mut cfg = (*base.cfg).clone();
+        let mut cfg = base.cfg.test_clone();
         cfg.tool_allowlist = Some(Arc::new(["grep".to_string()].into_iter().collect()));
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
@@ -2234,11 +2249,10 @@ mod tests {
             Some(Arc::new(PendingApprover {
                 entered: std::sync::Mutex::new(Some(entered)),
             })),
-            None,
         )
         .unwrap();
         let base = test_ctx(0, "pending-bash-approval");
-        let mut config = (*base.cfg).clone();
+        let mut config = base.cfg.test_clone();
         config.permissions = Arc::new(permissions);
         let ctx = ToolCtx {
             cfg: Arc::new(config),

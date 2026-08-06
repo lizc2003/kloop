@@ -55,6 +55,7 @@ use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
 use kloop_core::interaction::Questioner;
+use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
@@ -508,7 +509,9 @@ impl Server {
                 "subagents": true,
                 "mcp": true,
                 "images": true,
-                "approvals": true,
+                "approvals": {
+                    "scopes": ["once", "workspaceSession", "project"]
+                },
                 "questions": true,
                 "models": {"list": true},
                 "config": {"read": true},
@@ -534,14 +537,7 @@ impl Server {
         };
         match pending {
             PendingInteraction::Approval(reply) => {
-                let decision = match result["decision"].as_str() {
-                    Some("accept") => Decision::Allow,
-                    Some("acceptForSession") => Decision::AllowSession,
-                    Some("acceptAlways") => Decision::AllowAlways,
-                    // "decline", "cancel", anything unrecognized, or missing:
-                    // the safe answer.
-                    _ => Decision::Deny,
-                };
+                let decision = approval_decision(&result);
                 let _ = reply.send(decision);
             }
             PendingInteraction::Question {
@@ -655,17 +651,23 @@ impl Server {
         }
         let source_snapshot = rollout::load_session_snapshot(&src)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read source: {e}")))?;
-        let (options, migrate_fork) = resume_options(&source_snapshot, params, &self.default_cwd)?;
+        let (options, _) = resume_options(&source_snapshot, params, &self.default_cwd)?;
         let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
         let (messages, mut rollout) = rollout::resume_session(&new_path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume fork: {e}")))?;
-        if migrate_fork {
-            rollout
-                .append_runtime(&runtime_from_options(&options))
-                .map_err(|e| (wire::SERVER_ERROR, format!("cannot migrate fork: {e}")))?;
-        }
+        // The requested cut may precede the source's runtime line. Always stamp
+        // the effective canonical runtime onto the fork so it remains resumable
+        // after this server process exits.
+        rollout
+            .append_runtime(&runtime_from_options(&options))
+            .map_err(|e| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot persist fork runtime: {e}"),
+                )
+            })?;
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
         self.spawn_thread(new_id.clone(), history, options.clone())?;
@@ -964,10 +966,8 @@ impl Server {
         }
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
-        cfg.session_id = thread_id.clone();
-        cfg.scheduler
-            .bind_owner(thread_id.clone())
-            .map_err(|e| (wire::SERVER_ERROR, format!("cannot bind scheduler: {e:#}")))?;
+        cfg.bind_session(thread_id.clone())
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot bind session: {e:#}")))?;
         let handle_cwd = cfg.cwd.clone();
         let handle_model = cfg.model.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
@@ -1388,6 +1388,25 @@ impl Ui for ThreadUi {
     }
 }
 
+fn approval_decision(result: &Value) -> Decision {
+    match result["decision"].as_str() {
+        Some("accept") => Decision::Allow(ApprovalScope::Once),
+        Some("acceptForSession") => Decision::Allow(ApprovalScope::WorkspaceSession),
+        Some("acceptForProject") => Decision::Allow(ApprovalScope::Project),
+        // decline, cancel, the removed acceptAlways token, anything unknown, or
+        // a missing decision all fail closed.
+        _ => Decision::Deny,
+    }
+}
+
+fn approval_scope_name(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::WorkspaceSession => "workspaceSession",
+        ApprovalScope::Project => "project",
+    }
+}
+
 impl Approver for ThreadUi {
     fn confirm(
         &self,
@@ -1408,10 +1427,17 @@ impl Approver for ThreadUi {
         } else {
             "command"
         };
+        let approval_scopes = req
+            .approval_scopes
+            .iter()
+            .copied()
+            .map(approval_scope_name)
+            .collect::<Vec<_>>();
         let mut params = json!({
             "turnId": self.turn_id(),
             "kind": kind,
             "description": req.description,
+            "approvalScopes": approval_scopes,
         });
         if let Some(rules) = &req.remember_rules {
             params["rememberRules"] = json!(rules);
@@ -1520,5 +1546,35 @@ impl Questioner for ThreadUi {
                 )),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod approval_response_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_approval_tokens_map_exactly_and_legacy_fails_closed() {
+        assert_eq!(
+            approval_decision(&json!({"decision": "accept"})),
+            Decision::Allow(ApprovalScope::Once)
+        );
+        assert_eq!(
+            approval_decision(&json!({"decision": "acceptForSession"})),
+            Decision::Allow(ApprovalScope::WorkspaceSession)
+        );
+        assert_eq!(
+            approval_decision(&json!({"decision": "acceptForProject"})),
+            Decision::Allow(ApprovalScope::Project)
+        );
+        for result in [
+            json!({"decision": "decline"}),
+            json!({"decision": "cancel"}),
+            json!({"decision": "acceptAlways"}),
+            json!({"decision": "unknown"}),
+            json!({}),
+        ] {
+            assert_eq!(approval_decision(&result), Decision::Deny);
+        }
     }
 }

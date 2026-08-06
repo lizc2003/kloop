@@ -1313,7 +1313,6 @@ mod tests {
                 &rules,
                 PathBuf::from(cwd),
                 None,
-                None,
             )
             .unwrap(),
         )
@@ -1395,7 +1394,6 @@ mod tests {
             crate::permissions::Mode::Bypass,
             &Default::default(),
             t.root.clone(),
-            None,
             None,
         )
         .unwrap();

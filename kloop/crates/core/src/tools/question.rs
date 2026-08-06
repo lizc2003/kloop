@@ -205,7 +205,7 @@ mod tests {
 
     fn ctx_with(outcome: QuestionOutcome) -> ToolCtx {
         let ctx = test_ctx(0, "question");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.questioner = Some(Arc::new(ScriptedQuestioner(outcome)));
         ToolCtx {
             cfg: Arc::new(cfg),

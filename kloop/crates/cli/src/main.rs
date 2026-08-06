@@ -10,6 +10,8 @@ mod headless;
 mod image;
 mod mcp;
 mod mcp_auth;
+mod private_store;
+mod project_store;
 mod provider_config;
 mod startup;
 mod ui;
@@ -197,7 +199,7 @@ async fn main() -> Result<ExitCode> {
                     &options.cwd,
                 )?;
                 if let Some(model) = options.model {
-                    cfg.model = model;
+                    cfg.set_model(model);
                 }
                 Ok(cfg)
             })
@@ -286,11 +288,10 @@ async fn main() -> Result<ExitCode> {
             skills,
             &cwd,
         )?;
-        cfg.session_id = session_id.clone();
-        cfg.scheduler.bind_owner(session_id.clone())?;
+        cfg.bind_session(session_id.clone())?;
         // An explicit headless runaway guardrail enables the otherwise-absent cap.
         if let Some(max_rounds) = args.max_rounds {
-            cfg.max_rounds = Some(max_rounds);
+            cfg.set_max_rounds(Some(max_rounds));
         }
         let cfg = Arc::new(cfg);
         // `--worktree`: run this headless turn inside an isolated tree (plan 35
@@ -361,8 +362,7 @@ async fn main() -> Result<ExitCode> {
                 skills.clone(),
                 &cwd,
             )?;
-            cfg.session_id = factory_session_id.clone();
-            cfg.scheduler.bind_owner(factory_session_id.clone())?;
+            cfg.bind_session(factory_session_id.clone())?;
             Ok(cfg)
         },
         history,
@@ -451,8 +451,7 @@ async fn plain_main(
         skills,
         &cwd,
     )?;
-    cfg.session_id = session_id.clone();
-    cfg.scheduler.bind_owner(session_id.clone())?;
+    cfg.bind_session(session_id.clone())?;
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
 

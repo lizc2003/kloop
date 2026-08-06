@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use super::str_arg;
 use super::ToolCtx;
+use crate::config::EffectiveWorkspace;
 use crate::permissions::Mode;
 use crate::permissions::PlanExitOutcome;
 use kloop_protocol::ToolDef;
@@ -29,11 +30,15 @@ pub(super) fn enter_plan_mode_def() -> ToolDef {
     }
 }
 
-pub(super) async fn enter_plan_mode_tool(_input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn enter_plan_mode_tool(
+    _input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     if ctx.depth >= 1 {
         bail!("enter_plan_mode: only the top-level agent can enter plan mode");
     }
-    let perms = ctx.cfg.effective_permissions();
+    let perms = &workspace.permissions;
     if perms.enter_plan() {
         ctx.ui.emit(&crate::event::Event::ModeChanged(Mode::Plan));
         Ok("Entered plan mode. Continue with read-only exploration, then call exit_plan_mode with the complete implementation plan for approval.".into())
@@ -62,13 +67,17 @@ pub(super) fn exit_plan_mode_def() -> ToolDef {
     }
 }
 
-pub(super) async fn exit_plan_mode_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn exit_plan_mode_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     // Session-scoped like the worktree tools: a sub-agent is read-only in plan
     // mode but does not manage the session's mode.
     if ctx.depth >= 1 {
         bail!("exit_plan_mode: only the top-level agent can leave plan mode");
     }
-    let perms = ctx.cfg.effective_permissions();
+    let perms = &workspace.permissions;
     if perms.mode() != Mode::Plan {
         bail!("exit_plan_mode: the session is not in plan mode, so there is nothing to exit");
     }
@@ -149,10 +158,9 @@ mod tests {
             &PermissionRules::default(),
             PathBuf::from("/work/proj"),
             Some(approver),
-            None,
         )
         .unwrap();
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.permissions = Arc::new(perms);
         ToolCtx {
             cfg: Arc::new(cfg),
@@ -166,10 +174,9 @@ mod tests {
             &PermissionRules::default(),
             PathBuf::from("/work/proj"),
             Some(approver),
-            None,
         )
         .unwrap();
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.permissions = Arc::new(perms);
         ToolCtx {
             cfg: Arc::new(cfg),
@@ -181,7 +188,9 @@ mod tests {
     /// call is idempotent, and Exit restores the mode from before the first call.
     #[tokio::test]
     async fn enter_is_idempotent_and_exit_restores_original_mode() {
-        let approver = PlanApprover::new(vec![Decision::Allow]);
+        let approver = PlanApprover::new(vec![Decision::Allow(
+            crate::permissions::ApprovalScope::Once,
+        )]);
         let ctx = mode_ctx(test_ctx(0, "planenter"), Mode::AcceptEdits, approver);
 
         let (first, first_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
@@ -211,7 +220,9 @@ mod tests {
     /// and the approver was shown the plan text as the popup preview.
     #[tokio::test]
     async fn approve_exits_plan_mode_and_reports_it() {
-        let approver = PlanApprover::new(vec![Decision::Allow]);
+        let approver = PlanApprover::new(vec![Decision::Allow(
+            crate::permissions::ApprovalScope::Once,
+        )]);
         let ctx = plan_ctx(test_ctx(0, "planexit"), approver.clone());
         let (out, is_error) =
             run_tool("exit_plan_mode", json!({"plan": "1. do X\n2. do Y"}), &ctx).await;
@@ -268,7 +279,9 @@ mod tests {
     /// A sub-agent cannot leave plan mode (session-scoped, top-level only).
     #[tokio::test]
     async fn subagent_cannot_exit_plan_mode() {
-        let approver = PlanApprover::new(vec![Decision::Allow]);
+        let approver = PlanApprover::new(vec![Decision::Allow(
+            crate::permissions::ApprovalScope::Once,
+        )]);
         // depth-1 ctx, still swap in a plan-mode gate to reach the depth guard.
         let ctx = plan_ctx(test_ctx(1, "plansub"), approver);
         let (out, is_error) = run_tool("exit_plan_mode", json!({"plan": "x"}), &ctx).await;

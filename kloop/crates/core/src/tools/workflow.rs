@@ -410,11 +410,12 @@ impl HostBridge for WorkflowBridge {
             copy_option(&opts, &mut input, "maxRounds", "max_rounds");
             copy_option(&opts, &mut input, "isolation", "isolation");
             copy_option(&opts, &mut input, "model", "model");
+            let workspace = ctx.cfg.effective_workspace();
             let result = match schema {
                 Some(schema) => super::task::structured_task(&input, schema, &ctx)
                     .await
                     .map_err(|error| format!("{error:#}")),
-                None => super::task::task_tool(&input, &ctx)
+                None => super::task::task_tool(&input, &ctx, &workspace)
                     .await
                     .map(Value::String)
                     .map_err(|error| format!("{error:#}")),
@@ -456,7 +457,7 @@ mod tests {
 
     fn enabled_ctx(tag: &str) -> ToolCtx {
         let mut ctx = test_ctx(0, tag);
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.surface.workflow = true;
         let root =
             std::env::temp_dir().join(format!("kloop-workflow-test-{}-{tag}", std::process::id()));
@@ -727,7 +728,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let mut ctx = enabled_ctx("workflow-stop");
         let ui = Arc::new(RecordingUi::default());
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
@@ -785,7 +786,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let mut ctx = enabled_ctx("workflow-shutdown");
         let ui = Arc::new(RecordingUi::default());
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
@@ -848,7 +849,7 @@ mod tests {
                 input: json!({"count": 7}),
             }]),
         ]);
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(provider);
         ctx.cfg = Arc::new(cfg);
         let launched = workflow_tool(&json!({"script": script}), &ctx)
@@ -865,7 +866,7 @@ mod tests {
         ));
 
         let (provider, hit_seen) = kloop_provider::Provider::mock_recording(Vec::new());
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(provider);
         ctx.cfg = Arc::new(cfg);
         workflow_tool(
@@ -909,7 +910,7 @@ mod tests {
                 input: json!({"count": 9}),
             }]),
         ]);
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(provider);
         ctx.cfg = Arc::new(cfg);
         workflow_tool(
@@ -940,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_structured_agent_returns_object_and_journals_value() {
         let mut ctx = enabled_ctx("workflow-structured");
-        let mut cfg = (*ctx.cfg).clone();
+        let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(kloop_provider::Provider::mock(vec![vec![
             kloop_protocol::ContentBlock::ToolUse {
                 id: "structured-1".into(),

@@ -115,7 +115,7 @@ impl Approver for ScriptedApprover {
 
 fn ctx_at(root: &Path, ui: Arc<dyn Ui>, tag: &str) -> ToolCtx {
     let mut context = test_ctx(0, tag);
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.cwd = root.to_path_buf();
     context.cfg = Arc::new(config);
     context.ui = ui;
@@ -512,14 +512,14 @@ async fn seriality_report() -> Value {
 async fn permission_report() -> Value {
     let root = TempRoot::new("permission");
     let path = write_notebook(root.path(), "fixture.ipynb");
-    let approver = ScriptedApprover::new([Decision::Allow]);
+    let approver =
+        ScriptedApprover::new([Decision::Allow(crate::permissions::ApprovalScope::Once)]);
     let permissions = Arc::new(
         Permissions::new(
             Mode::Manual,
             &PermissionRules::default(),
             root.path().to_path_buf(),
             Some(approver.clone()),
-            None,
         )
         .unwrap(),
     );
@@ -528,7 +528,7 @@ async fn permission_report() -> Value {
         Arc::new(RecordingUi::default()),
         "plan57-permission",
     );
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.permissions = permissions;
     context.cfg = Arc::new(config);
     let absolute = path.to_string_lossy().into_owned();
@@ -564,7 +564,6 @@ async fn permission_report() -> Value {
         &PermissionRules::default(),
         root.path().to_path_buf(),
         None,
-        None,
     )
     .unwrap();
     assert!(accept
@@ -579,7 +578,6 @@ async fn permission_report() -> Value {
         Mode::Plan,
         &PermissionRules::default(),
         root.path().to_path_buf(),
-        None,
         None,
     )
     .unwrap();
@@ -598,7 +596,6 @@ async fn permission_report() -> Value {
             ..Default::default()
         },
         root.path().to_path_buf(),
-        None,
         None,
     )
     .unwrap();

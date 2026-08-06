@@ -121,7 +121,7 @@ fn scheduler_context(
     scheduler.bind_owner(owner).unwrap();
     let ui = Arc::new(RecordingUi::default());
     let mut context = test_ctx(0, tag);
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.inbox = Arc::clone(&inbox);
     config.scheduler = Arc::clone(&scheduler);
     config.session_id = owner.into();
@@ -413,7 +413,7 @@ async fn delivery_report() -> Value {
         .unwrap()
         .unwrap();
 
-    let mut config = (*context.cfg).clone();
+    let mut config = context.cfg.test_clone();
     config.provider = Arc::new(Provider::mock(vec![vec![ContentBlock::Text {
         text: "timer answer".into(),
     }]]));
@@ -563,13 +563,13 @@ async fn guard_report() -> Value {
     let (depth_text, depth_error) = run_tool("cron_list", json!({}), &depth).await;
     assert!(depth_error && depth_text.contains("top-level"));
     let mut agent = base.clone();
-    let mut agent_config = (*agent.cfg).clone();
+    let mut agent_config = agent.cfg.test_clone();
     agent_config.agent_label = "agent-1".into();
     agent.cfg = Arc::new(agent_config);
     let (agent_text, agent_error) = run_tool("cron_list", json!({}), &agent).await;
     assert!(agent_error && agent_text.contains("top-level"));
     let mut disabled = base.clone();
-    let mut disabled_config = (*disabled.cfg).clone();
+    let mut disabled_config = disabled.cfg.test_clone();
     disabled_config.surface.scheduler = false;
     disabled.cfg = Arc::new(disabled_config);
     let (surface_text, surface_error) = run_tool("cron_list", json!({}), &disabled).await;
@@ -592,27 +592,15 @@ async fn guard_report() -> Value {
 
 async fn permission_report() -> Value {
     let cwd = std::env::temp_dir();
-    let manual = Permissions::new(
-        Mode::Manual,
-        &PermissionRules::default(),
-        cwd.clone(),
-        None,
-        None,
-    )
-    .unwrap();
+    let manual =
+        Permissions::new(Mode::Manual, &PermissionRules::default(), cwd.clone(), None).unwrap();
     for name in ["cron_create", "cron_delete", "schedule_wakeup"] {
         assert!(manual.check(name, &json!({}), 0).await.is_ok());
     }
     assert!(manual.check("cron_list", &json!({}), 0).await.is_ok());
 
-    let plan = Permissions::new(
-        Mode::Plan,
-        &PermissionRules::default(),
-        cwd.clone(),
-        None,
-        None,
-    )
-    .unwrap();
+    let plan =
+        Permissions::new(Mode::Plan, &PermissionRules::default(), cwd.clone(), None).unwrap();
     for name in ["cron_create", "cron_delete", "schedule_wakeup"] {
         assert!(plan
             .check(name, &json!({}), 0)
@@ -629,7 +617,6 @@ async fn permission_report() -> Value {
             ..Default::default()
         },
         cwd.clone(),
-        None,
         None,
     )
     .unwrap();
@@ -648,7 +635,6 @@ async fn permission_report() -> Value {
         },
         cwd,
         Some(approver.clone()),
-        None,
     )
     .unwrap();
     assert!(ask

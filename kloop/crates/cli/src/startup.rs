@@ -5,7 +5,6 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -20,8 +19,13 @@ use kloop_core::hooks::HookEvent;
 use kloop_core::hooks::Hooks;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
+use kloop_core::permissions::GlobalPermissionPolicy;
 use kloop_core::permissions::PermissionRules;
+use kloop_core::permissions::PermissionSession;
 use kloop_core::permissions::Permissions;
+use kloop_core::permissions::ProjectPermissionPolicy;
+use kloop_core::permissions::ProjectPolicyRegistry;
+use kloop_core::project::WorkspaceIdentity;
 use kloop_core::shell_programs::ShellOverrides;
 use kloop_core::shell_programs::ShellPrograms;
 use kloop_core::skills::Skill;
@@ -40,6 +44,7 @@ use kloop_server::SkillsSnapshot;
 
 use crate::args::CliArgs;
 use crate::context;
+use crate::project_store::ProjectStore;
 use crate::provider_config::ResolvedProviderSettings;
 use crate::user_config::UserConfig;
 
@@ -47,8 +52,9 @@ use crate::user_config::UserConfig;
 /// deliberately absent: sessions add only their workspace-specific anchors.
 pub(crate) struct RuntimeSettings {
     config_path: PathBuf,
-    oauth_store_path: PathBuf,
-    permission_rules: Arc<Mutex<PermissionRules>>,
+    global_permissions: Arc<GlobalPermissionPolicy>,
+    project_registry: Arc<ProjectPolicyRegistry>,
+    project_store: Option<Arc<ProjectStore>>,
     hooks: Arc<Hooks>,
     sandbox: SandboxSettings,
     sandbox_disabled_by_env: bool,
@@ -67,8 +73,9 @@ impl RuntimeSettings {
             let (shell_programs, shell_warnings) = mock_shell_programs()?;
             return Ok(Self {
                 config_path: PathBuf::new(),
-                oauth_store_path: PathBuf::new(),
-                permission_rules: Arc::new(Mutex::new(PermissionRules::default())),
+                global_permissions: Arc::new(GlobalPermissionPolicy::empty()),
+                project_registry: Arc::new(ProjectPolicyRegistry::default()),
+                project_store: None,
                 hooks: Arc::new(Hooks::none()),
                 sandbox: SandboxSettings::default(),
                 sandbox_disabled_by_env: false,
@@ -83,16 +90,21 @@ impl RuntimeSettings {
         }
         let table = config.table();
         let config_path = config.path().to_path_buf();
-        let oauth_store_path = config_path
-            .parent()
-            .expect("global config always has a parent")
-            .join(crate::user_config::OAUTH_STORE);
         let (shell_programs, shell_warnings) =
             kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
+        let permission_rules = load_permission_rules(table)?;
+        let global_permissions = Arc::new(GlobalPermissionPolicy::new(
+            &permission_rules.deny,
+            &permission_rules.ask,
+        )?);
+        let project_store = Arc::new(ProjectStore::new(crate::project_store::project_store_root(
+            &config_path,
+        )?));
         Ok(Self {
             config_path,
-            oauth_store_path,
-            permission_rules: Arc::new(Mutex::new(load_permission_rules(table)?)),
+            global_permissions,
+            project_registry: Arc::new(ProjectPolicyRegistry::default()),
+            project_store: Some(project_store),
             hooks: Arc::new(Hooks {
                 defs: load_hooks(table)?,
             }),
@@ -225,8 +237,8 @@ fn load_hooks(root: &toml::Table) -> Result<Vec<HookDef>> {
     Ok(defs)
 }
 
-/// Rules from global `[permissions]`, with KLOOP_ALLOW / KLOOP_DENY /
-/// KLOOP_ASK (comma-separated) appended once at process startup.
+/// Global deny/ask rules from `[permissions]`, with KLOOP_DENY / KLOOP_ASK
+/// (comma-separated) appended once at process startup. Legacy allow input is rejected.
 fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     let mut rules = PermissionRules::default();
     if let Some(section) = root.get("permissions") {
@@ -234,8 +246,13 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
             .as_table()
             .context("[permissions] must be a table")?;
         for key in section.keys() {
-            if !matches!(key.as_str(), "allow" | "deny" | "ask") {
-                bail!("[permissions] has unknown key '{key}' (allow | deny | ask)");
+            if key == "allow" {
+                bail!(
+                    "permissions.allow is no longer supported; remove it from ~/.kloop/config.toml and approve rules separately in each project"
+                );
+            }
+            if !matches!(key.as_str(), "deny" | "ask") {
+                bail!("[permissions] has unknown key '{key}' (deny | ask)");
             }
         }
         let read = |key: &str, out: &mut Vec<String>| -> Result<()> {
@@ -255,7 +272,6 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
             }
             Ok(())
         };
-        read("allow", &mut rules.allow)?;
         read("deny", &mut rules.deny)?;
         read("ask", &mut rules.ask)?;
     }
@@ -264,6 +280,14 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
 
 fn load_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     let mut rules = parse_permission_rules(root)?;
+    if std::env::var("KLOOP_ALLOW")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        bail!(
+            "KLOOP_ALLOW is no longer supported; remove it and approve rules separately in each project"
+        );
+    }
     let append_env = |name: &str, out: &mut Vec<String>| {
         if let Ok(raw) = std::env::var(name) {
             out.extend(
@@ -274,30 +298,46 @@ fn load_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
             );
         }
     };
-    append_env("KLOOP_ALLOW", &mut rules.allow);
     append_env("KLOOP_DENY", &mut rules.deny);
     append_env("KLOOP_ASK", &mut rules.ask);
     Ok(rules)
 }
 
-fn persist_global_allow_rules(
-    path: &Path,
-    shared_rules: &Mutex<PermissionRules>,
-    new_rules: &[String],
-) -> Result<()> {
-    let mut snapshot = shared_rules.lock().unwrap();
-    crate::user_config::persist_allow_rules(path, new_rules)?;
-    for rule in new_rules {
-        if !snapshot.allow.contains(rule) {
-            snapshot.allow.push(rule.clone());
+fn load_project_permission_policy(
+    store: &Arc<ProjectStore>,
+    registry: &Arc<ProjectPolicyRegistry>,
+    project_id: kloop_core::project::ProjectId,
+    notify: &kloop_tui::NoteFn,
+) -> Arc<ProjectPermissionPolicy> {
+    let register = |snapshot| {
+        let writer: Arc<dyn kloop_core::permissions::ProjectPermissionWriter> = store.clone();
+        registry.get_or_insert(project_id.clone(), snapshot, writer)
+    };
+    let unavailable = || {
+        registry.invalidate(&project_id);
+        notify(
+            "project permission policy is unavailable or invalid; durable project approvals are disabled for this session",
+        );
+        Arc::new(ProjectPermissionPolicy::unavailable())
+    };
+    match store.load_blocking(&project_id) {
+        Ok(snapshot) if snapshot.revision == 0 => {
+            // Missing policy state is an authoritative revocation, but a load
+            // may have raced a same-process durable write. Clear the live view,
+            // then re-read before publishing the empty policy.
+            registry.invalidate(&project_id);
+            match store.load_blocking(&project_id) {
+                Ok(snapshot) => register(snapshot),
+                Err(_) => unavailable(),
+            }
         }
+        Ok(snapshot) => register(snapshot),
+        Err(_) => unavailable(),
     }
-    Ok(())
 }
 
-/// `approver` and `notify` are the UI-facing halves of the permission gate:
-/// the plain REPL passes a blocking stdin prompt + stderr printer, the TUI a
-/// popup + transcript note.
+/// Build one workspace permission view from process-global constraints, the
+/// project registry, and a fresh session scope.
 fn build_permissions(
     args: &CliArgs,
     cwd: &Path,
@@ -305,35 +345,35 @@ fn build_permissions(
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
 ) -> Result<Permissions> {
-    // --mock runs a canned turn with nobody at the keyboard: no gating at
-    // all. Otherwise the mode comes straight from --permission-mode (manual);
-    // bypass still enforces deny rules and safety checks.
     if args.mock {
         return Ok(Permissions::allow_all());
     }
-    let mode = args.permission_mode;
-    let rules = settings.permission_rules.lock().unwrap().clone();
-    let persist_path = settings.config_path.clone();
-    let shared_rules = Arc::clone(&settings.permission_rules);
-    let persist = Arc::new(move |rules: &[String]| {
-        match persist_global_allow_rules(&persist_path, &shared_rules, rules) {
-            Ok(()) => notify(&format!(
-                "saved global allow rule for all workspaces: {}",
-                rules.join(", ")
-            )),
-            Err(error) => notify(&format!("failed to save global allow rule: {error:#}")),
+
+    let identity = WorkspaceIdentity::resolve(cwd);
+    let project = match (
+        identity.project_id().cloned(),
+        settings.project_store.as_ref(),
+    ) {
+        (Some(project_id), Some(store)) => {
+            load_project_permission_policy(store, &settings.project_registry, project_id, &notify)
         }
-    });
-    Permissions::new(
-        mode,
-        &rules,
-        cwd.to_path_buf(),
-        Some(approver),
-        Some(persist),
-    )
-    .context(
-        "invalid permission rules in ~/.kloop/config.toml / KLOOP_ALLOW / KLOOP_DENY / KLOOP_ASK",
-    )
+        _ => {
+            if let kloop_core::project::ProjectIdentityStatus::Unavailable(reason) =
+                identity.status()
+            {
+                notify(&format!(
+                    "project identity unavailable ({reason}); durable project approvals are disabled for this session"
+                ));
+            }
+            Arc::new(ProjectPermissionPolicy::unavailable())
+        }
+    };
+    Ok(Permissions::from_layers(
+        Arc::clone(&settings.global_permissions),
+        project,
+        Arc::new(PermissionSession::new(args.permission_mode, Some(approver))),
+        identity,
+    ))
 }
 
 /// `[sandbox]` in the global user config: `enabled` (default true),
@@ -713,13 +753,15 @@ pub(crate) fn build_sandbox(
     }
     match kloop_core::sandbox::availability() {
         Ok(()) => {
+            let private_state_root =
+                crate::project_store::project_store_root(&runtime.config_path)?;
             let mut policy = kloop_core::sandbox::SandboxPolicy::workspace(
                 cwd,
                 &settings.writable_roots,
                 settings.allow_network,
             )
-            .with_denied_read_path(&runtime.config_path)
-            .with_denied_read_path(&runtime.oauth_store_path);
+            .with_denied_read_path(&private_state_root)
+            .with_denied_write_path(&private_state_root);
             policy.auto_allow = settings.auto_allow;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
@@ -867,9 +909,14 @@ pub(crate) fn config_from_settings(
     let cwd = cwd.to_path_buf();
     let questions_enabled = questioner.is_some();
     scheduler.set_missed_confirmation_available(questions_enabled);
-    let base = Config {
-        provider: Arc::new(Provider::mock(vec![])),
-        model: "mock".into(),
+    let (provider_transport, model) = if args.mock {
+        (Provider::mock(mock_demo_turns()), "mock".to_string())
+    } else {
+        (provider.provider(), provider.model().to_string())
+    };
+    Ok(Config {
+        provider: Arc::new(provider_transport),
+        model,
         system: project.system.clone(),
         project_instructions: project.instructions.clone(),
         max_rounds: None,
@@ -909,17 +956,6 @@ pub(crate) fn config_from_settings(
             worktree: !args.mock,
             scheduler: !args.mock,
         },
-    };
-    if args.mock {
-        return Ok(Config {
-            provider: Arc::new(Provider::mock(mock_demo_turns())),
-            ..base
-        });
-    }
-    Ok(Config {
-        provider: Arc::new(provider.provider()),
-        model: provider.model().to_string(),
-        ..base
     })
 }
 
@@ -976,6 +1012,8 @@ fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn config(raw: &str) -> toml::Table {
         raw.parse().unwrap()
     }
@@ -1018,6 +1056,45 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             &ShellPrograms::test_fixture()
         );
         assert!(runtime.shell_warnings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_project_policy_revokes_a_loaded_live_grant() {
+        let base = std::env::temp_dir().join(format!(
+            "kloop-project-policy-revoke-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd = base.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project_id = WorkspaceIdentity::resolve(&cwd)
+            .project_id()
+            .unwrap()
+            .clone();
+        let store = Arc::new(ProjectStore::new(base.join(".kloop")));
+        let additions =
+            kloop_core::permissions::ProjectAllowRules::parse(&["bash(cargo test *)".to_string()])
+                .unwrap();
+        kloop_core::permissions::ProjectPermissionWriter::append_allow(
+            store.as_ref(),
+            project_id.clone(),
+            additions,
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(ProjectPolicyRegistry::default());
+        let notify: kloop_tui::NoteFn = Arc::new(|_| {});
+        let first = load_project_permission_policy(&store, &registry, project_id.clone(), &notify);
+        assert_eq!(first.snapshot().revision, 1);
+
+        std::fs::remove_file(store.policy_path(&project_id)).unwrap();
+        let reloaded = load_project_permission_policy(&store, &registry, project_id, &notify);
+        assert!(Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(
+            reloaded.snapshot(),
+            kloop_core::permissions::ProjectPolicySnapshot::empty()
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1096,7 +1173,7 @@ model = "secret-model"
 wire_api = "responses"
 http_headers = { Authorization = "Bearer SENTINEL-PROVIDER" }
 [permissions]
-allow = ["bash(secret *)"]
+deny = ["bash(secret *)"]
 [[hooks]]
 event = "pre_turn"
 command = ["SENTINEL-HOOK"]
@@ -1137,7 +1214,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     }
 
     #[test]
-    fn sandbox_denies_global_config_and_oauth_store_reads() {
+    fn sandbox_denies_private_state_tree_reads_and_writes() {
         if kloop_core::sandbox::availability().is_err()
             || matches!(
                 std::env::var("KLOOP_SANDBOX").ok().as_deref(),
@@ -1150,20 +1227,29 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             std::env::temp_dir().join(format!("kloop-global-sandbox-deny-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let config_path = base.join("home/.kloop/config.toml");
-        let oauth_path = config_path
-            .parent()
-            .unwrap()
-            .join(crate::user_config::OAUTH_STORE);
-        let config = UserConfig::from_parts(config_path.clone(), toml::Table::new());
+        let private_state_root = config_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&private_state_root).unwrap();
+        let config = UserConfig::from_parts(config_path, toml::Table::new());
         let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
         let args = crate::args::parse_args(&[]).unwrap();
 
-        let policy = build_sandbox(&args, &base, &runtime, |_| {})
+        let policy = build_sandbox(&args, &private_state_root, &runtime, |_| {})
             .unwrap()
             .unwrap();
 
-        assert!(policy.denied_read_paths.contains(&config_path));
-        assert!(policy.denied_read_paths.contains(&oauth_path));
+        assert!(policy
+            .writable_roots
+            .iter()
+            .any(|root| root.root == private_state_root));
+        assert!(policy.denied_read_paths.contains(&private_state_root));
+        assert!(policy.denied_write_paths.contains(&private_state_root));
+        let (_, params) = kloop_core::sandbox::seatbelt_profile(&policy);
+        assert!(params
+            .iter()
+            .any(|(key, path)| key.starts_with("DENIED_READ_") && path == &private_state_root));
+        assert!(params
+            .iter()
+            .any(|(key, path)| key.starts_with("DENIED_WRITE_") && path == &private_state_root));
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1476,82 +1562,46 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     }
 
     #[test]
-    fn permission_config_parses_and_rejects_malformed_sections() {
+    fn permission_config_keeps_global_constraints_and_rejects_legacy_allow() {
         assert_eq!(
             parse_permission_rules(&toml::Table::new()).unwrap(),
             PermissionRules::default()
         );
 
         let rules = parse_permission_rules(&config(
-            "[permissions]\nallow = [\"bash(cargo build *)\"]\ndeny = [\"bash(git push *)\"]\nask = [\"web_fetch\"]\n",
+            "[permissions]\ndeny = [\"bash(git push *)\"]\nask = [\"web_fetch\"]\n",
         ))
         .unwrap();
         assert_eq!(
             rules,
             PermissionRules {
-                allow: vec!["bash(cargo build *)".into()],
+                allow: vec![],
                 deny: vec!["bash(git push *)".into()],
                 ask: vec!["web_fetch".into()],
             }
         );
 
         for bad in [
-            "[permissions]\nallow = \"not-an-array\"\n",
-            "[permissions]\nallow = [3]\n",
+            "[permissions]\nallow = []\n",
+            "[permissions]\nallow = [\"do-not-echo-this\"]\n",
             "[permissions]\nunknown = []\n",
             "permissions = false\n",
         ] {
-            assert!(
-                parse_permission_rules(&config(bad)).is_err(),
-                "accepted: {bad}"
-            );
+            let error = parse_permission_rules(&config(bad)).expect_err("accepted legacy config");
+            assert!(!error.to_string().contains("do-not-echo-this"));
         }
     }
 
     #[test]
-    fn persisted_allow_rules_update_the_process_snapshot() {
-        let dir = std::env::temp_dir().join(format!(
-            "kloop-global-permission-snapshot-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let path = dir.join("config.toml");
-        crate::user_config::write_private_atomic(
-            &path,
-            "test config",
-            b"[permissions]\ndeny = [\"bash(git push *)\"]\n",
-        )
-        .unwrap();
-        let shared = Arc::new(Mutex::new(PermissionRules {
-            deny: vec!["bash(git push *)".into()],
-            ..PermissionRules::default()
-        }));
-
-        persist_global_allow_rules(&path, &shared, &["bash(cargo test *)".into()]).unwrap();
-
-        assert_eq!(
-            shared.lock().unwrap().clone(),
-            PermissionRules {
-                allow: vec!["bash(cargo test *)".into()],
-                deny: vec!["bash(git push *)".into()],
-                ask: vec![],
-            }
-        );
-        let raw = crate::user_config::read_private_string(&path, "test config")
-            .unwrap()
-            .unwrap();
-        let disk: toml::Table = raw.parse().unwrap();
-        assert_eq!(
-            disk["permissions"]["allow"].as_array().unwrap(),
-            &[toml::Value::String("bash(cargo test *)".into())]
-        );
-        let _ = std::fs::remove_dir_all(dir);
+    fn nonempty_legacy_allow_environment_is_rejected_without_echoing_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("KLOOP_ALLOW", "bash(secret-command *)") };
+        let error = load_permission_rules(&toml::Table::new()).expect_err("accepted KLOOP_ALLOW");
+        unsafe { std::env::remove_var("KLOOP_ALLOW") };
+        assert!(error
+            .to_string()
+            .contains("KLOOP_ALLOW is no longer supported"));
+        assert!(!error.to_string().contains("secret-command"));
     }
 
     #[test]

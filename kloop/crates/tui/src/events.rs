@@ -210,6 +210,7 @@ mod tests {
         let ui = ChannelUi::new(tx);
         let req = ConfirmRequest {
             description: "bash: rm -rf /tmp/x".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         };
@@ -219,8 +220,15 @@ mod tests {
             panic!("expected a Confirm event");
         };
         assert_eq!(got, req);
-        reply.send(Decision::AllowSession).unwrap();
-        assert_eq!(fut.await, Decision::AllowSession);
+        reply
+            .send(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::WorkspaceSession,
+            ))
+            .unwrap();
+        assert_eq!(
+            fut.await,
+            Decision::Allow(kloop_core::permissions::ApprovalScope::WorkspaceSession)
+        );
     }
 
     /// A dropped reply sender (UI gone, turn cancelled) resolves to Deny.
@@ -230,6 +238,7 @@ mod tests {
         let ui = ChannelUi::new(tx);
         let fut = ui.confirm(ConfirmRequest {
             description: "x".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         });
@@ -243,6 +252,7 @@ mod tests {
         drop(rx);
         let fut = ui.confirm(ConfirmRequest {
             description: "y".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
         });

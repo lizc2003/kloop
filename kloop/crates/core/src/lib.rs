@@ -27,6 +27,7 @@ pub mod inbox;
 pub mod interaction;
 pub mod permissions;
 mod process_tree;
+pub mod project;
 pub mod rollout;
 pub mod sandbox;
 pub mod scheduler;

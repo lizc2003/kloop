@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-05,plan 1–59、61、62、64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> 基线:2026-08-06,plan 1–59、61–64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -8,7 +8,7 @@
 
 ## 一、总评
 
-- **规模**:kloop 9 crate 共 ~3.1 万行 Rust;codex codex-rs ~118 万行、cc(逆向
+- **规模**:kloop 10 crate 共 ~3.1 万行 Rust;codex codex-rs ~118 万行、cc(逆向
   TS)~71 万行。kloop 用约 3% 的代码量覆盖核心引擎面——对比按"同一能力的质量"看,
   不按面积。
 - **形态完成度:约九成**。refs 标注的"必然解"收敛面全部落地,多处质量反超(见二)。
@@ -43,12 +43,12 @@
 | microcompaction / 工具结果分档预算(200k/50k) | cc 单家 | 未立(offload 已覆盖大头) | 超长工具输出场景痛感 |
 | autocompact 警告带(剩 20k 提醒) | cc 单家 | 未立,小件 | 顺手做 |
 
-### 2. 权限系统——🟡 gate 核心齐，Project/Session 作用域待纠偏
+### 2. 权限系统——✅ Project/Session/Workspace 归属已纠偏
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | permission modes 全集（含 plan） | 概念双家 | **✅ Plan 37（2026-07-16）** | 已完成 |
-| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **Plan 63**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；显式 Runtime/Project/Session/Agent/Workspace 所有权；实施时迁移 Plan 61 已落地的窄 mutation-preview context seam | **未开工；Plan 62 已收尾，可开始** |
+| Config 生命周期 + project-scoped durable permission | 内部架构/安全边界 | **✅ Plan 63（2026-08-06）**：global 只留 deny/ask；用户私有 ProjectStore 保存 allow；PermissionSession cache 按 WorkspaceId 分区；单次调用冻结 EffectiveWorkspace；native protocol 1.0 原位采用 scoped approvals | 已完成；独立 context 类型仍可继续细化，但不再是权限归属缺陷 |
 | AI 分类器 auto 模式 / updatedInput 改写 | cc 单家 | 暂不做(plan 8 判) | 有小模型基建再议 |
 | execpolicy(execve 级 Starlark 规则) | codex 单家 | 暂不做 | 沙箱已有,重;痛感驱动 |
 
@@ -337,6 +337,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 |---|---|---|
 | 远端 CI 首次实跑(workflow 只做过本地等价验证) | workflow 已扩为 macOS/Linux/Windows 全 workspace + mock + corpus-only；仍待可用远端执行 | 用户提供/启用 runner |
 | Windows Plan 62 原生 lifecycle gate | **✅ 2026-08-05 本地 Windows 10 x64 全门通过**；focused selectors 继续进 workflow | 已完成；远端 CI 持续门禁 |
+| Plan 63 project permission / native protocol 1.0 | **✅ 2026-08-06**：kloop fmt/clippy/workspace/mock、real binary v1/v2-refusal smoke；Desktop 887 pass/52 skip/0 fail、TS/build、Tauri 229 tests；companion `54056dc5` | 已完成；private-store Windows target check/clippy已过，本次未做原生Windows runtime或真实Tauri GUI点击smoke |
 | Linux 平台测试(连带沙箱 Linux 片) | Plan 19 余片 | 可用远端 Linux runner |
 | 自审遗留:低危项与重复代码清理 | 教训 25 尾注挂账 | 顺手 |
 
@@ -344,7 +345,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 
 两家被海量用户长期锤过;kloop 的真 key 验收是每能力单场景闭环。长会话稳定性、大
 repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood**:
-- 建议下一步：继续用 kloop 自己实施 **Plan 63**，用真实多 workspace/server session 压力验证新的 Project/Session 权限归属；
+- 建议下一步：继续用 kloop 自己实施后续计划，并用真实多 workspace/server session 长期 dogfood Plan 63 的 Project/Session 权限归属；
 - 之后每个 plan 的实现会话尽量在 kloop 里跑,痛点直接变本报告新行;
 - 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯五类边界(多字节、
   大小写、Drop/Weak、预算耗尽、截断累积)。
@@ -357,7 +358,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 架构与 correctness**：Plan 61、62 已完成；Plan 63（Project/Session 权限归属）仍未开工，可在后续独立会话开始。
+- **T0 架构与 correctness**：Plan 61–64 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，并固定单次调用的 EffectiveWorkspace snapshot。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。

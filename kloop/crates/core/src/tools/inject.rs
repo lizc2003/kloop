@@ -34,6 +34,7 @@ use super::bash;
 use super::ToolCtx;
 use crate::agent::Ui;
 use crate::config::Config;
+use crate::config::EffectiveWorkspace;
 
 /// A referenced file's contents are truncated to this many bytes before being
 /// appended, so a `@big.log` mention can't blow the context window.
@@ -71,7 +72,8 @@ pub(crate) async fn expand_slash_injections(
         parent_rollout_id: None,
         program_result: None,
     };
-    expand(body, &ctx).await
+    let workspace = cfg.effective_workspace();
+    expand(body, &ctx, &workspace).await
 }
 
 /// A UI that swallows everything: an injected `!cmd` streams nothing and shows
@@ -87,12 +89,16 @@ impl Ui for SilentUi {
 /// command output can never drive a file read. Called directly by the `skill`
 /// tool (which holds a real [`ToolCtx`]); the slash path reaches it through
 /// [`expand_slash_injections`]. A body with no markers returns unchanged.
-pub(super) async fn expand(body: &str, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn expand(
+    body: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     if !has_injections(body) {
         return Ok(body.to_string());
     }
-    let with_bash = run_embedded_bash(body, ctx).await?;
-    let attachments = collect_file_attachments(body, ctx);
+    let with_bash = run_embedded_bash(body, ctx, workspace).await?;
+    let attachments = collect_file_attachments(body, workspace);
     Ok(format!("{with_bash}{attachments}"))
 }
 
@@ -159,7 +165,11 @@ fn find_embedded(body: &str) -> Vec<Embedded> {
 
 /// Replace each embedded-bash marker with the command's gated output. Sequential
 /// (not concurrent) so overlapping approval prompts never race the terminal.
-async fn run_embedded_bash(body: &str, ctx: &ToolCtx) -> Result<String> {
+async fn run_embedded_bash(
+    body: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     let markers = find_embedded(body);
     if markers.is_empty() {
         return Ok(body.to_string());
@@ -167,7 +177,7 @@ async fn run_embedded_bash(body: &str, ctx: &ToolCtx) -> Result<String> {
     let mut result = String::with_capacity(body.len());
     let mut last = 0;
     for m in &markers {
-        let output = run_gated_bash(&m.command, ctx).await?;
+        let output = run_gated_bash(&m.command, ctx, workspace).await?;
         result.push_str(&body[last..m.start]);
         result.push_str(output.trim_end());
         last = m.end;
@@ -180,24 +190,28 @@ async fn run_embedded_bash(body: &str, ctx: &ToolCtx) -> Result<String> {
 /// / ask / approver, then sandbox). A blocked command is an error that aborts
 /// the whole expansion; a command that merely exits non-zero returns its output
 /// (with the `[exit N]` tail), like the bash tool.
-async fn run_gated_bash(command: &str, ctx: &ToolCtx) -> Result<String> {
+async fn run_gated_bash(
+    command: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     let input = json!({ "command": command });
-    let sandbox_auto = bash::sandbox_auto_allowed("bash", &input, ctx);
-    ctx.cfg
-        .effective_permissions()
+    let sandbox_auto = bash::sandbox_auto_allowed("bash", &input, workspace);
+    workspace
+        .permissions
         .check_call("bash", &input, ctx.depth, sandbox_auto)
         .await
         .map_err(|reason| anyhow!("!`{command}`: {reason}"))?;
-    bash::bash_tool(&input, ctx).await
+    bash::bash_tool(&input, ctx, workspace).await
 }
 
 /// Append the contents of each `@file` mention that resolves to a readable file.
 /// A mention that isn't an existing file is left alone (it's prose, e.g.
 /// `@someone`); one blocked by the read gate is noted, not inlined (no leak);
 /// duplicates and unreadable/binary files are skipped.
-fn collect_file_attachments(body: &str, ctx: &ToolCtx) -> String {
-    let cwd = ctx.cfg.effective_cwd();
-    let perms = ctx.cfg.effective_permissions();
+fn collect_file_attachments(body: &str, workspace: &EffectiveWorkspace) -> String {
+    let cwd = &workspace.cwd;
+    let perms = &workspace.permissions;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut out = String::new();
     for mention in find_mentions(body) {
