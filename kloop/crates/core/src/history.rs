@@ -83,13 +83,24 @@ impl History {
                 ..
             } = block
             {
-                if text.chars().count() > self.cap {
-                    *text = self.spill(text.as_str());
-                }
+                let content = std::mem::take(text);
+                *text = self.offload_text(content);
             }
         }
         self.persist(|rollout| rollout.append_message(&msg));
         self.items.push(msg);
+    }
+
+    /// Bound machine-produced text before injecting it as a non-tool user
+    /// message (for example a detached Agent/Program result). Ordinary user text
+    /// does not use this helper. Oversized content lands in the same offload store
+    /// as tool results and returns a preview plus `read_offloaded` pointer.
+    pub(crate) fn offload_text(&mut self, content: String) -> String {
+        if content.chars().count() > self.cap {
+            self.spill(&content)
+        } else {
+            content
+        }
     }
 
     /// Pin a server thread's effective runtime after its Config has resolved
@@ -260,6 +271,25 @@ mod tests {
         let id = &content[id_start..id_start + 8];
         let on_disk = std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap();
         assert_eq!(on_disk, big);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn machine_injected_text_reuses_the_offload_store() {
+        let dir = temp_dir("inbox-spill");
+        let mut history = History::new(dir.clone());
+        assert_eq!(history.offload_text("small".into()), "small");
+
+        let big = "result".repeat(1_500);
+        let preview = history.offload_text(big.clone());
+        assert!(preview.contains("…[truncated]…"), "{preview}");
+        assert!(preview.contains("read_offloaded"), "{preview}");
+        let id_start = preview.find("id=off-").expect("pointer has id") + 3;
+        let id = &preview[id_start..id_start + 8];
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap(),
+            big
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

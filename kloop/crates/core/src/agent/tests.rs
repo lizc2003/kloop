@@ -20,6 +20,44 @@ impl Ui for NullUi {
     fn emit(&self, _: &Event) {}
 }
 
+#[test]
+fn drain_inbox_offloads_only_large_machine_results() {
+    let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let inbox = Inbox::default();
+    let large_agent = "agent-result".repeat(1_000);
+    let large_program = "program-result".repeat(1_000);
+    let large_user = "user-text".repeat(1_000);
+    inbox.push(InboxItem::SubAgentResult {
+        label: "agent-1".into(),
+        summary: large_agent.clone(),
+    });
+    inbox.push(InboxItem::ProgramResult {
+        label: "program-1".into(),
+        summary: large_program.clone(),
+    });
+    inbox.push(InboxItem::Steer(large_user.clone()));
+    let mut history = History::new(dir.clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+    assert!(drain_inbox(&inbox, &mut history, &ui));
+    assert_eq!(history.messages().len(), 3);
+    let text = |index: usize| match &history.messages()[index].content[0] {
+        ContentBlock::Text { text } => text.as_str(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    assert!(text(0).contains("read_offloaded"), "{}", text(0));
+    assert!(!text(0).contains(&large_agent), "agent body stayed inline");
+    assert!(text(1).contains("read_offloaded"), "{}", text(1));
+    assert!(
+        !text(1).contains(&large_program),
+        "program body stayed inline"
+    );
+    assert!(text(2).contains(&large_user), "user steering was truncated");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn tool_use(id: &str, cmd: &str) -> AssistantBlock {
     tool_use_named(id, "bash", json!({"command": cmd}))
 }

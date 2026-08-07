@@ -95,6 +95,13 @@ async fn run(source: &str, ctx: &ToolCtx) -> (String, bool) {
     run_tool("run_program", json!({ "source": source }), ctx).await
 }
 
+fn seed_program_source(ctx: &ToolCtx, run_id: &str, source: &str) {
+    let store = RunStore::new(&ctx.cfg.offload_dir, RunNamespace::Program).unwrap();
+    let id = RunId::parse(run_id).unwrap();
+    let run_dir = store.open(&id).unwrap();
+    persist_program_source(&run_dir, source).unwrap();
+}
+
 #[tokio::test]
 async fn program_reads_a_file_through_the_real_dispatch() {
     let file = tmp("read");
@@ -149,6 +156,24 @@ async fn tool_calls_pass_the_permission_gate() {
     let _ = std::fs::remove_file(&readable);
 }
 
+#[tokio::test]
+async fn program_cannot_detach_a_background_shell() {
+    let ctx = test_ctx(0, "no-detached-shell");
+    let (output, is_error) = run(
+        r#"try {
+               await tools.bash({ command: "sleep 30", background: true });
+               return "RAN";
+           } catch (error) {
+               return error.message;
+           }"#,
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{output}");
+    assert!(output.contains("must stay foreground"), "{output}");
+    assert_eq!(ctx.cfg.background_shells.running_count(), 0);
+}
+
 /// `agent()` reuses the run_agent seam, spawning a real sub-agent that samples the
 /// (scripted) provider and returns its final text.
 #[tokio::test]
@@ -197,6 +222,74 @@ async fn agent_cap_refuses_runaway_fanout() {
     assert!(out.contains("agent cap (2"), "the third hit the cap: {out}");
 }
 
+#[tokio::test]
+async fn program_agent_concurrency_limit_queues_excess_calls() {
+    let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+    let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+    let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+    let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
+    let provider = kloop_provider::Provider::mock_scripted(vec![
+        kloop_provider::MockTurn::Gate {
+            started: first_started_tx,
+            release: first_release_rx,
+            blocks: vec![kloop_protocol::AssistantBlock::Text {
+                text: "first".into(),
+            }],
+        },
+        kloop_provider::MockTurn::Gate {
+            started: second_started_tx,
+            release: second_release_rx,
+            blocks: vec![kloop_protocol::AssistantBlock::Text {
+                text: "second".into(),
+            }],
+        },
+    ]);
+    let ctx = with_program_limits(
+        with_provider(test_ctx(0, "program-concurrency-limit"), provider),
+        kloop_codemode::Limits {
+            max_concurrency: 1,
+            ..kloop_codemode::Limits::default()
+        },
+    );
+    let run_ctx = ctx.clone();
+    let running = tokio::spawn(async move {
+        run_tool(
+            "run_program",
+            json!({
+                "source": "return JSON.stringify(await parallel([(scope) => scope.agent('one'), (scope) => scope.agent('two')]));"
+            }),
+            &run_ctx,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_started_rx)
+        .await
+        .expect("first Program child did not start")
+        .expect("first Program child start dropped");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut second_started_rx
+        )
+        .await
+        .is_err(),
+        "second Program child started before the only slot was released"
+    );
+    first_release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), second_started_rx)
+        .await
+        .expect("second Program child did not start after release")
+        .expect("second Program child start dropped");
+    second_release_tx.send(()).unwrap();
+    let (output, is_error) = running.await.unwrap();
+    assert!(!is_error, "{output}");
+    assert!(
+        output.contains("first") && output.contains("second"),
+        "{output}"
+    );
+}
+
 /// Fire-and-forget: run_program {"background": true} returns a "started" message
 /// (NOT the result), and the detached program reinjects its return value into
 /// the PARENT's inbox as a framed ProgramResult when it finishes.
@@ -213,6 +306,28 @@ async fn background_program_returns_immediately_and_reinjects() {
     .await;
     assert!(!is_error, "{out}");
     assert!(out.contains("started in the background"), "{out}");
+    let program_id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("Program ID: "))
+        .expect("background response must expose program-N");
+    let run_id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("Run ID: "))
+        .expect("background response must expose durable run-*");
+    assert!(program_id.starts_with("program-"), "{out}");
+    assert!(run_id.starts_with("run-"), "{out}");
+    assert_ne!(program_id, run_id, "transient and durable IDs are distinct");
+    let stored_source = std::fs::read_to_string(
+        ctx.cfg
+            .offload_dir
+            .parent()
+            .unwrap_or(&ctx.cfg.offload_dir)
+            .join("program-runs")
+            .join(run_id)
+            .join("source.js"),
+    )
+    .unwrap();
+    assert_eq!(stored_source, "return 'PROG_DONE';");
     assert!(
         !out.contains("PROG_DONE"),
         "the result is NOT returned inline: {out}"
@@ -515,6 +630,7 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let provider = kloop_provider::Provider::mock(vec![text("FIRST"), text("SECOND")]);
     let ctx = with_provider(test_ctx(0, "resume"), provider);
     let src = r#"return await agent("do the work");"#;
+    seed_program_source(&ctx, &run_id, src);
     let args = json!({ "source": src, "resume_from_run_id": run_id });
 
     // Run 1: spawns the sub-agent, samples "FIRST", journals it.
@@ -534,6 +650,62 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
 }
 
 #[tokio::test]
+async fn resume_rejects_changed_source_before_spawning_an_agent() {
+    let run_id = format!("ktr-source-{}", std::process::id());
+    let run_dir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let provider =
+        kloop_provider::Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
+            text: "MUST_NOT_RUN".into(),
+        }]]);
+    let ctx = with_provider(test_ctx(0, "resume-source-mismatch"), provider);
+    seed_program_source(&ctx, &run_id, "return await agent('original');");
+
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({
+            "source": "return await agent('changed');",
+            "resume_from_run_id": run_id
+        }),
+        &ctx,
+    )
+    .await;
+    assert!(is_error, "{output}");
+    assert!(output.contains("byte-identical source"), "{output}");
+    assert!(
+        !run_dir.join("journal.jsonl").exists(),
+        "source mismatch must fail before opening or writing the journal"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn legacy_program_run_without_source_manifest_fails_closed() {
+    let run_id = format!("ktr-legacy-{}", std::process::id());
+    let run_dir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        r#"{"version":1,"seq":0,"key":"old","result":"cached"}
+"#,
+    )
+    .unwrap();
+    let ctx = test_ctx(0, "resume-legacy-source");
+
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({"source": "return 'new';", "resume_from_run_id": run_id}),
+        &ctx,
+    )
+    .await;
+    assert!(is_error, "{output}");
+    assert!(output.contains("no source manifest"), "{output}");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
 async fn concurrent_resume_of_one_program_run_is_rejected() {
     let run_id = format!("ktrlock-{}", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
@@ -550,8 +722,10 @@ async fn concurrent_resume_of_one_program_run_is_rejected() {
         }],
     }]);
     let ctx = with_provider(test_ctx(0, "resume-lock"), provider);
+    let src = "return await agent('hold the run lock');";
+    seed_program_source(&ctx, &run_id, src);
     let args = json!({
-        "source": "return await agent('hold the run lock');",
+        "source": src,
         "resume_from_run_id": run_id
     });
     let first_ctx = ctx.clone();
@@ -585,6 +759,7 @@ async fn failure_after_agent_reports_a_resumable_run_id() {
     let provider = kloop_provider::Provider::mock(vec![text("STEP_ONE_DONE")]);
     let ctx = with_provider(test_ctx(0, "resumefail"), provider);
     let src = r#"await agent("step one"); throw new Error("boom after step one");"#;
+    seed_program_source(&ctx, &run_id, src);
 
     let (out, is_error) = run_tool(
         "run_program",
@@ -708,6 +883,18 @@ fn run_program_def_renders_a_typescript_api() {
             }),
         },
         ToolDef {
+            name: "bash".into(),
+            description: "Run foreground or background".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "background": {"type": "boolean"}
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDef {
             name: "run_agent".into(),
             description: "spawn".into(),
             schema: json!({"type": "object"}),
@@ -730,6 +917,8 @@ fn run_program_def_renders_a_typescript_api() {
     // (the tool itself) isn't either.
     assert!(!d.contains("run_agent(args"), "{d}");
     assert!(!d.contains("run_program(args"), "{d}");
+    assert!(!d.contains("background?: boolean"), "{d}");
+    assert!(d.contains("Program cannot detach shell resources"), "{d}");
 }
 
 #[test]
@@ -764,6 +953,26 @@ fn program_surface_excludes_run_program_and_run_agent() {
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
     assert!(!names.iter().any(|n| n == "run_agent"));
+    assert!(!names.iter().any(|n| n == "bash_output"));
+    assert!(!names.iter().any(|n| n == "stop_bash"));
+}
+
+#[tokio::test]
+async fn core_bridge_rejects_names_outside_the_program_catalog() {
+    let bridge = CoreBridge::new(
+        test_ctx(0, "bridge-allowlist"),
+        kloop_codemode::Limits::default(),
+        None,
+        &["read_file".into()],
+    );
+    let error = bridge
+        .call_tool("run_agent".into(), json!({"prompt": "escape"}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "program tool 'run_agent' is not in this run's callable catalog"
+    );
 }
 
 // ---- External source (MCP) tools exposed to programs (plan 27) ----
@@ -893,6 +1102,29 @@ fn program_surface_includes_source_tools() {
     assert!(names.iter().any(|n| n == "srv__danger"));
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
+}
+
+#[test]
+fn program_surface_excludes_control_names_from_external_sources() {
+    let control = |name: &str| ToolDef {
+        name: name.into(),
+        description: "must stay outside Program".into(),
+        schema: json!({"type": "object"}),
+    };
+    let source: Arc<dyn ToolSource> = Arc::new(Srv {
+        defs: vec![
+            control("workflow"),
+            control("run_agent"),
+            control("srv__ok"),
+        ],
+    });
+    let names = program_tool_names(
+        &[source],
+        &crate::shell_programs::ShellPrograms::test_fixture(),
+    );
+    assert!(names.iter().any(|name| name == "srv__ok"));
+    assert!(!names.iter().any(|name| name == "workflow"));
+    assert!(!names.iter().any(|name| name == "run_agent"));
 }
 
 /// Slice 3: an MCP tool with a structured result reaches the program as the

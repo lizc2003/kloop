@@ -51,11 +51,11 @@ impl HostBridge for TestBridge {
 
     fn call_agent(
         &self,
-        seq: u32,
+        call_id: String,
         prompt: String,
         opts: Value,
     ) -> BoxFuture<Result<Value, String>> {
-        Box::pin(async move { Ok(Value::String(format!("agent#{seq}[{opts}]: {prompt}"))) })
+        Box::pin(async move { Ok(Value::String(format!("agent#{call_id}[{opts}]: {prompt}"))) })
     }
 
     fn log(&self, message: String) {
@@ -286,21 +286,168 @@ async fn agent_bridges_through_host() {
     )
     .await
     .unwrap();
-    assert_eq!(out, r#"agent#0[{"agent_type":"researcher"}]: find X"#);
+    assert_eq!(
+        out,
+        r#"agent#root/agent/0[{"agent_type":"researcher"}]: find X"#
+    );
 }
 
-/// The JS `agent()` wrapper assigns a monotonic seq per call (single-threaded,
-/// so deterministic) and passes it to the host — the host journals/replays by
-/// it. Two calls get 0 then 1, regardless of resolution order.
+/// Top-level `agent()` calls receive stable root call identities in invocation
+/// order. Concurrent helper callbacks use their explicit scope instead (covered
+/// below), so completion order never assigns identity.
 #[tokio::test]
-async fn agent_calls_carry_a_monotonic_seq() {
+async fn top_level_agent_calls_carry_stable_root_ids() {
     let out = run(
         r#"const a = await agent("one", {}); const b = await agent("two", {}); return a + "|" + b;"#,
         TestBridge::echo(),
     )
     .await
     .unwrap();
-    assert_eq!(out, "agent#0[{}]: one|agent#1[{}]: two");
+    assert_eq!(
+        out,
+        "agent#root/agent/0[{}]: one|agent#root/agent/1[{}]: two"
+    );
+}
+
+#[tokio::test]
+async fn helper_scopes_assign_topology_stable_agent_ids() {
+    let out = run(
+        r#"const p = await parallel([
+               (scope) => scope.agent("left", {}),
+               (scope) => scope.agent("right", {}),
+           ]);
+           const q = await pipeline(["a", "b"],
+               (prev, item, index, scope) => scope.agent("first-" + item, {}),
+               (prev, item, index, scope) => scope.agent("second-" + item, {}));
+           return JSON.stringify({p, q});"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["p"],
+        serde_json::json!([
+            "agent#root/parallel/0/branch/0/agent/0[{}]: left",
+            "agent#root/parallel/0/branch/1/agent/0[{}]: right"
+        ])
+    );
+    assert_eq!(
+        value["q"],
+        serde_json::json!([
+            "agent#root/pipeline/1/item/0/stage/1/agent/0[{}]: second-a",
+            "agent#root/pipeline/1/item/1/stage/1/agent/0[{}]: second-b"
+        ])
+    );
+}
+
+struct CompletionBridge {
+    reverse: bool,
+    completed: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl CompletionBridge {
+    fn new(reverse: bool) -> Arc<Self> {
+        Arc::new(Self {
+            reverse,
+            completed: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+}
+
+impl HostBridge for CompletionBridge {
+    fn call_tool(&self, _name: String, _args: Value) -> BoxFuture<Result<Value, String>> {
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn call_agent(
+        &self,
+        call_id: String,
+        prompt: String,
+        _opts: Value,
+    ) -> BoxFuture<Result<Value, String>> {
+        let delay_slow = self.reverse;
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            let long = if delay_slow {
+                prompt == "right"
+            } else {
+                prompt == "left"
+            };
+            tokio::time::sleep(if long {
+                Duration::from_millis(40)
+            } else {
+                Duration::from_millis(1)
+            })
+            .await;
+            completed
+                .lock()
+                .unwrap()
+                .push((call_id.clone(), prompt.clone()));
+            Ok(Value::String(format!("{call_id}={prompt}")))
+        })
+    }
+
+    fn log(&self, _message: String) {}
+}
+
+#[tokio::test]
+async fn helper_call_ids_ignore_agent_completion_order() {
+    let source = r#"return JSON.stringify(await parallel([
+        (scope) => scope.agent("left", {}),
+        (scope) => scope.agent("right", {}),
+    ]));"#;
+    let first = CompletionBridge::new(false);
+    let first_out = run(source, first.clone()).await.unwrap();
+    let second = CompletionBridge::new(true);
+    let second_out = run(source, second.clone()).await.unwrap();
+
+    assert_eq!(first_out, second_out);
+    let first_completed = first.completed.lock().unwrap().clone();
+    let second_completed = second.completed.lock().unwrap().clone();
+    assert_eq!(first_completed[0].1, "right");
+    assert_eq!(second_completed[0].1, "left");
+    let mut first_by_id = first_completed;
+    let mut second_by_id = second_completed;
+    first_by_id.sort();
+    second_by_id.sort();
+    assert_eq!(first_by_id, second_by_id);
+}
+
+#[tokio::test]
+async fn nested_helpers_propagate_the_parent_scope() {
+    let out = run(
+        r#"const out = await parallel([
+               (scope) => scope.pipeline(["x", "y"],
+                   (prev, item, index, child) => child.agent(item, {})),
+           ]);
+           return JSON.stringify(out);"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out,
+        r#"[["agent#root/parallel/0/branch/0/pipeline/0/item/0/stage/0/agent/0[{}]: x","agent#root/parallel/0/branch/0/pipeline/0/item/1/stage/0/agent/0[{}]: y"]]"#
+    );
+}
+
+#[tokio::test]
+async fn unscoped_agent_inside_concurrent_helper_fails_closed() {
+    let out = run(
+        r#"const out = await parallel([
+               async () => {
+                   try { await agent("unsafe", {}); return "RAN"; }
+                   catch (e) { return e.message; }
+               },
+           ]);
+           return out[0];"#,
+        TestBridge::echo(),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("scope.agent"), "{out}");
+    assert!(out.contains("stable call identity"), "{out}");
 }
 
 #[tokio::test]
@@ -327,6 +474,10 @@ async fn program_is_sandboxed_from_host_capabilities() {
                process: typeof process,
                console: typeof console,
                XMLHttpRequest: typeof XMLHttpRequest,
+               hostTool: typeof __call_tool,
+               hostAgent: typeof __agent,
+               hostLog: typeof __log,
+               hostPhase: typeof __phase,
            });"#,
         TestBridge::echo(),
     )
@@ -338,6 +489,10 @@ async fn program_is_sandboxed_from_host_capabilities() {
     assert_eq!(caps["process"], "undefined");
     assert_eq!(caps["console"], "undefined");
     assert_eq!(caps["XMLHttpRequest"], "undefined");
+    assert_eq!(caps["hostTool"], "undefined");
+    assert_eq!(caps["hostAgent"], "undefined");
+    assert_eq!(caps["hostLog"], "undefined");
+    assert_eq!(caps["hostPhase"], "undefined");
 }
 
 #[tokio::test]
@@ -412,6 +567,9 @@ async fn workflow_has_only_orchestration_globals_and_returns_json() {
             child,
             tools: typeof tools,
             hiddenTool: typeof __call_tool,
+            hiddenAgent: typeof __agent,
+            hiddenLog: typeof __log,
+            hiddenPhase: typeof __phase,
             process: typeof process,
             fetch: typeof fetch,
         };"#,
@@ -429,9 +587,12 @@ async fn workflow_has_only_orchestration_globals_and_returns_json() {
     .unwrap();
     assert_eq!(out["args"], serde_json::json!({"items": [1, 2]}));
     assert_eq!(out["metaName"], "demo");
-    assert_eq!(out["child"], "agent#0[{}]: inspect");
+    assert_eq!(out["child"], "agent#root/agent/0[{}]: inspect");
     assert_eq!(out["tools"], "undefined");
     assert_eq!(out["hiddenTool"], "undefined");
+    assert_eq!(out["hiddenAgent"], "undefined");
+    assert_eq!(out["hiddenLog"], "undefined");
+    assert_eq!(out["hiddenPhase"], "undefined");
     assert_eq!(out["process"], "undefined");
     assert_eq!(out["fetch"], "undefined");
     assert_eq!(*bridge.phases.lock().unwrap(), vec!["Scan"]);

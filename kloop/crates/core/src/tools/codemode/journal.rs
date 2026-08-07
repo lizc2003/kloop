@@ -1,18 +1,10 @@
-//! Content-addressed journal for a code-mode program's `agent()` calls (plan
-//! 24, journal resume). Each `agent()` call is keyed by its JS-assigned
-//! sequence number plus a canonical string of its prompt+params. On resume, a
-//! call whose `(seq, key)` matches the recorded run returns the cached result
-//! and skips re-spawning the sub-agent — so a long program that failed partway
-//! doesn't re-burn the tokens of the sub-agents that already completed. Only
-//! `agent()` is journaled (it is the expensive call); plain tool calls are not.
+//! Topology-addressed journal for code-mode and Workflow `agent()` calls.
 //!
-//! Unlike cc's prefix-replay (first divergence invalidates the rest), this
-//! memoizes each `(seq, key)` independently: a call whose key still matches is
-//! reused even if an earlier call diverged. That is safe because the key is the
-//! full (prompt + params) of the call — a call whose inputs depend on an
-//! upstream change has a changed prompt, so its key changes and it re-runs
-//! anyway. The JS-assigned seq (monotonic, single-threaded) makes replay
-//! independent of the order sub-agent futures happen to resolve in.
+//! Every call carries a stable identity assigned by the JavaScript orchestration
+//! topology (root ordinal, or helper/item/stage/branch path). A replay is a hit
+//! only when that identity and the complete structured prompt/options input both
+//! match. This is best-effort memoization of an expensive model call, not an
+//! exactly-once guarantee for workspace or other external state.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -25,7 +17,6 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
-
 use serde_json::Value;
 
 use super::super::run_store::RunDir;
@@ -33,24 +24,35 @@ use super::super::run_store::RunDir;
 #[cfg(test)]
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
+const JOURNAL_VERSION: u8 = 2;
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct AgentInput {
+    prompt: String,
+    opts: Value,
+}
+
+impl AgentInput {
+    fn new(prompt: &str, opts: &Value) -> Self {
+        Self {
+            prompt: prompt.to_string(),
+            opts: opts.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
-    #[serde(default = "journal_version")]
     version: u8,
-    seq: u32,
-    key: String,
+    call_id: String,
+    input: AgentInput,
     result: Value,
 }
 
-fn journal_version() -> u8 {
-    1
-}
-
 pub enum Claim {
-    /// The recorded run had this exact `(seq, key)`: reuse its result, skip the
-    /// spawn.
+    /// The prior run had this exact topology identity and complete input.
     Hit(Value),
-    /// A new or diverged call: run it live, then `record` the result.
+    /// A new, moved, or changed call: run it live, then record the result.
     Miss,
 }
 
@@ -60,28 +62,25 @@ enum Storage {
     Run(RunDir, &'static str),
 }
 
-/// One program run's agent journal, persisted to disk as calls resolve.
+/// One run's agent journal, persisted whenever a live call completes.
 pub struct Journal {
-    /// The prior run's calls by seq (empty on a fresh run).
-    old: HashMap<u32, Entry>,
-    /// This run's calls (hits carried over + fresh records), persisted on every
-    /// change so a mid-run crash still leaves a resumable journal.
-    written: Mutex<HashMap<u32, Entry>>,
+    /// Only current-version entries are eligible for replay. Version 1 used a
+    /// completion-order-sensitive sequence and is deliberately a cache miss.
+    old: HashMap<String, Entry>,
+    /// Hits carried over plus fresh records, persisted on every change so a
+    /// mid-run failure leaves a resumable journal.
+    written: Mutex<HashMap<String, Entry>>,
     storage: Storage,
 }
 
 impl Journal {
-    /// Open the journal at `path`, loading the prior run's entries if the file
-    /// exists (a fresh run starts with none).
+    /// Open a path-backed journal for unit tests.
     #[cfg(test)]
     pub fn open(path: PathBuf) -> Self {
-        let storage = Storage::Path(path);
-        Self::from_storage(storage)
+        Self::from_storage(Storage::Path(path))
     }
 
-    /// Open a journal whose artifacts are bound to an already-verified run
-    /// directory descriptor. Workflow uses this path so a symlink swap cannot
-    /// redirect journal reads or atomic replacements outside the run store.
+    /// Open a journal inside an already verified run directory.
     pub(in crate::tools) fn open_run(run_dir: RunDir, name: &'static str) -> Self {
         Self::from_storage(Storage::Run(run_dir, name))
     }
@@ -95,12 +94,12 @@ impl Journal {
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok()),
         };
-        let old: HashMap<u32, Entry> = raw
+        let old: HashMap<String, Entry> = raw
             .map(|raw| {
                 raw.lines()
                     .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
-                    .filter(|entry| entry.version == journal_version())
-                    .map(|entry| (entry.seq, entry))
+                    .filter(|entry| entry.version == JOURNAL_VERSION)
+                    .map(|entry| (entry.call_id.clone(), entry))
                     .collect()
             })
             .unwrap_or_default();
@@ -111,46 +110,42 @@ impl Journal {
         }
     }
 
-    /// Look up the call at `seq` with content `key`. A prior-run entry with the
-    /// same seq AND key is a hit — its result is carried into this run's journal
-    /// and returned. Anything else is a miss: the caller runs it live and calls
-    /// [`Journal::record`].
-    pub fn claim(&self, seq: u32, key: &str) -> Claim {
-        match self.old.get(&seq) {
-            Some(e) if e.key == key => Claim::Hit(e.result.clone()),
+    /// Look up one topology-addressed call. Both identity and complete input
+    /// must match; a moved or changed call runs live.
+    pub fn claim(&self, call_id: &str, prompt: &str, opts: &Value) -> Claim {
+        let input = AgentInput::new(prompt, opts);
+        match self.old.get(call_id) {
+            Some(entry) if entry.input == input => Claim::Hit(entry.result.clone()),
             _ => Claim::Miss,
         }
     }
 
-    /// Record a freshly-run call's result into this run's journal.
-    pub fn record(&self, seq: u32, key: String, result: Value) {
+    /// Record a successful live call.
+    pub fn record(&self, call_id: String, prompt: String, opts: Value, result: Value) {
         let mut written = self.written.lock().unwrap();
         written.insert(
-            seq,
+            call_id.clone(),
             Entry {
-                version: journal_version(),
-                seq,
-                key,
+                version: JOURNAL_VERSION,
+                call_id,
+                input: AgentInput { prompt, opts },
                 result,
             },
         );
         persist(&self.storage, &written);
     }
 
-    /// Whether any agent() call has been journaled this run — i.e. whether a
-    /// resume would have something to skip.
+    /// Whether this run has any reusable current-version agent result.
     pub fn is_active(&self) -> bool {
         !self.written.lock().unwrap().is_empty()
     }
 }
 
-/// Overwrite the journal file with this run's entries, seq-sorted so a resume
-/// replays them in call order regardless of completion order. Best-effort: a
-/// write failure just means this run isn't resumable, which must never break
-/// the running program.
-fn persist(storage: &Storage, written: &HashMap<u32, Entry>) {
+/// Rewrite current-version entries in stable topology order. Persistence is
+/// best-effort: losing resume data must not fail the live Program/Workflow.
+fn persist(storage: &Storage, written: &HashMap<String, Entry>) {
     let mut entries: Vec<&Entry> = written.values().collect();
-    entries.sort_by_key(|entry| entry.seq);
+    entries.sort_by(|left, right| left.call_id.cmp(&right.call_id));
     let mut out = String::new();
     for entry in entries {
         if let Ok(line) = serde_json::to_string(entry) {
@@ -192,31 +187,6 @@ fn persist_path(path: &PathBuf, out: &str) {
     let _ = std::fs::remove_file(temp);
 }
 
-/// A hash-free canonical key for an `agent()` call: its prompt plus the params
-/// that affect the result (`agent_type`, `max_rounds`), in a fixed order. Kept
-/// as a plain string — the journal is a local file, so there is no need for a
-/// crypto hash (and no new dependency). Distinct calls get distinct keys; the
-/// same call across runs gets the same key.
-pub fn agent_call_key(prompt: &str, opts: &Value) -> String {
-    let mut key = format!("prompt={prompt}");
-    for field in [
-        "agent_type",
-        "agentType",
-        "max_rounds",
-        "maxRounds",
-        "isolation",
-        "schema",
-        "model",
-        "effort",
-    ] {
-        if let Some(v) = opts.get(field) {
-            key.push('\u{0}');
-            key.push_str(&format!("{field}={v}"));
-        }
-    }
-    key
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,111 +199,181 @@ mod tests {
     }
 
     #[test]
-    fn key_is_stable_and_distinguishes_prompt_and_params() {
-        let a = agent_call_key("do X", &json!({}));
-        assert_eq!(a, agent_call_key("do X", &json!({})), "stable");
-        assert_ne!(a, agent_call_key("do Y", &json!({})), "prompt matters");
-        assert_ne!(
-            agent_call_key("do X", &json!({"agent_type": "researcher"})),
-            a,
-            "agent_type matters"
-        );
-        // Irrelevant fields don't change the key.
-        assert_eq!(agent_call_key("do X", &json!({"label": "z"})), a);
-    }
-
-    #[test]
-    fn fresh_journal_misses_everything() {
-        let path = tmp("fresh");
+    fn fresh_journal_misses_and_persists_structured_input() {
+        let path = tmp("fresh-v2");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        let j = Journal::open(path.clone());
-        assert!(matches!(j.claim(0, "k0"), Claim::Miss));
-        j.record(0, "k0".into(), "r0".into());
-        // The record landed on disk.
+        let journal = Journal::open(path.clone());
+        assert!(matches!(
+            journal.claim("root/agent/0", "do X", &json!({})),
+            Claim::Miss
+        ));
+        journal.record(
+            "root/agent/0".into(),
+            "do X".into(),
+            json!({"label": "x"}),
+            "result".into(),
+        );
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"result\":\"r0\""), "{raw}");
+        let entry: Entry = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(entry.version, JOURNAL_VERSION);
+        assert_eq!(entry.call_id, "root/agent/0");
+        assert_eq!(entry.input.prompt, "do X");
+        assert_eq!(entry.input.opts, json!({"label": "x"}));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn resume_hits_matching_seq_and_key_misses_on_divergence() {
-        let path = tmp("resume");
+    fn replay_requires_call_id_and_complete_input() {
+        let path = tmp("matching-v2");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        // First run records two calls.
         {
-            let j = Journal::open(path.clone());
-            j.record(0, agent_call_key("first", &json!({})), "R0".into());
-            j.record(1, agent_call_key("second", &json!({})), "R1".into());
+            let journal = Journal::open(path.clone());
+            journal.record(
+                "root/agent/0".into(),
+                "first".into(),
+                json!({"agent_type": "researcher", "label": "scan"}),
+                "R0".into(),
+            );
         }
-        // Resume: same calls hit; a changed key at the same seq misses.
-        let j = Journal::open(path.clone());
-        match j.claim(0, &agent_call_key("first", &json!({}))) {
-            Claim::Hit(r) => assert_eq!(r, "R0"),
-            Claim::Miss => panic!("seq 0 should hit"),
-        }
-        assert!(
-            matches!(
-                j.claim(1, &agent_call_key("CHANGED", &json!({}))),
-                Claim::Miss
+        let journal = Journal::open(path.clone());
+        assert!(matches!(
+            journal.claim(
+                "root/agent/0",
+                "first",
+                &json!({"label": "scan", "agent_type": "researcher"})
             ),
-            "a changed prompt at seq 1 must miss"
-        );
-        // A seq never recorded misses.
-        assert!(matches!(j.claim(9, "k9"), Claim::Miss));
+            Claim::Hit(value) if value == "R0"
+        ));
+        assert!(matches!(
+            journal.claim(
+                "root/agent/1",
+                "first",
+                &json!({"agent_type": "researcher", "label": "scan"})
+            ),
+            Claim::Miss
+        ));
+        assert!(matches!(
+            journal.claim(
+                "root/agent/0",
+                "changed",
+                &json!({"agent_type": "researcher", "label": "scan"})
+            ),
+            Claim::Miss
+        ));
+        assert!(matches!(
+            journal.claim(
+                "root/agent/0",
+                "first",
+                &json!({"agent_type": "researcher", "label": "changed"})
+            ),
+            Claim::Miss
+        ));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn same_key_at_different_seqs_are_independent() {
-        let path = tmp("dup");
+    fn structured_input_has_no_delimiter_collisions() {
+        let path = tmp("nul-v2");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         {
-            let j = Journal::open(path.clone());
-            let k = agent_call_key("loop body", &json!({}));
-            j.record(0, k.clone(), "iter-0".into());
-            j.record(1, k, "iter-1".into());
+            let journal = Journal::open(path.clone());
+            journal.record(
+                "root/agent/0".into(),
+                "a\0label=\"b\"".into(),
+                json!({}),
+                "cached".into(),
+            );
         }
-        let j = Journal::open(path.clone());
-        let k = agent_call_key("loop body", &json!({}));
-        // Each occurrence gets its own cached result by seq.
-        assert!(matches!(j.claim(0, &k), Claim::Hit(r) if r == "iter-0"));
-        assert!(matches!(j.claim(1, &k), Claim::Hit(r) if r == "iter-1"));
+        let journal = Journal::open(path.clone());
+        assert!(matches!(
+            journal.claim("root/agent/0", "a", &json!({"label": "b"})),
+            Claim::Miss
+        ));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn legacy_string_entries_remain_readable_and_future_versions_are_ignored() {
-        let path = tmp("legacy");
+    fn duplicate_inputs_at_distinct_topology_ids_remain_independent() {
+        let path = tmp("duplicate-v2");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        {
+            let journal = Journal::open(path.clone());
+            journal.record(
+                "root/parallel/0/branch/0/agent/0".into(),
+                "same".into(),
+                json!({}),
+                "left".into(),
+            );
+            journal.record(
+                "root/parallel/0/branch/1/agent/0".into(),
+                "same".into(),
+                json!({}),
+                "right".into(),
+            );
+        }
+        let journal = Journal::open(path.clone());
+        assert!(matches!(
+            journal.claim("root/parallel/0/branch/0/agent/0", "same", &json!({})),
+            Claim::Hit(value) if value == "left"
+        ));
+        assert!(matches!(
+            journal.claim("root/parallel/0/branch/1/agent/0", "same", &json!({})),
+            Claim::Hit(value) if value == "right"
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn version_one_and_future_entries_are_safe_cache_misses() {
+        let path = tmp("versions-v2");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let legacy = json!({"seq": 0, "key": "legacy", "result": "cached"});
-        let future = json!({"version": 2, "seq": 1, "key": "future", "result": 9});
+        let legacy = json!({"version": 1, "seq": 0, "key": "legacy", "result": "old"});
+        let future = json!({
+            "version": 3,
+            "call_id": "root/agent/1",
+            "input": {"prompt": "future", "opts": {}},
+            "result": "future"
+        });
         std::fs::write(&path, format!("{legacy}\n{future}\n")).unwrap();
         let journal = Journal::open(path.clone());
         assert!(matches!(
-            journal.claim(0, "legacy"),
-            Claim::Hit(value) if value == "cached"
+            journal.claim("root/agent/0", "legacy", &json!({})),
+            Claim::Miss
         ));
-        assert!(matches!(journal.claim(1, "future"), Claim::Miss));
+        assert!(matches!(
+            journal.claim("root/agent/1", "future", &json!({})),
+            Claim::Miss
+        ));
+        assert!(!journal.is_active());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn out_of_order_records_persist_in_seq_order() {
-        // Parallel agents complete out of order; the file must still be seq-sorted
-        // so a resume replays them correctly.
-        let path = tmp("order");
+    fn out_of_order_completions_persist_in_topology_order() {
+        let path = tmp("order-v2");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        let j = Journal::open(path.clone());
-        j.record(2, "k2".into(), "r2".into());
-        j.record(0, "k0".into(), "r0".into());
-        j.record(1, "k1".into(), "r1".into());
+        let journal = Journal::open(path.clone());
+        for id in [
+            "root/parallel/0/branch/2/agent/0",
+            "root/parallel/0/branch/0/agent/0",
+            "root/parallel/0/branch/1/agent/0",
+        ] {
+            journal.record(id.into(), id.into(), json!({}), id.into());
+        }
         let raw = std::fs::read_to_string(&path).unwrap();
-        let seqs: Vec<u32> = raw
+        let ids: Vec<String> = raw
             .lines()
-            .map(|l| serde_json::from_str::<Entry>(l).unwrap().seq)
+            .map(|line| serde_json::from_str::<Entry>(line).unwrap().call_id)
             .collect();
-        assert_eq!(seqs, vec![0, 1, 2], "persisted in seq order");
+        assert_eq!(
+            ids,
+            vec![
+                "root/parallel/0/branch/0/agent/0",
+                "root/parallel/0/branch/1/agent/0",
+                "root/parallel/0/branch/2/agent/0"
+            ]
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -48,13 +48,16 @@ pub trait HostBridge: Send + Sync + 'static {
     /// string, an MCP source tool its structured `CallToolResult` object.
     /// Err(reason) becomes a JS exception.
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>>;
-    /// `agent(prompt, opts)` — spawn a sub-agent (reuses core's task seam).
-    /// `seq` is the call's monotonic index, assigned by the JS `agent()` wrapper
-    /// (JS is single-threaded, so it is deterministic regardless of the order
-    /// sub-agent futures resolve in) — the host uses it to journal/replay the
-    /// call for resume.
-    fn call_agent(&self, seq: u32, prompt: String, opts: Value)
-        -> BoxFuture<Result<Value, String>>;
+    /// `agent(prompt, opts)` — spawn a sub-agent. `call_id` is assigned from the
+    /// stable orchestration topology: a root ordinal for sequential calls, or the
+    /// helper/branch/item/stage path for scoped concurrent calls. The host combines
+    /// it with the complete structured input for journal replay.
+    fn call_agent(
+        &self,
+        call_id: String,
+        prompt: String,
+        opts: Value,
+    ) -> BoxFuture<Result<Value, String>>;
     /// `log(msg)` — progress output surfaced to the user and appended to the
     /// program's result. Fire-and-forget, never blocks the program.
     fn log(&self, message: String);
@@ -63,17 +66,10 @@ pub trait HostBridge: Send + Sync + 'static {
     fn phase(&self, _title: String) {}
 }
 
-/// Resource ceilings for one program run. Engine-level limits (memory/stack/
-/// cpu) guard the interpreter; the caps (agents/items) are hard ceilings on
-/// orchestration fan-out — a model-written program loops and fans out
-/// programmatically, so it needs runaway ceilings a hand-written tool_use
-/// batch never hits. Values mirror cc's workflow caps (1000/4096). Two
-/// deliberate non-caps: concurrency is NOT paced (a program firing N concurrent
-/// `agent()` matches N concurrent `run_agent` calls, which kloop runs uncapped —
-/// pacing here would break that precedent; the total ceiling is the guard); and
-/// there is no token budget (cc's `budget.total` ships as a `null` placeholder,
-/// never enforced, and kloop has no turn-level budget source, so it would be a
-/// no-op — deferred, not built).
+/// Resource ceilings for one Program/Workflow run. Engine-level limits (memory/
+/// stack/cpu) guard the interpreter; orchestration caps bound total calls, live
+/// model concurrency, and helper input width. There is no token budget: kloop has
+/// no turn-level budget source, so exposing one would be a no-op.
 #[derive(Clone, Copy)]
 pub struct Limits {
     /// QuickJS heap cap; the interpreter raises out-of-memory past it.
@@ -88,6 +84,9 @@ pub struct Limits {
     /// guard against `while(true){ agent(...) }` (each sub-agent costs tokens).
     /// The (N+1)th call throws. Enforced host-side in the bridge.
     pub max_agents: u64,
+    /// Maximum live `agent()` calls. Additional calls wait for a slot without
+    /// blocking independent pipeline items; journal hits consume no slot.
+    pub max_concurrency: usize,
     /// Hard ceiling on the array length a single `parallel()`/`pipeline()` may
     /// take; over it throws (never silently truncates). Enforced in the prelude.
     pub max_items_per_call: usize,
@@ -100,6 +99,7 @@ impl Default for Limits {
             max_stack_bytes: 512 * 1024,
             cpu_burst: Duration::from_secs(5),
             max_agents: 1000,
+            max_concurrency: 16,
             max_items_per_call: 4096,
         }
     }
@@ -514,11 +514,11 @@ fn install_host_functions(
     let agent_bridge = bridge.clone();
     let agent = Function::new(
         ctx.clone(),
-        Async(move |prompt: String, opts_json: String, seq: u32| {
+        Async(move |call_id: String, prompt: String, opts_json: String| {
             let bridge = agent_bridge.clone();
             async move {
                 let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-                envelope(bridge.call_agent(seq, prompt, opts).await)
+                envelope(bridge.call_agent(call_id, prompt, opts).await)
             }
         }),
     )
@@ -566,15 +566,25 @@ fn build_prelude(tool_names: &[String], max_items: usize) -> String {
     let common = build_common_prelude(max_items);
     format!(
         r#"
-        globalThis.tools = {{}};
-        for (const __n of {names}) {{
-            globalThis.tools[__n] = async (args) => {{
-                const r = JSON.parse(await __call_tool(__n, JSON.stringify(args ?? {{}})));
-                if (!r.ok) throw new Error(r.error);
-                return r.value;
-            }};
-        }}
-        {common}
+        (() => {{
+            const __hostCallTool = globalThis.__call_tool;
+            const __hostAgent = globalThis.__agent;
+            const __hostLog = globalThis.__log;
+            if (!Reflect.deleteProperty(globalThis, '__call_tool') ||
+                !Reflect.deleteProperty(globalThis, '__agent') ||
+                !Reflect.deleteProperty(globalThis, '__log')) {{
+                throw new Error('codemode: cannot hide host bridge');
+            }}
+            globalThis.tools = {{}};
+            for (const __n of {names}) {{
+                globalThis.tools[__n] = async (args) => {{
+                    const r = JSON.parse(await __hostCallTool(__n, JSON.stringify(args ?? {{}})));
+                    if (!r.ok) throw new Error(r.error);
+                    return r.value;
+                }};
+            }}
+            {common}
+        }})();
         "#
     )
 }
@@ -585,20 +595,30 @@ fn build_workflow_prelude(args: &str, meta: &str, max_items: usize) -> String {
     let meta_literal = serde_json::to_string(meta).unwrap_or_else(|_| "\"null\"".into());
     format!(
         r#"
-        const __deepFreeze = (value) => {{
-            if (value && typeof value === 'object') {{
-                Object.freeze(value);
-                for (const child of Object.values(value)) __deepFreeze(child);
+        (() => {{
+            const __hostAgent = globalThis.__agent;
+            const __hostLog = globalThis.__log;
+            const __hostPhase = globalThis.__phase;
+            if (!Reflect.deleteProperty(globalThis, '__agent') ||
+                !Reflect.deleteProperty(globalThis, '__log') ||
+                !Reflect.deleteProperty(globalThis, '__phase')) {{
+                throw new Error('workflow: cannot hide host bridge');
             }}
-            return value;
-        }};
-        globalThis.args = __deepFreeze(JSON.parse({args_literal}));
-        globalThis.meta = __deepFreeze(JSON.parse({meta_literal}));
-        globalThis.phase = (title) => __phase(String(title));
-        // Deterministic resume: time and randomness are deliberately absent.
-        globalThis.Date = undefined;
-        Math.random = undefined;
-        {common}
+            const __deepFreeze = (value) => {{
+                if (value && typeof value === 'object') {{
+                    Object.freeze(value);
+                    for (const child of Object.values(value)) __deepFreeze(child);
+                }}
+                return value;
+            }};
+            globalThis.args = __deepFreeze(JSON.parse({args_literal}));
+            globalThis.meta = __deepFreeze(JSON.parse({meta_literal}));
+            globalThis.phase = (title) => __hostPhase(String(title));
+            // Deterministic resume: time and randomness are deliberately absent.
+            globalThis.Date = undefined;
+            Math.random = undefined;
+            {common}
+        }})();
         "#
     )
 }
@@ -606,35 +626,79 @@ fn build_workflow_prelude(args: &str, meta: &str, max_items: usize) -> String {
 fn build_common_prelude(max_items: usize) -> String {
     format!(
         r#"
-        globalThis.agent = (() => {{
-            let __seq = 0;
-            return async (prompt, opts) => {{
-                const r = JSON.parse(await __agent(String(prompt), JSON.stringify(opts ?? {{}}), __seq++));
-                if (!r.ok) throw new Error(r.error);
-                return r.value;
-            }};
-        }})();
-        globalThis.log = (msg) => __log(typeof msg === 'string' ? msg : JSON.stringify(msg));
         const __MAX_ITEMS = {max_items};
         const __checkItems = (n, who) => {{
             if (n > __MAX_ITEMS) throw new Error(
                 who + ': ' + n + ' items exceeds the cap of ' + __MAX_ITEMS + ' per call');
         }};
-        globalThis.parallel = (thunks) => {{
-            __checkItems((thunks ?? []).length, 'parallel');
-            return Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));
+        const __invokeAgent = async (callId, prompt, opts) => {{
+            const r = JSON.parse(await __hostAgent(
+                String(callId), String(prompt), JSON.stringify(opts ?? {{}})));
+            if (!r.ok) throw new Error(r.error);
+            return r.value;
         }};
-        globalThis.pipeline = (items, ...stages) => {{
+        let __activeScopes = 0;
+        let __rootAgentSeq = 0;
+        let __rootHelperSeq = 0;
+        const __scopeError = (name) => new Error(
+            name + ': use the callback scope (' +
+            (name === 'agent' ? 'scope.agent' : 'scope.' + name) +
+            ') inside parallel/pipeline so resume has a stable call identity');
+        const __runScoped = async (callback, scope, args) => {{
+            __activeScopes++;
+            try {{ return await callback(...args, scope); }}
+            finally {{ __activeScopes--; }}
+        }};
+        const __makeScope = (path) => {{
+            let agentSeq = 0;
+            let helperSeq = 0;
+            const scope = {{
+                agent: (prompt, opts) =>
+                    __invokeAgent(path + '/agent/' + agentSeq++, prompt, opts),
+                parallel: (thunks) =>
+                    __parallel(thunks, path + '/parallel/' + helperSeq++),
+                pipeline: (items, ...stages) =>
+                    __pipeline(items, stages, path + '/pipeline/' + helperSeq++),
+            }};
+            return Object.freeze(scope);
+        }};
+        const __parallel = (thunks, path) => {{
+            __checkItems((thunks ?? []).length, 'parallel');
+            return Promise.all((thunks ?? []).map((callback, index) => {{
+                const scope = __makeScope(path + '/branch/' + index);
+                return __runScoped(callback, scope, []).catch(() => null);
+            }}));
+        }};
+        const __pipeline = (items, stages, path) => {{
             __checkItems((items ?? []).length, 'pipeline');
             return Promise.all((items ?? []).map(async (item, index) => {{
                 let value = item;
-                for (const stage of stages) {{
-                    try {{ value = await stage(value, item, index); }}
-                    catch {{ return null; }}
+                for (let stageIndex = 0; stageIndex < stages.length; stageIndex++) {{
+                    const scope = __makeScope(
+                        path + '/item/' + index + '/stage/' + stageIndex);
+                    try {{
+                        value = await __runScoped(
+                            stages[stageIndex], scope, [value, item, index]);
+                    }} catch {{
+                        return null;
+                    }}
                 }}
                 return value;
             }}));
         }};
+        globalThis.agent = async (prompt, opts) => {{
+            if (__activeScopes > 0) throw __scopeError('agent');
+            return __invokeAgent('root/agent/' + __rootAgentSeq++, prompt, opts);
+        }};
+        globalThis.parallel = (thunks) => {{
+            if (__activeScopes > 0) throw __scopeError('parallel');
+            return __parallel(thunks, 'root/parallel/' + __rootHelperSeq++);
+        }};
+        globalThis.pipeline = (items, ...stages) => {{
+            if (__activeScopes > 0) throw __scopeError('pipeline');
+            return __pipeline(items, stages, 'root/pipeline/' + __rootHelperSeq++);
+        }};
+        globalThis.log = (msg) => __hostLog(typeof msg === 'string' ? msg : JSON.stringify(msg));
         "#
     )
 }

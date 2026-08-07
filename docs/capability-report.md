@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-06,plan 1–59、61–64 完成（plan 39 仍按已完成切片计）；精确 Claude Code 2.1.220
+> 基线:2026-08-07,plan 1–66、68 完成（plan 39 仍按已完成切片计；plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -114,7 +114,7 @@ origin:task-notification` 再采样；bundle 静态证据固定 Monitor 的 `ten
 TaskStop/session cleanup 和 URL/Bash 权限分流。clean CLI 未暴露 Monitor，harness 又不能权威开启
 server flag，因此 `monitor@clean-cli` 八格继续 `unknown`，不是 `missing`。kloop 不新增同名工具；
 它为 shell/agent/program 发无 turn owner 的统一 lifecycle event，后台 shell 终态只回灌状态和输出
-文件指针（不塞命令输出），TUI 空闲自动唤醒、plain/server 下一 turn 交付；两套 registry 各自原子
+文件指针（不塞命令输出），TUI/plain/native server 都在 idle 时按 inbox activity 自动 delivery；两套 registry 各自原子
 裁决一次终态，session shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再完成后台
 registry teardown；session active worktree 无 remove intent 时保留。
 自动后台化、stall 和逐事件 Monitor 仍是明确的产品边界。
@@ -176,6 +176,18 @@ Plan 53 将一般问答、Plan control、Workflow 与 CC `StructuredOutput` / kl
 stop/shutdown、resume hit/miss 和 edited script 均已接通。`structured_output` 仅在 Workflow schema child
 中作为 synthetic tool 临时注入，本地 JSON Schema 复验后以原生 JSON Value 回传，不进入主 registry。
 Named/nested workflow、token budget、remote execution 与 per-child provider effort 保持 intentional-diff。
+
+**Plan 68（2026-08-07）运行时加固**：不改变 Agent/Program/Workflow 的产品分工，但把此前依赖
+模型纪律的边界收进宿主。QuickJS raw `__*` bridge 在私有闭包捕获后删除，core 另以 Program 精确
+catalog 在 hook/permission/dispatch 前二次拒绝；source tool 也不能用控制面同名逃逸。Program 恢复
+原子保存并 byte-compare `source.js`/manifest，后台启动同时返回 transient `program-N` 与 durable
+`run-*`。journal v2 以 root/helper/branch/item/stage 拓扑 ID + 完整结构化 prompt/options 匹配，v1
+不猜测；并发 callback 必须用显式 scope，pipeline 保持 item-local/no-stage-barrier。Program/Workflow
+live agents 默认 16 路、总量 1000、单 helper 4096；排队可取消，journal hit 不占 live slot。超大后台
+Agent/Program 成功结果复用 History offload，Workflow 继续 bounded summary + `result.json`。`phase`
+只投影进度，不是 checkpoint/exactly-once。plain 与 native server 的 inbox activity idle delivery 文档也
+已纠正。新增默认 ignored 的 native-server evaluator，以 tool lifecycle 配对、source/journal/result artifact、
+唯一 terminal/delivery 验收真实 `claude-sonnet-4-6` 与 OpenAI Chat `gpt-5.5`，不以模型口头自评代替证据。
 
 Plan 54 已闭合 Skill、ToolSearch、dynamic MCP refresh/call 和 MCP resources：corpus 为
 129 captures/164 static evidence，matrix 当时仍为 56 行/448 单元。kloop 保留原生

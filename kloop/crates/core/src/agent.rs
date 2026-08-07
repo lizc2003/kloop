@@ -722,6 +722,21 @@ fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
         return false;
     }
     for item in pending {
+        let item = match item {
+            crate::inbox::InboxItem::SubAgentResult { label, summary } => {
+                crate::inbox::InboxItem::SubAgentResult {
+                    label,
+                    summary: history.offload_text(summary),
+                }
+            }
+            crate::inbox::InboxItem::ProgramResult { label, summary } => {
+                crate::inbox::InboxItem::ProgramResult {
+                    label,
+                    summary: history.offload_text(summary),
+                }
+            }
+            other => other,
+        };
         match &item {
             crate::inbox::InboxItem::ScheduledPrompt {
                 id,

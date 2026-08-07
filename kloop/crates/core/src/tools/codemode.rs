@@ -10,15 +10,18 @@
 //! The engine crate stays engine-only; the seam that reaches core's private
 //! gate lives here because the gate is what makes code-mode safe.
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -56,8 +59,16 @@ struct RunProgramInput {
     resume_from_run_id: Option<String>,
 }
 
+const PROGRAM_MANIFEST_VERSION: u8 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProgramManifest {
+    version: u8,
+    run_id: String,
+}
+
 pub(super) mod journal;
-use journal::agent_call_key;
 use journal::Claim;
 use journal::Journal;
 
@@ -71,6 +82,8 @@ fn is_program_callable(name: &str) -> bool {
             | "workflow"
             | "run_agent"
             | "wait_for_activity"
+            | "bash_output"
+            | "stop_bash"
             | "stop_agent"
             | "stop_program"
             | "stop_workflow"
@@ -94,6 +107,7 @@ fn program_tool_names(
     names.extend(
         super::merged_source_defs(sources)
             .into_iter()
+            .filter(|d| is_program_callable(&d.name))
             .map(|d| d.name),
     );
     names
@@ -118,6 +132,8 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             let run = store
                 .open(&id)
                 .map_err(|error| anyhow!("run_program: cannot resume {raw}: {error:#}"))?;
+            verify_program_source(&run, &source)
+                .with_context(|| format!("run_program: cannot resume {raw}"))?;
             (id, run)
         }
         None => {
@@ -125,6 +141,8 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             let run = store
                 .create(&id)
                 .map_err(|error| anyhow!("run_program: cannot create run: {error:#}"))?;
+            persist_program_source(&run, &source)
+                .context("run_program: cannot persist source contract")?;
             (id, run)
         }
     };
@@ -140,7 +158,12 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         return spawn_background_program(ctx, source, names, limits, run_id, journal, lease);
     }
     let _lease = lease;
-    let bridge = Arc::new(CoreBridge::new(ctx.clone(), limits, Some(journal.clone())));
+    let bridge = Arc::new(CoreBridge::new(
+        ctx.clone(),
+        limits,
+        Some(journal.clone()),
+        &names,
+    ));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
     // progress narration out of the context is the whole point of code-mode.
@@ -148,6 +171,45 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         Ok(out) => Ok(program_output(out)),
         Err(e) => Err(resume_hint(e, &journal, &run_id)),
     }
+}
+
+fn persist_program_source(run_dir: &super::run_store::RunDir, source: &str) -> Result<()> {
+    run_dir.write_atomic("source.js", source.as_bytes())?;
+    run_dir.write_atomic(
+        "manifest.json",
+        &serde_json::to_vec_pretty(&ProgramManifest {
+            version: PROGRAM_MANIFEST_VERSION,
+            run_id: run_dir.id().as_str().to_string(),
+        })?,
+    )?;
+    Ok(())
+}
+
+fn verify_program_source(run_dir: &super::run_store::RunDir, source: &str) -> Result<()> {
+    let manifest: ProgramManifest = serde_json::from_slice(
+        &run_dir
+            .read("manifest.json")
+            .context("stored run has no source manifest; legacy Program runs cannot be resumed")?,
+    )
+    .context("stored source manifest is invalid")?;
+    if manifest.version != PROGRAM_MANIFEST_VERSION {
+        bail!(
+            "unsupported Program manifest version {}; expected {PROGRAM_MANIFEST_VERSION}",
+            manifest.version
+        );
+    }
+    if manifest.run_id != run_dir.id().as_str() {
+        bail!("stored source manifest belongs to a different run");
+    }
+    let stored = run_dir
+        .read("source.js")
+        .context("stored run has no source bytes; legacy Program runs cannot be resumed")?;
+    if stored != source.as_bytes() {
+        bail!(
+            "source differs from the original Program run; resume requires byte-identical source"
+        );
+    }
+    Ok(())
 }
 
 /// Process-global run counter; combined with a wall-clock second it makes a
@@ -228,7 +290,12 @@ fn spawn_background_program(
     // turn's — the parent may end while the program is still going.
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
-    let bridge = Arc::new(CoreBridge::new(bg_ctx, limits, Some(journal.clone())));
+    let bridge = Arc::new(CoreBridge::new(
+        bg_ctx,
+        limits,
+        Some(journal.clone()),
+        &names,
+    ));
     super::subagent::emit_background_task(
         &ui,
         &label,
@@ -244,13 +311,14 @@ fn spawn_background_program(
         kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
     });
     background_executions.attach_abort(&label, worker.abort_handle());
+    let supervisor_run_id = run_id.clone();
     tokio::spawn({
         let label = label.clone();
         let ui = ui.clone();
         let preview = preview.clone();
         async move {
             let (status, reinject) = match worker.await {
-                Ok(outcome) => classify_program(outcome, &own_cancel, &journal, &run_id),
+                Ok(outcome) => classify_program(outcome, &own_cancel, &journal, &supervisor_run_id),
                 Err(error) if error.is_cancelled() => (ExecutionStatus::Aborted, None),
                 Err(error) => (
                     ExecutionStatus::Failed,
@@ -287,9 +355,7 @@ fn spawn_background_program(
         }
     });
     Ok(format!(
-        "Program {label} started in the background. Keep working; its return value will be \
-         delivered as a message when it finishes. Wait with wait_for_activity, or stop it with \
-         stop_program {{\"program_id\": \"{label}\"}}."
+        "Program started in the background.\nProgram ID: {label}\nRun ID: {run_id}\nKeep working; its return value will be delivered as a message when it finishes. Wait with wait_for_activity, stop only the program-N ID with stop_program {{\"program_id\": \"{label}\"}}, or resume a failed run-* ID with run_program.resume_from_run_id and the byte-identical source."
     ))
 }
 
@@ -344,21 +410,29 @@ struct CoreBridge {
     // writes take the write lock (serialized) so a program can't race two
     // edits to the same file past the ordering a normal round would enforce.
     gate: Arc<tokio::sync::RwLock<()>>,
-    // Total agent() calls so far and the ceiling; the (max_agents+1)th is
-    // refused — the runaway guard against unbounded sub-agent fan-out. Note we
-    // cap the TOTAL, not the concurrency: a program firing N concurrent agent()
-    // is the same as a model emitting N concurrent `run_agent` calls, which kloop
-    // already runs uncapped (join_all) — so pacing concurrency here would break
-    // that precedent. The hard total ceiling is the guard that matters.
+    // Exact names installed on this Program's `tools` object. The JS prelude is
+    // convenience, not the security boundary: raw/forged bridge calls are denied
+    // here before hooks, permissions, or dispatch.
+    allowed_tools: Arc<HashSet<String>>,
+    // Total agent() calls so far and the hard ceiling; the (max_agents+1)th is
+    // refused. A separate semaphore below paces finite concurrent fan-out.
     agent_count: AtomicU64,
     max_agents: u64,
+    // Per-run live child bound. Unlike max_agents this paces, rather than
+    // rejects, a finite fan-out; waiting observes the run cancellation token.
+    agent_slots: Arc<tokio::sync::Semaphore>,
     // agent() call journal for resume (plan 24): a hit returns the cached result
     // and skips the spawn (and the cap charge). None when resume is off.
     journal: Option<Arc<Journal>>,
 }
 
 impl CoreBridge {
-    fn new(ctx: ToolCtx, limits: kloop_codemode::Limits, journal: Option<Arc<Journal>>) -> Self {
+    fn new(
+        ctx: ToolCtx,
+        limits: kloop_codemode::Limits,
+        journal: Option<Arc<Journal>>,
+        allowed_tools: &[String],
+    ) -> Self {
         // Calls a program fires are "from a program": they skip the deferred-tool
         // lock gate, since the tool is already exposed on the program's `tools`
         // object. All other gates (deny, permission, sandbox, hooks) still apply.
@@ -370,8 +444,10 @@ impl CoreBridge {
             ctx,
             seq: AtomicU64::new(0),
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            allowed_tools: Arc::new(allowed_tools.iter().cloned().collect()),
             agent_count: AtomicU64::new(0),
             max_agents: limits.max_agents,
+            agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
             journal,
         }
     }
@@ -379,6 +455,18 @@ impl CoreBridge {
 
 impl HostBridge for CoreBridge {
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>> {
+        if !self.allowed_tools.contains(&name) {
+            return Box::pin(async move {
+                Err(format!(
+                    "program tool '{name}' is not in this run's callable catalog"
+                ))
+            });
+        }
+        if name == "bash" && args.get("background").and_then(Value::as_bool) == Some(true) {
+            return Box::pin(async {
+                Err("program bash calls must stay foreground; background resources are controlled by the parent session".into())
+            });
+        }
         let safe = super::is_concurrency_safe(&name, &args, &self.ctx.cfg.tool_sources);
         let id = format!("run_program-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         // Fresh per-call sink: execute_tool drops a source tool's structured
@@ -416,17 +504,18 @@ impl HostBridge for CoreBridge {
 
     fn call_agent(
         &self,
-        seq: u32,
+        call_id: String,
         prompt: String,
         opts: Value,
     ) -> BoxFuture<Result<Value, String>> {
         let ctx = self.ctx.clone();
-        // Journal replay is a synchronous, deterministic decision (seq comes
-        // from JS): a hit reuses a prior run's result and skips the spawn — and
-        // the cap charge, since a replayed call already ran last time.
-        let key = agent_call_key(&prompt, &opts);
+        // Journal replay is a synchronous decision keyed by a stable topology
+        // identity plus the complete structured input. A hit skips both spawn and
+        // cap charge.
         let journal = self.journal.clone();
-        let claim = journal.as_ref().map(|j| j.claim(seq, &key));
+        let claim = journal
+            .as_ref()
+            .map(|journal| journal.claim(&call_id, &prompt, &opts));
         let hit = matches!(claim, Some(Claim::Hit(_)));
         // Only a live (missed) call claims a cap slot; concurrent misses get
         // distinct counts from the sync fetch_add.
@@ -436,6 +525,8 @@ impl HostBridge for CoreBridge {
             self.agent_count.fetch_add(1, Ordering::Relaxed)
         };
         let max = self.max_agents;
+        let agent_slots = self.agent_slots.clone();
+        let cancel = ctx.cancel.clone();
         Box::pin(async move {
             if let Some(Claim::Hit(cached)) = claim {
                 return Ok(cached);
@@ -446,7 +537,15 @@ impl HostBridge for CoreBridge {
                      sub-agents without bound — narrow the work or process items in batches"
                 ));
             }
-            let mut agent_input = json!({ "prompt": prompt });
+            let _permit = tokio::select! {
+                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
+                    "program agent concurrency limiter closed unexpectedly".to_string()
+                })?,
+                _ = cancel.cancelled() => {
+                    return Err("program interrupted while waiting for an agent slot".into());
+                }
+            };
+            let mut agent_input = json!({ "prompt": prompt.clone() });
             for k in ["agent_type", "max_rounds"] {
                 if let Some(v) = opts.get(k) {
                     agent_input[k] = v.clone();
@@ -458,8 +557,8 @@ impl HostBridge for CoreBridge {
                 .map(Value::String)
                 .map_err(|e| format!("{e:#}"));
             // Record only a successful live call so a resume can skip it.
-            if let (Ok(out), Some(j)) = (&result, &journal) {
-                j.record(seq, key, out.clone());
+            if let (Ok(out), Some(journal)) = (&result, &journal) {
+                journal.record(call_id, prompt, opts, out.clone());
             }
             result
         })
@@ -489,7 +588,10 @@ pub(super) fn run_program_def(
     sources: &[ToolDef],
     deferred: &[ToolDef],
 ) -> ToolDef {
-    let has_source_tools = !sources.is_empty() || !deferred.is_empty();
+    let has_source_tools = sources
+        .iter()
+        .chain(deferred)
+        .any(|d| is_program_callable(&d.name));
     let mut decls = String::new();
     if has_source_tools {
         // Structured result an MCP tool resolves to (a subset of the MCP spec's
@@ -500,15 +602,27 @@ pub(super) fn run_program_def(
     }
     decls.push_str("declare const tools: {\n");
     for def in builtins.iter().filter(|d| is_program_callable(&d.name)) {
-        decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
+        let (description, schema) = if def.name == "bash" {
+            let mut schema = def.schema.clone();
+            if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("background");
+            }
+            (
+                "Run one foreground shell command; Program cannot detach shell resources".into(),
+                schema,
+            )
+        } else {
+            (one_line(&def.description), def.schema.clone())
+        };
+        decls.push_str(&format!("  /** {description} */\n"));
         decls.push_str(&format!(
             "  {}(args: {}): Promise<{}>;\n",
             def.name,
-            ts_type(&def.schema),
+            ts_type(&schema),
             builtin_output_type(&def.name)
         ));
     }
-    for def in sources {
+    for def in sources.iter().filter(|d| is_program_callable(&d.name)) {
         decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
         decls.push_str(&format!(
             "  {}(args: {}): Promise<CallToolResult>;\n",
@@ -518,40 +632,52 @@ pub(super) fn run_program_def(
     }
     decls.push_str("};\n");
     decls.push_str(
-        "declare function agent(prompt: string, opts?: { agent_type?: string; max_rounds?: number }): Promise<string>;\n",
+        "type AgentOptions = { agent_type?: string; max_rounds?: number };\n\
+         type OrchestrationScope = {\n\
+           agent(prompt: string, opts?: AgentOptions): Promise<string>;\n\
+           parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;\n\
+           pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number, scope: OrchestrationScope) => any>): Promise<any[]>;\n\
+         };\n\
+         declare function agent(prompt: string, opts?: AgentOptions): Promise<string>;\n",
     );
     decls.push_str("declare function log(msg: unknown): void;\n");
     decls.push_str(
-        "declare function parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>;\n",
+        "declare function parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;\n",
     );
     decls.push_str(
-        "declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number) => any>): Promise<any[]>;\n",
+        "declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number, scope: OrchestrationScope) => any>): Promise<any[]>;\n",
     );
 
     let mut description = format!(
-        "Run a JavaScript program that orchestrates tools instead of calling them one at a time. \
-Use this when a task is a loop, a fan-out, a pipeline, or a filter over many items — writing it \
-as one program keeps intermediate results in program variables instead of flooding the context \
-with one tool_result per step; only what you `return` (plus any `log(...)`) comes back.\n\n\
+        "Run a fixed JavaScript tool-orchestration program. Use Program for code-controlled loops, \
+batches, filters, and pipelines whose control flow is known; use run_agent instead for an \
+open-ended investigation. Writing one Program keeps intermediate results in program variables \
+instead of flooding the context with one tool_result per step; only what you `return` (plus any \
+`log(...)`) comes back. Program is not Workflow: it cannot launch or stop background resources, \
+and it cannot bypass the top-level Workflow capability gate.\n\n\
 The program body runs as an async function, so top-level `await` and `return` work. Each \
-`tools.<name>(...)` and `agent(...)` returns a Promise and goes through the exact same permission \
-and sandbox checks as a direct tool call. Run independent calls concurrently with `Promise.all` or \
-`parallel([...])`. There is no filesystem, network, module import, or console — the tools and \
-`agent()` are the only way to reach outside.\n\n\
+`tools.<name>(...)` and `agent(...)` returns a Promise and goes through the same hooks, permission, \
+sandbox, and workspace gates as a direct call. Use `Promise.all` for independent tool calls. For \
+concurrent agents, use `parallel([(scope) => scope.agent(...)])` or the fourth `scope` argument of \
+a `pipeline` stage; global `agent`/`parallel`/`pipeline` inside a concurrent helper callback is \
+rejected because it has no stable resume identity. Nested helpers use `scope.parallel` / \
+`scope.pipeline`. Pipeline items advance independently with no stage barrier. Live agent calls are \
+bounded and excess calls queue, while the total-call and helper-item caps still fail explicitly. \
+There is no filesystem, network, module import, or console — the public API below is the only way \
+to reach outside.\n\n\
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
-Set `background: true` to run the program detached: you get a program id back \
-immediately and its return value is delivered to you as a message when it \
-finishes (wait with `wait_for_activity`, or cancel the program-N id with \
-`stop_program`). Use this for long fan-outs/migrations so they don't hold up the \
-turn; omit it for a normal synchronous run.\n\n\
-If a program fails partway through a long agent() fan-out, it reports a \
-run_id; call run_program again with the SAME source and `resume_from_run_id` \
-set to it to skip the agent() calls that already completed (their results are \
-replayed from a journal) and only re-run the rest.\n\n\
+Set `background: true` to run the program detached: the launch response contains a transient \
+program-N ID for stop/lifecycle and a durable run-* ID for resume. Its return value is delivered \
+as a later message (wait with `wait_for_activity`, or stop only the program-N ID with \
+`stop_program`). Use this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
+If a program fails after successful agent calls, call run_program again with the byte-identical \
+source and its run-* `resume_from_run_id`. Journal v2 reuses only calls whose stable topology ID \
+and complete structured input match. This is best-effort model-call memoization, not deterministic \
+agent text, workspace-state validation, or exactly-once external side effects.\n\n\
 Available API (TypeScript):\n```ts\n{decls}```"
     );
 
-    if !deferred.is_empty() {
+    if deferred.iter().any(|d| is_program_callable(&d.name)) {
         description.push_str(
             "\n\nThese additional tools are also callable on `tools` by name but are not typed \
 above (there are too many to declare in full). Call them directly as `tools.<name>(args)`; each \
@@ -559,7 +685,7 @@ returns a `Promise<CallToolResult>`. You cannot call tool_search from inside a p
 need a tool's exact argument schema, call tool_search for it in a normal turn first, then write \
 the program:\n",
         );
-        for def in deferred {
+        for def in deferred.iter().filter(|d| is_program_callable(&d.name)) {
             description.push_str(&format!(
                 "- tools.{}: {}\n",
                 def.name,
@@ -575,8 +701,8 @@ the program:\n",
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "The JavaScript program to run"},
-                "background": {"type": "boolean", "description": "Run detached: return a program-N id immediately and deliver the return value later (default false). Wait with wait_for_activity; stop with stop_program."},
-                "resume_from_run_id": {"type": "string", "description": "Resume a failed run: pass the run_id it reported (with the same source) to skip agent() calls that already completed."}
+                "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
+                "resume_from_run_id": {"type": "string", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v2 agent calls are reused."}
             },
             "required": ["source"],
             "additionalProperties": false

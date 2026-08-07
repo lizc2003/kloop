@@ -1535,13 +1535,14 @@ constraint both cc and codex call out.
 Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
 cloned Config, like the todo list), so a running sub-agent never drains the
 parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
-a User cell); server mode enqueues via `turn/steer {threadId, input}` (pushed
-during a running turn it folds in at the next round boundary, pushed while idle
-it is delivered at the top of the next `turn/start` — there is no autowake in
-client-driven server mode). The plain REPL (blocking stdin) does not enqueue
-yet — the drain path is live for all three, so the gap is only the enqueue
-side. This is the cc/codex convergence: steering is enqueue-not-interrupt,
-delivered only between steps (see `refs/README.md`).
+a User cell); server mode enqueues via `turn/steer {threadId, input}` (while a
+turn runs it folds in at the next round boundary; while idle the thread worker's
+inbox-activity branch allocates a delivery turn). The plain REPL cannot accept a
+second stdin line while `run_turn` owns the foreground, so it still has no
+mid-turn steering input; its idle loop does select inbox activity for background
+result/scheduler delivery. All three share the same boundary-safe drain path.
+This is the cc/codex convergence: steering is enqueue-not-interrupt, delivered
+only between steps (see `refs/README.md`).
 
 ## Slash commands (Phase 2, sixteenth slice)
 
@@ -1603,16 +1604,27 @@ The program calls:
 
 ```ts
 declare const tools: { read_file(args: { path: string; … }): Promise<string>; … };
-declare function agent(prompt: string, opts?: { agent_type?; max_rounds? }): Promise<string>;
+type AgentOptions = { agent_type?: string; max_rounds?: number };
+type OrchestrationScope = {
+  agent(prompt: string, opts?: AgentOptions): Promise<string>;
+  parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;
+  pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number, scope: OrchestrationScope) => any>): Promise<any[]>;
+};
+declare function agent(prompt: string, opts?: AgentOptions): Promise<string>;
 declare function log(msg: unknown): void;
-declare function parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>;
-declare function pipeline(items: any[], ...stages): Promise<any[]>;
+declare function parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;
+declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number, scope: OrchestrationScope) => any>): Promise<any[]>;
 ```
 
 `parallel` is a barrier (all thunks, failures→null); `pipeline` runs each item
 through every stage as its own chain with **no barrier between stages** — a fast
-item reaches stage 3 while a slow one is still in stage 1 — matching cc's two
-core orchestration primitives.
+item reaches stage 3 while a slow one is still in stage 1. Concurrent callbacks
+must use their explicit scope: `parallel([(scope) => scope.agent(...)])`, or the
+fourth argument of a pipeline stage. Nested fan-out uses `scope.parallel` /
+`scope.pipeline`. Calling global `agent`/`parallel`/`pipeline` from such a
+callback fails closed because it has no topology-stable resume identity. Global
+`agent()` remains available before/after helpers and for top-level
+`Promise.all` calls whose invocation order is explicit.
 
 The `tools` API and its TypeScript declarations are generated from the tool
 schemas and carried in `run_program`'s description (typed declarations markedly
@@ -1640,67 +1652,78 @@ codex, whose built-ins are strings by default and objects only where the data
 is inherently structured; `grep` stays a string — its shape is output-mode
 dependent, so a program splits its lines per mode.)
 
-**The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
-the exact same gated dispatch a direct call takes** — `run_one` (allowlist →
-deferred lock → hooks → permission gate → sandbox → execute) and
-`run_agent_tool`. A
-denied tool is refused *inside* the program (the model catches the exception); a
-sandboxed command is still sandboxed. The `kloop-codemode` crate is engine-only
-and knows nothing of permissions; it calls back through a `HostBridge` trait,
-which `core/src/tools/codemode.rs` implements over the gate — that inversion is
-why `core` can depend on the engine crate without a cycle. `run_program` itself is
-auto-allowed (like `run_agent`): it touches nothing directly. `Promise.all` maps to
-the same concurrency rule as a normal round (read-only calls batch, writes take
-an exclusive lock).
+**The safety story is enforced twice.** The QuickJS prelude captures its raw
+host functions in a private closure and removes `__call_tool`, `__agent`,
+`__log`, and `__phase` before model source runs. Independently, core gives
+`CoreBridge` the exact per-run callable catalog and rejects any forged/noncatalog
+name before hooks, permissions, or dispatch. Every legitimate
+`tools.<name>(...)` and `agent(...)` then re-enters the same gated path as a
+direct call — `run_one` (catalog → deferred lock → hooks → permission gate →
+sandbox → execute) and `run_agent_tool`. A denied tool is refused *inside* the
+program (the model catches the exception); a sandboxed command is still
+sandboxed. Recursive runners and background control (`run_program`, `workflow`,
+`run_agent`, wait/stop) are neither described nor host-callable from Program.
+The `kloop-codemode` crate is engine-only and knows nothing of permissions; it
+calls back through a `HostBridge` trait, which `core/src/tools/codemode.rs`
+implements over the gate — that inversion avoids a crate cycle. `run_program`
+itself is auto-allowed (like `run_agent`): it touches nothing directly.
+`Promise.all` tool calls retain the normal concurrency rule (read-only calls
+batch, writes take an exclusive lock).
 
-**Resource limits** (`Limits`, per program run) are two layers. Engine limits
-guard the interpreter: a QuickJS heap cap, a stack cap, and an interrupt handler
-that kills a runaway synchronous loop (a CPU-burst deadline that ignores
-await-suspended time) or a user Ctrl+C. Orchestration **caps** are hard ceilings
-on fan-out — a model-written program loops and fans out programmatically, so it
-needs ceilings a hand-written tool_use batch never hits: `max_agents` (total
-`agent()` calls; the (N+1)th throws — the guard against `while(true){agent()}`)
-and `max_items` (a single `parallel()`/`pipeline()` array length; over it throws,
-never truncates). Both mirror cc's workflow caps (1000 / 4096). Concurrency is
-deliberately **not** paced — a program firing N concurrent `agent()` is the same
-as a model emitting N concurrent `run_agent` calls, which kloop runs uncapped, so
-pacing here would break that precedent; the total ceiling is the guard that
-matters. All five knobs override via `[codemode]` in global
-`~/.kloop/config.toml`
-(`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_items`) or
-`KLOOP_PROGRAM_*` env (env wins).
+**Resource limits** (`Limits`, per Program/Workflow run) are two layers. Engine
+limits guard the interpreter: a QuickJS heap cap, a stack cap, and an interrupt
+handler that kills a runaway synchronous loop (a CPU-burst deadline that ignores
+await-suspended time) or a user Ctrl+C. Orchestration limits are:
+
+- `max_agents` — hard cap on total live-miss `agent()` calls (default 1000); the
+  next call throws instead of allowing an unbounded loop.
+- `max_concurrency` — live child sampling cap (default 16); excess calls wait on
+  a cancellation-aware semaphore, so independent pipeline items keep flowing
+  without launching thousands of model requests. Journal hits consume no slot.
+- `max_items` — hard cap on one `parallel()`/`pipeline()` input (default 4096);
+  over-limit calls throw and never silently truncate.
+
+All six knobs override via `[codemode]` in global `~/.kloop/config.toml`
+(`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_concurrency`,
+`max_items`) or matching `KLOOP_PROGRAM_*` environment variables (environment
+wins). Detached Agent/Program/Workflow executions retain their separate,
+session-wide cap of 8.
 
 A running program is observable, not a black box: each `tools.<name>(...)` and
 `agent(...)` shows as its own tool line (the ops go through `run_one`, which
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
-**Background programs**: `run_program {"background": true}` fires and forgets —
-it returns a `program-N` id immediately and the program's return value is
-delivered to the parent as a message when it finishes, so a long fan-out /
-migration doesn't hold up the turn. It shares `BackgroundExecutions`, inbox
-reinjection, `wait_for_activity`, and TUI autowake with background agents and
-Workflows, but its typed stop is `stop_program {program_id}`. The shell registry
-stays separate because a shell has an output file and reinjects only a terminal
-pointer. Deliberately **not** copied from codex: its
+**Background programs**: `run_program {"background": true}` fires and forgets.
+The launch response has two intentionally different identities: transient
+`program-N` belongs to this session and is the only ID accepted by
+`stop_program`; durable `run-*` names the persisted source/journal and is the only
+ID accepted by `resume_from_run_id`. The result is delivered to the parent as a
+later message, so a long fan-out/migration does not hold up the turn. Oversized
+successful results use the same offload store as tool results: history receives
+a bounded head/tail preview plus a `read_offloaded` pointer, not an unbounded
+user message. Background Program shares `BackgroundExecutions`, inbox activity,
+`wait_for_activity`, and idle autodelivery with background Agent and Workflow.
+The shell registry stays separate because a shell has its own output file and
+reinjects only a terminal pointer. Deliberately **not** copied from codex: its
 cell/observation-frontier machinery (incremental pull-based output streamed to
-the model between `yield`s) — that is pull-based observation coupled to V8's
-synchronous-pause model, whereas kloop is push-based (result reinjected on
-completion) and `log()` already streams progress to the user live.
+the model between `yield`s) — kloop is push-based on completion and `log()`
+already streams progress to the user live.
 
-**Journal resume**: a long program that fails partway through an `agent()`
-fan-out doesn't have to re-burn the sub-agents that already finished. Every run
-has a `run_id` and journals each completed `agent()` call (keyed by its
-JS-assigned sequence number + a canonical string of its prompt+params) to
-`.kloop/program-runs/<run_id>/journal.jsonl`. On failure the run_id is reported;
-calling `run_program` again with the same source and `resume_from_run_id` set
-replays each matching `(seq, key)` from the journal — returning the cached
-result and skipping the spawn (and the agent-cap charge) — so only the calls
-that hadn't finished re-run. Only `agent()` is journaled (it is the expensive
-call). The JS-assigned seq makes replay independent of the order sub-agent
-futures resolve in; unlike cc's prefix-replay this memoizes each `(seq, key)`
-independently, which is safe because a call whose inputs changed has a changed
-prompt (so its key changes and it re-runs). A one-shot `run_program` tool_use
-maps cleanly onto this — exactly cc's `resumeFromRunId` shape.
+**Journal resume v2**: every new Program run atomically persists the original
+`source.js` and a versioned manifest before any worker starts. Resume first
+validates the Program namespace/run ID and requires byte-identical source; a
+changed source or a legacy run without the source contract fails before opening
+the journal or spawning an agent. Each completed `agent()` is stored as a
+structured record containing its topology call ID, complete prompt/options JSON,
+and result in `.kloop/program-runs/<run-id>/journal.jsonl`. Top-level calls use a
+root ordinal; scoped helper calls include helper/branch/item/stage and local
+ordinal. A hit requires both identity and complete input, so opposite future
+completion orders and repeated prompts cannot cross-wire results. Version-1
+sequence/string entries are not guessed: Program rejects their missing source
+contract, while Workflow treats them as safe cache misses. Only successful
+`agent()` calls are journaled. Replay is best-effort memoization of that model
+call — it does not make generated text deterministic, prove unchanged workspace
+state, or provide exactly-once semantics for external side effects.
 
 **Not done** (deferred, with reason): a token `budget` primitive — cc's
 `budget.total` ships as a hardcoded `null` placeholder (its hard cap never
@@ -1723,37 +1746,44 @@ with a pure-literal
 `export const meta = {name, description, phases?}` declaration and then has only
 these host capabilities:
 
-```js
-declare const args: unknown
-declare function agent(prompt, opts?)
-declare function log(message)
-declare function phase(title)
-declare function parallel(thunks)
-declare function pipeline(items, ...stages)
+```ts
+declare const args: unknown;
+declare const meta: Readonly<unknown>;
+declare function agent(prompt, opts?);
+declare function log(message);
+declare function phase(title);
+declare function parallel(thunks: Array<(scope) => unknown>);
+declare function pipeline(items, ...stages /* (prev, item, index, scope) */);
 ```
 
-There is deliberately no `tools`, `__call_tool`, filesystem, network, process,
-module import, `Date.now()`, or randomness in this runtime profile. Workflow
-code controls deterministic fan-out; each child `agent()` still re-enters the
-ordinary sub-agent runner and every child tool call still passes the normal
-allowlist → hook → permission → sandbox → executor chain. `parallel` is a
-barrier and `pipeline` is per-item/no-stage-barrier, as in code mode. `phase()`
-updates the background task detail and `log()` emits live notes; neither changes
-the script's return value.
+There is deliberately no `tools`, raw `__*` host bridge, filesystem, network,
+process, module import, `Date.now()`, or randomness in this runtime profile. The
+raw agent/log/phase functions are captured privately and removed before script
+execution. Workflow code controls deterministic topology; each child `agent()`
+still re-enters the ordinary sub-agent runner and every child tool call still
+passes the normal catalog → hook → permission → sandbox → executor chain.
+Concurrent callbacks use `scope.agent` and propagate nested helpers through that
+scope, exactly as in Program. `parallel` is a barrier and `pipeline` is
+per-item/no-stage-barrier. `phase()` updates display-only background detail and
+`log()` emits live notes; neither is a checkpoint, transaction, idempotency, or
+exactly-once boundary, and neither changes the return value.
 
 Each run is stored under `.kloop/workflow-runs/<run-id>/`; a versioned
-manifest governs its managed script, args, journal, and terminal result/error,
-and journal entries carry their own replay version. A later call with
-`resume_from_run_id` reuses matching `(sequence, prompt+result-affecting opts)`
-agent results, including JSON objects and arrays, while changed calls run live.
+manifest governs its managed script, args, journal, and terminal result/error.
+A later call with `resume_from_run_id` may use an edited managed script: journal
+v2 reuses only `agent()` results whose topology ID and complete structured input
+still match, including native JSON objects/arrays; moved or changed calls run
+live, and v1 entries are safe cache misses. This remains best-effort model-call
+memoization rather than workspace validation or exactly-once side effects.
 `script_path` is accepted only when it resolves to that run's managed script;
 arbitrary workspace paths, separators, traversal, and symlink escapes are
 rejected. On Unix, namespace/run directories and artifact read/write/rename/
 lease operations are descriptor-relative with no-follow; the non-Unix fallback
 revalidates paths but does not claim race-hard reparse-point safety until the
-future Windows backend lands. Background completion/failure is delivered at a
-step boundary and is also observable through global `wait_for_activity`; cancellation uses
-`stop_workflow {workflow_id}`.
+future Windows backend lands. Background completion/failure is persisted as
+`result.json`/`error.txt`, delivered with a bounded summary at a step boundary,
+and observable through global `wait_for_activity`; cancellation uses
+`stop_workflow {workflow_id}` with `workflow-N`, never durable `wf_*`.
 
 Passing `schema` in a Workflow `agent()` call activates the internal
 **`structured_output`** protocol for that child. The requested JSON Schema is
@@ -1796,10 +1826,13 @@ token so a finished parent turn never kills it) reinjects its result into the
 parent's `Config.inbox` — the same step-boundary queue as steering — as a framed
 `InboxItem::SubAgentResult`, drained into history at the next round boundary
 (the drain side was already built for steering; this is the queue's second
-consumer). A **success passes through verbatim**; a failure is truncated (~900
-tokens, codex's cap) with re-dispatch guidance; an **interrupted sub-agent
-reinjects nothing** (codex's `is_final` — its partial output is noise, and cc
-diverges here by delivering a `killed` partial). A `BackgroundExecutions`
+consumer). A short success passes through verbatim; an oversized success is
+stored in the session offload directory and reinjected as a bounded head/tail
+preview plus a `read_offloaded` pointer. Program success uses the same drain-time
+rule. A failure is already truncated (~900 tokens, codex's cap) with
+re-dispatch guidance; an **interrupted sub-agent reinjects nothing** (codex's
+`is_final` — its partial output is noise, and cc diverges here by delivering a
+`killed` partial). A `BackgroundExecutions`
 registry (`core/src/tools/background_executions.rs`) tracks detached agents,
 programs, and Workflows with their resource kind, enforces one shared concurrency
 cap (8), and reaps on session end. It remains separate from the background-shell
@@ -1809,15 +1842,14 @@ panic/forced abort still publishes exactly one terminal state. Both
 registries project through the same session-scoped `BackgroundTaskUpdated`
 event; this shared DTO is the compatibility seam, not a forced internal merge.
 
-**Autowake** closes the loop when the parent turn has already ended: in the TUI,
-a background sub-agent finishing while the agent sits idle starts a delivery turn
-automatically (the idle UI loop notices the non-empty inbox and dispatches a
-`Wake` — a turn with no new user text that just drains and responds), so the
-result reaches the model without the user having to type. A *running* turn drains
-at its own round boundary, so autowake only fires when idle (codex's guard:
-idle + pending work). The plain REPL (blocking stdin, no event loop) and the
-server (client-driven turns) don't autowake — their reinjection is delivered at
-the next user / `turn/start`; only the TUI has the event loop to be woken.
+**Autowake** closes the loop when the parent turn has already ended: every
+interactive frontend subscribes to inbox activity and starts a delivery turn only
+while the session is idle. The TUI dispatches a `Wake`; the plain REPL selects
+between stdin and inbox activity; the native server's thread worker selects
+between client turns and inbox activity and allocates a fresh monotonic turn ID.
+A *running* turn drains at its own round boundary, so autowake never races a
+second turn against it. Headless one-shot execution remains bounded and does not
+expose this idle session surface.
 Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
 
 Plan 52 fixed the semantic boundary against Claude Code 2.1.220; Plan 66 later

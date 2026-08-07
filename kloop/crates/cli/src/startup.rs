@@ -673,7 +673,8 @@ fn load_sandbox_settings(root: &toml::Table) -> Result<SandboxSettings> {
 
 /// `[codemode]` in the global user config (all optional; defaults in
 /// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
-/// limits) and `max_agents`, `max_items` (orchestration runaway ceilings). Each
+/// limits) and `max_agents`, `max_concurrency`, `max_items` (orchestration
+/// ceilings). Each
 /// is also overridable via `KLOOP_PROGRAM_<KEY>` env, which wins over the config
 /// value. Bounds one `run_program` (code-mode) run.
 fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> {
@@ -692,9 +693,10 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
                 "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
                 "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
                 "max_agents" => limits.max_agents = need()? as u64,
+                "max_concurrency" => limits.max_concurrency = need()? as usize,
                 "max_items" => limits.max_items_per_call = need()? as usize,
                 other => bail!(
-                    "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_items)"
+                    "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_concurrency | max_items)"
                 ),
             }
         }
@@ -702,9 +704,13 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
     let env_uint = |name: &str| -> Result<Option<u64>> {
         match std::env::var(name) {
             Ok(s) => {
-                Ok(Some(s.parse().with_context(|| {
-                    format!("{name} must be a positive integer")
-                })?))
+                let value = s
+                    .parse::<u64>()
+                    .with_context(|| format!("{name} must be a positive integer"))?;
+                if value == 0 {
+                    bail!("{name} must be a positive integer");
+                }
+                Ok(Some(value))
             }
             Err(_) => Ok(None),
         }
@@ -720,6 +726,9 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
     }
     if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_AGENTS")? {
         limits.max_agents = n;
+    }
+    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_CONCURRENCY")? {
+        limits.max_concurrency = n as usize;
     }
     if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_ITEMS")? {
         limits.max_items_per_call = n as usize;
@@ -1551,6 +1560,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         for bad in [
             "codemode = false\n",
             "[codemode]\nmax_agents = 0\n",
+            "[codemode]\nmax_concurrency = 0\n",
             "[codemode]\nmemory_mb = \"large\"\n",
             "[codemode]\nunknown = 1\n",
         ] {
@@ -1559,6 +1569,17 @@ http_headers = { Authorization = "SENTINEL-MCP" }
                 "accepted: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn codemode_config_loads_agent_concurrency_limit() {
+        let limits = load_program_limits(&config(
+            "[codemode]\nmax_agents = 20\nmax_concurrency = 3\nmax_items = 40\n",
+        ))
+        .unwrap();
+        assert_eq!(limits.max_agents, 20);
+        assert_eq!(limits.max_concurrency, 3);
+        assert_eq!(limits.max_items_per_call, 40);
     }
 
     #[test]

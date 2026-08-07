@@ -16,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
-use super::codemode::journal::agent_call_key;
 use super::codemode::journal::Claim;
 use super::codemode::journal::Journal;
 use super::run_store::RunDir;
@@ -61,7 +60,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run a deterministic JavaScript Workflow in the background. Use only when the user explicitly requested multi-agent orchestration. The script must begin with `export const meta = { name, description, phases }`; its body can use args, agent(), log(), phase(), parallel(), and pipeline(). Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. The tool returns a workflow-N execution id plus a durable wf_* run id immediately; the result is persisted and delivered at a later step boundary. Wait with wait_for_activity and stop only with stop_workflow. Structured agent schemas are supported by the internal structured_output protocol.".into(),
+        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and run_program for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v2 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered later. Wait with wait_for_activity and stop only workflow-N with stop_workflow. Resume may edit the managed script; only calls whose stable ID and complete input still match are replayed best-effort. Structured agent schemas use the internal structured_output protocol.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -375,6 +374,7 @@ struct WorkflowBridge {
     ctx: ToolCtx,
     agent_count: AtomicU64,
     max_agents: u64,
+    agent_slots: Arc<tokio::sync::Semaphore>,
     journal: Arc<Journal>,
     task_id: String,
     run_id: String,
@@ -394,6 +394,7 @@ impl WorkflowBridge {
             ctx,
             agent_count: AtomicU64::new(0),
             max_agents: limits.max_agents,
+            agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
             journal,
             task_id,
             run_id,
@@ -409,16 +410,17 @@ impl HostBridge for WorkflowBridge {
 
     fn call_agent(
         &self,
-        seq: u32,
+        call_id: String,
         prompt: String,
         opts: Value,
     ) -> BoxFuture<Result<Value, String>> {
-        let key = agent_call_key(&prompt, &opts);
-        let claim = self.journal.claim(seq, &key);
+        let claim = self.journal.claim(&call_id, &prompt, &opts);
         let live = matches!(claim, Claim::Miss);
         let count = live.then(|| self.agent_count.fetch_add(1, Ordering::Relaxed));
         let max = self.max_agents;
+        let agent_slots = self.agent_slots.clone();
         let ctx = self.ctx.clone();
+        let cancel = ctx.cancel.clone();
         let journal = self.journal.clone();
         Box::pin(async move {
             if let Claim::Hit(value) = claim {
@@ -427,8 +429,16 @@ impl HostBridge for WorkflowBridge {
             if count.is_some_and(|count| count >= max) {
                 return Err(format!("workflow exceeds the agent cap of {max}"));
             }
+            let _permit = tokio::select! {
+                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
+                    "workflow agent concurrency limiter closed unexpectedly".to_string()
+                })?,
+                _ = cancel.cancelled() => {
+                    return Err("workflow interrupted while waiting for an agent slot".into());
+                }
+            };
             let schema = opts.get("schema").cloned();
-            let mut input = json!({"prompt": prompt});
+            let mut input = json!({"prompt": prompt.clone()});
             copy_option(&opts, &mut input, "agent_type", "agent_type");
             copy_option(&opts, &mut input, "agentType", "agent_type");
             copy_option(&opts, &mut input, "max_rounds", "max_rounds");
@@ -446,7 +456,7 @@ impl HostBridge for WorkflowBridge {
                     .map_err(|error| format!("{error:#}")),
             };
             if let Ok(value) = &result {
-                journal.record(seq, key, value.clone());
+                journal.record(call_id, prompt, opts, value.clone());
             }
             result
         })
@@ -747,6 +757,138 @@ mod tests {
         assert_eq!(events.last().unwrap().status, BackgroundTaskStatus::Failed);
         let run_dir = std::path::Path::new(output_path).parent().unwrap();
         let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[tokio::test]
+    async fn workflow_agent_concurrency_limit_queues_excess_calls() {
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+        let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
+        let mut ctx = enabled_ctx("workflow-concurrency-limit");
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.program_limits.max_concurrency = 1;
+        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+            kloop_provider::MockTurn::Gate {
+                started: first_started_tx,
+                release: first_release_rx,
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
+                    text: "first".into(),
+                }],
+            },
+            kloop_provider::MockTurn::Gate {
+                started: second_started_tx,
+                release: second_release_rx,
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
+                    text: "second".into(),
+                }],
+            },
+        ]));
+        ctx.cfg = Arc::new(cfg);
+        let launched = workflow_tool(
+            &json!({
+                "script": "export const meta = { name: 'paced', description: 'paced fanout' }; return await parallel([(scope) => scope.agent('one'), (scope) => scope.agent('two')]);"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started_rx)
+            .await
+            .expect("first child did not start")
+            .expect("first child start dropped");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut second_started_rx
+            )
+            .await
+            .is_err(),
+            "second child started before the only live slot was released"
+        );
+        first_release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), second_started_rx)
+            .await
+            .expect("second child did not start after release")
+            .expect("second child start dropped");
+        second_release_tx.send(()).unwrap();
+        wait_idle(&ctx).await;
+        assert_eq!(ctx.cfg.inbox.drain().len(), 1);
+
+        if let Some(path) = launched
+            .lines()
+            .find_map(|line| line.strip_prefix("Script file: "))
+            .and_then(|path| std::path::Path::new(path).parent())
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_cancellation_releases_queued_agent_waiters() {
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+        let (_second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
+        let mut ctx = enabled_ctx("workflow-concurrency-cancel");
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.program_limits.max_concurrency = 1;
+        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+            kloop_provider::MockTurn::Gate {
+                started: first_started_tx,
+                release: first_release_rx,
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
+                    text: "first".into(),
+                }],
+            },
+            kloop_provider::MockTurn::Gate {
+                started: second_started_tx,
+                release: second_release_rx,
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
+                    text: "must not start".into(),
+                }],
+            },
+        ]));
+        ctx.cfg = Arc::new(cfg);
+        let launched = workflow_tool(
+            &json!({
+                "script": "export const meta = { name: 'cancel-paced', description: 'cancel queued fanout' }; return await parallel([(scope) => scope.agent('one'), (scope) => scope.agent('two')]);"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let task_id = launch_value(&launched, "Workflow ID: ").to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started_rx)
+            .await
+            .expect("first child did not start")
+            .expect("first child start dropped");
+        crate::tools::background_executions::stop_workflow_tool(
+            &json!({"workflow_id": task_id}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        first_release_tx.send(()).unwrap();
+        wait_idle(&ctx).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut second_started_rx
+            )
+            .await
+            .is_err(),
+            "queued child sampled after Workflow cancellation"
+        );
+        assert!(ctx.cfg.inbox.is_empty());
+
+        if let Some(path) = launched
+            .lines()
+            .find_map(|line| line.strip_prefix("Script file: "))
+            .and_then(|path| std::path::Path::new(path).parent())
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 
     #[tokio::test]
