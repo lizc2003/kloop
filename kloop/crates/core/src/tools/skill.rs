@@ -77,7 +77,7 @@ pub(super) async fn skill_tool(
 mod tests {
     use super::*;
     use crate::tools::testutil::*;
-    use kloop_protocol::ContentBlock;
+    use kloop_protocol::AssistantBlock;
     use kloop_provider::Provider;
 
     /// Config is behind an Arc, so tests clone-and-swap the skill registry (the
@@ -120,7 +120,7 @@ mod tests {
             context: SkillContext::Fork,
             ..Default::default()
         }];
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "forked result".into(),
         }]]);
         let ctx = with_skills(with_provider(test_ctx(0, "skill-fork"), provider), skills);

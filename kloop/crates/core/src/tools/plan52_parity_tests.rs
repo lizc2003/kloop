@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_provider::MockTurn;
@@ -108,8 +109,8 @@ impl Ui for BoundaryUi {
     }
 }
 
-fn text_blocks(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text { text: text.into() }]
+fn text_blocks(text: &str) -> Vec<AssistantBlock> {
+    vec![AssistantBlock::Text { text: text.into() }]
 }
 
 fn gate_turn(text: &str) -> (MockTurn, oneshot::Receiver<()>, oneshot::Sender<()>) {

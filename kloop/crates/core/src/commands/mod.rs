@@ -280,9 +280,10 @@ mod tests {
 
     #[tokio::test]
     async fn compact_summarizes_and_reports_counts() {
-        let provider = kloop_provider::Provider::mock(vec![vec![ContentBlock::Text {
-            text: "what happened so far".into(),
-        }]]);
+        let provider =
+            kloop_provider::Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
+                text: "what happened so far".into(),
+            }]]);
         let cfg = test_cfg(provider, Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("old request"));

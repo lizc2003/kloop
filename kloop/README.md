@@ -2091,7 +2091,10 @@ kloop --mock --headless --json
   TUI, or a questions-capable native-protocol client for those flows.
 - **Exit code** is `0` on a clean finish, `1` on error, interruption (Ctrl+C),
   or hitting `--max-rounds`. Without that explicit flag, headless uses the same
-  unbounded turn loop as interactive/server mode.
+  unbounded turn loop as interactive/server mode. In human text mode, a
+  refusal/filter/incomplete response or exhausted output-limit recovery still
+  prints any usable assistant text once, reports the stable failure on stderr,
+  and exits `1`; a valid empty EndTurn writes no placeholder line.
 - The session persists to `.kloop/sessions/` like every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 - **Scheduler shutdown.** After the main headless turn, kloop stops the scheduler before
@@ -2174,7 +2177,19 @@ cargo run
 # 45s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
 # response, and 1 MiB per unfinished SSE frame. Anthropic requires message_stop;
 # Responses requires response.completed/incomplete; Chat requires finish_reason
-# ([DONE] only ends the transport). Non-empty invalid tool JSON fails closed.
+# ([DONE] only ends the transport). Complete frames and EOF residuals are strict
+# UTF-8; malformed JSON, unknown semantic events, unclosed output items/parts,
+# missing final tool identity, and non-object arguments fail closed.
+#
+# Adapters publish only Text/Thinking/RedactedThinking/ToolUse blocks plus a
+# mandatory typed outcome. EndTurn, ToolUse, output limits, refusal, filtering,
+# and incomplete responses are distinct: only output limits enter bounded
+# continuation; refusal/filter/incomplete never retry, fallback, or dispatch a
+# tool. ToolUse must agree bidirectionally with unique, valid tool blocks. A
+# valid empty EndTurn creates no assistant history placeholder. Display items
+# with partial text close as failed on stream error, while completed blocks stay
+# completed; native protocol 1.0 keeps the existing item/completed method and
+# carries that distinction in the item's status field.
 
 # line-based REPL instead of the TUI
 cargo run -- --plain
@@ -2224,9 +2239,11 @@ session is saved and resumable — see Session persistence above.
   omission rule, role casing, serde round-trip).
 - **kloop-provider** — history-translation unit tests plus wiremock HTTP
   contracts for Anthropic Messages, OpenAI Chat Completions, and OpenAI
-  Responses: delta/block accumulation, usage capture, typed HTTP/timeout/
-  protocol failures, fixed transport and SSE caps, Retry-After, exact terminal
-  markers, fail-closed tool JSON, producer cancellation, and mid-stream death.
+  Responses: strict item/part/order/identity closure, typed semantic outcomes,
+  delta/final-value agreement, usage capture, strict UTF-8 terminal tails,
+  typed HTTP/timeout/protocol failures, fixed transport and SSE caps,
+  Retry-After, fail-closed tool input, producer cancellation, and mid-stream
+  death.
 - **kloop-core** — every tool's execute path (output/exit capture, timeout
   kill, line numbering, parent-dir creation, edit ambiguity, offload id
   validation, depth guard), dispatch ordering + orphan patching +

@@ -133,11 +133,11 @@ fn status_str(s: ItemStatus) -> &'static str {
 /// sub-agent `agent` label appear only when present.
 fn item_json(id: &str, item: &Item, fallback: &'static str) -> Value {
     match item {
-        Item::AssistantMessage { text } => {
-            json!({"id": id, "type": "assistantMessage", "status": fallback, "text": text})
+        Item::AssistantMessage { text, status } => {
+            json!({"id": id, "type": "assistantMessage", "status": status_str(*status), "text": text})
         }
-        Item::Reasoning { text } => {
-            json!({"id": id, "type": "reasoning", "status": fallback, "text": text})
+        Item::Reasoning { text, status } => {
+            json!({"id": id, "type": "reasoning", "status": status_str(*status), "text": text})
         }
         Item::ToolCall {
             agent,

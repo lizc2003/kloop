@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–64 已完成；Plan 65 已规划待实施)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–65 已完成)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -195,7 +195,9 @@
 >
 > **Plan 64 已完成（2026-08-04）**：`64-provider-stream-guard.md` 将三条 provider rail 收进 typed、单终态、consumer-drop 即 abort 的 stream seam；固定 open 45s / idle 15m / wall 30m / response 10MiB / unfinished frame 1MiB guard。Anthropic 只认 `message_stop`，Responses 只认 `response.completed|incomplete`，Chat 以 `finish_reason` 为语义终态、`[DONE]` 仅结束传输；非空非法 tool JSON 全部 fail closed。core 只在尚无任何 text/reasoning/完整 tool block 时，对 transport、open/idle/wall、HTTP 408/429/5xx、incomplete EOF 做总计 3 attempts，支持秒/HTTP-date `Retry-After`（60s cap）；non-retryable 不 fallback，partial semantic output 不 replay，protocol 1.0 仍只投影 `Error(String)`。确定性测试覆盖 guard、三 wire、tool/subagent retry seal、取消 producer 与 server 单 terminal；提交 SHA 以本条所在提交为准。
 >
-> **Plan 65 已规划（待实施）**：`65-provider-message-semantics.md` 在 Plan 64 transport seam 上引入窄 assistant output block 与 mandatory typed outcome，三 adapter 必须证明 block/output item closure并严格验证 tool identity/object arguments、stop/status映射和 UTF-8；refusal/filter/incomplete与恢复用尽的output-limit不再标 completed，provider path不写空assistant，Responses delta不能脱离`output_item.done`进入成功history。native protocol保持exact 1.0 shape，open partial item只复用现有`status:"failed"`收口，typed public terminal/独立partial状态留给未来显式版本升级。开工前直接按该计划的切片0 fixtures固定缺口，不要重做Plan 64 guard或提前设计2.0双栈。
+> **Plan 65 已完成（2026-08-07）**：`65-provider-message-semantics.md` 在 Plan 64 transport guard之上把provider输出收窄为Text/Thinking/RedactedThinking/ToolUse与mandatory typed outcome。Anthropic按message/block index、Chat按single choice/tool index、Responses按output item/part identity严格证明事件顺序、identity、object arguments、final accumulator与semantic terminal；unknown event、非法UTF-8、terminal前非法/未闭合EOF residual、orphan/mismatch与未闭合item全部fail closed。OpenAI Chat兼容stream前段空id/name，但完成时仍强制非空且唯一。core只在可信terminal后写history/usage，ToolUse outcome与blocks双向一致；空EndTurn不写assistant，Refused/Filtered/Incomplete保留可用文本但error且不retry/fallback/dispatch，output-limit恢复最多3次，耗尽仍error。assistant/reasoning无delta completion和failed partial在server/headless/plain/TUI使用同一item-id lifecycle；native protocol仍exact 1.0、rollout schema不变。Desktop专用`kloop`分支以`70db2645`按wire item.status闭合failed reasoning并保留terminal snapshot，未触碰app脏main。真实Anthropic、OpenAI Chat、OpenAI Responses的text与todo tool-use六条验收均通过；提交SHA以本条所在提交为准。
+>
+> **Plan 65 教训**：transport终止、完整assistant block、display item终止与turn outcome是四层不同事实，不能由EOF、`[DONE]`、事件名或空默认值互相推导；canonical delta不带provider item identity时，adapter必须拒绝同类display lifecycle交错，frontend仍须按core item id更新，不能用“最后一个cell”猜归属。SSE的strict residual只在尚无semantic terminal而HTTP body真正到EOF时裁决；已经收到合法terminal后不能把当前chunk误当EOF并拒绝下一chunk才闭合的可选transport tail，同时parser仍须接受规范允许的额外空事件/空行。
 >
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现

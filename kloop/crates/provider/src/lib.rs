@@ -8,6 +8,7 @@ mod responses;
 pub mod sse;
 mod stream;
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,7 +29,8 @@ pub(crate) use stream::GuardedBody;
 pub(crate) use stream::StreamCompletion;
 pub(crate) use stream::StreamSink;
 
-use kloop_protocol::ContentBlock;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::Message;
 use kloop_protocol::ToolDef;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
@@ -54,21 +56,28 @@ pub struct MockRequest {
 /// One scripted Mock response: content blocks, a gate-delayed response, a
 /// truncated response, or a typed provider failure.
 pub enum MockTurn {
-    Blocks(Vec<ContentBlock>),
+    Blocks(Vec<AssistantBlock>),
+    /// Completed blocks without display deltas, for lifecycle regression tests.
+    BlocksWithoutDeltas(Vec<AssistantBlock>),
+    /// Return an explicit semantic terminal after the supplied blocks.
+    Outcome {
+        blocks: Vec<AssistantBlock>,
+        outcome: AssistantOutcome,
+    },
     /// Report that sampling started, then wait for an explicit release before
     /// emitting blocks. Tests use this to coordinate concurrent and cancelled
     /// requests without wall-clock timing assumptions.
     Gate {
         started: tokio::sync::oneshot::Sender<()>,
         release: tokio::sync::oneshot::Receiver<()>,
-        blocks: Vec<ContentBlock>,
+        blocks: Vec<AssistantBlock>,
     },
     /// Blocks delivered, but the stream reports the output limit was hit.
-    Truncated(Vec<ContentBlock>),
+    Truncated(Vec<AssistantBlock>),
     /// Content deltas arrive, then the stream fails before any block completes.
-    PartialError(Vec<ContentBlock>, String),
+    PartialError(Vec<AssistantBlock>, String),
     /// Complete blocks arrive, then the attempt fails before its terminal.
-    BlocksThenError(Vec<ContentBlock>, ProviderFailure),
+    BlocksThenError(Vec<AssistantBlock>, ProviderFailure),
     /// The request is rejected for exceeding the context window.
     Overflow,
     /// A retryable transport failure.
@@ -140,6 +149,52 @@ pub(crate) fn parse_sse_json(rail: &str, data: &str) -> Result<Value, ProviderFa
         .map_err(|error| ProviderFailure::protocol(format!("{rail} malformed SSE JSON: {error}")))
 }
 
+fn validate_assistant_blocks(
+    rail: &str,
+    blocks: &[AssistantBlock],
+) -> Result<bool, ProviderFailure> {
+    let mut tool_ids = HashSet::new();
+    let mut has_tool = false;
+    for block in blocks {
+        if let AssistantBlock::ToolUse { id, name, input } = block {
+            has_tool = true;
+            if id.is_empty() || name.is_empty() {
+                return Err(ProviderFailure::protocol(format!(
+                    "{rail} completed a tool call with an empty identity"
+                )));
+            }
+            if !input.is_object() {
+                return Err(ProviderFailure::protocol(format!(
+                    "{rail} completed tool {name} with non-object input"
+                )));
+            }
+            if !tool_ids.insert(id) {
+                return Err(ProviderFailure::protocol(format!(
+                    "{rail} completed duplicate tool call id"
+                )));
+            }
+        }
+    }
+    Ok(has_tool)
+}
+
+pub(crate) fn validate_assistant_output(
+    rail: &str,
+    outcome: &AssistantOutcome,
+    blocks: &[AssistantBlock],
+) -> Result<(), ProviderFailure> {
+    let has_tool = validate_assistant_blocks(rail, blocks)?;
+    match (matches!(outcome, AssistantOutcome::ToolUse), has_tool) {
+        (true, false) => Err(ProviderFailure::protocol(format!(
+            "{rail} reported tool use without a completed tool call"
+        ))),
+        (false, true) => Err(ProviderFailure::protocol(format!(
+            "{rail} completed a tool call for a non-tool outcome"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn parse_tool_input(
     rail: &str,
     tool_name: &str,
@@ -148,15 +203,21 @@ pub(crate) fn parse_tool_input(
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(raw).map_err(|error| {
+    let input: Value = serde_json::from_str(raw).map_err(|error| {
         ProviderFailure::protocol(format!(
             "{rail} tool {tool_name} returned invalid JSON input: {error}"
         ))
-    })
+    })?;
+    if !input.is_object() {
+        return Err(ProviderFailure::protocol(format!(
+            "{rail} tool {tool_name} returned non-object JSON input"
+        )));
+    }
+    Ok(input)
 }
 
 impl Provider {
-    pub fn mock(turns: Vec<Vec<ContentBlock>>) -> Self {
+    pub fn mock(turns: Vec<Vec<AssistantBlock>>) -> Self {
         Self::mock_scripted(turns.into_iter().map(MockTurn::Blocks).collect())
     }
 
@@ -195,7 +256,7 @@ impl Provider {
                     tools: tools.to_vec(),
                 });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
-                    MockTurn::Blocks(vec![ContentBlock::Text {
+                    MockTurn::Blocks(vec![AssistantBlock::Text {
                         text: "mock exhausted".into(),
                     }])
                 });
@@ -282,12 +343,31 @@ impl Provider {
     }
 }
 
+fn mock_outcome(blocks: &[AssistantBlock]) -> AssistantOutcome {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
+    {
+        AssistantOutcome::ToolUse
+    } else {
+        AssistantOutcome::EndTurn
+    }
+}
+
 async fn run_mock_turn(
     turn: MockTurn,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let (blocks, stop_reason) = match turn {
-        MockTurn::Blocks(blocks) => (blocks, None),
+    let (blocks, outcome, with_deltas) = match turn {
+        MockTurn::Blocks(blocks) => {
+            let outcome = mock_outcome(&blocks);
+            (blocks, outcome, true)
+        }
+        MockTurn::BlocksWithoutDeltas(blocks) => {
+            let outcome = mock_outcome(&blocks);
+            (blocks, outcome, false)
+        }
+        MockTurn::Outcome { blocks, outcome } => (blocks, outcome, true),
         MockTurn::Gate {
             started,
             release,
@@ -295,14 +375,20 @@ async fn run_mock_turn(
         } => {
             let _ = started.send(());
             let _ = release.await;
-            (blocks, None)
+            let outcome = mock_outcome(&blocks);
+            (blocks, outcome, true)
         }
-        MockTurn::Truncated(blocks) => (blocks, Some("max_tokens".to_string())),
+        MockTurn::Truncated(blocks) => (
+            blocks,
+            AssistantOutcome::OutputLimit(kloop_protocol::OutputLimitKind::MaxOutputTokens),
+            true,
+        ),
         MockTurn::PartialError(blocks, message) => {
             emit_deltas(&blocks, sink).await?;
             return Err(ProviderFailure::transport(message));
         }
         MockTurn::BlocksThenError(blocks, failure) => {
+            validate_assistant_blocks("mock", &blocks)?;
             emit_blocks(blocks, sink).await?;
             return Err(failure);
         }
@@ -310,24 +396,34 @@ async fn run_mock_turn(
         MockTurn::Error(message) => return Err(ProviderFailure::transport(message)),
         MockTurn::Failure(failure) => return Err(failure),
     };
-    emit_blocks(blocks, sink).await?;
-    Ok(StreamCompletion::new(stop_reason, None))
+    validate_assistant_output("mock", &outcome, &blocks)?;
+    if with_deltas {
+        emit_blocks(blocks, sink).await?;
+    } else {
+        for block in blocks {
+            sink.block_done(block).await?;
+        }
+    }
+    Ok(StreamCompletion::new(outcome, None))
 }
 
-async fn emit_deltas(blocks: &[ContentBlock], sink: &StreamSink) -> Result<(), ProviderFailure> {
+async fn emit_deltas(blocks: &[AssistantBlock], sink: &StreamSink) -> Result<(), ProviderFailure> {
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => sink.text_delta(text.clone()).await?,
-            ContentBlock::Thinking { thinking, .. } => {
+            AssistantBlock::Text { text } => sink.text_delta(text.clone()).await?,
+            AssistantBlock::Thinking { thinking, .. } => {
                 sink.thinking_delta(thinking.clone()).await?
             }
-            _ => {}
+            AssistantBlock::RedactedThinking { .. } | AssistantBlock::ToolUse { .. } => {}
         }
     }
     Ok(())
 }
 
-async fn emit_blocks(blocks: Vec<ContentBlock>, sink: &StreamSink) -> Result<(), ProviderFailure> {
+async fn emit_blocks(
+    blocks: Vec<AssistantBlock>,
+    sink: &StreamSink,
+) -> Result<(), ProviderFailure> {
     emit_deltas(&blocks, sink).await?;
     for block in blocks {
         sink.block_done(block).await?;
@@ -338,6 +434,67 @@ async fn emit_blocks(blocks: Vec<ContentBlock>, sink: &StreamSink) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_input_requires_complete_json_object() {
+        assert_eq!(parse_tool_input("test", "bash", "").unwrap(), json!({}));
+        assert_eq!(parse_tool_input("test", "bash", "  \n").unwrap(), json!({}));
+        assert_eq!(
+            parse_tool_input("test", "bash", r#"{"command":"pwd"}"#).unwrap(),
+            json!({"command": "pwd"})
+        );
+
+        for raw in ["null", "[]", "true", "1", r#""text""#] {
+            let error = parse_tool_input("test", "bash", raw).unwrap_err();
+            assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+            assert!(!error.is_retryable());
+            assert!(error.to_string().contains("non-object JSON input"));
+        }
+        let error = parse_tool_input("test", "bash", "{oops").unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("invalid JSON input"));
+    }
+
+    #[tokio::test]
+    async fn mock_rejects_invalid_blocks_and_outcome_mismatches_before_emitting() {
+        let tool = |id: &str, input: Value| AssistantBlock::ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input,
+        };
+        let cases = vec![
+            MockTurn::Outcome {
+                blocks: vec![tool("", json!({}))],
+                outcome: AssistantOutcome::ToolUse,
+            },
+            MockTurn::Outcome {
+                blocks: vec![tool("t1", json!([]))],
+                outcome: AssistantOutcome::ToolUse,
+            },
+            MockTurn::Outcome {
+                blocks: vec![tool("t1", json!({})), tool("t1", json!({}))],
+                outcome: AssistantOutcome::ToolUse,
+            },
+            MockTurn::Outcome {
+                blocks: vec![AssistantBlock::Text { text: "x".into() }],
+                outcome: AssistantOutcome::ToolUse,
+            },
+            MockTurn::Outcome {
+                blocks: vec![tool("t1", json!({}))],
+                outcome: AssistantOutcome::EndTurn,
+            },
+        ];
+
+        for turn in cases {
+            let provider = Arc::new(Provider::mock_scripted(vec![turn]));
+            let mut stream = provider.stream("mock", "system", &[], &[]);
+            let error = stream.recv().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+            assert!(!error.after_semantic_output());
+            assert!(stream.recv().await.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn dropping_provider_stream_aborts_its_producer() {

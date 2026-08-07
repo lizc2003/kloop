@@ -1,6 +1,8 @@
 //! OpenAI-compat chat/completions adapter: translates the canonical history
 //! to chat messages and the tool_calls delta stream back into StreamEvents.
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 use serde_json::Value;
 
@@ -10,9 +12,12 @@ use super::GuardedBody;
 use super::ProviderFailure;
 use super::StreamCompletion;
 use super::StreamSink;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
+use kloop_protocol::OutputLimitKind;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
@@ -179,9 +184,203 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
 
 #[derive(Default)]
 struct CallAcc {
-    id: String,
-    name: String,
+    id: Option<String>,
+    name: Option<String>,
     args: String,
+}
+
+fn protocol(message: impl Into<String>) -> ProviderFailure {
+    ProviderFailure::protocol(format!("openai-compat {}", message.into()))
+}
+
+fn lock_identity(
+    slot: &mut Option<String>,
+    value: &Value,
+    field: &str,
+) -> Result<(), ProviderFailure> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let value = value
+        .as_str()
+        .ok_or_else(|| protocol(format!("tool {field} was not a string")))?;
+    if value.is_empty() {
+        return Ok(());
+    }
+    match slot {
+        Some(current) if current != value => {
+            Err(protocol(format!("tool {field} changed during streaming")))
+        }
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(value.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn map_finish_reason(reason: &str) -> Result<AssistantOutcome, ProviderFailure> {
+    match reason {
+        "stop" | "end_turn" => Ok(AssistantOutcome::EndTurn),
+        "tool_calls" | "function_call" | "tool_use" => Ok(AssistantOutcome::ToolUse),
+        "length" | "max_tokens" => Ok(AssistantOutcome::OutputLimit(
+            OutputLimitKind::MaxOutputTokens,
+        )),
+        "content_filter" => Ok(AssistantOutcome::Filtered),
+        "refusal" => Ok(AssistantOutcome::Refused),
+        _ => Err(protocol("returned an unknown finish reason")),
+    }
+}
+
+fn parse_usage(value: &Value) -> Result<Usage, ProviderFailure> {
+    let prompt = value["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| protocol("usage missing prompt_tokens"))?;
+    let output = value["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| protocol("usage missing completion_tokens"))?;
+    let cached = match value["prompt_tokens_details"]["cached_tokens"].as_u64() {
+        Some(value) => value,
+        None if value["prompt_tokens_details"].is_null() => 0,
+        None => return Err(protocol("usage cached_tokens was not an integer")),
+    };
+    if cached > prompt {
+        return Err(protocol("usage cached_tokens exceeded prompt_tokens"));
+    }
+    Ok(Usage {
+        input_tokens: prompt - cached,
+        output_tokens: output,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    })
+}
+
+fn semantic_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, ProviderFailure> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(protocol(format!("delta {field} was not a string"))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_choice_payload(
+    payload: &serde_json::Map<String, Value>,
+    text: &mut String,
+    thinking: &mut String,
+    display_text: &mut String,
+    refusal_seen: &mut bool,
+    calls: &mut BTreeMap<u64, CallAcc>,
+    sink: &StreamSink,
+) -> Result<bool, ProviderFailure> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "role",
+        "content",
+        "reasoning_content",
+        "reasoning",
+        "refusal",
+        "tool_calls",
+    ];
+    if payload
+        .keys()
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(protocol("returned an unknown semantic delta field"));
+    }
+    if let Some(role) = semantic_string(payload, "role")? {
+        if role != "assistant" {
+            return Err(protocol("delta role was not assistant"));
+        }
+    }
+
+    let mut semantic = false;
+    let reasoning_content = semantic_string(payload, "reasoning_content")?;
+    let reasoning = semantic_string(payload, "reasoning")?;
+    let reasoning_piece = match (reasoning_content, reasoning) {
+        (Some(left), Some(right)) if left != right => {
+            return Err(protocol("reasoning aliases conflicted"))
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    if let Some(piece) = reasoning_piece {
+        if !piece.is_empty() {
+            semantic = true;
+            thinking.push_str(piece);
+            sink.thinking_delta(piece.to_string()).await?;
+        }
+    }
+    if let Some(piece) = semantic_string(payload, "content")? {
+        if !piece.is_empty() {
+            semantic = true;
+            text.push_str(piece);
+            display_text.push_str(piece);
+            sink.text_delta(piece.to_string()).await?;
+        }
+    }
+    if let Some(piece) = semantic_string(payload, "refusal")? {
+        if !piece.is_empty() {
+            semantic = true;
+            *refusal_seen = true;
+            display_text.push_str(piece);
+            sink.text_delta(piece.to_string()).await?;
+        }
+    }
+
+    if let Some(tool_calls) = payload.get("tool_calls") {
+        let tool_calls = tool_calls
+            .as_array()
+            .ok_or_else(|| protocol("delta tool_calls was not an array"))?;
+        for call in tool_calls {
+            semantic = true;
+            let call_object = call
+                .as_object()
+                .ok_or_else(|| protocol("tool call was not an object"))?;
+            let index = call["index"]
+                .as_u64()
+                .ok_or_else(|| protocol("tool call was missing its wire index"))?;
+            if let Some(kind) = call.get("type") {
+                if kind.as_str() != Some("function") {
+                    return Err(protocol("tool call type was not function"));
+                }
+            }
+            let acc = calls.entry(index).or_default();
+            lock_identity(&mut acc.id, &call["id"], "id")?;
+            let function = call.get("function");
+            if let Some(function) = function {
+                let function = function
+                    .as_object()
+                    .ok_or_else(|| protocol("tool call function was not an object"))?;
+                lock_identity(
+                    &mut acc.name,
+                    function.get("name").unwrap_or(&Value::Null),
+                    "name",
+                )?;
+                if let Some(arguments) = function.get("arguments") {
+                    let arguments = arguments
+                        .as_str()
+                        .ok_or_else(|| protocol("tool arguments fragment was not a string"))?;
+                    acc.args.push_str(arguments);
+                }
+                if function
+                    .keys()
+                    .any(|field| !matches!(field.as_str(), "name" | "arguments"))
+                {
+                    return Err(protocol("tool function contained an unknown field"));
+                }
+            }
+            if call_object
+                .keys()
+                .any(|field| !matches!(field.as_str(), "index" | "id" | "type" | "function"))
+            {
+                return Err(protocol("tool call contained an unknown field"));
+            }
+        }
+    }
+    Ok(semantic)
 }
 
 pub(super) async fn stream(
@@ -196,121 +395,157 @@ pub(super) async fn stream(
     let mut parser = SseParser::default();
     let mut byte_stream = GuardedBody::new(resp.bytes_stream());
     let mut text = String::new();
+    let mut display_text = String::new();
     let mut thinking = String::new();
-    let mut calls: Vec<CallAcc> = Vec::new();
-    let mut stop_reason: Option<String> = None;
-    let mut usage: Option<Usage> = None;
+    let mut refusal_seen = false;
+    let mut calls = BTreeMap::new();
+    let mut choice_index = None;
+    let mut outcome = None;
+    let mut usage = None;
+    let mut transport_done = false;
 
-    'outer: while let Some(chunk) = byte_stream.next().await? {
+    while !transport_done {
+        let Some(chunk) = byte_stream.next().await? else {
+            break;
+        };
         for frame in parser.feed(&chunk)? {
-            if frame.data.trim() == "[DONE]" {
-                break 'outer;
+            if transport_done {
+                return Err(protocol("SSE frame arrived after [DONE]"));
             }
-            let v = crate::parse_sse_json("openai-compat", &frame.data)?;
-            if !v["error"].is_null() {
-                if is_overflow_message(&v["error"].to_string()) {
+            if !matches!(frame.event.as_deref(), None | Some("message")) {
+                return Err(protocol("returned an unknown SSE event name"));
+            }
+            if frame.data.trim() == "[DONE]" {
+                transport_done = true;
+                continue;
+            }
+            let value = crate::parse_sse_json("openai-compat", &frame.data)?;
+            if !value["error"].is_null() {
+                if is_overflow_message(&value["error"].to_string()) {
                     return Err(ProviderFailure::context_overflow());
                 }
-                return Err(ProviderFailure::protocol(format!(
-                    "openai-compat stream error: {}",
-                    v["error"]
-                )));
+                let code = value["error"]["code"].as_str().unwrap_or("unknown");
+                return Err(protocol(format!("stream error ({code})")));
             }
-            // With include_usage the final chunk carries usage and empty
-            // choices. OpenAI reports cached prompt tokens INSIDE
-            // prompt_tokens, so subtract them to keep the canonical split.
-            if v["usage"].is_object() {
-                let prompt = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-                let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
-                usage = Some(Usage {
-                    input_tokens: prompt.saturating_sub(cached),
-                    output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                    cache_read_input_tokens: cached,
-                    cache_creation_input_tokens: 0,
-                });
-            }
-            let delta = &v["choices"][0]["delta"];
-            // Reasoning models stream their thinking as reasoning_content
-            // (deepseek-style) or reasoning; either becomes a Thinking block
-            // with no signature (chat/completions has no replay blob).
-            let reasoning = delta["reasoning_content"]
-                .as_str()
-                .or_else(|| delta["reasoning"].as_str());
-            if let Some(piece) = reasoning {
-                if !piece.is_empty() {
-                    thinking.push_str(piece);
-                    sink.thinking_delta(piece.into()).await?;
+
+            if let Some(raw_usage) = value.get("usage") {
+                if !raw_usage.is_null() {
+                    if usage.is_some() {
+                        return Err(protocol("received duplicate usage"));
+                    }
+                    usage = Some(parse_usage(raw_usage)?);
                 }
             }
-            if let Some(piece) = delta["content"].as_str() {
-                if !piece.is_empty() {
-                    text.push_str(piece);
-                    sink.text_delta(piece.into()).await?;
+
+            let choices = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .ok_or_else(|| protocol("frame was missing choices"))?;
+            if choices.is_empty() {
+                if value.get("usage").is_none_or(Value::is_null) {
+                    return Err(protocol("empty choices frame did not contain usage"));
                 }
+                continue;
             }
-            if let Some(tcs) = delta["tool_calls"].as_array() {
-                for tc in tcs {
-                    let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                    while calls.len() <= index {
-                        calls.push(CallAcc::default());
-                    }
-                    let acc = &mut calls[index];
-                    if let Some(id) = tc["id"].as_str() {
-                        acc.id.push_str(id);
-                    }
-                    if let Some(name) = tc["function"]["name"].as_str() {
-                        acc.name.push_str(name);
-                    }
-                    if let Some(args) = tc["function"]["arguments"].as_str() {
-                        acc.args.push_str(args);
-                    }
+            if choices.len() != 1 {
+                return Err(protocol("returned more than one logical choice"));
+            }
+            let choice = &choices[0];
+            let index = choice["index"]
+                .as_u64()
+                .ok_or_else(|| protocol("choice was missing its index"))?;
+            match choice_index {
+                Some(current) if current != index => {
+                    return Err(protocol("choice index changed during streaming"))
                 }
+                None => choice_index = Some(index),
+                Some(_) => {}
             }
-            if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
-                stop_reason = Some(reason.to_string());
+
+            let payload = match (choice.get("delta"), choice.get("message")) {
+                (Some(Value::Object(delta)), None) => delta,
+                (None, Some(Value::Object(message))) => message,
+                (Some(Value::Object(_)), Some(Value::Object(_))) => {
+                    return Err(protocol("choice contained both delta and final message"))
+                }
+                _ => return Err(protocol("choice was missing a delta object")),
+            };
+            let semantic = apply_choice_payload(
+                payload,
+                &mut text,
+                &mut thinking,
+                &mut display_text,
+                &mut refusal_seen,
+                &mut calls,
+                sink,
+            )
+            .await?;
+            if outcome.is_some() && semantic {
+                return Err(protocol("semantic delta arrived after finish reason"));
+            }
+
+            if let Some(reason) = choice.get("finish_reason") {
+                if !reason.is_null() {
+                    let reason = reason
+                        .as_str()
+                        .ok_or_else(|| protocol("finish_reason was not a string"))?;
+                    if outcome.is_some() {
+                        return Err(protocol("received duplicate finish_reason"));
+                    }
+                    let mapped = map_finish_reason(reason)?;
+                    outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
+                        AssistantOutcome::Refused
+                    } else {
+                        mapped
+                    });
+                }
             }
         }
-        // finish_reason is the semantic terminal. Process every frame already
-        // coalesced in this body chunk (which commonly includes usage/[DONE]),
-        // but never wait on a separate optional transport-tail chunk.
-        if stop_reason.is_some() {
+
+        if outcome.is_some() {
             break;
         }
     }
 
-    if stop_reason.is_none() {
+    let Some(outcome) = outcome else {
+        parser.finish()?;
         return Err(ProviderFailure::incomplete_protocol(
             "openai-compat stream ended before finish_reason",
         ));
-    }
+    };
 
-    let mut parsed_calls = Vec::with_capacity(calls.len());
-    for acc in calls {
-        let input = crate::parse_tool_input("openai-compat", &acc.name, &acc.args)?;
-        parsed_calls.push(ContentBlock::ToolUse {
-            id: acc.id,
-            name: acc.name,
-            input,
-        });
-    }
-
-    // Thinking precedes the answer on the wire, so it finalizes first too.
+    let mut blocks = Vec::new();
     if !thinking.is_empty() {
-        sink.block_done(ContentBlock::Thinking {
+        blocks.push(AssistantBlock::Thinking {
             thinking,
             signature: String::new(),
-        })
-        .await?;
+        });
     }
-    if !text.is_empty() {
-        sink.block_done(ContentBlock::Text { text }).await?;
+    if !display_text.is_empty() {
+        blocks.push(AssistantBlock::Text { text: display_text });
     }
-    for block in parsed_calls {
+    for (_, acc) in calls {
+        let id = acc
+            .id
+            .ok_or_else(|| protocol("tool call completed without an id"))?;
+        let name = acc
+            .name
+            .ok_or_else(|| protocol("tool call completed without a name"))?;
+        let input = crate::parse_tool_input("openai-compat", &name, &acc.args)?;
+        blocks.push(AssistantBlock::ToolUse { id, name, input });
+    }
+    if refusal_seen
+        && blocks
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
+    {
+        return Err(protocol("response combined refusal with tool calls"));
+    }
+    crate::validate_assistant_output("openai-compat", &outcome, &blocks)?;
+    for block in blocks {
         sink.block_done(block).await?;
     }
-    Ok(StreamCompletion::new(stop_reason, usage))
+    Ok(StreamCompletion::new(outcome, usage))
 }
 
 #[cfg(test)]

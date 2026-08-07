@@ -9,18 +9,26 @@
 //! function calls they preceded — gpt-5-era models reject a function_call
 //! whose reasoning item is missing.
 
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+
 use serde_json::json;
 use serde_json::Value;
 
 use super::is_overflow_message;
+use super::sse::SseFrame;
 use super::sse::SseParser;
 use super::GuardedBody;
 use super::ProviderFailure;
 use super::StreamCompletion;
 use super::StreamSink;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
+use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
+use kloop_protocol::OutputLimitKind;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
@@ -176,64 +184,547 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
     out
 }
 
-/// One completed output item (from response.output_item.done) to a canonical
-/// block. Unknown item kinds map to None and are skipped.
-fn item_to_block(item: &Value) -> Result<Option<ContentBlock>, ProviderFailure> {
-    match item["type"].as_str().unwrap_or_default() {
-        "message" => {
-            let text: String = item["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|part| part["type"] == "output_text")
-                .map(|part| part["text"].as_str().unwrap_or(""))
-                .collect();
-            Ok(Some(ContentBlock::Text { text }))
-        }
-        "function_call" => {
-            let name = item["name"].as_str().unwrap_or_default().to_string();
-            let raw = item["arguments"].as_str().unwrap_or_default();
-            let input = crate::parse_tool_input("openai-responses", &name, raw)?;
-            Ok(Some(ContentBlock::ToolUse {
-                id: item["call_id"].as_str().unwrap_or_default().to_string(),
-                name,
-                input,
-            }))
-        }
-        "reasoning" => Ok(Some(ContentBlock::Thinking {
-            thinking: item["summary"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            signature: item["encrypted_content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        })),
-        _ => Ok(None),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessagePartKind {
+    OutputText,
+    Refusal,
+}
+
+fn message_part_value<'a>(
+    value: &'a Value,
+    kind: MessagePartKind,
+    field: &str,
+) -> Result<&'a str, ProviderFailure> {
+    match kind {
+        MessagePartKind::OutputText => required_str(&value["text"], field),
+        MessagePartKind::Refusal => required_str(&value["refusal"], field),
     }
 }
 
-fn usage_from(response: &Value) -> Option<Usage> {
-    let usage = &response["usage"];
-    if !usage.is_object() {
-        return None;
+struct TextPart {
+    kind: MessagePartKind,
+    text: String,
+    field_done: bool,
+    part_closed: bool,
+}
+
+#[derive(Default)]
+struct ReasoningPart {
+    text: String,
+    field_done: bool,
+    part_closed: bool,
+}
+
+enum ItemKind {
+    Message {
+        parts: BTreeMap<u64, TextPart>,
+    },
+    Reasoning {
+        summary: BTreeMap<u64, ReasoningPart>,
+        content: BTreeMap<u64, ReasoningPart>,
+    },
+    FunctionCall {
+        call_id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+        arguments_started: bool,
+        arguments_done: bool,
+    },
+}
+
+struct ItemState {
+    kind: ItemKind,
+}
+
+type ItemKey = (u64, String);
+
+fn protocol(message: impl Into<String>) -> ProviderFailure {
+    ProviderFailure::protocol(format!("openai-responses {}", message.into()))
+}
+
+fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
+    value
+        .as_str()
+        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
+}
+
+fn required_non_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
+    let value = required_str(value, field)?;
+    if value.is_empty() {
+        return Err(protocol(format!("{field} was empty")));
     }
-    // Like chat/completions, input_tokens includes the cached portion;
-    // subtract it out so input_tokens is the uncached remainder on all rails.
-    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-    let cached = usage["input_tokens_details"]["cached_tokens"]
+    Ok(value)
+}
+
+fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
+    value
         .as_u64()
-        .unwrap_or(0);
-    Some(Usage {
-        input_tokens: input.saturating_sub(cached),
-        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
+}
+
+fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
+    let kind = required_str(&value["type"], "event type")?;
+    if let Some(wire) = frame.event.as_deref() {
+        if wire != kind {
+            return Err(protocol("SSE event name did not match payload type"));
+        }
+    }
+    Ok(kind)
+}
+
+fn response_identity(response: &Value) -> Result<(&str, &str), ProviderFailure> {
+    Ok((
+        required_non_empty(&response["id"], "response id")?,
+        required_str(&response["status"], "response status")?,
+    ))
+}
+
+fn event_item_key(value: &Value) -> Result<ItemKey, ProviderFailure> {
+    Ok((
+        required_u64(&value["output_index"], "output_index")?,
+        required_non_empty(&value["item_id"], "item_id")?.to_string(),
+    ))
+}
+
+fn item_key(value: &Value) -> Result<ItemKey, ProviderFailure> {
+    Ok((
+        required_u64(&value["output_index"], "output_index")?,
+        required_non_empty(&value["item"]["id"], "output item id")?.to_string(),
+    ))
+}
+
+fn lock_identity(
+    slot: &mut Option<String>,
+    value: &Value,
+    field: &str,
+) -> Result<(), ProviderFailure> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let value = required_non_empty(value, field)?;
+    match slot {
+        Some(current) if current != value => Err(protocol(format!("{field} changed"))),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(value.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
+    let usage = &response["usage"];
+    if usage.is_null() {
+        return Ok(None);
+    }
+    if !usage.is_object() {
+        return Err(protocol("usage was not an object"));
+    }
+    let input = required_u64(&usage["input_tokens"], "input_tokens")?;
+    let output = required_u64(&usage["output_tokens"], "output_tokens")?;
+    let cached = match usage["input_tokens_details"]["cached_tokens"].as_u64() {
+        Some(value) => value,
+        None if usage["input_tokens_details"].is_null() => 0,
+        None => return Err(protocol("cached_tokens was not an integer")),
+    };
+    if cached > input {
+        return Err(protocol("cached_tokens exceeded input_tokens"));
+    }
+    Ok(Some(Usage {
+        input_tokens: input - cached,
+        output_tokens: output,
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: 0,
-    })
+    }))
+}
+
+fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
+    let status = required_str(&item["status"], "output item status")?;
+    if status != "in_progress" {
+        return Err(protocol("added output item was not in_progress"));
+    }
+    let kind = match required_str(&item["type"], "output item type")? {
+        "message" => {
+            if required_str(&item["role"], "message role")? != "assistant" {
+                return Err(protocol("output message role was not assistant"));
+            }
+            ItemKind::Message {
+                parts: BTreeMap::new(),
+            }
+        }
+        "reasoning" => ItemKind::Reasoning {
+            summary: BTreeMap::new(),
+            content: BTreeMap::new(),
+        },
+        "function_call" => {
+            let mut call_id = None;
+            let mut name = None;
+            lock_identity(&mut call_id, &item["call_id"], "call_id")?;
+            lock_identity(&mut name, &item["name"], "function name")?;
+            let arguments = match item.get("arguments") {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(value)) => value.clone(),
+                Some(_) => return Err(protocol("function arguments were not a string")),
+            };
+            ItemKind::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                arguments_started: false,
+                arguments_done: false,
+            }
+        }
+        _ => return Err(protocol("returned an unsupported output item type")),
+    };
+    Ok(ItemState { kind })
+}
+
+fn add_content_part(
+    state: &mut ItemState,
+    index: u64,
+    part: &Value,
+) -> Result<bool, ProviderFailure> {
+    match &mut state.kind {
+        ItemKind::Message { parts } => {
+            if parts.values().any(|part| !part.part_closed) {
+                return Err(protocol("message content parts overlapped"));
+            }
+            let kind = match required_str(&part["type"], "content part type")? {
+                "output_text" => MessagePartKind::OutputText,
+                "refusal" => MessagePartKind::Refusal,
+                _ => return Err(protocol("message contained an unsupported content part")),
+            };
+            let text = message_part_value(part, kind, "content part value")?.to_string();
+            if parts
+                .insert(
+                    index,
+                    TextPart {
+                        kind,
+                        text,
+                        field_done: false,
+                        part_closed: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(protocol("content_index was added more than once"));
+            }
+            Ok(kind == MessagePartKind::Refusal)
+        }
+        ItemKind::Reasoning { summary, content } => {
+            if summary.values().any(|part| !part.part_closed)
+                || content.values().any(|part| !part.part_closed)
+            {
+                return Err(protocol("reasoning parts overlapped"));
+            }
+            if required_str(&part["type"], "reasoning content part type")? != "reasoning_text" {
+                return Err(protocol("reasoning contained an unsupported content part"));
+            }
+            let text = required_str(&part["text"], "reasoning part text")?.to_string();
+            if content
+                .insert(
+                    index,
+                    ReasoningPart {
+                        text,
+                        ..Default::default()
+                    },
+                )
+                .is_some()
+            {
+                return Err(protocol("reasoning content_index was added more than once"));
+            }
+            Ok(false)
+        }
+        ItemKind::FunctionCall { .. } => Err(protocol("function call received a content part")),
+    }
+}
+
+fn text_part_mut(
+    state: &mut ItemState,
+    index: u64,
+    expected: MessagePartKind,
+) -> Result<&mut TextPart, ProviderFailure> {
+    let ItemKind::Message { parts } = &mut state.kind else {
+        return Err(protocol("text event referenced a non-message item"));
+    };
+    let part = parts
+        .get_mut(&index)
+        .ok_or_else(|| protocol("text event referenced an unknown content part"))?;
+    if part.kind != expected || part.part_closed || part.field_done {
+        return Err(protocol(
+            "text event referenced the wrong or closed content part",
+        ));
+    }
+    Ok(part)
+}
+
+fn reasoning_part_mut(
+    state: &mut ItemState,
+    index: u64,
+    summary: bool,
+) -> Result<&mut ReasoningPart, ProviderFailure> {
+    let ItemKind::Reasoning {
+        summary: summaries,
+        content,
+    } = &mut state.kind
+    else {
+        return Err(protocol("reasoning event referenced a non-reasoning item"));
+    };
+    let part = if summary {
+        summaries.get_mut(&index)
+    } else {
+        content.get_mut(&index)
+    }
+    .ok_or_else(|| protocol("reasoning event referenced an unknown part"))?;
+    if part.part_closed || part.field_done {
+        return Err(protocol("reasoning event referenced a closed part"));
+    }
+    Ok(part)
+}
+
+fn check_final_item_status(item: &Value, expected_type: &str) -> Result<(), ProviderFailure> {
+    if required_str(&item["type"], "final output item type")? != expected_type {
+        return Err(protocol("final output item type changed"));
+    }
+    if required_str(&item["status"], "final output item status")? != "completed" {
+        return Err(protocol("final output item was not completed"));
+    }
+    Ok(())
+}
+
+fn finish_message(
+    state: ItemState,
+    item: &Value,
+    refusal_seen: &mut bool,
+) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+    check_final_item_status(item, "message")?;
+    if required_str(&item["role"], "final message role")? != "assistant" {
+        return Err(protocol("final output message role was not assistant"));
+    }
+    let content = item["content"]
+        .as_array()
+        .ok_or_else(|| protocol("final message content was not an array"))?;
+    let ItemKind::Message { parts } = state.kind else {
+        return Err(protocol("final message referenced the wrong item type"));
+    };
+    let mut text = String::new();
+    if parts.is_empty() {
+        if !content.is_empty() {
+            return Err(protocol(
+                "final message introduced content without a part lifecycle",
+            ));
+        }
+    } else {
+        if content.len() != parts.len() {
+            return Err(protocol(
+                "final message content count did not match streamed parts",
+            ));
+        }
+        for (position, (index, part)) in parts.into_iter().enumerate() {
+            if index != position as u64 || !part.field_done || !part.part_closed {
+                return Err(protocol("message content parts were not fully closed"));
+            }
+            let final_part = &content[position];
+            let expected = match part.kind {
+                MessagePartKind::OutputText => "output_text",
+                MessagePartKind::Refusal => {
+                    *refusal_seen = true;
+                    "refusal"
+                }
+            };
+            if required_str(&final_part["type"], "final content part type")? != expected
+                || message_part_value(final_part, part.kind, "final content part value")?
+                    != part.text
+            {
+                return Err(protocol(
+                    "final message content did not match streamed text",
+                ));
+            }
+            text.push_str(&part.text);
+        }
+    }
+    Ok((!text.is_empty())
+        .then_some(AssistantBlock::Text { text })
+        .into_iter()
+        .collect())
+}
+
+fn verify_reasoning_parts(
+    final_parts: &Value,
+    parts: BTreeMap<u64, ReasoningPart>,
+    final_type: &str,
+) -> Result<Vec<String>, ProviderFailure> {
+    let final_parts = final_parts
+        .as_array()
+        .ok_or_else(|| protocol("final reasoning parts were not an array"))?;
+    if parts.is_empty() {
+        if final_parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(protocol(
+            "final reasoning introduced content without a part lifecycle",
+        ));
+    }
+    if final_parts.len() != parts.len() {
+        return Err(protocol(
+            "final reasoning part count did not match streaming",
+        ));
+    }
+    let mut texts = Vec::with_capacity(parts.len());
+    for (position, (index, part)) in parts.into_iter().enumerate() {
+        if index != position as u64 || !part.field_done || !part.part_closed {
+            return Err(protocol("reasoning parts were not fully closed"));
+        }
+        let final_part = &final_parts[position];
+        if required_str(&final_part["type"], "final reasoning part type")? != final_type
+            || required_str(&final_part["text"], "final reasoning text")? != part.text
+        {
+            return Err(protocol("final reasoning text did not match streamed text"));
+        }
+        texts.push(part.text);
+    }
+    Ok(texts)
+}
+
+fn finish_reasoning(
+    state: ItemState,
+    item: &Value,
+) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+    check_final_item_status(item, "reasoning")?;
+    let ItemKind::Reasoning { summary, content } = state.kind else {
+        return Err(protocol("final reasoning referenced the wrong item type"));
+    };
+    let mut texts = verify_reasoning_parts(&item["summary"], summary, "summary_text")?;
+    let mut raw = verify_reasoning_parts(&item["content"], content, "reasoning_text")?;
+    texts.append(&mut raw);
+    let signature = match item.get("encrypted_content") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => return Err(protocol("encrypted_content was not a string")),
+    };
+    let block = AssistantBlock::Thinking {
+        thinking: texts.concat(),
+        signature,
+    };
+    Ok(block
+        .has_semantic_payload()
+        .then_some(block)
+        .into_iter()
+        .collect())
+}
+
+fn finish_function_call(
+    state: ItemState,
+    item: &Value,
+) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+    check_final_item_status(item, "function_call")?;
+    let ItemKind::FunctionCall {
+        call_id,
+        name,
+        arguments,
+        arguments_started,
+        arguments_done,
+    } = state.kind
+    else {
+        return Err(protocol(
+            "final function call referenced the wrong item type",
+        ));
+    };
+    let final_call_id = required_non_empty(&item["call_id"], "final call_id")?;
+    let final_name = required_non_empty(&item["name"], "final function name")?;
+    if call_id
+        .as_deref()
+        .is_some_and(|value| value != final_call_id)
+    {
+        return Err(protocol("call_id changed"));
+    }
+    if name.as_deref().is_some_and(|value| value != final_name) {
+        return Err(protocol("function name changed"));
+    }
+    let final_arguments = required_str(&item["arguments"], "final function arguments")?;
+    if !arguments_started || !arguments_done {
+        return Err(protocol("function arguments were not fully closed"));
+    }
+    if arguments != final_arguments {
+        return Err(protocol(
+            "final function arguments did not match streamed arguments",
+        ));
+    }
+    let call_id = final_call_id.to_string();
+    let name = final_name.to_string();
+    let input = crate::parse_tool_input("openai-responses", &name, final_arguments)?;
+    Ok(vec![AssistantBlock::ToolUse {
+        id: call_id,
+        name,
+        input,
+    }])
+}
+
+fn finish_item(
+    state: ItemState,
+    item: &Value,
+    refusal_seen: &mut bool,
+) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+    if matches!(&state.kind, ItemKind::Message { .. }) {
+        finish_message(state, item, refusal_seen)
+    } else if matches!(&state.kind, ItemKind::Reasoning { .. }) {
+        finish_reasoning(state, item)
+    } else {
+        finish_function_call(state, item)
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    let mut chars = reason.chars();
+    let mut bounded: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn terminal_outcome(
+    event: &str,
+    response: &Value,
+    has_tool: bool,
+    has_refusal: bool,
+) -> Result<AssistantOutcome, ProviderFailure> {
+    let (_, status) = response_identity(response)?;
+    match event {
+        "response.completed" => {
+            if status != "completed" {
+                return Err(protocol("completed event carried a non-completed status"));
+            }
+            match (has_tool, has_refusal) {
+                (true, true) => Err(protocol("response combined refusal with function calls")),
+                (true, false) => Ok(AssistantOutcome::ToolUse),
+                (false, true) => Ok(AssistantOutcome::Refused),
+                (false, false) => Ok(AssistantOutcome::EndTurn),
+            }
+        }
+        "response.incomplete" => {
+            if status != "incomplete" {
+                return Err(protocol("incomplete event carried a non-incomplete status"));
+            }
+            if has_tool || has_refusal {
+                return Err(protocol("incomplete response contained conflicting output"));
+            }
+            let reason = required_non_empty(
+                &response["incomplete_details"]["reason"],
+                "incomplete reason",
+            )?;
+            match reason {
+                "max_output_tokens" => Ok(AssistantOutcome::OutputLimit(
+                    OutputLimitKind::MaxOutputTokens,
+                )),
+                "content_filter" => Ok(AssistantOutcome::Filtered),
+                _ => Ok(AssistantOutcome::Incomplete(IncompleteReason::Provider(
+                    bounded_reason(reason),
+                ))),
+            }
+        }
+        _ => unreachable!("terminal_outcome only receives semantic terminal events"),
+    }
 }
 
 pub(super) async fn stream(
@@ -247,72 +738,365 @@ pub(super) async fn stream(
 
     let mut parser = SseParser::default();
     let mut byte_stream = GuardedBody::new(resp.bytes_stream());
+    let mut response_id: Option<String> = None;
+    let mut in_progress_seen = false;
+    let mut items: BTreeMap<ItemKey, ItemState> = BTreeMap::new();
+    let mut seen_items = HashSet::new();
+    let mut completed_blocks = Vec::new();
+    let mut has_tool = false;
+    let mut has_refusal = false;
+    let mut completion = None;
+
     while let Some(chunk) = byte_stream.next().await? {
         for frame in parser.feed(&chunk)? {
-            let v = crate::parse_sse_json("openai-responses", &frame.data)?;
-            match v["type"].as_str().unwrap_or_default() {
-                "response.output_text.delta" => {
-                    let piece = v["delta"].as_str().unwrap_or_default();
-                    if !piece.is_empty() {
-                        sink.text_delta(piece.into()).await?;
+            if frame.data.trim() == "[DONE]" {
+                if completion.is_some() {
+                    continue;
+                }
+                return Err(protocol("[DONE] arrived before a semantic terminal"));
+            }
+            if completion.is_some() {
+                return Err(protocol("semantic event arrived after response terminal"));
+            }
+            let value = crate::parse_sse_json("openai-responses", &frame.data)?;
+            let event = event_type(&frame, &value)?;
+            match event {
+                "response.created" => {
+                    if response_id.is_some() {
+                        return Err(protocol("received duplicate response.created"));
                     }
-                }
-                // Summarized and raw reasoning text respectively; backends
-                // send one or the other.
-                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                    let piece = v["delta"].as_str().unwrap_or_default();
-                    if !piece.is_empty() {
-                        sink.thinking_delta(piece.into()).await?;
+                    let (id, status) = response_identity(&value["response"])?;
+                    if status != "in_progress" {
+                        return Err(protocol("created response was not in_progress"));
                     }
+                    response_id = Some(id.to_string());
                 }
-                // Complete items arrive whole here; the deltas above are for
-                // display only.
-                "response.output_item.done" => {
-                    if let Some(block) = item_to_block(&v["item"])? {
-                        sink.block_done(block).await?;
+                "response.in_progress" => {
+                    let expected = response_id
+                        .as_deref()
+                        .ok_or_else(|| protocol("response.in_progress arrived before created"))?;
+                    if in_progress_seen {
+                        return Err(protocol("received duplicate response.in_progress"));
                     }
+                    let (id, status) = response_identity(&value["response"])?;
+                    if id != expected || status != "in_progress" {
+                        return Err(protocol("response.in_progress identity or status changed"));
+                    }
+                    in_progress_seen = true;
                 }
-                "response.completed" => {
-                    return Ok(StreamCompletion::new(None, usage_from(&v["response"])));
+                "response.output_item.added" => {
+                    if response_id.is_none() {
+                        return Err(protocol("output item arrived before response.created"));
+                    }
+                    let key = item_key(&value)?;
+                    if !seen_items.insert(key.clone()) {
+                        return Err(protocol("output item identity was added more than once"));
+                    }
+                    let state = start_item(&value["item"])?;
+                    let display_kind_open = items.values().any(|current| {
+                        matches!(
+                            (&state.kind, &current.kind),
+                            (ItemKind::Message { .. }, ItemKind::Message { .. })
+                                | (ItemKind::Reasoning { .. }, ItemKind::Reasoning { .. })
+                        )
+                    });
+                    if display_kind_open {
+                        return Err(protocol(
+                            "concurrent display items had no canonical identity",
+                        ));
+                    }
+                    items.insert(key, state);
                 }
-                // The output cap cut the response short: surface it like the
-                // other rails' truncation stop_reasons so the agent's
-                // continue-nudge applies.
-                "response.incomplete" => {
-                    let reason = v["response"]["incomplete_details"]["reason"]
-                        .as_str()
-                        .unwrap_or("incomplete");
-                    let stop_reason = if reason == "max_output_tokens" {
-                        Some("length".to_string())
+                "response.content_part.added" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("content part referenced an unknown item"))?;
+                    let index = required_u64(&value["content_index"], "content_index")?;
+                    has_refusal |= add_content_part(state, index, &value["part"])?;
+                }
+                "response.output_text.delta" | "response.refusal.delta" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("text delta referenced an unknown item"))?;
+                    let index = required_u64(&value["content_index"], "content_index")?;
+                    let expected = if event == "response.output_text.delta" {
+                        MessagePartKind::OutputText
                     } else {
-                        Some(reason.to_string())
+                        has_refusal = true;
+                        MessagePartKind::Refusal
                     };
-                    return Ok(StreamCompletion::new(
-                        stop_reason,
-                        usage_from(&v["response"]),
+                    let part = text_part_mut(state, index, expected)?;
+                    let delta = required_str(&value["delta"], "text delta")?;
+                    part.text.push_str(delta);
+                    if !delta.is_empty() {
+                        sink.text_delta(delta.to_string()).await?;
+                    }
+                }
+                "response.output_text.done" | "response.refusal.done" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("text done referenced an unknown item"))?;
+                    let index = required_u64(&value["content_index"], "content_index")?;
+                    let expected = if event == "response.output_text.done" {
+                        MessagePartKind::OutputText
+                    } else {
+                        has_refusal = true;
+                        MessagePartKind::Refusal
+                    };
+                    let part = text_part_mut(state, index, expected)?;
+                    if message_part_value(&value, expected, "final text value")? != part.text {
+                        return Err(protocol("text done did not match accumulated delta"));
+                    }
+                    part.field_done = true;
+                }
+                "response.reasoning_summary_part.added" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("reasoning part referenced an unknown item"))?;
+                    let index = required_u64(&value["summary_index"], "summary_index")?;
+                    let ItemKind::Reasoning { summary, content } = &mut state.kind else {
+                        return Err(protocol("reasoning part referenced the wrong item type"));
+                    };
+                    if summary.values().any(|part| !part.part_closed)
+                        || content.values().any(|part| !part.part_closed)
+                    {
+                        return Err(protocol("reasoning parts overlapped"));
+                    }
+                    if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
+                    {
+                        return Err(protocol("reasoning summary part type was unsupported"));
+                    }
+                    let text = required_str(&value["part"]["text"], "summary part text")?;
+                    if summary.contains_key(&index) {
+                        return Err(protocol("summary_index was added more than once"));
+                    }
+                    summary.insert(
+                        index,
+                        ReasoningPart {
+                            text: text.to_string(),
+                            ..Default::default()
+                        },
+                    );
+                }
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("reasoning delta referenced an unknown item"))?;
+                    let summary = event == "response.reasoning_summary_text.delta";
+                    let index = if summary {
+                        required_u64(&value["summary_index"], "summary_index")?
+                    } else {
+                        required_u64(&value["content_index"], "content_index")?
+                    };
+                    let part = reasoning_part_mut(state, index, summary)?;
+                    let delta = required_str(&value["delta"], "reasoning delta")?;
+                    part.text.push_str(delta);
+                    if !delta.is_empty() {
+                        sink.thinking_delta(delta.to_string()).await?;
+                    }
+                }
+                "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("reasoning done referenced an unknown item"))?;
+                    let summary = event == "response.reasoning_summary_text.done";
+                    let index = if summary {
+                        required_u64(&value["summary_index"], "summary_index")?
+                    } else {
+                        required_u64(&value["content_index"], "content_index")?
+                    };
+                    let part = reasoning_part_mut(state, index, summary)?;
+                    if required_str(&value["text"], "final reasoning text")? != part.text {
+                        return Err(protocol("reasoning done did not match accumulated delta"));
+                    }
+                    part.field_done = true;
+                }
+                "response.reasoning_summary_part.done" => {
+                    let key = event_item_key(&value)?;
+                    let state = items.get_mut(&key).ok_or_else(|| {
+                        protocol("reasoning part done referenced an unknown item")
+                    })?;
+                    let index = required_u64(&value["summary_index"], "summary_index")?;
+                    let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
+                        return Err(protocol(
+                            "reasoning part done referenced the wrong item type",
+                        ));
+                    };
+                    let part = summary.get_mut(&index).ok_or_else(|| {
+                        protocol("reasoning part done referenced an unknown part")
+                    })?;
+                    if !part.field_done || part.part_closed {
+                        return Err(protocol("reasoning summary part closed out of order"));
+                    }
+                    if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
+                        || required_str(&value["part"]["text"], "summary part text")? != part.text
+                    {
+                        return Err(protocol("reasoning summary part final value changed"));
+                    }
+                    part.part_closed = true;
+                }
+                "response.content_part.done" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("content part done referenced an unknown item"))?;
+                    let index = required_u64(&value["content_index"], "content_index")?;
+                    match &mut state.kind {
+                        ItemKind::Message { parts } => {
+                            let part = parts.get_mut(&index).ok_or_else(|| {
+                                protocol("content part done referenced an unknown part")
+                            })?;
+                            if !part.field_done || part.part_closed {
+                                return Err(protocol("content part closed out of order"));
+                            }
+                            let expected = match part.kind {
+                                MessagePartKind::OutputText => "output_text",
+                                MessagePartKind::Refusal => "refusal",
+                            };
+                            if required_str(&value["part"]["type"], "content part type")?
+                                != expected
+                                || message_part_value(
+                                    &value["part"],
+                                    part.kind,
+                                    "content part value",
+                                )? != part.text
+                            {
+                                return Err(protocol("content part final value changed"));
+                            }
+                            part.part_closed = true;
+                        }
+                        ItemKind::Reasoning { content, .. } => {
+                            let part = content.get_mut(&index).ok_or_else(|| {
+                                protocol("reasoning content done referenced an unknown part")
+                            })?;
+                            if !part.field_done || part.part_closed {
+                                return Err(protocol("reasoning content part closed out of order"));
+                            }
+                            if required_str(&value["part"]["type"], "reasoning content part type")?
+                                != "reasoning_text"
+                                || required_str(&value["part"]["text"], "reasoning content text")?
+                                    != part.text
+                            {
+                                return Err(protocol("reasoning content final value changed"));
+                            }
+                            part.part_closed = true;
+                        }
+                        ItemKind::FunctionCall { .. } => {
+                            return Err(protocol("function call received content_part.done"))
+                        }
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("arguments delta referenced an unknown item"))?;
+                    let ItemKind::FunctionCall {
+                        arguments,
+                        arguments_started,
+                        arguments_done,
+                        ..
+                    } = &mut state.kind
+                    else {
+                        return Err(protocol("arguments delta referenced a non-function item"));
+                    };
+                    if *arguments_done {
+                        return Err(protocol("arguments delta arrived after arguments done"));
+                    }
+                    *arguments_started = true;
+                    arguments.push_str(required_str(&value["delta"], "arguments delta")?);
+                }
+                "response.function_call_arguments.done" => {
+                    let key = event_item_key(&value)?;
+                    let state = items
+                        .get_mut(&key)
+                        .ok_or_else(|| protocol("arguments done referenced an unknown item"))?;
+                    let ItemKind::FunctionCall {
+                        arguments,
+                        arguments_started,
+                        arguments_done,
+                        ..
+                    } = &mut state.kind
+                    else {
+                        return Err(protocol("arguments done referenced a non-function item"));
+                    };
+                    if *arguments_done {
+                        return Err(protocol("received duplicate arguments done"));
+                    }
+                    *arguments_started = true;
+                    if required_str(&value["arguments"], "final arguments")? != arguments.as_str() {
+                        return Err(protocol("arguments done did not match accumulated delta"));
+                    }
+                    *arguments_done = true;
+                }
+                "response.output_item.done" => {
+                    let key = item_key(&value)?;
+                    let state = items
+                        .remove(&key)
+                        .ok_or_else(|| protocol("output item done referenced a non-open item"))?;
+                    let mut blocks = finish_item(state, &value["item"], &mut has_refusal)?;
+                    for block in &blocks {
+                        has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
+                    }
+                    for block in blocks.drain(..) {
+                        if block.has_semantic_payload() {
+                            completed_blocks.push(block.clone());
+                            sink.block_done(block).await?;
+                        }
+                    }
+                }
+                "response.completed" | "response.incomplete" => {
+                    let expected = response_id
+                        .as_deref()
+                        .ok_or_else(|| protocol("terminal arrived before response.created"))?;
+                    if !items.is_empty() {
+                        return Err(protocol("terminal arrived with open output items"));
+                    }
+                    let (id, _) = response_identity(&value["response"])?;
+                    if id != expected {
+                        return Err(protocol("terminal response identity changed"));
+                    }
+                    let outcome =
+                        terminal_outcome(event, &value["response"], has_tool, has_refusal)?;
+                    crate::validate_assistant_output(
+                        "openai-responses",
+                        &outcome,
+                        &completed_blocks,
+                    )?;
+                    completion = Some(StreamCompletion::new(
+                        outcome,
+                        usage_from(&value["response"])?,
                     ));
                 }
                 "response.failed" => {
-                    let error = v["response"]["error"].to_string();
-                    if is_overflow_message(&error) {
+                    let error = &value["response"]["error"];
+                    if is_overflow_message(&error.to_string()) {
                         return Err(ProviderFailure::context_overflow());
                     }
-                    return Err(ProviderFailure::protocol(format!(
-                        "openai-responses failed: {error}"
-                    )));
+                    let code = error["code"].as_str().unwrap_or("unknown");
+                    return Err(protocol(format!("response failed ({code})")));
                 }
                 "error" => {
-                    if is_overflow_message(&v.to_string()) {
+                    if is_overflow_message(&value.to_string()) {
                         return Err(ProviderFailure::context_overflow());
                     }
-                    return Err(ProviderFailure::protocol(format!(
-                        "openai-responses stream error: {v}"
-                    )));
+                    let code = value["code"].as_str().unwrap_or("unknown");
+                    return Err(protocol(format!("stream error ({code})")));
                 }
-                _ => {}
+                _ => return Err(protocol("returned an unknown semantic event")),
             }
         }
+        if let Some(completion) = completion.take() {
+            return Ok(completion);
+        }
     }
+    parser.finish()?;
     Err(ProviderFailure::incomplete_protocol(
         "openai-responses stream ended before completion",
     ))

@@ -19,6 +19,9 @@ use crate::config::EffectiveWorkspace;
 use crate::event::Delta;
 use crate::event::Event;
 use crate::event::Item;
+use crate::event::ItemStatus;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::StreamEvent;
@@ -29,7 +32,7 @@ use kloop_provider::ProviderFailure;
 pub(super) struct SampleOk {
     pub(super) blocks: Vec<ContentBlock>,
     pub(super) usage: Option<Usage>,
-    pub(super) stop_reason: Option<String>,
+    pub(super) outcome: AssistantOutcome,
 }
 
 pub(super) enum Sampled {
@@ -162,7 +165,7 @@ async fn sample_once(
 ) -> Result<SampleOk, SampleError> {
     let system = &workspace.system;
     let mut rx = cfg.provider.stream(model, system, messages, tools);
-    let mut blocks = Vec::new();
+    let mut blocks: Vec<AssistantBlock> = Vec::new();
     // Open assistant/reasoning items, one of each at a time: a delta opens the
     // item (front-ends see `ItemStarted`), later deltas stream into it, and its
     // `BlockDone` finalizes it. A sub-agent (`stream_text` false) emits no
@@ -176,12 +179,13 @@ async fn sample_once(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                complete_open_items(
+                finish_open_items(
                     ui,
                     &mut text_item,
                     &mut think_item,
                     &text_accum,
                     &think_accum,
+                    ItemStatus::Failed,
                 );
                 return Err(SampleError::Cancelled {
                     partial: replayable_partial(blocks, &text_accum),
@@ -193,12 +197,13 @@ async fn sample_once(
                 ),
                 Some(Err(error)) => {
                     let message = error.to_string();
-                    complete_open_items(
+                    finish_open_items(
                         ui,
                         &mut text_item,
                         &mut think_item,
                         &text_accum,
                         &think_accum,
+                        ItemStatus::Failed,
                     );
                     return Err(if error.after_semantic_output() {
                         SampleError::AfterOutput {
@@ -212,92 +217,154 @@ async fn sample_once(
                     });
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
-                    if stream_text {
-                        text_accum.push_str(&t);
+                    text_accum.push_str(&t);
+                    if stream_text && !t.is_empty() {
                         let id = open_item(&mut text_item, item_seq, "msg", ui, || {
-                            Item::AssistantMessage { text: String::new() }
+                            Item::AssistantMessage {
+                                text: String::new(),
+                                status: ItemStatus::InProgress,
+                            }
                         });
                         ui.emit(&Event::ItemDelta { id, delta: Delta::Text(t) });
                     }
                 }
                 Some(Ok(StreamEvent::ThinkingDelta(t))) => {
-                    if stream_text {
-                        think_accum.push_str(&t);
+                    think_accum.push_str(&t);
+                    if stream_text && !t.is_empty() {
                         let id = open_item(&mut think_item, item_seq, "reasoning", ui, || {
-                            Item::Reasoning { text: String::new() }
+                            Item::Reasoning {
+                                text: String::new(),
+                                status: ItemStatus::InProgress,
+                            }
                         });
                         ui.emit(&Event::ItemDelta { id, delta: Delta::Reasoning(t) });
                     }
                 }
-                Some(Ok(StreamEvent::BlockDone(b))) => {
+                Some(Ok(StreamEvent::BlockDone(block))) => {
                     if stream_text {
-                        match &b {
-                            ContentBlock::Text { text } => {
-                                if let Some(id) = text_item.take() {
-                                    ui.emit(&Event::ItemCompleted {
-                                        id,
-                                        item: Item::AssistantMessage { text: text.clone() },
-                                    });
-                                }
-                                text_accum.clear();
+                        match &block {
+                            AssistantBlock::Text { text } => {
+                                let id = open_item(&mut text_item, item_seq, "msg", ui, || {
+                                    Item::AssistantMessage {
+                                        text: String::new(),
+                                        status: ItemStatus::InProgress,
+                                    }
+                                });
+                                let _ = text_item.take();
+                                ui.emit(&Event::ItemCompleted {
+                                    id,
+                                    item: Item::AssistantMessage {
+                                        text: text.clone(),
+                                        status: ItemStatus::Completed,
+                                    },
+                                });
                             }
-                            ContentBlock::Thinking { thinking, .. } => {
-                                if let Some(id) = think_item.take() {
-                                    ui.emit(&Event::ItemCompleted {
-                                        id,
-                                        item: Item::Reasoning { text: thinking.clone() },
-                                    });
-                                }
-                                think_accum.clear();
+                            AssistantBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                let id = open_item(
+                                    &mut think_item,
+                                    item_seq,
+                                    "reasoning",
+                                    ui,
+                                    || Item::Reasoning {
+                                        text: String::new(),
+                                        status: ItemStatus::InProgress,
+                                    },
+                                );
+                                let _ = think_item.take();
+                                ui.emit(&Event::ItemCompleted {
+                                    id,
+                                    item: Item::Reasoning {
+                                        text: thinking.clone(),
+                                        status: ItemStatus::Completed,
+                                    },
+                                });
                             }
-                            _ => {}
+                            AssistantBlock::Thinking { .. }
+                            | AssistantBlock::RedactedThinking { .. }
+                            | AssistantBlock::ToolUse { .. } => {}
                         }
                     }
-                    blocks.push(b);
+                    match &block {
+                        AssistantBlock::Text { .. } => text_accum.clear(),
+                        AssistantBlock::Thinking { .. } => think_accum.clear(),
+                        AssistantBlock::RedactedThinking { .. }
+                        | AssistantBlock::ToolUse { .. } => {}
+                    }
+                    blocks.push(block);
                 }
-                Some(Ok(StreamEvent::Done { usage, stop_reason })) => {
-                    complete_open_items(
-                        ui,
-                        &mut text_item,
-                        &mut think_item,
-                        &text_accum,
-                        &think_accum,
-                    );
-                    return Ok(SampleOk { blocks, usage, stop_reason });
+                Some(Ok(StreamEvent::Terminal { outcome, usage })) => {
+                    if text_item.is_some()
+                        || think_item.is_some()
+                        || !text_accum.is_empty()
+                        || !think_accum.is_empty()
+                    {
+                        finish_open_items(
+                            ui,
+                            &mut text_item,
+                            &mut think_item,
+                            &text_accum,
+                            &think_accum,
+                            ItemStatus::Failed,
+                        );
+                        return Err(SampleError::AfterOutput {
+                            error: "provider terminal arrived before display output closed".into(),
+                            partial: replayable_partial(blocks, &text_accum),
+                        });
+                    }
+                    return Ok(SampleOk {
+                        blocks: blocks
+                            .into_iter()
+                            .map(AssistantBlock::into_content_block)
+                            .collect(),
+                        usage,
+                        outcome,
+                    });
                 }
             }
         }
     }
 }
 
-fn replayable_partial(mut blocks: Vec<ContentBlock>, open_text: &str) -> Vec<ContentBlock> {
-    blocks.retain(|block| match block {
-        ContentBlock::Text { .. } | ContentBlock::RedactedThinking { .. } => true,
-        ContentBlock::Thinking { signature, .. } => !signature.is_empty(),
-        ContentBlock::Image { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult { .. } => false,
-    });
+fn replayable_partial(blocks: Vec<AssistantBlock>, open_text: &str) -> Vec<ContentBlock> {
+    let mut replayable: Vec<ContentBlock> = blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            AssistantBlock::Text { text } => Some(ContentBlock::Text { text }),
+            AssistantBlock::RedactedThinking { data } => {
+                Some(ContentBlock::RedactedThinking { data })
+            }
+            AssistantBlock::Thinking {
+                thinking,
+                signature,
+            } if !signature.is_empty() => Some(ContentBlock::Thinking {
+                thinking,
+                signature,
+            }),
+            AssistantBlock::Thinking { .. } | AssistantBlock::ToolUse { .. } => None,
+        })
+        .collect();
     if !open_text.is_empty() {
-        blocks.push(ContentBlock::Text {
+        replayable.push(ContentBlock::Text {
             text: open_text.to_string(),
         });
     }
-    blocks
+    replayable
 }
 
-fn complete_open_items(
+fn finish_open_items(
     ui: &Arc<dyn Ui>,
     text_item: &mut Option<String>,
     think_item: &mut Option<String>,
     text: &str,
     thinking: &str,
+    status: ItemStatus,
 ) {
     if let Some(id) = text_item.take() {
         ui.emit(&Event::ItemCompleted {
             id,
             item: Item::AssistantMessage {
                 text: text.to_string(),
+                status,
             },
         });
     }
@@ -306,6 +373,7 @@ fn complete_open_items(
             id,
             item: Item::Reasoning {
                 text: thinking.to_string(),
+                status,
             },
         });
     }

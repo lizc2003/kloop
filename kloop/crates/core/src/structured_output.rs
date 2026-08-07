@@ -27,11 +27,40 @@ pub(crate) fn validate_schema(schema: &Value) -> Result<()> {
 }
 
 pub(crate) fn tool_def(schema: &Value) -> ToolDef {
+    let schema = if direct_object_schema(schema) {
+        schema.clone()
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"value": schema},
+            "required": ["value"],
+            "additionalProperties": false,
+        })
+    };
     ToolDef {
         name: TOOL_NAME.into(),
         description: "Return the final result for this structured Workflow agent. Call this tool exactly once with a value matching its schema; invalid values are rejected and you must retry.".into(),
-        schema: schema.clone(),
+        schema,
     }
+}
+
+fn direct_object_schema(schema: &Value) -> bool {
+    schema.get("type").and_then(Value::as_str) == Some("object")
+}
+
+pub(crate) fn input_value<'a>(schema: &Value, input: &'a Value) -> Result<&'a Value, String> {
+    if direct_object_schema(schema) {
+        return Ok(input);
+    }
+    let object = input
+        .as_object()
+        .ok_or_else(|| "structured_output input must be an object".to_string())?;
+    if object.len() != 1 {
+        return Err("structured_output wrapper must contain only value".into());
+    }
+    object
+        .get("value")
+        .ok_or_else(|| "structured_output wrapper is missing value".into())
 }
 
 pub(crate) fn validate_value(schema: &Value, value: &Value) -> Result<(), String> {

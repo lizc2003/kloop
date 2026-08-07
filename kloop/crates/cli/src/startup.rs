@@ -33,7 +33,7 @@ use kloop_core::skills::SkillContext as CoreSkillContext;
 use kloop_core::skills::SkillSource;
 use kloop_core::tools::ToolSource;
 use kloop_core::Config;
-use kloop_protocol::ContentBlock;
+use kloop_protocol::AssistantBlock;
 use kloop_provider::Provider;
 use kloop_server::ConfigSnapshot;
 use kloop_server::SandboxConfigInfo;
@@ -965,13 +965,13 @@ pub(crate) fn config_from_settings(
 /// oversized output triggers offloading, round 4 reads it back, round 5 spawns
 /// a sub-agent (round 6 is the sub-agent's own reply), round 7 finishes with
 /// plain text.
-fn mock_demo_turns() -> Vec<Vec<ContentBlock>> {
-    let tool_use = |id: &str, name: &str, input: serde_json::Value| ContentBlock::ToolUse {
+fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
+    let tool_use = |id: &str, name: &str, input: serde_json::Value| AssistantBlock::ToolUse {
         id: id.into(),
         name: name.into(),
         input,
     };
-    let text = |t: &str| ContentBlock::Text { text: t.into() };
+    let text = |t: &str| AssistantBlock::Text { text: t.into() };
     vec![
         vec![
             text("Planning the demo as a todo list…\n"),

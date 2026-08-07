@@ -6,7 +6,8 @@ use std::time::SystemTime;
 
 use futures::Stream;
 use futures::StreamExt;
-use kloop_protocol::ContentBlock;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use tokio::sync::mpsc;
@@ -29,13 +30,13 @@ pub type StreamResult = Result<StreamEvent, ProviderFailure>;
 
 #[derive(Debug)]
 pub(crate) struct StreamCompletion {
-    pub(crate) stop_reason: Option<String>,
+    pub(crate) outcome: AssistantOutcome,
     pub(crate) usage: Option<Usage>,
 }
 
 impl StreamCompletion {
-    pub(crate) fn new(stop_reason: Option<String>, usage: Option<Usage>) -> Self {
-        Self { stop_reason, usage }
+    pub(crate) fn new(outcome: AssistantOutcome, usage: Option<Usage>) -> Self {
+        Self { outcome, usage }
     }
 }
 
@@ -53,7 +54,10 @@ impl StreamSink {
         self.send(StreamEvent::ThinkingDelta(text)).await
     }
 
-    pub(crate) async fn block_done(&self, block: ContentBlock) -> Result<(), ProviderFailure> {
+    pub(crate) async fn block_done(&self, block: AssistantBlock) -> Result<(), ProviderFailure> {
+        if !block.has_semantic_payload() {
+            return Ok(());
+        }
         self.send(StreamEvent::BlockDone(block)).await
     }
 
@@ -83,7 +87,7 @@ impl ProviderStream {
         match self.rx.recv().await {
             Some(Ok(event)) => {
                 self.semantic_output |= semantic_event(&event);
-                self.terminal_seen = matches!(event, StreamEvent::Done { .. });
+                self.terminal_seen = matches!(event, StreamEvent::Terminal { .. });
                 Some(Ok(event))
             }
             Some(Err(error)) => {
@@ -104,17 +108,8 @@ impl ProviderStream {
 fn semantic_event(event: &StreamEvent) -> bool {
     match event {
         StreamEvent::TextDelta(text) | StreamEvent::ThinkingDelta(text) => !text.is_empty(),
-        StreamEvent::BlockDone(block) => match block {
-            ContentBlock::Text { text } => !text.is_empty(),
-            ContentBlock::Thinking {
-                thinking,
-                signature,
-            } => !thinking.is_empty() || !signature.is_empty(),
-            ContentBlock::RedactedThinking { data } => !data.is_empty(),
-            ContentBlock::ToolUse { .. } => true,
-            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => false,
-        },
-        StreamEvent::Done { .. } => false,
+        StreamEvent::BlockDone(block) => block.has_semantic_payload(),
+        StreamEvent::Terminal { .. } => false,
     }
 }
 
@@ -133,8 +128,8 @@ where
     let sink = StreamSink { tx: tx.clone() };
     let producer = tokio::spawn(async move {
         let terminal = match run(sink).await {
-            Ok(completion) => Ok(StreamEvent::Done {
-                stop_reason: completion.stop_reason,
+            Ok(completion) => Ok(StreamEvent::Terminal {
+                outcome: completion.outcome,
                 usage: completion.usage,
             }),
             Err(error) => Err(error),

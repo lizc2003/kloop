@@ -32,6 +32,8 @@ use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::Config;
+#[cfg(test)]
+use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
@@ -172,8 +174,16 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-        if let Ok(mut w) = out.lock() {
-            let _ = writeln!(w, "{}", outcome.final_text);
+        if !outcome.final_text.is_empty() {
+            if let Ok(mut w) = out.lock() {
+                let _ = writeln!(w, "{}", outcome.final_text);
+            }
+        }
+        match &outcome.reason {
+            EndReason::Completed => {}
+            EndReason::MaxRounds => eprintln!("error: maximum rounds reached"),
+            EndReason::Aborted => eprintln!("error: interrupted"),
+            EndReason::Error(error) => eprintln!("error: {error}"),
         }
         exit_code(&outcome.reason)
     }
@@ -184,6 +194,8 @@ mod tests {
     use super::*;
 
     use kloop_core::permissions::Permissions;
+    use kloop_protocol::AssistantOutcome;
+    use kloop_provider::MockTurn;
     use kloop_provider::Provider;
 
     #[test]
@@ -276,9 +288,17 @@ mod tests {
 
     /// A minimal Config over a scripted Mock provider, enough to drive one
     /// headless turn in-process (mirrors the server contract-test factory).
-    fn mock_config(turns: Vec<Vec<ContentBlock>>) -> Config {
+    fn mock_config(turns: Vec<Vec<AssistantBlock>>) -> Config {
+        mock_provider_config(Provider::mock(turns))
+    }
+
+    fn mock_scripted_config(turns: Vec<MockTurn>) -> Config {
+        mock_provider_config(Provider::mock_scripted(turns))
+    }
+
+    fn mock_provider_config(provider: Provider) -> Config {
         Config {
-            provider: Arc::new(Provider::mock(turns)),
+            provider: Arc::new(provider),
             model: "mock".into(),
             system: "test".into(),
             project_instructions: None,
@@ -318,8 +338,8 @@ mod tests {
         }
     }
 
-    fn text_block(t: &str) -> ContentBlock {
-        ContentBlock::Text { text: t.into() }
+    fn text_block(t: &str) -> AssistantBlock {
+        AssistantBlock::Text { text: t.into() }
     }
 
     #[tokio::test]
@@ -343,6 +363,84 @@ mod tests {
             String::from_utf8(out.lock().unwrap().clone()).unwrap(),
             "the answer is 4\n"
         );
+    }
+
+    #[tokio::test]
+    async fn text_mode_preserves_semantic_error_content_and_exits_one() {
+        let cfg = Arc::new(mock_scripted_config(vec![MockTurn::Outcome {
+            blocks: vec![text_block("partial refusal")],
+            outcome: AssistantOutcome::Refused,
+        }]));
+        let history = History::new(cfg.offload_dir.clone());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let code = run_headless(
+            cfg,
+            history,
+            "hl".into(),
+            "request".into(),
+            Vec::new(),
+            false,
+            out.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(code, 1);
+        assert_eq!(
+            String::from_utf8(out.lock().unwrap().clone()).unwrap(),
+            "partial refusal\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_mode_preserves_transport_error_partial_and_exits_one() {
+        let cfg = Arc::new(mock_scripted_config(vec![MockTurn::PartialError(
+            vec![text_block("half answer")],
+            "stream dropped".into(),
+        )]));
+        let history = History::new(cfg.offload_dir.clone());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let code = run_headless(
+            cfg,
+            history,
+            "hl".into(),
+            "request".into(),
+            Vec::new(),
+            false,
+            out.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(code, 1);
+        assert_eq!(
+            String::from_utf8(out.lock().unwrap().clone()).unwrap(),
+            "half answer\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_mode_emits_nothing_for_an_empty_end_turn() {
+        let cfg = Arc::new(mock_scripted_config(vec![MockTurn::Outcome {
+            blocks: Vec::new(),
+            outcome: AssistantOutcome::EndTurn,
+        }]));
+        let history = History::new(cfg.offload_dir.clone());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let code = run_headless(
+            cfg,
+            history,
+            "hl".into(),
+            "request".into(),
+            Vec::new(),
+            false,
+            out.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(code, 0);
+        assert!(out.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

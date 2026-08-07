@@ -196,6 +196,86 @@ impl Usage {
     }
 }
 
+/// A provider-produced assistant block. This is intentionally narrower than
+/// [`ContentBlock`]: images and tool results belong to input/history and can
+/// never be constructed by the assistant-output stream seam.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssistantBlock {
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+}
+
+impl AssistantBlock {
+    /// Whether this completed block contains semantic output. Whitespace text
+    /// is meaningful; only the exact empty forms are absent. A signature-only
+    /// thinking block is load-bearing replay state and therefore semantic.
+    pub fn has_semantic_payload(&self) -> bool {
+        match self {
+            Self::Text { text } => !text.is_empty(),
+            Self::Thinking {
+                thinking,
+                signature,
+            } => !thinking.is_empty() || !signature.is_empty(),
+            Self::RedactedThinking { data } => !data.is_empty(),
+            Self::ToolUse { .. } => true,
+        }
+    }
+
+    /// Convert a validated provider output block at the sampling/history
+    /// boundary. There is deliberately no reverse blanket conversion.
+    pub fn into_content_block(self) -> ContentBlock {
+        match self {
+            Self::Text { text } => ContentBlock::Text { text },
+            Self::Thinking {
+                thinking,
+                signature,
+            } => ContentBlock::Thinking {
+                thinking,
+                signature,
+            },
+            Self::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
+            Self::ToolUse { id, name, input } => ContentBlock::ToolUse { id, name, input },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLimitKind {
+    MaxOutputTokens,
+    ModelContextWindow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncompleteReason {
+    PauseTurn,
+    Provider(String),
+}
+
+/// Why a syntactically complete provider message ended. This is an internal
+/// agent contract, not the public native protocol terminal shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssistantOutcome {
+    EndTurn,
+    ToolUse,
+    OutputLimit(OutputLimitKind),
+    Refused,
+    Filtered,
+    Incomplete(IncompleteReason),
+}
+
 /// Events emitted by a provider while one sampling request streams.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
@@ -204,13 +284,11 @@ pub enum StreamEvent {
     /// Incremental reasoning text for display only; the full block (with its
     /// signature) arrives via BlockDone.
     ThinkingDelta(String),
-    /// A fully accumulated content block.
-    BlockDone(ContentBlock),
-    /// Stream finished cleanly. stop_reason is informational only: the loop
-    /// decides continuation from the presence of tool_use blocks, never from
-    /// stop_reason (unreliable across providers).
-    Done {
-        stop_reason: Option<String>,
+    /// A fully accumulated, validated assistant output block.
+    BlockDone(AssistantBlock),
+    /// Stream finished with a mandatory semantic outcome.
+    Terminal {
+        outcome: AssistantOutcome,
         usage: Option<Usage>,
     },
 }
@@ -490,5 +568,73 @@ mod tests {
             cache_creation_input_tokens: 8,
         };
         assert_eq!(usage.total(), 1050);
+    }
+
+    #[test]
+    fn assistant_block_semantic_payload_preserves_exact_empty_rules() {
+        assert!(!AssistantBlock::Text {
+            text: String::new()
+        }
+        .has_semantic_payload());
+        assert!(AssistantBlock::Text { text: " ".into() }.has_semantic_payload());
+        assert!(!AssistantBlock::RedactedThinking {
+            data: String::new()
+        }
+        .has_semantic_payload());
+        assert!(!AssistantBlock::Thinking {
+            thinking: String::new(),
+            signature: String::new(),
+        }
+        .has_semantic_payload());
+        assert!(AssistantBlock::Thinking {
+            thinking: String::new(),
+            signature: "sig".into(),
+        }
+        .has_semantic_payload());
+        assert!(AssistantBlock::ToolUse {
+            id: "t".into(),
+            name: "bash".into(),
+            input: json!({}),
+        }
+        .has_semantic_payload());
+    }
+
+    #[test]
+    fn assistant_block_converts_only_to_assistant_content_shapes() {
+        let cases = [
+            (
+                AssistantBlock::Text { text: "hi".into() },
+                ContentBlock::Text { text: "hi".into() },
+            ),
+            (
+                AssistantBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+            ),
+            (
+                AssistantBlock::RedactedThinking { data: "d".into() },
+                ContentBlock::RedactedThinking { data: "d".into() },
+            ),
+            (
+                AssistantBlock::ToolUse {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "pwd"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "pwd"}),
+                },
+            ),
+        ];
+        for (assistant, content) in cases {
+            assert_eq!(assistant.into_content_block(), content);
+        }
     }
 }

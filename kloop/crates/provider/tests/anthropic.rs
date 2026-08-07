@@ -4,8 +4,12 @@
 
 use std::sync::Arc;
 
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
+use kloop_protocol::OutputLimitKind;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
@@ -30,9 +34,27 @@ async fn mount_sse(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(
+            // The production client is process-wide; close fixture sockets so a
+            // recycled wiremock port cannot inherit an idle connection.
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
+                .insert_header("connection", "close")
                 .set_body_raw(body, "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_bytes(server: &MockServer, body: Vec<u8>) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            // The production client is process-wide; close fixture sockets so a
+            // recycled wiremock port cannot inherit an idle connection.
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("connection", "close")
+                .set_body_bytes(body),
         )
         .mount(server)
         .await;
@@ -64,11 +86,11 @@ async fn streams_text_and_tool_use_with_usage() {
         &server,
         sse_body(&[
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 120}}}),
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}}),
             json!({"type": "content_block_stop", "index": 0}),
-            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}}),
             json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"comm"}}),
             json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "and\":\"ls\"}"}}),
             json!({"type": "content_block_stop", "index": 1}),
@@ -86,17 +108,19 @@ async fn streams_text_and_tool_use_with_usage() {
     assert!(matches!(&ok[0], StreamEvent::TextDelta(t) if t == "hel"));
     assert!(matches!(&ok[1], StreamEvent::TextDelta(t) if t == "lo"));
     assert!(
-        matches!(&ok[2], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "hello")
+        matches!(&ok[2], StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "hello")
     );
     assert!(matches!(
         &ok[3],
-        StreamEvent::BlockDone(ContentBlock::ToolUse { id, name, input })
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
             if id == "t1" && name == "bash" && input == &json!({"command": "ls"})
     ));
     assert!(matches!(
         &ok[4],
-        StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
-            if r == "tool_use" && *u == Usage { input_tokens: 120, output_tokens: 30, ..Default::default() }
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::ToolUse,
+            usage: Some(u),
+        } if *u == Usage { input_tokens: 120, output_tokens: 30, ..Default::default() }
     ));
     assert_eq!(ok.len(), 5);
 }
@@ -243,7 +267,7 @@ async fn cache_usage_fields_are_parsed() {
         .collect();
     assert!(matches!(
         &ok[0],
-        StreamEvent::Done { usage: Some(u), .. }
+        StreamEvent::Terminal { usage: Some(u), .. }
             if *u == Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -254,30 +278,186 @@ async fn cache_usage_fields_are_parsed() {
 }
 
 #[tokio::test]
-async fn unknown_block_kinds_are_ignored() {
+async fn stop_reasons_map_to_typed_outcomes() {
+    let cases = [
+        ("end_turn", AssistantOutcome::EndTurn),
+        ("stop_sequence", AssistantOutcome::EndTurn),
+        (
+            "max_tokens",
+            AssistantOutcome::OutputLimit(OutputLimitKind::MaxOutputTokens),
+        ),
+        (
+            "model_context_window_exceeded",
+            AssistantOutcome::OutputLimit(OutputLimitKind::ModelContextWindow),
+        ),
+        ("refusal", AssistantOutcome::Refused),
+        (
+            "pause_turn",
+            AssistantOutcome::Incomplete(IncompleteReason::PauseTurn),
+        ),
+    ];
+    let server = MockServer::start().await;
+    for (reason, expected) in cases {
+        mount_sse(
+            &server,
+            sse_body(&[
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 2}}}),
+                json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 1}}),
+                json!({"type": "message_stop"}),
+            ]),
+        )
+        .await;
+        let events = collect(anthropic(&server)).await;
+        assert_eq!(events.len(), 1, "reason {reason}");
+        assert!(matches!(
+            events[0].as_ref().unwrap(),
+            StreamEvent::Terminal { outcome, .. } if outcome == &expected
+        ));
+        server.reset().await;
+    }
+}
+
+#[tokio::test]
+async fn required_order_identity_and_stop_reason_fail_closed() {
+    let cases = vec![
+        vec![json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}})],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "content_block": {"type": "text", "text": ""}}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "t", "name": "", "input": {}}}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "t", "name": "bash", "input": []}}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_delta", "index": 7,
+                "delta": {"type": "text_delta", "text": "orphan"}}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "message_stop"}),
+        ],
+        vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "future_reason"}, "usage": {"output_tokens": 1}}),
+        ],
+    ];
+    let server = MockServer::start().await;
+    for (index, events) in cases.into_iter().enumerate() {
+        mount_sse(&server, sse_body(&events)).await;
+        let result = collect(anthropic(&server)).await;
+        assert_eq!(result.len(), 1, "case {index}");
+        let error = result.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ProviderFailureKind::Protocol,
+            "case {index}: {error}"
+        );
+        assert!(!error.is_retryable(), "case {index}");
+        server.reset().await;
+    }
+}
+
+#[tokio::test]
+async fn unsupported_content_blocks_fail_closed() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
         sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "s1"}}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
-            json!({"type": "content_block_stop", "index": 0}),
-            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}),
-            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ok"}}),
-            json!({"type": "content_block_stop", "index": 1}),
-            json!({"type": "message_stop"}),
         ]),
     )
     .await;
 
-    let ok: Vec<StreamEvent> = collect(anthropic(&server))
-        .await
-        .into_iter()
-        .map(|e| e.unwrap())
-        .collect();
-    // Only the text block survives: delta + done + Done.
-    assert_eq!(ok.len(), 3);
-    assert!(matches!(&ok[1], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "ok"));
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("unsupported content block"));
+}
+
+#[tokio::test]
+async fn concurrent_same_kind_display_blocks_fail_closed() {
+    let server = MockServer::start().await;
+    for block in [
+        json!({"type": "text", "text": ""}),
+        json!({"type": "thinking", "thinking": "", "signature": ""}),
+    ] {
+        mount_sse(
+            &server,
+            sse_body(&[
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": block.clone()}),
+                json!({"type": "content_block_start", "index": 1, "content_block": block}),
+            ]),
+        )
+        .await;
+        let events = collect(anthropic(&server)).await;
+        assert_eq!(events.len(), 1);
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.after_semantic_output());
+        server.reset().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_is_low_latency_but_later_complete_semantic_frames_fail_closed() {
+    let terminal = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1}}),
+        json!({"type": "message_stop"}),
+    ];
+    let server = MockServer::start().await;
+
+    let mut partial_tail = sse_body(&terminal);
+    partial_tail.push_str("event: ping\ndata: {");
+    mount_sse(&server, partial_tail).await;
+    let events = collect(anthropic(&server)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        })]
+    ));
+
+    server.reset().await;
+    let duplicate = sse_body(&[
+        terminal[0].clone(),
+        terminal[1].clone(),
+        terminal[2].clone(),
+        terminal[2].clone(),
+    ]);
+    mount_sse(&server, duplicate).await;
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+
+    server.reset().await;
+    mount_bytes(&server, b"event: message_start\ndata: \xff\n\n".to_vec()).await;
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
 }
 
 /// The thinking SSE contract: thinking_delta streams as ThinkingDelta events,
@@ -289,6 +469,7 @@ async fn thinking_blocks_stream_and_finalize_with_signature() {
     mount_sse(
         &server,
         sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "let me"}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " see"}}),
@@ -296,9 +477,10 @@ async fn thinking_blocks_stream_and_finalize_with_signature() {
             json!({"type": "content_block_stop", "index": 0}),
             json!({"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "blob"}}),
             json!({"type": "content_block_stop", "index": 1}),
-            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
             json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "answer"}}),
             json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
             json!({"type": "message_stop"}),
         ]),
     )
@@ -313,18 +495,18 @@ async fn thinking_blocks_stream_and_finalize_with_signature() {
     assert!(matches!(&ok[1], StreamEvent::ThinkingDelta(t) if t == " see"));
     assert!(matches!(
         &ok[2],
-        StreamEvent::BlockDone(ContentBlock::Thinking { thinking, signature })
+        StreamEvent::BlockDone(AssistantBlock::Thinking { thinking, signature })
             if thinking == "let me see" && signature == "sig-abc"
     ));
     assert!(matches!(
         &ok[3],
-        StreamEvent::BlockDone(ContentBlock::RedactedThinking { data }) if data == "blob"
+        StreamEvent::BlockDone(AssistantBlock::RedactedThinking { data }) if data == "blob"
     ));
     assert!(matches!(&ok[4], StreamEvent::TextDelta(t) if t == "answer"));
     assert!(
-        matches!(&ok[5], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "answer")
+        matches!(&ok[5], StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "answer")
     );
-    assert!(matches!(&ok[6], StreamEvent::Done { .. }));
+    assert!(matches!(&ok[6], StreamEvent::Terminal { .. }));
     assert_eq!(ok.len(), 7);
 }
 
@@ -381,12 +563,13 @@ async fn thinking_replay_and_request_modes() {
 /// Adaptive and off modes map to their wire shapes; Unset sends no field.
 #[tokio::test]
 async fn thinking_mode_field_shapes() {
+    let server = MockServer::start().await;
     for (mode, expected) in [
         (ThinkingMode::Unset, None),
         (ThinkingMode::Off, Some(json!({"type": "disabled"}))),
         (ThinkingMode::Adaptive, Some(json!({"type": "adaptive"}))),
     ] {
-        let server = MockServer::start().await;
+        server.reset().await;
         mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
         let provider = Arc::new(Provider::Anthropic {
             key: "test-key".into(),
@@ -409,7 +592,8 @@ async fn malformed_tool_input_fails_closed() {
     mount_sse(
         &server,
         sse_body(&[
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{not json"}}),
             json!({"type": "content_block_stop", "index": 0}),
             json!({"type": "message_stop"}),
@@ -471,7 +655,8 @@ async fn stream_without_message_stop_is_an_error() {
     mount_sse(
         &server,
         sse_body(&[
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}}),
         ]),
     )
@@ -507,7 +692,8 @@ async fn message_stop_does_not_close_an_unfinished_block() {
     mount_sse(
         &server,
         sse_body(&[
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash"}}),
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\":"}}),
             json!({"type": "message_stop"}),
         ]),

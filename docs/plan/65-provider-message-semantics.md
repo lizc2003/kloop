@@ -1,6 +1,6 @@
 # Plan 65 — Provider 消息语义、严格终态与 Partial 一致性
 
-> 状态：待实施
+> 状态：✅ 已完成（2026-08-07；提交 SHA 以本文件所在提交为准）
 >
 > 依赖：Plan 60、Plan 64
 >
@@ -594,6 +594,15 @@ git diff --check
 - Responses：普通text、tool use、`output_item.done`/completion closure。
 
 无法稳定由真实模型触发的 refusal/filter/incomplete/malformed wire必须用本地 loopback fixture权威覆盖；不得把“真实调用没触发”冒充负路径已验收。真实API若因rate limit失败，按项目已有fallback纪律记录实际执行的rail/model，不把替跑说成原模型通过。
+
+## 完成记录（2026-08-07）
+
+- Canonical seam 已收窄为四类 `AssistantBlock` 与 mandatory `AssistantOutcome`；mock 与 core 在发布、落 history 和 dispatch 前都复核 tool identity、唯一 id、object input 及 outcome/block 双向一致性。
+- 三条 adapter 已改为显式状态机：Anthropic验证 message/block index 与 stop；Chat验证 single choice、tool index、placeholder identity、finish alias 与 `[DONE]` 顺序；Responses验证 output item/part、refusal字段、arguments done、final identity/accumulator与terminal status。合法 semantic terminal保持低延迟；只有 terminal 前真实 EOF 的 residual 才按 strict UTF-8/incomplete分类。
+- Core、server、plain、headless与TUI统一了无delta completion和failed partial lifecycle；空EndTurn不写空assistant，所有Text block按顺序组成final text，transport/semantic partial在human headless可读，TUI不会把仍live但非末尾的display cell冻结进scrollback。
+- Desktop `kloop` 专用分支提交 `70db26456323cab78c043dfb5f63a7c0546977e3`：normalizer按wire item status闭合reasoning，terminal snapshot与history调用同步；4组kloop Bun contract共19 tests和`vue-tsc --noEmit`通过，未修改app脏main。
+- Rust focused provider/core/server/CLI/TUI tests、`cargo fmt --all --check`、workspace all-targets Clippy、`cargo test --workspace`、mock headless smoke与`git diff --check`均通过；provider suite为防连接复用回归连续运行两次通过。
+- 从仓库根`.kloop/env.local`仅source凭据、用隔离HOME执行真实验收：Anthropic、OpenAI-compatible Chat、OpenAI Responses的普通text与`todo_write` tool-use共六条均通过；未记录key、header或raw authenticated response。refusal/filter/incomplete/malformed wire由本地loopback fixture覆盖。
 
 ## 非目标
 

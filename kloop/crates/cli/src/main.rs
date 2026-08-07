@@ -453,7 +453,7 @@ async fn plain_main(
     )?;
     cfg.bind_session(session_id.clone())?;
     let cfg = Arc::new(cfg);
-    let ui: Arc<dyn Ui> = Arc::new(StdoutUi);
+    let ui: Arc<dyn Ui> = Arc::new(StdoutUi::default());
 
     if args.mock {
         history.record(Message::user_text("run the demo"));

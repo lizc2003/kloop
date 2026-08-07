@@ -733,7 +733,7 @@ mod tests {
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
                 release: release_rx,
-                blocks: vec![kloop_protocol::ContentBlock::Text {
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
                     text: "too late".into(),
                 }],
             },
@@ -791,7 +791,7 @@ mod tests {
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
                 release: release_rx,
-                blocks: vec![kloop_protocol::ContentBlock::Text {
+                blocks: vec![kloop_protocol::AssistantBlock::Text {
                     text: "too late".into(),
                 }],
             },
@@ -843,7 +843,7 @@ mod tests {
         let changed_script = "export const meta = { name: 'resume', description: 'resume object' }; const value = await agent('return changed count', { schema: { type: 'object', properties: { count: { type: 'integer' } }, required: ['count'], additionalProperties: false } }); return { got: value.count };";
         let mut ctx = enabled_ctx("workflow-resume");
         let (provider, first_seen) = kloop_provider::Provider::mock_recording(vec![
-            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::ContentBlock::ToolUse {
+            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::AssistantBlock::ToolUse {
                 id: "structured-first".into(),
                 name: "structured_output".into(),
                 input: json!({"count": 7}),
@@ -904,7 +904,7 @@ mod tests {
 
         std::fs::write(&script_path, changed_script).unwrap();
         let (provider, miss_seen) = kloop_provider::Provider::mock_recording(vec![
-            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::ContentBlock::ToolUse {
+            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::AssistantBlock::ToolUse {
                 id: "structured-changed".into(),
                 name: "structured_output".into(),
                 input: json!({"count": 9}),
@@ -943,7 +943,7 @@ mod tests {
         let mut ctx = enabled_ctx("workflow-structured");
         let mut cfg = ctx.cfg.test_clone();
         cfg.provider = Arc::new(kloop_provider::Provider::mock(vec![vec![
-            kloop_protocol::ContentBlock::ToolUse {
+            kloop_protocol::AssistantBlock::ToolUse {
                 id: "structured-1".into(),
                 name: "structured_output".into(),
                 input: json!({"count": 7}),

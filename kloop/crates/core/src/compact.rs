@@ -7,6 +7,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::history::estimate_message_tokens;
 use crate::history::History;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::StreamEvent;
@@ -145,11 +147,17 @@ async fn sample_summary(
                 Some(Ok(StreamEvent::TextDelta(_))) => {}
                 // The summary is the text; reasoning about it is discarded.
                 Some(Ok(StreamEvent::ThinkingDelta(_))) => {}
-                Some(Ok(StreamEvent::BlockDone(ContentBlock::Text { text }))) => {
+                Some(Ok(StreamEvent::BlockDone(AssistantBlock::Text { text }))) => {
                     summary.push_str(&text);
                 }
                 Some(Ok(StreamEvent::BlockDone(_))) => {}
-                Some(Ok(StreamEvent::Done { .. })) => return Ok(summary),
+                Some(Ok(StreamEvent::Terminal {
+                    outcome: AssistantOutcome::EndTurn,
+                    ..
+                })) => return Ok(summary),
+                Some(Ok(StreamEvent::Terminal { outcome, .. })) => {
+                    bail!("compaction ended with non-success outcome {outcome:?}")
+                }
             }
         }
     }
@@ -212,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_compaction_rebuilds_history_around_summary() {
-        let provider = kloop_provider::Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = kloop_provider::Provider::mock(vec![vec![AssistantBlock::Text {
             text: "what happened so far".into(),
         }]]);
         let cfg = compact_test_cfg(provider, "rebuild");
@@ -247,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_samples_on_the_given_model() {
         let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
-            kloop_provider::MockTurn::Blocks(vec![ContentBlock::Text {
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "summary".into(),
             }]),
         ]);
@@ -291,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn empty_summary_is_rejected() {
         let provider =
-            kloop_provider::Provider::mock(vec![vec![ContentBlock::Text { text: "   ".into() }]]);
+            kloop_provider::Provider::mock(vec![vec![AssistantBlock::Text { text: "   ".into() }]]);
         let cfg = compact_test_cfg(provider, "empty");
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{TimeZone as _, Utc};
-use kloop_protocol::{ContentBlock, Message};
+use kloop_protocol::{AssistantBlock, ContentBlock, Message};
 use kloop_provider::Provider;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -414,7 +414,7 @@ async fn delivery_report() -> Value {
         .unwrap();
 
     let mut config = context.cfg.test_clone();
-    config.provider = Arc::new(Provider::mock(vec![vec![ContentBlock::Text {
+    config.provider = Arc::new(Provider::mock(vec![vec![AssistantBlock::Text {
         text: "timer answer".into(),
     }]]));
     context.cfg = Arc::new(config);

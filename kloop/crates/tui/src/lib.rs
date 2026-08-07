@@ -562,7 +562,9 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
         }
     };
     let active_h = (h as usize).saturating_sub(reserve).max(1);
-    let n = render::commit_count(&app.cells, width, active_h);
+    let n = render::commit_count(&app.cells, width, active_h, |index| {
+        app.display_cell_live(index)
+    });
     if n == 0 {
         return Ok(());
     }

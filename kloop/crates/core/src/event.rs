@@ -133,9 +133,11 @@ pub enum Event {
 pub enum Item {
     AssistantMessage {
         text: String,
+        status: ItemStatus,
     },
     Reasoning {
         text: String,
+        status: ItemStatus,
     },
     /// `agent` is "" for the main agent's calls and the sub-agent's label
     /// ("agent-N") for calls made inside a task. `output` is set only on the
@@ -445,6 +447,7 @@ mod tests {
             id: "r0".into(),
             item: Item::Reasoning {
                 text: String::new(),
+                status: ItemStatus::InProgress,
             },
         };
         assert_eq!(reasoning.as_note(), None);

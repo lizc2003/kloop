@@ -170,7 +170,7 @@ fn parse_exit(input: &Value) -> Result<(ExitAction, bool)> {
 #[cfg(test)]
 mod tests {
     use crate::tools::testutil::*;
-    use kloop_protocol::ContentBlock;
+    use kloop_protocol::AssistantBlock;
     use kloop_provider::Provider;
     use serde_json::json;
 
@@ -320,12 +320,12 @@ mod tests {
     async fn subagent_inherits_active_worktree() {
         let repo = temp_git_repo("inherit");
         let provider = Provider::mock(vec![
-            vec![ContentBlock::ToolUse {
+            vec![AssistantBlock::ToolUse {
                 id: "w".into(),
                 name: "write_file".into(),
                 input: json!({"path": "sub.txt", "content": "s"}),
             }],
-            vec![ContentBlock::Text { text: "ok".into() }],
+            vec![AssistantBlock::Text { text: "ok".into() }],
         ]);
         let ctx = git_ctx(with_provider(test_ctx(0, "inherit"), provider), &repo, true);
         run_tool("enter_worktree", json!({"name": "wt"}), &ctx).await;

@@ -5,6 +5,9 @@ use crate::inbox::InboxItem;
 use crate::inbox::STEERING_PREFIX;
 use crate::tools::SourceOutput;
 use crate::tools::ToolSource;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
+use kloop_protocol::IncompleteReason;
 use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
 use kloop_provider::MockTurn;
@@ -17,12 +20,12 @@ impl Ui for NullUi {
     fn emit(&self, _: &Event) {}
 }
 
-fn tool_use(id: &str, cmd: &str) -> ContentBlock {
+fn tool_use(id: &str, cmd: &str) -> AssistantBlock {
     tool_use_named(id, "bash", json!({"command": cmd}))
 }
 
-fn tool_use_named(id: &str, name: &str, input: Value) -> ContentBlock {
-    ContentBlock::ToolUse {
+fn tool_use_named(id: &str, name: &str, input: Value) -> AssistantBlock {
+    AssistantBlock::ToolUse {
         id: id.into(),
         name: name.into(),
         input,
@@ -154,13 +157,13 @@ async fn structured_turn_exposes_synthetic_tool_and_retries_invalid_value() {
 async fn structured_turn_nudges_missing_calls_and_exhausts() {
     let schema = json!({"type": "string"});
     let (cfg, seen) = structured_config(vec![
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "plain".into(),
         }]),
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "still plain".into(),
         }]),
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "never called".into(),
         }]),
     ]);
@@ -190,7 +193,7 @@ async fn structured_turn_batches_ordinary_tools_and_preserves_response_order() {
     let schema = json!({"type": "array", "items": {"type": "integer"}});
     let (base, _) = structured_config(vec![MockTurn::Blocks(vec![
         tool_use_named("o1", "test__blocking_read", json!({"value": "first"})),
-        tool_use_named("s1", "structured_output", json!([1, 2])),
+        tool_use_named("s1", "structured_output", json!({"value": [1, 2]})),
         tool_use_named("o2", "test__blocking_read", json!({"value": "second"})),
     ])]);
     let mut cfg = base.test_clone();
@@ -233,7 +236,7 @@ async fn structured_turn_batches_ordinary_tools_and_preserves_response_order() {
 }
 #[tokio::test]
 async fn ordinary_turn_never_exposes_structured_output() {
-    let (cfg, seen) = structured_config(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+    let (cfg, seen) = structured_config(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
         text: "plain result".into(),
     }])]);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -301,7 +304,7 @@ async fn mock_end_to_end_three_rounds() {
     let provider = Provider::mock(vec![
         vec![tool_use("t1", "echo one"), tool_use("t2", "echo two")],
         vec![tool_use("t3", "true")],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "all done".into(),
         }],
     ]);
@@ -438,7 +441,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
         ],
     };
 
-    let provider = Provider::mock(vec![vec![ContentBlock::Text {
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
         text: "sub answer".into(),
     }]]);
     let mut cfg = compaction_cfg(provider, 200_000, "subhook").test_clone();
@@ -527,10 +530,10 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
 #[tokio::test]
 async fn predictive_compaction_fires_before_sampling() {
     let provider = Provider::mock(vec![
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "summary of everything so far".into(),
         }],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "final answer".into(),
         }],
     ]);
@@ -574,10 +577,10 @@ async fn overflow_compacts_and_retries() {
     use kloop_provider::MockTurn;
     let provider = Provider::mock_scripted(vec![
         MockTurn::Overflow,
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "summary of everything so far".into(),
         }]),
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "recovered answer".into(),
         }]),
     ]);
@@ -609,7 +612,7 @@ async fn repeated_overflow_surfaces_error() {
     use kloop_provider::MockTurn;
     let provider = Provider::mock_scripted(vec![
         MockTurn::Overflow,
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "summary".into(),
         }]),
         MockTurn::Overflow,
@@ -633,8 +636,8 @@ async fn repeated_overflow_surfaces_error() {
     );
 }
 
-fn text(t: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text { text: t.into() }]
+fn text(t: &str) -> Vec<AssistantBlock> {
+    vec![AssistantBlock::Text { text: t.into() }]
 }
 
 /// A truncated final response gets a "continue" nudge instead of ending
@@ -672,8 +675,8 @@ async fn truncated_response_recovers_with_continuation() {
     );
 }
 
-/// Truncation nudges are bounded: after the limit the turn completes with
-/// whatever text arrived instead of looping.
+/// Truncation nudges are bounded: after the limit the turn returns an error
+/// while preserving every partial segment instead of misreporting completion.
 #[tokio::test]
 async fn truncation_recovery_is_bounded() {
     use kloop_provider::MockTurn;
@@ -692,8 +695,11 @@ async fn truncation_recovery_is_bounded() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
 
-    assert_eq!(outcome.reason, EndReason::Completed);
-    // 3 nudges (the limit), so the 4th truncated response ends the turn.
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error("response remained truncated after 3 continuation attempts".into())
+    );
+    // 3 nudges (the limit), so the 4th truncated response returns the error.
     // Every cut-off segment is accumulated into the final deliverable.
     assert_eq!(outcome.final_text, "cut 1cut 2cut 3cut 4");
     assert_eq!(outcome.rounds, 4);
@@ -703,6 +709,203 @@ async fn truncation_recovery_is_bounded() {
         .filter(|m| *m == &Message::user_text(super::TRUNCATION_CONTINUE_MSG))
         .count();
     assert_eq!(nudges, 3);
+}
+
+#[tokio::test]
+async fn final_text_includes_every_text_block_in_provider_order() {
+    let provider = Provider::mock(vec![vec![
+        AssistantBlock::Text {
+            text: "first ".into(),
+        },
+        AssistantBlock::Thinking {
+            thinking: "middle".into(),
+            signature: String::new(),
+        },
+        AssistantBlock::Text {
+            text: "second".into(),
+        },
+    ]]);
+    let cfg = compaction_cfg(provider, 200_000, "multiple-text-blocks");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("answer in pieces"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "first second");
+}
+
+#[tokio::test]
+async fn empty_end_turn_completes_without_recording_empty_assistant() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Outcome {
+        blocks: Vec::new(),
+        outcome: AssistantOutcome::EndTurn,
+    }]);
+    let mut cfg = compaction_cfg(provider, 200_000, "empty-end-turn").test_clone();
+    cfg.fallback_model = Some("must-not-fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("say nothing"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(history.messages(), &[Message::user_text("say nothing")]);
+}
+
+#[tokio::test]
+async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
+    let cases = [
+        (
+            AssistantOutcome::Refused,
+            "model refused the request".to_string(),
+        ),
+        (
+            AssistantOutcome::Filtered,
+            "provider filtered the response".to_string(),
+        ),
+        (
+            AssistantOutcome::Incomplete(IncompleteReason::Provider("paused".into())),
+            "provider returned an incomplete response: paused".to_string(),
+        ),
+    ];
+    for (index, (semantic, expected)) in cases.into_iter().enumerate() {
+        let (provider, seen) = Provider::mock_recording(vec![
+            MockTurn::Outcome {
+                blocks: text("partial semantic content"),
+                outcome: semantic,
+            },
+            MockTurn::Blocks(text("must not retry")),
+        ]);
+        let mut cfg = compaction_cfg(provider, 200_000, &format!("semantic-{index}")).test_clone();
+        cfg.fallback_model = Some("must-not-fallback".into());
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("request"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.reason, EndReason::Error(expected));
+        assert_eq!(outcome.final_text, "partial semantic content");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            history.messages()[1],
+            Message::assistant(vec![ContentBlock::Text {
+                text: "partial semantic content".into(),
+            }])
+        );
+    }
+}
+
+#[tokio::test]
+async fn core_rejects_outcome_tool_mismatch_and_invalid_tool_shape_before_dispatch() {
+    let cases = [
+        MockTurn::Outcome {
+            blocks: vec![tool_use("t1", "echo no")],
+            outcome: AssistantOutcome::EndTurn,
+        },
+        MockTurn::Outcome {
+            blocks: vec![AssistantBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!(["not", "an", "object"]),
+            }],
+            outcome: AssistantOutcome::ToolUse,
+        },
+        MockTurn::Outcome {
+            blocks: vec![tool_use("dup", "echo one"), tool_use("dup", "echo two")],
+            outcome: AssistantOutcome::ToolUse,
+        },
+    ];
+    for (index, turn) in cases.into_iter().enumerate() {
+        let provider = Provider::mock_scripted(vec![turn]);
+        let cfg = compaction_cfg(provider, 200_000, &format!("invalid-tool-{index}"));
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("do not dispatch"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert!(matches!(outcome.reason, EndReason::Error(_)));
+        assert_eq!(history.messages(), &[Message::user_text("do not dispatch")]);
+    }
+}
+
+#[tokio::test]
+async fn completed_block_without_delta_still_has_one_item_lifecycle() {
+    struct EventUi(std::sync::Mutex<Vec<Event>>);
+    impl Ui for EventUi {
+        fn emit(&self, event: &Event) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    let provider = Provider::mock_scripted(vec![MockTurn::BlocksWithoutDeltas(text("final-only"))]);
+    let cfg = compaction_cfg(provider, 200_000, "no-delta-item");
+    let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
+    let ui: Arc<dyn Ui> = event_ui.clone();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("answer"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        *event_ui.0.lock().unwrap(),
+        vec![
+            Event::ItemStarted {
+                id: "msg-0".into(),
+                item: Item::AssistantMessage {
+                    text: String::new(),
+                    status: crate::event::ItemStatus::InProgress,
+                },
+            },
+            Event::ItemCompleted {
+                id: "msg-0".into(),
+                item: Item::AssistantMessage {
+                    text: "final-only".into(),
+                    status: crate::event::ItemStatus::Completed,
+                },
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn signed_empty_thinking_is_semantic_history_without_display_item() {
+    struct EventUi(std::sync::Mutex<Vec<Event>>);
+    impl Ui for EventUi {
+        fn emit(&self, event: &Event) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+    let block = AssistantBlock::Thinking {
+        thinking: String::new(),
+        signature: "signed".into(),
+    };
+    let provider = Provider::mock_scripted(vec![MockTurn::BlocksWithoutDeltas(vec![block])]);
+    let cfg = compaction_cfg(provider, 200_000, "signed-empty-thinking");
+    let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
+    let ui: Arc<dyn Ui> = event_ui.clone();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("think"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert!(event_ui.0.lock().unwrap().is_empty());
+    assert_eq!(
+        history.messages()[1],
+        Message::assistant(vec![ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: "signed".into(),
+        }])
+    );
 }
 
 /// After the primary model exhausts its retries, the turn continues on
@@ -804,6 +1007,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         "expected the visible stream error, got {:?}",
         outcome.reason
     );
+    assert_eq!(outcome.final_text, "half answer");
     assert_eq!(
         seen.lock().unwrap().len(),
         1,
@@ -833,6 +1037,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
                 id: "msg-0".into(),
                 item: Item::AssistantMessage {
                     text: String::new(),
+                    status: crate::event::ItemStatus::InProgress,
                 },
             },
             Event::ItemDelta {
@@ -843,6 +1048,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
                 id: "msg-0".into(),
                 item: Item::AssistantMessage {
                     text: "half answer".into(),
+                    status: crate::event::ItemStatus::Failed,
                 },
             },
         ]
@@ -901,8 +1107,13 @@ async fn subagent_internal_delta_also_seals_retry() {
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert_eq!(
         history.messages(),
-        &[Message::user_text("child work")],
-        "an internal partial delta blocks replay but remains invisible to parent history"
+        &[
+            Message::user_text("child work"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "private partial".into(),
+            }]),
+        ],
+        "the child records replay-safe partial text in its own history without retrying"
     );
 }
 
@@ -1016,7 +1227,7 @@ async fn no_round_limit_runs_until_completed() {
             )]
         })
         .collect::<Vec<_>>();
-    turns.push(vec![ContentBlock::Text {
+    turns.push(vec![AssistantBlock::Text {
         text: "finished after a long run".into(),
     }]);
     let provider = Provider::mock(turns);
@@ -1037,7 +1248,7 @@ async fn no_round_limit_runs_until_completed() {
 /// A token cancelled before the turn starts aborts before sampling.
 #[tokio::test]
 async fn pre_cancelled_turn_aborts_immediately() {
-    let provider = Provider::mock(vec![vec![ContentBlock::Text {
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
         text: "never sampled".into(),
     }]]);
     let cfg = compaction_cfg(provider, 200_000, "precancel");
@@ -1074,12 +1285,12 @@ async fn denied_tool_call_continues_the_turn() {
     }
 
     let provider = Provider::mock(vec![
-        vec![ContentBlock::ToolUse {
+        vec![AssistantBlock::ToolUse {
             id: "t1".into(),
             name: "write_file".into(),
             input: json!({"path": "should-not-exist", "content": "x"}),
         }],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "understood, taking another approach".into(),
         }],
     ]);
@@ -1140,7 +1351,7 @@ async fn four_hook_points_fire_in_order() {
     let mark = |event: &str| format!("echo {event} >> {}", marker.display());
     let provider = Provider::mock(vec![
         vec![tool_use("t1", "echo hi")],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "done".into(),
         }],
     ]);
@@ -1177,7 +1388,7 @@ async fn pre_tool_hook_block_becomes_error_tool_result() {
     let _ = std::fs::remove_file(&marker);
     let provider = Provider::mock(vec![
         vec![tool_use("t1", &format!("touch {}", marker.display()))],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "changing course".into(),
         }],
     ]);
@@ -1212,7 +1423,7 @@ async fn pre_tool_hook_block_becomes_error_tool_result() {
 #[tokio::test]
 async fn pre_turn_hook_block_prevents_the_turn() {
     use crate::hooks::HookEvent;
-    let provider = Provider::mock(vec![vec![ContentBlock::Text {
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
         text: "never sampled".into(),
     }]]);
     let cfg = hooked_cfg(
@@ -1243,7 +1454,7 @@ async fn hook_stdout_is_injected_as_user_context() {
     use kloop_protocol::Role;
     let provider = Provider::mock(vec![
         vec![tool_use("t1", "echo hi")],
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "done".into(),
         }],
     ]);
@@ -1767,11 +1978,11 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
     }
 
     let blocks = vec![
-        ContentBlock::Thinking {
+        AssistantBlock::Thinking {
             thinking: "pondering".into(),
             signature: "sig".into(),
         },
-        ContentBlock::Text {
+        AssistantBlock::Text {
             text: "answer".into(),
         },
     ];
@@ -1789,7 +2000,15 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "answer");
-    assert_eq!(history.messages()[1], Message::assistant(blocks));
+    assert_eq!(
+        history.messages()[1],
+        Message::assistant(
+            blocks
+                .into_iter()
+                .map(AssistantBlock::into_content_block)
+                .collect()
+        )
+    );
     assert_eq!(*split.thinking.lock().unwrap(), "pondering");
     assert_eq!(*split.text.lock().unwrap(), "answer");
 }
@@ -1800,17 +2019,17 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
 async fn subagent_roundtrip_returns_final_text() {
     let provider = Provider::mock(vec![
         // main agent round 1: spawn the sub-agent
-        vec![ContentBlock::ToolUse {
+        vec![AssistantBlock::ToolUse {
             id: "t1".into(),
             name: "task".into(),
             input: json!({"prompt": "sub work"}),
         }],
         // consumed by the sub-agent's own run_turn
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "sub result".into(),
         }],
         // main agent round 2: wrap up
-        vec![ContentBlock::Text {
+        vec![AssistantBlock::Text {
             text: "done".into(),
         }],
     ]);

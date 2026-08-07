@@ -224,11 +224,13 @@ pub struct App {
     /// into the status line — activity shows in the transcript. Kept as recent
     /// state for the animated status HUD (plan 38 slice 5).
     pub last_note: Option<String>,
-    /// Whether the last Assistant cell still accepts text deltas. A tool row,
-    /// note, or thinking cell in between closes it so ordering is preserved.
+    /// Whether the last Assistant cell still accepts text deltas.
     assistant_open: bool,
     /// Same for the last Thinking cell and thinking deltas.
     thinking_open: bool,
+    /// Turn-local native item ids to their live assistant/reasoning cells.
+    assistant_cells: HashMap<String, usize>,
+    reasoning_cells: HashMap<String, usize>,
     /// tool_use id -> cells index, to resolve ToolEnd.
     tool_cells: HashMap<String, usize>,
     /// agent label -> cells index of its Agent row.
@@ -280,6 +282,8 @@ impl App {
             last_note: None,
             assistant_open: false,
             thinking_open: false,
+            assistant_cells: HashMap::new(),
+            reasoning_cells: HashMap::new(),
             tool_cells: HashMap::new(),
             agent_cells: HashMap::new(),
             todo_cell: None,
@@ -334,6 +338,8 @@ impl App {
                 self.cells.clear();
                 self.tool_cells.clear();
                 self.agent_cells.clear();
+                self.assistant_cells.clear();
+                self.reasoning_cells.clear();
                 self.todo_cell = None;
                 self.assistant_open = false;
                 self.thinking_open = false;
@@ -372,6 +378,8 @@ impl App {
                 }
                 self.tool_cells.clear();
                 self.agent_cells.clear();
+                self.assistant_cells.clear();
+                self.reasoning_cells.clear();
                 self.todo_cell = None;
                 self.assistant_open = false;
                 self.thinking_open = false;
@@ -398,49 +406,119 @@ impl App {
     /// status rows; a sub-agent's todo update stays internal.
     fn apply_core(&mut self, ev: Event) {
         match ev {
-            Event::ItemDelta {
-                delta: Delta::Text(t),
-                ..
+            Event::ItemStarted {
+                id,
+                item: Item::AssistantMessage { text, .. },
             } => {
-                self.thinking_open = false;
-                if self.assistant_open {
-                    if let Some(Cell::Assistant(text)) = self.cells.last_mut() {
-                        text.push_str(&t);
-                        return;
+                if let Some(&index) = self.assistant_cells.get(&id) {
+                    if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                        *current = text;
                     }
+                } else {
+                    self.assistant_cells.insert(id, self.cells.len());
+                    self.cells.push(Cell::Assistant(text));
                 }
-                self.cells.push(Cell::Assistant(t));
-                self.assistant_open = true;
+                self.refresh_display_streaming();
             }
             Event::ItemDelta {
-                delta: Delta::Reasoning(t),
-                ..
+                id,
+                delta: Delta::Text(text),
             } => {
-                self.assistant_open = false;
-                if self.thinking_open {
-                    if let Some(Cell::Thinking { text, .. }) = self.cells.last_mut() {
-                        text.push_str(&t);
-                        return;
+                let index = match self.assistant_cells.get(&id).copied() {
+                    Some(index) => index,
+                    None => {
+                        let index = self.cells.len();
+                        self.assistant_cells.insert(id, index);
+                        self.cells.push(Cell::Assistant(String::new()));
+                        index
                     }
+                };
+                if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                    current.push_str(&text);
                 }
-                self.cells.push(Cell::Thinking {
-                    text: t,
-                    seconds: None,
-                });
-                self.thinking_open = true;
+                self.refresh_display_streaming();
             }
-            // Program output has no dedicated cell; the message/reasoning
-            // start/complete events only bracket the delta stream.
+            Event::ItemCompleted {
+                id,
+                item: Item::AssistantMessage { text, .. },
+            } => {
+                match self.assistant_cells.remove(&id) {
+                    Some(index) => {
+                        if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                            *current = text;
+                        }
+                    }
+                    None if !text.is_empty() => self.cells.push(Cell::Assistant(text)),
+                    None => {}
+                }
+                self.refresh_display_streaming();
+            }
+            Event::ItemStarted {
+                id,
+                item: Item::Reasoning { text, .. },
+            } => {
+                if let Some(&index) = self.reasoning_cells.get(&id) {
+                    if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
+                        *current = text;
+                    }
+                } else {
+                    self.reasoning_cells.insert(id, self.cells.len());
+                    self.cells.push(Cell::Thinking {
+                        text,
+                        seconds: None,
+                    });
+                }
+                self.refresh_display_streaming();
+            }
+            Event::ItemDelta {
+                id,
+                delta: Delta::Reasoning(text),
+            } => {
+                let index = match self.reasoning_cells.get(&id).copied() {
+                    Some(index) => index,
+                    None => {
+                        let index = self.cells.len();
+                        self.reasoning_cells.insert(id, index);
+                        self.cells.push(Cell::Thinking {
+                            text: String::new(),
+                            seconds: None,
+                        });
+                        index
+                    }
+                };
+                if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
+                    current.push_str(&text);
+                }
+                self.refresh_display_streaming();
+            }
+            Event::ItemCompleted {
+                id,
+                item: Item::Reasoning { text, .. },
+            } => {
+                match self.reasoning_cells.remove(&id) {
+                    Some(index) => {
+                        if let Some(Cell::Thinking { text: current, .. }) =
+                            self.cells.get_mut(index)
+                        {
+                            *current = text;
+                        }
+                    }
+                    None if !text.is_empty() => self.cells.push(Cell::Thinking {
+                        text,
+                        seconds: None,
+                    }),
+                    None => {}
+                }
+                self.refresh_display_streaming();
+            }
+            // Program output has no dedicated cell; todo starts and the turn
+            // bracket do not change the transcript.
             Event::ItemDelta {
                 delta: Delta::Output(_),
                 ..
             }
             | Event::ItemStarted {
-                item: Item::AssistantMessage { .. } | Item::Reasoning { .. } | Item::Todo { .. },
-                ..
-            }
-            | Event::ItemCompleted {
-                item: Item::AssistantMessage { .. } | Item::Reasoning { .. },
+                item: Item::Todo { .. },
                 ..
             }
             | Event::TurnStarted => {}
@@ -619,6 +697,8 @@ impl App {
                 self.running = false;
                 self.assistant_open = false;
                 self.thinking_open = false;
+                self.assistant_cells.clear();
+                self.reasoning_cells.clear();
                 self.last_note = None;
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
@@ -644,6 +724,19 @@ impl App {
                 }
             }
         }
+    }
+
+    fn refresh_display_streaming(&mut self) {
+        let last = self.cells.len().checked_sub(1);
+        self.assistant_open =
+            last.is_some_and(|last| self.assistant_cells.values().any(|index| *index == last));
+        self.thinking_open =
+            last.is_some_and(|last| self.reasoning_cells.values().any(|index| *index == last));
+    }
+
+    pub(crate) fn display_cell_live(&self, index: usize) -> bool {
+        self.assistant_cells.values().any(|value| *value == index)
+            || self.reasoning_cells.values().any(|value| *value == index)
     }
 
     /// Whether the last cell is an Assistant cell still receiving text deltas.
@@ -698,6 +791,14 @@ impl App {
             *i < self.cells.len()
         });
         self.agent_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.assistant_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.reasoning_cells.retain(|_, i| {
             *i = i.wrapping_sub(n);
             *i < self.cells.len()
         });
@@ -1301,12 +1402,13 @@ mod tests {
     use super::*;
 
     // Constructors for the core events the tests drive through `apply` — since
-    // plan 39 the worker wraps every `Ui::emit` in `AgentEvent::Core`. The `id`
-    // for message/reasoning items is irrelevant to the App (deltas drive the
-    // cells), so a fixed one is fine.
+    // plan 39 the worker wraps every `Ui::emit` in `AgentEvent::Core`.
     fn text_delta(s: &str) -> AgentEvent {
+        text_delta_for("m", s)
+    }
+    fn text_delta_for(id: &str, s: &str) -> AgentEvent {
         AgentEvent::Core(Event::ItemDelta {
-            id: "m".into(),
+            id: id.into(),
             delta: Delta::Text(s.into()),
         })
     }
@@ -1503,7 +1605,7 @@ mod tests {
         app.apply(text_delta("hel"));
         app.apply(text_delta("lo"));
         app.apply(tool_start("", "t1", "bash", "{}"));
-        app.apply(text_delta("world"));
+        app.apply(text_delta_for("m2", "world"));
         app.apply(tool_end("", "t1", false, ""));
 
         assert_eq!(
@@ -1627,30 +1729,58 @@ mod tests {
         );
     }
 
-    /// Thinking and answer deltas accumulate into separate cells, in stream
-    /// order — a thinking burst between text closes and reopens the answer.
+    /// Thinking and answer deltas are routed by item id even when the two
+    /// channels interleave; each lifecycle owns one cell.
     #[test]
-    fn thinking_deltas_get_their_own_cell() {
+    fn interleaved_display_deltas_keep_one_cell_per_item() {
         let mut app = App::new("s".into());
         app.apply(thinking_delta("let me"));
         app.apply(thinking_delta(" see"));
         app.apply(text_delta("answer"));
-        app.apply(thinking_delta("more thought"));
+        app.apply(thinking_delta(" more thought"));
         app.apply(text_delta("!"));
 
         assert_eq!(
             app.cells,
             vec![
                 Cell::Thinking {
-                    text: "let me see".into(),
+                    text: "let me see more thought".into(),
                     seconds: None
                 },
-                Cell::Assistant("answer".into()),
+                Cell::Assistant("answer!".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_display_completion_updates_the_original_cells() {
+        let mut app = App::new("s".into());
+        app.apply(text_delta("a"));
+        app.apply(thinking_delta("r"));
+        app.apply(text_delta("b"));
+        app.apply(AgentEvent::Core(Event::ItemCompleted {
+            id: "m".into(),
+            item: Item::AssistantMessage {
+                text: "ab".into(),
+                status: ItemStatus::Completed,
+            },
+        }));
+        app.apply(AgentEvent::Core(Event::ItemCompleted {
+            id: "r".into(),
+            item: Item::Reasoning {
+                text: "r".into(),
+                status: ItemStatus::Failed,
+            },
+        }));
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Assistant("ab".into()),
                 Cell::Thinking {
-                    text: "more thought".into(),
-                    seconds: None
+                    text: "r".into(),
+                    seconds: None,
                 },
-                Cell::Assistant("!".into()),
             ]
         );
     }

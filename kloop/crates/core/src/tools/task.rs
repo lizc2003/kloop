@@ -719,6 +719,7 @@ mod tests {
     use crate::agent::Ui;
     use crate::tools::dispatch_tools;
     use crate::tools::testutil::*;
+    use kloop_protocol::AssistantBlock;
     use kloop_protocol::ContentBlock;
     use kloop_provider::Provider;
     use serde_json::json;
@@ -779,14 +780,14 @@ mod tests {
     async fn task_without_round_limit_runs_until_completed() {
         let mut turns = (0..16)
             .map(|i| {
-                vec![ContentBlock::ToolUse {
+                vec![AssistantBlock::ToolUse {
                     id: format!("r{i}"),
                     name: "read_file".into(),
                     input: json!({"path": format!("missing-{i}")}),
                 }]
             })
             .collect::<Vec<_>>();
-        turns.push(vec![ContentBlock::Text {
+        turns.push(vec![AssistantBlock::Text {
             text: "finished after sixteen tool rounds".into(),
         }]);
         let ctx = with_provider(test_ctx(0, "task-unbounded"), Provider::mock(turns));
@@ -811,12 +812,12 @@ mod tests {
     async fn worktree_isolation_confines_writes_and_reports_branch() {
         let repo = temp_git_repo("confine");
         let provider = Provider::mock(vec![
-            vec![ContentBlock::ToolUse {
+            vec![AssistantBlock::ToolUse {
                 id: "w1".into(),
                 name: "write_file".into(),
                 input: json!({"path": "isolated.txt", "content": "sub work"}),
             }],
-            vec![ContentBlock::Text {
+            vec![AssistantBlock::Text {
                 text: "done".into(),
             }],
         ]);
@@ -860,12 +861,12 @@ mod tests {
     async fn isolated_subagent_branches_from_the_active_workspace_head() {
         let repo = temp_git_repo("active-base");
         let provider = Provider::mock(vec![
-            vec![ContentBlock::ToolUse {
+            vec![AssistantBlock::ToolUse {
                 id: "w1".into(),
                 name: "write_file".into(),
                 input: json!({"path": "child.txt", "content": "child"}),
             }],
-            vec![ContentBlock::Text {
+            vec![AssistantBlock::Text {
                 text: "done".into(),
             }],
         ]);
@@ -924,7 +925,7 @@ mod tests {
         use kloop_provider::MockTurn;
         let repo = temp_git_repo("sys");
         let (provider, seen) =
-            Provider::mock_recording(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "ok".into(),
             }])]);
         let base = ctx_in(with_provider(test_ctx(0, "sys"), provider), &repo);
@@ -966,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn clean_worktree_subagent_is_torn_down() {
         let repo = temp_git_repo("clean");
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "looked around".into(),
         }]]);
         let ctx = ctx_in(with_provider(test_ctx(0, "clean"), provider), &repo);
@@ -1005,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_worktree_subagents_write_their_own_trees() {
         let repo = temp_git_repo("parallel");
-        let write = ContentBlock::ToolUse {
+        let write = AssistantBlock::ToolUse {
             id: "w".into(),
             name: "write_file".into(),
             input: json!({"path": "out.txt", "content": "x"}),
@@ -1126,12 +1127,12 @@ mod tests {
                 dir = shell_dir
             )
         };
-        let tool_use = |id: &str, cmd: String| ContentBlock::ToolUse {
+        let tool_use = |id: &str, cmd: String| AssistantBlock::ToolUse {
             id: id.into(),
             name: "bash".into(),
             input: json!({"command": cmd}),
         };
-        let done = vec![ContentBlock::Text {
+        let done = vec![AssistantBlock::Text {
             text: "sub done".into(),
         }];
         // Whichever sub-agent samples first gets the A-side; the pair is
@@ -1198,7 +1199,7 @@ mod tests {
     /// tool_use ids in request order and the healthy sibling completes.
     #[tokio::test]
     async fn failing_task_does_not_sink_the_batch() {
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "solo done".into(),
         }]]);
         let ctx = with_provider(test_ctx(0, "taskfail"), provider);
@@ -1240,7 +1241,7 @@ mod tests {
     async fn agent_type_routes_system_model_and_tools() {
         use kloop_provider::MockTurn;
         let (provider, seen) =
-            Provider::mock_recording(vec![MockTurn::Blocks(vec![ContentBlock::Text {
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "researched".into(),
             }])]);
         let types = vec![AgentType {
@@ -1316,7 +1317,7 @@ mod tests {
 
         let provider = Provider::mock(vec![
             // sub-agent round 1: rewrite its (empty) todo list
-            vec![ContentBlock::ToolUse {
+            vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
                 name: "todo_write".into(),
                 input: json!({"todos": [
@@ -1324,7 +1325,7 @@ mod tests {
                 ]}),
             }],
             // sub-agent round 2: wrap up
-            vec![ContentBlock::Text {
+            vec![AssistantBlock::Text {
                 text: "sub done".into(),
             }],
         ]);
@@ -1362,7 +1363,7 @@ mod tests {
     /// final text into the PARENT's inbox as a framed SubAgentResult when done.
     #[tokio::test]
     async fn background_task_returns_immediately_and_reinjects() {
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "sub result".into(),
         }]]);
         let mut ctx = with_provider(test_ctx(0, "bg-reinject"), provider);
@@ -1415,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_background_task_does_not_reinject() {
         // Sub-agent blocks on a long bash so stop_agent can catch it running.
-        let provider = Provider::mock(vec![vec![ContentBlock::ToolUse {
+        let provider = Provider::mock(vec![vec![AssistantBlock::ToolUse {
             id: "s1".into(),
             name: "bash".into(),
             input: json!({"command": "sleep 30"}),
@@ -1468,7 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_shutdown_cancels_real_background_subagent() {
-        let provider = Provider::mock(vec![vec![ContentBlock::ToolUse {
+        let provider = Provider::mock(vec![vec![AssistantBlock::ToolUse {
             id: "s1".into(),
             name: "bash".into(),
             input: json!({"command": "sleep 30"}),
@@ -1521,7 +1522,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let sessions = root.join("sessions");
 
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "sub result".into(),
         }]]);
         let base = with_provider(test_ctx(0, "subpersist"), provider);
@@ -1575,7 +1576,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let sessions = root.join("sessions");
 
-        let provider = Provider::mock(vec![vec![ContentBlock::Text {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "bg result".into(),
         }]]);
         let base = with_provider(test_ctx(0, "bgpersist"), provider);
@@ -1619,7 +1620,7 @@ mod tests {
     /// background spawn names no session log and writes nothing.
     #[tokio::test]
     async fn background_task_without_session_notes_nothing() {
-        let provider = Provider::mock(vec![vec![ContentBlock::Text { text: "x".into() }]]);
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text { text: "x".into() }]]);
         let ctx = with_provider(test_ctx(0, "bg-nosession"), provider);
         let (out, _) = run_tool("task", json!({"prompt": "go", "background": true}), &ctx).await;
         assert!(

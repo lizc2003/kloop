@@ -369,11 +369,17 @@ fn is_committable(cell: &Cell) -> bool {
 
 /// How many leading cells to freeze into scrollback so the uncommitted tail fits
 /// an `active_h`-row viewport region. Commits only finalized cells and never the
-/// last one (the live cell stays on screen). A still-running cell at the front
-/// holds the line — but only until the backlog behind it grows past a few
-/// screens, at which point it is force-committed (frozen mid-run) so a stuck
-/// tool or background agent can't pin an unbounded tail in memory.
-pub fn commit_count(cells: &[Cell], width: usize, active_h: usize) -> usize {
+/// last one. A live assistant/reasoning cell is never committed even when it is
+/// no longer last; its completion must still update the original cell by id. A
+/// still-running tool/sub-agent row at the front holds the line until the backlog
+/// grows past a few screens, then may be frozen mid-run so it cannot pin an
+/// unbounded tail.
+pub fn commit_count(
+    cells: &[Cell],
+    width: usize,
+    active_h: usize,
+    mut display_cell_live: impl FnMut(usize) -> bool,
+) -> usize {
     let active_h = active_h.max(1);
     let heights: Vec<usize> = cells.iter().map(|c| cell_lines(c, width).len()).collect();
     let total: usize = heights.iter().sum();
@@ -384,6 +390,9 @@ pub fn commit_count(cells: &[Cell], width: usize, active_h: usize) -> usize {
     let mut committed = 0;
     let mut remaining = total;
     while remaining > active_h && committed + 1 < cells.len() {
+        if display_cell_live(committed) {
+            break;
+        }
         if !is_committable(&cells[committed]) && remaining <= hard_cap {
             break;
         }
@@ -1632,11 +1641,18 @@ mod tests {
         let five: Vec<Cell> = (0..5)
             .map(|i| Cell::Assistant(format!("line {i}")))
             .collect();
-        assert_eq!(commit_count(&five, 40, 10), 0, "fits: commit nothing");
+        assert_eq!(
+            commit_count(&five, 40, 10, |_| false),
+            0,
+            "fits: commit nothing"
+        );
         // total 5 > 3: commit the front 2 so the last 3 fit.
-        assert_eq!(commit_count(&five, 40, 3), 2);
+        assert_eq!(commit_count(&five, 40, 3, |_| false), 2);
         // Never commit the last cell even if the region is tiny.
-        assert_eq!(commit_count(&five, 40, 1), 4);
+        assert_eq!(commit_count(&five, 40, 1, |_| false), 4);
+        // A non-last display item can still receive deltas/completion by id and
+        // must never be frozen into immutable scrollback.
+        assert_eq!(commit_count(&five, 40, 1, |index| index == 0), 0);
 
         // A running tool at the front is not committable, so it holds the line
         // (and everything behind it) until it finishes — as long as the backlog
@@ -1649,7 +1665,7 @@ mod tests {
         }];
         cells.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
         assert_eq!(
-            commit_count(&cells, 40, 2),
+            commit_count(&cells, 40, 2, |_| false),
             0,
             "running front pins the tail"
         );

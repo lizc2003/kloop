@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -10,7 +11,9 @@ use crate::history::History;
 use crate::inbox::Inbox;
 use crate::tools::dispatch_tools;
 use crate::tools::ToolCtx;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 
@@ -301,7 +304,7 @@ async fn turn_rounds(
         let SampleOk {
             blocks,
             usage,
-            stop_reason,
+            outcome,
         } = match sample_with_retry(
             cfg,
             &active_model,
@@ -356,23 +359,25 @@ async fn turn_rounds(
                 }
             }
             Sampled::Cancelled { partial } => {
+                let final_text = text_content(&partial);
                 if !partial.is_empty() {
                     history.record(Message::assistant(partial));
                 }
                 return TurnOutcome {
                     reason: EndReason::Aborted,
-                    final_text: String::new(),
+                    final_text,
                     rounds: round,
                     structured_output: None,
                 };
             }
             Sampled::Partial { error, blocks } => {
+                let final_text = text_content(&blocks);
                 if !blocks.is_empty() {
                     history.record(Message::assistant(blocks));
                 }
                 return TurnOutcome {
                     reason: EndReason::Error(error),
-                    final_text: String::new(),
+                    final_text,
                     rounds: round,
                     structured_output: None,
                 };
@@ -405,7 +410,17 @@ async fn turn_rounds(
                 };
             }
         };
-        history.record(Message::assistant(blocks.clone()));
+        if let Err(error) = validate_assistant_result(&outcome, &blocks) {
+            return TurnOutcome {
+                reason: EndReason::Error(error),
+                final_text: String::new(),
+                rounds: round + 1,
+                structured_output: None,
+            };
+        }
+        if !blocks.is_empty() {
+            history.record(Message::assistant(blocks.clone()));
+        }
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
@@ -415,70 +430,108 @@ async fn turn_rounds(
 
         let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()
-            .filter_map(|b| match b {
+            .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, name, input } => {
                     Some((id.clone(), name.clone(), input.clone()))
                 }
-                _ => None,
+                ContentBlock::Text { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
-        if tool_uses.is_empty() {
-            if options.structured_schema.is_some() {
-                structured_failures += 1;
-                if structured_failures >= 3 {
-                    return TurnOutcome {
-                        reason: EndReason::Error(
-                            "structured output was not produced after 3 attempts".into(),
-                        ),
-                        final_text: String::new(),
-                        rounds: round + 1,
-                        structured_output: None,
-                    };
-                }
-                history.record(Message::user_text(crate::structured_output::nudge()));
-                continue;
-            }
-            // The turn would end here — but a steer that landed during this
-            // final sampling must not be lost. Absorb it and keep going, so a
-            // late "wait, also do X" is answered instead of dropped. (Steers
-            // during tool execution are already delivered at the loop top.)
-            if drain_inbox(&cfg.inbox, history, ui) {
-                continue;
-            }
-            // If the response was cut off by the output limit, ending would
-            // strand it mid-thought. Nudge the model to continue, a bounded
-            // number of times per turn. (A truncated response WITH tool calls
-            // needs no special handling: the loop continues naturally and the
-            // model resumes itself.)
-            let round_text = last_text(&blocks);
-            if is_truncated(stop_reason.as_deref())
-                && truncation_recoveries < TRUNCATION_RECOVERY_LIMIT
-            {
-                truncation_recoveries += 1;
-                // Keep the cut-off segment. A sub-agent (stream_text=false)
-                // delivers ONLY through final_text, so without this a long
-                // answer that overran the output limit would reach the parent
-                // as just its tail — the front would be lost.
-                truncated_prefix.push_str(&round_text);
-                ui.emit(&Event::Note(format!(
-                    "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
-                )));
-                history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
-                continue;
-            }
-            let final_text = if truncated_prefix.is_empty() {
-                round_text
-            } else {
-                format!("{truncated_prefix}{round_text}")
-            };
-            return TurnOutcome {
-                reason: EndReason::Completed,
-                final_text,
-                rounds: round + 1,
-                structured_output: None,
-            };
-        }
 
+        match &outcome {
+            AssistantOutcome::Refused => {
+                return TurnOutcome {
+                    reason: EndReason::Error("model refused the request".into()),
+                    final_text: text_content(&blocks),
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            AssistantOutcome::Filtered => {
+                return TurnOutcome {
+                    reason: EndReason::Error("provider filtered the response".into()),
+                    final_text: text_content(&blocks),
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            AssistantOutcome::Incomplete(reason) => {
+                let reason = match reason {
+                    IncompleteReason::PauseTurn => "pause_turn",
+                    IncompleteReason::Provider(reason) => reason,
+                };
+                return TurnOutcome {
+                    reason: EndReason::Error(format!(
+                        "provider returned an incomplete response: {reason}"
+                    )),
+                    final_text: text_content(&blocks),
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            AssistantOutcome::OutputLimit(_) => {
+                let round_text = text_content(&blocks);
+                if truncation_recoveries < TRUNCATION_RECOVERY_LIMIT {
+                    truncation_recoveries += 1;
+                    truncated_prefix.push_str(&round_text);
+                    ui.emit(&Event::Note(format!(
+                        "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
+                    )));
+                    history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
+                    continue;
+                }
+                let final_text = format!("{truncated_prefix}{round_text}");
+                return TurnOutcome {
+                    reason: EndReason::Error(format!(
+                        "response remained truncated after {TRUNCATION_RECOVERY_LIMIT} continuation attempts"
+                    )),
+                    final_text,
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            AssistantOutcome::EndTurn => {
+                if options.structured_schema.is_some() {
+                    structured_failures += 1;
+                    if structured_failures >= 3 {
+                        return TurnOutcome {
+                            reason: EndReason::Error(
+                                "structured output was not produced after 3 attempts".into(),
+                            ),
+                            final_text: String::new(),
+                            rounds: round + 1,
+                            structured_output: None,
+                        };
+                    }
+                    history.record(Message::user_text(crate::structured_output::nudge()));
+                    continue;
+                }
+                // The turn would end here — but a steer that landed during this
+                // final sampling must not be lost. Absorb it and keep going, so a
+                // late "wait, also do X" is answered instead of dropped. (Steers
+                // during tool execution are already delivered at the loop top.)
+                if drain_inbox(&cfg.inbox, history, ui) {
+                    continue;
+                }
+                let round_text = text_content(&blocks);
+                let final_text = if truncated_prefix.is_empty() {
+                    round_text
+                } else {
+                    format!("{truncated_prefix}{round_text}")
+                };
+                return TurnOutcome {
+                    reason: EndReason::Completed,
+                    final_text,
+                    rounds: round + 1,
+                    structured_output: None,
+                };
+            }
+            AssistantOutcome::ToolUse => {}
+        }
         let ctx = ToolCtx {
             cfg: cfg.clone(),
             ui: ui.clone(),
@@ -557,9 +610,11 @@ async fn dispatch_structured_tools(
                     "only one structured_output call may complete a turn",
                 )
             } else {
-                match crate::structured_output::validate_value(schema, &input) {
-                    Ok(()) => {
-                        accepted = Some(input);
+                match crate::structured_output::input_value(schema, &input).and_then(|value| {
+                    crate::structured_output::validate_value(schema, value).map(|()| value.clone())
+                }) {
+                    Ok(value) => {
+                        accepted = Some(value);
                         crate::structured_output::success_result(id)
                     }
                     Err(error) => crate::structured_output::error_result(id, &error),
@@ -586,26 +641,68 @@ async fn dispatch_structured_tools(
     )
 }
 
-/// The response was cut off by the output token limit ("max_tokens" on the
-/// Anthropic wire, "length" on OpenAI-compat). This is the one legitimate use
-/// of stop_reason: not to decide continuation, but to detect an ungraceful
-/// ending worth recovering from.
-fn is_truncated(stop_reason: Option<&str>) -> bool {
-    matches!(stop_reason, Some("max_tokens") | Some("length"))
+/// Defense in depth at the history/dispatch boundary. Adapters already enforce
+/// these rules; core repeats them so no provider implementation can construct
+/// replayable or dispatchable state outside the canonical assistant contract.
+fn validate_assistant_result(
+    outcome: &AssistantOutcome,
+    blocks: &[ContentBlock],
+) -> Result<(), String> {
+    let mut tool_ids = HashSet::new();
+    let mut has_tool = false;
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } if text.is_empty() => {
+                return Err("provider returned an empty assistant text block".into())
+            }
+            ContentBlock::RedactedThinking { data } if data.is_empty() => {
+                return Err("provider returned an empty redacted thinking block".into())
+            }
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } if thinking.is_empty() && signature.is_empty() => {
+                return Err("provider returned an empty thinking block".into())
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                has_tool = true;
+                if id.is_empty() || name.is_empty() {
+                    return Err("provider returned a tool call with an empty identity".into());
+                }
+                if !input.is_object() {
+                    return Err(format!(
+                        "provider returned non-object input for tool {name}"
+                    ));
+                }
+                if !tool_ids.insert(id) {
+                    return Err("provider returned duplicate tool call ids".into());
+                }
+            }
+            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {
+                return Err("provider returned a non-assistant output block".into())
+            }
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    match (matches!(outcome, AssistantOutcome::ToolUse), has_tool) {
+        (true, false) => Err("provider reported tool use without a tool call".into()),
+        (false, true) => Err("provider returned a tool call for a non-tool outcome".into()),
+        _ => Ok(()),
+    }
 }
 
-/// The last text block of a sampled response — the assistant's answer for the
-/// round. Used both to end a turn and to preserve the cut-off segment of a
-/// truncated round before the continuation nudge.
-fn last_text(blocks: &[ContentBlock]) -> String {
+/// All text blocks of a sampled response, in provider order. Used both to end
+/// a turn and to preserve every cut-off segment before a continuation nudge.
+fn text_content(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
-        .rev()
-        .find_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.clone()),
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 const TRUNCATION_RECOVERY_LIMIT: u32 = 3;

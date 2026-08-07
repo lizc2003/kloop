@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kloop_protocol::{ContentBlock, Message};
+use kloop_protocol::{AssistantBlock, ContentBlock, Message};
 use kloop_provider::{MockTurn, Provider};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -120,8 +120,8 @@ impl Approver for ScriptedApprover {
     }
 }
 
-fn tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
-    ContentBlock::ToolUse {
+fn tool_use(id: &str, name: &str, input: Value) -> AssistantBlock {
+    AssistantBlock::ToolUse {
         id: id.into(),
         name: name.into(),
         input,
@@ -587,7 +587,7 @@ async fn structured_output_report() -> Value {
 
     let (ordinary_config, ordinary_seen) = structured_config(
         root.path(),
-        vec![MockTurn::Blocks(vec![ContentBlock::Text {
+        vec![MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "plain".into(),
         }])],
     );

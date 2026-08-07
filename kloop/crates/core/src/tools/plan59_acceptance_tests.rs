@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use kloop_protocol::{ContentBlock, Message, ToolDef};
+use kloop_protocol::{AssistantBlock, Message, ToolDef};
 use kloop_provider::{MockTurn, Provider};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -440,16 +440,16 @@ async fn background_agent_scheduler_report() -> Value {
     let (live_started_tx, live_started_rx) = oneshot::channel();
     let (live_release_tx, live_release_rx) = oneshot::channel();
     let (provider, seen) = Provider::mock_recording(vec![
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "AGENT-RESULT-59".into(),
         }]),
-        MockTurn::Blocks(vec![ContentBlock::Text {
+        MockTurn::Blocks(vec![AssistantBlock::Text {
             text: "PARENT-REINJECTED-59".into(),
         }]),
         MockTurn::Gate {
             started: live_started_tx,
             release: live_release_rx,
-            blocks: vec![ContentBlock::Text {
+            blocks: vec![AssistantBlock::Text {
                 text: "MUST-NOT-DELIVER-59".into(),
             }],
         },
@@ -874,7 +874,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let workflow_provider = Provider::mock_scripted(vec![MockTurn::Gate {
         started: workflow_started_tx,
         release: workflow_release_rx,
-        blocks: vec![ContentBlock::Text {
+        blocks: vec![AssistantBlock::Text {
             text: "MUST-NOT-DELIVER-WORKFLOW-59".into(),
         }],
     }]);

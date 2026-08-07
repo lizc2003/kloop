@@ -153,9 +153,10 @@ async fn tool_calls_pass_the_permission_gate() {
 /// (scripted) provider and returns its final text.
 #[tokio::test]
 async fn agent_call_spawns_a_subagent() {
-    let provider = kloop_provider::Provider::mock(vec![vec![kloop_protocol::ContentBlock::Text {
-        text: "sub-agent result".into(),
-    }]]);
+    let provider =
+        kloop_provider::Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
+            text: "sub-agent result".into(),
+        }]]);
     let ctx = with_provider(test_ctx(0, "agent"), provider);
     let (out, is_error) = run(r#"return await agent("do the thing");"#, &ctx).await;
     assert!(!is_error, "{out}");
@@ -167,7 +168,7 @@ async fn agent_call_spawns_a_subagent() {
 /// sub-agents ever run.
 #[tokio::test]
 async fn agent_cap_refuses_runaway_fanout() {
-    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let text = |t: &str| vec![kloop_protocol::AssistantBlock::Text { text: t.into() }];
     let provider = kloop_provider::Provider::mock(vec![text("one"), text("two")]);
     let ctx = with_program_limits(
         with_provider(test_ctx(0, "agentcap"), provider),
@@ -480,7 +481,7 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let _ = std::fs::remove_dir_all(&jdir);
     std::fs::create_dir_all(&jdir).unwrap();
 
-    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let text = |t: &str| vec![kloop_protocol::AssistantBlock::Text { text: t.into() }];
     let provider = kloop_provider::Provider::mock(vec![text("FIRST"), text("SECOND")]);
     let ctx = with_provider(test_ctx(0, "resume"), provider);
     let src = r#"return await agent("do the work");"#;
@@ -514,7 +515,7 @@ async fn concurrent_resume_of_one_program_run_is_rejected() {
     let provider = kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Gate {
         started: started_tx,
         release: release_rx,
-        blocks: vec![kloop_protocol::ContentBlock::Text {
+        blocks: vec![kloop_protocol::AssistantBlock::Text {
             text: "LOCKED_RESULT".into(),
         }],
     }]);
@@ -550,7 +551,7 @@ async fn failure_after_agent_reports_a_resumable_run_id() {
     let _ = std::fs::remove_dir_all(&jdir);
     std::fs::create_dir_all(&jdir).unwrap();
 
-    let text = |t: &str| vec![kloop_protocol::ContentBlock::Text { text: t.into() }];
+    let text = |t: &str| vec![kloop_protocol::AssistantBlock::Text { text: t.into() }];
     let provider = kloop_provider::Provider::mock(vec![text("STEP_ONE_DONE")]);
     let ctx = with_provider(test_ctx(0, "resumefail"), provider);
     let src = r#"await agent("step one"); throw new Error("boom after step one");"#;

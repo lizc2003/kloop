@@ -23,6 +23,7 @@ use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::Rollout;
 use kloop_core::Config;
+use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_provider::Provider;
@@ -186,15 +187,15 @@ fn test_dirs(tag: &str) -> TestDirs {
     }
 }
 
-fn text(t: &str) -> ContentBlock {
-    ContentBlock::Text { text: t.into() }
+fn text(t: &str) -> AssistantBlock {
+    AssistantBlock::Text { text: t.into() }
 }
 
 /// Factory over a scripted Mock provider; every thread gets its own copy of
 /// the script. `gated` = a real Manual-mode permission gate wired to the
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
-fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
+fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
     Arc::new(move |options, approver, questioner, _notify| {
         let permissions = if gated {
             Permissions::new(
@@ -259,7 +260,7 @@ fn factory(turns: Vec<Vec<ContentBlock>>, offload: PathBuf, gated: bool) -> Conf
 }
 
 fn clocked_scheduler_factory(
-    turns: Vec<Vec<ContentBlock>>,
+    turns: Vec<Vec<AssistantBlock>>,
     offload: PathBuf,
     clock: Arc<kloop_core::scheduler::ManualClock>,
 ) -> ConfigFactory {
@@ -294,7 +295,7 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
 }
 
 fn recording_factory(
-    turns: Vec<Vec<ContentBlock>>,
+    turns: Vec<Vec<AssistantBlock>>,
     offload: PathBuf,
     seen: Arc<Mutex<Vec<ThreadStartOptions>>>,
 ) -> ConfigFactory {
@@ -305,8 +306,8 @@ fn recording_factory(
     })
 }
 
-fn tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
-    ContentBlock::ToolUse {
+fn tool_use(id: &str, name: &str, input: Value) -> AssistantBlock {
+    AssistantBlock::ToolUse {
         id: id.into(),
         name: name.into(),
         input,
@@ -339,7 +340,7 @@ fn temp_git_repo(tag: &str) -> PathBuf {
 /// Like `factory` but with worktree mode ON and cwd pointed at a real git repo
 /// (a bypass gate bound to the same project identity).
 fn worktree_factory(
-    turns: Vec<Vec<ContentBlock>>,
+    turns: Vec<Vec<AssistantBlock>>,
     offload: PathBuf,
     cwd: PathBuf,
 ) -> ConfigFactory {
@@ -960,9 +961,9 @@ async fn early_prefix_fork_keeps_runtime_written_after_the_cut() {
     let mut rollout = Rollout::new(source_path.clone());
     for message in [
         Message::user_text("q1"),
-        Message::assistant(vec![text("a1")]),
+        Message::assistant(vec![ContentBlock::Text { text: "a1".into() }]),
         Message::user_text("q2"),
-        Message::assistant(vec![text("a2")]),
+        Message::assistant(vec![ContentBlock::Text { text: "a2".into() }]),
     ] {
         rollout.append_message(&message).unwrap();
     }

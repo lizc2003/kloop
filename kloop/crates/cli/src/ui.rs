@@ -2,7 +2,9 @@
 //! ([`CliApprover`]) and the streaming stdout renderer ([`StdoutUi`]) the
 //! `--plain`/`--mock` REPL installs, plus the ANSI diff colorizer they share.
 
+use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::Mutex;
 
 use kloop_core::agent::Ui;
 use kloop_core::event::Delta;
@@ -267,9 +269,71 @@ fn parse_selection(input: &str, option_count: usize, multi_select: bool) -> Opti
     Some(selected)
 }
 
-pub(crate) struct StdoutUi;
+#[derive(Clone, Copy)]
+enum PlainItemKind {
+    Text,
+    Reasoning,
+}
+
+struct PlainItem {
+    kind: PlainItemKind,
+    printed: String,
+}
+
+#[derive(Default)]
+pub(crate) struct StdoutUi {
+    items: Mutex<HashMap<String, PlainItem>>,
+}
 
 impl StdoutUi {
+    fn print_piece(kind: PlainItemKind, text: &str) {
+        match kind {
+            PlainItemKind::Text => print!("{text}"),
+            PlainItemKind::Reasoning => print!("\x1b[2m{text}\x1b[0m"),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    fn start_item(&self, id: &str, kind: PlainItemKind, text: &str) {
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = items.entry(id.to_string()).or_insert_with(|| PlainItem {
+            kind,
+            printed: String::new(),
+        });
+        if entry.printed.is_empty() && !text.is_empty() {
+            Self::print_piece(kind, text);
+            entry.printed.push_str(text);
+        }
+    }
+
+    fn append_item(&self, id: &str, kind: PlainItemKind, text: &str) {
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = items.entry(id.to_string()).or_insert_with(|| PlainItem {
+            kind,
+            printed: String::new(),
+        });
+        Self::print_piece(entry.kind, text);
+        entry.printed.push_str(text);
+    }
+
+    fn finish_item(&self, id: &str, kind: PlainItemKind, text: &str) {
+        let previous = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id)
+            .map(|item| item.printed)
+            .unwrap_or_default();
+        if previous == text {
+            return;
+        }
+        if let Some(suffix) = text.strip_prefix(&previous) {
+            Self::print_piece(kind, suffix);
+        } else {
+            Self::print_piece(kind, text);
+        }
+    }
+
     /// The checklist a todo update renders (its own block, not a one-line note).
     fn todo_checklist(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
         let prefix = if agent.is_empty() {
@@ -292,21 +356,30 @@ impl StdoutUi {
 impl Ui for StdoutUi {
     fn emit(&self, ev: &Event) {
         match ev {
+            Event::ItemStarted {
+                id,
+                item: Item::AssistantMessage { text, .. },
+            } => self.start_item(id, PlainItemKind::Text, text),
+            Event::ItemStarted {
+                id,
+                item: Item::Reasoning { text, .. },
+            } => self.start_item(id, PlainItemKind::Reasoning, text),
             Event::ItemDelta {
-                delta: Delta::Text(s),
-                ..
-            } => {
-                print!("{s}");
-                let _ = std::io::stdout().flush();
-            }
+                id,
+                delta: Delta::Text(text),
+            } => self.append_item(id, PlainItemKind::Text, text),
             Event::ItemDelta {
-                delta: Delta::Reasoning(s),
-                ..
-            } => {
-                // Dim gray, inline with the stream: reasoning is context, not answer.
-                print!("\x1b[2m{s}\x1b[0m");
-                let _ = std::io::stdout().flush();
-            }
+                id,
+                delta: Delta::Reasoning(text),
+            } => self.append_item(id, PlainItemKind::Reasoning, text),
+            Event::ItemCompleted {
+                id,
+                item: Item::AssistantMessage { text, .. },
+            } => self.finish_item(id, PlainItemKind::Text, text),
+            Event::ItemCompleted {
+                id,
+                item: Item::Reasoning { text, .. },
+            } => self.finish_item(id, PlainItemKind::Reasoning, text),
             Event::ItemCompleted {
                 item: Item::Todo { agent, items },
                 ..

@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use kloop_protocol::ContentBlock;
+use kloop_protocol::AssistantBlock;
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::Message;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
@@ -30,9 +31,27 @@ async fn mount_sse(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
+            // The production client is process-wide; close fixture sockets so a
+            // recycled wiremock port cannot inherit an idle connection.
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
+                .insert_header("connection", "close")
                 .set_body_raw(body, "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_bytes(server: &MockServer, body: Vec<u8>) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            // The production client is process-wide; close fixture sockets so a
+            // recycled wiremock port cannot inherit an idle connection.
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("connection", "close")
+                .set_body_bytes(body),
         )
         .mount(server)
         .await;
@@ -64,16 +83,19 @@ async fn accumulates_tool_calls_and_usage_across_chunks() {
         &server,
         sse_body(
             &[
-                json!({"choices": [{"delta": {"content": "thin"}}]}),
-                json!({"choices": [{"delta": {"content": "king"}}]}),
-                json!({"choices": [{"delta": {"tool_calls": [
-                    {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"comm"}}
+                json!({"choices": [{"index": 0, "delta": {"content": "thin"}}]}),
+                json!({"choices": [{"index": 0, "delta": {"content": "king"}}]}),
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "c1", "function": {"name": "", "arguments": "{\"comm"}}
                 ]}}]}),
-                json!({"choices": [{"delta": {"tool_calls": [
-                    {"index": 0, "function": {"arguments": "and\":\"ls\"}"}},
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"name": "bash", "arguments": "and\":\"ls\"}"}},
                     {"index": 1, "id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"x\"}"}}
                 ]}}]}),
-                json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "", "function": {"name": "", "arguments": ""}}
+                ]}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
                 json!({"choices": [], "usage": {"prompt_tokens": 88, "completion_tokens": 17}}),
             ],
             true,
@@ -91,22 +113,24 @@ async fn accumulates_tool_calls_and_usage_across_chunks() {
     assert!(matches!(&ok[1], StreamEvent::TextDelta(t) if t == "king"));
     assert!(matches!(
         &ok[2],
-        StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "thinking"
+        StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "thinking"
     ));
     assert!(matches!(
         &ok[3],
-        StreamEvent::BlockDone(ContentBlock::ToolUse { id, name, input })
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
             if id == "c1" && name == "bash" && input == &json!({"command": "ls"})
     ));
     assert!(matches!(
         &ok[4],
-        StreamEvent::BlockDone(ContentBlock::ToolUse { id, name, input })
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
             if id == "c2" && name == "read_file" && input == &json!({"path": "x"})
     ));
     assert!(matches!(
         &ok[5],
-        StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
-            if r == "tool_calls" && *u == Usage { input_tokens: 88, output_tokens: 17, ..Default::default() }
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::ToolUse,
+            usage: Some(u),
+        } if *u == Usage { input_tokens: 88, output_tokens: 17, ..Default::default() }
     ));
     assert_eq!(ok.len(), 6);
 }
@@ -121,10 +145,10 @@ async fn reasoning_content_becomes_thinking_block() {
         &server,
         sse_body(
             &[
-                json!({"choices": [{"delta": {"reasoning_content": "hmm, "}}]}),
-                json!({"choices": [{"delta": {"reasoning": "two"}}]}),
-                json!({"choices": [{"delta": {"content": "4"}}]}),
-                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [{"index": 0, "delta": {"reasoning_content": "hmm, "}}]}),
+                json!({"choices": [{"index": 0, "delta": {"reasoning": "two"}}]}),
+                json!({"choices": [{"index": 0, "delta": {"content": "4"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
             ],
             true,
         ),
@@ -141,11 +165,11 @@ async fn reasoning_content_becomes_thinking_block() {
     assert!(matches!(&ok[2], StreamEvent::TextDelta(t) if t == "4"));
     assert!(matches!(
         &ok[3],
-        StreamEvent::BlockDone(ContentBlock::Thinking { thinking, signature })
+        StreamEvent::BlockDone(AssistantBlock::Thinking { thinking, signature })
             if thinking == "hmm, two" && signature.is_empty()
     ));
-    assert!(matches!(&ok[4], StreamEvent::BlockDone(ContentBlock::Text { text }) if text == "4"));
-    assert!(matches!(&ok[5], StreamEvent::Done { .. }));
+    assert!(matches!(&ok[4], StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "4"));
+    assert!(matches!(&ok[5], StreamEvent::Terminal { .. }));
     assert_eq!(ok.len(), 6);
 }
 
@@ -159,7 +183,7 @@ async fn cached_prompt_tokens_are_split_out_of_input() {
         &server,
         sse_body(
             &[
-                json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+                json!({"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}),
                 json!({"choices": [], "usage": {
                     "prompt_tokens": 1000,
                     "completion_tokens": 20,
@@ -176,7 +200,7 @@ async fn cached_prompt_tokens_are_split_out_of_input() {
         .into_iter()
         .map(|e| e.unwrap())
         .collect();
-    let StreamEvent::Done {
+    let StreamEvent::Terminal {
         usage: Some(usage), ..
     } = ok.last().unwrap()
     else {
@@ -195,16 +219,54 @@ async fn cached_prompt_tokens_are_split_out_of_input() {
 
 /// Non-empty malformed tool arguments fail closed before a ToolUse or Done is emitted.
 #[tokio::test]
+async fn empty_tool_identity_must_eventually_fill_and_nonempty_values_cannot_change() {
+    let cases = vec![
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "", "function": {"name": "", "arguments": "{}"}}
+            ]}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ],
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}
+            ]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "c2"}
+            ]}}]}),
+        ],
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}
+            ]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "sh"}}
+            ]}}]}),
+        ],
+    ];
+    let server = MockServer::start().await;
+    for (index, wire) in cases.into_iter().enumerate() {
+        mount_sse(&server, sse_body(&wire, true)).await;
+        let events = collect(openai(&server)).await;
+        assert_eq!(events.len(), 1, "case {index}");
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "case {index}");
+        assert!(!error.after_semantic_output(), "case {index}");
+        server.reset().await;
+    }
+}
+
+#[tokio::test]
 async fn malformed_arguments_fail_closed() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
         sse_body(
             &[
-                json!({"choices": [{"delta": {"tool_calls": [
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                     {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{oops"}}
                 ]}}]}),
-                json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
             ],
             true,
         ),
@@ -243,7 +305,7 @@ async fn stream_dying_mid_flight_is_an_error() {
     mount_sse(
         &server,
         sse_body(
-            &[json!({"choices": [{"delta": {"content": "par"}}]})],
+            &[json!({"choices": [{"index": 0, "delta": {"content": "par"}}]})],
             false,
         ),
     )
@@ -268,8 +330,8 @@ async fn finish_reason_succeeds_without_done_sentinel() {
         &server,
         sse_body(
             &[
-                json!({"choices": [{"delta": {"content": "ok"}}]}),
-                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
             ],
             false,
         ),
@@ -279,12 +341,15 @@ async fn finish_reason_succeeds_without_done_sentinel() {
     let events = collect(openai(&server)).await;
     assert!(matches!(
         events.last().unwrap().as_ref().unwrap(),
-        StreamEvent::Done { stop_reason: Some(reason), .. } if reason == "stop"
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
     ));
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, Ok(StreamEvent::Done { .. }) | Err(_)))
+            .filter(|event| matches!(event, Ok(StreamEvent::Terminal { .. }) | Err(_)))
             .count(),
         1
     );
@@ -300,6 +365,54 @@ async fn done_without_finish_reason_is_not_completion() {
     let error = events.into_iter().next().unwrap().unwrap_err();
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
     assert!(error.is_retryable());
+}
+
+#[tokio::test]
+async fn semantic_frame_after_done_fails_closed() {
+    let server = MockServer::start().await;
+    let finish = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+    mount_sse(&server, format!("data: [DONE]\n\ndata: {finish}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(!error.after_semantic_output());
+}
+
+#[tokio::test]
+async fn finish_reason_is_low_latency_but_later_complete_semantic_frames_fail_closed() {
+    let finish = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+    let server = MockServer::start().await;
+
+    let mut partial_tail = sse_body(std::slice::from_ref(&finish), false);
+    partial_tail.push_str("data: [DO");
+    mount_sse(&server, partial_tail).await;
+    let events = collect(openai(&server)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        })]
+    ));
+
+    server.reset().await;
+    mount_sse(&server, sse_body(&[finish.clone(), finish], false)).await;
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+
+    server.reset().await;
+    mount_bytes(&server, b"data: \xff\n\n".to_vec()).await;
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
 }
 
 #[tokio::test]

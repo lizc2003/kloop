@@ -1138,7 +1138,7 @@ mod tests {
 
         // First run: one completed turn, then the process "exits" (drop).
         let cfg = cfg_with(
-            Provider::mock(vec![vec![ContentBlock::Text {
+            Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
                 text: "noted: the magic word is kumquat".into(),
             }]]),
             &dir,
@@ -1155,7 +1155,7 @@ mod tests {
         let (resumed, rollout) = resume_session(&path).unwrap();
         assert_eq!(resumed, before_restart);
         let cfg = cfg_with(
-            Provider::mock(vec![vec![ContentBlock::Text {
+            Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
                 text: "it was kumquat".into(),
             }]]),
             &dir,
