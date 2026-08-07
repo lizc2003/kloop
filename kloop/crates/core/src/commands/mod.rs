@@ -221,7 +221,7 @@ mod tests {
             todos: Default::default(),
             inbox: Default::default(),
             scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
-            background_tasks: Default::default(),
+            background_executions: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),

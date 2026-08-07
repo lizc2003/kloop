@@ -204,14 +204,17 @@ Plan 52 完成时 corpus 为 **96 captures / 137 static evidence**，matrix 仍�
 67 `compatible` / 119 `intentional-diff` / 23 `missing` / 207 `unknown` / 22 `n/a` / 10 `same`。
 新增 Agent fixture 固定 `description + prompt` 必填、默认后台、显式 `run_in_background:false` 前台、
 model override，以及 remote gate 不满足时回退 local async；bundle locator 则补齐 async output、默认分支与
-team/remote gate。kloop 保留 `task` 原生默认同步、参数名、depth=1 和并发策略，故只把 local executor
+team/remote gate。Plan 52 当时固定 kloop 原生 `task` 默认同步；Plan 66 后公开名迁为
+`run_agent`，默认值、参数、depth=1 与并发策略不变，故仍只把 local executor
 能力记为 compatible，wire/schema/parser/output/lifecycle 均为 intentional diff。
 
 六个 Task* 现在各有独立 runtime case；额外的 scripted lifecycle 固定两条稳定 ID、owner/metadata、
 `blocks/blockedBy` 双向投影、pending→in_progress→completed→deleted 与删除后查询。TaskOutput/TaskStop
-只裁决 missing-ID 分支，不能外推 live lifecycle。kloop 不把 `todo_write`、`BackgroundTasks`、`wait`、
-`stop_agent` 组装成同名 registry：todo 仍是无 ID 全表替换，后台 registry 仍只拥有 agent/program
-执行生命周期，wait 仍只等 activity 且不 drain。
+只裁决 missing-ID 分支，不能外推 live lifecycle。kloop 不把 `todo_write`、后台执行或 shell
+组装成同名 registry：todo 仍是无 ID 全表替换；`BackgroundExecutions` 只拥有
+agent/program/workflow 回灌生命周期，`BackgroundShells` 继续拥有文件型 shell。
+Plan 66 将控制面收口为 ID-free、non-drain 的 `wait_for_activity`，以及
+`stop_agent` / `stop_program` / `stop_workflow` / `stop_bash` 四个资源专属 stop；交叉 ID fail closed。
 
 SendMessage clean fixture 固定 string-message observable-input backfill 与 unknown recipient；kloop 无
 model-visible mailbox，已执行维度标 missing。ListAgents 只在 bundle/alias 中坐实，`team=false` clean
@@ -219,10 +222,18 @@ profile 明确不注册；真实 team/remote/ListAgents 因 account/environment/
 继续 unknown，未连接真实 cloud、团队、凭据或用户 mailbox。
 
 kloop 新增公开 mock-only sampling `Gate`（started/release 两相同步），Plan 52 Rust report 真实运行
-`dispatch_tools`/`run_turn`，无 sleep/文件轮询地证明两个同步 task 同时到达 sampling，并锁定后台完成回灌、
-stop-vs-completion 一次终态、final sampling inbox 兜底、todo replacement、wait non-drain、stop scope 与
-CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter tamper
-测试 fail closed；没有新增 pair contract 或人为制造 `same`。
+`dispatch_tools`/`run_turn`，无 sleep/文件轮询地证明两个同步 run_agent 同时到达 sampling，并锁定后台完成回灌、
+stop-vs-completion 一次终态、final sampling inbox 兜底、todo replacement、wait_for_activity non-drain、unknown-stop
+error settlement 与 CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter
+tamper 测试 fail closed；没有新增 pair contract 或人为制造 `same`。Plan 66 的普通 Rust golden 另行表驱动
+全部 12 个跨资源 stop 负组合、`workflow-N`/`wf_*` 边界和 strict background/wait parser；这些不冒充
+Plan 52 report 自己覆盖的场景。
+
+Plan 66 是 kloop 原生协议的命名收口，不是 Claude Code adapter：`task → run_agent`、
+`wait → wait_for_activity`、`kill_bash → stop_bash`，并新增 typed `stop_program` / `stop_workflow`；
+Bash 的 `run_in_background` 同步迁为 `background`，与 Agent/Program 统一。`bash_output` 保留，
+因为它查询状态、可等待并读取输出尾部；`bash_background` 会误导成第二个启动入口。旧工具名与旧字段
+不双栈，只返定向迁移错误，`task_*` 留给后续结构化 Task graph。
 
 Plan 53 完成时 corpus 为 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
 状态为 65 `compatible` / 132 `intentional-diff` / 36 `missing` / 183 `unknown` / 22 `n/a` /

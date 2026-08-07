@@ -337,7 +337,7 @@ async fn mock_end_to_end_three_rounds() {
         todos: Default::default(),
         inbox: Default::default(),
         scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
-        background_tasks: Default::default(),
+        background_executions: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
         active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
@@ -516,7 +516,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         todos: Default::default(),
         inbox: Default::default(),
         scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
-        background_tasks: Default::default(),
+        background_executions: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
         active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
@@ -2013,7 +2013,7 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
     assert_eq!(*split.text.lock().unwrap(), "answer");
 }
 
-/// The task tool spawns a sub-agent that consumes its own turns from the
+/// run_agent spawns a sub-agent that consumes its own turns from the
 /// same provider and returns its final text as the tool result.
 #[tokio::test]
 async fn subagent_roundtrip_returns_final_text() {
@@ -2021,7 +2021,7 @@ async fn subagent_roundtrip_returns_final_text() {
         // main agent round 1: spawn the sub-agent
         vec![AssistantBlock::ToolUse {
             id: "t1".into(),
-            name: "task".into(),
+            name: "run_agent".into(),
             input: json!({"prompt": "sub work"}),
         }],
         // consumed by the sub-agent's own run_turn
@@ -2174,7 +2174,7 @@ async fn late_steering_keeps_the_turn_going() {
 }
 
 /// A running sub-agent must not drain the PARENT's steering queue: each
-/// agent gets its own inbox (the task tool resets it on the cloned Config).
+/// agent gets its own inbox (run_agent resets it on the cloned Config).
 /// A steer pushed to the parent while the sub-agent works is invisible to
 /// the sub-agent and delivered to the parent at its own next boundary.
 #[tokio::test]
@@ -2208,7 +2208,7 @@ async fn subagent_does_not_drain_parent_steering() {
         // parent round 0: spawn a sub-agent
         MockTurn::Blocks(vec![tool_use_named(
             "t1",
-            "task",
+            "run_agent",
             json!({"prompt": "sub work"}),
         )]),
         // sub round 0: run a tool (fires the parent steer mid-sub-turn)

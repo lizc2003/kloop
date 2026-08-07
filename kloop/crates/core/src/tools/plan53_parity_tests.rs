@@ -223,7 +223,12 @@ fn native_surface_report() -> Value {
         .find(|definition| definition.name == "run_program")
         .unwrap();
     let run_program_wire = format!("{} {}", run_program.description, run_program.schema);
-    assert!(names.iter().all(|name| !run_program_wire.contains(name)));
+    for name in names {
+        assert!(
+            !run_program_wire.contains(name),
+            "run_program surface leaked {name}: {run_program_wire}"
+        );
+    }
 
     json!({
         "enabled_depth_zero": names,
@@ -428,7 +433,7 @@ async fn workflow_report() -> Value {
     let (invalid, invalid_error) =
         run_tool("workflow", json!({"script": "return 1"}), &context).await;
     assert!(invalid_error && invalid.contains("meta"));
-    assert_eq!(context.cfg.background_tasks.running_count(), 0);
+    assert_eq!(context.cfg.background_executions.running_count(), 0);
     assert!(context.cfg.inbox.is_empty());
 
     let mut activity = context.cfg.inbox.subscribe_activity();
@@ -441,14 +446,14 @@ async fn workflow_report() -> Value {
     )
     .await;
     assert!(!launch_error, "{launched}");
-    assert!(launched.contains("Task ID: workflow-") && launched.contains("Run ID: wf_"));
-    if context.cfg.background_tasks.running_count() != 0 {
+    assert!(launched.contains("Workflow ID: workflow-") && launched.contains("Run ID: wf_"));
+    if context.cfg.background_executions.running_count() != 0 {
         tokio::time::timeout(Duration::from_secs(2), activity.changed())
             .await
             .expect("Workflow did not signal completion")
             .expect("Workflow activity channel closed");
     }
-    assert_eq!(context.cfg.background_tasks.running_count(), 0);
+    assert_eq!(context.cfg.background_executions.running_count(), 0);
     let items = context.cfg.inbox.drain();
     let [InboxItem::WorkflowResult {
         summary,

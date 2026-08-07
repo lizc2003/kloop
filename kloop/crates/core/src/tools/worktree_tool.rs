@@ -1,7 +1,7 @@
 //! `enter_worktree` / `exit_worktree` (plan 35 slice 2): let the SESSION move
 //! into an isolated git worktree at runtime and back out again — cc's
 //! EnterWorktree/ExitWorktree and codex's enter_worktree/exit_worktree, "one
-//! tree per session". Distinct from `task {isolation:worktree}` (slice 1),
+//! tree per session". Distinct from `run_agent {isolation:worktree}` (slice 1),
 //! which isolates a throwaway sub-agent. The switch flips the session's active
 //! worktree slot; the `effective_*` accessors make it take effect immediately.
 
@@ -330,7 +330,7 @@ mod tests {
         let ctx = git_ctx(with_provider(test_ctx(0, "inherit"), provider), &repo, true);
         run_tool("enter_worktree", json!({"name": "wt"}), &ctx).await;
 
-        let (out, is_error) = run_tool("task", json!({"prompt": "go"}), &ctx).await;
+        let (out, is_error) = run_tool("run_agent", json!({"prompt": "go"}), &ctx).await;
         assert!(!is_error, "{out}");
         // The sub-agent's relative write landed in the session's worktree.
         assert!(repo.join(".claude/worktrees/wt/sub.txt").exists());

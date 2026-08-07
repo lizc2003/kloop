@@ -320,7 +320,7 @@ mod tests {
                 kloop_core::shell_programs::ShellPrograms::test_fixture(),
             ),
             powershell_execution_gate: Default::default(),
-            background_tasks: kloop_core::tools::BackgroundTasks::new(),
+            background_executions: kloop_core::tools::BackgroundExecutions::new(),
             sandbox: None,
             agent_types: Arc::new(Vec::new()),
             tool_allowlist: None,

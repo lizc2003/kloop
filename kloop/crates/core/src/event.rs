@@ -47,8 +47,8 @@ pub enum BackgroundTaskStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTask {
     pub id: String,
-    /// Durable run identity when the task has one (Workflow); ordinary shell,
-    /// agent, and program tasks remain task-id-only.
+    /// Durable run identity when the execution has one (Workflow); ordinary shell,
+    /// agent, and program work remains execution-id-only.
     pub run_id: Option<String>,
     pub kind: BackgroundTaskKind,
     pub description: String,

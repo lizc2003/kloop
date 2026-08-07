@@ -149,7 +149,7 @@ async fn tool_calls_pass_the_permission_gate() {
     let _ = std::fs::remove_file(&readable);
 }
 
-/// `agent()` reuses the task seam, spawning a real sub-agent that samples the
+/// `agent()` reuses the run_agent seam, spawning a real sub-agent that samples the
 /// (scripted) provider and returns its final text.
 #[tokio::test]
 async fn agent_call_spawns_a_subagent() {
@@ -234,7 +234,11 @@ async fn background_program_returns_immediately_and_reinjects() {
         }
         other => panic!("expected ProgramResult, got {other:?}"),
     };
-    assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
+    assert_eq!(
+        ctx.cfg.background_executions.running_count(),
+        0,
+        "slot freed"
+    );
     assert_eq!(
         ui.background_events(),
         vec![
@@ -419,13 +423,39 @@ async fn powershell_gate_serializes_direct_and_background_program_executor_entry
     .expect("direct/background PowerShell gate test stalled");
 }
 
-/// A background program cancelled via stop_agent ends Aborted and reinjects
-/// NOTHING (codex's is_final) — only a wake so a blocked wait re-evaluates.
+#[tokio::test]
+async fn run_program_rejects_wrong_background_type_and_unknown_fields() {
+    let ctx = test_ctx(0, "run-program-strict-input");
+    let (wrong_type, type_error) = run_tool(
+        "run_program",
+        json!({"source": "return 'must not run';", "background": "true"}),
+        &ctx,
+    )
+    .await;
+    assert!(type_error);
+    assert!(wrong_type.contains("invalid type"), "{wrong_type}");
+
+    let (unknown, unknown_error) = run_tool(
+        "run_program",
+        json!({"source": "return 'must not run';", "run_in_background": true}),
+        &ctx,
+    )
+    .await;
+    assert!(unknown_error);
+    assert!(
+        unknown.contains("unknown field `run_in_background`"),
+        "{unknown}"
+    );
+    assert_eq!(ctx.cfg.background_executions.running_count(), 0);
+}
+
+/// A background program cancelled via stop_program ends Aborted and reinjects
+/// NOTHING — only an activity wake is published.
 #[tokio::test]
 async fn stopped_background_program_does_not_reinject() {
     let ui = Arc::new(RecordUi::default());
     let ctx = with_ui(test_ctx(0, "bg-prog-stop"), ui.clone());
-    // The program blocks on a long bash so stop_agent can catch it running.
+    // The program blocks on a long bash so stop_program can catch it running.
     let (out, _) = run_tool(
         "run_program",
         json!({ "source": "return await tools.bash({ command: 'sleep 30' });", "background": true }),
@@ -438,23 +468,23 @@ async fn stopped_background_program_does_not_reinject() {
         .unwrap()
         .to_string();
     for _ in 0..100 {
-        if ctx.cfg.background_tasks.running_count() == 1 {
+        if ctx.cfg.background_executions.running_count() == 1 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let (stop_out, is_error) = run_tool("stop_agent", json!({ "agent_id": id }), &ctx).await;
+    let (stop_out, is_error) = run_tool("stop_program", json!({ "program_id": id }), &ctx).await;
     assert!(!is_error, "{stop_out}");
     assert!(stop_out.contains("Stopping"), "{stop_out}");
 
     for _ in 0..300 {
-        if ctx.cfg.background_tasks.running_count() == 0 {
+        if ctx.cfg.background_executions.running_count() == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(
-        ctx.cfg.background_tasks.running_count(),
+        ctx.cfg.background_executions.running_count(),
         0,
         "stopped program did not reach a terminal state"
     );
@@ -678,7 +708,7 @@ fn run_program_def_renders_a_typescript_api() {
             }),
         },
         ToolDef {
-            name: "task".into(),
+            name: "run_agent".into(),
             description: "spawn".into(),
             schema: json!({"type": "object"}),
         },
@@ -696,9 +726,9 @@ fn run_program_def_renders_a_typescript_api() {
     assert!(d.contains("declare function agent("), "{d}");
     assert!(d.contains("declare function parallel<T>"), "{d}");
     assert!(d.contains("declare function pipeline("), "{d}");
-    // task is not callable from a program (agent() replaces it); run_program
+    // run_agent is not callable from a program (agent() replaces it); run_program
     // (the tool itself) isn't either.
-    assert!(!d.contains("task(args"), "{d}");
+    assert!(!d.contains("run_agent(args"), "{d}");
     assert!(!d.contains("run_program(args"), "{d}");
 }
 
@@ -728,12 +758,12 @@ fn ts_type_covers_common_shapes() {
 }
 
 #[test]
-fn program_surface_excludes_run_program_and_task() {
+fn program_surface_excludes_run_program_and_run_agent() {
     let names = program_tool_names(&[], &crate::shell_programs::ShellPrograms::test_fixture());
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "run_program"));
-    assert!(!names.iter().any(|n| n == "task"));
+    assert!(!names.iter().any(|n| n == "run_agent"));
 }
 
 // ---- External source (MCP) tools exposed to programs (plan 27) ----

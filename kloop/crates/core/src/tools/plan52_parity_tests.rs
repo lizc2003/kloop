@@ -178,11 +178,11 @@ fn lifecycle_counts(events: &[Event]) -> Value {
             Event::ItemStarted {
                 item: Item::ToolCall { name, .. },
                 ..
-            } if name == "task" => Some("tool_started"),
+            } if name == "run_agent" => Some("tool_started"),
             Event::ItemCompleted {
                 item: Item::ToolCall { name, .. },
                 ..
-            } if name == "task" => Some("tool_completed"),
+            } if name == "run_agent" => Some("tool_completed"),
             Event::ItemStarted {
                 item: Item::SubAgent { status, .. },
                 ..
@@ -232,12 +232,12 @@ async fn sync_task_batch_report() -> Value {
     let calls = vec![
         (
             "toolu_plan52_task_a".into(),
-            "task".into(),
+            "run_agent".into(),
             json!({"prompt": "first independent child"}),
         ),
         (
             "toolu_plan52_task_b".into(),
-            "task".into(),
+            "run_agent".into(),
             json!({"prompt": "second independent child"}),
         ),
     ];
@@ -294,7 +294,7 @@ async fn background_reinject_report() -> Value {
     let ui = Arc::new(RecordingUi::default());
     let ctx = ctx_with_provider(provider, ui.clone(), "plan52-background");
     let (start_output, start_error) = run_tool(
-        "task",
+        "run_agent",
         json!({"prompt": "background child", "background": true}),
         &ctx,
     )
@@ -310,9 +310,9 @@ async fn background_reinject_report() -> Value {
         .expect("background release receiver dropped");
     ui.wait_for_background(BackgroundTaskStatus::Completed)
         .await;
-    assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+    assert_eq!(ctx.cfg.background_executions.running_count(), 0);
 
-    let (wait_output, wait_error) = run_tool("wait", json!({}), &ctx).await;
+    let (wait_output, wait_error) = run_tool("wait_for_activity", json!({}), &ctx).await;
     assert!(!wait_error, "{wait_output}");
     let pending = ctx.cfg.inbox.drain();
     assert_eq!(pending.len(), 1);
@@ -327,7 +327,7 @@ async fn background_reinject_report() -> Value {
         "wait_result": wait_output,
         "events": projected_background_events(&ui.events(), &agent_id),
         "inbox": pending.into_iter().map(InboxItem::into_message).map(|text| text.replace(&agent_id, "<AGENT>")).collect::<Vec<_>>(),
-        "running_after": ctx.cfg.background_tasks.running_count(),
+        "running_after": ctx.cfg.background_executions.running_count(),
     })
 }
 
@@ -337,7 +337,7 @@ async fn stop_and_completion_arbitration_report() -> Value {
     let ui = Arc::new(RecordingUi::default());
     let ctx = ctx_with_provider(provider, ui.clone(), "plan52-stop-first");
     let (start_output, start_error) = run_tool(
-        "task",
+        "run_agent",
         json!({"prompt": "cancelled child", "background": true}),
         &ctx,
     )
@@ -362,7 +362,7 @@ async fn stop_and_completion_arbitration_report() -> Value {
     );
     ui.wait_for_background(BackgroundTaskStatus::Cancelled)
         .await;
-    assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+    assert_eq!(ctx.cfg.background_executions.running_count(), 0);
     assert!(ctx.cfg.inbox.is_empty());
 
     let (turn, started, release) = gate_turn("COMPLETED-FIRST-52");
@@ -371,7 +371,7 @@ async fn stop_and_completion_arbitration_report() -> Value {
     let completed_ctx =
         ctx_with_provider(provider, completed_ui.clone(), "plan52-completion-first");
     let (completed_start, completed_start_error) = run_tool(
-        "task",
+        "run_agent",
         json!({"prompt": "completed child", "background": true}),
         &completed_ctx,
     )
@@ -388,7 +388,7 @@ async fn stop_and_completion_arbitration_report() -> Value {
     completed_ui
         .wait_for_background(BackgroundTaskStatus::Completed)
         .await;
-    assert_eq!(completed_ctx.cfg.background_tasks.running_count(), 0);
+    assert_eq!(completed_ctx.cfg.background_executions.running_count(), 0);
     let completed_inbox = completed_ctx.cfg.inbox.drain();
     assert_eq!(completed_inbox.len(), 1);
     let (late_stop, late_stop_error) = run_tool(
@@ -405,14 +405,14 @@ async fn stop_and_completion_arbitration_report() -> Value {
             "stop_result": stop_output.replace(&stopped_id, "<AGENT>"),
             "events": projected_background_events(&ui.events(), &stopped_id),
             "inbox_empty": ctx.cfg.inbox.is_empty(),
-            "running_after": ctx.cfg.background_tasks.running_count(),
+            "running_after": ctx.cfg.background_executions.running_count(),
         },
         "completion_first": {
             "events": projected_background_events(&completed_ui.events(), &completed_id),
             "late_stop_result": late_stop.replace(&completed_id, "<AGENT>"),
             "late_stop_is_error": late_stop_error,
             "inbox": completed_inbox.into_iter().map(InboxItem::into_message).map(|text| text.replace(&completed_id, "<AGENT>")).collect::<Vec<_>>(),
-            "running_after": completed_ctx.cfg.background_tasks.running_count(),
+            "running_after": completed_ctx.cfg.background_executions.running_count(),
         },
     })
 }
@@ -449,7 +449,13 @@ async fn inbox_final_boundary_report() -> Value {
 }
 
 async fn native_surface_report() -> Value {
-    const EXPECTED_NATIVE: [&str; 4] = ["task", "todo_write", "wait", "stop_agent"];
+    const EXPECTED_NATIVE: [&str; 5] = [
+        "run_agent",
+        "todo_write",
+        "wait_for_activity",
+        "stop_agent",
+        "stop_program",
+    ];
     const CLAUDE_SURFACES: [&str; 10] = [
         "Agent",
         "TaskCreate",
@@ -498,10 +504,10 @@ async fn native_surface_report() -> Value {
         .filter(|name| names_zero.contains(name))
         .collect();
     assert!(claude_present.is_empty());
-    let task_schema = depth_zero
+    let agent_schema = depth_zero
         .iter()
-        .find(|def| def.name == "task")
-        .expect("task definition missing")
+        .find(|def| def.name == "run_agent")
+        .expect("run_agent definition missing")
         .schema
         .clone();
 
@@ -532,7 +538,7 @@ async fn native_surface_report() -> Value {
     ctx.cfg
         .inbox
         .push(InboxItem::Steer("WAIT-PENDING-52".into()));
-    let (wait_output, wait_error) = run_tool("wait", json!({}), &ctx).await;
+    let (wait_output, wait_error) = run_tool("wait_for_activity", json!({}), &ctx).await;
     assert!(!wait_error, "{wait_output}");
     let pending_after_wait = ctx.cfg.inbox.drain();
     assert_eq!(pending_after_wait.len(), 1);
@@ -548,13 +554,13 @@ async fn native_surface_report() -> Value {
         "depth_zero_native_tools": native_zero,
         "depth_one_native_tools": ["todo_write"],
         "claude_named_tools_present": claude_present,
-        "task_schema": task_schema,
+        "agent_schema": agent_schema,
         "todo": {
             "first_result": first_todo,
             "second_result": second_todo,
             "final_items": final_todos,
         },
-        "wait": {
+        "wait_for_activity": {
             "result": wait_output,
             "pending_after_wait": pending_after_wait.into_iter().map(InboxItem::into_message).collect::<Vec<_>>(),
         },

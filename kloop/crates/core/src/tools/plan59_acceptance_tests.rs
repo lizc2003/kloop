@@ -472,7 +472,7 @@ async fn background_agent_scheduler_report() -> Value {
     );
     let (shell_start, shell_start_error) = run_tool(
         "bash",
-        json!({"command": shell_command, "run_in_background": true}),
+        json!({"command": shell_command, "background": true}),
         &context,
     )
     .await;
@@ -492,19 +492,19 @@ async fn background_agent_scheduler_report() -> Value {
 
     let mut agent_activity = inbox.subscribe_activity();
     let (agent_start, agent_start_error) = run_tool(
-        "task",
+        "run_agent",
         json!({"prompt": "return the marker", "background": true}),
         &context,
     )
     .await;
     assert!(!agent_start_error && agent_start.starts_with("Sub-agent "));
-    if context.cfg.background_tasks.running_count() != 0 {
+    if context.cfg.background_executions.running_count() != 0 {
         tokio::time::timeout(Duration::from_secs(2), agent_activity.changed())
             .await
             .expect("background agent did not finish")
             .expect("agent activity channel closed");
     }
-    assert_eq!(context.cfg.background_tasks.running_count(), 0);
+    assert_eq!(context.cfg.background_executions.running_count(), 0);
 
     let (wakeup, wakeup_error) = run_tool(
         "schedule_wakeup",
@@ -567,7 +567,7 @@ async fn background_agent_scheduler_report() -> Value {
     assert_eq!(delivery_order, ["shell", "agent", "wakeup"]);
 
     let (live_agent, live_agent_error) = run_tool(
-        "task",
+        "run_agent",
         json!({"prompt": "remain live until session shutdown", "background": true}),
         &context,
     )
@@ -586,7 +586,7 @@ async fn background_agent_scheduler_report() -> Value {
     assert!(timeout_error && timed_out.contains("timed out"));
     let (live_shell, live_shell_error) = run_tool(
         "bash",
-        json!({"command": "sleep 30", "run_in_background": true}),
+        json!({"command": "sleep 30", "background": true}),
         &context,
     )
     .await;
@@ -609,11 +609,11 @@ async fn background_agent_scheduler_report() -> Value {
     )
     .await;
     assert!(!pending_wakeup_error && pending_wakeup.contains("Scheduled"));
-    assert_eq!(context.cfg.background_tasks.running_count(), 1);
+    assert_eq!(context.cfg.background_executions.running_count(), 1);
     assert_eq!(scheduler.list().unwrap().len(), 1);
     assert_eq!(context.cfg.shutdown_background_work().await, 0);
     drop(live_release_tx);
-    assert_eq!(context.cfg.background_tasks.running_count(), 0);
+    assert_eq!(context.cfg.background_executions.running_count(), 0);
     assert!(scheduler.list().unwrap_err().to_string().contains("closed"));
     let (cancelled_shell, cancelled_shell_error) =
         run_tool("bash_output", json!({"bash_id": live_shell_id}), &context).await;
@@ -933,8 +933,8 @@ async fn ask_plan_workflow_headless_report() -> Value {
         &context,
     )
     .await;
-    assert!(!workflow_error && workflow.contains("Task ID: workflow-"));
-    if context.cfg.background_tasks.running_count() != 0 {
+    assert!(!workflow_error && workflow.contains("Workflow ID: workflow-"));
+    if context.cfg.background_executions.running_count() != 0 {
         tokio::time::timeout(Duration::from_secs(2), workflow_activity.changed())
             .await
             .expect("workflow did not finish")
@@ -998,14 +998,14 @@ async fn ask_plan_workflow_headless_report() -> Value {
         &context,
     )
     .await;
-    assert!(!live_workflow_error && live_workflow.contains("Task ID: workflow-"));
+    assert!(!live_workflow_error && live_workflow.contains("Workflow ID: workflow-"));
     tokio::time::timeout(Duration::from_secs(2), workflow_started_rx)
         .await
         .expect("live workflow never sampled")
         .expect("live workflow start channel closed");
     assert_eq!(context.cfg.shutdown_background_work().await, 0);
     drop(workflow_release_tx);
-    assert_eq!(context.cfg.background_tasks.running_count(), 0);
+    assert_eq!(context.cfg.background_executions.running_count(), 0);
     assert!(context.cfg.inbox.is_empty());
 
     let enabled = names(context.cfg.surface);

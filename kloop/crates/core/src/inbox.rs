@@ -166,11 +166,11 @@ impl InboxItem {
 }
 
 /// A step-boundary injection queue that also signals waiters. Pushing advances
-/// an activity generation observed by the `wait` tool; unlike a stored `Notify`
-/// permit, an activity already consumed by the agent loop cannot wake a later
-/// wait for a different task.
+/// an activity generation observed by `wait_for_activity`; unlike a stored
+/// `Notify` permit, an activity already consumed by the agent loop cannot wake a
+/// later wait for different background work.
 ///
-/// Each agent gets its OWN inbox: the `task` tool hands a fresh one to every
+/// Each agent gets its OWN inbox: `run_agent` hands a fresh one to every
 /// sub-agent (a running sub-agent must never drain the parent's steering), and
 /// a background sub-agent reinjects into a *clone of the parent's* inbox held
 /// separately from its own.

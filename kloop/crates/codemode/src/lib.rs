@@ -69,7 +69,7 @@ pub trait HostBridge: Send + Sync + 'static {
 /// programmatically, so it needs runaway ceilings a hand-written tool_use
 /// batch never hits. Values mirror cc's workflow caps (1000/4096). Two
 /// deliberate non-caps: concurrency is NOT paced (a program firing N concurrent
-/// `agent()` matches N concurrent `task` calls, which kloop runs uncapped —
+/// `agent()` matches N concurrent `run_agent` calls, which kloop runs uncapped —
 /// pacing here would break that precedent; the total ceiling is the guard); and
 /// there is no token budget (cc's `budget.total` ships as a `null` placeholder,
 /// never enforced, and kloop has no turn-level budget source, so it would be a

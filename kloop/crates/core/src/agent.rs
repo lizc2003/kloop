@@ -208,11 +208,12 @@ async fn turn_rounds(
             // protocol, never a user-configurable capability or ordinary tool.
             tools.push(crate::structured_output::tool_def(schema));
         }
-        // At depth 0 the task tool exists; list the configured agent types in its
+        // At depth 0 run_agent exists; list configured agent types in its
         // description so the model knows what it can dispatch to.
         if depth == 0 && !cfg.agent_types.is_empty() {
-            if let Some(task) = tools.iter_mut().find(|t| t.name == "task") {
-                task.description
+            if let Some(run_agent) = tools.iter_mut().find(|tool| tool.name == "run_agent") {
+                run_agent
+                    .description
                     .push_str(&crate::agent_type::agent_types_hint(&cfg.agent_types));
             }
         }

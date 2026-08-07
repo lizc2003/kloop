@@ -9,8 +9,8 @@ use crate::hooks::Hooks;
 use crate::inbox::Inbox;
 use crate::permissions::Permissions;
 use crate::shell_programs::ShellPrograms;
+use crate::tools::BackgroundExecutions;
 use crate::tools::BackgroundShells;
-use crate::tools::BackgroundTasks;
 use crate::tools::ToolSource;
 
 #[cfg(not(all(test, windows)))]
@@ -260,7 +260,7 @@ pub struct Config {
     /// Working-directory anchor for THIS agent's tool calls: bash runs here,
     /// relative file/search paths resolve against it, and the permission gate
     /// and OS sandbox key their cwd checks off it. The main agent's is the
-    /// process cwd (so behavior is unchanged); a `task {isolation: worktree}`
+    /// process cwd (so behavior is unchanged); a `run_agent {isolation: worktree}`
     /// sub-agent's is its private git worktree (plan 35), which is how parallel
     /// sub-agents write the same relative path without colliding. `offload_dir`
     /// and `sessions_dir` deliberately do NOT follow — they stay in the main
@@ -273,12 +273,12 @@ pub struct Config {
     pub project_instructions: Option<String>,
     /// Optional sampling-round guardrail. Interactive/server turns and sub-agents
     /// leave this unset and run until the model finishes, the user interrupts, or
-    /// an error ends the turn. Headless `--max-rounds` and an explicit task
+    /// an error ends the turn. Headless `--max-rounds` and an explicit run_agent
     /// `max_rounds` set it for callers that need a runaway bound.
     pub max_rounds: Option<usize>,
     pub offload_dir: PathBuf,
     /// Directory holding session rollout files (`.kloop/sessions`). A sub-agent
-    /// the task tool spawns writes its own session file here, named
+    /// run_agent spawns a sub-agent that writes its own session file here, named
     /// `{parent session_id}-{agent-N}`, so its transcript is auditable and
     /// separately resumable. Sub-agents inherit the parent's dir with the
     /// Config clone. Empty for ephemeral sessions (mock, tests) — a sub-agent
@@ -307,13 +307,13 @@ pub struct Config {
     /// ephemeral (mock, tests). Sub-agents inherit the parent's id.
     pub session_id: String,
     /// Label identifying whose events these are in the UI: empty for the main
-    /// agent, "agent-N" for a sub-agent (stamped by the task tool on its
+    /// agent, "agent-N" for a sub-agent (stamped by run_agent on its
     /// cloned Config).
     pub agent_label: String,
     /// External command hooks; the shared Arc means sub-agents inherit the
     /// same hook set.
     pub hooks: Arc<Hooks>,
-    /// Session-scoped background shell registry (bash run_in_background).
+    /// Session-scoped background shell registry (`bash {background:true}`).
     /// Sub-agents share the parent's through the Config clone; server mode
     /// builds one per thread.
     pub background_shells: Arc<BackgroundShells>,
@@ -331,7 +331,7 @@ pub struct Config {
     /// the model escapes per call with disable_sandbox (which faces the same
     /// gate). Sub-agents inherit it with the Config.
     pub sandbox: Option<Arc<crate::sandbox::SandboxPolicy>>,
-    /// Named custom agent types the task tool can dispatch to (plan 17
+    /// Named custom agent types run_agent can dispatch to (plan 17
     /// slice 2). Empty when none are configured. Shared into sub-agent
     /// configs so a sub-agent could look them up too (though it cannot spawn
     /// further sub-agents).
@@ -354,14 +354,14 @@ pub struct Config {
     /// replace). Session-scoped process state, not history: it survives across
     /// turns within a session and starts empty on resume (the model rebuilds
     /// it from its own todo_write calls replayed in history). Each sub-agent
-    /// gets its OWN fresh list — the task tool resets this on the cloned
+    /// gets its OWN fresh list — run_agent resets this on the cloned
     /// Config so a sub-agent's planning never touches the parent's.
     pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
     /// Step-boundary injection queue (plans 22, 26, and 51). Items pushed here —
     /// user steering, detached-task results, or a background shell's terminal
     /// notification — are drained at round boundaries (never mid-request) and
     /// recorded as user messages before the next sampling, each with its own
-    /// framing. Each sub-agent gets its OWN fresh queue (the task tool resets it
+    /// framing. Each sub-agent gets its OWN fresh queue (run_agent resets it
     /// on the cloned Config, like `todos`) so a parent's steering is never drained
     /// by a running sub-agent; a *background* sub-agent instead reinjects into a
     /// clone of the PARENT's queue captured before the reset. A background shell
@@ -373,16 +373,12 @@ pub struct Config {
     /// a background task or shell: it owns timer/store state and only delivers
     /// typed prompts into `inbox` at step boundaries.
     pub scheduler: Arc<crate::scheduler::Scheduler>,
-    /// Registry of background async tasks — sub-agents (`task {"background":
-    /// true}`, plan 26) and programs (`run_program {"background": true}`, plan
-    /// 24), which share one lifecycle (detached run, result reinjected into the
-    /// inbox). Tracks in-flight tasks for `wait`/`stop_agent` and enforces a
-    /// concurrency cap. Shared into sub-agent configs like everything else,
-    /// though only the depth-0 agent spawns into it. Kept separate from
-    /// `background_shells` on purpose (a shell owns a readable output file and
-    /// reinjects only a terminal pointer, not the result body — a different
-    /// lifecycle; see [`BackgroundTasks`]).
-    pub background_tasks: Arc<BackgroundTasks>,
+    /// Registry of detached Agent, Program, and Workflow executions. They share
+    /// one lifecycle (own cancellation token, result reinjected into the inbox),
+    /// typed resource-specific stop tools, `wait_for_activity`, and an 8-way cap.
+    /// Kept separate from `background_shells`, whose result is an output file plus
+    /// a terminal inbox pointer rather than a reinjected body.
+    pub background_executions: Arc<BackgroundExecutions>,
     /// Resource ceilings for a `run_program` (code-mode) run — engine limits
     /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
@@ -473,7 +469,7 @@ impl Config {
             todos: Arc::new(std::sync::Mutex::new(Vec::new())),
             inbox: Arc::new(Inbox::default()),
             scheduler: Arc::clone(&self.scheduler),
-            background_tasks: Arc::clone(&self.background_tasks),
+            background_executions: Arc::clone(&self.background_executions),
             program_limits: self.program_limits,
             skills: Arc::clone(&self.skills),
             active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
@@ -512,7 +508,7 @@ impl Config {
             todos: Arc::clone(&self.todos),
             inbox: Arc::clone(&self.inbox),
             scheduler: Arc::clone(&self.scheduler),
-            background_tasks: Arc::clone(&self.background_tasks),
+            background_executions: Arc::clone(&self.background_executions),
             program_limits: self.program_limits,
             skills: Arc::clone(&self.skills),
             active_worktree: Arc::clone(&self.active_worktree),
@@ -540,7 +536,7 @@ impl Config {
         let timeout = Duration::from_secs(2);
         let scheduler = self.scheduler.shutdown().await;
         let (tasks, shells) = tokio::join!(
-            self.background_tasks.shutdown(timeout),
+            self.background_executions.shutdown(timeout),
             self.background_shells.shutdown(timeout)
         );
         scheduler + tasks + shells

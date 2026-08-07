@@ -937,7 +937,7 @@ pub(crate) fn config_from_settings(
         background_shells: kloop_core::tools::BackgroundShells::new(),
         shell_programs: Arc::clone(&runtime.shell_programs),
         powershell_execution_gate: Default::default(),
-        background_tasks: kloop_core::tools::BackgroundTasks::new(),
+        background_executions: kloop_core::tools::BackgroundExecutions::new(),
         sandbox,
         agent_types: Arc::clone(&runtime.agent_types),
         tool_allowlist: None,
@@ -1000,7 +1000,7 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
         ],
         vec![
             text("Delegating to a sub-agent…\n"),
-            tool_use("t5", "task", json!({"prompt": "say hi"})),
+            tool_use("t5", "run_agent", json!({"prompt": "say hi"})),
         ],
         // consumed by the sub-agent's own run_turn
         vec![text("hi from the sub-agent")],

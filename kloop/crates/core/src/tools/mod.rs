@@ -3,7 +3,7 @@
 //! tool implementations live in the sibling modules; this file is what the
 //! agent loop and the frontends depend on.
 
-mod background_tasks;
+mod background_executions;
 mod bash;
 mod codemode;
 mod fs;
@@ -32,26 +32,26 @@ mod run_store;
 mod scheduler;
 mod search;
 mod skill;
-mod task;
+mod subagent;
 mod todo;
 mod tool_search;
 pub mod web;
 mod workflow;
 mod worktree_tool;
 
-pub use background_tasks::BackgroundTasks;
-pub use background_tasks::TaskStatus;
+pub use background_executions::BackgroundExecutions;
+pub use background_executions::ExecutionStatus;
 pub use bash::BackgroundShells;
 // Slash-path prompt injections (`!cmd` / `@file`) for `/name` commands; the
 // dispatch layer (`crate::commands`) calls this before running the turn.
 pub(crate) use inject::expand_slash_injections;
-// Registered on the task tool's peer set only at depth 0 with skills loaded
+// Registered on the run_agent peer set only at depth 0 with skills loaded
 // (see `turn_rounds`); the pure skill logic it drives lives in `crate::skills`.
 pub(crate) use skill::skill_tool_def;
 pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
-// reusing the task sub-agent machinery.
-pub(crate) use task::fork_skill;
+// reusing the run_agent sub-agent machinery.
+pub(crate) use subagent::fork_skill;
 pub use todo::parse_todos;
 pub use todo::TodoItem;
 pub use todo::TodoStatus;
@@ -218,7 +218,7 @@ pub struct ToolCtx {
     pub from_program: bool,
     /// Id of the parent session's line that this round's assistant message was
     /// recorded as (`{stem}#{seq}`), or None for an in-memory-only session. The
-    /// task tool stamps it as the spawned sub-agent's `subagent_of`
+    /// run_agent stamps it as the spawned sub-agent's `subagent_of`
     /// back-pointer. Constant across a round's concurrent tool calls.
     pub parent_rollout_id: Option<String>,
     /// Per-call sink the code-mode bridge sets so a tool's structured result
@@ -258,7 +258,7 @@ pub fn all_tool_defs(
         .filter(|def| !deferred_names.contains(def.name.as_str()))
         .collect();
     defs.extend(inline_sources.iter().cloned());
-    // run_program is depth-0 only (like task). Now that sources are visible, its
+    // run_program is depth-0 only (like run_agent). Now that sources are visible, its
     // TypeScript API can list them: full declarations for inline source tools
     // (typed `Promise<CallToolResult>`), or a compact manifest for deferred
     // ones — both callable at runtime.
@@ -288,10 +288,11 @@ pub fn all_tool_defs(
         }
         if surface.workflow {
             defs.push(workflow::workflow_def());
+            defs.push(workflow::stop_workflow_def());
         }
         // Session worktree tools (plan 35 slice 2): only when the front-end
         // enables worktree mode (CLI/TUI/plain — not server threads or --mock),
-        // and only top-level (a sub-agent isolates via task {isolation}). Kept
+        // and only top-level (a sub-agent isolates via run_agent {isolation}). Kept
         // out of run_program's TS API and the deferral count on purpose.
         if surface.worktree {
             defs.push(worktree_tool::enter_worktree_def());
@@ -342,6 +343,7 @@ fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
             "enter_plan_mode",
             "exit_plan_mode",
             "workflow",
+            "stop_workflow",
             "enter_worktree",
             "exit_worktree",
             "structured_output",
@@ -373,9 +375,19 @@ fn reserved_builtin_names() -> std::collections::HashSet<String> {
     .map(|definition| definition.name)
     .collect();
     names.extend(
-        ["bash", "bash_output", "kill_bash", "powershell"]
-            .into_iter()
-            .map(String::from),
+        [
+            "bash",
+            "bash_output",
+            "stop_bash",
+            "powershell",
+            // Retired built-ins stay reserved so an MCP tool cannot impersonate an
+            // old call from resumed history before the migration error fires.
+            "task",
+            "wait",
+            "kill_bash",
+        ]
+        .into_iter()
+        .map(String::from),
     );
     names
 }
@@ -456,23 +468,24 @@ pub(super) fn source_definition_generation(
 }
 
 /// The built-in tool defs (bash, file, search, todo, and — at depth 0 —
-/// `task`). This is the set `run_program` derives its TypeScript API from, so
+/// `run_agent`). This is the set `run_program` derives its TypeScript API from, so
 /// it deliberately excludes `run_program` itself: no self-reference, and no
 /// throwaway description regeneration when only counting is needed.
 fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
-            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set run_in_background instead of appending '&'. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
+            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-N id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to run"},
-                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when run_in_background is set"},
-                    "run_in_background": {"type": "boolean", "description": "Run in the background: returns immediately with an ID and an output file path. Check on it later with bash_output or by reading the output file; stop it with kill_bash."},
+                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
+                    "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-N id and output file path (default false)"},
                     "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
                 },
-                "required": ["command"]
+                "required": ["command"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
@@ -481,22 +494,24 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "bash_id": {"type": "string", "description": "ID from a run_in_background bash call, e.g. bg-1"},
+                    "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"},
                     "block": {"type": "boolean", "description": "Wait for completion (default true)"},
                     "timeout_ms": {"type": "integer", "description": "Max wait when blocking (default 30000, max 600000)"}
                 },
-                "required": ["bash_id"]
+                "required": ["bash_id"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
-            name: "kill_bash".into(),
-            description: "Stop a running background bash command by ID; kills its whole process tree.".into(),
+            name: "stop_bash".into(),
+            description: "Stop a running background bash command by its bg-N id; terminates the whole owned process tree. Any other resource id is rejected with a directed correction.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "bash_id": {"type": "string", "description": "ID from a run_in_background bash call, e.g. bg-1"}
+                    "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"}
                 },
-                "required": ["bash_id"]
+                "required": ["bash_id"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
@@ -634,55 +649,70 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
         },
     ];
     defs.retain(|definition| match definition.name.as_str() {
-        "bash" | "bash_output" | "kill_bash" => shell_programs.bash_available(),
+        "bash" | "bash_output" | "stop_bash" => shell_programs.bash_available(),
         "powershell" => cfg!(windows) && shell_programs.powershell_available(),
         _ => true,
     });
     #[cfg(windows)]
     if let Some(bash) = defs.iter_mut().find(|definition| definition.name == "bash") {
-        bash.description = "Run a command with the validated Git for Windows `bash.exe -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands set run_in_background. Windows Job Object containment owns the full process tree; filesystem/network sandboxing is not implemented. Prefer forward slashes inside Bash commands.".into();
+        bash.description = "Run a command with the validated Git for Windows `bash.exe -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands set background=true. Windows Job Object containment owns the full process tree; filesystem/network sandboxing is not implemented. Prefer forward slashes inside Bash commands.".into();
         bash.schema["properties"]
             .as_object_mut()
             .expect("bash properties are an object")
             .remove("disable_sandbox");
     }
-    // Available at every depth (sub-agents plan too); task is depth-0 only.
+    // Available at every depth (sub-agents plan too); run_agent is depth-0 only.
     defs.push(todo::todo_write_def());
     if depth == 0 {
         defs.push(ToolDef {
-            name: "task".into(),
-            description: "Spawn a sub-agent with a fresh history to work on a self-contained prompt. By default this blocks and returns the sub-agent's final text; consecutive task calls in one response run as parallel sub-agents — use that for independent subtasks. Pass background=true to fire-and-forget instead: it returns immediately with an agent id (agent-N) and the sub-agent's result is delivered to you as a message when it finishes — use this to keep working while a long subtask runs, then block for it with the wait tool. Sub-agents cannot spawn further sub-agents. Pass agent_type to use a configured specialized agent (see below); omit it for a general-purpose sub-agent.".into(),
+            name: "run_agent".into(),
+            description: "Run a sub-agent with a fresh history on a self-contained prompt. By default this blocks and returns the final text; consecutive run_agent calls in one response run in parallel. Set background=true to return immediately with an agent-N id and receive the result later as an inbox message. Use wait_for_activity to wait without consuming results and stop_agent only with that agent-N id. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string", "description": "Complete standalone task description"},
-                    "agent_type": {"type": "string", "description": "Name of a configured agent type to use (its own system prompt, model, and tools); omit for a general-purpose sub-agent"},
-                    "background": {"type": "boolean", "description": "Fire-and-forget: return an agent id immediately and deliver the result as a message when it finishes, instead of blocking (default false)"},
-                    "max_rounds": {"type": "integer", "minimum": 1, "description": "Optional round cap for the sub-agent; omitted means no round limit"},
-                    "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "Where the sub-agent works. \"shared\" (default) uses the current working directory. \"worktree\" gives it a private git worktree on its own branch, so parallel sub-agents can edit the same files without conflicting; unmerged changes are reported back on their branch for you to merge. Requires a git repository."}
+                    "prompt": {"type": "string", "description": "Complete standalone work description"},
+                    "agent_type": {"type": "string", "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
+                    "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
+                    "max_rounds": {"type": "integer", "minimum": 1, "description": "Optional round cap; omitted means no round limit"},
+                    "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}
                 },
-                "required": ["prompt"]
+                "required": ["prompt"],
+                "additionalProperties": false
             }),
         });
         defs.push(ToolDef {
-            name: "wait".into(),
-            description: "Block until a background sub-agent (dispatched with task background=true) finishes, or new input arrives, or the timeout passes. Returns a short status; the finished sub-agent's result is delivered separately as a message. Only useful when background sub-agents are running.".into(),
+            name: "wait_for_activity".into(),
+            description: "Wait for any active background shell, agent, program, or Workflow to finish; pending inbox input also wakes it. Takes no resource ID and never reads or drains a result — completed results are delivered separately at the next step boundary.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "timeout_ms": {"type": "integer", "description": "Max wait (default 30000, min 10000, max 3600000)"}
-                }
+                },
+                "additionalProperties": false
             }),
         });
         defs.push(ToolDef {
             name: "stop_agent".into(),
-            description: "Stop a running background sub-agent by id (agent-N). It ends without reporting a result.".into(),
+            description: "Stop a running background agent by its agent-N id. It ends without reporting a result. Use stop_program for program-N, stop_workflow for workflow-N, or stop_bash for bg-N.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "agent_id": {"type": "string", "description": "The agent id from a background task call, e.g. agent-2"}
+                    "agent_id": {"type": "string", "description": "The agent-N id from run_agent with background=true"}
                 },
-                "required": ["agent_id"]
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        });
+        defs.push(ToolDef {
+            name: "stop_program".into(),
+            description: "Stop a running background code-mode program by its program-N id. It ends without reporting a result. Use stop_agent for agent-N, stop_workflow for workflow-N, or stop_bash for bg-N; this is not a durable run_id.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "program_id": {"type": "string", "description": "The program-N id from run_program with background=true"}
+                },
+                "required": ["program_id"],
+                "additionalProperties": false
             }),
         });
     }
@@ -712,9 +742,8 @@ pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
     match name {
         "read_file" | "read_offloaded" | "grep" | "glob" => true,
-        // bash_output only reads registry state; kill_bash only signals
-        // processes this agent itself started (cc marks both concurrency-safe).
-        "bash_output" | "kill_bash" => true,
+        // These inspect or signal resources already created by a gated call.
+        "bash_output" | "stop_bash" => true,
         // tool_search reads defs and grows the unlock set — monotonic,
         // order-independent state, safe to batch.
         "tool_search" => true,
@@ -734,15 +763,13 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         }
         "ask_user_question" | "workflow" | "cron_list" => true,
         "cron_create" | "cron_delete" | "schedule_wakeup" => false,
-        // task is always safe to batch (cc shape): consecutive task calls run
-        // as parallel sub-agents. Their own tool calls are gated individually
-        // — a sub-agent's write still faces hooks and the permission gate.
-        "task" => true,
-        // stop_agent only signals a sub-agent's own cancel token — like
-        // kill_bash, nothing the batch could race on. wait BLOCKS, so it must
-        // run alone (batching it would stall its siblings behind the deadline).
-        "stop_agent" => true,
-        "wait" => false,
+        // Consecutive run_agent calls may run in parallel; child tool calls are
+        // still gated independently.
+        "run_agent" => true,
+        // Resource-specific stops only signal an owned cancellation token.
+        // wait_for_activity blocks, so it must run alone.
+        "stop_agent" | "stop_program" | "stop_workflow" => true,
+        "wait_for_activity" => false,
         "powershell" | "write_file" | "edit_file" | "notebook_edit" => false,
         other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
     }
@@ -843,6 +870,15 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     // process can appear after the turn was cancelled.
     let foreground_shell_started = AtomicBool::new(false);
     let gated = async {
+        match name.as_str() {
+            "task" => bail!("tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"),
+            "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
+            "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
+            _ => {}
+        }
+        if name == "bash" && input.get("run_in_background").is_some() {
+            bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
+        }
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
         // hallucination — reject before hooks or the human are consulted.
@@ -850,7 +886,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
             bail!("tool '{name}' is not available to this agent type");
         }
-        if matches!(name.as_str(), "bash" | "bash_output" | "kill_bash")
+        if matches!(name.as_str(), "bash" | "bash_output" | "stop_bash")
             && !ctx.cfg.shell_programs.bash_available()
         {
             bail!("tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session");
@@ -948,7 +984,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
             None => None,
         };
         let foreground_shell = name == "powershell"
-            || (name == "bash" && !input["run_in_background"].as_bool().unwrap_or(false));
+            || (name == "bash" && !input["background"].as_bool().unwrap_or(false));
         if foreground_shell {
             foreground_shell_started.store(true, Ordering::Release);
         }
@@ -1071,7 +1107,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
 }
 
 /// Returns an explicitly type-erased future: this is the recursion boundary
-/// (execute_tool -> task -> run_turn -> dispatch_tools -> execute_tool), and
+/// (execute_tool -> run_agent -> run_turn -> dispatch_tools -> execute_tool), and
 /// the `dyn Future + Send` signature is what lets rustc resolve the otherwise
 /// cyclic Send inference for the recursive async call graph.
 fn execute_tool<'a>(
@@ -1146,7 +1182,7 @@ fn execute_tool<'a>(
             "bash" => bash::bash_tool(input, ctx, workspace).await,
             "powershell" => powershell::powershell_tool(input, ctx, workspace).await,
             "bash_output" => bash::bash_output_tool(input, ctx).await,
-            "kill_bash" => bash::kill_bash_tool(input, ctx).await,
+            "stop_bash" => bash::stop_bash_tool(input, ctx).await,
             "grep" => {
                 search::grep_tool(input, &workspace.cwd, Arc::clone(&workspace.permissions)).await
             }
@@ -1170,14 +1206,18 @@ fn execute_tool<'a>(
             "call_tool" => Err(anyhow!(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
-            "task" => task::task_tool(input, ctx, workspace).await,
+            "run_agent" => subagent::run_agent_tool(input, ctx, workspace).await,
             "ask_user_question" => question::ask_user_question_tool(input, ctx).await,
             "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx, workspace).await,
             "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
             "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
-            "wait" => background_tasks::wait_tool(input, ctx).await,
-            "stop_agent" => background_tasks::stop_agent_tool(input, ctx).await,
+            "wait_for_activity" => {
+                background_executions::wait_for_activity_tool(input, ctx).await
+            }
+            "stop_agent" => background_executions::stop_agent_tool(input, ctx).await,
+            "stop_program" => background_executions::stop_program_tool(input, ctx).await,
+            "stop_workflow" => background_executions::stop_workflow_tool(input, ctx).await,
             "cron_create" => scheduler::cron_create_tool(input, ctx).await,
             "cron_delete" => scheduler::cron_delete_tool(input, ctx).await,
             "cron_list" => scheduler::cron_list_tool(input, ctx).await,
@@ -1201,6 +1241,19 @@ pub(crate) fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
 pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     input[key]
         .as_str()
+        .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
+}
+
+pub(crate) fn strict_str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| anyhow!("{tool}: input must be an object"))?;
+    if let Some(unexpected) = object.keys().find(|candidate| candidate.as_str() != key) {
+        return Err(anyhow!("{tool}: unknown field `{unexpected}`"));
+    }
+    object
+        .get(key)
+        .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
 }
 
@@ -1297,7 +1350,7 @@ pub(crate) mod testutil {
                 todos: Default::default(),
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-                background_tasks: Default::default(),
+                background_executions: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: std::sync::Arc::new(
@@ -1576,13 +1629,13 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
-        for name in ["bash", "bash_output", "kill_bash", "powershell"] {
+        for name in ["bash", "bash_output", "stop_bash", "powershell"] {
             assert!(!names.iter().any(|candidate| candidate == name), "{name}");
         }
 
         let available = ShellPrograms::test_fixture();
         let definitions = tool_defs(0, &available);
-        for name in ["bash", "bash_output", "kill_bash"] {
+        for name in ["bash", "bash_output", "stop_bash"] {
             assert!(definitions.iter().any(|definition| definition.name == name));
         }
         #[cfg(windows)]
@@ -1664,7 +1717,7 @@ mod tests {
                     .iter()
                     .filter(|definition| matches!(
                         definition.name.as_str(),
-                        "bash" | "bash_output" | "kill_bash" | "powershell"
+                        "bash" | "bash_output" | "stop_bash" | "powershell"
                     ))
                     .count(),
                 shell_tool_count
@@ -1692,15 +1745,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_defs_expose_task_only_at_depth_zero() {
+    fn tool_defs_expose_run_agent_only_at_depth_zero() {
         let names = |depth| {
             tool_defs(depth, &ShellPrograms::native_posix())
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
         };
-        assert!(names(0).iter().any(|n| n == "task"));
-        assert!(!names(1).iter().any(|n| n == "task"));
+        assert!(names(0).iter().any(|n| n == "run_agent"));
+        assert!(!names(1).iter().any(|n| n == "run_agent"));
     }
 
     #[test]
@@ -1806,7 +1859,7 @@ mod tests {
             vec![
                 "bash",
                 "bash_output",
-                "kill_bash",
+                "stop_bash",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -1815,9 +1868,10 @@ mod tests {
                 "glob",
                 "read_offloaded",
                 "todo_write",
-                "task",
-                "wait",
+                "run_agent",
+                "wait_for_activity",
                 "stop_agent",
+                "stop_program",
                 "srv__echo",
                 "srv__fail",
                 "srv__image",
@@ -1847,6 +1901,46 @@ mod tests {
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
+    }
+
+    #[tokio::test]
+    async fn retired_tool_names_are_reserved_and_return_migration_errors() {
+        let retired = ["task", "wait", "kill_bash"];
+        let source: Arc<dyn ToolSource> = Arc::new(StubSource {
+            defs: retired
+                .iter()
+                .map(|name| ToolDef {
+                    name: (*name).into(),
+                    description: "must stay hidden".into(),
+                    schema: json!({"type": "object"}),
+                })
+                .collect(),
+            readonly: String::new(),
+        });
+        let names = all_tool_defs(
+            0,
+            &[source],
+            TOOL_DEFER_THRESHOLD,
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        )
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+        for name in retired {
+            assert!(!names.iter().any(|candidate| candidate == name));
+        }
+
+        let ctx = test_ctx(0, "retired-tool-names");
+        for (name, input, replacement) in [
+            ("task", json!({"prompt": "x"}), "run_agent"),
+            ("wait", json!({}), "wait_for_activity"),
+            ("kill_bash", json!({"bash_id": "bg-1"}), "stop_bash"),
+        ] {
+            let (output, is_error) = run_tool(name, input, &ctx).await;
+            assert!(is_error, "{name}: {output}");
+            assert!(output.contains(replacement), "{name}: {output}");
+        }
     }
 
     #[test]
@@ -1994,7 +2088,7 @@ mod tests {
         let warnings =
             tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("55 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("56 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -2480,7 +2574,7 @@ mod tests {
             &json!({"bash_id": "bg-1"})
         ));
         assert!(is_concurrency_safe(
-            "kill_bash",
+            "stop_bash",
             &json!({"bash_id": "bg-1"})
         ));
         assert!(!is_concurrency_safe(
@@ -2488,8 +2582,13 @@ mod tests {
             &json!({"path": "x", "content": ""})
         ));
         assert!(!is_concurrency_safe("edit_file", &json!({})));
-        // Consecutive task calls run as parallel sub-agents (cc shape).
-        assert!(is_concurrency_safe("task", &json!({"prompt": "x"})));
+        // Consecutive run_agent calls run as parallel sub-agents.
+        assert!(is_concurrency_safe("run_agent", &json!({"prompt": "x"})));
+        assert!(is_concurrency_safe(
+            "stop_program",
+            &json!({"program_id": "program-1"})
+        ));
+        assert!(!is_concurrency_safe("wait_for_activity", &json!({})));
 
         // read-only commands, incl. pipes and chains of safe segments
         assert!(is_concurrency_safe("bash", &bash_input("ls -la")));
@@ -2582,7 +2681,7 @@ mod tests {
                 todos: Default::default(),
                 inbox: Default::default(),
                 scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
-                background_tasks: Default::default(),
+                background_executions: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: std::sync::Arc::new(

@@ -1159,13 +1159,13 @@ impl CallFacts {
     fn is_readonly(&self, name: &str) -> bool {
         match name {
             "read_file" | "read_offloaded" | "grep" | "glob" => true,
-            // bash_output reads registry state; kill_bash only signals
+            // bash_output reads registry state; stop_bash only signals
             // processes the agent itself started via bash — neither can
             // touch anything the original bash call wasn't already gated on.
-            "bash_output" | "kill_bash" => true,
-            // task itself touches nothing; every tool call the sub-agent
-            // makes passes through this same gate.
-            "task" => true,
+            "bash_output" | "stop_bash" => true,
+            // run_agent itself touches nothing; every child tool call passes
+            // through this same gate.
+            "run_agent" => true,
             // Creating a managed tree and keeping one are session controls. An
             // existing-path Enter and remove action are intercepted as hazards
             // above; remove is also mutating for the plan-mode gate.
@@ -1175,10 +1175,9 @@ impl CallFacts {
             // no system side effect. Read-only here so it passes the plan-mode
             // gate above and does its own approval (Permissions::confirm_exit_plan).
             "ask_user_question" | "enter_plan_mode" | "exit_plan_mode" => true,
-            // wait only blocks; stop_agent only signals a sub-agent this agent
-            // itself spawned — neither touches anything the sub-agent's own
-            // calls weren't already gated on (same reasoning as kill_bash).
-            "wait" | "stop_agent" => true,
+            // Waiting only blocks; resource-specific stops only signal owned
+            // cancellation tokens. None bypasses the stopped work's own gates.
+            "wait_for_activity" | "stop_agent" | "stop_program" | "stop_workflow" => true,
             // run_program (code-mode) itself touches nothing; every tools.<name>()
             // and agent() call the program makes re-enters this same gate.
             "run_program" | "workflow" => true,
@@ -1730,8 +1729,8 @@ mod tests {
         assert!(ok(&p, "grep", json!({"pattern": "fn main"})).await);
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "bash_output", json!({"bash_id": "bg-1"})).await);
-        assert!(ok(&p, "kill_bash", json!({"bash_id": "bg-1"})).await);
-        assert!(ok(&p, "task", json!({"prompt": "go"})).await);
+        assert!(ok(&p, "stop_bash", json!({"bash_id": "bg-1"})).await);
+        assert!(ok(&p, "run_agent", json!({"prompt": "go"})).await);
         assert!(ok(&p, "tool_search", json!({"query": "select:x"})).await);
         assert!(ok(&p, "skill", json!({"name": "fixture"})).await);
         assert!(ok(&p, "list_mcp_resources", json!({})).await);
@@ -1871,12 +1870,16 @@ mod tests {
         // whole-tool and path-glob deny forms
         let p = gate(
             Mode::Manual,
-            rules(&["write_file"], &["write_file(secrets/**)", "task"], &[]),
+            rules(
+                &["write_file"],
+                &["write_file(secrets/**)", "run_agent"],
+                &[],
+            ),
             ScriptedApprover::new(vec![]),
         );
         assert!(!ok(&p, "write_file", file("secrets/key.pem")).await);
         assert!(ok(&p, "write_file", file("src/main.rs")).await);
-        assert!(!ok(&p, "task", json!({"prompt": "x"})).await);
+        assert!(!ok(&p, "run_agent", json!({"prompt": "x"})).await);
     }
 
     // ── layer 2: safety checks are bypass-immune ───────────────────────
@@ -2626,7 +2629,7 @@ mod tests {
         assert!(ok(&p, "grep", json!({"pattern": "fn"})).await);
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "bash", bash("git status && ls")).await);
-        assert!(ok(&p, "task", json!({"prompt": "look around"})).await);
+        assert!(ok(&p, "run_agent", json!({"prompt": "look around"})).await);
         assert!(ok(&p, "exit_plan_mode", json!({"plan": "do X"})).await);
         // Writes and side-effecting bash are refused.
         for (name, input) in [

@@ -285,12 +285,12 @@ fn map_tool_name(name: &str) -> String {
         "Bash" => "bash",
         "PowerShell" => "powershell",
         "BashOutput" => "bash_output",
-        "KillShell" | "KillBash" => "kill_bash",
+        "KillShell" | "KillBash" => "stop_bash",
         "Grep" => "grep",
         "Glob" => "glob",
         "WebFetch" => "web_fetch",
         "WebSearch" => "web_search",
-        "Task" => "task",
+        "Task" => "run_agent",
         "TodoWrite" => "todo_write",
         "Skill" => "skill",
         other => other,
@@ -517,12 +517,20 @@ mod tests {
         let list = Skill::parse(
             "s",
             "/s",
-            "---\ndescription: d\nallowed-tools:\n  - Read\n  - Bash(git log:*)\n  - srv__x\n  - read_file\n---\nb",
+            "---\ndescription: d\nallowed-tools:\n  - Read\n  - Bash(git log:*)\n  - Task\n  - KillBash\n  - BashOutput\n  - srv__x\n  - read_file\n---\nb",
         )
         .unwrap();
         assert_eq!(
             list.allowed_tools.unwrap(),
-            vec!["read_file", "bash", "srv__x", "read_file"]
+            vec![
+                "read_file",
+                "bash",
+                "run_agent",
+                "stop_bash",
+                "bash_output",
+                "srv__x",
+                "read_file",
+            ]
         );
         // String form: comma- or space-separated.
         let str_form = Skill::parse(

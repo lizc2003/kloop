@@ -340,7 +340,7 @@ pub fn discover_windows(
     let mut warnings = Vec::new();
     if bash.is_none() {
         warnings.push(
-            "Git for Windows Bash was not found; bash, bash_output and kill_bash are unavailable. Install Git for Windows or set [shells].bash to its bin\\bash.exe."
+            "Git for Windows Bash was not found; bash, bash_output and stop_bash are unavailable. Install Git for Windows or set [shells].bash to its bin\\bash.exe."
                 .to_string(),
         );
     }

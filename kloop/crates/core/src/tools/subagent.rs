@@ -4,11 +4,14 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::background_tasks::TaskStatus;
+use super::background_executions::ExecutionKind;
+use super::background_executions::ExecutionStatus;
 use super::str_arg;
 use super::ToolCtx;
 use crate::agent::run_structured_turn;
@@ -37,48 +40,63 @@ use kloop_protocol::Message;
 /// failure is truncated, since its noise shouldn't crowd the parent's context.
 const MAX_REINJECT_ERROR_CHARS: usize = 3600;
 
-/// Process-global so parallel task calls (and any future spawner) never hand
+/// Process-global so parallel run_agent calls (and any future spawner) never hand
 /// out the same label — same reasoning as the offload counter (lesson 2).
 static AGENT_SEQ: AtomicUsize = AtomicUsize::new(1);
 
-pub(super) async fn task_tool(
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunAgentInput {
+    prompt: String,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    max_rounds: Option<u64>,
+    #[serde(default)]
+    isolation: Option<String>,
+}
+
+pub(super) async fn run_agent_tool(
     input: &Value,
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
     if ctx.depth >= 1 {
-        bail!("task: sub-agents cannot spawn further sub-agents");
+        bail!("run_agent: sub-agents cannot spawn further sub-agents");
     }
-    let prompt = str_arg(input, "prompt", "task")?.to_string();
-    let max_rounds = match input.get("max_rounds") {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let n = value
-                .as_u64()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| anyhow!("task: max_rounds must be a positive integer"))?;
+    let parsed: RunAgentInput =
+        serde_json::from_value(input.clone()).context("run_agent: invalid input")?;
+    let prompt = parsed.prompt;
+    let max_rounds = match parsed.max_rounds {
+        None => None,
+        Some(n) => {
+            if n == 0 {
+                bail!("run_agent: max_rounds must be a positive integer");
+            }
             Some(usize::try_from(n).unwrap_or(usize::MAX))
         }
     };
-    let background = input["background"].as_bool().unwrap_or(false);
+    let background = parsed.background;
     // A custom agent type overrides the sub-agent's system prompt, model and
     // tool set; an unknown name is an is_error result naming the available
     // types. Omitting agent_type keeps the general-purpose inherit-everything
     // sub-agent.
-    let agent_type = match input["agent_type"].as_str() {
-        Some(name) => {
-            Some(AgentType::lookup(&ctx.cfg.agent_types, name).map_err(|e| anyhow!("task: {e}"))?)
-        }
+    let agent_type = match parsed.agent_type.as_deref() {
+        Some(name) => Some(
+            AgentType::lookup(&ctx.cfg.agent_types, name).map_err(|e| anyhow!("run_agent: {e}"))?,
+        ),
         None => None,
     };
     // `isolation: "worktree"` gives the sub-agent its own git worktree so it
     // can edit files without racing sibling sub-agents on the shared tree
     // (plan 35). Any other value is an error — an unrecognized isolation must
     // not silently degrade to the shared cwd.
-    let isolate = match input["isolation"].as_str() {
+    let isolate = match parsed.isolation.as_deref() {
         None | Some("shared") => false,
         Some("worktree") => true,
-        Some(other) => bail!("task: unknown isolation '{other}' (expected \"worktree\")"),
+        Some(other) => bail!("run_agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
     let agent = next_agent_label();
     let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type);
@@ -86,8 +104,8 @@ pub(super) async fn task_tool(
     let depth = ctx.depth + 1;
     // The label shown next to the running agent carries its type, if any.
     let preview = match agent_type {
-        Some(at) => format!("[{}] {}", at.name, task_preview(&prompt)),
-        None => task_preview(&prompt),
+        Some(at) => format!("[{}] {}", at.name, agent_preview(&prompt)),
+        None => agent_preview(&prompt),
     };
 
     // Create the worktree BEFORE spawning and rewire the sub-agent's cwd
@@ -96,8 +114,8 @@ pub(super) async fn task_tool(
     let worktree = if isolate {
         let wt = worktree::create(&workspace.cwd, &agent)
             .await
-            .map_err(|e| anyhow!("task: {e:#}"))?;
-        Some(bind_subagent_worktree(&mut sub, wt, "task").await?)
+            .map_err(|e| anyhow!("run_agent: {e:#}"))?;
+        Some(bind_subagent_worktree(&mut sub, wt, "run_agent").await?)
     } else {
         None
     };
@@ -108,12 +126,19 @@ pub(super) async fn task_tool(
     }
 
     run_sub_agent_sync(
-        ctx, sub_cfg, agent, preview, prompt, depth, "task", worktree,
+        ctx,
+        sub_cfg,
+        agent,
+        preview,
+        prompt,
+        depth,
+        "run_agent",
+        worktree,
     )
     .await
 }
 
-pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx) -> Result<Value> {
+pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx) -> Result<Value> {
     if ctx.depth >= 1 {
         bail!("workflow agent: nested sub-agents are unavailable");
     }
@@ -148,8 +173,8 @@ pub(super) async fn structured_task(input: &Value, schema: Value, ctx: &ToolCtx)
         sub.model = model.to_string();
     }
     let preview = match agent_type {
-        Some(agent_type) => format!("[{}] {}", agent_type.name, task_preview(&prompt)),
-        None => task_preview(&prompt),
+        Some(agent_type) => format!("[{}] {}", agent_type.name, agent_preview(&prompt)),
+        None => agent_preview(&prompt),
     };
     let worktree = if isolate {
         let worktree = worktree::create(&workspace.cwd, &agent)
@@ -262,14 +287,14 @@ fn next_agent_label() -> String {
     format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// A sub-agent began working on `task`; its item id is its label. Shared with
-/// the codemode program runner, whose background agent has the same lifecycle.
-pub(super) fn emit_agent_start(ui: &Arc<dyn crate::agent::Ui>, label: &str, task: &str) {
+/// A sub-agent began working on a description; its item id is its label. Shared
+/// with the code-mode program runner, whose background agent has the same lifecycle.
+pub(super) fn emit_agent_start(ui: &Arc<dyn crate::agent::Ui>, label: &str, description: &str) {
     ui.emit(&Event::ItemStarted {
         id: label.to_string(),
         item: Item::SubAgent {
             label: label.to_string(),
-            task: task.to_string(),
+            task: description.to_string(),
             status: ItemStatus::InProgress,
         },
     });
@@ -297,14 +322,14 @@ pub(super) fn emit_background_task(
     label: &str,
     kind: BackgroundTaskKind,
     description: &str,
-    status: TaskStatus,
+    status: ExecutionStatus,
     detail: Option<String>,
 ) {
     let status = match status {
-        TaskStatus::Running => BackgroundTaskStatus::Running,
-        TaskStatus::Completed | TaskStatus::MaxRounds => BackgroundTaskStatus::Completed,
-        TaskStatus::Failed => BackgroundTaskStatus::Failed,
-        TaskStatus::Aborted => BackgroundTaskStatus::Cancelled,
+        ExecutionStatus::Running => BackgroundTaskStatus::Running,
+        ExecutionStatus::Completed | ExecutionStatus::MaxRounds => BackgroundTaskStatus::Completed,
+        ExecutionStatus::Failed => BackgroundTaskStatus::Failed,
+        ExecutionStatus::Aborted => BackgroundTaskStatus::Cancelled,
     };
     ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
         id: label.to_string(),
@@ -321,7 +346,7 @@ pub(super) fn emit_background_task(
 /// sub-agent runs as its OWN tokio task — besides matching the semantics, this
 /// breaks the recursion cycle (execute_tool -> run_turn -> dispatch_tools ->
 /// execute_tool): the caller only holds a JoinHandle, which is Send regardless
-/// of the recursive future's type. Shared by the `task` tool and a `fork`
+/// of the recursive future's type. Shared by the `run_agent` tool and a `fork`
 /// skill; `who` prefixes the error messages.
 #[allow(clippy::too_many_arguments)]
 async fn run_sub_agent_sync(
@@ -398,7 +423,7 @@ async fn run_sub_agent_sync(
 /// model, and only the final result returns — the skill's intermediate work
 /// stays out of the delegating model's context. A sub-agent cannot spawn one
 /// (depth ≥ 1), so it there degrades to inline (returns the body), matching the
-/// `task` depth rule without dead-ending the skill.
+/// `run_agent` depth rule without dead-ending the skill.
 pub(crate) async fn fork_skill(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
@@ -419,7 +444,7 @@ pub(crate) async fn fork_skill(
     if let Some(tools) = &skill.allowed_tools {
         sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
     }
-    let preview = format!("[skill:{}] {}", skill.name, task_preview(&body));
+    let preview = format!("[skill:{}] {}", skill.name, agent_preview(&body));
     run_sub_agent_sync(
         ctx,
         Arc::new(sub),
@@ -434,7 +459,7 @@ pub(crate) async fn fork_skill(
 }
 
 /// Fire-and-forget spawn (plan 26): register the agent, launch a DETACHED tokio
-/// task, and return immediately. Unlike the synchronous path the sub-agent runs
+/// worker, and return immediately. Unlike the synchronous path the sub-agent runs
 /// on its OWN cancel token (registered for `stop_agent`) — a finished parent
 /// turn must never kill a still-running background agent. When it ends, it
 /// reinjects its result into the PARENT's inbox (captured before `build_sub_config`
@@ -451,22 +476,23 @@ async fn spawn_background(
     worktree: Option<worktree::Worktree>,
 ) -> Result<String> {
     let own_cancel = CancellationToken::new();
-    if let Err(msg) = ctx
-        .cfg
-        .background_tasks
-        .register(&agent, preview, own_cancel.clone())
-    {
+    if let Err(msg) = ctx.cfg.background_executions.register(
+        ExecutionKind::Agent,
+        &agent,
+        preview,
+        own_cancel.clone(),
+    ) {
         // The slot couldn't be reserved: nothing will run, so undo the worktree
         // now instead of leaking an empty tree.
         if let Some(wt) = worktree {
             worktree::finish(wt)
                 .await
-                .map_err(|error| anyhow!("task: {msg}; worktree cleanup failed: {error:#}"))?;
+                .map_err(|error| anyhow!("run_agent: {msg}; worktree cleanup failed: {error:#}"))?;
         }
-        return Err(anyhow!("task: {msg}"));
+        return Err(anyhow!("run_agent: {msg}"));
     }
     let parent_inbox = ctx.cfg.inbox.clone();
-    let background_tasks = ctx.cfg.background_tasks.clone();
+    let background_executions = ctx.cfg.background_executions.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
     let description = preview.to_string();
@@ -475,7 +501,7 @@ async fn spawn_background(
         &agent,
         BackgroundTaskKind::Agent,
         &description,
-        TaskStatus::Running,
+        ExecutionStatus::Running,
         None,
     );
 
@@ -491,7 +517,7 @@ async fn spawn_background(
             run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await
         }
     });
-    background_tasks.attach_abort(&agent, worker.abort_handle());
+    background_executions.attach_abort(&agent, worker.abort_handle());
     tokio::spawn({
         let label = agent.clone();
         let ui = ui.clone();
@@ -499,11 +525,11 @@ async fn spawn_background(
         async move {
             let (mut status, mut reinject) = match worker.await {
                 Ok(outcome) => classify_background(outcome),
-                Err(error) if error.is_cancelled() => (TaskStatus::Aborted, None),
+                Err(error) if error.is_cancelled() => (ExecutionStatus::Aborted, None),
                 Err(error) => (
-                    TaskStatus::Failed,
+                    ExecutionStatus::Failed,
                     Some(format!(
-                        "[sub-agent failed] background task panicked: {error}\nYou may re-dispatch it or try another approach."
+                        "[sub-agent failed] background worker panicked: {error}\nYou may re-dispatch it or try another approach."
                     )),
                 ),
             };
@@ -522,7 +548,7 @@ async fn spawn_background(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        status = TaskStatus::Failed;
+                        status = ExecutionStatus::Failed;
                         let note = format!("[worktree cleanup failed] {error:#}");
                         cleanup_detail = Some(note.clone());
                         match &mut reinject {
@@ -535,7 +561,7 @@ async fn spawn_background(
                     }
                 }
             }
-            let terminal = background_tasks.finish(&label, status, |actual, deliver| {
+            let terminal = background_executions.finish(&label, status, |actual, deliver| {
                 if deliver {
                     if let Some(summary) = reinject {
                         parent_inbox.push(InboxItem::SubAgentResult {
@@ -546,7 +572,7 @@ async fn spawn_background(
                         parent_inbox.notify_activity();
                     }
                 } else {
-                    debug_assert_eq!(actual, TaskStatus::Aborted);
+                    debug_assert_eq!(actual, ExecutionStatus::Aborted);
                     parent_inbox.notify_activity();
                 }
             });
@@ -564,8 +590,8 @@ async fn spawn_background(
     });
     Ok(format!(
         "Sub-agent {agent} started in the background.{session_note} Keep working; its result will \
-         be delivered to you as a message when it finishes. Block for it with the wait tool, or \
-         stop it with stop_agent."
+         be delivered as a message when it finishes. Wait with wait_for_activity, or stop it \
+         with stop_agent {{\"agent_id\": \"{agent}\"}}."
     ))
 }
 
@@ -609,42 +635,42 @@ fn child_session_note(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> S
 /// reinjection). Success/round-limit pass through verbatim (codex); a failure
 /// is truncated; an interrupted agent reinjects nothing (codex's is_final —
 /// its partial output is noise, and the model that stopped it already knows).
-fn classify_background(outcome: TurnOutcome) -> (TaskStatus, Option<String>) {
+fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>) {
     match outcome.reason {
-        EndReason::Completed => (TaskStatus::Completed, Some(outcome.final_text)),
+        EndReason::Completed => (ExecutionStatus::Completed, Some(outcome.final_text)),
         EndReason::MaxRounds => (
-            TaskStatus::MaxRounds,
+            ExecutionStatus::MaxRounds,
             Some(format!(
                 "[sub-agent stopped at its round limit]\n{}",
                 outcome.final_text
             )),
         ),
         EndReason::Error(e) => (
-            TaskStatus::Failed,
+            ExecutionStatus::Failed,
             Some(format!(
                 "[sub-agent failed] {}\nYou may re-dispatch it or try another approach.",
                 truncate_error(&e)
             )),
         ),
-        EndReason::Aborted => (TaskStatus::Aborted, None),
+        EndReason::Aborted => (ExecutionStatus::Aborted, None),
     }
 }
 
-pub(super) fn task_status_detail(status: TaskStatus) -> Option<String> {
+pub(super) fn execution_status_detail(status: ExecutionStatus) -> Option<String> {
     match status {
-        TaskStatus::Running | TaskStatus::Completed => None,
-        TaskStatus::Failed => Some("background task failed".into()),
-        TaskStatus::MaxRounds => Some("stopped at round limit".into()),
-        TaskStatus::Aborted => Some("stopped".into()),
+        ExecutionStatus::Running | ExecutionStatus::Completed => None,
+        ExecutionStatus::Failed => Some("background agent failed".into()),
+        ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
+        ExecutionStatus::Aborted => Some("stopped".into()),
     }
 }
 
 fn background_terminal_detail(
-    status: TaskStatus,
+    status: ExecutionStatus,
     cleanup_detail: Option<String>,
 ) -> Option<String> {
-    let mut detail = task_status_detail(status);
-    if status == TaskStatus::Aborted {
+    let mut detail = execution_status_detail(status);
+    if status == ExecutionStatus::Aborted {
         if let Some(cleanup) = cleanup_detail {
             match &mut detail {
                 Some(text) => {
@@ -677,7 +703,7 @@ fn clone_for_subagent(
     ctx.cfg.subagent_from(workspace, max_rounds, agent)
 }
 
-/// Build the `task` sub-agent's Config: the shared clone plus any agent_type
+/// Build the `run_agent` sub-agent's Config: the shared clone plus any agent_type
 /// overrides (system prompt, model, tool allowlist). Returned unwrapped so the
 /// caller can still rewire it (worktree isolation) before sharing the Arc.
 fn build_sub_config(
@@ -704,7 +730,7 @@ fn build_sub_config(
 
 /// First line of the prompt, truncated — the label a UI shows next to the
 /// agent while it runs.
-fn task_preview(prompt: &str) -> String {
+fn agent_preview(prompt: &str) -> String {
     let line = prompt.lines().next().unwrap_or("");
     let mut preview: String = line.chars().take(80).collect();
     if preview.len() < line.len() {
@@ -753,31 +779,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_is_refused_at_depth_one() {
+    async fn run_agent_is_refused_at_depth_one() {
         let ctx = test_ctx(1, "depth");
-        let (out, is_error) = run_tool("task", json!({"prompt": "recurse"}), &ctx).await;
+        let (out, is_error) = run_tool("run_agent", json!({"prompt": "recurse"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("cannot spawn"));
     }
 
     #[tokio::test]
-    async fn task_rejects_non_positive_round_limit() {
-        let ctx = test_ctx(0, "task-zero-rounds");
+    async fn run_agent_rejects_non_positive_round_limit() {
+        let ctx = test_ctx(0, "run-agent-zero-rounds");
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "keep going", "max_rounds": 0}),
             &ctx,
         )
         .await;
 
         assert!(is_error);
-        assert_eq!(out, "task: max_rounds must be a positive integer");
+        assert_eq!(out, "run_agent: max_rounds must be a positive integer");
     }
 
     /// Omitting max_rounds must not inherit the parent's guardrail or the old
     /// sub-agent default of 15: the child runs until it produces a final answer.
     #[tokio::test]
-    async fn task_without_round_limit_runs_until_completed() {
+    async fn run_agent_without_round_limit_runs_until_completed() {
         let mut turns = (0..16)
             .map(|i| {
                 vec![AssistantBlock::ToolUse {
@@ -790,9 +816,9 @@ mod tests {
         turns.push(vec![AssistantBlock::Text {
             text: "finished after sixteen tool rounds".into(),
         }]);
-        let ctx = with_provider(test_ctx(0, "task-unbounded"), Provider::mock(turns));
+        let ctx = with_provider(test_ctx(0, "run-agent-unbounded"), Provider::mock(turns));
 
-        let (out, is_error) = run_tool("task", json!({"prompt": "keep going"}), &ctx).await;
+        let (out, is_error) = run_tool("run_agent", json!({"prompt": "keep going"}), &ctx).await;
 
         assert!(!is_error, "{out}");
         assert_eq!(out, "finished after sixteen tool rounds");
@@ -824,7 +850,7 @@ mod tests {
         let ctx = ctx_in(with_provider(test_ctx(0, "confine"), provider), &repo);
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "go", "isolation": "worktree"}),
             &ctx,
         )
@@ -892,7 +918,7 @@ mod tests {
         }
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "go", "isolation": "worktree"}),
             &ctx,
         )
@@ -940,7 +966,7 @@ mod tests {
         };
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "go", "isolation": "worktree"}),
             &ctx,
         )
@@ -973,7 +999,7 @@ mod tests {
         let ctx = ctx_in(with_provider(test_ctx(0, "clean"), provider), &repo);
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "just look", "isolation": "worktree"}),
             &ctx,
         )
@@ -1023,12 +1049,12 @@ mod tests {
             vec![
                 (
                     "t1".into(),
-                    "task".into(),
+                    "run_agent".into(),
                     json!({"prompt": "a", "isolation": "worktree", "max_rounds": 1}),
                 ),
                 (
                     "t2".into(),
-                    "task".into(),
+                    "run_agent".into(),
                     json!({"prompt": "b", "isolation": "worktree", "max_rounds": 1}),
                 ),
             ],
@@ -1060,8 +1086,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_isolation_errors() {
         let ctx = test_ctx(0, "iso-bad");
-        let (out, is_error) =
-            run_tool("task", json!({"prompt": "x", "isolation": "sandbox"}), &ctx).await;
+        let (out, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "x", "isolation": "sandbox"}),
+            &ctx,
+        )
+        .await;
         assert!(is_error);
         assert!(out.contains("unknown isolation 'sandbox'"), "{out}");
     }
@@ -1070,12 +1100,12 @@ mod tests {
     /// not a shared-cwd fall back.
     #[tokio::test]
     async fn worktree_isolation_requires_a_git_repo() {
-        let dir = std::env::temp_dir().join(format!("kloop-task-nogit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kloop-agent-nogit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = ctx_in(test_ctx(0, "nogit"), &dir);
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "x", "isolation": "worktree"}),
             &ctx,
         )
@@ -1111,13 +1141,13 @@ mod tests {
         }
     }
 
-    /// Two task calls in one batch really run in parallel: each sub-agent's
+    /// Two run_agent calls in one batch really run in parallel: each sub-agent's
     /// bash waits for a file the OTHER sub-agent creates, so finishing fast
     /// at all proves concurrency (serial execution takes the full 3s poll).
     /// Each start gets a matching successful end with its own label.
     #[tokio::test]
-    async fn consecutive_tasks_run_as_parallel_subagents() {
-        let dir = std::env::temp_dir().join(format!("kloop-partask-{}", std::process::id()));
+    async fn consecutive_run_agent_calls_run_as_parallel_subagents() {
+        let dir = std::env::temp_dir().join(format!("kloop-paragent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let shell_dir = dir.to_string_lossy().replace('\\', "/");
@@ -1151,8 +1181,8 @@ mod tests {
         let started = std::time::Instant::now();
         let results = dispatch_tools(
             vec![
-                ("t1".into(), "task".into(), json!({"prompt": "one"})),
-                ("t2".into(), "task".into(), json!({"prompt": "two"})),
+                ("t1".into(), "run_agent".into(), json!({"prompt": "one"})),
+                ("t2".into(), "run_agent".into(), json!({"prompt": "two"})),
             ],
             &ctx,
         )
@@ -1183,7 +1213,10 @@ mod tests {
         let starts: Vec<&String> = events.iter().filter(|e| e.starts_with("start ")).collect();
         let ends: Vec<&String> = events.iter().filter(|e| e.starts_with("end ")).collect();
         assert_eq!(starts.len(), 2);
-        assert_ne!(starts[0], starts[1], "each task gets its own label");
+        assert_ne!(
+            starts[0], starts[1],
+            "each run_agent call gets its own label"
+        );
         for start in &starts {
             let label = start.split_whitespace().nth(1).unwrap();
             assert!(label.starts_with("agent-"), "got {start}");
@@ -1195,18 +1228,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One bad call in a task batch fails alone: results stay paired to their
+    /// One bad call in a run_agent batch fails alone: results stay paired to their
     /// tool_use ids in request order and the healthy sibling completes.
     #[tokio::test]
-    async fn failing_task_does_not_sink_the_batch() {
+    async fn failing_run_agent_does_not_sink_the_batch() {
         let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "solo done".into(),
         }]]);
-        let ctx = with_provider(test_ctx(0, "taskfail"), provider);
+        let ctx = with_provider(test_ctx(0, "run-agent-fail"), provider);
         let results = dispatch_tools(
             vec![
-                ("t1".into(), "task".into(), json!({"prompt": "solo"})),
-                ("t2".into(), "task".into(), json!({})), // missing prompt
+                ("t1".into(), "run_agent".into(), json!({"prompt": "solo"})),
+                ("t2".into(), "run_agent".into(), json!({})), // missing prompt
             ],
             &ctx,
         )
@@ -1229,9 +1262,7 @@ mod tests {
         };
         assert_eq!(tool_use_id, "t2");
         assert!(is_error);
-        assert!(content
-            .as_text()
-            .contains("missing required string argument 'prompt'"));
+        assert!(content.as_text().contains("missing field `prompt`"));
     }
 
     /// agent_type overrides route to the sub-agent's request: its system
@@ -1260,7 +1291,7 @@ mod tests {
         };
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "find X", "agent_type": "researcher"}),
             &ctx,
         )
@@ -1301,11 +1332,41 @@ mod tests {
             cfg: Arc::new(cfg),
             ..base
         };
-        let (out, is_error) =
-            run_tool("task", json!({"prompt": "x", "agent_type": "ghost"}), &ctx).await;
+        let (out, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "x", "agent_type": "ghost"}),
+            &ctx,
+        )
+        .await;
         assert!(is_error);
         assert!(out.contains("unknown agent_type 'ghost'"), "{out}");
         assert!(out.contains("researcher"), "lists what's available: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_wrong_background_type_and_unknown_fields() {
+        let ctx = test_ctx(0, "run-agent-strict-input");
+        let (wrong_type, type_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "must not run", "background": "true"}),
+            &ctx,
+        )
+        .await;
+        assert!(type_error);
+        assert!(wrong_type.contains("invalid type"), "{wrong_type}");
+
+        let (unknown, unknown_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "must not run", "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(unknown_error);
+        assert!(
+            unknown.contains("unknown field `run_in_background`"),
+            "{unknown}"
+        );
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
     }
 
     /// A sub-agent's todo_write writes to its own fresh list, never the
@@ -1338,7 +1399,7 @@ mod tests {
         }];
 
         let results = dispatch_tools(
-            vec![("t1".into(), "task".into(), json!({"prompt": "go"}))],
+            vec![("t1".into(), "run_agent".into(), json!({"prompt": "go"}))],
             &ctx,
         )
         .await;
@@ -1358,11 +1419,11 @@ mod tests {
         assert_eq!(parent[0].status, TodoStatus::Pending);
     }
 
-    /// Fire-and-forget: task {background:true} returns a "started" message
+    /// Fire-and-forget: run_agent {background:true} returns a "started" message
     /// immediately (NOT the result), and the detached sub-agent reinjects its
     /// final text into the PARENT's inbox as a framed SubAgentResult when done.
     #[tokio::test]
-    async fn background_task_returns_immediately_and_reinjects() {
+    async fn background_agent_returns_immediately_and_reinjects() {
         let provider = Provider::mock(vec![vec![AssistantBlock::Text {
             text: "sub result".into(),
         }]]);
@@ -1371,7 +1432,7 @@ mod tests {
         ctx.ui = rec.clone();
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "go do it", "background": true}),
             &ctx,
         )
@@ -1400,7 +1461,11 @@ mod tests {
             }
             other => panic!("expected SubAgentResult, got {other:?}"),
         };
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 0, "slot freed");
+        assert_eq!(
+            ctx.cfg.background_executions.running_count(),
+            0,
+            "slot freed"
+        );
         assert_eq!(
             rec.0.lock().unwrap().clone(),
             vec![
@@ -1414,7 +1479,7 @@ mod tests {
     /// reinjects NOTHING (codex's is_final) — only a wake so a blocked wait
     /// re-evaluates.
     #[tokio::test]
-    async fn stopped_background_task_does_not_reinject() {
+    async fn stopped_background_agent_does_not_reinject() {
         // Sub-agent blocks on a long bash so stop_agent can catch it running.
         let provider = Provider::mock(vec![vec![AssistantBlock::ToolUse {
             id: "s1".into(),
@@ -1425,7 +1490,12 @@ mod tests {
         let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
         ctx.ui = rec.clone();
 
-        let (out, _) = run_tool("task", json!({"prompt": "long", "background": true}), &ctx).await;
+        let (out, _) = run_tool(
+            "run_agent",
+            json!({"prompt": "long", "background": true}),
+            &ctx,
+        )
+        .await;
         let agent = out
             .split_whitespace()
             .find(|w| w.starts_with("agent-"))
@@ -1433,7 +1503,7 @@ mod tests {
             .to_string();
         // Let the sub-agent get into its bash before stopping it.
         for _ in 0..100 {
-            if ctx.cfg.background_tasks.running_count() == 1 {
+            if ctx.cfg.background_executions.running_count() == 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1444,13 +1514,13 @@ mod tests {
 
         // Wait for it to actually wind down, then assert nothing was reinjected.
         for _ in 0..300 {
-            if ctx.cfg.background_tasks.running_count() == 0 {
+            if ctx.cfg.background_executions.running_count() == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(
-            ctx.cfg.background_tasks.running_count(),
+            ctx.cfg.background_executions.running_count(),
             0,
             "stopped sub-agent did not reach a terminal state"
         );
@@ -1478,8 +1548,12 @@ mod tests {
         let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
         ctx.ui = rec.clone();
 
-        let (out, is_error) =
-            run_tool("task", json!({"prompt": "long", "background": true}), &ctx).await;
+        let (out, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "long", "background": true}),
+            &ctx,
+        )
+        .await;
         assert!(!is_error, "{out}");
         let agent = out
             .split_whitespace()
@@ -1487,7 +1561,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
         assert!(ctx.cfg.inbox.is_empty());
         assert_eq!(
             rec.0.lock().unwrap().clone(),
@@ -1498,7 +1572,7 @@ mod tests {
         );
 
         let (out, is_error) = run_tool(
-            "task",
+            "run_agent",
             json!({"prompt": "too late", "background": true}),
             &ctx,
         )
@@ -1535,7 +1609,8 @@ mod tests {
             ..base
         };
 
-        let (out, is_error) = run_tool("task", json!({"prompt": "do the sub thing"}), &ctx).await;
+        let (out, is_error) =
+            run_tool("run_agent", json!({"prompt": "do the sub thing"}), &ctx).await;
         assert!(!is_error, "{out}");
         assert_eq!(out, "sub result");
 
@@ -1569,7 +1644,7 @@ mod tests {
     /// "started" message (so a human auditing the parent can jump to it) and
     /// the detached sub-agent's file lands on disk.
     #[tokio::test]
-    async fn background_task_notes_child_session_and_persists() {
+    async fn background_agent_notes_child_session_and_persists() {
         use crate::rollout::{is_subagent_session, sessions_by_recency};
 
         let root = std::env::temp_dir().join(format!("kloop-bgpersist-{}", std::process::id()));
@@ -1589,8 +1664,12 @@ mod tests {
             ..base
         };
 
-        let (out, is_error) =
-            run_tool("task", json!({"prompt": "go", "background": true}), &ctx).await;
+        let (out, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "go", "background": true}),
+            &ctx,
+        )
+        .await;
         assert!(!is_error, "{out}");
         assert!(
             out.contains("Its session log is 20260714-111111-agent-"),
@@ -1599,7 +1678,7 @@ mod tests {
 
         // Wait for the detached sub-agent to finish and flush its file.
         for _ in 0..300 {
-            if ctx.cfg.background_tasks.running_count() == 0
+            if ctx.cfg.background_executions.running_count() == 0
                 && !sessions_by_recency(&sessions).is_empty()
             {
                 break;
@@ -1619,10 +1698,15 @@ mod tests {
     /// Without a persistent parent (empty session_id, as in mock/tests) a
     /// background spawn names no session log and writes nothing.
     #[tokio::test]
-    async fn background_task_without_session_notes_nothing() {
+    async fn background_agent_without_session_notes_nothing() {
         let provider = Provider::mock(vec![vec![AssistantBlock::Text { text: "x".into() }]]);
         let ctx = with_provider(test_ctx(0, "bg-nosession"), provider);
-        let (out, _) = run_tool("task", json!({"prompt": "go", "background": true}), &ctx).await;
+        let (out, _) = run_tool(
+            "run_agent",
+            json!({"prompt": "go", "background": true}),
+            &ctx,
+        )
+        .await;
         assert!(
             !out.contains("session log"),
             "an ephemeral parent has no child session log to name: {out}"
@@ -1640,20 +1724,20 @@ mod tests {
         // Success passes through verbatim.
         assert_eq!(
             classify_background(outcome(EndReason::Completed)),
-            (TaskStatus::Completed, Some("the answer".into()))
+            (ExecutionStatus::Completed, Some("the answer".into()))
         );
         // Round limit is framed but still carries the text.
         let (status, msg) = classify_background(outcome(EndReason::MaxRounds));
-        assert_eq!(status, TaskStatus::MaxRounds);
+        assert_eq!(status, ExecutionStatus::MaxRounds);
         assert!(msg.unwrap().contains("the answer"));
         // A failure is framed with re-dispatch guidance.
         let (status, msg) = classify_background(outcome(EndReason::Error("boom".into())));
-        assert_eq!(status, TaskStatus::Failed);
+        assert_eq!(status, ExecutionStatus::Failed);
         assert!(msg.unwrap().contains("boom"));
         // Interrupted reinjects nothing.
         assert_eq!(
             classify_background(outcome(EndReason::Aborted)),
-            (TaskStatus::Aborted, None)
+            (ExecutionStatus::Aborted, None)
         );
     }
 
@@ -1661,7 +1745,7 @@ mod tests {
     fn cancelled_worktree_location_survives_as_terminal_detail() {
         assert_eq!(
             background_terminal_detail(
-                TaskStatus::Aborted,
+                ExecutionStatus::Aborted,
                 Some("worktree kept at /tmp/agent-1".into())
             )
             .as_deref(),
@@ -1669,7 +1753,7 @@ mod tests {
         );
         assert_eq!(
             background_terminal_detail(
-                TaskStatus::Completed,
+                ExecutionStatus::Completed,
                 Some("worktree kept at /tmp/agent-1".into())
             ),
             None,
@@ -1687,11 +1771,11 @@ mod tests {
     }
 
     #[test]
-    fn task_preview_takes_first_line_truncated() {
-        assert_eq!(task_preview("fix the bug\nthen test"), "fix the bug");
-        assert_eq!(task_preview(""), "");
+    fn agent_preview_takes_first_line_truncated() {
+        assert_eq!(agent_preview("fix the bug\nthen test"), "fix the bug");
+        assert_eq!(agent_preview(""), "");
         let long = "x".repeat(100);
-        let preview = task_preview(&long);
+        let preview = agent_preview(&long);
         assert_eq!(preview.chars().count(), 81);
         assert!(preview.ends_with('…'));
     }

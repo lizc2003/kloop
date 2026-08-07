@@ -14,7 +14,8 @@ use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::background_tasks::TaskStatus;
+use super::background_executions::ExecutionKind;
+use super::background_executions::ExecutionStatus;
 use super::codemode::journal::agent_call_key;
 use super::codemode::journal::Claim;
 use super::codemode::journal::Journal;
@@ -60,7 +61,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run a deterministic JavaScript Workflow in the background. Use only when the user explicitly requested multi-agent orchestration. The script must begin with `export const meta = { name, description, phases }`; its body can use args, agent(), log(), phase(), parallel(), and pipeline(). Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. The tool returns task/run IDs immediately; the result is persisted and delivered at a later step boundary. Structured agent schemas are supported by the internal structured_output protocol.".into(),
+        description: "Run a deterministic JavaScript Workflow in the background. Use only when the user explicitly requested multi-agent orchestration. The script must begin with `export const meta = { name, description, phases }`; its body can use args, agent(), log(), phase(), parallel(), and pipeline(). Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. The tool returns a workflow-N execution id plus a durable wf_* run id immediately; the result is persisted and delivered at a later step boundary. Wait with wait_for_activity and stop only with stop_workflow. Structured agent schemas are supported by the internal structured_output protocol.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -72,6 +73,21 @@ pub(super) fn workflow_def() -> ToolDef {
                 "description": {"type": "string", "description": "Ignored; set meta.description in the script."},
                 "title": {"type": "string", "description": "Ignored; set meta.name in the script."}
             },
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn stop_workflow_def() -> ToolDef {
+    ToolDef {
+        name: "stop_workflow".into(),
+        description: "Stop a running Workflow by its workflow-N execution id. It ends without reporting a result. Use stop_agent for agent-N, stop_program for program-N, or stop_bash for bg-N. Do not pass the durable wf_* run id used for resume.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string", "description": "The workflow-N id returned when the Workflow launched"}
+            },
+            "required": ["workflow_id"],
             "additionalProperties": false
         }),
     }
@@ -197,11 +213,16 @@ fn launch_workflow(
     let task_id = format!("workflow-{}", WORKFLOW_SEQ.fetch_add(1, Ordering::Relaxed));
     let cancel = CancellationToken::new();
     ctx.cfg
-        .background_tasks
-        .register(&task_id, &prepared.meta.description, cancel.clone())
+        .background_executions
+        .register(
+            ExecutionKind::Workflow,
+            &task_id,
+            &prepared.meta.description,
+            cancel.clone(),
+        )
         .map_err(|error| anyhow!("workflow: {error}"))?;
     let ui = ctx.ui.clone();
-    let background_tasks = ctx.cfg.background_tasks.clone();
+    let background_executions = ctx.cfg.background_executions.clone();
     let parent_inbox = ctx.cfg.inbox.clone();
     let limits = ctx.cfg.program_limits;
     let mut workflow_ctx = ctx.clone();
@@ -220,7 +241,7 @@ fn launch_workflow(
         &task_id,
         &run_id_text,
         &description,
-        TaskStatus::Running,
+        ExecutionStatus::Running,
         None,
         None,
     );
@@ -230,7 +251,7 @@ fn launch_workflow(
         let _lease = lease;
         kloop_codemode::run_workflow(&prepared, &args, bridge, worker_cancel, limits).await
     });
-    background_tasks.attach_abort(&task_id, worker.abort_handle());
+    background_executions.attach_abort(&task_id, worker.abort_handle());
     let task_id_for_supervisor = task_id.clone();
     let supervisor_run_id = run_id_text.clone();
     let supervisor_description = description.clone();
@@ -241,28 +262,28 @@ fn launch_workflow(
                 &serde_json::to_vec_pretty(&value).unwrap_or_default(),
             ) {
                 Ok(path) => (
-                    TaskStatus::Completed,
+                    ExecutionStatus::Completed,
                     truncate(&value.to_string(), MAX_REINJECT_CHARS),
                     path,
                 ),
                 Err(error) => persist_error(&run_dir, format!("cannot persist result: {error:#}")),
             },
             Ok(Err(_error)) if cancel.is_cancelled() => (
-                TaskStatus::Aborted,
+                ExecutionStatus::Aborted,
                 String::new(),
                 run_dir.path().to_path_buf(),
             ),
             Ok(Err(error)) => persist_error(&run_dir, format!("{error:#}")),
             Err(error) if error.is_cancelled() => (
-                TaskStatus::Aborted,
+                ExecutionStatus::Aborted,
                 String::new(),
                 run_dir.path().to_path_buf(),
             ),
             Err(error) => persist_error(&run_dir, format!("workflow task panicked: {error}")),
         };
         let terminal =
-            background_tasks.finish(&task_id_for_supervisor, observed, |actual, deliver| {
-                if deliver && actual != TaskStatus::Aborted {
+            background_executions.finish(&task_id_for_supervisor, observed, |actual, deliver| {
+                if deliver && actual != ExecutionStatus::Aborted {
                     parent_inbox.push(InboxItem::WorkflowResult {
                         task_id: task_id_for_supervisor.clone(),
                         run_id: supervisor_run_id.clone(),
@@ -281,24 +302,28 @@ fn launch_workflow(
                 &supervisor_description,
                 terminal,
                 Some(output_path.to_string_lossy().to_string()),
-                task_status_detail(terminal),
+                execution_status_detail(terminal),
             );
         }
     });
 
     Ok(format!(
-        "Workflow launched in background. Task ID: {task_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nYou will be notified when it completes; use wait or stop_agent with the task ID.",
+        "Workflow launched in background. Workflow ID: {task_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nYou will be notified when it completes; wait with wait_for_activity or stop it with stop_workflow {{\"workflow_id\": \"{task_id}\"}}.",
         description,
         output_script.display(),
         run_id_text,
     ))
 }
 
-fn persist_error(run_dir: &RunDir, error: String) -> (TaskStatus, String, std::path::PathBuf) {
+fn persist_error(run_dir: &RunDir, error: String) -> (ExecutionStatus, String, std::path::PathBuf) {
     let summary = truncate(&error, MAX_REINJECT_CHARS);
     match run_dir.write_atomic("error.txt", error.as_bytes()) {
-        Ok(path) => (TaskStatus::Failed, summary, path),
-        Err(_) => (TaskStatus::Failed, summary, run_dir.path().to_path_buf()),
+        Ok(path) => (ExecutionStatus::Failed, summary, path),
+        Err(_) => (
+            ExecutionStatus::Failed,
+            summary,
+            run_dir.path().to_path_buf(),
+        ),
     }
 }
 
@@ -310,13 +335,13 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{prefix}… (truncated; see output file)")
 }
 
-fn task_status_detail(status: TaskStatus) -> Option<String> {
+fn execution_status_detail(status: ExecutionStatus) -> Option<String> {
     match status {
-        TaskStatus::Running => None,
-        TaskStatus::Completed => Some("completed".into()),
-        TaskStatus::Failed => Some("failed".into()),
-        TaskStatus::MaxRounds => Some("stopped at round limit".into()),
-        TaskStatus::Aborted => Some("stopped".into()),
+        ExecutionStatus::Running => None,
+        ExecutionStatus::Completed => Some("completed".into()),
+        ExecutionStatus::Failed => Some("failed".into()),
+        ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
+        ExecutionStatus::Aborted => Some("stopped".into()),
     }
 }
 
@@ -325,15 +350,15 @@ fn emit_workflow(
     id: &str,
     run_id: &str,
     description: &str,
-    status: TaskStatus,
+    status: ExecutionStatus,
     output_path: Option<String>,
     detail: Option<String>,
 ) {
     let status = match status {
-        TaskStatus::Running => BackgroundTaskStatus::Running,
-        TaskStatus::Completed | TaskStatus::MaxRounds => BackgroundTaskStatus::Completed,
-        TaskStatus::Failed => BackgroundTaskStatus::Failed,
-        TaskStatus::Aborted => BackgroundTaskStatus::Cancelled,
+        ExecutionStatus::Running => BackgroundTaskStatus::Running,
+        ExecutionStatus::Completed | ExecutionStatus::MaxRounds => BackgroundTaskStatus::Completed,
+        ExecutionStatus::Failed => BackgroundTaskStatus::Failed,
+        ExecutionStatus::Aborted => BackgroundTaskStatus::Cancelled,
     };
     ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
         id: id.to_string(),
@@ -412,10 +437,10 @@ impl HostBridge for WorkflowBridge {
             copy_option(&opts, &mut input, "model", "model");
             let workspace = ctx.cfg.effective_workspace();
             let result = match schema {
-                Some(schema) => super::task::structured_task(&input, schema, &ctx)
+                Some(schema) => super::subagent::structured_agent(&input, schema, &ctx)
                     .await
                     .map_err(|error| format!("{error:#}")),
-                None => super::task::task_tool(&input, &ctx, &workspace)
+                None => super::subagent::run_agent_tool(&input, &ctx, &workspace)
                     .await
                     .map(Value::String)
                     .map_err(|error| format!("{error:#}")),
@@ -437,7 +462,7 @@ impl HostBridge for WorkflowBridge {
             &self.task_id,
             &self.run_id,
             &self.description,
-            TaskStatus::Running,
+            ExecutionStatus::Running,
             None,
             Some(title),
         );
@@ -494,7 +519,7 @@ mod tests {
 
     async fn wait_idle(ctx: &ToolCtx) {
         for _ in 0..400 {
-            if ctx.cfg.background_tasks.running_count() == 0 {
+            if ctx.cfg.background_executions.running_count() == 0 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -523,33 +548,35 @@ mod tests {
             workflow: true,
             ..Default::default()
         };
-        assert!(super::super::all_tool_defs(
-            0,
-            &[],
-            30,
-            enabled,
-            &crate::shell_programs::ShellPrograms::native_posix(),
-        )
-        .iter()
-        .any(|definition| definition.name == "workflow"));
-        assert!(!super::super::all_tool_defs(
-            1,
-            &[],
-            30,
-            enabled,
-            &crate::shell_programs::ShellPrograms::native_posix(),
-        )
-        .iter()
-        .any(|definition| definition.name == "workflow"));
-        assert!(!super::super::all_tool_defs(
+        let enabled_names = |depth| {
+            super::super::all_tool_defs(
+                depth,
+                &[],
+                30,
+                enabled,
+                &crate::shell_programs::ShellPrograms::native_posix(),
+            )
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>()
+        };
+        let depth_zero = enabled_names(0);
+        assert!(depth_zero.iter().any(|name| name == "workflow"));
+        assert!(depth_zero.iter().any(|name| name == "stop_workflow"));
+        let depth_one = enabled_names(1);
+        assert!(!depth_one.iter().any(|name| name == "workflow"));
+        assert!(!depth_one.iter().any(|name| name == "stop_workflow"));
+
+        let disabled = super::super::all_tool_defs(
             0,
             &[],
             30,
             Default::default(),
             &crate::shell_programs::ShellPrograms::native_posix(),
-        )
-        .iter()
-        .any(|definition| definition.name == "workflow"));
+        );
+        assert!(!disabled.iter().any(|definition| {
+            matches!(definition.name.as_str(), "workflow" | "stop_workflow")
+        }));
     }
 
     #[tokio::test]
@@ -559,7 +586,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("meta"), "{error:#}");
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
     }
 
     #[tokio::test]
@@ -583,7 +610,7 @@ mod tests {
                 workflow_tool(&input, &ctx).await.is_err(),
                 "accepted {input}"
             );
-            assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+            assert_eq!(ctx.cfg.background_executions.running_count(), 0);
             assert!(ctx.cfg.inbox.is_empty());
         }
 
@@ -597,7 +624,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("args exceeds"), "{error:#}");
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
         assert!(ui.background().is_empty());
     }
 
@@ -616,10 +643,10 @@ mod tests {
         .await
         .unwrap();
         assert!(launched.contains("Workflow launched in background"));
-        let launched_task_id = launch_value(&launched, "Task ID: ").to_string();
+        let launched_task_id = launch_value(&launched, "Workflow ID: ").to_string();
         let launched_run_id = launch_value(&launched, "Run ID: ").to_string();
         assert!(launched_run_id.starts_with("wf_"));
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 1);
+        assert_eq!(ctx.cfg.background_executions.running_count(), 1);
 
         wait_idle(&ctx).await;
         let items = ctx.cfg.inbox.drain();
@@ -680,7 +707,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let task_id = launch_value(&launched, "Task ID: ").to_string();
+        let task_id = launch_value(&launched, "Workflow ID: ").to_string();
         let run_id = launch_value(&launched, "Run ID: ").to_string();
         wait_idle(&ctx).await;
 
@@ -748,14 +775,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let task_id = launch_value(&launched, "Task ID: ").to_string();
+        let task_id = launch_value(&launched, "Workflow ID: ").to_string();
         tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
             .await
             .expect("child sampling did not start")
             .expect("child sampling gate dropped");
-        crate::tools::background_tasks::stop_agent_tool(&json!({"agent_id": task_id}), &ctx)
-            .await
-            .unwrap();
+        crate::tools::background_executions::stop_workflow_tool(
+            &json!({"workflow_id": task_id}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let _ = release_tx.send(());
         wait_idle(&ctx).await;
 
@@ -812,7 +842,7 @@ mod tests {
             .expect("child sampling gate dropped");
         assert_eq!(
             ctx.cfg
-                .background_tasks
+                .background_executions
                 .shutdown(std::time::Duration::from_secs(1))
                 .await,
             0
@@ -900,7 +930,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("args exceeds"), "{error:#}");
-        assert_eq!(ctx.cfg.background_tasks.running_count(), 0);
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
 
         std::fs::write(&script_path, changed_script).unwrap();
         let (provider, miss_seen) = kloop_provider::Provider::mock_recording(vec![
@@ -959,7 +989,7 @@ mod tests {
         .await
         .unwrap();
         for _ in 0..400 {
-            if ctx.cfg.background_tasks.running_count() == 0 {
+            if ctx.cfg.background_executions.running_count() == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

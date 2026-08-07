@@ -2,7 +2,7 @@
 //! that orchestrates the built-in tools and sub-agents; it runs in an isolated
 //! QuickJS runtime (the `kloop-codemode` crate) and every `tools.<name>(...)`
 //! or `agent(...)` call routes back here through [`CoreBridge`], which re-enters
-//! the same gated dispatch (`run_one` / `task_tool`) a direct tool call takes —
+//! the same gated dispatch (`run_one` / `run_agent_tool`) a direct tool call takes —
 //! hooks, permission gate and sandbox all apply per call, unchanged. Only what
 //! the program returns (plus `log()` output) comes back to the model; the
 //! intermediate tool results stay in program variables, off the context window.
@@ -16,12 +16,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::background_tasks::TaskStatus;
+use super::background_executions::ExecutionKind;
+use super::background_executions::ExecutionStatus;
 use super::run_store::RunId;
 use super::run_store::RunLease;
 use super::run_store::RunNamespace;
@@ -43,20 +46,34 @@ const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 /// reasoning as the offload/agent counters.
 static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunProgramInput {
+    source: String,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    resume_from_run_id: Option<String>,
+}
+
 pub(super) mod journal;
 use journal::agent_call_key;
 use journal::Claim;
 use journal::Journal;
 
-/// Tools NOT exposed to a program: `run_program` itself (no program-in-program),
-/// `task` (replaced by the `agent()` orchestration primitive), and the
-/// background-dispatch tools `wait`/`stop_agent` (a program orchestrates
-/// synchronously via `agent()`/`parallel()`; fire-and-forget is a model-loop
-/// concept with no meaning inside one program run).
+/// Tools NOT exposed to a program: recursive runners and model-loop background
+/// controls. A program orchestrates synchronously through `agent()`/`parallel()`;
+/// it cannot detach or cancel sibling executions from inside itself.
 fn is_program_callable(name: &str) -> bool {
     !matches!(
         name,
-        "run_program" | "workflow" | "task" | "wait" | "stop_agent"
+        "run_program"
+            | "workflow"
+            | "run_agent"
+            | "wait_for_activity"
+            | "stop_agent"
+            | "stop_program"
+            | "stop_workflow"
     )
 }
 
@@ -83,7 +100,11 @@ fn program_tool_names(
 }
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let source = super::str_arg(input, "source", "run_program")?.to_string();
+    let RunProgramInput {
+        source,
+        background,
+        resume_from_run_id,
+    } = serde_json::from_value(input.clone()).context("run_program: invalid input")?;
     let names = program_tool_names(&ctx.cfg.tool_sources, &ctx.cfg.shell_programs);
     let limits = ctx.cfg.program_limits;
     // Each run has a run_id and an agent()-call journal. A resume passes the old
@@ -91,7 +112,7 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     // skipped instead of re-spawned (and re-charged) — plan 24 journal resume.
     let store = RunStore::new(&ctx.cfg.offload_dir, RunNamespace::Program)
         .map_err(|error| anyhow!("run_program: cannot open run store: {error:#}"))?;
-    let (run_id, run_dir) = match input["resume_from_run_id"].as_str() {
+    let (run_id, run_dir) = match resume_from_run_id.as_deref() {
         Some(raw) => {
             let id = RunId::parse(raw).map_err(|error| anyhow!("run_program: {error:#}"))?;
             let run = store
@@ -115,7 +136,7 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
 
     // Fire-and-forget: spawn detached, return a program id now, reinject the
     // return value at the next round boundary (reuses the plan-26 async path).
-    if input["background"].as_bool().unwrap_or(false) {
+    if background {
         return spawn_background_program(ctx, source, names, limits, run_id, journal, lease);
     }
     let _lease = lease;
@@ -179,11 +200,11 @@ fn program_preview(source: &str) -> String {
 }
 
 /// Fire-and-forget program spawn (plan 24, `run_program {"background": true}`):
-/// register in the shared async-task registry, launch a DETACHED tokio task on
+/// register in the shared background-execution registry, launch a DETACHED worker on
 /// its OWN cancel token (a finished parent turn must not kill a still-running
 /// program), and return immediately. When the program ends it reinjects its
 /// return value into the parent's inbox. Mirrors the sub-agent background path
-/// (plan 26) and reuses the same registry, `wait`, `stop_agent` and autowake.
+/// and reuses the same execution registry and autowake.
 fn spawn_background_program(
     ctx: &ToolCtx,
     source: String,
@@ -197,23 +218,23 @@ fn spawn_background_program(
     let own_cancel = CancellationToken::new();
     let preview = program_preview(&source);
     ctx.cfg
-        .background_tasks
-        .register(&label, &preview, own_cancel.clone())
+        .background_executions
+        .register(ExecutionKind::Program, &label, &preview, own_cancel.clone())
         .map_err(|msg| anyhow!("run_program: {msg}"))?;
     let parent_inbox = ctx.cfg.inbox.clone();
-    let background_tasks = ctx.cfg.background_tasks.clone();
+    let background_executions = ctx.cfg.background_executions.clone();
     let ui = ctx.ui.clone();
     // The program's tool calls run on the program's own cancel, not the parent
     // turn's — the parent may end while the program is still going.
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
     let bridge = Arc::new(CoreBridge::new(bg_ctx, limits, Some(journal.clone())));
-    super::task::emit_background_task(
+    super::subagent::emit_background_task(
         &ui,
         &label,
         BackgroundTaskKind::Program,
         &preview,
-        TaskStatus::Running,
+        ExecutionStatus::Running,
         None,
     );
 
@@ -222,7 +243,7 @@ fn spawn_background_program(
         let _lease = lease;
         kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
     });
-    background_tasks.attach_abort(&label, worker.abort_handle());
+    background_executions.attach_abort(&label, worker.abort_handle());
     tokio::spawn({
         let label = label.clone();
         let ui = ui.clone();
@@ -230,15 +251,15 @@ fn spawn_background_program(
         async move {
             let (status, reinject) = match worker.await {
                 Ok(outcome) => classify_program(outcome, &own_cancel, &journal, &run_id),
-                Err(error) if error.is_cancelled() => (TaskStatus::Aborted, None),
+                Err(error) if error.is_cancelled() => (ExecutionStatus::Aborted, None),
                 Err(error) => (
-                    TaskStatus::Failed,
+                    ExecutionStatus::Failed,
                     Some(format!(
-                        "[background program failed] program task panicked: {error}\nYou may re-run it or try another approach."
+                        "[background program failed] program worker panicked: {error}\nYou may re-run it or try another approach."
                     )),
                 ),
             };
-            let terminal = background_tasks.finish(&label, status, |actual, deliver| {
+            let terminal = background_executions.finish(&label, status, |actual, deliver| {
                 if deliver {
                     if let Some(summary) = reinject {
                         parent_inbox.push(InboxItem::ProgramResult {
@@ -249,43 +270,42 @@ fn spawn_background_program(
                         parent_inbox.notify_activity();
                     }
                 } else {
-                    debug_assert_eq!(actual, TaskStatus::Aborted);
+                    debug_assert_eq!(actual, ExecutionStatus::Aborted);
                     parent_inbox.notify_activity();
                 }
             });
             if let Some(terminal) = terminal {
-                super::task::emit_background_task(
+                super::subagent::emit_background_task(
                     &ui,
                     &label,
                     BackgroundTaskKind::Program,
                     &preview,
                     terminal,
-                    super::task::task_status_detail(terminal),
+                    super::subagent::execution_status_detail(terminal),
                 );
             }
         }
     });
     Ok(format!(
         "Program {label} started in the background. Keep working; its return value will be \
-         delivered to you as a message when it finishes. Block for it with the wait tool, or \
-         stop it with stop_agent."
+         delivered as a message when it finishes. Wait with wait_for_activity, or stop it with \
+         stop_program {{\"program_id\": \"{label}\"}}."
     ))
 }
 
 /// Map a background program's terminal outcome to (registry status, optional
 /// reinjection). Success reinjects the return value; a failure reinjects a
-/// framed, truncated error; a program stopped via `stop_agent` (its own cancel
-/// fired) reinjects nothing — the model that stopped it already knows (codex's
-/// is_final).
+/// framed, truncated error; a program stopped via `stop_program` reinjects
+/// nothing because the caller already knows it was stopped.
 fn classify_program(
     outcome: Result<String>,
     own_cancel: &CancellationToken,
     journal: &Journal,
     run_id: &str,
-) -> (TaskStatus, Option<String>) {
+) -> (ExecutionStatus, Option<String>) {
     match outcome {
-        Ok(out) => (TaskStatus::Completed, Some(program_output(out))),
-        Err(_) if own_cancel.is_cancelled() => (TaskStatus::Aborted, None),
+        Ok(out) => (ExecutionStatus::Completed, Some(program_output(out))),
+        Err(_) if own_cancel.is_cancelled() => (ExecutionStatus::Aborted, None),
         Err(e) => {
             let mut msg = format!(
                 "[background program failed] {}",
@@ -300,7 +320,7 @@ fn classify_program(
             } else {
                 msg.push_str("\nYou may re-run it or try another approach.");
             }
-            (TaskStatus::Failed, Some(msg))
+            (ExecutionStatus::Failed, Some(msg))
         }
     }
 }
@@ -327,7 +347,7 @@ struct CoreBridge {
     // Total agent() calls so far and the ceiling; the (max_agents+1)th is
     // refused — the runaway guard against unbounded sub-agent fan-out. Note we
     // cap the TOTAL, not the concurrency: a program firing N concurrent agent()
-    // is the same as a model emitting N concurrent `task` calls, which kloop
+    // is the same as a model emitting N concurrent `run_agent` calls, which kloop
     // already runs uncapped (join_all) — so pacing concurrency here would break
     // that precedent. The hard total ceiling is the guard that matters.
     agent_count: AtomicU64,
@@ -426,14 +446,14 @@ impl HostBridge for CoreBridge {
                      sub-agents without bound — narrow the work or process items in batches"
                 ));
             }
-            let mut task_input = json!({ "prompt": prompt });
+            let mut agent_input = json!({ "prompt": prompt });
             for k in ["agent_type", "max_rounds"] {
                 if let Some(v) = opts.get(k) {
-                    task_input[k] = v.clone();
+                    agent_input[k] = v.clone();
                 }
             }
             let workspace = ctx.cfg.effective_workspace();
-            let result = super::task::task_tool(&task_input, &ctx, &workspace)
+            let result = super::subagent::run_agent_tool(&agent_input, &ctx, &workspace)
                 .await
                 .map(Value::String)
                 .map_err(|e| format!("{e:#}"));
@@ -455,7 +475,7 @@ impl HostBridge for CoreBridge {
 /// The `run_program` tool definition. Its description carries the TypeScript API the
 /// program can call, generated from `callable`'s schemas — the same trick the
 /// references converge on (typed API declarations markedly improve how reliably
-/// the model calls tools). Depth-0 only, like `task`.
+/// the model calls tools). Depth-0 only, like `run_agent`.
 ///
 /// `builtins` are declared returning `Promise<string>`. `sources` are inline
 /// external (MCP) tools, declared returning `Promise<CallToolResult>` (a program
@@ -521,9 +541,9 @@ and sandbox checks as a direct tool call. Run independent calls concurrently wit
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
 Set `background: true` to run the program detached: you get a program id back \
 immediately and its return value is delivered to you as a message when it \
-finishes (block for it with the `wait` tool, or cancel it with `stop_agent`). \
-Use this for long fan-outs/migrations so they don't hold up the turn; omit it \
-for a normal synchronous run.\n\n\
+finishes (wait with `wait_for_activity`, or cancel the program-N id with \
+`stop_program`). Use this for long fan-outs/migrations so they don't hold up the \
+turn; omit it for a normal synchronous run.\n\n\
 If a program fails partway through a long agent() fan-out, it reports a \
 run_id; call run_program again with the SAME source and `resume_from_run_id` \
 set to it to skip the agent() calls that already completed (their results are \
@@ -555,10 +575,11 @@ the program:\n",
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "The JavaScript program to run"},
-                "background": {"type": "boolean", "description": "Run detached: returns a program id immediately and delivers the return value as a message when it finishes (block with wait, cancel with stop_agent). Omit for a synchronous run."},
+                "background": {"type": "boolean", "description": "Run detached: return a program-N id immediately and deliver the return value later (default false). Wait with wait_for_activity; stop with stop_program."},
                 "resume_from_run_id": {"type": "string", "description": "Resume a failed run: pass the run_id it reported (with the same source) to skip agent() calls that already completed."}
             },
-            "required": ["source"]
+            "required": ["source"],
+            "additionalProperties": false
         }),
     }
 }

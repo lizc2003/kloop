@@ -1,10 +1,10 @@
 //! Foreground and background shell execution. The background shape follows
-//! cc: `run_in_background` returns immediately with an id and an output file
+//! Native `background: true` returns immediately with an id and an output file
 //! (stdout/stderr interleaved at the fd level — no reader tasks, no pipe
-//! deadlock), `bash_output` blocks on completion by default, `kill_bash`
+//! deadlock), `bash_output` blocks on completion by default, `stop_bash`
 //! kills the whole owned process tree (Unix process group or Windows Job).
 //! Interrupting a turn never touches
-//! background shells; kill_bash, the size watchdog, and explicit session
+//! background shells; stop_bash, the size watchdog, and explicit session
 //! shutdown reap them. State changes emit session-scoped background-task
 //! events. cc's auto-backgrounding and model-visible Monitor tool are not ported.
 
@@ -22,6 +22,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -29,6 +30,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::str_arg;
+use super::strict_str_arg;
 use super::ToolCtx;
 use crate::agent::Ui;
 use crate::config::EffectiveWorkspace;
@@ -72,6 +74,25 @@ const FOREGROUND_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// offload directory never collide on output file names (same lesson as the
 /// offload counter).
 static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashInput {
+    command: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    disable_sandbox: bool,
+}
+
+fn parse_bash_input(input: &Value) -> Result<BashInput> {
+    if input.get("run_in_background").is_some() {
+        bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
+    }
+    serde_json::from_value(input.clone()).context("bash: invalid input")
+}
 
 const MODEL_SHELL_SECRET_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -146,22 +167,27 @@ pub(super) async fn bash_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
-    let command = str_arg(input, "command", "bash")?;
+    #[cfg(windows)]
+    if input.get("disable_sandbox").is_some() {
+        bail!("bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented");
+    }
+    let parsed = parse_bash_input(input)?;
+    let command = parsed.command.as_str();
     let bash = ctx
         .cfg
         .shell_programs
         .bash
         .as_ref()
         .context("bash: Git for Windows Bash is unavailable in this session")?;
-    #[cfg(windows)]
-    if input.get("disable_sandbox").is_some() {
-        bail!("bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented");
-    }
-    let sandbox = call_sandbox(input, workspace);
+    let sandbox = if parsed.disable_sandbox {
+        None
+    } else {
+        workspace.sandbox.clone()
+    };
     let cwd = workspace.cwd.clone();
-    if input["run_in_background"].as_bool().unwrap_or(false) {
-        // No timeout in background mode (cc clears the timer too); the
-        // watchdog and kill_bash are the safety net.
+    if parsed.background {
+        // No timeout in background mode; the watchdog and stop_bash are the
+        // safety net.
         return ctx.cfg.background_shells.spawn_background(
             command,
             &cwd,
@@ -173,7 +199,7 @@ pub(super) async fn bash_tool(
     if ctx.cancel.is_cancelled() {
         bail!("interrupted");
     }
-    let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
+    let timeout_ms = parsed.timeout_ms.unwrap_or(60_000);
     let output = run_foreground(
         command,
         &cwd,
@@ -465,12 +491,15 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     ))
 }
 
-pub(super) async fn kill_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let id = str_arg(input, "bash_id", "kill_bash")?;
+pub(super) async fn stop_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    let id = strict_str_arg(input, "bash_id", "stop_bash")?;
+    if let Some(hint) = super::background_executions::execution_stop_hint(id) {
+        bail!(hint);
+    }
     let shells = &ctx.cfg.background_shells;
     let command = shells
         .request_kill(id)
-        .map_err(|e| anyhow!("kill_bash: {e}"))?;
+        .map_err(|e| anyhow!("stop_bash: {e}"))?;
     // The monitor task does the killing; wait for it to confirm so the
     // reported status is final rather than racy.
     let started = std::time::Instant::now();
@@ -642,9 +671,19 @@ impl BackgroundShells {
         Ok(format!(
             "Command running in background with ID: {id}. Output is being written to: {}. \
              You will be notified when it changes state. Check on it with bash_output; stop it \
-             with kill_bash.",
+             with stop_bash.",
             path.display()
         ))
+    }
+
+    pub(super) fn running_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .shells
+            .values()
+            .filter(|shell| shell.status.is_active())
+            .count()
     }
 
     fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf, Option<BgSandbox>)> {
@@ -1552,7 +1591,7 @@ Wait-Process -Id $grandchild.Id
         let ctx = test_ctx(0, "bg-complete");
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": "echo bg-hello; echo bg-err 1>&2", "run_in_background": true}),
+            json!({"command": "echo bg-hello; echo bg-err 1>&2", "background": true}),
             &ctx,
         )
         .await;
@@ -1574,7 +1613,7 @@ Wait-Process -Id $grandchild.Id
         let (ctx, ui) = recording_ctx("bg-events");
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": "printf done", "run_in_background": true}),
+            json!({"command": "printf done", "background": true}),
             &ctx,
         )
         .await;
@@ -1624,7 +1663,7 @@ Wait-Process -Id $grandchild.Id
         let (ctx, ui) = recording_ctx("bg-fail");
         let (out, _) = run_tool(
             "bash",
-            json!({"command": "echo pre; exit 7", "run_in_background": true}),
+            json!({"command": "echo pre; exit 7", "background": true}),
             &ctx,
         )
         .await;
@@ -1662,7 +1701,7 @@ Wait-Process -Id $grandchild.Id
         // ignores it.
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": "sleep 30", "run_in_background": true, "timeout_ms": 10}),
+            json!({"command": "sleep 30", "background": true, "timeout_ms": 10}),
             &ctx,
         )
         .await;
@@ -1682,23 +1721,23 @@ Wait-Process -Id $grandchild.Id
         assert!(out.contains(&format!("{id}: running")), "{out}");
 
         // Clean up.
-        let (out, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx2).await;
+        let (out, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx2).await;
         assert!(!is_error, "{out}");
     }
 
     #[tokio::test]
-    async fn kill_bash_stops_a_running_shell() {
+    async fn stop_bash_stops_a_running_shell() {
         let ctx = test_ctx(0, "bg-kill");
         let (out, _) = run_tool(
             "bash",
-            json!({"command": "sleep 30", "run_in_background": true}),
+            json!({"command": "sleep 30", "background": true}),
             &ctx,
         )
         .await;
         let id = bg_id(&out);
         let started = std::time::Instant::now();
 
-        let (out, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
+        let (out, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
         assert!(!is_error, "{out}");
         assert!(out.contains(&format!("Stopped {id} (sleep 30)")), "{out}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -1713,7 +1752,7 @@ Wait-Process -Id $grandchild.Id
         ));
 
         // A second kill is an error: the shell is no longer running.
-        let (out, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
+        let (out, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("not running"), "{out}");
     }
@@ -1726,7 +1765,7 @@ Wait-Process -Id $grandchild.Id
         let command = tree.command();
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": command, "run_in_background": true}),
+            json!({"command": command, "background": true}),
             &ctx,
         )
         .await;
@@ -1760,12 +1799,8 @@ Wait-Process -Id $grandchild.Id
             "session teardown must not enqueue a turn that cannot run"
         );
 
-        let (out, is_error) = run_tool(
-            "bash",
-            json!({"command": "true", "run_in_background": true}),
-            &ctx,
-        )
-        .await;
+        let (out, is_error) =
+            run_tool("bash", json!({"command": "true", "background": true}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("session is closing"), "{out}");
     }
@@ -1778,7 +1813,7 @@ Wait-Process -Id $grandchild.Id
         let command = tree.command();
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": command, "run_in_background": true}),
+            json!({"command": command, "background": true}),
             &ctx,
         )
         .await;
@@ -1861,7 +1896,7 @@ Wait-Process -Id $grandchild.Id
             "bash",
             json!({
                 "command": tree.command_with_powershell(&powershell),
-                "run_in_background": true
+                "background": true
             }),
             &ctx,
         )
@@ -1869,7 +1904,7 @@ Wait-Process -Id $grandchild.Id
         assert!(!is_error, "{output}");
         let id = bg_id(&output);
         let pids = wait_for_windows_tree_pids(&tree).await;
-        let (output, is_error) = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
+        let (output, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
         assert!(!is_error, "{output}");
         assert_windows_processes_dead(pids).await;
 
@@ -1879,7 +1914,7 @@ Wait-Process -Id $grandchild.Id
             "bash",
             json!({
                 "command": tree.command_with_powershell(&powershell),
-                "run_in_background": true
+                "background": true
             }),
             &ctx,
         )
@@ -1899,7 +1934,7 @@ Wait-Process -Id $grandchild.Id
             let command = tree.command();
             let (out, is_error) = run_tool(
                 "bash",
-                json!({"command": command, "run_in_background": true}),
+                json!({"command": command, "background": true}),
                 &ctx,
             )
             .await;
@@ -1914,7 +1949,7 @@ Wait-Process -Id $grandchild.Id
         let ctx = test_ctx(0, "bg-block-timeout");
         let (out, _) = run_tool(
             "bash",
-            json!({"command": "sleep 30", "run_in_background": true}),
+            json!({"command": "sleep 30", "background": true}),
             &ctx,
         )
         .await;
@@ -1930,7 +1965,7 @@ Wait-Process -Id $grandchild.Id
             out.contains(&format!("{id}: still running after 200ms")),
             "{out}"
         );
-        let _ = run_tool("kill_bash", json!({"bash_id": id}), &ctx).await;
+        let _ = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
     }
 
     #[tokio::test]
@@ -1940,7 +1975,7 @@ Wait-Process -Id $grandchild.Id
             "bash",
             // ~100KB of x's then a marker; the tail must keep the marker and
             // drop the front.
-            json!({"command": "yes x | head -c 100000; echo TAIL-MARKER", "run_in_background": true}),
+            json!({"command": "yes x | head -c 100000; echo TAIL-MARKER", "background": true}),
             &ctx,
         )
         .await;
@@ -2363,7 +2398,7 @@ Wait-Process -Id $grandchild.Id
             let (ctx, _) = sandbox_ctx("bg");
             let (out, is_error) = run_tool(
                 "bash",
-                json!({"command": "echo bg-sandboxed", "run_in_background": true}),
+                json!({"command": "echo bg-sandboxed", "background": true}),
                 &ctx,
             )
             .await;
@@ -2378,7 +2413,7 @@ Wait-Process -Id $grandchild.Id
                 "bash",
                 json!({
                     "command": format!("echo hi > {}", blocked.display()),
-                    "run_in_background": true
+                    "background": true
                 }),
                 &ctx,
             )
@@ -2391,13 +2426,71 @@ Wait-Process -Id $grandchild.Id
     }
 
     #[tokio::test]
+    async fn background_field_is_strict_and_old_name_fails_closed() {
+        let ctx = test_ctx(0, "bash-background-field");
+        let (old, old_error) = run_tool(
+            "bash",
+            json!({"command": "printf should-not-run", "run_in_background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(old_error);
+        assert!(old.contains("use background instead"), "{old}");
+
+        let (unknown, unknown_error) = run_tool(
+            "bash",
+            json!({"command": "printf should-not-run", "description": "legacy"}),
+            &ctx,
+        )
+        .await;
+        assert!(unknown_error);
+        assert!(unknown.contains("unknown field `description`"), "{unknown}");
+
+        let (wrong_type, wrong_type_error) = run_tool(
+            "bash",
+            json!({"command": "printf should-not-run", "background": "yes"}),
+            &ctx,
+        )
+        .await;
+        assert!(wrong_type_error);
+        assert!(wrong_type.contains("invalid type"), "{wrong_type}");
+        assert_eq!(ctx.cfg.background_shells.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_bash_rejects_every_execution_id_with_a_directed_hint() {
+        let ctx = test_ctx(0, "stop-bash-typed-id");
+        for (id, hint) in [
+            ("agent-1", "use stop_agent {agent_id: \"agent-1\"}"),
+            ("program-1", "use stop_program {program_id: \"program-1\"}"),
+            (
+                "workflow-1",
+                "use stop_workflow {workflow_id: \"workflow-1\"}",
+            ),
+        ] {
+            let (output, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
+            assert!(is_error, "{id}: {output}");
+            assert!(output.contains(hint), "{id}: {output}");
+        }
+
+        let (unknown, unknown_error) = run_tool(
+            "stop_bash",
+            json!({"bash_id": "bg-1", "agent_id": "agent-1"}),
+            &ctx,
+        )
+        .await;
+        assert!(unknown_error);
+        assert!(unknown.contains("unknown field `agent_id`"), "{unknown}");
+    }
+
+    #[tokio::test]
     async fn unknown_background_ids_error() {
         let ctx = test_ctx(0, "bg-unknown");
         let (out, is_error) = run_tool("bash_output", json!({"bash_id": "bg-99999"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("no background command"), "{out}");
 
-        let (out, is_error) = run_tool("kill_bash", json!({"bash_id": "bg-99999"}), &ctx).await;
+        let (out, is_error) = run_tool("stop_bash", json!({"bash_id": "bg-99999"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("no background command"), "{out}");
 

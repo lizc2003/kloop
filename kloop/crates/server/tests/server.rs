@@ -242,7 +242,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             todos: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
-            background_tasks: Default::default(),
+            background_executions: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
@@ -383,7 +383,7 @@ fn worktree_factory(
             todos: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
-            background_tasks: Default::default(),
+            background_executions: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
@@ -1351,7 +1351,7 @@ async fn subagent_items_carry_the_agent_label() {
     let dirs = test_dirs("subagent");
     let script = vec![
         // main: spawn the sub-agent
-        vec![tool_use("t1", "task", json!({"prompt": "sub work"}))],
+        vec![tool_use("t1", "run_agent", json!({"prompt": "sub work"}))],
         // consumed by the sub-agent: one tool call, then its answer
         vec![tool_use("s1", "bash", json!({"command": "echo hi"}))],
         vec![text("sub result")],
@@ -1385,7 +1385,7 @@ async fn subagent_items_carry_the_agent_label() {
     let task_row = log
         .iter()
         .find(|m| {
-            m["params"]["item"]["type"] == "toolCall" && m["params"]["item"]["name"] == "task"
+            m["params"]["item"]["type"] == "toolCall" && m["params"]["item"]["name"] == "run_agent"
         })
         .unwrap();
     assert!(task_row["params"]["item"].get("agent").is_none());

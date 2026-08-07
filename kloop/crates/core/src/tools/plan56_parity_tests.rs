@@ -540,12 +540,7 @@ async fn effective_context_report() -> Value {
     assert!(!is_error && output.contains("context.txt"), "{output}");
     successful_tools.push("grep");
     let pwd_command = if cfg!(windows) { "pwd -W" } else { "pwd" };
-    let (output, is_error) = run_tool(
-        "bash",
-        json!({"command": pwd_command, "description": "Print worktree cwd"}),
-        &context,
-    )
-    .await;
+    let (output, is_error) = run_tool("bash", json!({"command": pwd_command}), &context).await;
     let output = output.replace('\\', "/");
     let expected = crate::worktree::git_compatible_path(&worktree)
         .to_string_lossy()

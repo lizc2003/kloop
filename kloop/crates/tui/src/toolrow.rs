@@ -92,7 +92,7 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "bash" => {
             let cmd = s("command");
             let bg = v
-                .get("run_in_background")
+                .get("background")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let detail = if bg {
@@ -124,7 +124,12 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "web_search" => ("Search".into(), s("query")),
         "read_offloaded" => ("Read".into(), s("path")),
         "bash_output" => ("BashOutput".into(), s("bash_id")),
-        "kill_bash" => ("KillBash".into(), s("bash_id")),
+        "stop_bash" => ("StopBash".into(), s("bash_id")),
+        "run_agent" => ("RunAgent".into(), s("prompt")),
+        "wait_for_activity" => ("WaitForActivity".into(), String::new()),
+        "stop_agent" => ("StopAgent".into(), s("agent_id")),
+        "stop_program" => ("StopProgram".into(), s("program_id")),
+        "stop_workflow" => ("StopWorkflow".into(), s("workflow_id")),
         "tool_search" => ("ToolSearch".into(), s("query")),
         "skill" => ("Skill".into(), s("name")),
         // call_tool wraps a real tool name; show that so the row reads as the
@@ -310,7 +315,7 @@ mod tests {
     fn background_bash_is_flagged() {
         let lines = tool_cell_lines(
             "bash",
-            r#"{"command":"sleep 9","run_in_background":true}"#,
+            r#"{"command":"sleep 9","background":true}"#,
             ToolStatus::Ok,
             Some("bg-1 started"),
             60,

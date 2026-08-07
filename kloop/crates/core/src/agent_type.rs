@@ -1,6 +1,6 @@
 //! Custom agent types (plan 17 slice 2): named sub-agent definitions that
 //! override the system prompt, model, and available tools. Dispatched via the
-//! `task` tool's `agent_type` parameter; loaded from global
+//! `run_agent` tool's `agent_type` parameter; loaded from global
 //! `~/.kloop/config.toml` `[agents.<name>]` by the CLI. The shape follows cc's `.claude/agents`
 //! frontmatter — the system prompt is **replaced**, not concatenated; an
 //! omitted model or tool set inherits the parent's; an unknown type is an
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentType {
     pub name: String,
-    /// What this agent is for — shown to the model in the task tool's
+    /// What this agent is for — shown to the model in the run_agent tool's
     /// description so it can choose an `agent_type`.
     pub description: String,
     /// Replaces the sub-agent's system prompt entirely (cc semantics — not
@@ -54,7 +54,7 @@ pub fn tool_available(allowlist: Option<&HashSet<String>>, tool: &str) -> bool {
     tool == "read_offloaded" || allowlist.is_none_or(|allow| allow.contains(tool))
 }
 
-/// The block appended to the `task` tool's description listing the available
+/// The block appended to the `run_agent` tool's description listing the available
 /// agent types. Session-stable (config-derived), so it stays byte-stable for
 /// the prompt cache.
 pub fn agent_types_hint(types: &[AgentType]) -> String {

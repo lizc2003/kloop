@@ -185,7 +185,7 @@ rejected. Rewind is idle-only — a running turn owns History (Ctrl+C first).
 
 ### Sub-agent sessions
 
-A sub-agent the `task` tool spawns (synchronous batch or `background: true`)
+A sub-agent the `run_agent` tool spawns (synchronous batch or `background: true`)
 writes its own session file next to the parent's, so its full transcript is
 auditable — the parent's tool_result keeps only the sub-agent's final text,
 while the file records every tool call it made. Both references converged on
@@ -196,7 +196,7 @@ nested dirs or codex's SQLite `thread_spawn_edges`:
 - the child file is `{parent id}-{agent-N}.jsonl` — the name itself shows the
   lineage and stays unique (parent id is unique, the label is process-global);
 - its first line carries `subagent_of` = `{parent id}#{seq}` of the parent
-  turn's assistant line that made the spawning `task` call — a *line-level*
+  turn's assistant line that made the spawning `run_agent` call — a *line-level*
   back-pointer (finer than either reference's session-level link), independent
   of the fork `parent` field since a sub-agent history is wholly its own (no
   prefix copied);
@@ -206,7 +206,7 @@ nested dirs or codex's SQLite `thread_spawn_edges`:
   the default `--resume`/`--continue` picker skips them (they are reachable
   only by explicit id) — matching cc hiding sidechains and codex's source
   filter, while still keeping them visible for audit;
-- the parent's `task {background:true}` reply names the child's session log so
+- the parent's `run_agent {background:true}` reply names the child's session log so
   a human reading the parent transcript can jump to it. A parent with no
   session (`--mock`, tests) leaves the sub-agent in memory, as before.
 
@@ -822,7 +822,7 @@ not a policy decision (the permission gate is the enforcement layer).
 Whatever an allowing hook prints on stdout is injected into history as a
 `[{event} hook]`-prefixed user message the model sees.
 
-**Sub-agents** (dispatched by the `task` tool) fire `subagent_start` /
+**Sub-agents** (dispatched by the `run_agent` tool) fire `subagent_start` /
 `subagent_stop` **instead of** `pre_turn` / `post_turn` — the split both cc
 (`Stop`→`SubagentStop`) and codex ("child turns run SubagentStop")
 converge on, so a "when the main agent finishes" hook and a "when a
@@ -1093,7 +1093,7 @@ batching: read-only calls may overlap, while opaque/redirection calls execute se
 
 ## Background bash (Phase 2, tenth slice)
 
-`bash` takes `run_in_background`: the command starts in its own owned process
+`bash` takes `background`: the command starts in its own owned process
 tree (Unix process group or Windows Job), stdout/stderr interleave straight into
 a file under `.kloop/offload/`
 (`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
@@ -1104,7 +1104,7 @@ returns immediately with the ID and the output path. Companions:
   reports `running` / `completed (exit 0)` / `failed (exit N)` /
   `killed (reason)` plus the last 30k bytes of output (read the file with
   `read_file` for more). Read-only: skips the gate, joins concurrent batches.
-- **kill_bash** `{bash_id}` — terminates the whole owned process tree and waits
+- **stop_bash** `{bash_id}` — terminates the whole owned process tree and waits
   for the registry to confirm. Auto-allowed: it can only signal processes this
   agent itself started.
 
@@ -1116,7 +1116,7 @@ background shells. Every shell publishes a session-scoped lifecycle
 frontends. On terminal state, the launching agent's step-boundary inbox receives
 only the status, summary, and output-file pointer — command output stays in the
 file. A running turn sees it at the next sampling boundary; the TUI autowakes
-when idle; plain/server deliver it on the next turn. `kill_bash`, a 1 GiB
+when idle; plain/server deliver it on the next turn. `stop_bash`, a 1 GiB
 output-file watchdog, and explicit session shutdown reap the whole process
 tree. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
 threads sharing one offload directory never collide.
@@ -1126,8 +1126,8 @@ requests cooperative cancellation, then bounds the wait (worker abort or shell
 SIGKILL fallback). Late terminal events are thread/session scoped rather than
 being attached to a fake turn id; a terminal transition wins once, so a stop /
 natural-completion race cannot reinject or notify twice. The shell registry
-remains separate from the agent/program registry because it owns an output file
-and reinjects only a pointer, while agents/programs reinject result bodies.
+remains separate from the agent/program/workflow registry because it owns an output file
+and reinjects only a pointer, while the other executions reinject result bodies.
 
 Deliberately not ported: cc's automatic foreground→background promotion, stall
 policy, and model-visible `Monitor`. Exact 2.1.220 evidence shows Monitor is a
@@ -1190,8 +1190,8 @@ overlap even when they use separate dispatch rounds or `CoreBridge` instances;
 Config clones and sub-agents share the gate, while independent server sessions do
 not. The gate is acquired after hooks and permission approval but before spawn,
 so cancellation while waiting creates no process. It is released before
-post-tool hooks and is never held around `run_program`, task, skill, wait, or
-other orchestration wrappers.
+post-tool hooks and is never held around `run_program`, `run_agent`, `skill`,
+`wait_for_activity`, or other orchestration wrappers.
 
 Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
 and read-only classifier are never applied. Plan mode rejects it without asking;
@@ -1284,8 +1284,8 @@ unknown rather than weakening kloop's safety policy to manufacture fixtures.
 
 ## Parallel sub-agents (Phase 2, twelfth slice)
 
-The `task` tool dispatches concurrently (cc shape): `is_concurrency_safe`
-marks `task` unconditionally safe, so consecutive task calls in one response
+The `run_agent` tool dispatches concurrently (cc shape): `is_concurrency_safe`
+marks `run_agent` unconditionally safe, so consecutive run_agent calls in one response
 run as parallel sub-agents inside the ordinary concurrent batch. Results stay
 paired to their `tool_use_id`s in request order; one sub-agent failing (bad
 input, error, panic) becomes its own `is_error` tool_result without sinking
@@ -1316,7 +1316,7 @@ Presentation per frontend:
 
 ### Custom agent types
 
-A `task` call can target a named specialized agent via the `agent_type`
+A `run_agent` call can target a named specialized agent via the `agent_type`
 parameter. Types are defined in global `~/.kloop/config.toml`:
 
 ```toml
@@ -1333,14 +1333,14 @@ semantics): `system` **replaces** the system prompt (not concatenated),
 exact allowlist — the sub-agent's tool defs are filtered to it and a call to
 anything outside is rejected at dispatch (`read_offloaded` always stays
 available, so a restricted agent can still read back a truncated result).
-Only `description` is required; it is shown to the model in the task tool's
+Only `description` is required; it is shown to the model in the run_agent tool's
 description so it can pick a type, and an unknown `agent_type` is an
 is_error result naming the available ones. Sub-agents still can't spawn
 further sub-agents, and they share the parent's permission gate — the human's
 last word doesn't loosen inside a sub-agent. `--mock` reads no config, so it
 sees no types.
 
-Sub-agent transcripts are persisted in their own `{parent}-agent-N.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `task {"background": true}` plus `wait`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
+Sub-agent transcripts are persisted in their own `{parent}-agent-N.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `run_agent {"background": true}` plus `wait_for_activity`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
 
 ### Worktree isolation
 
@@ -1348,10 +1348,10 @@ kloop has two intentionally separate worktree lifecycles. Both use the shared
 provenance-aware Git implementation in `crates/core/src/worktree.rs`, but they
 do not share ownership, an active slot, or deletion rights:
 
-- **Task isolation**: `task {"prompt":"...","isolation":"worktree"}` creates a
-  task-owned checkout from the current HEAD. A clean task tree is removed when
-  the task finishes; a tree with uncommitted changes, commits, or an uncertain
-  Git probe is retained and reported. Parallel task worktree mutations are
+- **Agent isolation**: `run_agent {"prompt":"...","isolation":"worktree"}` creates an
+  agent-owned checkout from the current HEAD. A clean agent worktree is removed when
+  the agent finishes; a worktree with uncommitted changes, commits, or an uncertain
+  Git probe is retained and reported. Parallel agent worktree mutations are
   serialized per Git common directory.
 - **Session worktrees**: at depth zero, and only when the current frontend
   enables the worktree surface, the model may create or enter a worktree and
@@ -1493,7 +1493,7 @@ The list is **session-scoped process state on the `Config`, not history**: it
 survives across turns within a session and starts empty on resume — the model
 rebuilds it from its own `todo_write` calls replayed in history (the TUI
 replays each historical call as its checklist too). Each **sub-agent gets its
-own fresh list** (the `task` tool resets it on the cloned Config), so a
+own fresh list** (the `run_agent` tool resets it on the cloned Config), so a
 sub-agent's planning never touches the parent's. It has no external side
 effect, so the permission gate auto-allows it (read-only self-verdict); it
 runs serially (full-table replace has ordering).
@@ -1532,7 +1532,7 @@ recorded right after the round's `tool_result` blocks (a separate user
 message), it never interleaves tool results with regular text — the ordering
 constraint both cc and codex call out.
 
-Each **sub-agent gets its own fresh queue** (the `task` tool resets it on the
+Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
 cloned Config, like the todo list), so a running sub-agent never drains the
 parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
 a User cell); server mode enqueues via `turn/steer {threadId, input}` (pushed
@@ -1642,13 +1642,14 @@ dependent, so a program splits its lines per mode.)
 
 **The safety story is that every `tools.<name>(...)` and `agent(...)` re-enters
 the exact same gated dispatch a direct call takes** — `run_one` (allowlist →
-deferred lock → hooks → permission gate → sandbox → execute) and `task_tool`. A
+deferred lock → hooks → permission gate → sandbox → execute) and
+`run_agent_tool`. A
 denied tool is refused *inside* the program (the model catches the exception); a
 sandboxed command is still sandboxed. The `kloop-codemode` crate is engine-only
 and knows nothing of permissions; it calls back through a `HostBridge` trait,
 which `core/src/tools/codemode.rs` implements over the gate — that inversion is
 why `core` can depend on the engine crate without a cycle. `run_program` itself is
-auto-allowed (like `task`): it touches nothing directly. `Promise.all` maps to
+auto-allowed (like `run_agent`): it touches nothing directly. `Promise.all` maps to
 the same concurrency rule as a normal round (read-only calls batch, writes take
 an exclusive lock).
 
@@ -1662,7 +1663,7 @@ needs ceilings a hand-written tool_use batch never hits: `max_agents` (total
 and `max_items` (a single `parallel()`/`pipeline()` array length; over it throws,
 never truncates). Both mirror cc's workflow caps (1000 / 4096). Concurrency is
 deliberately **not** paced — a program firing N concurrent `agent()` is the same
-as a model emitting N concurrent `task` calls, which kloop runs uncapped, so
+as a model emitting N concurrent `run_agent` calls, which kloop runs uncapped, so
 pacing here would break that precedent; the total ceiling is the guard that
 matters. All five knobs override via `[codemode]` in global
 `~/.kloop/config.toml`
@@ -1676,12 +1677,11 @@ emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 **Background programs**: `run_program {"background": true}` fires and forgets —
 it returns a `program-N` id immediately and the program's return value is
 delivered to the parent as a message when it finishes, so a long fan-out /
-migration doesn't hold up the turn. It reuses the async sub-agent machinery
-wholesale (see "Async sub-agents" below): the same registry, the same `wait` /
-`stop_agent` tools, the same inbox reinjection and TUI autowake — a background
-program and a background sub-agent are the same kind of detached task, so they
-share one registry (the shell registry stays separate: a shell has an output
-file and reinjects a terminal pointer rather than the result body). Deliberately **not** copied from codex: its
+migration doesn't hold up the turn. It shares `BackgroundExecutions`, inbox
+reinjection, `wait_for_activity`, and TUI autowake with background agents and
+Workflows, but its typed stop is `stop_program {program_id}`. The shell registry
+stays separate because a shell has an output file and reinjects only a terminal
+pointer. Deliberately **not** copied from codex: its
 cell/observation-frontier machinery (incremental pull-based output streamed to
 the model between `yield`s) — that is pull-based observation coupled to V8's
 synchronous-pause model, whereas kloop is push-based (result reinjected on
@@ -1715,9 +1715,11 @@ Skills, not a code-mode one). See `docs/plan/24-code-mode.md` and
 ## Workflow orchestration (Plan 53)
 
 `workflow` is a separate, depth-0-only orchestration tool; it is not an alias
-for `run_program`. It always launches in the background and returns a task id,
-a stable `wf_*` run id, the managed script path, and resume guidance before any
-agent work completes. The script must begin with a pure-literal
+for `run_program`. It always launches in the background and returns a
+`workflow-N` execution id, a stable `wf_*` run id, the managed script path, and
+resume guidance before any agent work completes. `stop_workflow` accepts only
+the execution id; the durable run id is only for resume. The script must begin
+with a pure-literal
 `export const meta = {name, description, phases?}` declaration and then has only
 these host capabilities:
 
@@ -1750,8 +1752,8 @@ rejected. On Unix, namespace/run directories and artifact read/write/rename/
 lease operations are descriptor-relative with no-follow; the non-Unix fallback
 revalidates paths but does not claim race-hard reparse-point safety until the
 future Windows backend lands. Background completion/failure is delivered at a
-step boundary and is
-also observable through the shared `wait` / `stop_agent` task registry.
+step boundary and is also observable through global `wait_for_activity`; cancellation uses
+`stop_workflow {workflow_id}`.
 
 Passing `schema` in a Workflow `agent()` call activates the internal
 **`structured_output`** protocol for that child. The requested JSON Schema is
@@ -1768,17 +1770,26 @@ resolution are intentional first-release omissions.
 
 ## Async sub-agents (Phase 2, eighteenth slice)
 
-`task` takes `background: true`: instead of blocking and returning the
-sub-agent's final text, it **fires and forgets** — returns an `agent-N` id
-immediately and the sub-agent's result is delivered to the parent as a message
-when it finishes. So the parent can dispatch a long subtask, keep working, and
-collect the result later. Two companion tools manage the in-flight agents:
+`run_agent` takes `background: true`: instead of blocking and returning the
+sub-agent's final text, it returns an `agent-N` id immediately and delivers the
+result to the parent inbox when it finishes. Background control is resource
+specific:
 
-- `wait` — block until a background sub-agent finishes (or new input arrives, or
-  a timeout: default 30s, 10s–1h). It returns a short status line; the finished
-  agent's result arrives separately at the next round boundary. Like codex's
-  `wait`, it **signals but does not carry** — it never drains the queue itself.
-- `stop_agent` — cancel a runaway background sub-agent by id.
+- `wait_for_activity {timeout_ms?}` is the global session barrier. It waits for
+  an active shell, agent, program, or Workflow to finish, or for new inbox input.
+  It accepts no ID, returns only a short status, and **never drains** results;
+  completion content arrives at the next round boundary.
+- `stop_agent {agent_id}` accepts only `agent-N`.
+- `stop_program {program_id}` accepts only `program-N`.
+- `stop_workflow {workflow_id}` accepts only `workflow-N`, never durable `wf_*`.
+- Shells retain `bash_output {bash_id}` for file-backed output and use
+  `stop_bash {bash_id}` for `bg-N`.
+
+Passing an ID to the wrong stop tool fails and names the correct tool. The
+executor also enforces the declared schemas: `wait_for_activity` rejects every
+resource-ID field, and a non-boolean `background` never falls back to foreground
+execution. This keeps agent results, code-mode results, Workflow artifacts, and
+shell output files from collapsing into a misleading universal task handle.
 
 Mechanism: the detached sub-agent (its own tokio task, on its **own** cancel
 token so a finished parent turn never kills it) reinjects its result into the
@@ -1788,14 +1799,13 @@ parent's `Config.inbox` — the same step-boundary queue as steering — as a fr
 consumer). A **success passes through verbatim**; a failure is truncated (~900
 tokens, codex's cap) with re-dispatch guidance; an **interrupted sub-agent
 reinjects nothing** (codex's `is_final` — its partial output is noise, and cc
-diverges here by delivering a `killed` partial). A separate `BackgroundTasks`
-registry (`core/src/tools/background_tasks.rs`) tracks the in-flight agents,
-enforces a concurrency cap (8), and reaps on session end — kept **separate** from
-the background-shell registry, because codex keeps its shell tasks and
-sub-agents in distinct mechanisms and cc only unifies the *state* model, not
-spawn (a shared `Tasks` abstraction would be pre-abstracting against that).
-Plan 51 adds atomic stop-vs-completion arbitration and a supervisor around each
-worker, so panic/forced abort still publishes exactly one terminal state. Both
+diverges here by delivering a `killed` partial). A `BackgroundExecutions`
+registry (`core/src/tools/background_executions.rs`) tracks detached agents,
+programs, and Workflows with their resource kind, enforces one shared concurrency
+cap (8), and reaps on session end. It remains separate from the background-shell
+registry because shell output is file-backed. It retains Plan 51's atomic
+stop-vs-completion arbitration and a supervisor around each worker, so
+panic/forced abort still publishes exactly one terminal state. Both
 registries project through the same session-scoped `BackgroundTaskUpdated`
 event; this shared DTO is the compatibility seam, not a forced internal merge.
 
@@ -1810,14 +1820,30 @@ server (client-driven turns) don't autowake — their reinjection is delivered a
 the next user / `turn/start`; only the TUI has the event loop to be woken.
 Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
 
-Plan 52 fixes the product boundary against exact Claude Code 2.1.220 rather than treating similar names as aliases:
+Plan 52 fixed the semantic boundary against Claude Code 2.1.220; Plan 66 later
+renamed the native surface without adding compatibility aliases:
 
-- kloop keeps the native `task` name and defaults to **synchronous** execution; Claude Code `Agent` requires both `description` and `prompt` and defaults to background unless `run_in_background:false` is explicit. kloop does not add an `Agent` compatibility wrapper or change its default.
-- `todo_write` is a full-table checklist, not Claude Code's stable-ID Task registry. There are no kloop `TaskCreate/Get/List/Update/Output/Stop` aliases; `wait` only observes activity without draining the inbox, and `stop_agent` only owns native background agent/program entries.
-- `Config.inbox` is an internal step-boundary delivery queue, not an addressable Team mailbox. kloop does not expose `SendMessage` or `ListAgents`, and does not connect remote/cloud or user team state.
-- consecutive synchronous task calls remain dispatcher-parallel; detached agent/program work remains capped at 8 per session. Exact Claude Code concurrency limits are evidence, not a reason to replace the native policy.
+- kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
+  Code `Agent` requires both `description` and `prompt` and defaults to background
+  unless `run_in_background:false` is explicit.
+- `todo_write` is a full-table checklist, not Claude Code's stable-ID Task
+  registry. There are currently no kloop `TaskCreate/Get/List/Update/Output/Stop`
+  aliases; `task_*` is reserved for the native Task V2 graph.
+- `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
+  `stop_program`, `stop_workflow`, and `stop_bash` deliberately replace a
+  universal TaskStop façade.
+- `Config.inbox` is an internal step-boundary delivery queue, not an addressable
+  Team mailbox. kloop does not expose `SendMessage` or `ListAgents`, and does not
+  connect remote/cloud or user team state.
+- Consecutive synchronous `run_agent` calls remain dispatcher-parallel; detached
+  agent/program/workflow work remains capped at 8 per session.
 
-The Plan 52 executable report proves those boundaries with a two-phase mock sampling gate: two task calls must both enter sampling before either is released; background completion and stop race to one terminal state; late inbox delivery is folded in only at a sampling boundary. See `docs/plan/52-agent-task-team-parity.md`.
+The Plan 52 executable report consumes the renamed agent/todo/wait surface while
+retaining the original Claude Code fixture corpus. Plan 66's dispatcher tests
+separately lock all twelve cross-resource stop combinations, the durable `wf_*`
+boundary, and strict background/wait parsing. See
+`docs/plan/52-agent-task-team-parity.md` and
+`docs/plan/66-background-tool-naming.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 
@@ -1851,7 +1877,7 @@ Two ways to trigger a skill, both expanding the **same** body:
   injected context (progressive disclosure — the body stays out until triggered),
   alongside the deferred-tools notice and session-stable for the prompt cache.
   When a task matches, the model calls the built-in **`skill`** tool
-  (`skill({"name": ..., "arguments": ...})`), which — like `task` — exists only
+  (`skill({"name": ..., "arguments": ...})`), which — like `run_agent` — exists only
   at depth 0 and only when skills are loaded (a sub-agent gets a focused task,
   not the whole catalog).
 - **The user invokes it** as `/name args` — the same slash seam as the built-in
@@ -1866,7 +1892,7 @@ A skill runs one of two ways (its `context` frontmatter field):
   so the instructions enter the conversation and the turn continues — kloop
   returns the body as a tool result rather than queueing a separate user message
   like cc's SkillTool.
-- **`fork`**: the body runs as an **isolated sub-agent** (reusing the `task`
+- **`fork`**: the body runs as an **isolated sub-agent** (reusing the `run_agent`
   machinery), and only its final result comes back — the skill's intermediate
   work (tool calls, scratch output) stays out of the delegating model's context.
   A `model` frontmatter field overrides the sub-agent's model, and
@@ -2428,14 +2454,14 @@ crates/core/        kloop-core — the agent, network-free
                     dispatch with hook+permission gating; ToolSource seam
                     for external (MCP) tools
     bash.rs         foreground + background Bash execution, the
-                    BackgroundShells registry, bash_output/kill_bash
+                    BackgroundShells registry, bash_output/stop_bash
     powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
     fs.rs           read/write/edit file, read_offloaded
     web.rs          web_fetch/web_search agent contracts: names, descriptions,
                     input schemas (network execution stays in kloop-web)
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware
                     walking, output modes, paging, clipping)
-    task.rs         sub-agent spawning
+    subagent.rs         sub-agent spawning
     codemode.rs     the run_program tool: CoreBridge (re-enters the gate per op),
                     TypeScript API generation; engine is the codemode crate
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
