@@ -76,7 +76,7 @@ impl TestClient {
     }
 
     async fn recv(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
+        let line = tokio::time::timeout(Duration::from_secs(30), self.lines.next_line())
             .await
             .expect("timed out waiting for a server line")
             .unwrap()

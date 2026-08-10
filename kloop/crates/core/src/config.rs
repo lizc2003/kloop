@@ -351,10 +351,11 @@ pub struct Config {
     /// before dispatch. Shared into sub-agent configs so a parent's discoveries
     /// carry over.
     pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashMap<String, u64>>>,
-    /// Session-scoped structured task graph shared by the main Agent and every
-    /// child Agent cloned from this Config. It is process state, not history or
-    /// durable storage: a fresh Config (including resume) starts with an empty
-    /// graph. Unlike the retired per-Agent todo list, sub-agents clone this Arc.
+    /// Root-owned, session-scoped structured task graph. Child Configs retain
+    /// this Arc as an internal session service, but depth gates keep Task V2 out
+    /// of child catalogs and reject forged child calls. It is process state,
+    /// not history or durable storage: a fresh Config (including resume) starts
+    /// with an empty graph.
     pub tasks: Arc<crate::tools::TaskRegistry>,
     /// Step-boundary injection queue (plans 22, 26, and 51). Items pushed here —
     /// user steering, detached-task results, or a background shell's terminal

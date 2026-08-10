@@ -474,7 +474,7 @@ pub(super) fn source_definition_generation(
     source_definition_snapshot(sources, name).map(|(_, generation)| generation)
 }
 
-/// The built-in tool defs (bash, file, search, tasks, and — at depth 0 —
+/// The built-in tool defs (bash, file, search, and — at depth 0 — tasks plus
 /// `run_agent`). This is the set `run_program` derives its TypeScript API from, so
 /// it deliberately excludes `run_program` itself: no self-reference, and no
 /// throwaway description regeneration when only counting is needed.
@@ -668,10 +668,11 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             .expect("bash properties are an object")
             .remove("disable_sandbox");
     }
-    // Available at every depth: sub-agents can coordinate through the shared
-    // session task graph and local Agent mailbox, while run_agent itself
-    // remains depth-0 only.
-    defs.extend(task::tool_defs());
+    // Local Agent mailbox tools remain available at every depth. The session
+    // task graph is root-owned even though child Configs retain the same Arc.
+    if depth == 0 {
+        defs.extend(task::tool_defs());
+    }
     defs.extend(agent_message::tool_defs());
     if depth == 0 {
         defs.push(ToolDef {
@@ -859,6 +860,13 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     }
 }
 
+fn is_root_task_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "task_create" | "task_get" | "task_update" | "task_list"
+    )
+}
+
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
     let event_input = agent_message::event_input(&name, &input);
     ctx.ui.emit(&Event::ItemStarted {
@@ -889,6 +897,12 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         }
         if name == "bash" && input.get("run_in_background").is_some() {
             bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
+        }
+        // The catalog hides Task V2 from child Agents, but stale context or a
+        // forged call must fail before allowlists, hooks, permissions, or the
+        // registry handler can observe it.
+        if ctx.depth > 0 && is_root_task_tool(&name) {
+            bail!("tool '{name}' is only available to the root agent");
         }
         // A custom agent type's tool allowlist is a capability gate: the tool
         // is filtered out of this sub-agent's defs, so a call to it is a
@@ -1844,15 +1858,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_defs_expose_run_agent_only_at_depth_zero() {
+    fn tool_defs_expose_root_controls_only_at_depth_zero() {
         let names = |depth| {
             tool_defs(depth, &ShellPrograms::native_posix())
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
         };
-        assert!(names(0).iter().any(|n| n == "run_agent"));
-        assert!(!names(1).iter().any(|n| n == "run_agent"));
+        let root = names(0);
+        let child = names(1);
+        assert!(root.iter().any(|name| name == "run_agent"));
+        assert!(!child.iter().any(|name| name == "run_agent"));
+        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+            assert!(root.iter().any(|name| name == task_tool), "{task_tool}");
+            assert!(!child.iter().any(|name| name == task_tool), "{task_tool}");
+        }
     }
 
     #[test]
@@ -2391,6 +2411,102 @@ mod tests {
         // read_offloaded is the infra exception: never blocked by the list.
         let (out, _) = run_tool("read_offloaded", json!({"id": "off-9999"}), &ctx).await;
         assert!(!out.contains("not available to this agent type"), "{out}");
+    }
+
+    /// A child cannot gain root Task V2 capability through an explicit custom
+    /// allowlist, a forged call, or the deferred call_tool envelope.
+    #[tokio::test]
+    async fn child_task_calls_fail_before_the_registry_even_when_allowlisted() {
+        let root = test_ctx(0, "root-task-gate");
+        let (created, is_error) = run_tool(
+            "task_create",
+            json!({"subject":"root work","description":"owned by root"}),
+            &root,
+        )
+        .await;
+        assert!(!is_error, "{created}");
+
+        let task_tools = ["task_create", "task_get", "task_update", "task_list"];
+        let mut cfg = root.cfg.test_clone();
+        cfg.tool_allowlist = Some(Arc::new(
+            task_tools.into_iter().map(str::to_string).collect(),
+        ));
+        let child = ToolCtx {
+            cfg: Arc::new(cfg),
+            depth: 1,
+            ..root.clone()
+        };
+        for (name, input) in [
+            (
+                "task_create",
+                json!({"subject":"forged","description":"must not exist"}),
+            ),
+            ("task_get", json!({"task_id":"1"})),
+            ("task_update", json!({"task_id":"1","status":"completed"})),
+            ("task_list", json!({})),
+        ] {
+            let (output, is_error) = run_tool(name, input, &child).await;
+            assert!(is_error, "{name}: {output}");
+            assert_eq!(
+                output,
+                format!("tool '{name}' is only available to the root agent")
+            );
+        }
+        let (output, is_error) = run_tool(
+            "call_tool",
+            json!({"tool_name":"task_list","params":{}}),
+            &child,
+        )
+        .await;
+        assert!(is_error, "{output}");
+        assert_eq!(
+            output,
+            "tool 'task_list' is only available to the root agent"
+        );
+
+        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &root).await;
+        assert!(!is_error, "{task}");
+        let task: Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(task["task"]["status"], "pending");
+        assert_eq!(task["task"]["owner"], Value::Null);
+        let (listed, is_error) = run_tool("task_list", json!({}), &root).await;
+        assert!(!is_error, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_task_gate_runs_before_pre_tool_hooks() {
+        let marker =
+            std::env::temp_dir().join(format!("kloop-child-task-hook-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let base = test_ctx(1, "root-task-hook-order");
+        let mut cfg = base.cfg.test_clone();
+        cfg.hooks = Arc::new(crate::hooks::Hooks {
+            defs: vec![crate::hooks::HookDef {
+                event: crate::hooks::HookEvent::PreTool,
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("printf ran > '{}'", marker.display()),
+                ],
+                matcher: Some("task_list".into()),
+                timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
+            }],
+        });
+        let child = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (output, is_error) = run_tool("task_list", json!({}), &child).await;
+        assert!(is_error, "{output}");
+        assert_eq!(
+            output,
+            "tool 'task_list' is only available to the root agent"
+        );
+        assert!(!marker.exists(), "pre-tool hook ran before the root gate");
     }
 
     #[test]

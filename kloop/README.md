@@ -1490,11 +1490,10 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Shared task graph (Plan 71)
+## Root-owned session task graph (Plans 71–72)
 
-Task V2 is a **session-scoped structured graph** shared by the main Agent and
-all foreground/background child Agents created from its `Config`. Four native
-snake_case tools form the complete first slice:
+Task V2 is a **session-scoped structured work graph owned by the root/main
+Agent**. Only depth 0 receives or may execute its four native snake_case tools:
 
 - `task_create {subject, description, owner?, blocked_by?}` creates a pending
   task and returns an opaque stable ID (`"1"`, `"2"`, …).
@@ -1513,23 +1512,30 @@ edges, and cycles fail atomically without consuming an ID or partially changing
 the graph. Completed tasks remain addressable; the first slice has no delete,
 filters, pagination, metadata, or active-form field.
 
-The registry is an `Arc<TaskRegistry>` on `Config`: child Agents clone that Arc,
-while independent CLI sessions/native server threads and a resumed process get
-fresh empty registries. It is not written to rollout or reconstructed from
-history, and owner is only a coordination label — it does not claim a live
-Agent, route mailbox messages, or bind an execution resource. `/clear` empties
-the graph but keeps the live registry's ID high-water mark so a running peer
-cannot observe an ID being reused. The registry is bounded to 256 tasks, 256
-blockers per task, 200-character single-line subjects/owners, and 8 KiB
-descriptions.
+The registry is an `Arc<TaskRegistry>` on `Config`. Child Configs retain the Arc
+as an internal session service, but their depth>0 catalogs omit all four tools
+and the dispatcher rejects stale or forged calls before allowlists, hooks,
+permissions, or registry handlers. Foreground children return through their
+`run_agent` tool result; background children return through `SubAgentResult` in
+the parent Inbox. Neither path automatically changes a task: root decides when
+to call `task_update`. There is no per-child task list, Team assignment, claim,
+or task-to-execution binding, and owner remains only a coordination label.
 
-Task calls use the ordinary `toolCall` event/wire lifecycle; there is no task
-board item or special frontend state. The permission gate auto-allows these
-session-memory operations (including in plan mode), while dispatcher
+Independent CLI sessions/native server threads and a resumed process get fresh
+empty registries. The graph is not written to rollout or reconstructed from
+history. `/clear` empties it but keeps the live registry's ID high-water mark so
+stale model context or late child results cannot make an old ID refer to new
+work. The registry is bounded to 256 tasks, 256 blockers per task,
+200-character single-line subjects/owners, and 8 KiB descriptions.
+
+Root Task calls use the ordinary `toolCall` event/wire lifecycle; there is no
+task board item or special frontend state. The permission gate auto-allows
+these session-memory operations (including in plan mode), while dispatcher
 classification keeps create/update serial and get/list concurrency-safe.
-Program JavaScript cannot call the task tools directly; real child Agents it
-launches can. `todo_write` and its checklist UI/wire path were removed rather
-than retained as a second, drifting task model.
+Program/Workflow JavaScript cannot call Task V2 directly, and real child Agents
+they launch are depth>0 and likewise have no Task capability. `todo_write` and
+its checklist UI/wire path were removed rather than retained as a second,
+drifting task model.
 
 ## Steering — mid-turn injection (Phase 2, fifteenth slice)
 
@@ -1587,8 +1593,8 @@ the model. The set is small and lives one-file-per-command under
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an
   append-only compacted-to-nothing marker that resume replays to empty; it
-  does **not** fork a new session file). Process-state (the shared task graph and
-  steering queue) resets too.
+  does **not** fork a new session file). Process-state (the root-owned task graph
+  and steering queue) resets too.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C); in server mode it is inert — quitting one
   thread must not stop a multi-session process, so it just relays a note.
@@ -1973,8 +1979,10 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
   Code `Agent` requires both `description` and `prompt` and defaults to background
   unless `run_in_background:false` is explicit.
-- kloop exposes the native snake_case `task_create/get/update/list` graph above,
-  not PascalCase Claude Code adapters. There are no `TaskOutput`/`TaskStop`
+- kloop exposes the native snake_case `task_create/get/update/list` graph above
+  only to the depth-0 root Agent, not as PascalCase Claude Code adapters or a
+  child/Team collaboration surface. Child completion is an execution result;
+  root explicitly advances graph state. There are no `TaskOutput`/`TaskStop`
   aliases: those names belong to execution resources in Claude Code, while
   kloop keeps graph state separate from Agent/Program/Workflow/Shell lifecycle.
 - `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
@@ -1989,11 +1997,13 @@ renamed the native surface without adding compatibility aliases:
 The Plan 52 executable report now consumes the native run_agent/task-graph/wait
 surface while retaining the original Claude Code fixture corpus. Plan 66's
 dispatcher tests separately lock all twelve cross-resource stop combinations,
-the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 owns
-the later Task V2 product contract and removal of the old checklist. See
-`docs/plan/52-agent-task-team-parity.md`,
-`docs/plan/66-background-tool-naming.md`, and
-`docs/plan/71-task-v2-session-graph.md`.
+the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 added
+Task V2 and removed the old checklist; Plan 72 supersedes only its child-sharing
+contract by making the session graph root-owned and child execution result-only.
+See `docs/plan/52-agent-task-team-parity.md`,
+`docs/plan/66-background-tool-naming.md`,
+`docs/plan/71-task-v2-session-graph.md`, and
+`docs/plan/72-task-v2-root-owned-session-graph.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

@@ -370,7 +370,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
     [
         ToolDef {
             name: "task_create".into(),
-            description: "Create one pending task in the shared task graph for this live session. Returns a stable opaque task ID. subject and description are required; owner is an optional coordination label; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, claim a mailbox, persist across resume, or create a background execution.".into(),
+            description: "Create one pending task in the root-owned task graph for this live session. Returns a stable opaque task ID. subject and description are required; owner is an optional coordination label; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, claim a mailbox, persist across resume, or create a background execution.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -385,7 +385,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_get".into(),
-            description: "Get one task from this live session's shared task graph by its stable ID. Returns subject, description, status, optional owner, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
+            description: "Get one task from this live session's root-owned task graph by its stable ID. Returns subject, description, status, optional owner, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {"task_id": {"type": "string", "description": "Stable task ID returned by task_create"}},
@@ -395,7 +395,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_update".into(),
-            description: "Atomically patch one task in this live session's shared task graph. Omitted fields stay unchanged; owner=null clears the owner; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
+            description: "Atomically patch one task in this live session's root-owned task graph. Omitted fields stay unchanged; owner=null clears the owner; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -412,7 +412,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_list".into(),
-            description: "List all tasks in this live session's shared task graph, ordered by numeric task ID. Returns compact records with subject, status, owner, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
+            description: "List all tasks in this live session's root-owned task graph, ordered by numeric task ID. Returns compact records with subject, status, owner, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {},
@@ -917,18 +917,21 @@ mod tests {
     }
 
     #[test]
-    fn definitions_are_strict_and_available_at_both_depths() {
+    fn definitions_are_strict_and_root_only() {
         let defs = tool_defs();
+        let task_names = defs
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            defs.iter()
-                .map(|definition| definition.name.as_str())
-                .collect::<Vec<_>>(),
+            task_names,
             vec!["task_create", "task_get", "task_update", "task_list"]
         );
         for definition in defs {
             assert_eq!(definition.schema["additionalProperties"], false);
         }
-        for depth in [0, 1] {
+
+        for depth in [0, 1, 2] {
             let names = crate::tools::tool_defs(
                 depth,
                 &crate::shell_programs::ShellPrograms::test_fixture(),
@@ -937,7 +940,11 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
             for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
-                assert!(names.iter().any(|name| name == task_tool), "depth {depth}");
+                assert_eq!(
+                    names.iter().any(|name| name == task_tool),
+                    depth == 0,
+                    "{task_tool} at depth {depth}"
+                );
             }
             assert!(!names.iter().any(|name| name == "todo_write"));
         }

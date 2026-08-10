@@ -223,8 +223,9 @@ profile 明确不注册；真实 team/remote/ListAgents 因 account/environment/
 
 kloop 新增公开 mock-only sampling `Gate`（started/release 两相同步），Plan 52 Rust report 真实运行
 `dispatch_tools`/`run_turn`，无 sleep/文件轮询地证明两个同步 run_agent 同时到达 sampling，并锁定后台完成回灌、
-stop-vs-completion 一次终态、final sampling inbox 兜底、native Task V2 强依赖生命周期、wait_for_activity non-drain、unknown-stop
-error settlement 与 CC 同名 surface 缺席。`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter
+stop-vs-completion 一次终态、final sampling inbox 兜底、native Task V2 root 生命周期、depth>0 catalog 缺席与
+forged/custom-allowlist runtime 拒绝、wait_for_activity non-drain、unknown-stop error settlement 与 CC 同名 surface 缺席。
+`verify.py` 固定 selector 运行该 report，并以缺场景、事件重排、伪 adapter、child catalog escalation 和 runtime bypass
 tamper 测试 fail closed；没有新增 pair contract 或人为制造 `same`。Plan 66 的普通 Rust golden 另行表驱动
 全部 12 个跨资源 stop 负组合、`workflow-N`/`wf_*` 边界和 strict background/wait parser；这些不冒充
 Plan 52 report 自己覆盖的场景。
@@ -235,7 +236,7 @@ Bash 的 `run_in_background` 同步迁为 `background`，与 Agent/Program 统�
 因为它查询状态、可等待并读取输出尾部；`bash_background` 会误导成第二个启动入口。旧工具名与旧字段
 不双栈，只返定向迁移错误，`task_*` 留给后续结构化 Task graph。
 
-**2026-08-10 后续产品边界（Plan 71）**：上述 Plan 52/66 段落继续作为固定 2.1.220 取证与当时 kloop 产品面的历史记录，不回写 raw/normalized fixture 或 exact-binary 事实。当前 kloop 已新增原生 snake_case `task_create/task_get/task_update/task_list`：session-scoped 稳定 ID、`pending|in_progress|completed`、owner、强约束 `blocked_by` DAG 和反向 `blocks` 投影；main、前台与后台 child Agent共享同一 registry。它仍不是 Claude Code PascalCase adapter，也不连接 `TaskOutput/TaskStop`、后台执行 registry、Local/Team mailbox 或跨进程 store。旧 `todo_write` 与专属 checklist/Event/wire path 已直接删除，不做兼容同步。
+**2026-08-10 后续产品边界（Plan 71 → Plan 72）**：上述 Plan 52/66 段落继续作为固定 2.1.220 取证与当时 kloop 产品面的历史记录，不回写 raw/normalized fixture 或 exact-binary 事实。Plan 71 新增原生 snake_case `task_create/task_get/task_update/task_list`：session-scoped 稳定 ID、`pending|in_progress|completed`、owner、强约束 `blocked_by` DAG 和反向 `blocks` 投影，并删除旧 `todo_write` 与专属 checklist/Event/wire path。Plan 72 随后收紧过度共享：四工具只在 depth-0 root catalog/dispatcher 可用，前台/后台以及 Program/Workflow 启动的真实 child 只返回执行结果，由 root 显式更新；没有 child 私有 list、Team/claim、自动 task↔execution 绑定、`TaskOutput/TaskStop` adapter、mailbox 耦合或跨进程 store。Plan 71 的共享-child dogfood 保留为当时历史，不代表当前产品面。
 
 Plan 53 完成时 corpus 为 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
 状态为 65 `compatible` / 132 `intentional-diff` / 36 `missing` / 183 `unknown` / 22 `n/a` /

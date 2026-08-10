@@ -2,6 +2,10 @@
 
 > 状态：✅ 已完成（2026-08-10；提交 SHA 以本条所在提交为准）
 >
+> 后续修订：Plan 72 将 Task 图收紧为 depth-0 root-owned；普通前台/后台 child
+> Agent 不再看到或执行 `task_*`，只返回执行结果，由 root 显式更新。以下共享 child
+> 契约与真实验收保留为 Plan 71 当时的历史记录，不代表当前产品面。
+>
 > 完成结论：已落地共享 `Arc<TaskRegistry>`、四个 strict snake_case 工具、稳定 ID、
 > 强依赖/无环/单向状态约束和 clear 高水位，并删除 `todo_write` 及其 Event、TUI、plain、
 > native wire、历史 replay 和兼容执行链。Task V2 只走普通 ToolCall，不持久化，也不接 mailbox。

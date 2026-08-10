@@ -459,7 +459,7 @@ async fn native_surface_report() -> Value {
         "stop_agent",
         "stop_program",
     ];
-    const DEPTH_ONE_TASKS: [&str; 4] = ["task_create", "task_get", "task_update", "task_list"];
+    const TASK_TOOLS: [&str; 4] = ["task_create", "task_get", "task_update", "task_list"];
     const CLAUDE_SURFACES: [&str; 10] = [
         "Agent",
         "TaskCreate",
@@ -494,14 +494,12 @@ async fn native_surface_report() -> Value {
         .filter(|name| names_zero.contains(name))
         .collect();
     assert_eq!(native_zero, EXPECTED_NATIVE);
-    assert_eq!(
-        DEPTH_ONE_TASKS
-            .iter()
-            .copied()
-            .filter(|name| names_one.contains(name))
-            .collect::<Vec<_>>(),
-        DEPTH_ONE_TASKS
-    );
+    let depth_one_tasks = TASK_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| names_one.contains(name))
+        .collect::<Vec<_>>();
+    assert!(depth_one_tasks.is_empty());
     let claude_present: Vec<&str> = CLAUDE_SURFACES
         .iter()
         .copied()
@@ -550,7 +548,7 @@ async fn native_surface_report() -> Value {
     assert!(!complete_blocker_error, "{complete_blocker}");
     let (start_dependent, start_dependent_error) = run_tool(
         "task_update",
-        json!({"task_id":"2","status":"in_progress","owner":"agent-1"}),
+        json!({"task_id":"2","status":"in_progress","owner":"root"}),
         &ctx,
     )
     .await;
@@ -558,6 +556,45 @@ async fn native_surface_report() -> Value {
     let (get_dependent, get_dependent_error) =
         run_tool("task_get", json!({"task_id":"2"}), &ctx).await;
     assert!(!get_dependent_error, "{get_dependent}");
+
+    let mut child_cfg = ctx.cfg.test_clone();
+    child_cfg.tool_allowlist = Some(Arc::new(
+        TASK_TOOLS.iter().map(|name| (*name).to_string()).collect(),
+    ));
+    let child_ctx = ToolCtx {
+        cfg: Arc::new(child_cfg),
+        depth: 1,
+        ..ctx.clone()
+    };
+    let mut child_task_gate = Vec::new();
+    for (name, input) in [
+        (
+            "task_create",
+            json!({"subject":"forged","description":"child must not create"}),
+        ),
+        ("task_get", json!({"task_id":"2"})),
+        ("task_update", json!({"task_id":"2","status":"completed"})),
+        ("task_list", json!({})),
+    ] {
+        let (result, is_error) = run_tool(name, input, &child_ctx).await;
+        assert!(is_error, "{name}: {result}");
+        assert_eq!(
+            result,
+            format!("tool '{name}' is only available to the root agent")
+        );
+        child_task_gate.push(json!({
+            "name": name,
+            "result": result,
+            "is_error": is_error,
+        }));
+    }
+    let (complete_dependent, complete_dependent_error) = run_tool(
+        "task_update",
+        json!({"task_id":"2","status":"completed"}),
+        &ctx,
+    )
+    .await;
+    assert!(!complete_dependent_error, "{complete_dependent}");
     let (list_tasks, list_tasks_error) = run_tool("task_list", json!({}), &ctx).await;
     assert!(!list_tasks_error, "{list_tasks}");
 
@@ -578,7 +615,7 @@ async fn native_surface_report() -> Value {
 
     json!({
         "depth_zero_native_tools": native_zero,
-        "depth_one_native_tools": DEPTH_ONE_TASKS,
+        "depth_one_native_tools": depth_one_tasks,
         "claude_named_tools_present": claude_present,
         "agent_schema": agent_schema,
         "task_graph": {
@@ -588,8 +625,10 @@ async fn native_surface_report() -> Value {
             "complete_blocker": complete_blocker,
             "start_dependent": start_dependent,
             "get_dependent": get_dependent,
+            "complete_dependent": complete_dependent,
             "list": list_tasks,
         },
+        "child_task_gate": child_task_gate,
         "wait_for_activity": {
             "result": wait_output,
             "pending_after_wait": pending_after_wait.into_iter().map(InboxItem::into_message).collect::<Vec<_>>(),

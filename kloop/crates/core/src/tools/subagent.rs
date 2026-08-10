@@ -1615,10 +1615,10 @@ mod tests {
         assert!(ctx.cfg.inbox.is_empty());
     }
 
-    /// Child Agents clone the session TaskRegistry Arc, so a foreground child
-    /// can update a task the parent created and the parent observes the change.
+    /// A foreground child may forge a Task V2 call, but the depth gate rejects
+    /// it; the child still returns its result and only root advances the task.
     #[tokio::test]
-    async fn subagent_task_graph_is_shared_with_the_parent() {
+    async fn foreground_subagent_reports_without_mutating_the_root_task() {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
@@ -1633,10 +1633,10 @@ mod tests {
                 text: "sub done".into(),
             }],
         ]);
-        let ctx = with_provider(test_ctx(0, "task-sharing"), provider);
+        let ctx = with_provider(test_ctx(0, "root-task-foreground"), provider);
         let (created, is_error) = run_tool(
             "task_create",
-            json!({"subject":"parent task","description":"shared work"}),
+            json!({"subject":"root task","description":"child reports work"}),
             &ctx,
         )
         .await;
@@ -1659,14 +1659,25 @@ mod tests {
         let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
         assert!(!is_error, "{task}");
         let task: Value = serde_json::from_str(&task).unwrap();
-        assert_eq!(task["task"]["owner"], "agent-1");
-        assert_eq!(task["task"]["status"], "completed");
+        assert_eq!(task["task"]["owner"], Value::Null);
+        assert_eq!(task["task"]["status"], "pending");
+
+        let (updated, is_error) = run_tool(
+            "task_update",
+            json!({"task_id":"1","owner":"root","status":"completed"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{updated}");
+        let updated: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(updated["task"]["owner"], "root");
+        assert_eq!(updated["task"]["status"], "completed");
     }
 
-    /// Background children use the same Config clone path, so their graph writes
-    /// are visible before terminal delivery is reinjected into the parent Inbox.
+    /// A background child has the same result-only contract: forged task calls
+    /// fail, terminal text reaches the parent Inbox, and root updates the graph.
     #[tokio::test]
-    async fn background_subagent_shares_the_parent_task_graph() {
+    async fn background_subagent_reports_without_mutating_the_root_task() {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
@@ -1681,17 +1692,17 @@ mod tests {
                 text: "background task done".into(),
             }],
         ]);
-        let ctx = with_provider(test_ctx(0, "background-task-sharing"), provider);
+        let ctx = with_provider(test_ctx(0, "root-task-background"), provider);
         let (created, is_error) = run_tool(
             "task_create",
-            json!({"subject":"shared","description":"background child updates this"}),
+            json!({"subject":"root task","description":"background child reports work"}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{created}");
         let (started, is_error) = run_tool(
             "run_agent",
-            json!({"prompt":"complete task 1","background":true}),
+            json!({"prompt":"report task 1 result","background":true}),
             &ctx,
         )
         .await;
@@ -1703,8 +1714,25 @@ mod tests {
         let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
         assert!(!is_error, "{task}");
         let task: Value = serde_json::from_str(&task).unwrap();
-        assert_eq!(task["task"]["owner"], "background-child");
-        assert_eq!(task["task"]["status"], "completed");
+        assert_eq!(task["task"]["owner"], Value::Null);
+        assert_eq!(task["task"]["status"], "pending");
+        let delivered = ctx.cfg.inbox.drain();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0]
+            .clone()
+            .into_message()
+            .contains("background task done"));
+
+        let (updated, is_error) = run_tool(
+            "task_update",
+            json!({"task_id":"1","owner":"root","status":"completed"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{updated}");
+        let updated: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(updated["task"]["owner"], "root");
+        assert_eq!(updated["task"]["status"], "completed");
     }
 
     /// Fire-and-forget: run_agent {background:true} returns a "started" message
