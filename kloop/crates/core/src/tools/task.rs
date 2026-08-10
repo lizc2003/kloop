@@ -15,7 +15,6 @@ use super::ToolCtx;
 
 const MAX_TASKS: usize = 256;
 const MAX_SUBJECT_CHARS: usize = 200;
-const MAX_OWNER_CHARS: usize = 200;
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_BLOCKERS: usize = 256;
 const MAX_DIAGNOSTIC_CHARS: usize = 80;
@@ -54,7 +53,6 @@ struct StoredTask {
     subject: String,
     description: String,
     status: TaskStatus,
-    owner: Option<String>,
     blocked_by: Vec<u64>,
 }
 
@@ -64,7 +62,6 @@ pub struct TaskView {
     subject: String,
     description: String,
     status: TaskStatus,
-    owner: Option<String>,
     blocked_by: Vec<String>,
     blocks: Vec<String>,
 }
@@ -74,7 +71,6 @@ struct TaskSummary {
     id: String,
     subject: String,
     status: TaskStatus,
-    owner: Option<String>,
     blocked_by: Vec<String>,
     blocks: Vec<String>,
 }
@@ -100,12 +96,7 @@ pub struct TaskRegistry {
 
 impl TaskRegistry {
     fn create(&self, input: TaskCreateInput) -> Result<TaskView> {
-        validate_task_text(
-            &input.subject,
-            &input.description,
-            input.owner.as_deref(),
-            "task_create",
-        )?;
+        validate_task_text(&input.subject, &input.description, "task_create")?;
         let mut state = self.state.write().unwrap();
         if state.tasks.len() >= MAX_TASKS {
             bail!("task_create: task limit of {MAX_TASKS} reached");
@@ -120,7 +111,6 @@ impl TaskRegistry {
             subject: input.subject,
             description: input.description,
             status: TaskStatus::Pending,
-            owner: input.owner,
             blocked_by: input.blocked_by,
         };
         state.tasks.insert(id, task);
@@ -150,21 +140,11 @@ impl TaskRegistry {
         if let Some(status) = patch.status {
             candidate.status = status;
         }
-        match patch.owner {
-            OwnerPatch::Unchanged => {}
-            OwnerPatch::Set(owner) => candidate.owner = Some(owner),
-            OwnerPatch::Clear => candidate.owner = None,
-        }
         if let Some(blocked_by) = patch.blocked_by {
             candidate.blocked_by = blocked_by;
         }
 
-        validate_task_text(
-            &candidate.subject,
-            &candidate.description,
-            candidate.owner.as_deref(),
-            "task_update",
-        )?;
+        validate_task_text(&candidate.subject, &candidate.description, "task_update")?;
         if candidate.status.rank() < current.status.rank() {
             bail!(
                 "task_update: status cannot move backward from {} to {}",
@@ -196,12 +176,7 @@ impl TaskRegistry {
     }
 }
 
-fn validate_task_text(
-    subject: &str,
-    description: &str,
-    owner: Option<&str>,
-    tool: &str,
-) -> Result<()> {
+fn validate_task_text(subject: &str, description: &str, tool: &str) -> Result<()> {
     validate_single_line(subject, "subject", MAX_SUBJECT_CHARS, tool)?;
     if description.trim().is_empty() {
         bail!("{tool}: description must not be empty");
@@ -214,9 +189,6 @@ fn validate_task_text(
         .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
     {
         bail!("{tool}: description contains an unsupported control character");
-    }
-    if let Some(owner) = owner {
-        validate_single_line(owner, "owner", MAX_OWNER_CHARS, tool)?;
     }
     Ok(())
 }
@@ -307,7 +279,6 @@ fn task_view(tasks: &BTreeMap<u64, StoredTask>, id: u64) -> Option<TaskView> {
         subject: task.subject.clone(),
         description: task.description.clone(),
         status: task.status,
-        owner: task.owner.clone(),
         blocked_by: ids_as_strings(&task.blocked_by),
         blocks: blocks_for(tasks, id),
     })
@@ -319,7 +290,6 @@ fn task_summary(tasks: &BTreeMap<u64, StoredTask>, id: u64) -> Option<TaskSummar
         id: task.id.to_string(),
         subject: task.subject.clone(),
         status: task.status,
-        owner: task.owner.clone(),
         blocked_by: ids_as_strings(&task.blocked_by),
         blocks: blocks_for(tasks, id),
     })
@@ -348,7 +318,6 @@ fn status_name(status: TaskStatus) -> &'static str {
 struct TaskCreateInput {
     subject: String,
     description: String,
-    owner: Option<String>,
     blocked_by: Vec<u64>,
 }
 
@@ -356,27 +325,19 @@ struct TaskPatch {
     subject: Option<String>,
     description: Option<String>,
     status: Option<TaskStatus>,
-    owner: OwnerPatch,
     blocked_by: Option<Vec<u64>>,
-}
-
-enum OwnerPatch {
-    Unchanged,
-    Set(String),
-    Clear,
 }
 
 pub(super) fn tool_defs() -> [ToolDef; 4] {
     [
         ToolDef {
             name: "task_create".into(),
-            description: "Create one pending task in the root-owned task graph for this live session. Returns a stable opaque task ID. subject and description are required; owner is an optional coordination label; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, claim a mailbox, persist across resume, or create a background execution.".into(),
+            description: "Create one pending task in the root-owned task graph for this live session. Returns a stable opaque task ID. subject and description are required; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, assign work, claim a mailbox, persist across resume, or create a background execution.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS, "description": "Short single-line task title"},
                     "description": {"type": "string", "description": "Complete task instructions"},
-                    "owner": {"type": "string", "maxLength": MAX_OWNER_CHARS, "description": "Optional coordination label"},
                     "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Existing task IDs that must complete first"}
                 },
                 "required": ["subject", "description"],
@@ -385,7 +346,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_get".into(),
-            description: "Get one task from this live session's root-owned task graph by its stable ID. Returns subject, description, status, optional owner, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
+            description: "Get one task from this live session's root-owned task graph by its stable ID. Returns subject, description, status, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {"task_id": {"type": "string", "description": "Stable task ID returned by task_create"}},
@@ -395,7 +356,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_update".into(),
-            description: "Atomically patch one task in this live session's root-owned task graph. Omitted fields stay unchanged; owner=null clears the owner; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
+            description: "Atomically patch one task in this live session's root-owned task graph. Omitted fields stay unchanged; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -403,7 +364,6 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
                     "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS},
                     "description": {"type": "string"},
                     "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                    "owner": {"anyOf": [{"type": "string", "maxLength": MAX_OWNER_CHARS}, {"type": "null"}], "description": "Set a coordination label, or null to clear it"},
                     "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Complete replacement dependency list; [] clears it"}
                 },
                 "required": ["task_id"],
@@ -412,7 +372,7 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
         },
         ToolDef {
             name: "task_list".into(),
-            description: "List all tasks in this live session's root-owned task graph, ordered by numeric task ID. Returns compact records with subject, status, owner, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
+            description: "List all tasks in this live session's root-owned task graph, ordered by numeric task ID. Returns compact records with subject, status, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {},
@@ -449,17 +409,15 @@ pub(super) fn task_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 fn parse_create(input: &Value) -> Result<TaskCreateInput> {
     let object = strict_object(
         input,
-        &["subject", "description", "owner", "blocked_by"],
+        &["subject", "description", "blocked_by"],
         "task_create",
     )?;
     let subject = required_string(object, "subject", "task_create")?.to_string();
     let description = required_string(object, "description", "task_create")?.to_string();
-    let owner = optional_owner(object, "task_create")?;
     let blocked_by = optional_blocked_by(object, "task_create")?.unwrap_or_default();
     Ok(TaskCreateInput {
         subject,
         description,
-        owner,
         blocked_by,
     })
 }
@@ -467,14 +425,7 @@ fn parse_create(input: &Value) -> Result<TaskCreateInput> {
 fn parse_update(input: &Value) -> Result<(u64, TaskPatch)> {
     let object = strict_object(
         input,
-        &[
-            "task_id",
-            "subject",
-            "description",
-            "status",
-            "owner",
-            "blocked_by",
-        ],
+        &["task_id", "subject", "description", "status", "blocked_by"],
         "task_update",
     )?;
     let id = required_task_id(object, "task_update")?;
@@ -487,12 +438,6 @@ fn parse_update(input: &Value) -> Result<(u64, TaskPatch)> {
         .get("status")
         .map(|value| TaskStatus::parse(value, "task_update"))
         .transpose()?;
-    let owner = match object.get("owner") {
-        None => OwnerPatch::Unchanged,
-        Some(Value::Null) => OwnerPatch::Clear,
-        Some(Value::String(owner)) => OwnerPatch::Set(owner.clone()),
-        Some(_) => bail!("task_update: 'owner' must be a string or null when provided"),
-    };
     let blocked_by = optional_blocked_by(object, "task_update")?;
     Ok((
         id,
@@ -500,7 +445,6 @@ fn parse_update(input: &Value) -> Result<(u64, TaskPatch)> {
             subject,
             description,
             status,
-            owner,
             blocked_by,
         },
     ))
@@ -535,14 +479,6 @@ fn optional_string(object: &Map<String, Value>, key: &str, tool: &str) -> Result
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => bail!("{tool}: '{key}' must be a string when provided"),
-    }
-}
-
-fn optional_owner(object: &Map<String, Value>, tool: &str) -> Result<Option<String>> {
-    match object.get("owner") {
-        None => Ok(None),
-        Some(Value::String(owner)) => Ok(Some(owner.clone())),
-        Some(_) => bail!("{tool}: 'owner' must be a string when provided"),
     }
 }
 
@@ -620,49 +556,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_get_list_and_patch_have_stable_json() {
+    async fn create_get_list_and_patch_have_stable_json_without_owner() {
         let ctx = test_ctx(0, "task-basic");
         let first = create(&ctx, "First", &[]).await;
         let second = create(&ctx, "Second", &["1"]).await;
-        assert_eq!(first["task"]["id"], "1");
-        assert_eq!(first["task"]["status"], "pending");
-        assert_eq!(first["task"]["owner"], Value::Null);
-        assert_eq!(second["task"]["id"], "2");
-        assert_eq!(second["task"]["blocked_by"], json!(["1"]));
+        assert_eq!(
+            first,
+            json!({
+                "task": {
+                    "id": "1",
+                    "subject": "First",
+                    "description": "Description for First",
+                    "status": "pending",
+                    "blocked_by": [],
+                    "blocks": [],
+                }
+            })
+        );
+        assert_eq!(
+            second,
+            json!({
+                "task": {
+                    "id": "2",
+                    "subject": "Second",
+                    "description": "Description for Second",
+                    "status": "pending",
+                    "blocked_by": ["1"],
+                    "blocks": [],
+                }
+            })
+        );
 
         let (output, is_error) = run_tool(
             "task_update",
-            json!({"task_id":"1","owner":"agent-1","status":"completed"}),
+            json!({"task_id":"1","status":"completed"}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{output}");
         let updated: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(updated["task"]["owner"], "agent-1");
-        assert_eq!(updated["task"]["blocks"], json!(["2"]));
+        assert_eq!(
+            updated,
+            json!({
+                "task": {
+                    "id": "1",
+                    "subject": "First",
+                    "description": "Description for First",
+                    "status": "completed",
+                    "blocked_by": [],
+                    "blocks": ["2"],
+                }
+            })
+        );
 
         let (output, is_error) = run_tool(
             "task_update",
-            json!({"task_id":"2","status":"in_progress","owner":null}),
+            json!({"task_id":"2","status":"in_progress"}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{output}");
         let updated: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(updated["task"]["owner"], Value::Null);
         assert_eq!(updated["task"]["status"], "in_progress");
+        assert!(updated["task"].get("owner").is_none());
 
         let (output, is_error) = run_tool("task_list", json!({}), &ctx).await;
         assert!(!is_error, "{output}");
         let listed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(listed["tasks"][0]["id"], "1");
-        assert_eq!(listed["tasks"][1]["id"], "2");
-        assert!(listed["tasks"][0].get("description").is_none());
+        assert_eq!(
+            listed,
+            json!({
+                "tasks": [
+                    {
+                        "id": "1",
+                        "subject": "First",
+                        "status": "completed",
+                        "blocked_by": [],
+                        "blocks": ["2"],
+                    },
+                    {
+                        "id": "2",
+                        "subject": "Second",
+                        "status": "in_progress",
+                        "blocked_by": ["1"],
+                        "blocks": [],
+                    }
+                ]
+            })
+        );
 
         let (output, is_error) = run_tool("task_get", json!({"task_id":"2"}), &ctx).await;
         assert!(!is_error, "{output}");
         let fetched: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(fetched["task"]["description"], "Description for Second");
+        assert_eq!(fetched, updated);
     }
 
     #[tokio::test]
@@ -746,6 +732,41 @@ mod tests {
         assert_eq!(create(&ctx, "First", &[]).await["task"]["id"], "1");
         ctx.cfg.tasks.clear();
         assert_eq!(create(&ctx, "Second", &[]).await["task"]["id"], "2");
+    }
+
+    #[tokio::test]
+    async fn owner_inputs_are_rejected_without_id_or_snapshot_mutation() {
+        let ctx = test_ctx(0, "task-owner-removed");
+        for owner in [json!("assistant"), Value::Null] {
+            let (output, is_error) = run_tool(
+                "task_create",
+                json!({"subject":"invalid","description":"must not exist","owner":owner}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{output}");
+            assert!(output.contains("unknown field `owner`"), "{output}");
+        }
+        assert_eq!(create(&ctx, "First", &[]).await["task"]["id"], "1");
+        let (before, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
+        assert!(!is_error, "{before}");
+
+        for owner in [json!("assistant"), Value::Null] {
+            let (output, is_error) = run_tool(
+                "task_update",
+                json!({"task_id":"1","status":"completed","owner":owner}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{output}");
+            assert!(output.contains("unknown field `owner`"), "{output}");
+        }
+        let (after, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
+        assert!(!is_error, "{after}");
+        assert_eq!(after, before);
+        let after: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["task"]["status"], "pending");
+        assert!(after["task"].get("owner").is_none());
     }
 
     #[tokio::test]
@@ -844,7 +865,6 @@ mod tests {
                         .create(TaskCreateInput {
                             subject: format!("Task {index}"),
                             description: "parallel create".into(),
-                            owner: None,
                             blocked_by: Vec::new(),
                         })
                         .unwrap()
@@ -869,7 +889,6 @@ mod tests {
                 .create(TaskCreateInput {
                     subject: "Independent".into(),
                     description: "separate live Config".into(),
-                    owner: None,
                     blocked_by: Vec::new(),
                 })
                 .unwrap()
@@ -886,7 +905,6 @@ mod tests {
             json!({"subject":"x","description":"x\u{0000}"}),
             json!({"subject":"x".repeat(MAX_SUBJECT_CHARS + 1),"description":"x"}),
             json!({"subject":"x","description":"x".repeat(MAX_DESCRIPTION_BYTES + 1)}),
-            json!({"subject":"x","description":"x","owner":"x".repeat(MAX_OWNER_CHARS + 1)}),
         ] {
             let (output, is_error) = run_tool("task_create", input, &ctx).await;
             assert!(is_error, "{output}");
@@ -899,7 +917,6 @@ mod tests {
                 .create(TaskCreateInput {
                     subject: format!("Task {index}"),
                     description: "bounded".into(),
-                    owner: None,
                     blocked_by: Vec::new(),
                 })
                 .unwrap();
@@ -908,7 +925,6 @@ mod tests {
             .create(TaskCreateInput {
                 subject: "Too many".into(),
                 description: "bounded".into(),
-                owner: None,
                 blocked_by: Vec::new(),
             })
             .unwrap_err()
@@ -929,6 +945,7 @@ mod tests {
         );
         for definition in defs {
             assert_eq!(definition.schema["additionalProperties"], false);
+            assert!(definition.schema["properties"].get("owner").is_none());
         }
 
         for depth in [0, 1, 2] {

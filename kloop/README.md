@@ -1490,17 +1490,17 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session task graph (Plans 71–72)
+## Root-owned session task graph (Plans 71–73)
 
 Task V2 is a **session-scoped structured work graph owned by the root/main
 Agent**. Only depth 0 receives or may execute its four native snake_case tools:
 
-- `task_create {subject, description, owner?, blocked_by?}` creates a pending
-  task and returns an opaque stable ID (`"1"`, `"2"`, …).
+- `task_create {subject, description, blocked_by?}` creates a pending task and
+  returns an opaque stable ID (`"1"`, `"2"`, …).
 - `task_get {task_id}` returns the full record, including direct `blocked_by`
   dependencies and the computed reverse `blocks` projection.
 - `task_update {task_id, ...patch}` atomically changes subject, description,
-  status, owner, or the complete `blocked_by` list; `owner:null` clears owner.
+  status, or the complete `blocked_by` list.
 - `task_list {}` returns compact records in numeric-ID order; use `task_get`
   for the full description.
 
@@ -1518,15 +1518,15 @@ and the dispatcher rejects stale or forged calls before allowlists, hooks,
 permissions, or registry handlers. Foreground children return through their
 `run_agent` tool result; background children return through `SubAgentResult` in
 the parent Inbox. Neither path automatically changes a task: root decides when
-to call `task_update`. There is no per-child task list, Team assignment, claim,
-or task-to-execution binding, and owner remains only a coordination label.
+to call `task_update`. There is no per-child task list, assignment/owner field,
+Team claim, or task-to-execution binding.
 
 Independent CLI sessions/native server threads and a resumed process get fresh
 empty registries. The graph is not written to rollout or reconstructed from
 history. `/clear` empties it but keeps the live registry's ID high-water mark so
 stale model context or late child results cannot make an old ID refer to new
 work. The registry is bounded to 256 tasks, 256 blockers per task,
-200-character single-line subjects/owners, and 8 KiB descriptions.
+200-character single-line subjects and 8 KiB descriptions.
 
 Root Task calls use the ordinary `toolCall` event/wire lifecycle; there is no
 task board item or special frontend state. The permission gate auto-allows

@@ -2,6 +2,9 @@
 
 > 状态：✅ 已完成（2026-08-10；提交 SHA 以本条所在提交为准）
 >
+> 后续字段修订：Plan 73 已从当前 kloop native Task V2 完整删除无 assignment
+> 语义的 `owner`；以下 owner 契约与真实 dogfood 值保留为 Plan 72 历史事实。
+>
 > 完成结论：Task V2 已从 all-Agent shared editing 收紧为 depth-0 root-owned work graph。
 > depth>0 catalog 不含四工具，forged/custom-allowlist/`call_tool` 调用在 hooks、permissions
 > 和 registry handler 前拒绝；前台/后台 child 只返回结果，由 root 显式推进任务。

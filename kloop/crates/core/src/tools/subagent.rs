@@ -1625,7 +1625,6 @@ mod tests {
                 name: "task_update".into(),
                 input: json!({
                     "task_id": "1",
-                    "owner": "agent-1",
                     "status": "completed"
                 }),
             }],
@@ -1659,18 +1658,18 @@ mod tests {
         let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
         assert!(!is_error, "{task}");
         let task: Value = serde_json::from_str(&task).unwrap();
-        assert_eq!(task["task"]["owner"], Value::Null);
+        assert!(task["task"].get("owner").is_none());
         assert_eq!(task["task"]["status"], "pending");
 
         let (updated, is_error) = run_tool(
             "task_update",
-            json!({"task_id":"1","owner":"root","status":"completed"}),
+            json!({"task_id":"1","status":"completed"}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
         let updated: Value = serde_json::from_str(&updated).unwrap();
-        assert_eq!(updated["task"]["owner"], "root");
+        assert!(updated["task"].get("owner").is_none());
         assert_eq!(updated["task"]["status"], "completed");
     }
 
@@ -1684,7 +1683,6 @@ mod tests {
                 name: "task_update".into(),
                 input: json!({
                     "task_id":"1",
-                    "owner":"background-child",
                     "status":"completed"
                 }),
             }],
@@ -1714,7 +1712,7 @@ mod tests {
         let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
         assert!(!is_error, "{task}");
         let task: Value = serde_json::from_str(&task).unwrap();
-        assert_eq!(task["task"]["owner"], Value::Null);
+        assert!(task["task"].get("owner").is_none());
         assert_eq!(task["task"]["status"], "pending");
         let delivered = ctx.cfg.inbox.drain();
         assert_eq!(delivered.len(), 1);
@@ -1725,13 +1723,13 @@ mod tests {
 
         let (updated, is_error) = run_tool(
             "task_update",
-            json!({"task_id":"1","owner":"root","status":"completed"}),
+            json!({"task_id":"1","status":"completed"}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
         let updated: Value = serde_json::from_str(&updated).unwrap();
-        assert_eq!(updated["task"]["owner"], "root");
+        assert!(updated["task"].get("owner").is_none());
         assert_eq!(updated["task"]["status"], "completed");
     }
 

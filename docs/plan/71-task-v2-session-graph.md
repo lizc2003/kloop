@@ -2,6 +2,9 @@
 
 > 状态：✅ 已完成（2026-08-10；提交 SHA 以本条所在提交为准）
 >
+> 后续字段修订：Plan 73 已从当前 kloop native Task V2 完整删除无 assignment
+> 语义的 `owner`；以下 owner 契约与真实 dogfood 值保留为 Plan 71 历史事实。
+>
 > 后续修订：Plan 72 将 Task 图收紧为 depth-0 root-owned；普通前台/后台 child
 > Agent 不再看到或执行 `task_*`，只返回执行结果，由 root 显式更新。以下共享 child
 > 契约与真实验收保留为 Plan 71 当时的历史记录，不代表当前产品面。

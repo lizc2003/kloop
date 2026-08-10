@@ -512,8 +512,41 @@ async fn native_surface_report() -> Value {
         .expect("run_agent definition missing")
         .schema
         .clone();
+    let task_schemas = TASK_TOOLS
+        .iter()
+        .map(|name| {
+            let schema = depth_zero
+                .iter()
+                .find(|def| def.name == *name)
+                .unwrap_or_else(|| panic!("{name} definition missing"))
+                .schema
+                .clone();
+            ((*name).to_string(), schema)
+        })
+        .collect::<serde_json::Map<String, Value>>();
 
     let ctx = test_ctx(0, "plan52-native-surface");
+    let mut owner_field_gate = Vec::new();
+    for (owner_kind, owner) in [("string", json!("assistant")), ("null", Value::Null)] {
+        let (result, is_error) = run_tool(
+            "task_create",
+            json!({
+                "subject":"forged owner",
+                "description":"must not create",
+                "owner": owner,
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(is_error, "task_create/{owner_kind}: {result}");
+        assert!(result.contains("unknown field `owner`"), "{result}");
+        owner_field_gate.push(json!({
+            "name": "task_create",
+            "owner_kind": owner_kind,
+            "result": result,
+            "is_error": is_error,
+        }));
+    }
     let (blocker, blocker_error) = run_tool(
         "task_create",
         json!({"subject":"first","description":"finish first"}),
@@ -548,11 +581,27 @@ async fn native_surface_report() -> Value {
     assert!(!complete_blocker_error, "{complete_blocker}");
     let (start_dependent, start_dependent_error) = run_tool(
         "task_update",
-        json!({"task_id":"2","status":"in_progress","owner":"root"}),
+        json!({"task_id":"2","status":"in_progress"}),
         &ctx,
     )
     .await;
     assert!(!start_dependent_error, "{start_dependent}");
+    for (owner_kind, owner) in [("string", json!("assistant")), ("null", Value::Null)] {
+        let (result, is_error) = run_tool(
+            "task_update",
+            json!({"task_id":"2","status":"completed","owner":owner}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error, "task_update/{owner_kind}: {result}");
+        assert!(result.contains("unknown field `owner`"), "{result}");
+        owner_field_gate.push(json!({
+            "name": "task_update",
+            "owner_kind": owner_kind,
+            "result": result,
+            "is_error": is_error,
+        }));
+    }
     let (get_dependent, get_dependent_error) =
         run_tool("task_get", json!({"task_id":"2"}), &ctx).await;
     assert!(!get_dependent_error, "{get_dependent}");
@@ -618,6 +667,7 @@ async fn native_surface_report() -> Value {
         "depth_one_native_tools": depth_one_tasks,
         "claude_named_tools_present": claude_present,
         "agent_schema": agent_schema,
+        "task_schemas": task_schemas,
         "task_graph": {
             "blocker": blocker,
             "dependent": dependent,
@@ -628,6 +678,7 @@ async fn native_surface_report() -> Value {
             "complete_dependent": complete_dependent,
             "list": list_tasks,
         },
+        "owner_field_gate": owner_field_gate,
         "child_task_gate": child_task_gate,
         "wait_for_activity": {
             "result": wait_output,

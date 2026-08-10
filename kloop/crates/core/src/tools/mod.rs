@@ -2468,7 +2468,7 @@ mod tests {
         assert!(!is_error, "{task}");
         let task: Value = serde_json::from_str(&task).unwrap();
         assert_eq!(task["task"]["status"], "pending");
-        assert_eq!(task["task"]["owner"], Value::Null);
+        assert!(task["task"].get("owner").is_none());
         let (listed, is_error) = run_tool("task_list", json!({}), &root).await;
         assert!(!is_error, "{listed}");
         let listed: Value = serde_json::from_str(&listed).unwrap();

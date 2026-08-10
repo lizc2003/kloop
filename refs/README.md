@@ -236,7 +236,7 @@ Bash 的 `run_in_background` 同步迁为 `background`，与 Agent/Program 统�
 因为它查询状态、可等待并读取输出尾部；`bash_background` 会误导成第二个启动入口。旧工具名与旧字段
 不双栈，只返定向迁移错误，`task_*` 留给后续结构化 Task graph。
 
-**2026-08-10 后续产品边界（Plan 71 → Plan 72）**：上述 Plan 52/66 段落继续作为固定 2.1.220 取证与当时 kloop 产品面的历史记录，不回写 raw/normalized fixture 或 exact-binary 事实。Plan 71 新增原生 snake_case `task_create/task_get/task_update/task_list`：session-scoped 稳定 ID、`pending|in_progress|completed`、owner、强约束 `blocked_by` DAG 和反向 `blocks` 投影，并删除旧 `todo_write` 与专属 checklist/Event/wire path。Plan 72 随后收紧过度共享：四工具只在 depth-0 root catalog/dispatcher 可用，前台/后台以及 Program/Workflow 启动的真实 child 只返回执行结果，由 root 显式更新；没有 child 私有 list、Team/claim、自动 task↔execution 绑定、`TaskOutput/TaskStop` adapter、mailbox 耦合或跨进程 store。Plan 71 的共享-child dogfood 保留为当时历史，不代表当前产品面。
+**2026-08-10 后续产品边界（Plan 71 → Plan 72 → Plan 73）**：上述 Plan 52/66 段落继续作为固定 2.1.220 取证与当时 kloop 产品面的历史记录，不回写 raw/normalized fixture 或 exact-binary 事实。Plan 71 新增原生 snake_case `task_create/task_get/task_update/task_list`：session-scoped 稳定 ID、`pending|in_progress|completed`、当时的 owner、强约束 `blocked_by` DAG 和反向 `blocks` 投影，并删除旧 `todo_write` 与专属 checklist/Event/wire path。Plan 72 随后收紧过度共享：四工具只在 depth-0 root catalog/dispatcher 可用，前台/后台以及 Program/Workflow 启动的真实 child 只返回执行结果，由 root 显式更新；没有 child 私有 list、Team/claim、自动 task↔execution 绑定、`TaskOutput/TaskStop` adapter、mailbox 耦合或跨进程 store。Plan 73 又从当前 kloop native schema、parser、storage 和输出完整删除无真实 assignment 语义的 owner，传 string/null 均 strict reject；固定 Claude Code fixture 里的 external owner 事实保持不变。Plan 71 的共享-child dogfood及 Plan 71/72 当时的 owner 值保留为历史，不代表当前产品面。
 
 Plan 53 完成时 corpus 为 **110 captures / 151 static evidence**，matrix 仍为 56 行/448 单元，
 状态为 65 `compatible` / 132 `intentional-diff` / 36 `missing` / 183 `unknown` / 22 `n/a` /
