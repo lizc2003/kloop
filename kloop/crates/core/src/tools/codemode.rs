@@ -52,6 +52,8 @@ static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunProgramInput {
+    #[serde(default)]
+    description: Option<String>,
     source: String,
     #[serde(default)]
     background: bool,
@@ -114,11 +116,20 @@ fn program_tool_names(
 }
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    let parsed: RunProgramInput =
+        serde_json::from_value(input.clone()).context("run_program: invalid input")?;
+    let explicit_description = super::optional_display_description(input, "run_program")?;
+    debug_assert_eq!(
+        parsed.description.as_deref(),
+        explicit_description.as_deref()
+    );
+    let description = explicit_description.unwrap_or_else(|| program_preview(&parsed.source));
     let RunProgramInput {
+        description: _,
         source,
         background,
         resume_from_run_id,
-    } = serde_json::from_value(input.clone()).context("run_program: invalid input")?;
+    } = parsed;
     let names = program_tool_names(&ctx.cfg.tool_sources, &ctx.cfg.shell_programs);
     let limits = ctx.cfg.program_limits;
     // Each run has a run_id and an agent()-call journal. A resume passes the old
@@ -155,7 +166,16 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     // Fire-and-forget: spawn detached, return a program id now, reinject the
     // return value at the next round boundary (reuses the plan-26 async path).
     if background {
-        return spawn_background_program(ctx, source, names, limits, run_id, journal, lease);
+        return spawn_background_program(
+            ctx,
+            source,
+            names,
+            limits,
+            run_id,
+            description,
+            journal,
+            lease,
+        );
     }
     let _lease = lease;
     let bridge = Arc::new(CoreBridge::new(
@@ -267,21 +287,27 @@ fn program_preview(source: &str) -> String {
 /// program), and return immediately. When the program ends it reinjects its
 /// return value into the parent's inbox. Mirrors the sub-agent background path
 /// and reuses the same execution registry and autowake.
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_program(
     ctx: &ToolCtx,
     source: String,
     names: Vec<String>,
     limits: kloop_codemode::Limits,
     run_id: String,
+    description: String,
     journal: Arc<Journal>,
     lease: RunLease,
 ) -> Result<String> {
     let label = format!("program-{}", PROGRAM_SEQ.fetch_add(1, Ordering::Relaxed));
     let own_cancel = CancellationToken::new();
-    let preview = program_preview(&source);
     ctx.cfg
         .background_executions
-        .register(ExecutionKind::Program, &label, &preview, own_cancel.clone())
+        .register(
+            ExecutionKind::Program,
+            &label,
+            &description,
+            own_cancel.clone(),
+        )
         .map_err(|msg| anyhow!("run_program: {msg}"))?;
     let parent_inbox = ctx.cfg.inbox.clone();
     let background_executions = ctx.cfg.background_executions.clone();
@@ -299,8 +325,9 @@ fn spawn_background_program(
     super::subagent::emit_background_task(
         &ui,
         &label,
+        Some(&run_id),
         BackgroundTaskKind::Program,
-        &preview,
+        &description,
         ExecutionStatus::Running,
         None,
     );
@@ -315,7 +342,7 @@ fn spawn_background_program(
     tokio::spawn({
         let label = label.clone();
         let ui = ui.clone();
-        let preview = preview.clone();
+        let description = description.clone();
         async move {
             let (status, reinject) = match worker.await {
                 Ok(outcome) => classify_program(outcome, &own_cancel, &journal, &supervisor_run_id),
@@ -332,6 +359,7 @@ fn spawn_background_program(
                     if let Some(summary) = reinject {
                         parent_inbox.push(InboxItem::ProgramResult {
                             label: label.clone(),
+                            run_id: supervisor_run_id.clone(),
                             summary,
                         });
                     } else {
@@ -346,8 +374,9 @@ fn spawn_background_program(
                 super::subagent::emit_background_task(
                     &ui,
                     &label,
+                    Some(&supervisor_run_id),
                     BackgroundTaskKind::Program,
-                    &preview,
+                    &description,
                     terminal,
                     super::subagent::execution_status_detail(terminal),
                 );
@@ -355,7 +384,7 @@ fn spawn_background_program(
         }
     });
     Ok(format!(
-        "Program started in the background.\nProgram ID: {label}\nRun ID: {run_id}\nKeep working; its return value will be delivered as a message when it finishes. Wait with wait_for_activity, stop only the program-N ID with stop_program {{\"program_id\": \"{label}\"}}, or resume a failed run-* ID with run_program.resume_from_run_id and the byte-identical source."
+        "Program({description}) started in the background.\nProgram ID: {label}\nRun ID: {run_id}\nKeep working; its return value will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, stop only the program-N ID with stop_program {{\"program_id\": \"{label}\"}}, or resume a failed run-* ID with run_program.resume_from_run_id and the byte-identical source."
     ))
 }
 
@@ -667,9 +696,11 @@ There is no filesystem, network, module import, or console — the public API be
 to reach outside.\n\n\
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
 Set `background: true` to run the program detached: the launch response contains a transient \
-program-N ID for stop/lifecycle and a durable run-* ID for resume. Its return value is delivered \
-as a later message (wait with `wait_for_activity`, or stop only the program-N ID with \
-`stop_program`). Use this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
+program-N ID for stop/lifecycle and a durable run-* ID for resume. Optional `description` is \
+display-only and falls back to a source preview. Its return value is delivered automatically as a \
+later message. Call `wait_for_activity` once only when you truly need to block for any activity; \
+never use it as a status/output polling loop. Stop only the program-N ID with `stop_program`. Use \
+this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
 If a program fails after successful agent calls, call run_program again with the byte-identical \
 source and its run-* `resume_from_run_id`. Journal v2 reuses only calls whose stable topology ID \
 and complete structured input match. This is best-effort model-call memoization, not deterministic \
@@ -700,6 +731,7 @@ the program:\n",
         schema: json!({
             "type": "object",
             "properties": {
+                "description": {"type": "string", "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
                 "source": {"type": "string", "description": "The JavaScript program to run"},
                 "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
                 "resume_from_run_id": {"type": "string", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v2 agent calls are reused."}

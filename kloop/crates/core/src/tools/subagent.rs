@@ -47,6 +47,8 @@ static AGENT_SEQ: AtomicUsize = AtomicUsize::new(1);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunAgentInput {
+    #[serde(default)]
+    description: Option<String>,
     prompt: String,
     #[serde(default)]
     agent_type: Option<String>,
@@ -68,7 +70,9 @@ pub(super) async fn run_agent_tool(
     }
     let parsed: RunAgentInput =
         serde_json::from_value(input.clone()).context("run_agent: invalid input")?;
+    let description = super::optional_display_description(input, "run_agent")?;
     let prompt = parsed.prompt;
+    let _ = parsed.description;
     let max_rounds = match parsed.max_rounds {
         None => None,
         Some(n) => {
@@ -102,10 +106,12 @@ pub(super) async fn run_agent_tool(
     let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
-    // The label shown next to the running agent carries its type, if any.
+    // A custom label improves human-facing lifecycle rows without changing the
+    // task prompt. Preserve the configured agent type as a display decoration.
+    let description = description.unwrap_or_else(|| agent_preview(&prompt));
     let preview = match agent_type {
-        Some(at) => format!("[{}] {}", at.name, agent_preview(&prompt)),
-        None => agent_preview(&prompt),
+        Some(at) => format!("[{}] {description}", at.name),
+        None => description,
     };
 
     // Create the worktree BEFORE spawning and rewire the sub-agent's cwd
@@ -320,6 +326,7 @@ pub(super) fn emit_agent_end(ui: &Arc<dyn crate::agent::Ui>, label: &str, ok: bo
 pub(super) fn emit_background_task(
     ui: &Arc<dyn crate::agent::Ui>,
     label: &str,
+    run_id: Option<&str>,
     kind: BackgroundTaskKind,
     description: &str,
     status: ExecutionStatus,
@@ -333,7 +340,7 @@ pub(super) fn emit_background_task(
     };
     ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
         id: label.to_string(),
-        run_id: None,
+        run_id: run_id.map(str::to_string),
         kind,
         description: description.to_string(),
         status,
@@ -499,6 +506,7 @@ async fn spawn_background(
     emit_background_task(
         &ui,
         &agent,
+        None,
         BackgroundTaskKind::Agent,
         &description,
         ExecutionStatus::Running,
@@ -580,6 +588,7 @@ async fn spawn_background(
                 emit_background_task(
                     &ui,
                     &label,
+                    None,
                     BackgroundTaskKind::Agent,
                     &description,
                     terminal,
@@ -589,9 +598,7 @@ async fn spawn_background(
         }
     });
     Ok(format!(
-        "Sub-agent {agent} started in the background.{session_note} Keep working; its result will \
-         be delivered as a message when it finishes. Wait with wait_for_activity, or stop it \
-         with stop_agent {{\"agent_id\": \"{agent}\"}}."
+        "Agent({description}) started in the background.{session_note}\nAgent ID: {agent}\nKeep working; its result will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_agent {{\"agent_id\": \"{agent}\"}}."
     ))
 }
 
@@ -1141,6 +1148,18 @@ mod tests {
         }
     }
 
+    /// Records the full session-scoped lifecycle projection without conflating it
+    /// with the foreground SubAgent item lifecycle.
+    #[derive(Default)]
+    struct BackgroundTaskUi(std::sync::Mutex<Vec<BackgroundTask>>);
+    impl Ui for BackgroundTaskUi {
+        fn emit(&self, event: &Event) {
+            if let Event::BackgroundTaskUpdated(task) = event {
+                self.0.lock().unwrap().push(task.clone());
+            }
+        }
+    }
+
     /// Two run_agent calls in one batch really run in parallel: each sub-agent's
     /// bash waits for a file the OTHER sub-agent creates, so finishing fast
     /// at all proves concurrency (serial execution takes the full 3s poll).
@@ -1369,6 +1388,37 @@ mod tests {
         assert_eq!(ctx.cfg.background_executions.running_count(), 0);
     }
 
+    #[tokio::test]
+    async fn run_agent_rejects_invalid_descriptions_before_background_side_effects() {
+        let mut ctx = test_ctx(0, "run-agent-description-invalid");
+        let ui = std::sync::Arc::new(BackgroundTaskUi::default());
+        ctx.ui = ui.clone();
+        let cases = [
+            (Value::Null, "must be a string"),
+            (json!(7), "invalid type"),
+            (json!("  "), "must not be empty"),
+            (json!("two\tparts"), "single line"),
+            (json!("x".repeat(201)), "200-character limit"),
+        ];
+        for (description, expected) in cases {
+            let (output, is_error) = run_tool(
+                "run_agent",
+                json!({
+                    "prompt": "must not run",
+                    "description": description,
+                    "background": true
+                }),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{output}");
+            assert!(output.contains(expected), "{output}");
+        }
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
+        assert!(ui.0.lock().unwrap().is_empty());
+        assert!(ctx.cfg.inbox.is_empty());
+    }
+
     /// A sub-agent's todo_write writes to its own fresh list, never the
     /// parent's — the Config clone would otherwise share the Arc.
     #[tokio::test]
@@ -1439,6 +1489,7 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert!(out.contains("started in the background"), "{out}");
+        assert!(out.contains("Agent(go do it)"), "{out}");
         assert!(
             !out.contains("sub result"),
             "the result is NOT returned inline: {out}"
@@ -1471,6 +1522,78 @@ mod tests {
             vec![
                 format!("background {label} Running"),
                 format!("background {label} Completed"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn background_agent_uses_explicit_description_for_every_lifecycle_surface() {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "finished".into(),
+        }]]);
+        let mut ctx = with_provider(test_ctx(0, "bg-description"), provider);
+        let ui = std::sync::Arc::new(BackgroundTaskUi::default());
+        ctx.ui = ui.clone();
+
+        let (output, is_error) = run_tool(
+            "run_agent",
+            json!({
+                "prompt": "inspect the private implementation prompt",
+                "description": "audit lifecycle UX",
+                "background": true
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert!(
+            output.starts_with("Agent(audit lifecycle UX) started in the background."),
+            "{output}"
+        );
+        assert!(
+            !output.contains("private implementation prompt"),
+            "{output}"
+        );
+        let agent_id = output
+            .lines()
+            .find_map(|line| line.strip_prefix("Agent ID: "))
+            .unwrap()
+            .to_string();
+
+        for _ in 0..300 {
+            if !ctx.cfg.inbox.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for _ in 0..300 {
+            if ui.0.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let tasks = ui.0.lock().unwrap().clone();
+        assert_eq!(
+            tasks,
+            vec![
+                BackgroundTask {
+                    id: agent_id.clone(),
+                    run_id: None,
+                    kind: BackgroundTaskKind::Agent,
+                    description: "audit lifecycle UX".into(),
+                    status: BackgroundTaskStatus::Running,
+                    output_path: None,
+                    detail: None,
+                },
+                BackgroundTask {
+                    id: agent_id,
+                    run_id: None,
+                    kind: BackgroundTaskKind::Agent,
+                    description: "audit lifecycle UX".into(),
+                    status: BackgroundTaskStatus::Completed,
+                    output_path: None,
+                    detail: None,
+                },
             ]
         );
     }

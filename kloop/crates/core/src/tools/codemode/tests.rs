@@ -47,6 +47,17 @@ impl RecordUi {
             .collect()
     }
 }
+
+#[derive(Default)]
+struct BackgroundTaskUi(Mutex<Vec<crate::event::BackgroundTask>>);
+impl Ui for BackgroundTaskUi {
+    fn emit(&self, event: &Event) {
+        if let Event::BackgroundTaskUpdated(task) = event {
+            self.0.lock().unwrap().push(task.clone());
+        }
+    }
+}
+
 impl Ui for RecordUi {
     fn emit(&self, ev: &Event) {
         match ev {
@@ -300,7 +311,11 @@ async fn background_program_returns_immediately_and_reinjects() {
     let ctx = with_ui(test_ctx(0, "bg-program"), ui.clone());
     let (out, is_error) = run_tool(
         "run_program",
-        json!({ "source": "return 'PROG_DONE';", "background": true }),
+        json!({
+            "source": "return 'PROG_DONE';",
+            "description": "background smoke",
+            "background": true
+        }),
         &ctx,
     )
     .await;
@@ -310,20 +325,23 @@ async fn background_program_returns_immediately_and_reinjects() {
         .lines()
         .find_map(|line| line.strip_prefix("Program ID: "))
         .expect("background response must expose program-N");
-    let run_id = out
+    let run_id_from_launch = out
         .lines()
         .find_map(|line| line.strip_prefix("Run ID: "))
         .expect("background response must expose durable run-*");
     assert!(program_id.starts_with("program-"), "{out}");
-    assert!(run_id.starts_with("run-"), "{out}");
-    assert_ne!(program_id, run_id, "transient and durable IDs are distinct");
+    assert!(run_id_from_launch.starts_with("run-"), "{out}");
+    assert_ne!(
+        program_id, run_id_from_launch,
+        "transient and durable IDs are distinct"
+    );
     let stored_source = std::fs::read_to_string(
         ctx.cfg
             .offload_dir
             .parent()
             .unwrap_or(&ctx.cfg.offload_dir)
             .join("program-runs")
-            .join(run_id)
+            .join(run_id_from_launch)
             .join("source.js"),
     )
     .unwrap();
@@ -342,8 +360,13 @@ async fn background_program_returns_immediately_and_reinjects() {
     let items = ctx.cfg.inbox.drain();
     assert_eq!(items.len(), 1, "one reinjected result");
     let label = match &items[0] {
-        InboxItem::ProgramResult { label, summary } => {
+        InboxItem::ProgramResult {
+            label,
+            run_id,
+            summary,
+        } => {
             assert!(label.starts_with("program-"), "{label}");
+            assert_eq!(run_id, run_id_from_launch);
             assert_eq!(summary, "PROG_DONE");
             label.clone()
         }
@@ -361,6 +384,107 @@ async fn background_program_returns_immediately_and_reinjects() {
             format!("background {label} Completed"),
         ]
     );
+}
+
+#[tokio::test]
+async fn background_program_projects_one_description_and_durable_run_id() {
+    use crate::event::BackgroundTask;
+    use crate::event::BackgroundTaskKind;
+    use crate::event::BackgroundTaskStatus;
+
+    let mut ctx = test_ctx(0, "bg-program-description");
+    let ui = Arc::new(BackgroundTaskUi::default());
+    ctx.ui = ui.clone();
+    let source = "return 'DONE';";
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({
+            "source": source,
+            "description": "compile release notes",
+            "background": true
+        }),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.starts_with("Program(compile release notes) started in the background."),
+        "{output}"
+    );
+    assert!(!output.contains(source), "{output}");
+    let program_id = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Program ID: "))
+        .unwrap()
+        .to_string();
+    let run_id = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Run ID: "))
+        .unwrap()
+        .to_string();
+
+    for _ in 0..300 {
+        if !ctx.cfg.inbox.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(matches!(
+        ctx.cfg.inbox.drain().as_slice(),
+        [crate::inbox::InboxItem::ProgramResult {
+            label,
+            run_id: delivered_run_id,
+            summary,
+        }] if label == &program_id && delivered_run_id == &run_id && summary == "DONE"
+    ));
+    for _ in 0..300 {
+        if ui.0.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ui.0.lock().unwrap().clone(),
+        vec![
+            BackgroundTask {
+                id: program_id.clone(),
+                run_id: Some(run_id.clone()),
+                kind: BackgroundTaskKind::Program,
+                description: "compile release notes".into(),
+                status: BackgroundTaskStatus::Running,
+                output_path: None,
+                detail: None,
+            },
+            BackgroundTask {
+                id: program_id,
+                run_id: Some(run_id.clone()),
+                kind: BackgroundTaskKind::Program,
+                description: "compile release notes".into(),
+                status: BackgroundTaskStatus::Completed,
+                output_path: None,
+                detail: None,
+            },
+        ]
+    );
+
+    let run_dir = ctx
+        .cfg
+        .offload_dir
+        .parent()
+        .unwrap_or(&ctx.cfg.offload_dir)
+        .join("program-runs")
+        .join(run_id);
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("source.js")).unwrap(),
+        source
+    );
+    let manifest = std::fs::read_to_string(run_dir.join("manifest.json")).unwrap();
+    assert!(!manifest.contains("compile release notes"), "{manifest}");
+    let journal = run_dir.join("journal.jsonl");
+    if journal.exists() {
+        let journal = std::fs::read_to_string(journal).unwrap();
+        assert!(!journal.contains("compile release notes"), "{journal}");
+    }
 }
 
 #[cfg(windows)]
@@ -564,6 +688,53 @@ async fn run_program_rejects_wrong_background_type_and_unknown_fields() {
     assert_eq!(ctx.cfg.background_executions.running_count(), 0);
 }
 
+#[tokio::test]
+async fn run_program_rejects_invalid_descriptions_before_creating_run_artifacts() {
+    let mut ctx = test_ctx(0, "run-program-description-invalid");
+    let root = std::env::temp_dir().join(format!(
+        "kloop-codemode-description-invalid-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut cfg = ctx.cfg.test_clone();
+    cfg.offload_dir = root.join("offload");
+    ctx.cfg = Arc::new(cfg);
+    let ui = Arc::new(BackgroundTaskUi::default());
+    ctx.ui = ui.clone();
+    let run_root = root.join("program-runs");
+    assert!(!run_root.exists());
+
+    let cases = [
+        (Value::Null, "must be a string"),
+        (json!(false), "invalid type"),
+        (json!(" \t"), "must not be empty"),
+        (json!("two\nlines"), "single line"),
+        (json!("界".repeat(201)), "200-character limit"),
+    ];
+    for (description, expected) in cases {
+        let (output, is_error) = run_tool(
+            "run_program",
+            json!({
+                "source": "return 'must not run';",
+                "description": description,
+                "background": true
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(is_error, "{output}");
+        assert!(output.contains(expected), "{output}");
+    }
+    assert!(
+        !run_root.exists(),
+        "invalid metadata must not open the run store"
+    );
+    assert_eq!(ctx.cfg.background_executions.running_count(), 0);
+    assert!(ui.0.lock().unwrap().is_empty());
+    assert!(ctx.cfg.inbox.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A background program cancelled via stop_program ends Aborted and reinjects
 /// NOTHING — only an activity wake is published.
 #[tokio::test]
@@ -631,16 +802,29 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let ctx = with_provider(test_ctx(0, "resume"), provider);
     let src = r#"return await agent("do the work");"#;
     seed_program_source(&ctx, &run_id, src);
-    let args = json!({ "source": src, "resume_from_run_id": run_id });
+    let first_args = json!({
+        "source": src,
+        "resume_from_run_id": run_id,
+        "description": "first display label"
+    });
 
     // Run 1: spawns the sub-agent, samples "FIRST", journals it.
-    let (out1, e1) = run_tool("run_program", args.clone(), &ctx).await;
+    let (out1, e1) = run_tool("run_program", first_args, &ctx).await;
     assert!(!e1, "{out1}");
     assert_eq!(out1, "FIRST");
 
-    // Run 2 (same run_id + source): the agent() call hits the journal — no
-    // re-spawn, so the second provider turn is never consumed.
-    let (out2, e2) = run_tool("run_program", args, &ctx).await;
+    // Run 2 (same run_id + source, different display metadata): the agent() call
+    // hits the journal — no re-spawn, so the second provider turn is never consumed.
+    let (out2, e2) = run_tool(
+        "run_program",
+        json!({
+            "source": src,
+            "resume_from_run_id": run_id,
+            "description": "second display label"
+        }),
+        &ctx,
+    )
+    .await;
     assert!(!e2, "{out2}");
     assert_eq!(
         out2, "FIRST",

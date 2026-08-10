@@ -25,9 +25,9 @@ use crate::tools::TodoStatus;
 pub type ItemId = String;
 
 /// Session-scoped background work is not owned by the turn that launched it.
-/// Shells, sub-agents, and code-mode programs keep separate registries but share
-/// this read-only projection so every frontend can render one lifecycle without
-/// inventing a late `turnId`.
+/// Shells use their own registry while Agents, Programs, and Workflows share an
+/// execution registry; this read-only projection lets every frontend render one
+/// lifecycle without inventing a late `turnId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundTaskKind {
     Shell,
@@ -47,8 +47,8 @@ pub enum BackgroundTaskStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTask {
     pub id: String,
-    /// Durable run identity when the execution has one (Workflow); ordinary shell,
-    /// agent, and program work remains execution-id-only.
+    /// Durable run identity when the execution has one. Programs use `run-*`,
+    /// Workflows use `wf_*`; ordinary shell and Agent work is execution-id-only.
     pub run_id: Option<String>,
     pub kind: BackgroundTaskKind,
     pub description: String,
@@ -184,6 +184,39 @@ pub fn tool_summary(input: &Value) -> String {
     input.to_string().chars().take(120).collect()
 }
 
+fn background_task_note(task: &BackgroundTask) -> String {
+    let kind = match task.kind {
+        BackgroundTaskKind::Shell => "Shell",
+        BackgroundTaskKind::Agent => "Agent",
+        BackgroundTaskKind::Program => "Program",
+        BackgroundTaskKind::Workflow => "Workflow",
+    };
+    let status = match task.status {
+        BackgroundTaskStatus::Running => "Running",
+        BackgroundTaskStatus::Completed => "Completed",
+        BackgroundTaskStatus::Failed => "Failed",
+        BackgroundTaskStatus::Cancelled => "Cancelled",
+    };
+    let mut note = format!("{kind}({}) · {status} · {}", task.description, task.id);
+    if let Some(run_id) = &task.run_id {
+        note.push_str(&format!(" · resumable as {run_id}"));
+    }
+    if let Some(detail) = &task.detail {
+        let label = if task.kind == BackgroundTaskKind::Workflow
+            && task.status == BackgroundTaskStatus::Running
+        {
+            "Phase: "
+        } else {
+            ""
+        };
+        note.push_str(&format!(" · {label}{detail}"));
+    }
+    if let Some(output_path) = &task.output_path {
+        note.push_str(&format!(" · output: {output_path}"));
+    }
+    note
+}
+
 impl Event {
     /// The note a front-end that renders only text and notes shows for this
     /// event, or `None` if the event has no note form (deltas, tool completions,
@@ -225,26 +258,7 @@ impl Event {
                     "failed"
                 }
             )),
-            Event::BackgroundTaskUpdated(task) => {
-                let kind = match task.kind {
-                    BackgroundTaskKind::Shell => "shell",
-                    BackgroundTaskKind::Agent => "agent",
-                    BackgroundTaskKind::Program => "program",
-                    BackgroundTaskKind::Workflow => "workflow",
-                };
-                let state = match task.status {
-                    BackgroundTaskStatus::Running => "started",
-                    BackgroundTaskStatus::Completed => "completed",
-                    BackgroundTaskStatus::Failed => "failed",
-                    BackgroundTaskStatus::Cancelled => "cancelled",
-                };
-                let detail = task
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(": {detail}"))
-                    .unwrap_or_default();
-                Some(format!("background {kind} {} {state}{detail}", task.id))
-            }
+            Event::BackgroundTaskUpdated(task) => Some(background_task_note(task)),
             Event::ScheduledTaskUpdated(task) => {
                 let origin = match task.origin {
                     ScheduledTaskOrigin::Cron => "cron",
@@ -423,7 +437,7 @@ mod tests {
     fn background_task_note_preserves_terminal_detail() {
         let event = Event::BackgroundTaskUpdated(BackgroundTask {
             id: "program-2".into(),
-            run_id: None,
+            run_id: Some("run-123".into()),
             kind: BackgroundTaskKind::Program,
             description: "run checks".into(),
             status: BackgroundTaskStatus::Cancelled,
@@ -432,7 +446,42 @@ mod tests {
         });
         assert_eq!(
             event.as_note().as_deref(),
-            Some("background program program-2 cancelled: session shutdown")
+            Some(
+                "Program(run checks) · Cancelled · program-2 · resumable as run-123 · session shutdown"
+            )
+        );
+    }
+
+    #[test]
+    fn background_task_note_formats_workflow_phase_and_shell_output() {
+        let workflow = Event::BackgroundTaskUpdated(BackgroundTask {
+            id: "workflow-3".into(),
+            run_id: Some("wf_abc".into()),
+            kind: BackgroundTaskKind::Workflow,
+            description: "review changes".into(),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: Some("Verify 2/4".into()),
+        });
+        assert_eq!(
+            workflow.as_note().as_deref(),
+            Some(
+                "Workflow(review changes) · Running · workflow-3 · resumable as wf_abc · Phase: Verify 2/4"
+            )
+        );
+
+        let shell = Event::BackgroundTaskUpdated(BackgroundTask {
+            id: "bg-9".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Shell,
+            description: "cargo test".into(),
+            status: BackgroundTaskStatus::Completed,
+            output_path: Some("/tmp/bg-9.out".into()),
+            detail: Some("exit code 0".into()),
+        });
+        assert_eq!(
+            shell.as_note().as_deref(),
+            Some("Shell(cargo test) · Completed · bg-9 · exit code 0 · output: /tmp/bg-9.out")
         );
     }
 

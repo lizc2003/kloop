@@ -60,7 +60,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and run_program for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v2 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered later. Wait with wait_for_activity and stop only workflow-N with stop_workflow. Resume may edit the managed script; only calls whose stable ID and complete input still match are replayed best-effort. Structured agent schemas use the internal structured_output protocol.".into(),
+        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and run_program for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v2 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered automatically later. Call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop only workflow-N with stop_workflow. Resume may edit the managed script; only calls whose stable ID and complete input still match are replayed best-effort. Structured agent schemas use the internal structured_output protocol.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -307,7 +307,7 @@ fn launch_workflow(
     });
 
     Ok(format!(
-        "Workflow launched in background. Workflow ID: {task_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nYou will be notified when it completes; wait with wait_for_activity or stop it with stop_workflow {{\"workflow_id\": \"{task_id}\"}}.",
+        "Workflow launched in background. Workflow ID: {task_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nIts bounded result will be delivered automatically when it completes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_workflow {{\"workflow_id\": \"{task_id}\"}}.",
         description,
         output_script.display(),
         run_id_text,
@@ -646,13 +646,17 @@ mod tests {
         let launched = workflow_tool(
             &json!({
                 "script": "export const meta = { name: 'minimal', description: 'return marker', phases: [{ title: 'Run' }] }; phase('Run'); return { marker: 'ok', args };",
-                "args": {"value": 53}
+                "args": {"value": 53},
+                "description": "ignored top-level description",
+                "title": "ignored top-level title"
             }),
             &ctx,
         )
         .await
         .unwrap();
         assert!(launched.contains("Workflow launched in background"));
+        assert!(launched.contains("Summary: return marker"), "{launched}");
+        assert!(!launched.contains("ignored top-level"), "{launched}");
         let launched_task_id = launch_value(&launched, "Workflow ID: ").to_string();
         let launched_run_id = launch_value(&launched, "Run ID: ").to_string();
         assert!(launched_run_id.starts_with("wf_"));
@@ -680,6 +684,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["version"], 1);
         assert_eq!(manifest["runId"], launched_run_id);
+        assert_eq!(manifest["meta"]["name"], "minimal");
+        assert_eq!(manifest["meta"]["description"], "return marker");
+        assert!(!manifest.to_string().contains("ignored top-level"));
 
         let events = ui.background();
         assert!(events.len() >= 3, "{events:?}");

@@ -76,9 +76,11 @@ pub enum InboxItem {
         summary: String,
     },
     /// A background program's return value, reinjected to its parent
-    /// (plan 24). `label` is the "program-N" id; `summary` is the return value.
+    /// (plan 24). `label` is the "program-N" execution id; `run_id` is the
+    /// durable "run-*" resume id; `summary` is the return value.
     ProgramResult {
         label: String,
+        run_id: String,
         summary: String,
     },
     WorkflowResult {
@@ -114,10 +116,14 @@ impl InboxItem {
         match self {
             InboxItem::Steer(text) => format!("{STEERING_PREFIX}\n{text}"),
             InboxItem::SubAgentResult { label, summary } => {
-                format!("{SUBAGENT_PREFIX}\n[{label}]\n{summary}")
+                format!("{SUBAGENT_PREFIX}\n[Agent {label}]\n{summary}")
             }
-            InboxItem::ProgramResult { label, summary } => {
-                format!("{PROGRAM_PREFIX}\n[{label}]\n{summary}")
+            InboxItem::ProgramResult {
+                label,
+                run_id,
+                summary,
+            } => {
+                format!("{PROGRAM_PREFIX}\n[Program {label}] run {run_id}\n{summary}")
             }
             InboxItem::WorkflowResult {
                 task_id,
@@ -125,7 +131,7 @@ impl InboxItem {
                 summary,
                 output_path,
             } => format!(
-                "{WORKFLOW_PREFIX}\n[{task_id}] run {run_id}\n{summary}\noutput file: {output_path}"
+                "{WORKFLOW_PREFIX}\n[Workflow {task_id}] run {run_id}\n{summary}\noutput file: {output_path}"
             ),
             InboxItem::ShellResult {
                 id,
@@ -243,15 +249,28 @@ mod tests {
                 summary: "found 3 matches".into(),
             }
             .into_message(),
-            format!("{SUBAGENT_PREFIX}\n[agent-2]\nfound 3 matches")
+            format!("{SUBAGENT_PREFIX}\n[Agent agent-2]\nfound 3 matches")
         );
         assert_eq!(
             InboxItem::ProgramResult {
                 label: "program-1".into(),
+                run_id: "run-1".into(),
                 summary: "42".into(),
             }
             .into_message(),
-            format!("{PROGRAM_PREFIX}\n[program-1]\n42")
+            format!("{PROGRAM_PREFIX}\n[Program program-1] run run-1\n42")
+        );
+        assert_eq!(
+            InboxItem::WorkflowResult {
+                task_id: "workflow-4".into(),
+                run_id: "wf_123".into(),
+                summary: "verified".into(),
+                output_path: "/tmp/workflow.json".into(),
+            }
+            .into_message(),
+            format!(
+                "{WORKFLOW_PREFIX}\n[Workflow workflow-4] run wf_123\nverified\noutput file: /tmp/workflow.json"
+            )
         );
         assert_eq!(
             InboxItem::ShellResult {

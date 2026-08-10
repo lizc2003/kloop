@@ -729,12 +729,15 @@ fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
                     summary: history.offload_text(summary),
                 }
             }
-            crate::inbox::InboxItem::ProgramResult { label, summary } => {
-                crate::inbox::InboxItem::ProgramResult {
-                    label,
-                    summary: history.offload_text(summary),
-                }
-            }
+            crate::inbox::InboxItem::ProgramResult {
+                label,
+                run_id,
+                summary,
+            } => crate::inbox::InboxItem::ProgramResult {
+                label,
+                run_id,
+                summary: history.offload_text(summary),
+            },
             other => other,
         };
         match &item {

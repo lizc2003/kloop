@@ -189,6 +189,28 @@ Agent/Program 成功结果复用 History offload，Workflow 继续 bounded summa
 已纠正。新增默认 ignored 的 native-server evaluator，以 tool lifecycle 配对、source/journal/result artifact、
 唯一 terminal/delivery 验收真实 `claude-sonnet-4-6` 与 OpenAI Chat `gpt-5.5`，不以模型口头自评代替证据。
 
+**Plan 69（2026-08-10）后台生命周期 UX**：不改变 Plan 66/68 的工具名、typed stop、恢复 ID、
+终态仲裁或自动 delivery，只补展示元数据和跨 surface 投影。`run_agent` / `run_program` 新增 optional
+`description`（200 Unicode 字符、非空白、无控制字符），缺省分别回退 prompt/source preview；验证在
+worktree/run store/registry/spawn 前完成，且 Program description 不进入 `source.js`、manifest、byte-identical
+resume 或 journal key。Workflow 继续只认 `meta.description`，顶层 `description/title` 保持
+accepted-but-ignored。Agent/Shell 无 durable ID；Program Running/唯一 terminal 使用同一 `run-*`，Workflow
+使用同一 `wf_*`；native `thread/backgroundTask/updated` 继续无 `turnId`、协议仍为 1.0，只 additive 使用
+既有 optional `runId`。Inbox framing 固定为 `[Agent agent-N]`、`[Program program-N] run run-*`、
+`[Workflow workflow-N] run wf_*`，超大 Agent/Program 仍只 offload result body。
+
+TUI 将后台更新从无关联 Note 改为 session-owned typed row：live tail 按 execution ID 原位 upsert；Running
+row 被 hard cap 冻结进 native scrollback 后不回写，晚到 terminal 追加同 ID 关联 row；TurnEnded 只收口
+foreground `Cell::Agent`。plain/headless 共用 core 单行 formatter，server 继续结构化 DTO。
+`wait_for_activity` 明确为 ID-free、non-draining 的一次性 activity barrier：不调用也会在 step/final/idle
+boundary 自动 delivery，timeout 不代表失败、不消费结果，并禁止短周期 status/output polling。仍未加入
+Task registry、`TaskOutput`、通用 stop/status getter、registry snapshot/hydration 或资源管理面板。
+默认 ignored 的 native-server evaluator 在真实 Anthropic `claude-sonnet-4-6` 与 OpenAI Chat
+`gpt-5.4-mini` 各跑通：每家 1 个 background Agent、1 个 background Program、1 个 Workflow，均有
+显式 description、typed execution ID、Running + 唯一 Completed terminal、Program/Workflow durable ID
+一致、3 次 exactly-once automatic delivery；Program 20k 结果进入 offload，Workflow result 保持 artifact。
+验收不调用 `wait_for_activity`，也不保存 key、endpoint、raw response 或 transcript。
+
 Plan 54 已闭合 Skill、ToolSearch、dynamic MCP refresh/call 和 MCP resources：corpus 为
 129 captures/164 static evidence，matrix 当时仍为 56 行/448 单元。kloop 保留原生
 `skill {name,arguments}` inline/fork、稳定 provider array + `call_tool`、资源 URI 人工批准；stdio

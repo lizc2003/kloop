@@ -475,6 +475,80 @@ mod tests {
     }
 
     #[test]
+    fn program_lifecycle_keeps_one_durable_run_id_without_turn_ownership() {
+        use kloop_core::event::BackgroundTask;
+        use kloop_core::event::BackgroundTaskKind;
+        use kloop_core::event::BackgroundTaskStatus;
+
+        let task = |status, output_path: Option<&str>| {
+            Event::BackgroundTaskUpdated(BackgroundTask {
+                id: "program-4".into(),
+                run_id: Some("run-44".into()),
+                kind: BackgroundTaskKind::Program,
+                description: "compile assets".into(),
+                status,
+                output_path: output_path.map(str::to_string),
+                detail: None,
+            })
+        };
+        for (event, status, output_path) in [
+            (
+                task(BackgroundTaskStatus::Running, None),
+                "running",
+                Value::Null,
+            ),
+            (
+                task(BackgroundTaskStatus::Completed, Some("/tmp/run-44/result")),
+                "completed",
+                json!("/tmp/run-44/result"),
+            ),
+        ] {
+            assert_eq!(
+                project_event(&event, 99),
+                Some((
+                    "thread/backgroundTask/updated",
+                    json!({"task": {
+                        "id": "program-4",
+                        "runId": "run-44",
+                        "kind": "program",
+                        "description": "compile assets",
+                        "status": status,
+                        "outputPath": output_path,
+                        "detail": null,
+                    }})
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn agent_background_update_omits_durable_and_turn_ids() {
+        let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
+            id: "agent-6".into(),
+            run_id: None,
+            kind: kloop_core::event::BackgroundTaskKind::Agent,
+            description: "inspect logs".into(),
+            status: kloop_core::event::BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: None,
+        });
+        assert_eq!(
+            project_event(&update, 123),
+            Some((
+                "thread/backgroundTask/updated",
+                json!({"task": {
+                    "id": "agent-6",
+                    "kind": "agent",
+                    "description": "inspect logs",
+                    "status": "running",
+                    "outputPath": null,
+                    "detail": null,
+                }})
+            ))
+        );
+    }
+
+    #[test]
     fn workflow_updates_include_durable_run_identity() {
         let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
             id: "workflow-7".into(),

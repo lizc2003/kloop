@@ -326,6 +326,10 @@ impl BackgroundExecutions {
             return Err(format!(
                 "{id} is a bash id; use stop_bash {{bash_id: \"{id}\"}} instead"
             ));
+        } else if id.starts_with("run-") {
+            return Err(format!(
+                "{id} is a durable Program resume id; stop_program requires the program-N execution id returned by run_program"
+            ));
         } else if id.starts_with("wf_") {
             return Err(format!(
                 "{id} is a durable workflow run id; stop_workflow requires the workflow-N execution id returned by workflow"
@@ -481,12 +485,12 @@ pub(super) async fn wait_for_activity_tool(input: &Value, ctx: &ToolCtx) -> Resu
     }
     tokio::select! {
         _ = activity.changed() => Ok(status_report(
-            "Background work finished or new input arrived; it will be delivered on the next step.",
+            "Background work finished or new input arrived. No result was consumed; pending results will be delivered automatically on the next step.",
             executions.running_count(),
             shells.running_count(),
         )),
         _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => Ok(status_report(
-            &format!("Timed out after {}s with no activity.", timeout_ms / 1000),
+            &format!("Timed out after {}s with no activity. This is not a background failure and consumed no result; pending results will still be delivered automatically. Do not call wait_for_activity again as a polling loop.", timeout_ms / 1000),
             executions.running_count(),
             shells.running_count(),
         )),
@@ -562,6 +566,36 @@ mod tests {
         assert!(!is_error, "{out}");
         assert!(out.contains("ready and will be delivered"), "{out}");
         assert!(!ctx.cfg.inbox.is_empty(), "wait must not drain the inbox");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_timeout_is_non_terminal_and_consumes_nothing() {
+        let ctx = test_ctx(0, "wait-timeout");
+        ctx.cfg
+            .background_executions
+            .register(
+                ExecutionKind::Agent,
+                "agent-timeout",
+                "still running",
+                CancellationToken::new(),
+            )
+            .unwrap();
+
+        let (output, is_error) = run_tool(
+            "wait_for_activity",
+            json!({"timeout_ms": MIN_WAIT_MS}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert!(output.contains("not a background failure"), "{output}");
+        assert!(output.contains("consumed no result"), "{output}");
+        assert!(
+            output.contains("Do not call wait_for_activity again"),
+            "{output}"
+        );
+        assert_eq!(ctx.cfg.background_executions.running_count(), 1);
+        assert!(ctx.cfg.inbox.is_empty());
     }
 
     #[tokio::test]
@@ -713,11 +747,27 @@ mod tests {
             assert!(output.contains(hint), "{tool}: {output}");
         }
 
-        let (durable, durable_error) =
-            run_tool("stop_workflow", json!({"workflow_id": "wf_plan66"}), &ctx).await;
-        assert!(durable_error);
-        assert!(durable.contains("durable workflow run id"), "{durable}");
-        assert!(durable.contains("workflow-N execution id"), "{durable}");
+        for (tool, input) in [
+            ("stop_agent", json!({"agent_id": "run-plan69"})),
+            ("stop_program", json!({"program_id": "run-plan69"})),
+            ("stop_workflow", json!({"workflow_id": "run-plan69"})),
+        ] {
+            let (durable, durable_error) = run_tool(tool, input, &ctx).await;
+            assert!(durable_error, "{tool}: {durable}");
+            assert!(durable.contains("durable Program resume id"), "{durable}");
+            assert!(durable.contains("program-N execution id"), "{durable}");
+        }
+
+        for (tool, input) in [
+            ("stop_agent", json!({"agent_id": "wf_plan66"})),
+            ("stop_program", json!({"program_id": "wf_plan66"})),
+            ("stop_workflow", json!({"workflow_id": "wf_plan66"})),
+        ] {
+            let (durable, durable_error) = run_tool(tool, input, &ctx).await;
+            assert!(durable_error, "{tool}: {durable}");
+            assert!(durable.contains("durable workflow run id"), "{durable}");
+            assert!(durable.contains("workflow-N execution id"), "{durable}");
+        }
     }
 
     #[test]

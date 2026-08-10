@@ -156,8 +156,8 @@ fn result_report(results: &[ContentBlock]) -> Vec<Value> {
 
 fn started_agent_id(output: &str) -> String {
     output
-        .strip_prefix("Sub-agent ")
-        .and_then(|rest| rest.split_whitespace().next())
+        .lines()
+        .find_map(|line| line.strip_prefix("Agent ID: "))
         .expect("background task result must contain its agent id")
         .to_string()
 }

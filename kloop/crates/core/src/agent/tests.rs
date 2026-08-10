@@ -34,6 +34,7 @@ fn drain_inbox_offloads_only_large_machine_results() {
     });
     inbox.push(InboxItem::ProgramResult {
         label: "program-1".into(),
+        run_id: "run-1".into(),
         summary: large_program.clone(),
     });
     inbox.push(InboxItem::Steer(large_user.clone()));
@@ -46,8 +47,14 @@ fn drain_inbox_offloads_only_large_machine_results() {
         ContentBlock::Text { text } => text.as_str(),
         other => panic!("expected text, got {other:?}"),
     };
+    assert!(text(0).contains("[Agent agent-1]"), "{}", text(0));
     assert!(text(0).contains("read_offloaded"), "{}", text(0));
     assert!(!text(0).contains(&large_agent), "agent body stayed inline");
+    assert!(
+        text(1).contains("[Program program-1] run run-1"),
+        "{}",
+        text(1)
+    );
     assert!(text(1).contains("read_offloaded"), "{}", text(1));
     assert!(
         !text(1).contains(&large_program),

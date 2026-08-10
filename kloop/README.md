@@ -554,7 +554,7 @@ turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
 call carries its full `input`, and `output` + `agent` label when present; a
 `todo_write` surfaces only as a `todo` item, never a tool row); plus
 `thread/backgroundTask/updated {task:{id, kind, description, status,
-outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present only for Workflow; **no
+outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present for Program `run-*` and Workflow `wf_*`; **no
 `turnId`**, because completion may arrive after the launching turn),
 `thread/scheduler/updated {task:{id, origin:"cron"|"loopWakeup",
 status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detail?}}`
@@ -1296,6 +1296,13 @@ one prompt owns the terminal at a time).
 
 Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
 its cloned Config, and core's `Event` stream (plan 39) carries it end to end.
+`run_agent.description` is optional display metadata: at most 200 Unicode
+characters, nonblank, single-line, and control-character-free. It labels the
+launch response and foreground/background lifecycle row but never replaces or
+modifies the child prompt; omission falls back to the first-line prompt preview.
+Invalid metadata fails before label allocation, worktree creation, registration,
+or spawn. A configured `agent_type` remains a display decoration rather than an
+instance identity.
 **Sampling rounds are unbounded by default**, matching codex's child-thread
 turn loop; `max_rounds` is an optional per-call guardrail for callers that
 explicitly need one. The recursion-depth and background-concurrency limits stay
@@ -1694,7 +1701,11 @@ A running program is observable, not a black box: each `tools.<name>(...)` and
 emits the same UI lifecycle a direct call does) and `log(...)` prints live.
 
 **Background programs**: `run_program {"background": true}` fires and forgets.
-The launch response has two intentionally different identities: transient
+Its optional `description` follows the same 200-character display-only contract as
+Agent and falls back to a first-line source preview. Validation happens before the
+run store is opened; description never enters `source.js`, the manifest, source
+identity, or journal replay keys. The launch response has two intentionally
+different identities: transient
 `program-N` belongs to this session and is the only ID accepted by
 `stop_program`; durable `run-*` names the persisted source/journal and is the only
 ID accepted by `resume_from_run_id`. The result is delivered to the parent as a
@@ -1703,7 +1714,9 @@ successful results use the same offload store as tool results: history receives
 a bounded head/tail preview plus a `read_offloaded` pointer, not an unbounded
 user message. Background Program shares `BackgroundExecutions`, inbox activity,
 `wait_for_activity`, and idle autodelivery with background Agent and Workflow.
-The shell registry stays separate because a shell has its own output file and
+Both Program Running and its unique terminal `BackgroundTaskUpdated` carry the
+same durable `run-*`; native wire projects it through the existing optional
+`runId` field without adding a turn owner or changing protocol version. The shell registry stays separate because a shell has its own output file and
 reinjects only a terminal pointer. Deliberately **not** copied from codex: its
 cell/observation-frontier machinery (incremental pull-based output streamed to
 the model between `yield`s) — kloop is push-based on completion and `log()`
@@ -1744,7 +1757,9 @@ resume guidance before any agent work completes. `stop_workflow` accepts only
 the execution id; the durable run id is only for resume. The script must begin
 with a pure-literal
 `export const meta = {name, description, phases?}` declaration and then has only
-these host capabilities:
+these host capabilities. `meta.description` is the sole display source for launch,
+lifecycle, manifest, and UI; the legacy top-level `description`/`title` inputs are
+accepted-but-ignored and cannot override script metadata:
 
 ```ts
 declare const args: unknown;
@@ -1801,14 +1816,28 @@ resolution are intentional first-release omissions.
 ## Async sub-agents (Phase 2, eighteenth slice)
 
 `run_agent` takes `background: true`: instead of blocking and returning the
-sub-agent's final text, it returns an `agent-N` id immediately and delivers the
-result to the parent inbox when it finishes. Background control is resource
-specific:
+sub-agent's final text, it returns a typed `agent-N` execution ID immediately and
+delivers the result to the parent Inbox automatically when it finishes. Program
+and Workflow use the same delivery boundary while retaining separate durable
+identities:
 
-- `wait_for_activity {timeout_ms?}` is the global session barrier. It waits for
-  an active shell, agent, program, or Workflow to finish, or for new inbox input.
-  It accepts no ID, returns only a short status, and **never drains** results;
-  completion content arrives at the next round boundary.
+| wire tool | UI product | execution ID (status/stop) | durable ID (resume) |
+|---|---|---|---|
+| `bash {background:true}` | Shell | `bg-N` | — |
+| `run_agent {background:true}` | Agent | `agent-N` | — |
+| `run_program {background:true}` | Program | `program-N` | `run-*` |
+| `workflow` | Workflow | `workflow-N` | `wf_*` |
+
+Passing `run-*` to any typed stop fails closed and directs the caller to the
+launch response's `program-N`; `wf_*` behaves likewise for Workflow. Background
+control remains resource specific:
+
+- `wait_for_activity {timeout_ms?}` is a non-draining global session activity
+  barrier, not a status or output getter. Call it once only when the current model
+  step truly needs to block for any shell, Agent, Program, Workflow, or Inbox
+  activity. Results still arrive at the next step/final/idle delivery boundary if
+  the tool is never called. A timeout is not a resource failure, consumes nothing,
+  and must not become a short-period polling loop.
 - `stop_agent {agent_id}` accepts only `agent-N`.
 - `stop_program {program_id}` accepts only `program-N`.
 - `stop_workflow {workflow_id}` accepts only `workflow-N`, never durable `wf_*`.
@@ -1841,6 +1870,19 @@ stop-vs-completion arbitration and a supervisor around each worker, so
 panic/forced abort still publishes exactly one terminal state. Both
 registries project through the same session-scoped `BackgroundTaskUpdated`
 event; this shared DTO is the compatibility seam, not a forced internal merge.
+Agent, Program, and Workflow completion messages retain typed provenance as
+`[Agent agent-N]`, `[Program program-N] run run-*`, and
+`[Workflow workflow-N] run wf_*`; only the result body is eligible for offload.
+
+The TUI renders this event as a session-owned lifecycle row, not as a turn-owned
+sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the
+same execution ID replace one mutable live-tail row. A Running row is normally
+kept out of native scrollback; if the hard tail cap forces it into immutable
+scrollback, later Running updates are ignored and the unique terminal update is
+appended as a linked row with the same typed ID. `/clear` and fork rebuild reset
+only the UI indices; a late terminal still starts a fresh identifiable row. This
+is an event projection, not a resource manager: there is no list/hydration,
+universal stop, status getter, or output panel.
 
 **Autowake** closes the loop when the parent turn has already ended: every
 interactive frontend subscribes to inbox activity and starts a delivery turn only

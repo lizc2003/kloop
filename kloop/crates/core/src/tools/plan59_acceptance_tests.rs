@@ -497,7 +497,10 @@ async fn background_agent_scheduler_report() -> Value {
         &context,
     )
     .await;
-    assert!(!agent_start_error && agent_start.starts_with("Sub-agent "));
+    assert!(
+        !agent_start_error && agent_start.starts_with("Agent(return the marker)"),
+        "{agent_start}"
+    );
     if context.cfg.background_executions.running_count() != 0 {
         tokio::time::timeout(Duration::from_secs(2), agent_activity.changed())
             .await
@@ -572,7 +575,10 @@ async fn background_agent_scheduler_report() -> Value {
         &context,
     )
     .await;
-    assert!(!live_agent_error && live_agent.starts_with("Sub-agent "));
+    assert!(
+        !live_agent_error && live_agent.starts_with("Agent(remain live until session shutdown)"),
+        "{live_agent}"
+    );
     tokio::time::timeout(Duration::from_secs(2), live_started_rx)
         .await
         .expect("live agent never sampled")

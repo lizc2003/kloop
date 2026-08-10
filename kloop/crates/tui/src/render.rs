@@ -15,6 +15,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
+use kloop_core::event::BackgroundTaskKind;
+use kloop_core::event::BackgroundTaskStatus;
 use kloop_core::tools::TodoStatus;
 
 use std::time::Duration;
@@ -123,6 +125,33 @@ fn status_mark(status: &ToolStatus) -> (&'static str, Color) {
     }
 }
 
+fn background_status_mark(status: BackgroundTaskStatus) -> (&'static str, Color) {
+    match status {
+        BackgroundTaskStatus::Running => ("●", Color::Cyan),
+        BackgroundTaskStatus::Completed => ("✓", Color::Green),
+        BackgroundTaskStatus::Failed => ("✗", Color::Red),
+        BackgroundTaskStatus::Cancelled => ("■", Color::Gray),
+    }
+}
+
+fn background_kind(kind: BackgroundTaskKind) -> &'static str {
+    match kind {
+        BackgroundTaskKind::Shell => "Shell",
+        BackgroundTaskKind::Agent => "Agent",
+        BackgroundTaskKind::Program => "Program",
+        BackgroundTaskKind::Workflow => "Workflow",
+    }
+}
+
+fn background_status(status: BackgroundTaskStatus) -> &'static str {
+    match status {
+        BackgroundTaskStatus::Running => "Running",
+        BackgroundTaskStatus::Completed => "Completed",
+        BackgroundTaskStatus::Failed => "Failed",
+        BackgroundTaskStatus::Cancelled => "Cancelled",
+    }
+}
+
 /// The display lines for one cell at `width` columns. Both paths that put a
 /// cell on screen go through this — rendering the live tail in the viewport and
 /// freezing a finalized cell into native scrollback (`insert_before`) — so a
@@ -194,6 +223,44 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 Span::styled(format!("{mark} "), Style::new().fg(color)),
                 Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
             ]));
+        }
+        Cell::BackgroundTask(task) => {
+            let (mark, color) = background_status_mark(task.status);
+            let title = format!("{}({})", background_kind(task.kind), task.description);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::new().fg(color)),
+                Span::styled(
+                    truncate(&title, width.saturating_sub(2)),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let mut identity = format!("{} · {}", background_status(task.status), task.id);
+            if let Some(run_id) = &task.run_id {
+                identity.push_str(&format!(" · resumable as {run_id}"));
+            }
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("  {identity}"), width),
+                DIM,
+            )));
+            if let Some(detail) = &task.detail {
+                let label = if task.kind == BackgroundTaskKind::Workflow
+                    && task.status == BackgroundTaskStatus::Running
+                {
+                    "Phase: "
+                } else {
+                    ""
+                };
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("  {label}{detail}"), width),
+                    DIM,
+                )));
+            }
+            if let Some(output_path) = &task.output_path {
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("  output: {output_path}"), width),
+                    DIM,
+                )));
+            }
         }
         Cell::Todo(items) => {
             lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
@@ -363,6 +430,7 @@ pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'stati
 fn is_committable(cell: &Cell) -> bool {
     match cell {
         Cell::Tool { status, .. } | Cell::Agent { status, .. } => *status != ToolStatus::Running,
+        Cell::BackgroundTask(task) => task.status != BackgroundTaskStatus::Running,
         _ => true,
     }
 }
@@ -1671,6 +1739,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn running_background_row_pins_tail_until_hard_cap_forces_freeze() {
+        let running = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "agent-1".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Agent,
+            description: "long audit".into(),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: None,
+        });
+        let mut under_cap = vec![running.clone()];
+        under_cap.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
+        assert_eq!(commit_count(&under_cap, 40, 2, |_| false), 0);
+
+        let mut over_cap = vec![running];
+        over_cap.extend((0..10).map(|i| Cell::Assistant(format!("l{i}"))));
+        assert!(
+            commit_count(&over_cap, 40, 2, |_| false) > 0,
+            "the hard cap must prevent an unbounded mutable tail"
+        );
+    }
+
     /// A System cell (slash-command output) renders every line dim and wrapped,
     /// unlike a Note which collapses to one truncated line.
     #[test]
@@ -1729,6 +1820,73 @@ mod tests {
                 "✓ agent-1 find the bug (3 tool uses)",
             ]
         );
+    }
+
+    #[test]
+    fn background_rows_render_typed_identity_phase_and_terminal_artifact() {
+        let workflow = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "workflow-3".into(),
+            run_id: Some("wf_3".into()),
+            kind: BackgroundTaskKind::Workflow,
+            description: "review changes".into(),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: Some("Verify 2/4".into()),
+        });
+        let workflow_lines = cell_lines(&workflow, 80);
+        assert_eq!(
+            workflow_lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec![
+                "● Workflow(review changes)",
+                "  Running · workflow-3 · resumable as wf_3",
+                "  Phase: Verify 2/4",
+            ]
+        );
+        assert_eq!(workflow_lines[0].spans[0].style.fg, Some(Color::Cyan));
+
+        let program = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "program-2".into(),
+            run_id: Some("run-2".into()),
+            kind: BackgroundTaskKind::Program,
+            description: "run checks".into(),
+            status: BackgroundTaskStatus::Failed,
+            output_path: Some("/tmp/run-2/error.txt".into()),
+            detail: Some("exit code 1".into()),
+        });
+        let program_lines = cell_lines(&program, 80);
+        assert_eq!(
+            program_lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec![
+                "✗ Program(run checks)",
+                "  Failed · program-2 · resumable as run-2",
+                "  exit code 1",
+                "  output: /tmp/run-2/error.txt",
+            ]
+        );
+        assert_eq!(program_lines[0].spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn background_status_style_depends_only_on_typed_status() {
+        for (status, mark, color) in [
+            (BackgroundTaskStatus::Running, "●", Color::Cyan),
+            (BackgroundTaskStatus::Completed, "✓", Color::Green),
+            (BackgroundTaskStatus::Failed, "✗", Color::Red),
+            (BackgroundTaskStatus::Cancelled, "■", Color::Gray),
+        ] {
+            let cell = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+                id: "agent-1".into(),
+                run_id: None,
+                kind: BackgroundTaskKind::Agent,
+                description: "detail says failed cancelled completed".into(),
+                status,
+                output_path: None,
+                detail: Some("running failed cancelled completed".into()),
+            });
+            let lines = cell_lines(&cell, 80);
+            assert!(line_text(&lines[0]).starts_with(mark));
+            assert_eq!(lines[0].spans[0].style.fg, Some(color));
+        }
     }
 
     /// A Todo cell renders a header plus one marked line per item, showing

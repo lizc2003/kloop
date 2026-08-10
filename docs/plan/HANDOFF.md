@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–69 已完成)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -206,6 +206,25 @@
 > **Plan 68 已完成（2026-08-07）**：`68-agent-program-workflow-optimization.md` 在真实 `claude-sonnet-4-6` / OpenAI Chat `gpt-5.5` 概念测评后端到端收紧三原语。QuickJS prelude 私有捕获并删除 raw `__call_tool`/`__agent`/`__log`/`__phase`，core 再以精确 Program catalog 在 hook/permission/dispatch 前拒绝伪造名，source control-name collision 同样排除。并发 helper callback 改用显式 scope；journal v2 以 root/helper/branch/item/stage 拓扑 ID + 完整结构化 input 精确 replay，pipeline 不加 stage barrier，v1 不猜。Program 新 run 原子保存 source/manifest，resume 要求 byte-identical，后台同时返回 transient `program-N` 与 durable `run-*`；Workflow 保留 edited-script resume。Program/Workflow live Agent 默认 16 路、总量 1000、单 helper 4096，排队取消安全且 journal hit 不占槽。后台 Agent/Program 超大 success 在 inbox drain 复用 offload；plain/native server idle autodelivery 文档已纠正。默认 ignored 的 native-server real evaluator 以 tool lifecycle、source/journal/result artifact 和唯一 terminal/delivery 验收双 provider，不记录 raw response/key/endpoint。提交 SHA 以本条所在提交为准。
 >
 > **Plan 68 教训**：①模型源码前隐藏 capability 只是第一层，host bridge 必须持同一精确 allowlist 再拒绝；否则一个裸全局名就能绕过整个产品面。②并发恢复 identity 必须来自拓扑，不可来自 future 完成/续跑到达顺序；为了保持 pipeline 流水线，应把 scope 传给 callback，而不是加 barrier/串行。③“完整输入 memoization”也不是外部状态幂等，`phase` 更不是 checkpoint；文档要明确 best-effort 边界。④后台结果虽然由本地 worker 产生，进入 history 后仍占模型上下文，必须和 tool result 共用 offload 预算。
+>
+> **Plan 69 已完成（2026-08-10）**：`69-background-resource-lifecycle-ux.md` 在不改 Plan 66/68
+> 工具协议、typed stop、恢复 identity、终态仲裁和自动 delivery 的前提下补齐跨 surface 生命周期 UX。
+> `run_agent`/`run_program` 新增 strict optional display description，缺省回退 prompt/source preview；Program
+> 的 source/manifest/journal identity 不受展示元数据影响，Workflow 仍只认 `meta.description`。Program
+> Running/terminal 与 Inbox 都保留同一 `run-*`；三类结果 framing 固定产品类型、execution ID 和 optional
+> durable ID。TUI 用 session-owned `Cell::BackgroundTask` 按 execution ID 原位 upsert；Running row 被 hard cap
+> 冻结后只追加同 ID terminal，不回写 native scrollback。plain/headless 共用 core formatter，native server
+> 保持 protocol 1.0 和无 `turnId` 的结构化 DTO。`wait_for_activity` 继续 ID-free/non-draining，timeout 不消费
+> 结果，模型文案明确自动 delivery 与禁止轮询。没有新增 Task registry、TaskOutput、通用 stop/status getter、
+> snapshot/hydration 或资源面板。默认 ignored native-server evaluator 已在 Anthropic `claude-sonnet-4-6`
+> 和 OpenAI Chat `gpt-5.4-mini` 各验 1 个 background Agent、Program、Workflow：3 个 Running + unique
+> Completed terminal、typed/durable ID、Program offload、Workflow artifact 与 3 次 exactly-once automatic
+> delivery 全部通过，且没有调用 `wait_for_activity`。提交 SHA 以本条所在提交为准。
+>
+> **Plan 69 教训**：①description 这类人类展示元数据必须在任何持久化/spawn 前校验，并与 prompt/source/
+> durable identity 物理分流；否则改标题会制造恢复 miss。②session-owned lifecycle 不应伪造 launch turn owner；
+> execution ID 才是跨 turn、跨 frontend 的关联键。③native scrollback 一旦提交就不可变，运行行被 hard cap
+> 冻结后只能忽略中间更新并追加关联 terminal，不能保留悬空 index 或偷偷改历史。
 >
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现

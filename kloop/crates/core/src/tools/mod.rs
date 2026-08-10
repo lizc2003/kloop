@@ -666,10 +666,11 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "run_agent".into(),
-            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is offloaded for read_offloaded). Use wait_for_activity to wait without consuming results and stop_agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
+            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is offloaded for read_offloaded). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
+                    "description": {"type": "string", "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes the prompt or result."},
                     "prompt": {"type": "string", "description": "Complete standalone work description"},
                     "agent_type": {"type": "string", "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
                     "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
@@ -682,7 +683,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
         });
         defs.push(ToolDef {
             name: "wait_for_activity".into(),
-            description: "Wait for any active background shell, agent, program, or Workflow to finish; pending inbox input also wakes it. Takes no resource ID and never reads or drains a result — completed results are delivered separately at the next step boundary.".into(),
+            description: "Wait once for any background shell, Agent, Program, or Workflow activity when the caller truly needs to block. Pending inbox input also wakes it. Takes no resource ID and never reads or drains a result; results are delivered automatically at the next step/final/idle boundary even if this tool is never called. A timeout is not a background failure and consumes nothing. Do not call repeatedly as a status/output polling loop.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -1238,6 +1239,30 @@ pub(crate) fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
     }
 }
 
+pub(crate) const MAX_DISPLAY_DESCRIPTION_CHARS: usize = 200;
+
+/// Validate optional human-facing metadata before any tool side effect. Reading
+/// the raw JSON preserves the distinction between an omitted field and an
+/// explicit `null`, which serde's `Option<String>` would otherwise erase.
+pub(crate) fn optional_display_description(input: &Value, tool: &str) -> Result<Option<String>> {
+    let Some(value) = input.get("description") else {
+        return Ok(None);
+    };
+    let description = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{tool}: description must be a string when provided"))?;
+    if description.trim().is_empty() {
+        bail!("{tool}: description must not be empty");
+    }
+    if description.chars().count() > MAX_DISPLAY_DESCRIPTION_CHARS {
+        bail!("{tool}: description exceeds the {MAX_DISPLAY_DESCRIPTION_CHARS}-character limit");
+    }
+    if description.chars().any(char::is_control) {
+        bail!("{tool}: description must be a single line without control characters");
+    }
+    Ok(Some(description.to_string()))
+}
+
 pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     input[key]
         .as_str()
@@ -1610,6 +1635,60 @@ mod tests {
                 self.both_started.wait().await;
                 Ok(SourceOutput::text(format!("completed {tool}")))
             })
+        }
+    }
+
+    #[test]
+    fn optional_display_description_is_strict_and_unicode_counted() {
+        assert_eq!(
+            optional_display_description(&json!({}), "run_agent").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_display_description(&json!({"description": "审查后台生命周期"}), "run_agent")
+                .unwrap()
+                .as_deref(),
+            Some("审查后台生命周期")
+        );
+        for (value, message) in [
+            (Value::Null, "must be a string"),
+            (json!(42), "must be a string"),
+            (json!("   "), "must not be empty"),
+            (json!("two\nlines"), "single line"),
+            (json!("x".repeat(201)), "200-character limit"),
+        ] {
+            let error = optional_display_description(&json!({"description": value}), "run_agent")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{error}");
+        }
+        assert!(optional_display_description(
+            &json!({"description": "界".repeat(MAX_DISPLAY_DESCRIPTION_CHARS)}),
+            "run_program",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn agent_and_program_schemas_bound_display_description() {
+        let definitions = tool_defs(0, &ShellPrograms::native_posix());
+        for name in ["run_agent", "run_program"] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap();
+            assert_eq!(
+                definition.schema["properties"]["description"],
+                json!({
+                    "type": "string",
+                    "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS,
+                    "description": if name == "run_agent" {
+                        "Optional short, single-line display label. It never changes the prompt or result."
+                    } else {
+                        "Optional short, single-line display label. It never changes source identity, journal replay, or the result."
+                    }
+                })
+            );
         }
     }
 

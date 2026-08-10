@@ -16,6 +16,11 @@ use serde_json::json;
 use serde_json::Value;
 
 const AGENT_SENTINEL: &str = "AGENT_DIRECT_68";
+const BACKGROUND_AGENT_SENTINEL: &str = "BACKGROUND_AGENT_69";
+const BACKGROUND_AGENT_DESCRIPTION: &str = "verify background Agent delivery";
+const BACKGROUND_PROGRAM_SENTINEL: &str = "BACKGROUND_PROGRAM_69";
+const BACKGROUND_PROGRAM_DESCRIPTION: &str = "verify background Program delivery";
+const BACKGROUND_PROGRAM_SOURCE: &str = "return 'BACKGROUND_PROGRAM_69:' + 'x'.repeat(20000);";
 const PROGRAM_CHILD_SENTINEL: &str = "PROGRAM_CHILD_68";
 const PROGRAM_FAILURE_SENTINEL: &str = "PROGRAM_EXPECTED_FAILURE_68";
 const WORKFLOW_SENTINEL: &str = "WORKFLOW_RESULT_68";
@@ -207,12 +212,12 @@ impl NativeClient {
         }
     }
 
-    fn collect_workflow_delivery(&self, mut messages: Vec<Value>) -> Vec<Value> {
+    fn collect_background_delivery(&self, mut messages: Vec<Value>, kind: &str) -> Vec<Value> {
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
             let terminal_index = messages.iter().position(|message| {
                 message["method"] == "thread/backgroundTask/updated"
-                    && message["params"]["task"]["kind"] == "workflow"
+                    && message["params"]["task"]["kind"] == kind
                     && matches!(
                         message["params"]["task"]["status"].as_str(),
                         Some("completed" | "failed" | "cancelled")
@@ -276,6 +281,73 @@ fn assert_tool_pairs(messages: &[Value], name: &str, expected: usize) -> Vec<Str
                 .to_string()
         })
         .collect()
+}
+
+fn assert_background_lifecycle(
+    messages: &[Value],
+    kind: &str,
+    description: &str,
+    run_prefix: Option<&str>,
+) -> (String, Option<String>) {
+    let updates: Vec<&Value> = messages
+        .iter()
+        .filter(|message| {
+            message["method"] == "thread/backgroundTask/updated"
+                && message["params"]["task"]["kind"] == kind
+        })
+        .collect();
+    assert!(!updates.is_empty(), "missing {kind} lifecycle events");
+    assert!(updates.iter().all(|message| {
+        message["params"].get("turnId").is_none()
+            && message["params"]["task"]["description"] == description
+    }));
+
+    let execution_id = updates[0]["params"]["task"]["id"]
+        .as_str()
+        .expect("background update omitted execution id")
+        .to_string();
+    assert!(updates
+        .iter()
+        .all(|message| message["params"]["task"]["id"] == execution_id));
+    assert!(updates
+        .iter()
+        .any(|message| message["params"]["task"]["status"] == "running"));
+    let terminals: Vec<&Value> = updates
+        .iter()
+        .copied()
+        .filter(|message| {
+            matches!(
+                message["params"]["task"]["status"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            )
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "{kind} must publish one terminal state");
+    assert_eq!(
+        terminals[0]["params"]["task"]["status"], "completed",
+        "{kind} did not complete successfully"
+    );
+
+    let run_id = match run_prefix {
+        Some(prefix) => {
+            let run_id = updates[0]["params"]["task"]["runId"]
+                .as_str()
+                .expect("durable background work omitted runId")
+                .to_string();
+            assert!(run_id.starts_with(prefix), "unexpected run id shape");
+            assert!(updates
+                .iter()
+                .all(|message| message["params"]["task"]["runId"] == run_id));
+            Some(run_id)
+        }
+        None => {
+            assert!(updates
+                .iter()
+                .all(|message| message["params"]["task"].get("runId").is_none()));
+            None
+        }
+    };
+    (execution_id, run_id)
 }
 
 fn extract_run_id(text: &str) -> Option<String> {
@@ -379,22 +451,136 @@ fn real_agent_program_workflow_contract() {
         .join(".kloop/program-runs")
         .join(&run_id)
         .join("source.js");
+    let invoked_program_sources: Vec<&str> =
+        tool_items(&program_messages, "item/started", "run_program")
+            .into_iter()
+            .map(|message| {
+                message["params"]["item"]["input"]["source"]
+                    .as_str()
+                    .expect("run_program omitted source")
+            })
+            .collect();
+    assert_eq!(invoked_program_sources.len(), 2);
+    assert_eq!(
+        invoked_program_sources[0], invoked_program_sources[1],
+        "resume source was not byte-identical"
+    );
+    assert_eq!(
+        invoked_program_sources[0].trim_end_matches(['\r', '\n']),
+        PROGRAM_SOURCE,
+        "model changed the requested Program source"
+    );
     assert_eq!(
         std::fs::read_to_string(stored_source).expect("missing Program source artifact"),
-        PROGRAM_SOURCE
+        invoked_program_sources[0]
+    );
+
+    let background_agent_prompt = format!(
+        "Acceptance case background Agent. Call run_agent exactly once with background=true, description `{BACKGROUND_AGENT_DESCRIPTION}`, and prompt `Reply exactly {BACKGROUND_AGENT_SENTINEL}`. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching any more tools."
+    );
+    let initial_background_agent = client.run_turn(&thread_id, &background_agent_prompt);
+    let background_agent_messages =
+        client.collect_background_delivery(initial_background_agent, "agent");
+    let background_agent_outputs = assert_tool_pairs(&background_agent_messages, "run_agent", 1);
+    assert!(
+        background_agent_outputs[0].contains(&format!("Agent({BACKGROUND_AGENT_DESCRIPTION})"))
+            && background_agent_outputs[0].contains("Agent ID: agent-"),
+        "background Agent launch omitted its display description or execution id"
+    );
+    assert!(
+        tool_items(
+            &background_agent_messages,
+            "item/started",
+            "wait_for_activity"
+        )
+        .is_empty(),
+        "background delivery must not require wait_for_activity"
+    );
+    let (background_agent_id, no_agent_run_id) = assert_background_lifecycle(
+        &background_agent_messages,
+        "agent",
+        BACKGROUND_AGENT_DESCRIPTION,
+        None,
+    );
+    assert!(background_agent_id.starts_with("agent-"));
+    assert!(no_agent_run_id.is_none());
+
+    let background_program_prompt = format!(
+        "Acceptance case background Program. Call run_program exactly once with background=true, description `{BACKGROUND_PROGRAM_DESCRIPTION}`, and the exact JavaScript source below. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching another Program.\n\n```js\n{BACKGROUND_PROGRAM_SOURCE}\n```"
+    );
+    let initial_background_program = client.run_turn(&thread_id, &background_program_prompt);
+    let background_program_messages =
+        client.collect_background_delivery(initial_background_program, "program");
+    let background_program_outputs =
+        assert_tool_pairs(&background_program_messages, "run_program", 1);
+    assert!(
+        background_program_outputs[0]
+            .contains(&format!("Program({BACKGROUND_PROGRAM_DESCRIPTION})"))
+            && background_program_outputs[0].contains("Program ID: program-")
+            && background_program_outputs[0].contains("Run ID: run-"),
+        "background Program launch omitted display, execution, or durable identity"
+    );
+    assert!(
+        tool_items(
+            &background_program_messages,
+            "item/started",
+            "wait_for_activity"
+        )
+        .is_empty(),
+        "background delivery must not require wait_for_activity"
+    );
+    let (background_program_id, background_program_run_id) = assert_background_lifecycle(
+        &background_program_messages,
+        "program",
+        BACKGROUND_PROGRAM_DESCRIPTION,
+        Some("run-"),
+    );
+    assert!(background_program_id.starts_with("program-"));
+    let background_program_run_id = background_program_run_id.unwrap();
+    assert!(background_program_outputs[0].contains(&background_program_run_id));
+    assert_eq!(
+        std::fs::read_to_string(
+            root.workspace()
+                .join(".kloop/program-runs")
+                .join(&background_program_run_id)
+                .join("source.js")
+        )
+        .expect("missing background Program source artifact"),
+        BACKGROUND_PROGRAM_SOURCE
+    );
+    let offloaded_program_result = std::fs::read_dir(root.workspace().join(".kloop/offload"))
+        .expect("background Program result was not offloaded")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .any(|content| content.contains(BACKGROUND_PROGRAM_SENTINEL));
+    assert!(
+        offloaded_program_result,
+        "large background Program result missing from offload artifacts"
     );
 
     let workflow_prompt = format!(
-        "Acceptance case Workflow. I explicitly authorize multi-agent Workflow orchestration. Call workflow exactly once with the exact script below and no args. Then call wait_for_activity as needed until its result is delivered; do not call run_agent or run_program directly. Finish with `WORKFLOW_CASE_DONE_68`.\n\n```js\n{WORKFLOW_SCRIPT}\n```"
+        "Acceptance case Workflow. I explicitly authorize multi-agent Workflow orchestration. Call workflow exactly once with the exact script below and no args. Do not call wait_for_activity, run_agent, or run_program directly; the Workflow result will be delivered automatically. Finish after the delivered result is folded in.\n\n```js\n{WORKFLOW_SCRIPT}\n```"
     );
     let initial_workflow = client.run_turn(&thread_id, &workflow_prompt);
-    let workflow_messages = client.collect_workflow_delivery(initial_workflow);
+    let workflow_messages = client.collect_background_delivery(initial_workflow, "workflow");
     let workflow_outputs = assert_tool_pairs(&workflow_messages, "workflow", 1);
     assert!(
         workflow_outputs[0].contains("Workflow ID: workflow-")
             && workflow_outputs[0].contains("Run ID: wf_"),
         "Workflow launch omitted transient or durable identity"
     );
+    assert!(
+        tool_items(&workflow_messages, "item/started", "wait_for_activity").is_empty(),
+        "Workflow delivery must not require wait_for_activity"
+    );
+    let (workflow_id, workflow_run_id) = assert_background_lifecycle(
+        &workflow_messages,
+        "workflow",
+        "Exercise scoped Workflow agents",
+        Some("wf_"),
+    );
+    assert!(workflow_outputs[0].contains(&workflow_id));
+    assert!(workflow_outputs[0].contains(&workflow_run_id.unwrap()));
     let terminals: Vec<&Value> = workflow_messages
         .iter()
         .filter(|message| {
@@ -430,6 +616,20 @@ fn real_agent_program_workflow_contract() {
     .expect("cannot read acceptance rollout");
     assert_eq!(
         rollout
+            .matches("A background sub-agent you dispatched has finished")
+            .count(),
+        1,
+        "background Agent result was not delivered exactly once"
+    );
+    assert_eq!(
+        rollout
+            .matches("A background program you launched has finished")
+            .count(),
+        1,
+        "background Program result was not delivered exactly once"
+    );
+    assert_eq!(
+        rollout
             .matches("A background Workflow you launched has finished")
             .count(),
         1,
@@ -437,6 +637,6 @@ fn real_agent_program_workflow_contract() {
     );
 
     println!(
-        "real primitive acceptance passed: provider={provider} model={model} agent_calls=1 program_calls=2 program_child_spawns=1 workflow_calls=1 workflow_terminals=1"
+        "real primitive acceptance passed: provider={provider} model={model} foreground_agent_calls=1 foreground_program_calls=2 program_child_spawns=1 background_agent_calls=1 background_program_calls=1 workflow_calls=1 terminals=3 automatic_deliveries=3"
     );
 }

@@ -1,6 +1,6 @@
 # Plan 69 — 后台三原语生命周期展示
 
-> 状态：📋 待实施（2026-08-07；本文件仅规划，不含生产代码修改）
+> 状态：✅ 已完成（2026-08-10；提交 SHA 以本条所在提交为准）
 >
 > 依赖：Plan 51、52、53、66、68
 
@@ -145,6 +145,19 @@ Inbox 注入使用稳定来源 framing：
 - 用真实 Anthropic 与 OpenAI Chat 各运行一组后台 Agent、后台 Program 和 Workflow：模型可正确生成 `description`/`background`，无需 `TaskOutput`，协议事件与自动 delivery 完成闭环。
 - dogfood 只记录脱敏后的资源类型、计数、状态和 ID 形状；不记录 key、endpoint、raw provider response 或 transcript。
 
+## 完成记录
+
+- `run_agent` / `run_program` 已接 strict optional `description`：最大 200 个 Unicode 字符，显式 null、非字符串、空白、控制字符和超长值均在副作用前拒绝；缺省回退 prompt/source preview。Agent prompt 与 Program source/manifest/journal/resume identity 均未混入展示值。
+- Agent 回执、foreground item、background registry/event 使用同一 resolved description；Program Running/唯一 terminal/Inbox 使用同一 `run-*`；Workflow 回执/event/manifest 只取 `meta.description`，顶层 ignored `description/title` 不能覆盖。
+- plain/headless 的 core formatter、Inbox 三类来源 framing、`run-*`/`wf_*` stop 诊断和 non-draining `wait_for_activity` 文案已固定；native `thread/backgroundTask/updated` 与 protocol 1.0 未改，Program 只 additive 使用既有 `runId`。
+- TUI 已新增 session-owned `Cell::BackgroundTask`。同 ID 在 live tail 原位 upsert；Running row 被 hard cap 冻结后忽略中间更新，terminal 追加同 ID 关联 row；clear/fork 重置索引，TurnEnded 不误杀 detached row。renderer 和 tool row 使用产品名、typed status、execution/durable ID 与受限 detail/artifact。
+- 未加入通用 Task registry、`TaskOutput`、status/output getter、通用 stop、registry snapshot/hydration 或资源管理面板；后续阶段边界保持不变。
+
+验证（2026-08-10）：
+
+- `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`cargo run -p kloop -- --mock`、mock headless JSON、full exact-binary verifier、corpus-only verifier、`git diff --check` 全部通过。
+- focused core/TUI/server tests 覆盖 description 校验与 identity 隔离、Program `runId`、Inbox/offload、typed stop/wait、live/frozen TUI row、status-only style、friendly labels、Workflow 单一 description 来源和 exact wire object。
+- 默认 ignored native-server evaluator 在真实 Anthropic `claude-sonnet-4-6` 与 OpenAI Chat `gpt-5.4-mini` 各通过：每家 background Agent / Program / Workflow 各 1 个，3 个 Running + unique Completed terminal，typed/durable ID 一致，Program 20k 结果 offload、Workflow artifact、3 次 exactly-once automatic delivery；全程不调用 `wait_for_activity`，不记录 key、endpoint、raw response 或 transcript。
 ## 后续阶段：可操作后台资源面板
 
 本计划只做结构化 lifecycle row，不立即实现 Claude Code 式 `↓ to manage` 面板。完整面板必须在后续独立计划中先补齐：

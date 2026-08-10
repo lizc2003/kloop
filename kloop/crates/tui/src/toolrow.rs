@@ -125,11 +125,37 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "read_offloaded" => ("Read".into(), s("path")),
         "bash_output" => ("BashOutput".into(), s("bash_id")),
         "stop_bash" => ("StopBash".into(), s("bash_id")),
-        "run_agent" => ("RunAgent".into(), s("prompt")),
-        "wait_for_activity" => ("WaitForActivity".into(), String::new()),
-        "stop_agent" => ("StopAgent".into(), s("agent_id")),
-        "stop_program" => ("StopProgram".into(), s("program_id")),
-        "stop_workflow" => ("StopWorkflow".into(), s("workflow_id")),
+        "run_agent" => {
+            let description = s("description");
+            let detail = if description.is_empty() {
+                s("prompt")
+            } else {
+                description
+            };
+            ("Run Agent".into(), detail)
+        }
+        "run_program" => {
+            let description = s("description");
+            let detail = if description.is_empty() {
+                s("source")
+            } else {
+                description
+            };
+            ("Run Program".into(), detail)
+        }
+        "workflow" => {
+            let script_path = s("script_path");
+            let detail = if script_path.is_empty() {
+                "inline script".into()
+            } else {
+                script_path
+            };
+            ("Workflow".into(), detail)
+        }
+        "wait_for_activity" => ("Wait for activity".into(), String::new()),
+        "stop_agent" => ("Stop Agent".into(), s("agent_id")),
+        "stop_program" => ("Stop Program".into(), s("program_id")),
+        "stop_workflow" => ("Stop Workflow".into(), s("workflow_id")),
         "tool_search" => ("ToolSearch".into(), s("query")),
         "skill" => ("Skill".into(), s("name")),
         // call_tool wraps a real tool name; show that so the row reads as the
@@ -446,6 +472,66 @@ mod tests {
         assert_eq!(text(&lines[0]), "✓ Read Cargo.toml");
         assert_eq!(text(&lines[1]), "  └ 1 [workspace]");
         assert_eq!(text(&lines[2]), "    2 resolver = \"2\"");
+    }
+
+    #[test]
+    fn background_tools_use_product_labels_and_display_descriptions() {
+        let rows = [
+            (
+                "run_agent",
+                r#"{"prompt":"private long prompt","description":"inspect logs"}"#,
+                "✓ Run Agent inspect logs",
+            ),
+            (
+                "run_agent",
+                r#"{"prompt":"fallback prompt"}"#,
+                "✓ Run Agent fallback prompt",
+            ),
+            (
+                "run_program",
+                r#"{"source":"return privateSource","description":"compile assets"}"#,
+                "✓ Run Program compile assets",
+            ),
+            (
+                "run_program",
+                r#"{"source":"return fallbackSource"}"#,
+                "✓ Run Program return fallbackSource",
+            ),
+            (
+                "workflow",
+                r#"{"script":"return 1","description":"ignored top-level"}"#,
+                "✓ Workflow inline script",
+            ),
+            (
+                "workflow",
+                r#"{"script_path":"/tmp/wf/script.js","description":"ignored"}"#,
+                "✓ Workflow /tmp/wf/script.js",
+            ),
+            (
+                "stop_agent",
+                r#"{"agent_id":"agent-1"}"#,
+                "✓ Stop Agent agent-1",
+            ),
+            (
+                "stop_program",
+                r#"{"program_id":"program-1"}"#,
+                "✓ Stop Program program-1",
+            ),
+            (
+                "stop_workflow",
+                r#"{"workflow_id":"workflow-1"}"#,
+                "✓ Stop Workflow workflow-1",
+            ),
+            (
+                "wait_for_activity",
+                r#"{"timeout_ms":30000}"#,
+                "✓ Wait for activity",
+            ),
+        ];
+        for (name, input, expected) in rows {
+            let lines = tool_cell_lines(name, input, ToolStatus::Ok, None, 80);
+            assert_eq!(text(&lines[0]), expected);
+        }
     }
 
     #[test]

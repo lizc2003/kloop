@@ -3,12 +3,15 @@
 //! [`Command`]s come out. The event loop in lib.rs owns the side effects.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
+use kloop_core::event::BackgroundTask;
+use kloop_core::event::BackgroundTaskStatus;
 use kloop_core::event::Delta;
 use kloop_core::event::Event;
 use kloop_core::event::Item;
@@ -79,6 +82,9 @@ pub enum Cell {
         tools: usize,
         last_tool: String,
     },
+    /// Session-scoped detached work owns a lifecycle independent of the turn that
+    /// launched it, so it must not reuse the turn-owned Agent row.
+    BackgroundTask(BackgroundTask),
     /// The model's current task list (todo_write). Updated in place within a
     /// turn; a new user turn starts a fresh block.
     Todo(Vec<TodoItem>),
@@ -235,6 +241,11 @@ pub struct App {
     tool_cells: HashMap<String, usize>,
     /// agent label -> cells index of its Agent row.
     agent_cells: HashMap<String, usize>,
+    /// Execution id -> mutable lifecycle row still present in the live tail.
+    background_task_cells: HashMap<String, usize>,
+    /// Running rows forced into native scrollback by the hard cap. Their terminal
+    /// update becomes one linked follow-up row because scrollback is immutable.
+    frozen_background_tasks: HashSet<String>,
     /// Index of the current turn's Todo cell, updated in place as the model
     /// rewrites its list; reset each new user turn so a fresh block starts.
     todo_cell: Option<usize>,
@@ -286,6 +297,8 @@ impl App {
             reasoning_cells: HashMap::new(),
             tool_cells: HashMap::new(),
             agent_cells: HashMap::new(),
+            background_task_cells: HashMap::new(),
+            frozen_background_tasks: HashSet::new(),
             todo_cell: None,
             fork_picker: None,
             mode: Mode::default(),
@@ -338,6 +351,8 @@ impl App {
                 self.cells.clear();
                 self.tool_cells.clear();
                 self.agent_cells.clear();
+                self.background_task_cells.clear();
+                self.frozen_background_tasks.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
                 self.todo_cell = None;
@@ -378,6 +393,8 @@ impl App {
                 }
                 self.tool_cells.clear();
                 self.agent_cells.clear();
+                self.background_task_cells.clear();
+                self.frozen_background_tasks.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
                 self.todo_cell = None;
@@ -648,12 +665,35 @@ impl App {
                 }
             }
             Event::BackgroundTaskUpdated(task) => {
-                let event = Event::BackgroundTaskUpdated(task);
-                if let Some(note) = event.as_note() {
-                    self.assistant_open = false;
-                    self.thinking_open = false;
-                    self.last_note = Some(note.clone());
-                    self.cells.push(Cell::Note(note));
+                self.assistant_open = false;
+                self.thinking_open = false;
+                if let Some(note) = Event::BackgroundTaskUpdated(task.clone()).as_note() {
+                    self.last_note = Some(note);
+                }
+                let terminal = task.status != BackgroundTaskStatus::Running;
+                if let Some(index) = self.background_task_cells.get(&task.id).copied() {
+                    if matches!(self.cells.get(index), Some(Cell::BackgroundTask(_))) {
+                        self.cells[index] = Cell::BackgroundTask(task.clone());
+                        if terminal {
+                            self.background_task_cells.remove(&task.id);
+                        }
+                        return;
+                    }
+                    self.background_task_cells.remove(&task.id);
+                }
+                if self.frozen_background_tasks.contains(&task.id) {
+                    if !terminal {
+                        return;
+                    }
+                    self.frozen_background_tasks.remove(&task.id);
+                    self.cells.push(Cell::BackgroundTask(task));
+                    return;
+                }
+                let id = task.id.clone();
+                let index = self.cells.len();
+                self.cells.push(Cell::BackgroundTask(task));
+                if !terminal {
+                    self.background_task_cells.insert(id, index);
                 }
             }
             Event::ScheduledTaskUpdated(task) => {
@@ -785,12 +825,23 @@ impl App {
             return;
         }
         let n = n.min(self.cells.len());
+        for cell in &self.cells[..n] {
+            if let Cell::BackgroundTask(task) = cell {
+                if task.status == BackgroundTaskStatus::Running {
+                    self.frozen_background_tasks.insert(task.id.clone());
+                }
+            }
+        }
         self.cells.drain(0..n);
         self.tool_cells.retain(|_, i| {
             *i = i.wrapping_sub(n);
             *i < self.cells.len()
         });
         self.agent_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.background_task_cells.retain(|_, i| {
             *i = i.wrapping_sub(n);
             *i < self.cells.len()
         });
@@ -1490,40 +1541,120 @@ mod tests {
     }
 
     fn background_update(
+        id: &str,
+        kind: kloop_core::event::BackgroundTaskKind,
+        run_id: Option<&str>,
         status: kloop_core::event::BackgroundTaskStatus,
         detail: Option<&str>,
+        output_path: Option<&str>,
     ) -> AgentEvent {
         AgentEvent::Core(Event::BackgroundTaskUpdated(
             kloop_core::event::BackgroundTask {
-                id: "agent-4".into(),
-                run_id: None,
-                kind: kloop_core::event::BackgroundTaskKind::Agent,
+                id: id.into(),
+                run_id: run_id.map(str::to_string),
+                kind,
                 description: "inspect logs".into(),
                 status,
-                output_path: None,
+                output_path: output_path.map(str::to_string),
                 detail: detail.map(str::to_string),
             },
         ))
     }
 
     #[test]
-    fn background_updates_render_as_session_notes() {
+    fn background_updates_upsert_one_session_owned_lifecycle_row() {
+        use kloop_core::event::BackgroundTaskKind;
+        use kloop_core::event::BackgroundTaskStatus;
+
         let mut app = App::new("s".into());
         app.apply(background_update(
-            kloop_core::event::BackgroundTaskStatus::Running,
+            "workflow-4",
+            BackgroundTaskKind::Workflow,
+            Some("wf_4"),
+            BackgroundTaskStatus::Running,
+            None,
             None,
         ));
         app.apply(background_update(
-            kloop_core::event::BackgroundTaskStatus::Cancelled,
-            Some("session shutdown"),
+            "workflow-4",
+            BackgroundTaskKind::Workflow,
+            Some("wf_4"),
+            BackgroundTaskStatus::Running,
+            Some("Verify"),
+            None,
         ));
+        app.apply(background_update(
+            "workflow-4",
+            BackgroundTaskKind::Workflow,
+            Some("wf_4"),
+            BackgroundTaskStatus::Completed,
+            None,
+            Some("/tmp/result.json"),
+        ));
+
         assert_eq!(
             app.cells,
-            vec![
-                Cell::Note("background agent agent-4 started".into()),
-                Cell::Note("background agent agent-4 cancelled: session shutdown".into()),
-            ]
+            vec![Cell::BackgroundTask(BackgroundTask {
+                id: "workflow-4".into(),
+                run_id: Some("wf_4".into()),
+                kind: BackgroundTaskKind::Workflow,
+                description: "inspect logs".into(),
+                status: BackgroundTaskStatus::Completed,
+                output_path: Some("/tmp/result.json".into()),
+                detail: None,
+            })]
         );
+        assert!(app.background_task_cells.is_empty());
+        assert!(app.frozen_background_tasks.is_empty());
+    }
+
+    #[test]
+    fn frozen_background_running_updates_are_ignored_and_terminal_is_linked() {
+        use kloop_core::event::BackgroundTaskKind;
+        use kloop_core::event::BackgroundTaskStatus;
+
+        let mut app = App::new("s".into());
+        app.apply(background_update(
+            "program-2",
+            BackgroundTaskKind::Program,
+            Some("run-2"),
+            BackgroundTaskStatus::Running,
+            None,
+            None,
+        ));
+        app.cells.push(Cell::Assistant("later".into()));
+        app.drain_committed(1);
+        assert_eq!(app.cells, vec![Cell::Assistant("later".into())]);
+        assert!(app.background_task_cells.is_empty());
+        assert!(app.frozen_background_tasks.contains("program-2"));
+
+        app.apply(background_update(
+            "program-2",
+            BackgroundTaskKind::Program,
+            Some("run-2"),
+            BackgroundTaskStatus::Running,
+            Some("still running"),
+            None,
+        ));
+        assert_eq!(app.cells, vec![Cell::Assistant("later".into())]);
+
+        app.apply(background_update(
+            "program-2",
+            BackgroundTaskKind::Program,
+            Some("run-2"),
+            BackgroundTaskStatus::Failed,
+            Some("exit 1"),
+            Some("/tmp/program.err"),
+        ));
+        assert_eq!(app.cells.len(), 2);
+        assert!(matches!(
+            &app.cells[1],
+            Cell::BackgroundTask(task)
+                if task.id == "program-2"
+                    && task.run_id.as_deref() == Some("run-2")
+                    && task.status == BackgroundTaskStatus::Failed
+        ));
+        assert!(!app.frozen_background_tasks.contains("program-2"));
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1727,6 +1858,26 @@ mod tests {
                 last_tool: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn turn_end_does_not_fail_session_owned_background_rows() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        app.apply(background_update(
+            "agent-9",
+            kloop_core::event::BackgroundTaskKind::Agent,
+            None,
+            BackgroundTaskStatus::Running,
+            None,
+            None,
+        ));
+        app.apply(turn_ended(EndReason::Aborted));
+        assert!(matches!(
+            &app.cells[0],
+            Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running
+        ));
+        assert_eq!(app.background_task_cells.get("agent-9"), Some(&0));
     }
 
     /// Thinking and answer deltas are routed by item id even when the two
@@ -2011,10 +2162,31 @@ mod tests {
             ))
         );
 
+        app.background_task_cells.insert("agent-8".into(), 0);
+        app.frozen_background_tasks.insert("program-8".into());
         app.apply(AgentEvent::ClearTranscript);
         assert!(app.cells.is_empty());
         assert!(app.tool_cells.is_empty());
+        assert!(app.background_task_cells.is_empty());
+        assert!(app.frozen_background_tasks.is_empty());
         assert_eq!(app.todo_cell, None);
+
+        // A terminal update arriving after clear has no stale row to mutate, so it
+        // starts a fresh linked lifecycle row rather than disappearing.
+        app.apply(background_update(
+            "program-8",
+            kloop_core::event::BackgroundTaskKind::Program,
+            Some("run-8"),
+            kloop_core::event::BackgroundTaskStatus::Cancelled,
+            Some("session shutdown"),
+            None,
+        ));
+        assert!(matches!(
+            app.cells.as_slice(),
+            [Cell::BackgroundTask(task)]
+                if task.id == "program-8"
+                    && task.status == BackgroundTaskStatus::Cancelled
+        ));
     }
 
     fn fp(seq: u64, preview: &str) -> ForkPoint {
@@ -2080,6 +2252,8 @@ mod tests {
     fn forked_rebuilds_transcript_and_adopts_session_id() {
         let mut app = App::new("old".into());
         app.cells.push(Cell::User("stale".into()));
+        app.background_task_cells.insert("agent-old".into(), 0);
+        app.frozen_background_tasks.insert("program-old".into());
         app.apply(AgentEvent::Forked {
             session_id: "new".into(),
             messages: vec![
@@ -2099,6 +2273,8 @@ mod tests {
             ]
         );
         assert!(app.fork_picker.is_none());
+        assert!(app.background_task_cells.is_empty());
+        assert!(app.frozen_background_tasks.is_empty());
     }
 
     #[test]
