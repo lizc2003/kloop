@@ -227,6 +227,23 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             }
             Some(("thread/backgroundTask/updated", json!({"task": task_json})))
         }
+        Event::AgentMessageUpdated(message) => {
+            let status = match message.status {
+                kloop_core::event::AgentMessageStatus::Queued => "queued",
+                kloop_core::event::AgentMessageStatus::Delivered => "delivered",
+                kloop_core::event::AgentMessageStatus::Undeliverable => "undeliverable",
+            };
+            Some((
+                "thread/agentMessage/updated",
+                json!({
+                    "messageId": message.id.as_str(),
+                    "from": message.from.as_str(),
+                    "to": message.to.as_str(),
+                    "summary": message.summary,
+                    "status": status,
+                }),
+            ))
+        }
         Event::ScheduledTaskUpdated(task) => {
             let origin = match task.origin {
                 kloop_core::event::ScheduledTaskOrigin::Cron => "cron",
@@ -472,6 +489,37 @@ mod tests {
                 }})
             ))
         );
+    }
+
+    #[test]
+    fn local_agent_message_updates_are_thread_scoped_and_body_free() {
+        let update = Event::AgentMessageUpdated(kloop_core::event::AgentMessageUpdate {
+            id: "message-7".parse().unwrap(),
+            from: "agent-3".parse().unwrap(),
+            to: "main".parse().unwrap(),
+            summary: "review close race".into(),
+            status: kloop_core::event::AgentMessageStatus::Delivered,
+        });
+        let projected = project_event(&update, 99);
+        assert_eq!(
+            projected,
+            Some((
+                "thread/agentMessage/updated",
+                json!({
+                    "messageId": "message-7",
+                    "from": "agent-3",
+                    "to": "main",
+                    "summary": "review close race",
+                    "status": "delivered",
+                })
+            ))
+        );
+        let (_, params) = projected.unwrap();
+        assert!(params.get("turnId").is_none());
+        assert!(params.get("message").is_none());
+        assert!(params.get("body").is_none());
+        assert!(params.get("contextId").is_none());
+        assert!(params.get("taskId").is_none());
     }
 
     #[test]

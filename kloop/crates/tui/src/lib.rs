@@ -174,6 +174,7 @@ pub async fn run(
     );
     let cwd = effective_cwd;
 
+    let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let worker = tokio::spawn(agent_worker(
         cfg,
@@ -194,7 +195,7 @@ pub async fn run(
         Ok(t) => t,
         Err(e) => {
             restore_terminal();
-            let remaining = cfg_shutdown.shutdown_background_work().await;
+            let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
             if remaining > 0 {
                 eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
             }
@@ -216,7 +217,7 @@ pub async fn run(
     )
     .await;
     restore_terminal();
-    let remaining = cfg_shutdown.shutdown_background_work().await;
+    let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
     if remaining > 0 {
         eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
     }

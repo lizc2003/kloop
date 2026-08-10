@@ -89,6 +89,8 @@ fn is_program_callable(name: &str) -> bool {
             | "stop_agent"
             | "stop_program"
             | "stop_workflow"
+            | "send_message"
+            | "list_agents"
     )
 }
 

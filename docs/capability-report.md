@@ -293,8 +293,8 @@ D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/t
 | ownership/provenance-safe removal | 安全产品边界 | **✅ Plan 56**：仅当前 session Managed 可删，External/task/previous-session 与 provenance mismatch fail closed | 已完成 |
 | Worktree 条件注册 | 表面策略分歧 | kloop 保留 depth-0 + `SurfaceCapabilities.worktree` gate，matrix 记 `intentional-diff` | 有意保留 |
 | 独立 stable-ID Task registry | CC/CodeWhale 有独立状态层 | **Plan 52 拍板不实现**；todo 与执行 registry 分层保留 | 原生多 agent 共享任务分配成为产品需求时另立计划 |
-| send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **Plan 52 仅取证**；内部 Inbox 不暴露 | 需要向运行中子 agent 追加消息或横向协作时 |
-| ListAgents / team roster / remote | exact bundle 有 descriptor/gate；本机 true-profile 不权威 | 保持 `unknown`，不接真实团队/云 | 有 hermetic transport/profile 与明确产品需求时 |
+| send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **✅ Plan 70（2026-08-10）**：同 session `main ↔ agent-N` 与 sibling，typed local identity、严格有界 FIFO、safe-boundary delivery、独立 lifecycle；A2A 1.0 aligned 但不是 A2A endpoint/support | 已完成 |
+| ListAgents / local live roster | CC exact bundle 有 descriptor/gate；远程/team profile 不权威 | **✅ Plan 70（2026-08-10）**：严格 `list_agents {}` 只列同 directory Open peers；不做 remote discovery、Agent Card 或团队持久态 | 已完成 |
 | Agent 并发上限 | exact 2.1.220 当前 profile 未测出统一 cap | 保留 kloop：同步批并发；后台 agent/program 每 session 8 | native 压测或失控实例证明需排队策略时 |
 | agent 类型 per-type effort/max_turns | cc 单家 | plan 17 片 2 未做节 | 有真实 agent 类型库再说 |
 

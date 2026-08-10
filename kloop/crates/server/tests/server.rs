@@ -227,7 +227,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
-            agent_label: String::new(),
+            local_agent: kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
             shell_programs: std::sync::Arc::new(
@@ -268,6 +268,7 @@ fn clocked_scheduler_factory(
     Arc::new(move |options, approver, questioner, notify| {
         let mut cfg = inner(options, approver, questioner, notify)?;
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());
+        cfg.local_agent = kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox));
         cfg.inbox = Arc::clone(&inbox);
         cfg.scheduler = kloop_core::scheduler::Scheduler::with_clock(
             inbox,
@@ -368,7 +369,7 @@ fn worktree_factory(
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
-            agent_label: String::new(),
+            local_agent: kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
             hooks: std::sync::Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
             shell_programs: std::sync::Arc::new(

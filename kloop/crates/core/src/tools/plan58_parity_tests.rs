@@ -564,7 +564,7 @@ async fn guard_report() -> Value {
     assert!(depth_error && depth_text.contains("top-level"));
     let mut agent = base.clone();
     let mut agent_config = agent.cfg.test_clone();
-    agent_config.agent_label = "agent-1".into();
+    agent_config.local_agent = agent_config.local_agent.child("agent-1".parse().unwrap());
     agent.cfg = Arc::new(agent_config);
     let (agent_text, agent_error) = run_tool("cron_list", json!({}), &agent).await;
     assert!(agent_error && agent_text.contains("top-level"));

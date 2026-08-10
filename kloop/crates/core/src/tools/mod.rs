@@ -3,6 +3,7 @@
 //! tool implementations live in the sibling modules; this file is what the
 //! agent loop and the frontends depend on.
 
+mod agent_message;
 mod background_executions;
 mod bash;
 mod codemode;
@@ -132,6 +133,13 @@ struct ToolExecution {
         crate::file_state::FileStateUpdate,
     )>,
     path_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+struct PreparedExecution<'a> {
+    read: Option<&'a fs::PreparedRead>,
+    mutation: Option<&'a fs::PreparedMutation>,
+    source_generation: Option<u64>,
+    local_send_committed: &'a AtomicBool,
 }
 
 impl ToolExecution {
@@ -661,12 +669,14 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             .expect("bash properties are an object")
             .remove("disable_sandbox");
     }
-    // Available at every depth (sub-agents plan too); run_agent is depth-0 only.
+    // Available at every depth: sub-agents can plan and coordinate with peers,
+    // while run_agent itself remains depth-0 only.
     defs.push(todo::todo_write_def());
+    defs.extend(agent_message::tool_defs());
     if depth == 0 {
         defs.push(ToolDef {
             name: "run_agent".into(),
-            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is offloaded for read_offloaded). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
+            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is offloaded for read_offloaded). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -762,8 +772,8 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
-        "ask_user_question" | "workflow" | "cron_list" => true,
-        "cron_create" | "cron_delete" | "schedule_wakeup" => false,
+        "ask_user_question" | "workflow" | "cron_list" | "list_agents" => true,
+        "send_message" | "cron_create" | "cron_delete" | "schedule_wakeup" => false,
         // Consecutive run_agent calls may run in parallel; child tool calls are
         // still gated independently.
         "run_agent" => true,
@@ -852,24 +862,28 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     // never as a generic tool row: cc renders the checklist in the call's place.
     // Suppressing the ToolCall events here means no front-end needs a skip.
     let tool_row = name != "todo_write";
+    let event_input = agent_message::event_input(&name, &input);
     if tool_row {
         ctx.ui.emit(&Event::ItemStarted {
             id: id.clone(),
             item: Item::ToolCall {
-                agent: ctx.cfg.agent_label.clone(),
+                agent: ctx.cfg.agent_label().to_string(),
                 name: name.clone(),
-                input: input.clone(),
+                input: event_input.clone(),
                 status: ItemStatus::InProgress,
                 output: None,
             },
         });
     }
-    let event_input = input.clone();
     // Once a foreground shell has spawned, its own cancellation branch must
     // finish process-tree cleanup before we emit interrupted. Earlier
     // cancellation (hooks/permission) still drops the gated future, so no
     // process can appear after the turn was cancelled.
     let foreground_shell_started = AtomicBool::new(false);
+    // Local send is an irreversible in-memory commit. If cancellation lands
+    // during a post-hook, finish the paired queued result instead of reporting
+    // `interrupted` after the recipient mailbox already changed.
+    let local_send_committed = AtomicBool::new(false);
     let gated = async {
         match name.as_str() {
             "task" => bail!("tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"),
@@ -916,7 +930,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         // there is nothing left to ask about.
         let hooks = &ctx.cfg.hooks;
         let session_id = &ctx.cfg.session_id;
-        let agent = &ctx.cfg.agent_label;
+        let agent = ctx.cfg.agent_label();
         match hooks
             .pre_tool(session_id, agent, &name, &input, ctx.ui.as_ref())
             .await
@@ -989,16 +1003,13 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if foreground_shell {
             foreground_shell_started.store(true, Ordering::Release);
         }
-        let execution = execute_tool(
-            &name,
-            &input,
-            prepared_read.as_ref(),
-            prepared_mutation.as_ref(),
-            expected_source_generation,
-            &ctx,
-            &workspace,
-        )
-        .await;
+        let prepared = PreparedExecution {
+            read: prepared_read.as_ref(),
+            mutation: prepared_mutation.as_ref(),
+            source_generation: expected_source_generation,
+            local_send_committed: &local_send_committed,
+        };
+        let execution = execute_tool(&name, &input, prepared, &ctx, &workspace).await;
         if foreground_shell {
             foreground_shell_started.store(false, Ordering::Release);
         }
@@ -1028,7 +1039,9 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let mut gated = Box::pin(gated);
     let gated_result = tokio::select! {
         _ = ctx.cancel.cancelled() => {
-            if foreground_shell_started.load(Ordering::Acquire) {
+            if foreground_shell_started.load(Ordering::Acquire)
+                || local_send_committed.load(Ordering::Acquire)
+            {
                 Some(gated.await)
             } else {
                 None
@@ -1092,7 +1105,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         ctx.ui.emit(&Event::ItemCompleted {
             id: tool_use_id.clone(),
             item: Item::ToolCall {
-                agent: ctx.cfg.agent_label.clone(),
+                agent: ctx.cfg.agent_label().to_string(),
                 name: name.clone(),
                 input: event_input,
                 status: if *is_error {
@@ -1114,9 +1127,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
 fn execute_tool<'a>(
     name: &'a str,
     input: &'a Value,
-    prepared_read: Option<&'a fs::PreparedRead>,
-    prepared_mutation: Option<&'a fs::PreparedMutation>,
-    expected_source_generation: Option<u64>,
+    prepared: PreparedExecution<'a>,
     ctx: &'a ToolCtx,
     workspace: &'a EffectiveWorkspace,
 ) -> Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>> {
@@ -1124,7 +1135,7 @@ fn execute_tool<'a>(
         // read_file is the sole BUILT-IN that can return non-text: on an image
         // file it returns an image block (ToolResultContent::Blocks).
         if name == "read_file" {
-            let Some(prepared) = prepared_read else {
+            let Some(prepared) = prepared.read else {
                 return ToolExecution::from_result(Err(anyhow!(
                     "read_file: target was not prepared"
                 )));
@@ -1140,16 +1151,18 @@ fn execute_tool<'a>(
             };
         }
         if matches!(name, "write_file" | "edit_file" | "notebook_edit") {
-            let Some(prepared) = prepared_mutation else {
+            let Some(prepared_mutation) = prepared.mutation else {
                 return ToolExecution::from_result(Err(anyhow!(
                     "{name}: mutation target was not prepared"
                 )));
             };
             let state = Arc::clone(&workspace.file_state);
             let output = match name {
-                "write_file" => fs::write_file_tool(input, prepared, ctx, workspace).await,
-                "edit_file" => fs::edit_file_tool(input, prepared, ctx, workspace).await,
-                "notebook_edit" => fs::notebook_edit_tool(input, prepared, ctx, workspace).await,
+                "write_file" => fs::write_file_tool(input, prepared_mutation, ctx, workspace).await,
+                "edit_file" => fs::edit_file_tool(input, prepared_mutation, ctx, workspace).await,
+                "notebook_edit" => {
+                    fs::notebook_edit_tool(input, prepared_mutation, ctx, workspace).await
+                }
                 _ => unreachable!("matched file mutation tool"),
             };
             return match output {
@@ -1167,7 +1180,7 @@ fn execute_tool<'a>(
         // program still gets the structured form via the sink.
         if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
             return match source
-                .call_at_generation(name, input, expected_source_generation)
+                .call_at_generation(name, input, prepared.source_generation)
                 .await
             {
                 Ok(out) => {
@@ -1208,6 +1221,16 @@ fn execute_tool<'a>(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
             "run_agent" => subagent::run_agent_tool(input, ctx, workspace).await,
+            "send_message" => {
+                let result = agent_message::send_message_tool(input, ctx);
+                if result.is_ok() {
+                    prepared
+                        .local_send_committed
+                        .store(true, Ordering::Release);
+                }
+                result
+            }
+            "list_agents" => agent_message::list_agents_tool(input, ctx),
             "ask_user_question" => question::ask_user_question_tool(input, ctx).await,
             "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx, workspace).await,
             "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
@@ -1360,7 +1383,7 @@ pub(crate) mod testutil {
                 file_state: Default::default(),
                 tool_sources: sources,
                 session_id: String::new(),
-                agent_label: String::new(),
+                local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 shell_programs: std::sync::Arc::new(
@@ -1947,6 +1970,8 @@ mod tests {
                 "glob",
                 "read_offloaded",
                 "todo_write",
+                "send_message",
+                "list_agents",
                 "run_agent",
                 "wait_for_activity",
                 "stop_agent",
@@ -2167,7 +2192,7 @@ mod tests {
         let warnings =
             tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("56 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("58 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -2728,6 +2753,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let inbox = Arc::new(crate::inbox::Inbox::default());
         let ctx = ToolCtx {
             cfg: Arc::new(Config {
                 provider: Arc::new(Provider::mock(vec![])),
@@ -2745,7 +2771,7 @@ mod tests {
                 file_state: Default::default(),
                 tool_sources: Vec::new(),
                 session_id: String::new(),
-                agent_label: String::new(),
+                local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
                 hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 shell_programs: std::sync::Arc::new(
@@ -2758,8 +2784,8 @@ mod tests {
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
                 todos: Default::default(),
-                inbox: Default::default(),
-                scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
+                inbox: Arc::clone(&inbox),
+                scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),

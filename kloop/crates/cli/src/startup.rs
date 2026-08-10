@@ -941,7 +941,7 @@ pub(crate) fn config_from_settings(
         // The caller stamps the real session id once it knows it (after
         // open_history / per server thread).
         session_id: String::new(),
-        agent_label: String::new(),
+        local_agent: kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
         hooks: Arc::clone(&runtime.hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         shell_programs: Arc::clone(&runtime.shell_programs),

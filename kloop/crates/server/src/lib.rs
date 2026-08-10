@@ -1255,7 +1255,8 @@ async fn thread_worker(
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
     }
-    let remaining = cfg.shutdown_background_work().await;
+    let shutdown_ui: Arc<dyn Ui> = ui.clone();
+    let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
     if remaining > 0 {
         ui.emit(&Event::Note(format!(
             "{remaining} background task(s) missed the shutdown deadline"

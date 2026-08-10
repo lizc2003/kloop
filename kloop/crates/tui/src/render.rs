@@ -15,6 +15,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
+use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
 use kloop_core::tools::TodoStatus;
@@ -131,6 +132,14 @@ fn background_status_mark(status: BackgroundTaskStatus) -> (&'static str, Color)
         BackgroundTaskStatus::Completed => ("✓", Color::Green),
         BackgroundTaskStatus::Failed => ("✗", Color::Red),
         BackgroundTaskStatus::Cancelled => ("■", Color::Gray),
+    }
+}
+
+fn agent_message_status(status: AgentMessageStatus) -> (&'static str, &'static str, Color) {
+    match status {
+        AgentMessageStatus::Queued => ("●", "Queued", Color::Cyan),
+        AgentMessageStatus::Delivered => ("✓", "Delivered", Color::Green),
+        AgentMessageStatus::Undeliverable => ("✗", "Undeliverable", Color::Red),
     }
 }
 
@@ -261,6 +270,28 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                     DIM,
                 )));
             }
+        }
+        Cell::AgentMessage(message) => {
+            let (mark, status, color) = agent_message_status(message.status);
+            let title = format!("Message from Agent · {}", message.from);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::new().fg(color)),
+                Span::styled(
+                    truncate(&title, width.saturating_sub(2)),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                truncate(
+                    &format!("  {status} to {} · {}", message.to, message.id),
+                    width,
+                ),
+                DIM,
+            )));
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("  {}", message.summary), width),
+                DIM,
+            )));
         }
         Cell::Todo(items) => {
             lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
@@ -431,6 +462,7 @@ fn is_committable(cell: &Cell) -> bool {
     match cell {
         Cell::Tool { status, .. } | Cell::Agent { status, .. } => *status != ToolStatus::Running,
         Cell::BackgroundTask(task) => task.status != BackgroundTaskStatus::Running,
+        Cell::AgentMessage(message) => message.status != AgentMessageStatus::Queued,
         _ => true,
     }
 }
@@ -1864,6 +1896,27 @@ mod tests {
             ]
         );
         assert_eq!(program_lines[0].spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn agent_message_row_shows_route_id_summary_and_typed_status() {
+        let cell = Cell::AgentMessage(kloop_core::event::AgentMessageUpdate {
+            id: "message-12".parse().unwrap(),
+            from: "agent-4".parse().unwrap(),
+            to: "main".parse().unwrap(),
+            summary: "review shutdown ordering".into(),
+            status: AgentMessageStatus::Delivered,
+        });
+        let lines = cell_lines(&cell, 80);
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec![
+                "✓ Message from Agent · agent-4",
+                "  Delivered to main · message-12",
+                "  review shutdown ordering",
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
     }
 
     #[test]

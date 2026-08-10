@@ -1773,7 +1773,7 @@ Wait-Process -Id $grandchild.Id
         let id = bg_id(&out);
         let pids = wait_for_tree_pids(&tree).await;
 
-        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_eq!(ctx.cfg.shutdown_background_work(&ctx.ui).await, 0);
         assert_processes_dead(pids).await;
         let (out, is_error) =
             run_tool("bash_output", json!({"bash_id": id, "block": false}), &ctx).await;
@@ -1821,7 +1821,7 @@ Wait-Process -Id $grandchild.Id
         let id = bg_id(&out);
         let pids = wait_for_windows_tree_pids(&tree).await;
 
-        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_eq!(ctx.cfg.shutdown_background_work(&ctx.ui).await, 0);
         assert_windows_processes_dead(pids).await;
         let (out, is_error) =
             run_tool("bash_output", json!({"bash_id": id, "block": false}), &ctx).await;
@@ -1921,7 +1921,7 @@ Wait-Process -Id $grandchild.Id
         .await;
         assert!(!is_error, "{output}");
         let pids = wait_for_windows_tree_pids(&tree).await;
-        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_eq!(ctx.cfg.shutdown_background_work(&ctx.ui).await, 0);
         assert_windows_processes_dead(pids).await;
     }
 

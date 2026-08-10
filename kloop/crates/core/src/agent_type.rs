@@ -46,12 +46,12 @@ impl AgentType {
     }
 }
 
-/// Whether a tool is usable under an agent type's allowlist. `read_offloaded`
-/// is always available — it is how any agent reads back a truncated tool
-/// result, pure infrastructure, so restricting it would strand a sub-agent
-/// on its own large output rather than remove a capability.
+/// Whether a tool is usable under an agent type's allowlist. Infrastructure
+/// needed for any real Agent to consume bounded output and coordinate with the
+/// local live roster stays available regardless of a task-specific allowlist.
 pub fn tool_available(allowlist: Option<&HashSet<String>>, tool: &str) -> bool {
-    tool == "read_offloaded" || allowlist.is_none_or(|allow| allow.contains(tool))
+    matches!(tool, "read_offloaded" | "send_message" | "list_agents")
+        || allowlist.is_none_or(|allow| allow.contains(tool))
 }
 
 /// The block appended to the `run_agent` tool's description listing the available
@@ -122,6 +122,8 @@ mod tests {
         assert!(!tool_available(Some(&allow), "bash"));
         // Infrastructure exception: always available.
         assert!(tool_available(Some(&allow), "read_offloaded"));
+        assert!(tool_available(Some(&allow), "send_message"));
+        assert!(tool_available(Some(&allow), "list_agents"));
         // No allowlist = everything.
         assert!(tool_available(None, "bash"));
     }

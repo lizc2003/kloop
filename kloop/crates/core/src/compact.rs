@@ -169,6 +169,7 @@ mod tests {
     use serde_json::json;
 
     fn compact_test_cfg(provider: kloop_provider::Provider, tag: &str) -> Arc<Config> {
+        let inbox = Arc::new(crate::inbox::Inbox::default());
         Arc::new(Config {
             provider: Arc::new(provider),
             model: "mock".into(),
@@ -185,7 +186,7 @@ mod tests {
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
-            agent_label: String::new(),
+            local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
             hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             shell_programs: std::sync::Arc::new(
@@ -198,8 +199,8 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
-            inbox: Default::default(),
-            scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
+            inbox: Arc::clone(&inbox),
+            scheduler: crate::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),

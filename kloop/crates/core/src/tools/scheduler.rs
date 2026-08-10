@@ -231,7 +231,7 @@ fn bind(ctx: &ToolCtx) -> Result<()> {
 }
 
 fn require_top_level(ctx: &ToolCtx, tool: &str) -> Result<()> {
-    if ctx.depth != 0 || !ctx.cfg.agent_label.is_empty() {
+    if ctx.depth != 0 || !ctx.cfg.agent_label().is_empty() {
         bail!("{tool} is available only to the top-level session owner");
     }
     if !ctx.cfg.surface.scheduler {

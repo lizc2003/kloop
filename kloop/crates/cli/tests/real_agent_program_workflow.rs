@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::BufRead as _;
 use std::io::BufReader;
 use std::io::Read as _;
@@ -27,6 +28,11 @@ const WORKFLOW_SENTINEL: &str = "WORKFLOW_RESULT_68";
 const WORKFLOW_LEFT: &str = "WORKFLOW_LEFT_68";
 const WORKFLOW_RIGHT: &str = "WORKFLOW_RIGHT_68";
 const PROGRAM_SOURCE: &str = "const child = await agent(\"Reply exactly PROGRAM_CHILD_68\");\nthrow new Error(\"PROGRAM_EXPECTED_FAILURE_68:\" + child);";
+const MAILBOX_AGENT_A_DESCRIPTION: &str = "mailbox Agent A";
+const MAILBOX_AGENT_B_DESCRIPTION: &str = "mailbox Agent B";
+const MAILBOX_MAIN_TO_A: &str = "MAILBOX_MAIN_TO_A_70";
+const MAILBOX_A_TO_B: &str = "MAILBOX_A_TO_B_70";
+const MAILBOX_B_TO_MAIN: &str = "MAILBOX_B_TO_MAIN_70";
 const WORKFLOW_SCRIPT: &str = r#"export const meta = {
   name: 'real-primitives-68',
   description: 'Exercise scoped Workflow agents',
@@ -83,9 +89,13 @@ struct NativeClient {
 
 impl NativeClient {
     fn spawn(root: &TestRoot) -> Self {
+        Self::spawn_with_permission_mode(root, "accept-edits")
+    }
+
+    fn spawn_with_permission_mode(root: &TestRoot, permission_mode: &str) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kloop"));
         command
-            .args(["app-server", "--permission-mode", "accept-edits"])
+            .args(["app-server", "--permission-mode", permission_mode])
             .current_dir(root.workspace())
             .env_clear()
             .env("HOME", root.0.join("home"))
@@ -638,5 +648,227 @@ fn real_agent_program_workflow_contract() {
 
     println!(
         "real primitive acceptance passed: provider={provider} model={model} foreground_agent_calls=1 foreground_program_calls=2 program_child_spawns=1 background_agent_calls=1 background_program_calls=1 workflow_calls=1 terminals=3 automatic_deliveries=3"
+    );
+}
+
+#[test]
+#[ignore = "requires real Anthropic or OpenAI Chat credentials"]
+fn real_local_agent_mailbox_contract() {
+    let provider = std::env::var("KLOOP_PROVIDER").expect("set KLOOP_PROVIDER");
+    assert!(
+        matches!(provider.as_str(), "anthropic" | "openai"),
+        "real evaluator supports anthropic or OpenAI Chat only"
+    );
+    let model_var = if provider == "anthropic" {
+        "ANTHROPIC_MODEL"
+    } else {
+        "OPENAI_MODEL"
+    };
+    let model = std::env::var(model_var)
+        .or_else(|_| std::env::var("KLOOP_MODEL"))
+        .expect("set the selected provider model");
+    let root = TestRoot::new();
+    let mut client = NativeClient::spawn_with_permission_mode(&root, "bypass");
+    let initialized = client.request(
+        "initialize",
+        json!({"protocolVersion": "1.0", "capabilities": {}}),
+    );
+    assert_eq!(initialized["protocolVersion"], "1.0");
+    let started = client.request(
+        "thread/start",
+        json!({"cwd": root.workspace(), "model": model}),
+    );
+    let thread_id = started["thread"]["id"]
+        .as_str()
+        .expect("thread/start omitted id")
+        .to_string();
+
+    let agent_a_prompt = format!(
+        "You are mailbox Agent A. First call bash exactly once with command `sleep 8`. After it completes, consume the local peer message from main. Then call list_agents exactly once, select the other open Agent whose description is exactly `{MAILBOX_AGENT_B_DESCRIPTION}`, and call send_message exactly once to its exact agent-N id with summary `A to B` and message `{MAILBOX_A_TO_B}`. Do not use wait_for_activity or any status polling. After the queued result, finish with exactly `MAILBOX_A_DONE_70`."
+    );
+    let agent_b_prompt = format!(
+        "You are mailbox Agent B. First call bash exactly once with command `sleep 25`. At the next safe boundary, consume Agent A's peer message `{MAILBOX_A_TO_B}`. Then call send_message exactly once to `main` with summary `B to main` and message `{MAILBOX_B_TO_MAIN}`. Do not use wait_for_activity, list_agents, or any status polling. After the queued result, finish with exactly `MAILBOX_B_DONE_70`."
+    );
+    let main_prompt = format!(
+        "Exercise the local Agent mailbox contract. In one assistant response call run_agent exactly twice with background=true: description `{MAILBOX_AGENT_A_DESCRIPTION}` and prompt `{agent_a_prompt}`; description `{MAILBOX_AGENT_B_DESCRIPTION}` and prompt `{agent_b_prompt}`. After both launch tool results return, identify Agent A's exact agent-N id from its description and call send_message exactly once to it with summary `main to A` and message `{MAILBOX_MAIN_TO_A}`. Do not call wait_for_activity, list_agents, stop tools, or poll status. After the queued result, end the current turn with `MAILBOX_MAIN_LAUNCHED_70`; background terminals and results will arrive automatically."
+    );
+    let mut messages = client.run_turn(&thread_id, &main_prompt);
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let terminal_agents = messages
+            .iter()
+            .filter(|message| {
+                message["method"] == "thread/backgroundTask/updated"
+                    && message["params"]["task"]["kind"] == "agent"
+                    && matches!(
+                        message["params"]["task"]["status"].as_str(),
+                        Some("completed" | "failed" | "cancelled")
+                    )
+            })
+            .count();
+        let delivered = messages
+            .iter()
+            .filter(|message| {
+                message["method"] == "thread/agentMessage/updated"
+                    && message["params"]["status"] == "delivered"
+            })
+            .count();
+        let last_terminal = messages.iter().rposition(|message| {
+            message["method"] == "thread/backgroundTask/updated"
+                && message["params"]["task"]["kind"] == "agent"
+                && matches!(
+                    message["params"]["task"]["status"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                )
+        });
+        let completion_after_terminals = last_terminal.is_some_and(|index| {
+            messages[index + 1..]
+                .iter()
+                .any(|message| message["method"] == "turn/completed")
+        });
+        if terminal_agents == 2 && delivered == 3 && completion_after_terminals {
+            break;
+        }
+        messages.push(client.receive(deadline));
+    }
+
+    assert_tool_pairs(&messages, "run_agent", 2);
+    assert_tool_pairs(&messages, "send_message", 3);
+    assert_tool_pairs(&messages, "list_agents", 1);
+    assert!(
+        tool_items(&messages, "item/started", "wait_for_activity").is_empty(),
+        "mailbox coordination must not poll wait_for_activity"
+    );
+
+    let agent_id = |description: &str| {
+        messages
+            .iter()
+            .find(|message| {
+                message["method"] == "thread/backgroundTask/updated"
+                    && message["params"]["task"]["kind"] == "agent"
+                    && message["params"]["task"]["description"] == description
+            })
+            .and_then(|message| message["params"]["task"]["id"].as_str())
+            .expect("missing described Agent lifecycle")
+            .to_string()
+    };
+    let agent_a = agent_id(MAILBOX_AGENT_A_DESCRIPTION);
+    let agent_b = agent_id(MAILBOX_AGENT_B_DESCRIPTION);
+    assert_ne!(agent_a, agent_b);
+
+    for id in [&agent_a, &agent_b] {
+        let updates = messages
+            .iter()
+            .filter(|message| {
+                message["method"] == "thread/backgroundTask/updated"
+                    && message["params"]["task"]["id"] == *id
+            })
+            .collect::<Vec<_>>();
+        assert!(updates
+            .iter()
+            .any(|message| message["params"]["task"]["status"] == "running"));
+        let terminals = updates
+            .iter()
+            .filter(|message| message["params"]["task"]["status"] != "running")
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "Agent {id} emitted duplicate terminal");
+        assert_eq!(terminals[0]["params"]["task"]["status"], "completed");
+    }
+
+    let expected_routes = [
+        ("main", agent_a.as_str()),
+        (agent_a.as_str(), agent_b.as_str()),
+        (agent_b.as_str(), "main"),
+    ];
+    let updates = messages
+        .iter()
+        .filter(|message| message["method"] == "thread/agentMessage/updated")
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 6, "each of three messages needs two states");
+    assert!(updates.iter().all(|message| {
+        let params = &message["params"];
+        params.get("turnId").is_none()
+            && params.get("message").is_none()
+            && params.get("body").is_none()
+            && params.get("contextId").is_none()
+            && params.get("taskId").is_none()
+            && params.get("threadId").is_some()
+    }));
+    assert!(updates
+        .iter()
+        .all(|message| message["params"]["status"] != "undeliverable"));
+
+    let mut route_ids = Vec::new();
+    for (from, to) in expected_routes {
+        let route = updates
+            .iter()
+            .filter(|message| message["params"]["from"] == from && message["params"]["to"] == to)
+            .collect::<Vec<_>>();
+        assert_eq!(route.len(), 2, "route {from}->{to} did not have two states");
+        assert_eq!(route[0]["params"]["status"], "queued");
+        assert_eq!(route[1]["params"]["status"], "delivered");
+        let id = route[0]["params"]["messageId"]
+            .as_str()
+            .expect("message update omitted id");
+        assert_eq!(route[1]["params"]["messageId"], id);
+        route_ids.push(id.to_string());
+    }
+    assert_eq!(route_ids.iter().collect::<HashSet<_>>().len(), 3);
+    let sequences = route_ids
+        .iter()
+        .map(|id| id.strip_prefix("message-").unwrap().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, [1, 2, 3]);
+
+    let send_starts = tool_items(&messages, "item/started", "send_message");
+    assert!(send_starts.iter().all(|message| {
+        let input = &message["params"]["item"]["input"];
+        input.get("to").is_some()
+            && input.get("summary").is_some()
+            && input.get("messageBytes").is_some()
+            && input.get("message").is_none()
+    }));
+    let senders = send_starts
+        .iter()
+        .map(|message| {
+            message["params"]["item"]["agent"]
+                .as_str()
+                .unwrap_or("main")
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        senders,
+        HashSet::from(["main".to_string(), agent_a.clone(), agent_b.clone()])
+    );
+    let list_start = tool_items(&messages, "item/started", "list_agents");
+    assert_eq!(list_start[0]["params"]["item"]["agent"], agent_a);
+
+    client.shutdown();
+    let sessions = root.workspace().join(".kloop/sessions");
+    let main_rollout = std::fs::read_to_string(sessions.join(format!("{thread_id}.jsonl")))
+        .expect("missing main mailbox rollout");
+    let agent_a_rollout =
+        std::fs::read_to_string(sessions.join(format!("{thread_id}-{agent_a}.jsonl")))
+            .expect("missing Agent A rollout");
+    let agent_b_rollout =
+        std::fs::read_to_string(sessions.join(format!("{thread_id}-{agent_b}.jsonl")))
+            .expect("missing Agent B rollout");
+    assert!(agent_a_rollout.contains(MAILBOX_MAIN_TO_A));
+    assert!(agent_a_rollout.contains(&format!("[{} from main]", route_ids[0])));
+    assert!(agent_b_rollout.contains(MAILBOX_A_TO_B));
+    assert!(agent_b_rollout.contains(&format!("[{} from {agent_a}]", route_ids[1])));
+    assert!(main_rollout.contains(MAILBOX_B_TO_MAIN));
+    assert!(main_rollout.contains(&format!("[{} from {agent_b}]", route_ids[2])));
+    assert_eq!(
+        main_rollout
+            .matches("A background sub-agent you dispatched has finished")
+            .count(),
+        2,
+        "final Agent results must keep the existing completion path"
+    );
+
+    println!(
+        "real local mailbox acceptance passed: provider={provider} model={model} messages=3 delivered=3 agent_terminals=2 completion_deliveries=2"
     );
 }

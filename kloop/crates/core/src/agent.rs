@@ -110,11 +110,11 @@ async fn run_turn_with_options(
     depth: u8,
     options: TurnOptions,
 ) -> TurnOutcome {
-    // A sub-agent (agent_label set) fires subagent_start/subagent_stop instead
+    // A sub-agent (typed local identity set) fires subagent_start/subagent_stop instead
     // of pre_turn/post_turn — the split both cc and codex converge on (a
     // sub-agent's turn boundary is its own event, carrying its transcript and
     // result). The main agent keeps the plain turn hooks.
-    let agent = &cfg.agent_label;
+    let agent = cfg.agent_label();
     let start = if agent.is_empty() {
         cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await
     } else {
@@ -261,6 +261,7 @@ async fn turn_rounds(
         // this round's request. At round 0 the queue is empty (the turn just
         // started) so this is a no-op. Never touches an in-flight request.
         drain_inbox(&cfg.inbox, history, ui);
+        drain_local_mailbox(cfg, history, ui);
         // The injected context is outside history and a dynamic MCP refresh may
         // replace its deferred-tool notice between rounds, so account for the
         // current version rather than pinning the turn's first estimate.
@@ -518,6 +519,9 @@ async fn turn_rounds(
                 if drain_inbox(&cfg.inbox, history, ui) {
                     continue;
                 }
+                if !cfg.local_agent.can_finish_naturally() {
+                    continue;
+                }
                 let round_text = text_content(&blocks);
                 let final_text = if truncated_prefix.is_empty() {
                     round_text
@@ -568,6 +572,12 @@ async fn turn_rounds(
             };
         }
         if let Some(value) = structured_output {
+            if drain_inbox(&cfg.inbox, history, ui) {
+                continue;
+            }
+            if !cfg.local_agent.can_finish_naturally() {
+                continue;
+            }
             return TurnOutcome {
                 reason: EndReason::Completed,
                 final_text: String::new(),
@@ -775,6 +785,17 @@ fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
         }
         history.record(Message::user_text(item.into_message()));
     }
+    true
+}
+
+fn drain_local_mailbox(cfg: &Config, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
+    let Some(batch) = cfg.local_agent.claim_boundary() else {
+        return false;
+    };
+    for item in batch.items().iter().cloned() {
+        history.record(Message::user_text(item.into_message()));
+    }
+    batch.commit(ui);
     true
 }
 

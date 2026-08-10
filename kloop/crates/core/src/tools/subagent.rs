@@ -103,6 +103,7 @@ pub(super) async fn run_agent_tool(
         Some(other) => bail!("run_agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
     let agent = next_agent_label();
+    let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
     let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type);
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
@@ -128,7 +129,18 @@ pub(super) async fn run_agent_tool(
     let sub_cfg = Arc::new(sub);
 
     if background {
-        return spawn_background(ctx, sub_cfg, agent, &preview, prompt, depth, ui, worktree).await;
+        return spawn_background(
+            ctx,
+            sub_cfg,
+            agent,
+            &preview,
+            agent_type_name,
+            prompt,
+            depth,
+            ui,
+            worktree,
+        )
+        .await;
     }
 
     run_sub_agent_sync(
@@ -136,6 +148,7 @@ pub(super) async fn run_agent_tool(
         sub_cfg,
         agent,
         preview,
+        agent_type_name,
         prompt,
         depth,
         "run_agent",
@@ -195,11 +208,22 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
     let cancel = ctx.cancel.clone();
     let depth = ctx.depth + 1;
     let subagent_of = ctx.parent_rollout_id.clone();
+    let (lease, worktree) = register_child_with_cleanup(
+        &sub_cfg,
+        agent_type.map(|agent_type| agent_type.name.as_str()),
+        &preview,
+        &ui,
+        &agent,
+        "workflow agent",
+        worktree,
+    )
+    .await?;
     emit_agent_start(&ui, &agent, &preview);
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
         async move {
+            let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             run_structured_turn(&sub_cfg, &mut history, &ui, &cancel, depth, schema).await
@@ -288,6 +312,40 @@ async fn bind_subagent_worktree(
     Ok(worktree)
 }
 
+async fn register_child_with_cleanup(
+    sub_cfg: &Arc<Config>,
+    agent_type: Option<&str>,
+    preview: &str,
+    ui: &Arc<dyn crate::agent::Ui>,
+    agent: &str,
+    who: &str,
+    worktree: Option<worktree::Worktree>,
+) -> Result<(
+    crate::agent_mailbox::LiveAgentLease,
+    Option<worktree::Worktree>,
+)> {
+    match sub_cfg.local_agent.register_child(
+        Arc::clone(&sub_cfg.inbox),
+        agent_type,
+        preview,
+        ui.clone(),
+    ) {
+        Ok(lease) => Ok((lease, worktree)),
+        Err(error) => {
+            let cleanup_error = match worktree {
+                Some(worktree) => worktree::finish(worktree).await.err(),
+                None => None,
+            };
+            match cleanup_error {
+                Some(cleanup) => Err(anyhow!(
+                    "{who}: cannot register {agent}: {error}; worktree cleanup failed: {cleanup:#}"
+                )),
+                None => Err(anyhow!("{who}: cannot register {agent}: {error}")),
+            }
+        }
+    }
+}
+
 /// Process-global monotonic agent label, so parallel spawners never collide.
 fn next_agent_label() -> String {
     format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
@@ -361,6 +419,7 @@ async fn run_sub_agent_sync(
     sub_cfg: Arc<Config>,
     agent: String,
     preview: String,
+    agent_type: Option<String>,
     prompt: String,
     depth: u8,
     who: &str,
@@ -369,11 +428,22 @@ async fn run_sub_agent_sync(
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
+    let (lease, worktree) = register_child_with_cleanup(
+        &sub_cfg,
+        agent_type.as_deref(),
+        &preview,
+        &ui,
+        &agent,
+        who,
+        worktree,
+    )
+    .await?;
     emit_agent_start(&ui, &agent, &preview);
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
         async move {
+            let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             run_turn(&sub_cfg, &mut history, &ui, &cancel, depth).await
@@ -457,6 +527,7 @@ pub(crate) async fn fork_skill(
         Arc::new(sub),
         agent,
         preview,
+        None,
         body,
         ctx.depth + 1,
         "skill",
@@ -477,11 +548,30 @@ async fn spawn_background(
     sub_cfg: Arc<Config>,
     agent: String,
     preview: &str,
+    agent_type: Option<String>,
     prompt: String,
     depth: u8,
     ui: Arc<dyn crate::agent::Ui>,
     worktree: Option<worktree::Worktree>,
 ) -> Result<String> {
+    let lease = match sub_cfg.local_agent.register_child(
+        Arc::clone(&sub_cfg.inbox),
+        agent_type.as_deref(),
+        preview,
+        ui.clone(),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            if let Some(worktree) = worktree {
+                worktree::finish(worktree).await.map_err(|cleanup| {
+                    anyhow!(
+                        "run_agent: cannot register {agent}: {error}; worktree cleanup failed: {cleanup:#}"
+                    )
+                })?;
+            }
+            return Err(anyhow!("run_agent: cannot register {agent}: {error}"));
+        }
+    };
     let own_cancel = CancellationToken::new();
     if let Err(msg) = ctx.cfg.background_executions.register(
         ExecutionKind::Agent,
@@ -520,6 +610,7 @@ async fn spawn_background(
         let ui = ui.clone();
         let label = agent.clone();
         async move {
+            let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
             run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await
@@ -707,7 +798,11 @@ fn clone_for_subagent(
     max_rounds: Option<usize>,
     agent: String,
 ) -> Config {
-    ctx.cfg.subagent_from(workspace, max_rounds, agent)
+    ctx.cfg.subagent_from(
+        workspace,
+        max_rounds,
+        agent.parse().expect("generated agent label is canonical"),
+    )
 }
 
 /// Build the `run_agent` sub-agent's Config: the shared clone plus any agent_type
@@ -774,7 +869,7 @@ mod tests {
         });
 
         let workspace = ctx.cfg.effective_workspace();
-        let sub = clone_for_subagent(&ctx, &workspace, None, "agent-fresh".into());
+        let sub = clone_for_subagent(&ctx, &workspace, None, "agent-999".into());
         assert!(!Arc::ptr_eq(&ctx.cfg.file_state, &sub.file_state));
         assert!(Arc::ptr_eq(
             &ctx.cfg.powershell_execution_gate,
@@ -783,6 +878,37 @@ mod tests {
         assert!(sub.file_state.observation(&path).is_none());
         assert!(ctx.cfg.file_state.observation(&path).is_some());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn child_is_registered_before_sampling_and_can_list_main() {
+        let (provider, seen) = Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::ToolUse {
+                id: "list".into(),
+                name: "list_agents".into(),
+                input: json!({}),
+            }]),
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "listed".into(),
+            }]),
+        ]);
+        let ctx = with_provider(test_ctx(0, "child-roster"), provider);
+        let (output, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt":"list the live local Agents"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "listed");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { content, is_error: false, .. }
+                    if content.as_text().contains("\"id\":\"main\""))
+            })
+        }));
     }
 
     #[tokio::test]
@@ -1033,6 +1159,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    #[tokio::test]
+    async fn registration_failure_cleans_an_already_bound_worktree() {
+        let repo = temp_git_repo("register-close");
+        let ctx = ctx_in(test_ctx(0, "register-close"), &repo);
+        let workspace = ctx.cfg.effective_workspace();
+        let agent = "agent-9000".to_string();
+        let mut sub = build_sub_config(&ctx, &workspace, None, agent.clone(), None);
+        let worktree = worktree::create(&workspace.cwd, &agent).await.unwrap();
+        let worktree = bind_subagent_worktree(&mut sub, worktree, "test")
+            .await
+            .unwrap();
+        let sub_cfg = Arc::new(sub);
+        ctx.cfg.local_agent.shutdown(&ctx.ui);
+
+        let error = match register_child_with_cleanup(
+            &sub_cfg,
+            None,
+            "registration race",
+            &ctx.ui,
+            &agent,
+            "run_agent",
+            Some(worktree),
+        )
+        .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("registration unexpectedly succeeded during shutdown"),
+        };
+        assert!(error.contains("session is closing"), "{error}");
+        let trees = std::fs::read_dir(repo.join(".claude/worktrees"))
+            .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(trees.is_empty(), "registration failure leaked {trees:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// TWO isolated sub-agents in one parallel batch each write the same
     /// relative filename — the point of worktrees. Each write lands in its
     /// OWN tree (both kept), and the main repo stays clean.
@@ -1143,6 +1305,40 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(format!("background {} {:?}", task.id, task.status)),
+                Event::AgentMessageUpdated(update) => self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(format!("message {} {:?}", update.id, update.status)),
+                _ => {}
+            }
+        }
+    }
+
+    struct StopUi {
+        events: std::sync::Mutex<Vec<String>>,
+        bash_started: std::sync::atomic::AtomicBool,
+    }
+
+    impl Ui for StopUi {
+        fn emit(&self, event: &Event) {
+            match event {
+                Event::ItemStarted {
+                    item: Item::ToolCall { name, agent, .. },
+                    ..
+                } if name == "bash" && !agent.is_empty() => {
+                    self.bash_started.store(true, Ordering::Release);
+                }
+                Event::BackgroundTaskUpdated(task) => self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push(format!("background {} {:?}", task.id, task.status)),
+                Event::AgentMessageUpdated(update) => self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push(format!("message {} {:?}", update.id, update.status)),
                 _ => {}
             }
         }
@@ -1610,7 +1806,10 @@ mod tests {
             input: json!({"command": "sleep 30"}),
         }]]);
         let mut ctx = with_provider(test_ctx(0, "bg-stopped"), provider);
-        let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        let rec = std::sync::Arc::new(StopUi {
+            events: std::sync::Mutex::new(Vec::new()),
+            bash_started: std::sync::atomic::AtomicBool::new(false),
+        });
         ctx.ui = rec.clone();
 
         let (out, _) = run_tool(
@@ -1626,11 +1825,24 @@ mod tests {
             .to_string();
         // Let the sub-agent get into its bash before stopping it.
         for _ in 0..100 {
-            if ctx.cfg.background_executions.running_count() == 1 {
+            if rec.bash_started.load(Ordering::Acquire) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(
+            rec.bash_started.load(Ordering::Acquire),
+            "sub-agent never entered its in-flight bash"
+        );
+        ctx.cfg
+            .local_agent
+            .send(
+                agent.parse().unwrap(),
+                "stop pending".into(),
+                "message must fail with the stopped target".into(),
+                &ctx.ui,
+            )
+            .unwrap();
         let (stop_out, is_error) = run_tool("stop_agent", json!({"agent_id": agent}), &ctx).await;
         assert!(!is_error, "{stop_out}");
         assert!(stop_out.contains("Stopping"), "{stop_out}");
@@ -1647,14 +1859,27 @@ mod tests {
             0,
             "stopped sub-agent did not reach a terminal state"
         );
+        let batch = ctx
+            .cfg
+            .local_agent
+            .claim_boundary()
+            .expect("stopped target must notify the sender");
+        assert!(matches!(
+            &batch.items()[0],
+            crate::inbox::InboxItem::AgentMessageUndeliverable { failures, .. }
+                if failures[0].message_ids[0].as_str() == "message-1"
+        ));
+        batch.commit(&ctx.ui);
         assert!(
             ctx.cfg.inbox.is_empty(),
-            "an interrupted sub-agent reinjects nothing"
+            "an interrupted sub-agent reinjects no completion result"
         );
         assert_eq!(
-            rec.0.lock().unwrap().clone(),
+            rec.events.lock().unwrap().clone(),
             vec![
                 format!("background {agent} Running"),
+                "message message-1 Queued".into(),
+                "message message-1 Undeliverable".into(),
                 format!("background {agent} Cancelled"),
             ]
         );
@@ -1683,7 +1908,7 @@ mod tests {
             .find(|word| word.starts_with("agent-"))
             .unwrap()
             .to_string();
-        assert_eq!(ctx.cfg.shutdown_background_work().await, 0);
+        assert_eq!(ctx.cfg.shutdown_background_work(&ctx.ui).await, 0);
         assert_eq!(ctx.cfg.background_executions.running_count(), 0);
         assert!(ctx.cfg.inbox.is_empty());
         assert_eq!(

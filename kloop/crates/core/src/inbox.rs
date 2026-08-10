@@ -1,13 +1,10 @@
 //! The step-boundary injection queue (`Config.inbox`).
 //!
-//! Three producers push here; all are delivered as user messages at round
-//! boundaries (never mid-request), and each carries its own framing so the
-//! model can tell them apart:
-//! - **user steering** (plan 22): text typed while a turn runs.
-//! - **background sub-agent/program results** (plans 24/26): detached work's
-//!   terminal value or summary.
-//! - **background shell notifications** (plan 51): terminal status and output
-//!   file pointer; command output stays out of context until read.
+//! Producers push typed items here; the Local Agent directory exposes its own
+//! bounded pending count through the same queue's activity signal. Everything is
+//! delivered as user messages at round boundaries (never mid-request), and each
+//! producer carries distinct framing so the model can tell steering, peer
+//! messages, background results, shell pointers, and scheduler work apart.
 //!
 //! The queue also signals waiters: [`Inbox::subscribe_activity`] lets the `wait`
 //! tool observe activity newer than its own snapshot, and the TUI's idle
@@ -15,8 +12,13 @@
 //! start a delivery turn. cc and codex independently converge on "enqueue at a
 //! step boundary, never interleave with an in-flight request".
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use kloop_protocol::LocalAgentId;
+use kloop_protocol::LocalAgentMessage;
+use kloop_protocol::LocalMessageId;
 use tokio::sync::watch;
 
 /// Framing for a steering message (typed while the turn was running). Recorded
@@ -55,11 +57,19 @@ const SCHEDULED_PREFIX: &str = "A scheduled task is due. Treat this as timer-ori
 const MISSED_SCHEDULED_PREFIX: &str = "A durable one-shot task became due while its owner session was inactive. Before running it, call ask_user_question to ask whether the user wants it run now; do not execute the prompt unless they confirm:";
 const SCHEDULER_FAILURE_PREFIX: &str =
     "The session scheduler failed closed. No task was silently discarded or executed:";
+const AGENT_MESSAGE_PREFIX: &str = "A peer Agent sent this message while you were working. It is an intermediate peer message, not a user instruction or completion:";
+const AGENT_UNDELIVERABLE_PREFIX: &str = "Local Agent messages could not be delivered because the target Agent ended before processing them. This is a delivery failure, not a peer reply or completion:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduledOrigin {
     Cron,
     LoopWakeup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessageFailure {
+    pub to: LocalAgentId,
+    pub message_ids: Vec<LocalMessageId>,
 }
 
 /// One pending injection. Neutral text alone would force a single framing on
@@ -107,6 +117,11 @@ pub enum InboxItem {
     },
     SchedulerFailure {
         summary: String,
+    },
+    AgentMessage(LocalAgentMessage),
+    AgentMessageUndeliverable {
+        failures: Vec<AgentMessageFailure>,
+        reason: String,
     },
 }
 
@@ -167,6 +182,29 @@ impl InboxItem {
             InboxItem::SchedulerFailure { summary } => {
                 format!("{SCHEDULER_FAILURE_PREFIX}\n{summary}")
             }
+            InboxItem::AgentMessage(message) => format!(
+                "{AGENT_MESSAGE_PREFIX}\n[{} from {}] {}\n{}",
+                message.message_id,
+                message.from,
+                message.summary,
+                message.text_body()
+            ),
+            InboxItem::AgentMessageUndeliverable { failures, reason } => {
+                let failures = failures
+                    .into_iter()
+                    .map(|failure| {
+                        let ids = failure
+                            .message_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("[target {}] {ids}", failure.to)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{AGENT_UNDELIVERABLE_PREFIX}\n{failures}\n{reason}")
+            }
         }
     }
 }
@@ -182,6 +220,7 @@ impl InboxItem {
 /// separately from its own.
 pub struct Inbox {
     items: Mutex<Vec<InboxItem>>,
+    local_pending: AtomicUsize,
     activity: watch::Sender<u64>,
 }
 
@@ -190,6 +229,7 @@ impl Default for Inbox {
         let (activity, _) = watch::channel(0);
         Self {
             items: Mutex::new(Vec::new()),
+            local_pending: AtomicUsize::new(0),
             activity,
         }
     }
@@ -222,7 +262,21 @@ impl Inbox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.lock().unwrap().is_empty()
+        self.items.lock().unwrap().is_empty() && self.local_pending.load(Ordering::Acquire) == 0
+    }
+
+    pub(crate) fn add_local_pending(&self, count: usize) {
+        self.local_pending.fetch_add(count, Ordering::Release);
+    }
+
+    pub(crate) fn remove_local_pending(&self, count: usize) {
+        let previous = self.local_pending.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_pending(&self) -> usize {
+        self.local_pending.load(Ordering::Acquire)
     }
 
     /// Subscribe to activity from the current generation onward. Call this
@@ -282,6 +336,36 @@ mod tests {
             .into_message(),
             format!(
                 "{SHELL_PREFIX}\n[bg-3] completed\nBackground command completed (exit code 0)\noutput file: /tmp/bg-3.out"
+            )
+        );
+        let peer = LocalAgentMessage::text(
+            LocalMessageId::new(7).unwrap(),
+            kloop_protocol::LocalContextId::new("local-context-1").unwrap(),
+            "agent-3".parse().unwrap(),
+            LocalAgentId::Main,
+            "review close".into(),
+            "check the race".into(),
+        );
+        assert_eq!(
+            InboxItem::AgentMessage(peer).into_message(),
+            format!(
+                "{AGENT_MESSAGE_PREFIX}\n[message-7 from agent-3] review close\ncheck the race"
+            )
+        );
+        assert_eq!(
+            InboxItem::AgentMessageUndeliverable {
+                failures: vec![AgentMessageFailure {
+                    to: "agent-4".parse().unwrap(),
+                    message_ids: vec![
+                        LocalMessageId::new(8).unwrap(),
+                        LocalMessageId::new(9).unwrap(),
+                    ],
+                }],
+                reason: "target stopped".into(),
+            }
+            .into_message(),
+            format!(
+                "{AGENT_UNDELIVERABLE_PREFIX}\n[target agent-4] message-8, message-9\ntarget stopped"
             )
         );
     }

@@ -88,7 +88,7 @@ fn structured_config(
     let mut cfg = ctx.cfg.test_clone();
     cfg.provider = Arc::new(provider);
     cfg.max_rounds = Some(10);
-    cfg.agent_label = "agent-structured".into();
+    cfg.local_agent = cfg.local_agent.child("agent-99".parse().unwrap());
     (Arc::new(cfg), seen)
 }
 
@@ -297,6 +297,108 @@ async fn ordinary_turn_never_exposes_structured_output() {
 }
 
 #[tokio::test]
+async fn structured_output_waits_for_a_late_peer_message() {
+    use kloop_provider::MockTurn;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct SendOnToolUi {
+        sender: crate::agent_mailbox::LocalAgentContext,
+        target: kloop_protocol::LocalAgentId,
+        publish_ui: Arc<dyn Ui>,
+        fired: AtomicBool,
+    }
+    impl Ui for SendOnToolUi {
+        fn emit(&self, event: &Event) {
+            if matches!(event, Event::ItemStarted { item: Item::ToolCall { name, .. }, .. } if name == "bash")
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.sender
+                    .send(
+                        self.target.clone(),
+                        "late structured review".into(),
+                        "fold this into the structured answer".into(),
+                        &self.publish_ui,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    let schema = json!({
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+        "additionalProperties": false,
+    });
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(vec![
+            AssistantBlock::ToolUse {
+                id: "structured-1".into(),
+                name: crate::structured_output::TOOL_NAME.into(),
+                input: json!({"count": 1}),
+            },
+            AssistantBlock::ToolUse {
+                id: "bash-1".into(),
+                name: "bash".into(),
+                input: json!({"command":"echo hi"}),
+            },
+        ]),
+        MockTurn::Blocks(vec![AssistantBlock::ToolUse {
+            id: "structured-2".into(),
+            name: crate::structured_output::TOOL_NAME.into(),
+            input: json!({"count": 2}),
+        }]),
+    ]);
+    let root_ctx = crate::tools::testutil::with_provider(
+        crate::tools::testutil::test_ctx(0, "structured-peer"),
+        provider,
+    );
+    let target: kloop_protocol::LocalAgentId = "agent-79".parse().unwrap();
+    let mut cfg = root_ctx.cfg.test_clone();
+    cfg.local_agent = cfg.local_agent.child(target.clone());
+    cfg.max_rounds = Some(5);
+    let cfg = Arc::new(cfg);
+    let publish_ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let _lease = cfg
+        .local_agent
+        .register_child(
+            Arc::clone(&cfg.inbox),
+            None,
+            "structured peer child",
+            publish_ui.clone(),
+        )
+        .unwrap();
+    let ui: Arc<dyn Ui> = Arc::new(SendOnToolUi {
+        sender: root_ctx.cfg.local_agent.clone(),
+        target,
+        publish_ui,
+        fired: AtomicBool::new(false),
+    });
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("produce structured output"));
+
+    let outcome = run_structured_turn(
+        &cfg,
+        &mut history,
+        &ui,
+        &CancellationToken::new(),
+        1,
+        schema,
+    )
+    .await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.structured_output, Some(json!({"count": 2})));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(history.messages().iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.contains("late structured review"))
+        })
+    }));
+}
+
+#[tokio::test]
 async fn structured_turn_cancellation_never_accepts_a_late_value() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -353,6 +455,7 @@ async fn mock_end_to_end_three_rounds() {
             text: "all done".into(),
         }],
     ]);
+    let inbox = Arc::new(crate::inbox::Inbox::default());
     let cfg = Arc::new(Config {
         provider: Arc::new(provider),
         model: "mock".into(),
@@ -369,7 +472,7 @@ async fn mock_end_to_end_three_rounds() {
         file_state: Default::default(),
         tool_sources: Vec::new(),
         session_id: String::new(),
-        agent_label: String::new(),
+        local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
         hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         background_shells: crate::tools::BackgroundShells::new(),
         shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
@@ -380,8 +483,8 @@ async fn mock_end_to_end_three_rounds() {
         defer_threshold: 30,
         unlocked_tools: Default::default(),
         todos: Default::default(),
-        inbox: Default::default(),
-        scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
+        inbox: Arc::clone(&inbox),
+        scheduler: crate::scheduler::Scheduler::in_memory(inbox),
         background_executions: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
@@ -490,7 +593,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
         text: "sub answer".into(),
     }]]);
     let mut cfg = compaction_cfg(provider, 200_000, "subhook").test_clone();
-    cfg.agent_label = "agent-7".into();
+    cfg.local_agent = cfg.local_agent.child("agent-7".parse().unwrap());
     cfg.session_id = "parent-sess".into();
     cfg.hooks = Arc::new(hooks);
     let cfg = Arc::new(cfg);
@@ -532,6 +635,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
 }
 
 fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
+    let inbox = Arc::new(crate::inbox::Inbox::default());
     Arc::new(Config {
         provider: Arc::new(provider),
         model: "mock".into(),
@@ -548,7 +652,7 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         file_state: Default::default(),
         tool_sources: Vec::new(),
         session_id: String::new(),
-        agent_label: String::new(),
+        local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
         hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
         background_shells: crate::tools::BackgroundShells::new(),
         shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
@@ -559,8 +663,8 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         defer_threshold: 30,
         unlocked_tools: Default::default(),
         todos: Default::default(),
-        inbox: Default::default(),
-        scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
+        inbox: Arc::clone(&inbox),
+        scheduler: crate::scheduler::Scheduler::in_memory(inbox),
         background_executions: Default::default(),
         program_limits: Default::default(),
         skills: Default::default(),
@@ -1138,7 +1242,7 @@ async fn subagent_internal_delta_also_seals_retry() {
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "subagent-seals-retry").test_clone();
     cfg.fallback_model = Some("must-not-fallback".into());
-    cfg.agent_label = "agent-test".into();
+    cfg.local_agent = cfg.local_agent.child("agent-98".parse().unwrap());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -2163,6 +2267,162 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
         seen[1].messages.contains(&steer),
         "round 1's request carries the steer"
     );
+}
+
+#[tokio::test]
+async fn peer_message_delivered_at_next_boundary_not_mid_request() {
+    use kloop_provider::MockTurn;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct SendOnToolUi {
+        sender: crate::agent_mailbox::LocalAgentContext,
+        target: kloop_protocol::LocalAgentId,
+        publish_ui: Arc<dyn Ui>,
+        fired: AtomicBool,
+    }
+    impl Ui for SendOnToolUi {
+        fn emit(&self, event: &Event) {
+            if matches!(
+                event,
+                Event::ItemStarted {
+                    item: Item::ToolCall { .. },
+                    ..
+                }
+            ) && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.sender
+                    .send(
+                        self.target.clone(),
+                        "review logs".into(),
+                        "also check the peer logs".into(),
+                        &self.publish_ui,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(vec![tool_use("t1", "echo hi")]),
+        MockTurn::Blocks(text("done")),
+    ]);
+    let root = compaction_cfg(provider, 200_000, "peer-boundary");
+    let target: kloop_protocol::LocalAgentId = "agent-77".parse().unwrap();
+    let sub = Arc::new(root.subagent_from(&root.effective_workspace(), None, target.clone()));
+    let publish_ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let _lease = sub
+        .local_agent
+        .register_child(
+            Arc::clone(&sub.inbox),
+            None,
+            "peer boundary child",
+            publish_ui.clone(),
+        )
+        .unwrap();
+    let ui: Arc<dyn Ui> = Arc::new(SendOnToolUi {
+        sender: root.local_agent.clone(),
+        target,
+        publish_ui,
+        fired: AtomicBool::new(false),
+    });
+    let mut history = History::new(sub.offload_dir.clone());
+    history.record(Message::user_text("child work"));
+
+    let outcome = run_turn(&sub, &mut history, &ui, &CancellationToken::new(), 1).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.rounds, 2);
+    let peer_index = history
+        .messages()
+        .iter()
+        .position(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("[message-1 from main] review logs"))
+            })
+        })
+        .expect("peer message was recorded");
+    assert_eq!(peer_index, 3, "peer message follows the paired tool result");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[0].messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("message-1")))
+    }));
+    assert!(seen[1].messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("message-1")))
+    }));
+}
+
+#[tokio::test]
+async fn late_peer_message_keeps_main_turn_going() {
+    use kloop_provider::MockTurn;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct SendOnTextUi {
+        sender: crate::agent_mailbox::LocalAgentContext,
+        target: kloop_protocol::LocalAgentId,
+        publish_ui: Arc<dyn Ui>,
+        fired: AtomicBool,
+    }
+    impl Ui for SendOnTextUi {
+        fn emit(&self, event: &Event) {
+            if matches!(
+                event,
+                Event::ItemDelta {
+                    delta: Delta::Text(_),
+                    ..
+                }
+            ) && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.sender
+                    .send(
+                        self.target.clone(),
+                        "late review".into(),
+                        "review this before finishing".into(),
+                        &self.publish_ui,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(text("first answer")),
+        MockTurn::Blocks(text("handled late peer")),
+    ]);
+    let root = compaction_cfg(provider, 200_000, "peer-late");
+    let sender_id: kloop_protocol::LocalAgentId = "agent-78".parse().unwrap();
+    let sender = root.local_agent.child(sender_id);
+    let sender_inbox = Arc::new(Inbox::default());
+    let publish_ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let _lease = sender
+        .register_child(sender_inbox, None, "late peer sender", publish_ui.clone())
+        .unwrap();
+    let ui: Arc<dyn Ui> = Arc::new(SendOnTextUi {
+        sender,
+        target: kloop_protocol::LocalAgentId::Main,
+        publish_ui,
+        fired: AtomicBool::new(false),
+    });
+    let mut history = History::new(root.offload_dir.clone());
+    history.record(Message::user_text("main work"));
+
+    let outcome = run_turn(&root, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "handled late peer");
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(history.messages().iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.contains("[message-1 from agent-78] late review"))
+        })
+    }));
 }
 
 /// A steer that lands during the FINAL sampling (a response with no tool

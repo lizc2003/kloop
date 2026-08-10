@@ -10,6 +10,8 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use kloop_core::agent::EndReason;
+use kloop_core::event::AgentMessageStatus;
+use kloop_core::event::AgentMessageUpdate;
 use kloop_core::event::BackgroundTask;
 use kloop_core::event::BackgroundTaskStatus;
 use kloop_core::event::Delta;
@@ -85,6 +87,9 @@ pub enum Cell {
     /// Session-scoped detached work owns a lifecycle independent of the turn that
     /// launched it, so it must not reuse the turn-owned Agent row.
     BackgroundTask(BackgroundTask),
+    /// Local peer-message delivery state, keyed by message-N and independent of
+    /// the sender/recipient Agent execution lifecycle.
+    AgentMessage(AgentMessageUpdate),
     /// The model's current task list (todo_write). Updated in place within a
     /// turn; a new user turn starts a fresh block.
     Todo(Vec<TodoItem>),
@@ -246,6 +251,10 @@ pub struct App {
     /// Running rows forced into native scrollback by the hard cap. Their terminal
     /// update becomes one linked follow-up row because scrollback is immutable.
     frozen_background_tasks: HashSet<String>,
+    /// Message id -> mutable queued row still present in the live tail.
+    agent_message_cells: HashMap<String, usize>,
+    /// Queued message rows frozen into immutable native scrollback.
+    frozen_agent_messages: HashSet<String>,
     /// Index of the current turn's Todo cell, updated in place as the model
     /// rewrites its list; reset each new user turn so a fresh block starts.
     todo_cell: Option<usize>,
@@ -299,6 +308,8 @@ impl App {
             agent_cells: HashMap::new(),
             background_task_cells: HashMap::new(),
             frozen_background_tasks: HashSet::new(),
+            agent_message_cells: HashMap::new(),
+            frozen_agent_messages: HashSet::new(),
             todo_cell: None,
             fork_picker: None,
             mode: Mode::default(),
@@ -353,6 +364,8 @@ impl App {
                 self.agent_cells.clear();
                 self.background_task_cells.clear();
                 self.frozen_background_tasks.clear();
+                self.agent_message_cells.clear();
+                self.frozen_agent_messages.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
                 self.todo_cell = None;
@@ -395,6 +408,8 @@ impl App {
                 self.agent_cells.clear();
                 self.background_task_cells.clear();
                 self.frozen_background_tasks.clear();
+                self.agent_message_cells.clear();
+                self.frozen_agent_messages.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
                 self.todo_cell = None;
@@ -696,6 +711,38 @@ impl App {
                     self.background_task_cells.insert(id, index);
                 }
             }
+            Event::AgentMessageUpdated(message) => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                if let Some(note) = Event::AgentMessageUpdated(message.clone()).as_note() {
+                    self.last_note = Some(note);
+                }
+                let id = message.id.to_string();
+                let terminal = message.status != AgentMessageStatus::Queued;
+                if let Some(index) = self.agent_message_cells.get(&id).copied() {
+                    if matches!(self.cells.get(index), Some(Cell::AgentMessage(_))) {
+                        self.cells[index] = Cell::AgentMessage(message.clone());
+                        if terminal {
+                            self.agent_message_cells.remove(&id);
+                        }
+                        return;
+                    }
+                    self.agent_message_cells.remove(&id);
+                }
+                if self.frozen_agent_messages.contains(&id) {
+                    if !terminal {
+                        return;
+                    }
+                    self.frozen_agent_messages.remove(&id);
+                    self.cells.push(Cell::AgentMessage(message));
+                    return;
+                }
+                let index = self.cells.len();
+                self.cells.push(Cell::AgentMessage(message));
+                if !terminal {
+                    self.agent_message_cells.insert(id, index);
+                }
+            }
             Event::ScheduledTaskUpdated(task) => {
                 let event = Event::ScheduledTaskUpdated(task);
                 if let Some(note) = event.as_note() {
@@ -826,10 +873,14 @@ impl App {
         }
         let n = n.min(self.cells.len());
         for cell in &self.cells[..n] {
-            if let Cell::BackgroundTask(task) = cell {
-                if task.status == BackgroundTaskStatus::Running {
+            match cell {
+                Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running => {
                     self.frozen_background_tasks.insert(task.id.clone());
                 }
+                Cell::AgentMessage(message) if message.status == AgentMessageStatus::Queued => {
+                    self.frozen_agent_messages.insert(message.id.to_string());
+                }
+                _ => {}
             }
         }
         self.cells.drain(0..n);
@@ -842,6 +893,10 @@ impl App {
             *i < self.cells.len()
         });
         self.background_task_cells.retain(|_, i| {
+            *i = i.wrapping_sub(n);
+            *i < self.cells.len()
+        });
+        self.agent_message_cells.retain(|_, i| {
             *i = i.wrapping_sub(n);
             *i < self.cells.len()
         });
@@ -2699,6 +2754,54 @@ mod tests {
                 Cell::Note("resumed session — 1 message(s)".into()),
             ]
         );
+    }
+
+    #[test]
+    fn agent_message_lifecycle_is_separate_and_upserts_by_message_id() {
+        let mut app = App::new("s".into());
+        let update = |status| {
+            Event::AgentMessageUpdated(AgentMessageUpdate {
+                id: "message-8".parse().unwrap(),
+                from: "agent-2".parse().unwrap(),
+                to: "main".parse().unwrap(),
+                summary: "inspect close".into(),
+                status,
+            })
+        };
+        app.apply_core(update(AgentMessageStatus::Queued));
+        assert_eq!(app.cells.len(), 1);
+        assert_eq!(app.agent_message_cells.get("message-8"), Some(&0));
+        assert!(app.background_task_cells.is_empty());
+
+        app.apply_core(update(AgentMessageStatus::Delivered));
+        assert_eq!(app.cells.len(), 1);
+        assert!(matches!(
+            &app.cells[0],
+            Cell::AgentMessage(message) if message.status == AgentMessageStatus::Delivered
+        ));
+        assert!(app.agent_message_cells.is_empty());
+        assert!(app.background_task_cells.is_empty());
+    }
+
+    #[test]
+    fn frozen_agent_message_gets_one_linked_terminal_row() {
+        let mut app = App::new("s".into());
+        let message = |status| {
+            Event::AgentMessageUpdated(AgentMessageUpdate {
+                id: "message-9".parse().unwrap(),
+                from: "agent-3".parse().unwrap(),
+                to: "main".parse().unwrap(),
+                summary: "check ordering".into(),
+                status,
+            })
+        };
+        app.apply_core(message(AgentMessageStatus::Queued));
+        app.drain_committed(1);
+        assert!(app.cells.is_empty());
+        assert!(app.frozen_agent_messages.contains("message-9"));
+        app.apply_core(message(AgentMessageStatus::Undeliverable));
+        assert_eq!(app.cells.len(), 1);
+        assert!(!app.frozen_agent_messages.contains("message-9"));
     }
 
     #[tokio::test]

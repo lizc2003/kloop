@@ -503,7 +503,7 @@ async fn workflow_report() -> Value {
         })
         .collect::<Vec<_>>();
     assert_eq!(statuses, ["running", "running", "completed"]);
-    assert_eq!(context.cfg.shutdown_background_work().await, 0);
+    assert_eq!(context.cfg.shutdown_background_work(&context.ui).await, 0);
 
     json!({
         "standalone": true,
@@ -532,7 +532,7 @@ fn structured_config(
     config.provider = Arc::new(provider);
     config.max_rounds = Some(10);
     config.offload_dir = root.join("offload");
-    config.agent_label = "plan53-structured".into();
+    config.local_agent = config.local_agent.child("agent-53".parse().unwrap());
     (Arc::new(config), seen)
 }
 

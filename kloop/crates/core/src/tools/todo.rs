@@ -80,7 +80,7 @@ pub(super) async fn todo_write_tool(input: &Value, ctx: &ToolCtx) -> Result<Stri
     *ctx.cfg.todos.lock().unwrap() = todos.clone();
     // Each write is a self-contained snapshot: a completed item keyed by a
     // per-owner slot, so a UI replaces its checklist in place.
-    let agent = &ctx.cfg.agent_label;
+    let agent = ctx.cfg.agent_label();
     let id = if agent.is_empty() {
         "todos".to_string()
     } else {
@@ -89,7 +89,7 @@ pub(super) async fn todo_write_tool(input: &Value, ctx: &ToolCtx) -> Result<Stri
     ctx.ui.emit(&Event::ItemCompleted {
         id,
         item: Item::Todo {
-            agent: agent.clone(),
+            agent: agent.to_string(),
             items: todos.clone(),
         },
     });

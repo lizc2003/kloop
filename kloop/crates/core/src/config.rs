@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use kloop_provider::Provider;
 
+use crate::agent_mailbox::LocalAgentContext;
 use crate::file_state::FileState;
 use crate::hooks::Hooks;
 use crate::inbox::Inbox;
@@ -306,10 +307,10 @@ pub struct Config {
     /// Session id surfaced in hook events; empty when the session is
     /// ephemeral (mock, tests). Sub-agents inherit the parent's id.
     pub session_id: String,
-    /// Label identifying whose events these are in the UI: empty for the main
-    /// agent, "agent-N" for a sub-agent (stamped by run_agent on its
-    /// cloned Config).
-    pub agent_label: String,
+    /// Typed local routing identity and session-scoped live Agent directory.
+    /// Hooks and turn-owned UI use [`Config::agent_label`] for their legacy
+    /// empty-main display projection; routing never infers identity from it.
+    pub local_agent: LocalAgentContext,
     /// External command hooks; the shared Arc means sub-agents inherit the
     /// same hook set.
     pub hooks: Arc<Hooks>,
@@ -403,6 +404,18 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn agent_id(&self) -> &kloop_protocol::LocalAgentId {
+        self.local_agent.agent_id()
+    }
+
+    pub fn parent_agent_id(&self) -> Option<&kloop_protocol::LocalAgentId> {
+        self.local_agent.parent_agent_id()
+    }
+
+    pub fn agent_label(&self) -> &str {
+        self.local_agent.agent_label()
+    }
+
     pub fn base_workspace(&self) -> EffectiveWorkspace {
         EffectiveWorkspace {
             identity: self.permissions.identity().clone(),
@@ -438,7 +451,7 @@ impl Config {
         &self,
         workspace: &EffectiveWorkspace,
         max_rounds: Option<usize>,
-        agent_label: String,
+        agent_id: kloop_protocol::LocalAgentId,
     ) -> Self {
         Self {
             provider: Arc::clone(&self.provider),
@@ -456,7 +469,7 @@ impl Config {
             file_state: Arc::new(FileState::default()),
             tool_sources: self.tool_sources.clone(),
             session_id: self.session_id.clone(),
-            agent_label,
+            local_agent: self.local_agent.child(agent_id),
             hooks: Arc::clone(&self.hooks),
             background_shells: Arc::clone(&self.background_shells),
             shell_programs: Arc::clone(&self.shell_programs),
@@ -495,7 +508,7 @@ impl Config {
             file_state: Arc::clone(&self.file_state),
             tool_sources: self.tool_sources.clone(),
             session_id: self.session_id.clone(),
-            agent_label: self.agent_label.clone(),
+            local_agent: self.local_agent.clone(),
             hooks: Arc::clone(&self.hooks),
             background_shells: Arc::clone(&self.background_shells),
             shell_programs: Arc::clone(&self.shell_programs),
@@ -532,7 +545,8 @@ impl Config {
 
     /// Stop every session-scoped detached worker before its frontend/runtime is
     /// torn down. Returns the number that missed the bounded reap deadline.
-    pub async fn shutdown_background_work(&self) -> usize {
+    pub async fn shutdown_background_work(&self, ui: &Arc<dyn crate::agent::Ui>) -> usize {
+        self.local_agent.shutdown(ui);
         let timeout = Duration::from_secs(2);
         let scheduler = self.scheduler.shutdown().await;
         let (tasks, shells) = tokio::join!(

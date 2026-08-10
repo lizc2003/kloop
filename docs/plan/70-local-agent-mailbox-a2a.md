@@ -1,6 +1,18 @@
 # Plan 70 — Local Agent Mailbox 与 A2A 1.0 分层
 
-> 状态：📋 待实施（本文件只规划，不含生产代码修改）
+> 状态：✅ 已完成（2026-08-10；提交 SHA 以本条所在提交为准）
+>
+> 完成结论：已落地 typed local identity、session-scoped 单锁 directory、严格有界
+> `send_message`/`list_agents`、safe-boundary FIFO delivery、natural/forced/shutdown close
+> 仲裁、独立 message lifecycle 及 TUI/plain/native/headless 投影。Local envelope 只与 A2A 1.0
+> Message/Part/Context 概念对齐；没有 Agent Card、remote discovery/transport/auth、A2A Task 或
+> A2A support 声明。
+>
+> 真实验收：默认 ignored native-server evaluator 分别在 Anthropic `claude-sonnet-4-6` 与
+> OpenAI Chat `gpt-5.4-mini` 通过 main→A、A `list_agents` 后→B、B→main；3 个 monotonic
+> `message-N` 均按 Queued→Delivered，两个后台 Agent 各唯一 Completed terminal，最终 completion
+> 仍走既有自动 delivery，且没有 `wait_for_activity`/status polling。判据来自 tool/event lifecycle 与
+> recipient rollout sentinel/framed ID，不采信模型自然语言自评。
 >
 > 依赖：Plan 51、52、53、66、68、69
 

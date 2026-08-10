@@ -3,14 +3,241 @@
 //! accounting, and shared error markers. Nothing here knows about networks,
 //! filesystems, or the agent loop.
 
+use serde::de::Error as _;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::Serializer;
+use std::fmt;
+use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
     Assistant,
+}
+
+/// A live Agent address inside one local kloop session. It is deliberately not
+/// a URL, Agent Card identity, provider role, or durable execution id.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LocalAgentId {
+    Main,
+    Agent(String),
+}
+
+impl LocalAgentId {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Main => "main",
+            Self::Agent(id) => id,
+        }
+    }
+
+    /// The legacy display projection used by hooks and turn-owned UI items.
+    pub fn display_label(&self) -> &str {
+        match self {
+            Self::Main => "",
+            Self::Agent(id) => id,
+        }
+    }
+
+    pub fn is_main(&self) -> bool {
+        matches!(self, Self::Main)
+    }
+}
+
+impl fmt::Display for LocalAgentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LocalAgentId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "main" {
+            return Ok(Self::Main);
+        }
+        let Some(number) = value.strip_prefix("agent-") else {
+            return Err("local Agent id must be `main` or `agent-N`".into());
+        };
+        if number.is_empty()
+            || number.starts_with('0')
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || number.parse::<u64>().is_err()
+        {
+            return Err("local Agent id must use canonical `agent-N` with N >= 1".into());
+        }
+        Ok(Self::Agent(value.to_string()))
+    }
+}
+
+impl Serialize for LocalAgentId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalAgentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LocalMessageId(String);
+
+impl LocalMessageId {
+    pub fn new(sequence: u64) -> Option<Self> {
+        (sequence > 0).then(|| Self(format!("message-{sequence}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LocalMessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for LocalMessageId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some(number) = value.strip_prefix("message-") else {
+            return Err("local message id must be `message-N`".into());
+        };
+        if number.is_empty()
+            || number.starts_with('0')
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || number.parse::<u64>().is_err()
+        {
+            return Err("local message id must use canonical `message-N` with N >= 1".into());
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl Serialize for LocalMessageId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalMessageId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+/// Opaque correlation scope for one in-memory local Agent directory. It must
+/// not expose a session path, credential, endpoint, or tenant identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LocalContextId(String);
+
+impl LocalContextId {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err("local context id must be 1..=128 printable bytes".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LocalContextId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for LocalContextId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalContextId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        LocalContextId::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LocalAgentPart {
+    Text { text: String },
+}
+
+/// A transport-neutral local message. `from`, `to`, and `summary` are local
+/// routing/display fields; a future A2A adapter must project only the content
+/// identity/context/parts into an A2A Message and resolve `to` separately.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAgentMessage {
+    pub message_id: LocalMessageId,
+    pub context_id: LocalContextId,
+    pub from: LocalAgentId,
+    pub to: LocalAgentId,
+    pub summary: String,
+    pub parts: Vec<LocalAgentPart>,
+}
+
+impl LocalAgentMessage {
+    pub fn text(
+        message_id: LocalMessageId,
+        context_id: LocalContextId,
+        from: LocalAgentId,
+        to: LocalAgentId,
+        summary: String,
+        text: String,
+    ) -> Self {
+        Self {
+            message_id,
+            context_id,
+            from,
+            to,
+            summary,
+            parts: vec![LocalAgentPart::Text { text }],
+        }
+    }
+
+    pub fn text_body(&self) -> &str {
+        let [LocalAgentPart::Text { text }] = self.parts.as_slice() else {
+            unreachable!("local Agent messages are constructed with one text part")
+        };
+        text
+    }
 }
 
 /// Canonical content block, Anthropic Messages wire shape. The OpenAI-compat
@@ -555,6 +782,88 @@ mod tests {
                 content: vec![img],
             }
         );
+    }
+
+    #[test]
+    fn local_agent_ids_are_canonical_and_string_encoded() {
+        for (wire, id, label) in [
+            ("main", LocalAgentId::Main, ""),
+            (
+                "agent-42",
+                LocalAgentId::Agent("agent-42".into()),
+                "agent-42",
+            ),
+        ] {
+            assert_eq!(wire.parse::<LocalAgentId>().unwrap(), id);
+            assert_eq!(id.as_str(), wire);
+            assert_eq!(id.display_label(), label);
+            assert_eq!(serde_json::to_value(&id).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<LocalAgentId>(json!(wire)).unwrap(),
+                id
+            );
+        }
+        for invalid in [
+            "",
+            "Main",
+            "agent-",
+            "agent-0",
+            "agent-01",
+            "agent-x",
+            "program-1",
+        ] {
+            assert!(invalid.parse::<LocalAgentId>().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn local_message_is_distinct_from_provider_chat_and_a2a_task() {
+        let message = LocalAgentMessage::text(
+            LocalMessageId::new(7).unwrap(),
+            LocalContextId::new("local-context-3").unwrap(),
+            LocalAgentId::Agent("agent-3".into()),
+            LocalAgentId::Main,
+            "review the race".into(),
+            "Check close ordering.".into(),
+        );
+        assert_eq!(message.text_body(), "Check close ordering.");
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            json!({
+                "message_id": "message-7",
+                "context_id": "local-context-3",
+                "from": "agent-3",
+                "to": "main",
+                "summary": "review the race",
+                "parts": [{"type": "text", "text": "Check close ordering."}],
+            })
+        );
+
+        // A2A 1.0 addresses the peer by endpoint, outside Message. This fixture
+        // freezes the future adapter seam: local route/summary never become A2A
+        // metadata and a local message id is not a Task id.
+        let a2a_message = json!({
+            "kind": "message",
+            "messageId": message.message_id.as_str(),
+            "contextId": message.context_id.as_str(),
+            "role": "user",
+            "parts": [{"kind": "text", "text": message.text_body()}],
+        });
+        assert!(a2a_message.get("to").is_none());
+        assert!(a2a_message.get("from").is_none());
+        assert!(a2a_message.get("summary").is_none());
+        assert!(a2a_message.get("taskId").is_none());
+        assert!(a2a_message.get("url").is_none());
+    }
+
+    #[test]
+    fn local_ids_and_context_reject_noncanonical_wire_values() {
+        for invalid in ["message-0", "message-01", "message-x", "task-1"] {
+            assert!(invalid.parse::<LocalMessageId>().is_err(), "{invalid}");
+        }
+        assert!(LocalContextId::new("").is_err());
+        assert!(LocalContextId::new("bad\ncontext").is_err());
+        assert!(LocalContextId::new("x".repeat(129)).is_err());
     }
 
     /// total() is the full context size: cached prompt tokens still occupy

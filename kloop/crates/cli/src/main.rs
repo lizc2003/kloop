@@ -304,7 +304,7 @@ async fn main() -> Result<ExitCode> {
         }
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c(cancel.clone());
-        let code = headless::run_headless(
+        let result = headless::run_headless(
             cfg.clone(),
             history,
             session_id,
@@ -316,7 +316,7 @@ async fn main() -> Result<ExitCode> {
         )
         .await;
         watcher.abort();
-        let remaining = cfg.shutdown_background_work().await;
+        let remaining = cfg.shutdown_background_work(&result.ui).await;
         if remaining > 0 {
             eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
         }
@@ -324,7 +324,7 @@ async fn main() -> Result<ExitCode> {
         if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
             eprintln!("{}", note.trim());
         }
-        return Ok(ExitCode::from(code as u8));
+        return Ok(ExitCode::from(result.code as u8));
     }
 
     // The TUI is the default entry point; --plain keeps the line-based REPL,
@@ -463,7 +463,7 @@ async fn plain_main(
             "\n--- mock run: {:?} after {} round(s) ---",
             outcome.reason, outcome.rounds
         );
-        let _ = cfg.shutdown_background_work().await;
+        let _ = cfg.shutdown_background_work(&ui).await;
         return Ok(());
     }
 
@@ -576,7 +576,7 @@ async fn plain_main(
             EndReason::Error(e) => println!("[error: {e}]"),
         }
     }
-    let remaining = cfg.shutdown_background_work().await;
+    let remaining = cfg.shutdown_background_work(&ui).await;
     if remaining > 0 {
         eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
     }

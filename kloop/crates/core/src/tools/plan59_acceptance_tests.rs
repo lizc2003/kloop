@@ -617,7 +617,7 @@ async fn background_agent_scheduler_report() -> Value {
     assert!(!pending_wakeup_error && pending_wakeup.contains("Scheduled"));
     assert_eq!(context.cfg.background_executions.running_count(), 1);
     assert_eq!(scheduler.list().unwrap().len(), 1);
-    assert_eq!(context.cfg.shutdown_background_work().await, 0);
+    assert_eq!(context.cfg.shutdown_background_work(&context.ui).await, 0);
     drop(live_release_tx);
     assert_eq!(context.cfg.background_executions.running_count(), 0);
     assert!(scheduler.list().unwrap_err().to_string().contains("closed"));
@@ -1009,7 +1009,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
         .await
         .expect("live workflow never sampled")
         .expect("live workflow start channel closed");
-    assert_eq!(context.cfg.shutdown_background_work().await, 0);
+    assert_eq!(context.cfg.shutdown_background_work(&context.ui).await, 0);
     drop(workflow_release_tx);
     assert_eq!(context.cfg.background_executions.running_count(), 0);
     assert!(context.cfg.inbox.is_empty());

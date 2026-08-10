@@ -190,6 +190,7 @@ mod tests {
     /// A Config wired to the given provider; only the fields the commands read
     /// (provider/model/context_window/todos/inbox) matter here.
     fn test_cfg(provider: kloop_provider::Provider, window: Option<u64>) -> Arc<Config> {
+        let inbox = Arc::new(crate::inbox::Inbox::default());
         Arc::new(Config {
             provider: Arc::new(provider),
             model: "test-model".into(),
@@ -206,7 +207,7 @@ mod tests {
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: String::new(),
-            agent_label: String::new(),
+            local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
             hooks: Arc::new(crate::hooks::Hooks::none()),
             background_shells: crate::tools::BackgroundShells::new(),
             shell_programs: std::sync::Arc::new(
@@ -219,8 +220,8 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
-            inbox: Default::default(),
-            scheduler: crate::scheduler::Scheduler::in_memory(Default::default()),
+            inbox: Arc::clone(&inbox),
+            scheduler: crate::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
             program_limits: Default::default(),
             skills: Default::default(),

@@ -556,6 +556,9 @@ call carries its full `input`, and `output` + `agent` label when present; a
 `thread/backgroundTask/updated {task:{id, kind, description, status,
 outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present for Program `run-*` and Workflow `wf_*`; **no
 `turnId`**, because completion may arrive after the launching turn),
+`thread/agentMessage/updated {messageId,from,to,summary,status}`
+for the separate Local Agent Mailbox lifecycle (`status` ∈ `queued` / `delivered` /
+`undeliverable`; **no `turnId` and no message body, context ID, or Task ID**),
 `thread/scheduler/updated {task:{id, origin:"cron"|"loopWakeup",
 status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detail?}}`
 for owner-scoped scheduler lifecycle (**no `turnId`**),
@@ -1295,7 +1298,10 @@ prompts serialize (the TUI already queues; the plain REPL takes a mutex so
 one prompt owns the terminal at a time).
 
 Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
-its cloned Config, and core's `Event` stream (plan 39) carries it end to end.
+its typed session-local identity. While live, the same canonical label is its Local
+Agent Mailbox address; `main` is the root address. The address is ephemeral and
+resolves only inside that session — it is not a remote endpoint, Agent Card, or
+Task ID. Core's `Event` stream (plan 39) carries the display label end to end.
 `run_agent.description` is optional display metadata: at most 200 Unicode
 characters, nonblank, single-line, and control-character-free. It labels the
 launch response and foreground/background lifecycle row but never replaces or
@@ -1338,8 +1344,9 @@ Each field overrides the sub-agent's Config (cc's `.claude/agents`
 semantics): `system` **replaces** the system prompt (not concatenated),
 `model` swaps the model (the point of a cheap searcher), and `tools` is an
 exact allowlist — the sub-agent's tool defs are filtered to it and a call to
-anything outside is rejected at dispatch (`read_offloaded` always stays
-available, so a restricted agent can still read back a truncated result).
+anything outside is rejected at dispatch (`read_offloaded`, `send_message`, and
+`list_agents` always stay available as runtime infrastructure, so a restricted
+agent can read back a truncated result and coordinate with live peers).
 Only `description` is required; it is shown to the model in the run_agent tool's
 description so it can pick a type, and an unknown `agent_type` is an
 is_error result naming the available ones. Sub-agents still can't spawn
@@ -1521,23 +1528,28 @@ dropped: it queues, and is delivered to the model as a user message at the
 next round boundary — never spliced into an in-flight request. It does not
 interrupt the current tools (Ctrl+C stays the hard stop). This is a general
 **step-boundary injection queue** (`Config.inbox`, a signalling `Inbox` of
-typed `InboxItem`s); its producers are user steering, background
-sub-agent/program results, and background-shell terminal pointers, each with its
-own framing.
+typed `InboxItem`s); its producers are user steering, Local Agent Mailbox
+messages and delivery failures, background sub-agent/program/workflow results,
+scheduled prompts, and background-shell terminal pointers, each with its own
+framing.
 
-The mechanism is a straight drain of `Config.inbox` at round boundaries in the
-agent loop (`core/src/agent.rs`): at the **top of each round** (delivering
-steers typed during the previous round's tool execution before the next
-sampling), and again in an **end guard** — when the model returns no tool
-calls, a steer that landed during that final sampling is absorbed and the turn
-continues instead of ending, so a late "wait, also do X" is answered rather
-than lost. Each injected message is framed (`The user sent this message while
-you were working…`) so the model treats it as a mid-work interjection to fold
-in, not a brand-new task. It is recorded to history (and rollout) as a normal
-user message, so it survives compaction and replays on resume; because it is
-recorded right after the round's `tool_result` blocks (a separate user
-message), it never interleaves tool results with regular text — the ordering
-constraint both cc and codex call out.
+The mechanism is a straight drain of `Config.inbox` plus its typed Local Agent
+Mailbox at round boundaries in the agent loop (`core/src/agent.rs`): at the
+**top of each round** (delivering steers and peer messages that arrived during
+the previous round before the next sampling), and again in an **end guard** —
+when the model returns no tool calls, a late ordinary Inbox item is absorbed and
+the turn continues instead of ending. Peer-message pending state is checked by
+the same final gate but claimed only at the next round top, so one provider
+sampling sees at most one bounded FIFO batch (8 messages / 32 KiB) and no message
+is inserted into an in-flight request. Each injected item has producer-specific
+framing: user steering says the user interjected; a Local Agent message carries
+its `message-N`, sender, summary, and bounded body while explicitly identifying
+itself as intermediate peer communication rather than a user instruction or
+completion. It is recorded to history (and rollout) as a normal user message, so
+it survives compaction and replays on resume; because it is recorded right after
+the round's `tool_result` blocks (a separate user message), it never interleaves
+tool results with regular text — the ordering constraint both cc and codex call
+out.
 
 Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
 cloned Config, like the todo list), so a running sub-agent never drains the
@@ -1891,8 +1903,60 @@ between stdin and inbox activity; the native server's thread worker selects
 between client turns and inbox activity and allocates a fresh monotonic turn ID.
 A *running* turn drains at its own round boundary, so autowake never races a
 second turn against it. Headless one-shot execution remains bounded and does not
-expose this idle session surface.
+expose this idle session surface; its teardown nevertheless reuses the selected
+text/NDJSON UI sink, so a queued mailbox event still receives its shutdown
+`undeliverable` terminal on the same stream.
 Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
+
+### Local Agent Mailbox (Plan 70)
+
+Every real Agent at every depth has two strict built-ins:
+
+- `send_message {to,message,summary?}` queues one bounded text message for an
+  exact live peer address (`main` or `agent-N`). The runtime, not the model,
+  supplies sender, `message-N`, opaque local context, and lifecycle state. A
+  successful result means **queued**, not read, understood, replied to, or
+  completed. The body is at most 8 KiB; the optional one-line summary is at most
+  200 Unicode scalars / 1 KiB, or is derived from the first visible body line.
+- `list_agents {}` returns the other currently open Agents in that session with
+  parent, optional configured type, bounded description, and exact address. It
+  is only a momentary local roster; a returned peer can close immediately.
+
+The session directory uses one mutex to linearize address lifecycle, quotas,
+enqueue/claim/ack, and close races. Per-target pending peer mail is bounded to 32
+messages / 128 KiB; a sender can enqueue 64 messages; the session accepts at
+most 256 messages / 512 KiB cumulatively. Quota failure allocates no ID and
+emits no lifecycle event. System-generated delivery failures do not consume
+model send quotas and coalesce by reason into bounded notifications containing
+typed target/message-ID groups. A natural child close first rejects later sends,
+then waits for already committed mail to cross a round boundary. Forced close
+or session shutdown resolves every unclaimed message exactly once as
+`undeliverable` and wakes a still-live sender with message IDs only; already
+committed delivery claims are never double-resolved. Final route removal releases
+the closed Agent's Inbox and metadata rather than retaining session-long
+tombstones. Message lifecycle is an independent core event and never mutates the
+Agent's `BackgroundTask` terminal or completion delivery.
+
+The TUI upserts one body-free row per message ID; plain output uses the same
+bounded lifecycle note; native server/headless JSON emits the independent
+`thread/agentMessage/updated` notification documented above. The sender's tool
+event input also contains only target, summary, and byte count, while its
+canonical audited tool input and the recipient's framed history retain the body.
+Program/Workflow JavaScript bridges cannot call either tool directly, although
+real child Agents launched by those runtimes can. Messaging does not transfer
+permissions, workspace, sandbox, hooks, or tool catalogs.
+
+Foreground `run_agent` blocks the parent's model loop, so the parent cannot send
+a mid-run follow-up from that same loop; use `background:true` when live
+parent→child coordination is required. Final foreground/background completion
+still travels through the existing tool result / `SubAgentResult` path and is
+not inferred from a peer message.
+
+This is an **A2A-aligned local envelope**, not A2A support. The local `to` is an
+in-process transport address and is excluded from an A2A Message projection;
+`message-N` is not an A2A Task ID, and `agent-N` is not an Agent Card endpoint.
+Remote discovery, Agent Cards, HTTP/JSON-RPC/gRPC, streaming/push, authentication,
+A2A Task lifecycle, and artifacts require a separate gateway.
 
 Plan 52 fixed the semantic boundary against Claude Code 2.1.220; Plan 66 later
 renamed the native surface without adding compatibility aliases:
@@ -1906,9 +1970,9 @@ renamed the native surface without adding compatibility aliases:
 - `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
   `stop_program`, `stop_workflow`, and `stop_bash` deliberately replace a
   universal TaskStop façade.
-- `Config.inbox` is an internal step-boundary delivery queue, not an addressable
-  Team mailbox. kloop does not expose `SendMessage` or `ListAgents`, and does not
-  connect remote/cloud or user team state.
+- `Config.inbox` remains the typed step-boundary delivery queue. Plan 70 adds
+  strict session-local `send_message` / `list_agents` over a separate live Agent
+  directory; it does not connect remote/cloud or user team state.
 - Consecutive synchronous `run_agent` calls remain dispatcher-parallel; detached
   agent/program/workflow work remains capped at 8 per session.
 

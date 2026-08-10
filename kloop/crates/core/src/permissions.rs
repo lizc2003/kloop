@@ -1165,7 +1165,7 @@ impl CallFacts {
             "bash_output" | "stop_bash" => true,
             // run_agent itself touches nothing; every child tool call passes
             // through this same gate.
-            "run_agent" => true,
+            "run_agent" | "send_message" | "list_agents" => true,
             // Creating a managed tree and keeping one are session controls. An
             // existing-path Enter and remove action are intercepted as hazards
             // above; remove is also mutating for the plan-mode gate.

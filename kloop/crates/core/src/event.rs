@@ -18,6 +18,8 @@ use crate::agent::EndReason;
 use crate::permissions::Mode;
 use crate::tools::TodoItem;
 use crate::tools::TodoStatus;
+use kloop_protocol::LocalAgentId;
+use kloop_protocol::LocalMessageId;
 
 /// A stable identifier for an item within a turn. Tool calls reuse the model's
 /// `tool_use` id; a sub-agent uses its label ("agent-N"); a todo list uses a
@@ -55,6 +57,22 @@ pub struct BackgroundTask {
     pub status: BackgroundTaskStatus,
     pub output_path: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMessageStatus {
+    Queued,
+    Delivered,
+    Undeliverable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessageUpdate {
+    pub id: LocalMessageId,
+    pub from: LocalAgentId,
+    pub to: LocalAgentId,
+    pub summary: String,
+    pub status: AgentMessageStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +128,9 @@ pub enum Event {
     /// item event this deliberately has no turn owner: the terminal update may
     /// arrive after the launching turn completed.
     BackgroundTaskUpdated(BackgroundTask),
+    /// One local peer message changed delivery state. This is independent of
+    /// both the sender and recipient Agent lifecycle and never carries the body.
+    AgentMessageUpdated(AgentMessageUpdate),
     /// Owner-scoped scheduler lifecycle. Like background work this is session
     /// scoped and may arrive without the turn that created the job.
     ScheduledTaskUpdated(ScheduledTask),
@@ -259,6 +280,17 @@ impl Event {
                 }
             )),
             Event::BackgroundTaskUpdated(task) => Some(background_task_note(task)),
+            Event::AgentMessageUpdated(message) => {
+                let status = match message.status {
+                    AgentMessageStatus::Queued => "queued",
+                    AgentMessageStatus::Delivered => "delivered",
+                    AgentMessageStatus::Undeliverable => "undeliverable",
+                };
+                Some(format!(
+                    "Message from Agent · {} → {} · {} · {status} · {}",
+                    message.from, message.to, message.id, message.summary
+                ))
+            }
             Event::ScheduledTaskUpdated(task) => {
                 let origin = match task.origin {
                     ScheduledTaskOrigin::Cron => "cron",
@@ -320,6 +352,23 @@ mod tests {
             active_form: active.into(),
             status,
         }
+    }
+
+    #[test]
+    fn agent_message_note_names_route_identity_and_status() {
+        let event = Event::AgentMessageUpdated(AgentMessageUpdate {
+            id: "message-4".parse().unwrap(),
+            from: "agent-2".parse().unwrap(),
+            to: "main".parse().unwrap(),
+            summary: "check the race".into(),
+            status: AgentMessageStatus::Undeliverable,
+        });
+        assert_eq!(
+            event.as_note().as_deref(),
+            Some(
+                "Message from Agent · agent-2 → main · message-4 · undeliverable · check the race"
+            )
+        );
     }
 
     #[test]

@@ -226,6 +226,34 @@
 > execution ID 才是跨 turn、跨 frontend 的关联键。③native scrollback 一旦提交就不可变，运行行被 hard cap
 > 冻结后只能忽略中间更新并追加关联 terminal，不能保留悬空 index 或偷偷改历史。
 >
+> **Plan 70 已完成（2026-08-10）**：`70-local-agent-mailbox-a2a.md` 为同一 session 的 live
+> `main`/`agent-N` 增加 typed Local Agent Mailbox。`send_message` 与 `list_agents` 是所有真实 Agent
+> depth 都可用的严格 builtin；sender/context/`message-N`/status 由 runtime 注入，Program/Workflow JS
+> bridge 不能直接伪造。单锁 directory 线性化注册、quota、enqueue、boundary claim/ack 与 close；消息只在
+> sampling 前按 FIFO 8 条/32 KiB 注入，natural final gate、structured-output gate、stop/error/shutdown 都不
+> 会把 in-flight request 或 tool pairing 撕开。已提交 enqueue 最终唯一成为 Delivered 或 Undeliverable；
+> delivery failure 按 reason 聚合 typed target/message-ID group，不占模型发送额度；关闭 route 释放 Inbox/
+> metadata，隔离 worktree 在 registration/shutdown race 失败时仍 cleanup。最终 Agent completion 与
+> `BackgroundTaskUpdated` 保持原路径，message lifecycle 单独投影为 TUI row、plain note 和无正文/turnId 的
+> `thread/agentMessage/updated`；headless shutdown 复用原 NDJSON sink，不丢 terminal。
+>
+> **Plan 70 分层与验收**：local `to` 是进程内 transport address，不进入 A2A Message；`message-N` 不是
+> A2A Task ID，`agent-N` 不是 Agent Card endpoint。远程 discovery、Agent Card、transport/auth/stream/push、
+> Task/Artifact 仍须独立 A2A gateway，当前只称 A2A-aligned Local Mailbox。默认 ignored native-server
+> evaluator 在 Anthropic `claude-sonnet-4-6` 与 OpenAI Chat `gpt-5.4-mini` 各完成 main→A、A list 后→B、
+> B→main：3 个 monotonic message ID 均 Queued→Delivered，2 个 Agent 各唯一 terminal/completion，且无
+> `wait_for_activity` polling；recipient rollout 用不可猜 sentinel 与 framed ID 判定，不采信模型自评。
+> fmt、all-target clippy、workspace tests、full/corpus verifier、plain/headless mock 与双 provider evaluator
+> 全绿；提交 SHA 以本条所在提交为准。
+>
+> **Plan 70 教训**：①local address、remote discovery、message content 与 Task lifecycle 是四层不同能力，
+> 对齐 Message/Part 名词不等于拥有 A2A endpoint。②“Queued event 先于 Delivered”必须和 enqueue/claim
+> 共用线性化临界段；只在解锁后 emit 会让 active recipient 反序。③route close、后台 terminal、completion
+> publication 与 worktree cleanup 是独立 lifecycle，cleanup 要先于 terminal，注册失败也必须消费已创建资源。
+> ④严格 schema 不能约束内部调用或 event projection；runtime boundary 要重验 control/Unicode separator/
+> metadata budget，无效模型输入也不能把巨型 target/unknown field 复制到 UI。⑤系统失败通知要按 typed
+> message ID 聚合，否则多 sibling 同时 stop 会绕过 peer mailbox 的数量预算。
+>
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现
 > absolute `lpApplicationName`、Windows ordinal-case UTF-16 environment、stdio-only handle list、suspended

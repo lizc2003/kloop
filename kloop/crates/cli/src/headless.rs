@@ -131,7 +131,15 @@ impl Ui for HeadlessTextUi {
     }
 }
 
-/// Run one headless turn and return the process exit code. `out` is the machine
+/// The turn outcome plus the same UI sink used during the run. Session shutdown
+/// reuses the sink so lifecycle events committed after `turn/completed` stay on
+/// the selected text or NDJSON surface.
+pub(crate) struct HeadlessResult {
+    pub(crate) code: i32,
+    pub(crate) ui: Arc<dyn Ui>,
+}
+
+/// Run one headless turn and return its result. `out` is the machine
 /// channel (stdout): in `--json` mode every event lands there; otherwise the
 /// final text does. Generic over the writer so the whole path is drivable
 /// in-process over a buffer, like the server's contract tests.
@@ -145,7 +153,7 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
     json: bool,
     out: Arc<Mutex<W>>,
     cancel: CancellationToken,
-) -> i32 {
+) -> HeadlessResult {
     let msg = if pending_images.is_empty() {
         Message::user_text(prompt)
     } else {
@@ -170,7 +178,10 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             "turn/completed",
             kloop_server::turn_completed_params(HEADLESS_TURN_ID, &outcome.reason),
         );
-        exit_code(&outcome.reason)
+        HeadlessResult {
+            code: exit_code(&outcome.reason),
+            ui: dyn_ui,
+        }
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
@@ -185,7 +196,10 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             EndReason::Aborted => eprintln!("error: interrupted"),
             EndReason::Error(error) => eprintln!("error: {error}"),
         }
-        exit_code(&outcome.reason)
+        HeadlessResult {
+            code: exit_code(&outcome.reason),
+            ui,
+        }
     }
 }
 
@@ -297,6 +311,7 @@ mod tests {
     }
 
     fn mock_provider_config(provider: Provider) -> Config {
+        let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Config {
             provider: Arc::new(provider),
             model: "mock".into(),
@@ -313,7 +328,7 @@ mod tests {
             file_state: Default::default(),
             tool_sources: Vec::new(),
             session_id: "hl".into(),
-            agent_label: String::new(),
+            local_agent: kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
             hooks: Arc::new(kloop_core::hooks::Hooks::none()),
             background_shells: kloop_core::tools::BackgroundShells::new(),
             shell_programs: std::sync::Arc::new(
@@ -327,8 +342,8 @@ mod tests {
             defer_threshold: 30,
             unlocked_tools: Default::default(),
             todos: Default::default(),
-            inbox: Default::default(),
-            scheduler: kloop_core::scheduler::Scheduler::in_memory(Default::default()),
+            inbox: Arc::clone(&inbox),
+            scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             program_limits: Default::default(),
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
@@ -347,7 +362,7 @@ mod tests {
         let cfg = Arc::new(mock_config(vec![vec![text_block("the answer is 4")]]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let code = run_headless(
+        let result = run_headless(
             cfg,
             history,
             "hl".into(),
@@ -358,7 +373,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        assert_eq!(code, 0);
+        assert_eq!(result.code, 0);
         assert_eq!(
             String::from_utf8(out.lock().unwrap().clone()).unwrap(),
             "the answer is 4\n"
@@ -373,7 +388,7 @@ mod tests {
         }]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let code = run_headless(
+        let result = run_headless(
             cfg,
             history,
             "hl".into(),
@@ -385,7 +400,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(code, 1);
+        assert_eq!(result.code, 1);
         assert_eq!(
             String::from_utf8(out.lock().unwrap().clone()).unwrap(),
             "partial refusal\n"
@@ -400,7 +415,7 @@ mod tests {
         )]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let code = run_headless(
+        let result = run_headless(
             cfg,
             history,
             "hl".into(),
@@ -412,7 +427,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(code, 1);
+        assert_eq!(result.code, 1);
         assert_eq!(
             String::from_utf8(out.lock().unwrap().clone()).unwrap(),
             "half answer\n"
@@ -427,7 +442,7 @@ mod tests {
         }]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let code = run_headless(
+        let result = run_headless(
             cfg,
             history,
             "hl".into(),
@@ -439,8 +454,62 @@ mod tests {
         )
         .await;
 
-        assert_eq!(code, 0);
+        assert_eq!(result.code, 0);
         assert!(out.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_shutdown_reuses_the_wire_sink_for_message_terminals() {
+        let cfg = Arc::new(mock_config(vec![vec![text_block("done")]]));
+        let history = History::new(cfg.offload_dir.clone());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let result = run_headless(
+            cfg.clone(),
+            history,
+            "hl".into(),
+            "hi".into(),
+            Vec::new(),
+            true,
+            out.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        let child = cfg.local_agent.child("agent-99".parse().unwrap());
+        let _lease = child
+            .register_child(
+                Arc::new(kloop_core::inbox::Inbox::default()),
+                None,
+                "shutdown target",
+                result.ui.clone(),
+            )
+            .unwrap();
+        cfg.local_agent
+            .send(
+                child.agent_id().clone(),
+                "shutdown".into(),
+                "pending body".into(),
+                &result.ui,
+            )
+            .unwrap();
+        cfg.local_agent.shutdown(&result.ui);
+
+        let raw = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        let events = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let updates = events
+            .iter()
+            .filter(|event| event["method"] == "thread/agentMessage/updated")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["params"]["status"], "queued");
+        assert_eq!(updates[1]["params"]["status"], "undeliverable");
+        assert!(updates.iter().all(|event| {
+            event["params"]["threadId"] == "hl"
+                && event["params"].get("message").is_none()
+                && event["params"].get("body").is_none()
+        }));
     }
 
     #[tokio::test]
@@ -448,7 +517,7 @@ mod tests {
         let cfg = Arc::new(mock_config(vec![vec![text_block("hello there")]]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let code = run_headless(
+        let result = run_headless(
             cfg,
             history,
             "hl".into(),
@@ -459,7 +528,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        assert_eq!(code, 0);
+        assert_eq!(result.code, 0);
 
         let raw = String::from_utf8(out.lock().unwrap().clone()).unwrap();
         let events: Vec<Value> = raw

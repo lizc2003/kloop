@@ -1139,6 +1139,8 @@ fn program_surface_excludes_run_program_and_run_agent() {
     assert!(!names.iter().any(|n| n == "run_agent"));
     assert!(!names.iter().any(|n| n == "bash_output"));
     assert!(!names.iter().any(|n| n == "stop_bash"));
+    assert!(!names.iter().any(|n| n == "send_message"));
+    assert!(!names.iter().any(|n| n == "list_agents"));
 }
 
 #[tokio::test]
