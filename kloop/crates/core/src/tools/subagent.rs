@@ -1615,34 +1615,32 @@ mod tests {
         assert!(ctx.cfg.inbox.is_empty());
     }
 
-    /// A sub-agent's todo_write writes to its own fresh list, never the
-    /// parent's — the Config clone would otherwise share the Arc.
+    /// Child Agents clone the session TaskRegistry Arc, so a foreground child
+    /// can update a task the parent created and the parent observes the change.
     #[tokio::test]
-    async fn subagent_todos_are_isolated_from_the_parent() {
-        use crate::tools::TodoItem;
-        use crate::tools::TodoStatus;
-
+    async fn subagent_task_graph_is_shared_with_the_parent() {
         let provider = Provider::mock(vec![
-            // sub-agent round 1: rewrite its (empty) todo list
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
-                name: "todo_write".into(),
-                input: json!({"todos": [
-                    {"content": "sub task", "activeForm": "doing sub task", "status": "in_progress"}
-                ]}),
+                name: "task_update".into(),
+                input: json!({
+                    "task_id": "1",
+                    "owner": "agent-1",
+                    "status": "completed"
+                }),
             }],
-            // sub-agent round 2: wrap up
             vec![AssistantBlock::Text {
                 text: "sub done".into(),
             }],
         ]);
-        let ctx = with_provider(test_ctx(0, "todo-isolation"), provider);
-        // The parent already has a task list of its own.
-        *ctx.cfg.todos.lock().unwrap() = vec![TodoItem {
-            content: "parent task".into(),
-            active_form: "doing parent task".into(),
-            status: TodoStatus::Pending,
-        }];
+        let ctx = with_provider(test_ctx(0, "task-sharing"), provider);
+        let (created, is_error) = run_tool(
+            "task_create",
+            json!({"subject":"parent task","description":"shared work"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{created}");
 
         let results = dispatch_tools(
             vec![("t1".into(), "run_agent".into(), json!({"prompt": "go"}))],
@@ -1658,11 +1656,55 @@ mod tests {
             }
         );
 
-        // The parent's list is untouched by the sub-agent's todo_write.
-        let parent = ctx.cfg.todos.lock().unwrap();
-        assert_eq!(parent.len(), 1);
-        assert_eq!(parent[0].content, "parent task");
-        assert_eq!(parent[0].status, TodoStatus::Pending);
+        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
+        assert!(!is_error, "{task}");
+        let task: Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(task["task"]["owner"], "agent-1");
+        assert_eq!(task["task"]["status"], "completed");
+    }
+
+    /// Background children use the same Config clone path, so their graph writes
+    /// are visible before terminal delivery is reinjected into the parent Inbox.
+    #[tokio::test]
+    async fn background_subagent_shares_the_parent_task_graph() {
+        let provider = Provider::mock(vec![
+            vec![AssistantBlock::ToolUse {
+                id: "s1".into(),
+                name: "task_update".into(),
+                input: json!({
+                    "task_id":"1",
+                    "owner":"background-child",
+                    "status":"completed"
+                }),
+            }],
+            vec![AssistantBlock::Text {
+                text: "background task done".into(),
+            }],
+        ]);
+        let ctx = with_provider(test_ctx(0, "background-task-sharing"), provider);
+        let (created, is_error) = run_tool(
+            "task_create",
+            json!({"subject":"shared","description":"background child updates this"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{created}");
+        let (started, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt":"complete task 1","background":true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{started}");
+        let (waited, is_error) =
+            run_tool("wait_for_activity", json!({"timeout_ms":10_000}), &ctx).await;
+        assert!(!is_error, "{waited}");
+
+        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
+        assert!(!is_error, "{task}");
+        let task: Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(task["task"]["owner"], "background-child");
+        assert_eq!(task["task"]["status"], "completed");
     }
 
     /// Fire-and-forget: run_agent {background:true} returns a "started" message

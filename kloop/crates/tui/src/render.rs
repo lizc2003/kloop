@@ -18,7 +18,6 @@ use unicode_width::UnicodeWidthChar;
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
-use kloop_core::tools::TodoStatus;
 
 use std::time::Duration;
 
@@ -292,31 +291,6 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 truncate(&format!("  {}", message.summary), width),
                 DIM,
             )));
-        }
-        Cell::Todo(items) => {
-            lines.push(Line::from(Span::styled("todos".to_string(), DIM)));
-            for item in items {
-                // in_progress shows its activeForm (what's happening now);
-                // the others show the plain content.
-                // Done green, in-progress cyan (an active status indicator),
-                // pending dim — no yellow/dark-gray foregrounds (styles.md).
-                let (mark, mark_style, text, style) = match item.status {
-                    TodoStatus::Completed => {
-                        ("✓", Style::new().fg(Color::Green), &item.content, DIM)
-                    }
-                    TodoStatus::InProgress => (
-                        "▶",
-                        Style::new().fg(Color::Cyan),
-                        &item.active_form,
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                    TodoStatus::Pending => ("○", DIM, &item.content, DIM),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {mark} "), mark_style),
-                    Span::styled(truncate(text, width.saturating_sub(4)), style),
-                ]));
-            }
         }
         Cell::Note(text) => {
             lines.push(Line::from(Span::styled(
@@ -1521,29 +1495,6 @@ mod tests {
         assert!(diff_stats_line("(overwriting existing file, 999 bytes)").is_none());
     }
 
-    /// The todo palette (plan 38 slice 6): completed green, in-progress cyan, and
-    /// pending dim — no yellow or dark-gray foregrounds (styles.md).
-    #[test]
-    fn todo_marks_use_the_status_palette() {
-        use kloop_core::tools::TodoItem;
-        let item = |status| TodoItem {
-            content: "c".into(),
-            active_form: "a".into(),
-            status,
-        };
-        let cells = vec![Cell::Todo(vec![
-            item(TodoStatus::Completed),
-            item(TodoStatus::InProgress),
-            item(TodoStatus::Pending),
-        ])];
-        let lines = transcript_lines(&cells, 40);
-        // lines[0] is the "todos" header; [1..4] the marks.
-        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Green));
-        assert_eq!(lines[2].spans[0].style.fg, Some(Color::Cyan));
-        assert_eq!(lines[3].spans[0].style.fg, None); // pending: dim, no fg
-        assert!(lines[3].spans[0].style.add_modifier.contains(Modifier::DIM));
-    }
-
     /// End-to-end (TestBackend): the session banner inserted as the first cell
     /// renders its box and fields into the viewport.
     #[test]
@@ -1940,34 +1891,6 @@ mod tests {
             assert!(line_text(&lines[0]).starts_with(mark));
             assert_eq!(lines[0].spans[0].style.fg, Some(color));
         }
-    }
-
-    /// A Todo cell renders a header plus one marked line per item, showing
-    /// the activeForm for the in_progress item and content for the rest.
-    #[test]
-    fn todo_cell_renders_a_marked_checklist() {
-        use kloop_core::tools::TodoItem;
-        let item = |content: &str, active: &str, status: TodoStatus| TodoItem {
-            content: content.into(),
-            active_form: active.into(),
-            status,
-        };
-        let cells = vec![Cell::Todo(vec![
-            item("Parse input", "Parsing input", TodoStatus::Completed),
-            item("Run tests", "Running tests", TodoStatus::InProgress),
-            item("Write docs", "Writing docs", TodoStatus::Pending),
-        ])];
-        let lines = transcript_lines(&cells, 40);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(
-            texts,
-            vec![
-                "todos",
-                "  ✓ Parse input",
-                "  ▶ Running tests",
-                "  ○ Write docs",
-            ]
-        );
     }
 
     #[test]

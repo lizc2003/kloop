@@ -14,9 +14,9 @@ pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
     // Replacing with an empty history writes a compacted marker; the usage
     // anchor is dropped and the next turn starts on a blank context.
     history.replace_all(Vec::new());
-    // Process-state that lives outside History resets too, matching what a
-    // brand-new session would look like (both start empty on resume).
-    cfg.todos.lock().unwrap().clear();
+    // Process-state that lives outside History resets too. Keep the task ID
+    // high-water mark so a running peer can never observe an ID being reused.
+    cfg.tasks.clear();
     cfg.inbox.drain();
     SlashResult::cleared_message("conversation cleared")
 }

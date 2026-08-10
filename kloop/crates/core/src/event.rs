@@ -16,14 +16,12 @@ use serde_json::Value;
 
 use crate::agent::EndReason;
 use crate::permissions::Mode;
-use crate::tools::TodoItem;
-use crate::tools::TodoStatus;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalMessageId;
 
 /// A stable identifier for an item within a turn. Tool calls reuse the model's
-/// `tool_use` id; a sub-agent uses its label ("agent-N"); a todo list uses a
-/// fixed per-owner slot; assistant/reasoning messages use a turn-local counter.
+/// `tool_use` id; a sub-agent uses its label ("agent-N");
+/// assistant/reasoning messages use a turn-local counter.
 pub type ItemId = String;
 
 /// Session-scoped background work is not owned by the turn that launched it.
@@ -176,12 +174,6 @@ pub enum Item {
         task: String,
         status: ItemStatus,
     },
-    /// The model rewrote its task list (full replacement). `agent` is "" for the
-    /// main agent, "agent-N" for a sub-agent's internal planning.
-    Todo {
-        agent: String,
-        items: Vec<TodoItem>,
-    },
 }
 
 /// Streaming content routed to an open item's channel.
@@ -309,35 +301,8 @@ impl Event {
                     .unwrap_or_default();
                 Some(format!("{origin} {} {state}{detail}", task.id))
             }
-            Event::ItemCompleted {
-                item: Item::Todo { agent, items },
-                ..
-            } => Some(todo_note(agent, items)),
             _ => None,
         }
-    }
-}
-
-/// The one-line note for a todo update, matching the pre-plan-39 `todo_update`
-/// default: "todos {done}/{total} · now: {active}" while an item runs, else
-/// "todos {done}/{total} done", with an "{agent} · " prefix for a sub-agent.
-fn todo_note(agent: &str, todos: &[TodoItem]) -> String {
-    let done = todos
-        .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
-        .count();
-    let prefix = if agent.is_empty() {
-        String::new()
-    } else {
-        format!("{agent} · ")
-    };
-    match todos.iter().find(|t| t.status == TodoStatus::InProgress) {
-        Some(current) => format!(
-            "{prefix}todos {done}/{} · now: {}",
-            todos.len(),
-            current.active_form
-        ),
-        None => format!("{prefix}todos {done}/{} done", todos.len()),
     }
 }
 
@@ -345,14 +310,6 @@ fn todo_note(agent: &str, todos: &[TodoItem]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn todo(content: &str, active: &str, status: TodoStatus) -> TodoItem {
-        TodoItem {
-            content: content.into(),
-            active_form: active.into(),
-            status,
-        }
-    }
 
     #[test]
     fn agent_message_note_names_route_identity_and_status() {
@@ -451,35 +408,6 @@ mod tests {
             },
         };
         assert_eq!(ended_fail.as_note().as_deref(), Some("agent-1 failed"));
-    }
-
-    #[test]
-    fn todo_note_matches_old_default() {
-        let running = Event::ItemCompleted {
-            id: "todos".into(),
-            item: Item::Todo {
-                agent: String::new(),
-                items: vec![
-                    todo("A", "Doing A", TodoStatus::Completed),
-                    todo("B", "Doing B", TodoStatus::InProgress),
-                ],
-            },
-        };
-        assert_eq!(
-            running.as_note().as_deref(),
-            Some("todos 1/2 · now: Doing B")
-        );
-        let all_done = Event::ItemCompleted {
-            id: "todos-agent-1".into(),
-            item: Item::Todo {
-                agent: "agent-1".into(),
-                items: vec![todo("A", "Doing A", TodoStatus::Completed)],
-            },
-        };
-        assert_eq!(
-            all_done.as_note().as_deref(),
-            Some("agent-1 · todos 1/1 done")
-        );
     }
 
     #[test]

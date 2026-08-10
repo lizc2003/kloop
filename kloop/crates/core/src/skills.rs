@@ -291,7 +291,6 @@ fn map_tool_name(name: &str) -> String {
         "WebFetch" => "web_fetch",
         "WebSearch" => "web_search",
         "Task" => "run_agent",
-        "TodoWrite" => "todo_write",
         "Skill" => "skill",
         other => other,
     }

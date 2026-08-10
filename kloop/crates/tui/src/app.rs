@@ -25,8 +25,6 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
-use kloop_core::tools::TodoItem;
-use kloop_core::tools::TodoStatus;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
@@ -90,9 +88,6 @@ pub enum Cell {
     /// Local peer-message delivery state, keyed by message-N and independent of
     /// the sender/recipient Agent execution lifecycle.
     AgentMessage(AgentMessageUpdate),
-    /// The model's current task list (todo_write). Updated in place within a
-    /// turn; a new user turn starts a fresh block.
-    Todo(Vec<TodoItem>),
     Note(String),
     /// Output of a slash command — a wrapped, dim multi-line block (unlike a
     /// Note, which collapses to one truncated line).
@@ -231,7 +226,7 @@ pub struct App {
     /// so a diff taller than the popup can be read in full. Reset to 0 when the
     /// front prompt changes; clamped to a valid range at render time.
     pub confirm_scroll: usize,
-    /// Latest agent activity (note / tool / sub-agent / todo). No longer churned
+    /// Latest Agent activity (note / tool / sub-agent). No longer churned
     /// into the status line — activity shows in the transcript. Kept as recent
     /// state for the animated status HUD (plan 38 slice 5).
     pub last_note: Option<String>,
@@ -255,9 +250,6 @@ pub struct App {
     agent_message_cells: HashMap<String, usize>,
     /// Queued message rows frozen into immutable native scrollback.
     frozen_agent_messages: HashSet<String>,
-    /// Index of the current turn's Todo cell, updated in place as the model
-    /// rewrites its list; reset each new user turn so a fresh block starts.
-    todo_cell: Option<usize>,
     /// The rewind picker while it is open (Ctrl+R when idle); None otherwise.
     /// While open it captures the keyboard, like a confirm prompt.
     pub fork_picker: Option<ForkPicker>,
@@ -310,7 +302,6 @@ impl App {
             frozen_background_tasks: HashSet::new(),
             agent_message_cells: HashMap::new(),
             frozen_agent_messages: HashSet::new(),
-            todo_cell: None,
             fork_picker: None,
             mode: Mode::default(),
             ctrl_c_exit_armed: false,
@@ -368,7 +359,6 @@ impl App {
                 self.frozen_agent_messages.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
-                self.todo_cell = None;
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.last_note = None;
@@ -412,7 +402,6 @@ impl App {
                 self.frozen_agent_messages.clear();
                 self.assistant_cells.clear();
                 self.reasoning_cells.clear();
-                self.todo_cell = None;
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.last_note = None;
@@ -434,8 +423,8 @@ impl App {
     /// Project one core [`Event`] onto the transcript. Message and reasoning
     /// items are driven by their deltas (their start/complete events only bound
     /// the stream — the sealing is done by the next event clearing the open
-    /// flag, exactly as before plan 39); tool calls and sub-agents map to their
-    /// status rows; a sub-agent's todo update stays internal.
+    /// flag, exactly as before plan 39); tool calls and sub-agents map to status
+    /// rows.
     fn apply_core(&mut self, ev: Event) {
         match ev {
             Event::ItemStarted {
@@ -543,14 +532,10 @@ impl App {
                 }
                 self.refresh_display_streaming();
             }
-            // Program output has no dedicated cell; todo starts and the turn
-            // bracket do not change the transcript.
+            // Program output and the turn bracket have no dedicated transcript
+            // cell.
             Event::ItemDelta {
                 delta: Delta::Output(_),
-                ..
-            }
-            | Event::ItemStarted {
-                item: Item::Todo { .. },
                 ..
             }
             | Event::TurnStarted => {}
@@ -650,33 +635,6 @@ impl App {
                     } else {
                         ToolStatus::Failed
                     };
-                }
-            }
-            Event::ItemCompleted {
-                item: Item::Todo { agent, items },
-                ..
-            } => {
-                // A sub-agent's planning stays internal (lesson 3): only the main
-                // agent's list surfaces as a transcript block.
-                if !agent.is_empty() {
-                    return;
-                }
-                self.assistant_open = false;
-                self.thinking_open = false;
-                let done = items
-                    .iter()
-                    .filter(|t| t.status == TodoStatus::Completed)
-                    .count();
-                self.last_note = Some(format!("todos {done}/{}", items.len()));
-                // Update this turn's block in place; start one if there is none.
-                match self.todo_cell {
-                    Some(i) if matches!(self.cells.get(i), Some(Cell::Todo(_))) => {
-                        self.cells[i] = Cell::Todo(items);
-                    }
-                    _ => {
-                        self.todo_cell = Some(self.cells.len());
-                        self.cells.push(Cell::Todo(items));
-                    }
                 }
             }
             Event::BackgroundTaskUpdated(task) => {
@@ -908,7 +866,6 @@ impl App {
             *i = i.wrapping_sub(n);
             *i < self.cells.len()
         });
-        self.todo_cell = self.todo_cell.and_then(|i| i.checked_sub(n));
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Command {
@@ -1108,7 +1065,7 @@ impl App {
         // expanded text.
         let display = self.composer.text().trim().to_string();
         // A slash command runs only when idle; it is not a message, so no User
-        // cell and no new todo block. While a turn runs, a '/'-line is steering.
+        // cell. While a turn runs, a '/'-line is steering.
         if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
             let _ = self.composer.submit();
             self.running = true;
@@ -1120,7 +1077,7 @@ impl App {
             // next FRESH turn — a steer has no image channel, so taking them here
             // (and showing a `[image: …]` cell) would drop them silently. An
             // image-only Enter has nothing to steer, so it is a no-op that leaves
-            // the image attached. No new turn / todo reset.
+            // the image attached. No new turn starts.
             return match self.composer.submit_text() {
                 Some(text) => {
                     self.cells.push(Cell::User(display));
@@ -1139,7 +1096,6 @@ impl App {
         for label in &labels {
             self.cells.push(Cell::User(format!("[image: {label}]")));
         }
-        self.todo_cell = None;
         self.running = true;
         Command::Submit(sub.text)
     }
@@ -1467,15 +1423,6 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                         seconds: None,
                     });
                 }
-                // A historical todo_write replays as its checklist block, the
-                // same shape the live path renders (never a generic tool row).
-                (Role::Assistant, ContentBlock::ToolUse { name, input, .. })
-                    if name == "todo_write" =>
-                {
-                    if let Some(items) = kloop_core::tools::parse_todos(input) {
-                        cells.push(Cell::Todo(items));
-                    }
-                }
                 (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
                     let (status, output) = match results.get(id.as_str()) {
                         Some((false, text)) => (ToolStatus::Ok, Some(text.clone())),
@@ -1573,15 +1520,6 @@ mod tests {
                 } else {
                     ItemStatus::Failed
                 },
-            },
-        })
-    }
-    fn todo_update(todos: Vec<TodoItem>) -> AgentEvent {
-        AgentEvent::Core(Event::ItemCompleted {
-            id: "todos".into(),
-            item: Item::Todo {
-                agent: String::new(),
-                items: todos,
             },
         })
     }
@@ -1863,23 +1801,15 @@ mod tests {
     #[test]
     fn drain_committed_rebases_index_maps() {
         let mut app = App::new("s".into());
-        // Two tool cells and a live todo scattered through the tail.
         app.apply(tool_start("", "t1", "bash", "{}"));
-        app.apply(todo_update(vec![todo(
-            "Do",
-            "Doing",
-            TodoStatus::InProgress,
-        )]));
+        app.cells.push(Cell::Assistant("middle".into()));
         app.apply(tool_start("", "t2", "grep", "{}"));
-        // cells: [Tool t1 (0), Todo (1), Tool t2 (2)]
         assert_eq!(app.cells.len(), 3);
 
         app.drain_committed(2);
-        // Only Tool t2 remains, now at index 0.
         assert_eq!(app.cells.len(), 1);
         assert_eq!(app.tool_cells.get("t1"), None, "committed cell dropped");
         assert_eq!(app.tool_cells.get("t2"), Some(&0), "survivor shifted down");
-        assert_eq!(app.todo_cell, None, "committed todo cell dropped");
 
         // A late ToolEnd for the now-frozen t1 is a harmless no-op; t2 resolves.
         app.apply(tool_end("", "t1", true, ""));
@@ -1991,102 +1921,6 @@ mod tests {
         );
     }
 
-    fn todo(content: &str, active: &str, status: TodoStatus) -> TodoItem {
-        TodoItem {
-            content: content.into(),
-            active_form: active.into(),
-            status,
-        }
-    }
-
-    /// A todo_write call renders as a single Todo block, not a generic tool
-    /// row: core emits no ToolCall for it (only the `Todo` item), so the
-    /// TodoUpdate owns the cell, updated in place as the list evolves in a turn.
-    #[test]
-    fn todo_write_renders_as_a_single_updating_block() {
-        let mut app = App::new("s".into());
-        let first = vec![
-            todo("Parse", "Parsing", TodoStatus::InProgress),
-            todo("Test", "Testing", TodoStatus::Pending),
-        ];
-        app.apply(todo_update(first.clone()));
-        assert_eq!(app.cells, vec![Cell::Todo(first)]);
-
-        // A second update within the turn replaces the same cell in place.
-        let second = vec![
-            todo("Parse", "Parsing", TodoStatus::Completed),
-            todo("Test", "Testing", TodoStatus::InProgress),
-        ];
-        app.apply(todo_update(second.clone()));
-        assert_eq!(app.cells, vec![Cell::Todo(second)], "updated in place");
-        assert_eq!(app.last_note.as_deref(), Some("todos 1/2"));
-    }
-
-    /// A new user turn starts a fresh Todo block; the previous turn's stays in
-    /// the transcript as history.
-    #[test]
-    fn new_turn_starts_a_fresh_todo_block() {
-        let mut app = App::new("s".into());
-        let plan = vec![todo("Step", "Doing step", TodoStatus::InProgress)];
-        app.apply(todo_update(plan.clone()));
-        app.apply(turn_ended(EndReason::Completed));
-
-        // Submit a new turn, then the model writes todos again.
-        for c in "next".chars() {
-            app.on_key(key(KeyCode::Char(c)));
-        }
-        app.on_key(key(KeyCode::Enter));
-        let plan2 = vec![todo("Other", "Doing other", TodoStatus::Pending)];
-        app.apply(todo_update(plan2.clone()));
-
-        assert_eq!(
-            app.cells,
-            vec![
-                Cell::Todo(plan),
-                Cell::User("next".into()),
-                Cell::Todo(plan2),
-            ],
-            "the new turn's list is a separate block below the user message"
-        );
-    }
-
-    /// A sub-agent's todo_update never reaches the loop (dropped in ChannelUi),
-    /// so the App only ever sees main-agent TodoUpdate events — but defend the
-    /// invariant here too: an empty-agent update is the only one that renders.
-    #[test]
-    fn resume_replays_todo_write_as_a_checklist_block() {
-        use serde_json::json;
-        let messages = vec![
-            Message::user_text("plan it"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "todo_write".into(),
-                input: json!({"todos": [
-                    {"content": "Parse", "activeForm": "Parsing", "status": "completed"},
-                    {"content": "Test", "activeForm": "Testing", "status": "in_progress"},
-                ]}),
-            }]),
-            Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "Updated todo list: 2 item(s)".into(),
-                is_error: false,
-            }]),
-        ];
-        let cells = cells_from_history(&messages);
-        assert_eq!(
-            cells,
-            vec![
-                Cell::User("plan it".into()),
-                Cell::Todo(vec![
-                    todo("Parse", "Parsing", TodoStatus::Completed),
-                    todo("Test", "Testing", TodoStatus::InProgress),
-                ]),
-                Cell::Note("resumed session — 3 message(s)".into()),
-            ],
-            "a historical todo_write replays as its checklist, not a tool row"
-        );
-    }
-
     #[test]
     fn typing_editing_and_submit() {
         let mut app = App::new("s".into());
@@ -2117,19 +1951,16 @@ mod tests {
     }
 
     /// Steering (Enter while a turn runs) queues the text as Command::Steer and
-    /// shows it as a User cell, but does not end/restart the turn or reset the
-    /// live todo block.
+    /// shows it as a User cell without ending or restarting the turn.
     #[test]
     fn steering_while_running_queues_without_a_new_turn() {
         let mut app = App::new("s".into());
         app.running = true;
-        app.todo_cell = Some(0);
         type_str(&mut app, "also do X");
         let cmd = app.on_key(key(KeyCode::Enter));
         assert_eq!(cmd, Command::Steer("also do X".into()));
         assert!(app.running, "steering does not end or restart the turn");
         assert_eq!(app.composer.text(), "");
-        assert_eq!(app.todo_cell, Some(0), "a steer keeps the live todo block");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
     }
 
@@ -2177,8 +2008,8 @@ mod tests {
     }
 
     /// An idle slash line routes to the worker as Command::Slash and marks the
-    /// app busy, without pushing a User cell or starting a todo block. While a
-    /// turn runs, the same text is steering — Ctrl+C is the only hard stop.
+    /// app busy without pushing a User cell. While a turn runs, the same text is
+    /// steering — Ctrl+C is the only hard stop.
     #[test]
     fn slash_command_routes_only_when_idle() {
         let mut app = App::new("s".into());
@@ -2205,7 +2036,6 @@ mod tests {
         let mut app = App::new("s".into());
         app.cells.push(Cell::User("earlier".into()));
         app.tool_cells.insert("t1".into(), 0);
-        app.todo_cell = Some(3);
 
         app.apply(AgentEvent::System(
             "model: x\ncontext: ~0 / 100 tokens (0%)".into(),
@@ -2224,7 +2054,6 @@ mod tests {
         assert!(app.tool_cells.is_empty());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
-        assert_eq!(app.todo_cell, None);
 
         // A terminal update arriving after clear has no stale row to mutate, so it
         // starts a fresh linked lifecycle row rather than disappearing.

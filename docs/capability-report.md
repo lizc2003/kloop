@@ -388,7 +388,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 
 两家被海量用户长期锤过;kloop 的真 key 验收是每能力单场景闭环。长会话稳定性、大
 repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood**:
-- 建议下一步：按已确认顺序实现 PDF 原生分页读取，再做 session-scoped Task V2；两项都继续用 kloop 自身 dogfood；
+- **Task V2 已销账（Plan 71，2026-08-10）**：session-scoped `task_create/get/update/list`、稳定 ID、owner、强约束 dependency graph 与 main/foreground/background Agent 共享已落地；`todo_write` 已删除。继续用真实任务 dogfood；下一产品切片回到 PDF 原生分页读取；
 - 之后每个 plan 的实现会话尽量在 kloop 里跑,痛点直接变本报告新行;
 - 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯五类边界(多字节、
   大小写、Drop/Weak、预算耗尽、截断累积)。
@@ -401,7 +401,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 下一产品切片**：先做 `read_file` PDF 原生分页读取；随后实现 session-scoped Task V2（`task_create/get/update/list`），`task_*` 已由 Plan 66 释放并预留。
+- **T0 下一产品切片**：`read_file` PDF 原生分页读取仍待实现。session-scoped Task V2 已由 **Plan 71（2026-08-10）** 完成：`task_create/get/update/list`、稳定 ID、强依赖图、同 session Agent 共享；旧 `todo_write` 已删除。
 - **T0 架构与 correctness**：Plan 61–66 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，Plan 66 已把后台资源名与 ID 域分开。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。

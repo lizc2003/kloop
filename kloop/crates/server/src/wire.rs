@@ -126,12 +126,10 @@ fn status_str(s: ItemStatus) -> &'static str {
 }
 
 /// Serialize a core [`Item`] to its wire object: a camelCase `type` tag plus
-/// `id`, `status`, and the type's own fields. `fallback` is the status for the
-/// items that carry none of their own (message/reasoning/todo) — derived from
-/// whether the event was a start or a completion. A tool call carries the full
+/// `id`, `status`, and the type's own fields. A tool call carries the full
 /// `input` both times (the wire no longer sends a summary); `output` and the
 /// sub-agent `agent` label appear only when present.
-fn item_json(id: &str, item: &Item, fallback: &'static str) -> Value {
+fn item_json(id: &str, item: &Item) -> Value {
     match item {
         Item::AssistantMessage { text, status } => {
             json!({"id": id, "type": "assistantMessage", "status": status_str(*status), "text": text})
@@ -166,13 +164,6 @@ fn item_json(id: &str, item: &Item, fallback: &'static str) -> Value {
             "id": id, "type": "subAgent", "label": label, "task": task,
             "status": status_str(*status),
         }),
-        Item::Todo { agent, items } => {
-            let mut o = json!({"id": id, "type": "todo", "status": fallback, "todos": items});
-            if !agent.is_empty() {
-                o["agent"] = Value::String(agent.clone());
-            }
-            o
-        }
     }
 }
 
@@ -184,7 +175,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
     match ev {
         Event::ItemStarted { id, item } => Some((
             "item/started",
-            json!({"turnId": turn_id, "item": item_json(id, item, "inProgress")}),
+            json!({"turnId": turn_id, "item": item_json(id, item)}),
         )),
         Event::ItemDelta { id, delta } => {
             let (channel, text) = match delta {
@@ -199,7 +190,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         }
         Event::ItemCompleted { id, item } => Some((
             "item/completed",
-            json!({"turnId": turn_id, "item": item_json(id, item, "completed")}),
+            json!({"turnId": turn_id, "item": item_json(id, item)}),
         )),
         Event::BackgroundTaskUpdated(task) => {
             let kind = match task.kind {

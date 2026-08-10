@@ -1184,9 +1184,10 @@ impl CallFacts {
             // tool_search only reads tool definitions and marks them
             // unlocked; the unlocked tool's own calls still pass this gate.
             "tool_search" | "cron_list" => true,
-            // todo_write mutates only the in-memory task list — nothing on
-            // the user's system to sign off on (cc never prompts for it).
-            "todo_write" => true,
+            // The task graph mutates only session memory — nothing on the
+            // user's system to sign off on. Dispatcher concurrency still
+            // serializes create/update independently of this permission fact.
+            "task_create" | "task_get" | "task_update" | "task_list" => true,
             // skill only loads a local skill file's instructions into the
             // conversation — no system side effect (cc never prompts to
             // activate one); tools those instructions later prompt are gated
@@ -1734,7 +1735,9 @@ mod tests {
         assert!(ok(&p, "tool_search", json!({"query": "select:x"})).await);
         assert!(ok(&p, "skill", json!({"name": "fixture"})).await);
         assert!(ok(&p, "list_mcp_resources", json!({})).await);
-        assert!(ok(&p, "todo_write", json!({"todos": []})).await);
+        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+            assert!(ok(&p, task_tool, json!({})).await);
+        }
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
         assert!(ok(&p, "bash", bash("sed -n 1,20p f.rs")).await);
         assert_eq!(approver.ask_count(), 0);
@@ -2630,6 +2633,9 @@ mod tests {
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "bash", bash("git status && ls")).await);
         assert!(ok(&p, "run_agent", json!({"prompt": "look around"})).await);
+        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+            assert!(ok(&p, task_tool, json!({})).await);
+        }
         assert!(ok(&p, "exit_plan_mode", json!({"plan": "do X"})).await);
         // Writes and side-effecting bash are refused.
         for (name, input) in [

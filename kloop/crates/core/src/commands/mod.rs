@@ -188,7 +188,7 @@ mod tests {
     use kloop_protocol::Message;
 
     /// A Config wired to the given provider; only the fields the commands read
-    /// (provider/model/context_window/todos/inbox) matter here.
+    /// (provider/model/context_window/tasks/inbox) matter here.
     fn test_cfg(provider: kloop_provider::Provider, window: Option<u64>) -> Arc<Config> {
         let inbox = Arc::new(crate::inbox::Inbox::default());
         Arc::new(Config {
@@ -219,7 +219,7 @@ mod tests {
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
-            todos: Default::default(),
+            tasks: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: crate::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
@@ -306,18 +306,28 @@ mod tests {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("some earlier work"));
-        cfg.todos.lock().unwrap().push(crate::tools::TodoItem {
-            content: "leftover".into(),
-            active_form: "doing".into(),
-            status: crate::tools::TodoStatus::InProgress,
-        });
+        let mut task_ctx = crate::tools::testutil::test_ctx(0, "command-clear");
+        task_ctx.cfg = Arc::clone(&cfg);
+        let (output, is_error) = crate::tools::testutil::run_tool(
+            "task_create",
+            serde_json::json!({"subject":"leftover","description":"clear me"}),
+            &task_ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
         cfg.inbox
             .push(crate::inbox::InboxItem::Steer("stale steer".into()));
 
         let result = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
         assert_eq!(result, SlashResult::cleared_message("conversation cleared"));
         assert!(history.messages().is_empty());
-        assert!(cfg.todos.lock().unwrap().is_empty());
+        let (tasks, is_error) =
+            crate::tools::testutil::run_tool("task_list", serde_json::json!({}), &task_ctx).await;
+        assert!(!is_error, "{tasks}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tasks).unwrap(),
+            serde_json::json!({"tasks": []})
+        );
         assert!(cfg.inbox.is_empty());
     }
 

@@ -351,20 +351,18 @@ pub struct Config {
     /// before dispatch. Shared into sub-agent configs so a parent's discoveries
     /// carry over.
     pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashMap<String, u64>>>,
-    /// The structured task list the model maintains via todo_write (full-table
-    /// replace). Session-scoped process state, not history: it survives across
-    /// turns within a session and starts empty on resume (the model rebuilds
-    /// it from its own todo_write calls replayed in history). Each sub-agent
-    /// gets its OWN fresh list — run_agent resets this on the cloned
-    /// Config so a sub-agent's planning never touches the parent's.
-    pub todos: Arc<std::sync::Mutex<Vec<crate::tools::TodoItem>>>,
+    /// Session-scoped structured task graph shared by the main Agent and every
+    /// child Agent cloned from this Config. It is process state, not history or
+    /// durable storage: a fresh Config (including resume) starts with an empty
+    /// graph. Unlike the retired per-Agent todo list, sub-agents clone this Arc.
+    pub tasks: Arc<crate::tools::TaskRegistry>,
     /// Step-boundary injection queue (plans 22, 26, and 51). Items pushed here —
     /// user steering, detached-task results, or a background shell's terminal
     /// notification — are drained at round boundaries (never mid-request) and
     /// recorded as user messages before the next sampling, each with its own
     /// framing. Each sub-agent gets its OWN fresh queue (run_agent resets it
-    /// on the cloned Config, like `todos`) so a parent's steering is never drained
-    /// by a running sub-agent; a *background* sub-agent instead reinjects into a
+    /// on the cloned Config) so a parent's steering is never drained by a
+    /// running sub-agent; a *background* sub-agent instead reinjects into a
     /// clone of the PARENT's queue captured before the reset. A background shell
     /// notifies the inbox of the agent that launched it while keeping command
     /// output in its file. The front-end also holds a clone of this Arc to enqueue
@@ -479,7 +477,7 @@ impl Config {
             tool_allowlist: self.tool_allowlist.clone(),
             defer_threshold: self.defer_threshold,
             unlocked_tools: Arc::clone(&self.unlocked_tools),
-            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tasks: Arc::clone(&self.tasks),
             inbox: Arc::new(Inbox::default()),
             scheduler: Arc::clone(&self.scheduler),
             background_executions: Arc::clone(&self.background_executions),
@@ -518,7 +516,7 @@ impl Config {
             tool_allowlist: self.tool_allowlist.clone(),
             defer_threshold: self.defer_threshold,
             unlocked_tools: Arc::clone(&self.unlocked_tools),
-            todos: Arc::clone(&self.todos),
+            tasks: Arc::clone(&self.tasks),
             inbox: Arc::clone(&self.inbox),
             scheduler: Arc::clone(&self.scheduler),
             background_executions: Arc::clone(&self.background_executions),

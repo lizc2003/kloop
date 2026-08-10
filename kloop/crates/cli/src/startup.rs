@@ -952,7 +952,7 @@ pub(crate) fn config_from_settings(
         tool_allowlist: None,
         defer_threshold: runtime.defer_threshold,
         unlocked_tools: Default::default(),
-        todos: Default::default(),
+        tasks: Default::default(),
         inbox,
         scheduler,
         program_limits: runtime.program_limits,
@@ -968,12 +968,12 @@ pub(crate) fn config_from_settings(
     })
 }
 
-/// Scripted turns for `--mock`, exercising all five bets (plus the todo list)
-/// without an API key: round 1 lays out a todo list, round 2 batches two
-/// read-only bash calls concurrently, round 3 runs an unsafe command whose
-/// oversized output triggers offloading, round 4 reads it back, round 5 spawns
-/// a sub-agent (round 6 is the sub-agent's own reply), round 7 finishes with
-/// plain text.
+/// Scripted turns for `--mock`, exercising all five bets plus the shared Task V2
+/// graph without an API key: rounds 1–2 create and inspect dependent tasks,
+/// round 3 batches two read-only bash calls concurrently, round 4 runs an unsafe
+/// command whose oversized output triggers offloading, round 5 reads it back,
+/// round 6 spawns a sub-agent (round 7 is the sub-agent's own reply), and round 8
+/// finishes with plain text.
 fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
     let tool_use = |id: &str, name: &str, input: serde_json::Value| AssistantBlock::ToolUse {
         id: id.into(),
@@ -983,16 +983,31 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
     let text = |t: &str| AssistantBlock::Text { text: t.into() };
     vec![
         vec![
-            text("Planning the demo as a todo list…\n"),
+            text("Creating a shared task graph…\n"),
             tool_use(
                 "t0",
-                "todo_write",
-                json!({"todos": [
-                    {"content": "Look around", "activeForm": "Looking around", "status": "in_progress"},
-                    {"content": "Offload a big output and read it back", "activeForm": "Offloading a big output", "status": "pending"},
-                    {"content": "Delegate to a sub-agent", "activeForm": "Delegating to a sub-agent", "status": "pending"},
-                ]}),
+                "task_create",
+                json!({"subject":"Look around","description":"Inspect the workspace"}),
             ),
+            tool_use(
+                "t0b",
+                "task_create",
+                json!({
+                    "subject":"Offload a big output",
+                    "description":"Generate a large result and read it back",
+                    "blocked_by":["1"]
+                }),
+            ),
+        ],
+        vec![
+            text("Completing the blocker and inspecting the graph…\n"),
+            tool_use(
+                "t0c",
+                "task_update",
+                json!({"task_id":"1","status":"completed"}),
+            ),
+            tool_use("t0d", "task_get", json!({"task_id":"2"})),
+            tool_use("t0e", "task_list", json!({})),
         ],
         vec![
             text("Looking around (these two run as one concurrent batch)…\n"),
@@ -1013,7 +1028,9 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
         ],
         // consumed by the sub-agent's own run_turn
         vec![text("hi from the sub-agent")],
-        vec![text("Demo complete: parallel batch, offload + read-back, and a sub-agent all worked.")],
+        vec![text(
+            "Demo complete: shared tasks, parallel batch, offload + read-back, and a sub-agent all worked.",
+        )],
     ]
 }
 

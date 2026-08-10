@@ -449,13 +449,17 @@ async fn inbox_final_boundary_report() -> Value {
 }
 
 async fn native_surface_report() -> Value {
-    const EXPECTED_NATIVE: [&str; 5] = [
+    const EXPECTED_NATIVE: [&str; 8] = [
         "run_agent",
-        "todo_write",
+        "task_create",
+        "task_get",
+        "task_update",
+        "task_list",
         "wait_for_activity",
         "stop_agent",
         "stop_program",
     ];
+    const DEPTH_ONE_TASKS: [&str; 4] = ["task_create", "task_get", "task_update", "task_list"];
     const CLAUDE_SURFACES: [&str; 10] = [
         "Agent",
         "TaskCreate",
@@ -491,12 +495,12 @@ async fn native_surface_report() -> Value {
         .collect();
     assert_eq!(native_zero, EXPECTED_NATIVE);
     assert_eq!(
-        EXPECTED_NATIVE
+        DEPTH_ONE_TASKS
             .iter()
             .copied()
             .filter(|name| names_one.contains(name))
             .collect::<Vec<_>>(),
-        vec!["todo_write"]
+        DEPTH_ONE_TASKS
     );
     let claude_present: Vec<&str> = CLAUDE_SURFACES
         .iter()
@@ -512,28 +516,50 @@ async fn native_surface_report() -> Value {
         .clone();
 
     let ctx = test_ctx(0, "plan52-native-surface");
-    let (first_todo, first_error) = run_tool(
-        "todo_write",
-        json!({"todos": [
-            {"content": "first", "activeForm": "doing first", "status": "in_progress"},
-            {"content": "second", "activeForm": "doing second", "status": "pending"}
-        ]}),
+    let (blocker, blocker_error) = run_tool(
+        "task_create",
+        json!({"subject":"first","description":"finish first"}),
         &ctx,
     )
     .await;
-    assert!(!first_error, "{first_todo}");
-    let (second_todo, second_error) = run_tool(
-        "todo_write",
-        json!({"todos": [
-            {"content": "replacement", "activeForm": "replacing", "status": "completed"}
-        ]}),
+    assert!(!blocker_error, "{blocker}");
+    let (dependent, dependent_error) = run_tool(
+        "task_create",
+        json!({
+            "subject":"second",
+            "description":"wait for first",
+            "blocked_by":["1"]
+        }),
         &ctx,
     )
     .await;
-    assert!(!second_error, "{second_todo}");
-    let final_todos = ctx.cfg.todos.lock().unwrap().clone();
-    assert_eq!(final_todos.len(), 1);
-    assert_eq!(final_todos[0].content, "replacement");
+    assert!(!dependent_error, "{dependent}");
+    let (blocked_start, blocked_start_error) = run_tool(
+        "task_update",
+        json!({"task_id":"2","status":"in_progress"}),
+        &ctx,
+    )
+    .await;
+    assert!(blocked_start_error, "{blocked_start}");
+    let (complete_blocker, complete_blocker_error) = run_tool(
+        "task_update",
+        json!({"task_id":"1","status":"completed"}),
+        &ctx,
+    )
+    .await;
+    assert!(!complete_blocker_error, "{complete_blocker}");
+    let (start_dependent, start_dependent_error) = run_tool(
+        "task_update",
+        json!({"task_id":"2","status":"in_progress","owner":"agent-1"}),
+        &ctx,
+    )
+    .await;
+    assert!(!start_dependent_error, "{start_dependent}");
+    let (get_dependent, get_dependent_error) =
+        run_tool("task_get", json!({"task_id":"2"}), &ctx).await;
+    assert!(!get_dependent_error, "{get_dependent}");
+    let (list_tasks, list_tasks_error) = run_tool("task_list", json!({}), &ctx).await;
+    assert!(!list_tasks_error, "{list_tasks}");
 
     ctx.cfg
         .inbox
@@ -552,13 +578,17 @@ async fn native_surface_report() -> Value {
 
     json!({
         "depth_zero_native_tools": native_zero,
-        "depth_one_native_tools": ["todo_write"],
+        "depth_one_native_tools": DEPTH_ONE_TASKS,
         "claude_named_tools_present": claude_present,
         "agent_schema": agent_schema,
-        "todo": {
-            "first_result": first_todo,
-            "second_result": second_todo,
-            "final_items": final_todos,
+        "task_graph": {
+            "blocker": blocker,
+            "dependent": dependent,
+            "blocked_start": {"result": blocked_start, "is_error": blocked_start_error},
+            "complete_blocker": complete_blocker,
+            "start_dependent": start_dependent,
+            "get_dependent": get_dependent,
+            "list": list_tasks,
         },
         "wait_for_activity": {
             "result": wait_output,

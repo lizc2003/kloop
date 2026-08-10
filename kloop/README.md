@@ -550,9 +550,8 @@ project directory.
 turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
 `item/started` / `item/delta {itemId, channel, text}` (channel ∈
 `text`/`reasoning`/`output`) / `item/completed`, where `item.type` ∈
-`assistantMessage` / `reasoning` / `toolCall` / `subAgent` / `todo` (a tool
-call carries its full `input`, and `output` + `agent` label when present; a
-`todo_write` surfaces only as a `todo` item, never a tool row); plus
+`assistantMessage` / `reasoning` / `toolCall` / `subAgent` (a tool call
+carries its full `input`, and `output` + `agent` label when present); plus
 `thread/backgroundTask/updated {task:{id, kind, description, status,
 outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present for Program `run-*` and Workflow `wf_*`; **no
 `turnId`**, because completion may arrive after the launching turn),
@@ -1491,35 +1490,46 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Todo list (Phase 2, fourteenth slice)
+## Shared task graph (Plan 71)
 
-`todo_write` (`core/src/tools/todo.rs`) is cc's TodoWrite: a single tool the
-model uses to keep a structured task list, so multi-step work stays coherent
-and its progress is visible. It is **full-table replacement** — the model
-sends the entire list every call (each item is `{content, activeForm,
-status}`, `status ∈ pending | in_progress | completed`, no ids), so there is
-no incremental state to drift. Validation is minimal (non-empty list,
-non-empty content/activeForm, valid status); multiple `in_progress` items are
-allowed (cc's one-at-a-time is guidance carried in the tool description, not a
-hard rule).
+Task V2 is a **session-scoped structured graph** shared by the main Agent and
+all foreground/background child Agents created from its `Config`. Four native
+snake_case tools form the complete first slice:
 
-The list is **session-scoped process state on the `Config`, not history**: it
-survives across turns within a session and starts empty on resume — the model
-rebuilds it from its own `todo_write` calls replayed in history (the TUI
-replays each historical call as its checklist too). Each **sub-agent gets its
-own fresh list** (the `run_agent` tool resets it on the cloned Config), so a
-sub-agent's planning never touches the parent's. It has no external side
-effect, so the permission gate auto-allows it (read-only self-verdict); it
-runs serially (full-table replace has ordering).
+- `task_create {subject, description, owner?, blocked_by?}` creates a pending
+  task and returns an opaque stable ID (`"1"`, `"2"`, …).
+- `task_get {task_id}` returns the full record, including direct `blocked_by`
+  dependencies and the computed reverse `blocks` projection.
+- `task_update {task_id, ...patch}` atomically changes subject, description,
+  status, owner, or the complete `blocked_by` list; `owner:null` clears owner.
+- `task_list {}` returns compact records in numeric-ID order; use `task_get`
+  for the full description.
 
-Rendering: `todo_write` never shows as a generic tool row — core emits only a
-`todo` item for it (no `toolCall`), which renders as a checklist. The TUI keeps
-one `Cell::Todo` per turn, updated in place as the list evolves (a new user turn
-starts a fresh block); the plain REPL prints the marked list; the native
-protocol server emits a `todo` item (`item/completed`) with the full list (a
-sub-agent's carries an `agent` field). A sub-agent's list stays internal to the
-TUI transcript (lesson 3), the way its text does. Not done (deliberate): dependency graphs, cross-session todo
-stores, rollout persistence of the list.
+Statuses are `pending | in_progress | completed`. They move only forward:
+`pending` may become in-progress or completed, and in-progress may complete;
+completed tasks cannot reopen. A task cannot enter a non-pending state until
+all blockers are completed. Missing dependencies, self-dependencies, duplicate
+edges, and cycles fail atomically without consuming an ID or partially changing
+the graph. Completed tasks remain addressable; the first slice has no delete,
+filters, pagination, metadata, or active-form field.
+
+The registry is an `Arc<TaskRegistry>` on `Config`: child Agents clone that Arc,
+while independent CLI sessions/native server threads and a resumed process get
+fresh empty registries. It is not written to rollout or reconstructed from
+history, and owner is only a coordination label — it does not claim a live
+Agent, route mailbox messages, or bind an execution resource. `/clear` empties
+the graph but keeps the live registry's ID high-water mark so a running peer
+cannot observe an ID being reused. The registry is bounded to 256 tasks, 256
+blockers per task, 200-character single-line subjects/owners, and 8 KiB
+descriptions.
+
+Task calls use the ordinary `toolCall` event/wire lifecycle; there is no task
+board item or special frontend state. The permission gate auto-allows these
+session-memory operations (including in plan mode), while dispatcher
+classification keeps create/update serial and get/list concurrency-safe.
+Program JavaScript cannot call the task tools directly; real child Agents it
+launches can. `todo_write` and its checklist UI/wire path were removed rather
+than retained as a second, drifting task model.
 
 ## Steering — mid-turn injection (Phase 2, fifteenth slice)
 
@@ -1552,8 +1562,7 @@ tool results with regular text — the ordering constraint both cc and codex cal
 out.
 
 Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
-cloned Config, like the todo list), so a running sub-agent never drains the
-parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
+cloned Config), so a running sub-agent never drains the parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
 a User cell); server mode enqueues via `turn/steer {threadId, input}` (while a
 turn runs it folds in at the next round boundary; while idle the thread worker's
 inbox-activity branch allocates a delivery turn). The plain REPL cannot accept a
@@ -1578,8 +1587,8 @@ the model. The set is small and lives one-file-per-command under
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an
   append-only compacted-to-nothing marker that resume replays to empty; it
-  does **not** fork a new session file). Process-state (todos, steering queue)
-  resets too.
+  does **not** fork a new session file). Process-state (the shared task graph and
+  steering queue) resets too.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C); in server mode it is inert — quitting one
   thread must not stop a multi-session process, so it just relays a note.
@@ -1964,9 +1973,10 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
   Code `Agent` requires both `description` and `prompt` and defaults to background
   unless `run_in_background:false` is explicit.
-- `todo_write` is a full-table checklist, not Claude Code's stable-ID Task
-  registry. There are currently no kloop `TaskCreate/Get/List/Update/Output/Stop`
-  aliases; `task_*` is reserved for the native Task V2 graph.
+- kloop exposes the native snake_case `task_create/get/update/list` graph above,
+  not PascalCase Claude Code adapters. There are no `TaskOutput`/`TaskStop`
+  aliases: those names belong to execution resources in Claude Code, while
+  kloop keeps graph state separate from Agent/Program/Workflow/Shell lifecycle.
 - `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
   `stop_program`, `stop_workflow`, and `stop_bash` deliberately replace a
   universal TaskStop façade.
@@ -1976,12 +1986,14 @@ renamed the native surface without adding compatibility aliases:
 - Consecutive synchronous `run_agent` calls remain dispatcher-parallel; detached
   agent/program/workflow work remains capped at 8 per session.
 
-The Plan 52 executable report consumes the renamed agent/todo/wait surface while
-retaining the original Claude Code fixture corpus. Plan 66's dispatcher tests
-separately lock all twelve cross-resource stop combinations, the durable `wf_*`
-boundary, and strict background/wait parsing. See
-`docs/plan/52-agent-task-team-parity.md` and
-`docs/plan/66-background-tool-naming.md`.
+The Plan 52 executable report now consumes the native run_agent/task-graph/wait
+surface while retaining the original Claude Code fixture corpus. Plan 66's
+dispatcher tests separately lock all twelve cross-resource stop combinations,
+the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 owns
+the later Task V2 product contract and removal of the old checklist. See
+`docs/plan/52-agent-task-team-parity.md`,
+`docs/plan/66-background-tool-naming.md`, and
+`docs/plan/71-task-v2-session-graph.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

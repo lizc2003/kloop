@@ -18,7 +18,6 @@ use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
-use kloop_core::tools::TodoStatus;
 
 /// ANSI-color a diff preview for the plain REPL: additions green, deletions
 /// red, everything else (context, hunk gaps, markers) dim.
@@ -333,24 +332,6 @@ impl StdoutUi {
             Self::print_piece(kind, text);
         }
     }
-
-    /// The checklist a todo update renders (its own block, not a one-line note).
-    fn todo_checklist(&self, agent: &str, todos: &[kloop_core::tools::TodoItem]) {
-        let prefix = if agent.is_empty() {
-            String::new()
-        } else {
-            format!("{agent} · ")
-        };
-        eprintln!("\x1b[2m[{prefix}todos]\x1b[0m");
-        for todo in todos {
-            let (mark, text) = match todo.status {
-                TodoStatus::Completed => ("✓", &todo.content),
-                TodoStatus::InProgress => ("▶", &todo.active_form),
-                TodoStatus::Pending => ("○", &todo.content),
-            };
-            eprintln!("\x1b[2m  {mark} {text}\x1b[0m");
-        }
-    }
 }
 
 impl Ui for StdoutUi {
@@ -380,10 +361,6 @@ impl Ui for StdoutUi {
                 id,
                 item: Item::Reasoning { text, .. },
             } => self.finish_item(id, PlainItemKind::Reasoning, text),
-            Event::ItemCompleted {
-                item: Item::Todo { agent, items },
-                ..
-            } => self.todo_checklist(agent, items),
             // Tool starts, sub-agent lifecycle, cwd/mode changes, and notes all
             // reduce to the one-line dim note they showed before plan 39.
             other => {

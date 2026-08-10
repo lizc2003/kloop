@@ -1121,7 +1121,7 @@ mod tests {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
-                todos: Default::default(),
+                tasks: Default::default(),
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),

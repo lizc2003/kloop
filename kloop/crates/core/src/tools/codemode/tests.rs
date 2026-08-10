@@ -1131,16 +1131,27 @@ fn ts_type_covers_common_shapes() {
 }
 
 #[test]
-fn program_surface_excludes_run_program_and_run_agent() {
+fn program_surface_excludes_agent_and_task_control_tools() {
     let names = program_tool_names(&[], &crate::shell_programs::ShellPrograms::test_fixture());
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
-    assert!(!names.iter().any(|n| n == "run_program"));
-    assert!(!names.iter().any(|n| n == "run_agent"));
-    assert!(!names.iter().any(|n| n == "bash_output"));
-    assert!(!names.iter().any(|n| n == "stop_bash"));
-    assert!(!names.iter().any(|n| n == "send_message"));
-    assert!(!names.iter().any(|n| n == "list_agents"));
+    for excluded in [
+        "run_program",
+        "run_agent",
+        "bash_output",
+        "stop_bash",
+        "send_message",
+        "list_agents",
+        "task_create",
+        "task_get",
+        "task_update",
+        "task_list",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == excluded),
+            "{excluded} must not be callable from Program JavaScript"
+        );
+    }
 }
 
 #[tokio::test]

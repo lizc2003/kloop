@@ -239,7 +239,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
-            todos: Default::default(),
+            tasks: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
@@ -381,7 +381,7 @@ fn worktree_factory(
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
-            todos: Default::default(),
+            tasks: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
@@ -1241,21 +1241,14 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// A todo_write call surfaces as a `todo` item (not a generic tool row)
-/// carrying the full list; the main agent's carries no "agent" field, and there
-/// is no separate `toolCall` item for it (core no longer double-emits).
+/// Task V2 uses the ordinary toolCall lifecycle; the native wire has no
+/// task-board or retired todo item type.
 #[tokio::test]
-async fn todo_write_surfaces_as_a_todo_item() {
-    let dirs = test_dirs("todo");
+async fn task_create_surfaces_as_an_ordinary_tool_call() {
+    let dirs = test_dirs("task-create");
+    let input = json!({"subject":"Parse","description":"Parse the input"});
     let turns = vec![
-        vec![tool_use(
-            "t1",
-            "todo_write",
-            json!({"todos": [
-                {"content": "Parse", "activeForm": "Parsing", "status": "in_progress"},
-                {"content": "Test", "activeForm": "Testing", "status": "pending"},
-            ]}),
-        )],
+        vec![tool_use("t1", "task_create", input.clone())],
         vec![text("done")],
     ];
     let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
@@ -1266,28 +1259,86 @@ async fn todo_write_surfaces_as_a_todo_item() {
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
 
-    // No toolCall item for todo_write — only the todo item.
     assert!(
-        !log.iter().any(|m| m["params"]["item"]["type"] == "toolCall"
-            && m["params"]["item"]["name"] == "todo_write"),
-        "todo_write must not surface as a tool row: {log:?}"
+        !log.iter()
+            .any(|message| message["params"]["item"]["type"] == "todo"),
+        "the retired todo item type must be absent: {log:?}"
     );
-    let todo = log
+    let calls = log
         .iter()
-        .find(|m| m["params"]["item"]["type"] == "todo")
-        .expect("a todo item");
-    assert_eq!(todo["method"], "item/completed");
-    assert_eq!(
-        todo["params"]["item"]["todos"],
-        json!([
-            {"content": "Parse", "activeForm": "Parsing", "status": "in_progress"},
-            {"content": "Test", "activeForm": "Testing", "status": "pending"},
-        ])
-    );
-    assert!(
-        todo["params"]["item"].get("agent").is_none(),
-        "the main agent's list carries no agent field"
-    );
+        .filter(|message| {
+            message["params"]["item"]["type"] == "toolCall"
+                && message["params"]["item"]["name"] == "task_create"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "started and completed toolCall: {log:?}");
+    assert_eq!(calls[0]["method"], "item/started");
+    assert_eq!(calls[0]["params"]["item"]["input"], input);
+    assert_eq!(calls[1]["method"], "item/completed");
+    assert_eq!(calls[1]["params"]["item"]["status"], "completed");
+    assert!(calls[1]["params"]["item"]["output"]
+        .as_str()
+        .is_some_and(|output| output.contains("\"id\":\"1\"")));
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn task_graph_is_isolated_per_server_thread() {
+    let dirs = test_dirs("task-thread-isolation");
+    let turns = vec![
+        vec![tool_use(
+            "t1",
+            "task_create",
+            json!({"subject":"Thread task","description":"must stay local"}),
+        )],
+        vec![text("done")],
+    ];
+    let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client.request("thread/start", json!({})).await;
+    let first = client.recv().await["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.request("thread/start", json!({})).await;
+    let second = client.recv().await["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .request("turn/start", json!({"threadId":first,"input":"create"}))
+        .await;
+    client
+        .request("turn/start", json!({"threadId":second,"input":"create"}))
+        .await;
+    let mut completed = 0;
+    let log = client
+        .recv_until(|message| {
+            if message["method"] == "turn/completed" {
+                completed += 1;
+            }
+            completed == 2
+        })
+        .await;
+    for thread_id in [&first, &second] {
+        let output = log
+            .iter()
+            .find(|message| {
+                message["method"] == "item/completed"
+                    && message["params"]["threadId"] == *thread_id
+                    && message["params"]["item"]["name"] == "task_create"
+            })
+            .and_then(|message| message["params"]["item"]["output"].as_str())
+            .unwrap_or_else(|| panic!("missing task_create completion for {thread_id}: {log:?}"));
+        let output: Value = serde_json::from_str(output).unwrap();
+        assert_eq!(
+            output["task"]["id"], "1",
+            "each server thread owns a fresh registry"
+        );
+    }
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
@@ -1344,7 +1395,7 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// A task call surfaces the sub-agent lifecycle on the wire: a `subAgent` item
+/// A run_agent call surfaces the sub-agent lifecycle on the wire: a `subAgent`
 /// brackets it, and the sub-agent's own tool calls carry an "agent" field while
 /// the main agent's calls stay unadorned.
 #[tokio::test]

@@ -34,7 +34,7 @@ mod scheduler;
 mod search;
 mod skill;
 mod subagent;
-mod todo;
+mod task;
 mod tool_search;
 pub mod web;
 mod workflow;
@@ -53,9 +53,7 @@ pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the run_agent sub-agent machinery.
 pub(crate) use subagent::fork_skill;
-pub use todo::parse_todos;
-pub use todo::TodoItem;
-pub use todo::TodoStatus;
+pub use task::TaskRegistry;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -393,6 +391,7 @@ fn reserved_builtin_names() -> std::collections::HashSet<String> {
             "task",
             "wait",
             "kill_bash",
+            "todo_write",
         ]
         .into_iter()
         .map(String::from),
@@ -475,7 +474,7 @@ pub(super) fn source_definition_generation(
     source_definition_snapshot(sources, name).map(|(_, generation)| generation)
 }
 
-/// The built-in tool defs (bash, file, search, todo, and — at depth 0 —
+/// The built-in tool defs (bash, file, search, tasks, and — at depth 0 —
 /// `run_agent`). This is the set `run_program` derives its TypeScript API from, so
 /// it deliberately excludes `run_program` itself: no self-reference, and no
 /// throwaway description regeneration when only counting is needed.
@@ -669,9 +668,10 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             .expect("bash properties are an object")
             .remove("disable_sandbox");
     }
-    // Available at every depth: sub-agents can plan and coordinate with peers,
-    // while run_agent itself remains depth-0 only.
-    defs.push(todo::todo_write_def());
+    // Available at every depth: sub-agents can coordinate through the shared
+    // session task graph and local Agent mailbox, while run_agent itself
+    // remains depth-0 only.
+    defs.extend(task::tool_defs());
     defs.extend(agent_message::tool_defs());
     if depth == 0 {
         defs.push(ToolDef {
@@ -772,8 +772,10 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
                     crate::shell::BashAnalysis::Opaque => false,
                 })
         }
-        "ask_user_question" | "workflow" | "cron_list" | "list_agents" => true,
-        "send_message" | "cron_create" | "cron_delete" | "schedule_wakeup" => false,
+        "ask_user_question" | "workflow" | "cron_list" | "list_agents" | "task_get"
+        | "task_list" => true,
+        "send_message" | "cron_create" | "cron_delete" | "schedule_wakeup" | "task_create"
+        | "task_update" => false,
         // Consecutive run_agent calls may run in parallel; child tool calls are
         // still gated independently.
         "run_agent" => true,
@@ -858,23 +860,17 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 }
 
 async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
-    // todo_write surfaces only as its `Todo` item (emitted from the tool itself),
-    // never as a generic tool row: cc renders the checklist in the call's place.
-    // Suppressing the ToolCall events here means no front-end needs a skip.
-    let tool_row = name != "todo_write";
     let event_input = agent_message::event_input(&name, &input);
-    if tool_row {
-        ctx.ui.emit(&Event::ItemStarted {
-            id: id.clone(),
-            item: Item::ToolCall {
-                agent: ctx.cfg.agent_label().to_string(),
-                name: name.clone(),
-                input: event_input.clone(),
-                status: ItemStatus::InProgress,
-                output: None,
-            },
-        });
-    }
+    ctx.ui.emit(&Event::ItemStarted {
+        id: id.clone(),
+        item: Item::ToolCall {
+            agent: ctx.cfg.agent_label().to_string(),
+            name: name.clone(),
+            input: event_input.clone(),
+            status: ItemStatus::InProgress,
+            output: None,
+        },
+    });
     // Once a foreground shell has spawned, its own cancellation branch must
     // finish process-tree cleanup before we emit interrupted. Earlier
     // cancellation (hooks/permission) still drops the gated future, so no
@@ -1101,22 +1097,20 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     // output would otherwise be cloned onto the event channel wholesale. The UI
     // truncates further for display.
     let output: String = content.as_text().chars().take(4000).collect();
-    if tool_row {
-        ctx.ui.emit(&Event::ItemCompleted {
-            id: tool_use_id.clone(),
-            item: Item::ToolCall {
-                agent: ctx.cfg.agent_label().to_string(),
-                name: name.clone(),
-                input: event_input,
-                status: if *is_error {
-                    ItemStatus::Failed
-                } else {
-                    ItemStatus::Completed
-                },
-                output: (!output.is_empty()).then_some(output),
+    ctx.ui.emit(&Event::ItemCompleted {
+        id: tool_use_id.clone(),
+        item: Item::ToolCall {
+            agent: ctx.cfg.agent_label().to_string(),
+            name: name.clone(),
+            input: event_input,
+            status: if *is_error {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Completed
             },
-        });
-    }
+            output: (!output.is_empty()).then_some(output),
+        },
+    });
     result
 }
 
@@ -1212,7 +1206,10 @@ fn execute_tool<'a>(
                 .await
             }
             "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
-            "todo_write" => todo::todo_write_tool(input, ctx).await,
+            "task_create" => task::task_create_tool(input, ctx),
+            "task_get" => task::task_get_tool(input, ctx),
+            "task_update" => task::task_update_tool(input, ctx),
+            "task_list" => task::task_list_tool(input, ctx),
             "skill" => skill::skill_tool(input, ctx, workspace).await,
             "tool_search" => tool_search::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
@@ -1395,7 +1392,7 @@ pub(crate) mod testutil {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
-                todos: Default::default(),
+                tasks: Default::default(),
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
@@ -1969,7 +1966,10 @@ mod tests {
                 "grep",
                 "glob",
                 "read_offloaded",
-                "todo_write",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2008,8 +2008,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_tool_names_are_reserved_and_return_migration_errors() {
-        let retired = ["task", "wait", "kill_bash"];
+    async fn retired_tool_names_stay_reserved_and_legacy_migrations_are_directed() {
+        let retired = ["task", "wait", "kill_bash", "todo_write"];
         let source: Arc<dyn ToolSource> = Arc::new(StubSource {
             defs: retired
                 .iter()
@@ -2045,6 +2045,9 @@ mod tests {
             assert!(is_error, "{name}: {output}");
             assert!(output.contains(replacement), "{name}: {output}");
         }
+        let (output, is_error) = run_tool("todo_write", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert_eq!(output, "unknown tool: todo_write");
     }
 
     #[test]
@@ -2192,7 +2195,7 @@ mod tests {
         let warnings =
             tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("58 tools"), "got: {warnings:?}");
+        assert!(warnings[0].contains("61 tools"), "got: {warnings:?}");
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -2681,6 +2684,16 @@ mod tests {
             "stop_bash",
             &json!({"bash_id": "bg-1"})
         ));
+        assert!(is_concurrency_safe("task_get", &json!({"task_id":"1"})));
+        assert!(is_concurrency_safe("task_list", &json!({})));
+        assert!(!is_concurrency_safe(
+            "task_create",
+            &json!({"subject":"x","description":"y"})
+        ));
+        assert!(!is_concurrency_safe(
+            "task_update",
+            &json!({"task_id":"1","status":"completed"})
+        ));
         assert!(!is_concurrency_safe(
             "write_file",
             &json!({"path": "x", "content": ""})
@@ -2783,7 +2796,7 @@ mod tests {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
-                todos: Default::default(),
+                tasks: Default::default(),
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
