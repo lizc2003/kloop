@@ -417,10 +417,18 @@ reader never parks holding the lock a resize's cursor-position query needs.
 The UI loop `select!`s those key events against agent events, folds both into
 pure state (`App`, whose `cells` are the uncommitted tail), and renders via
 pure cell→line functions — which is what makes the transcript logic testable
-without a terminal. Before each draw it freezes the finalized cells that
-overflow the viewport into scrollback with `insert_before`, then clears and
-fully redraws the current viewport so terminal scroll-region quirks cannot
-leave Ratatui's diff buffer out of sync; native scrollback remains intact.
+without a terminal. `Terminal::draw` owns autoresize. After a completed frame,
+the backend captures one physical size and pins `Backend::size()` through
+confirmation, any irreversible overflow commit, and its repaint. If the captured
+geometry already differs from the completed frame, the loop redraws first;
+repeated resize churn skips commit for that frame. Once finalized cells must
+freeze, `insert_before` writes them to native scrollback, clear succeeds, the App
+drains that exact prefix, and the loop immediately repaints the tail while the
+size fence is still held. A resize that arrives during the transaction becomes
+visible only to the next frame, so commit and repaint cannot split across two
+geometries. Key handling receives the final repaint's viewport. Composer wrapping,
+cursor projection, visible height, and ↑/↓ navigation likewise come from one
+canonical visual-row layout.
 Streaming deltas are drained in batches so a burst of tokens redraws once, not
 per token.
 
@@ -436,19 +444,32 @@ approvals the scroll keys (plus j/k) page through a tall diff and y/a/p/n
 answer, Esc denies; for rewind ↑↓/kj move and Enter/Esc select or cancel.
 `--plain` keeps the old line-based REPL; `--mock` stays on plain output.
 
-The input is a **multi-line composer** (plan 38 slice 3, `crates/tui/src/composer.rs`),
-a `›` prompt over a dim placeholder when empty. **Shift+Enter / Alt+Enter / Ctrl+J**
-insert a newline (Ctrl+J is the portable one — many terminals do not distinguish
-Shift+Enter); arrow keys move the cursor across lines, and **↑/↓ on the first/last
-line** step through the input history instead. A **large paste** collapses to a
-`[Pasted N chars]` placeholder that expands to the full text on submit (so the
-composer stays readable). **Ctrl+V / Alt+V** pastes an image straight off the OS
-clipboard (a screenshot, a browser copy, or a Finder-copied file) — terminals
-keep Cmd+V for their own text paste, so a distinct key reads the clipboard, the
-same choice Claude Code and codex make; a pasted or dragged **image-file path**
-attaches too. The image shows on a `📎` line above the composer and rides the
-turn (reusing the `--image` ingestion — `crates/tui/src/clipboard.rs` via
-`arboard`), merged with any startup `--image` blocks.
+The input is a **multi-line composer** (Plan 38 slice 3, hardened by Plan 76,
+`crates/tui/src/composer.rs`) with a `›` prompt over a dim placeholder when
+empty. Its document coordinates are strong UTF-8 byte offsets, but the cursor
+only lands on extended-grapheme boundaries: **Left/Right, Backspace, and forward
+Delete** cross a whole combining sequence, ZWJ emoji, skin-tone emoji, flag, or
+wide glyph. Home/End retain hard logical-line semantics; **↑/↓ follow soft-wrapped
+visual rows** at the current viewport width, preserve a display-column goal over
+short/CJK rows, and enter history only at the first/last visual row. One canonical
+layout drives wrapping, cursor row/column, the eight-row window, and composer
+height, so Unicode scalar count, grapheme boundaries, display columns, and visual
+rows are never treated as interchangeable coordinates. **Shift+Enter /
+Alt+Enter / Ctrl+J** insert a newline (Ctrl+J is the portable one — many terminals
+do not distinguish Shift+Enter).
+
+A large text paste becomes an indivisible, range-addressed **paste atom** with a
+stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,
+history recall, draft restore, and steering expand that exact payload once, while
+identical text typed by the user remains literal. The cursor cannot enter an
+atom; adjacent Backspace/Delete removes it whole, and a range edit that cuts one
+materializes its payload before editing. **Ctrl+V / Alt+V** pastes an image
+straight off the OS clipboard (a screenshot, browser copy, or Finder-copied
+file); a pasted or dragged single-line **image-file path** attaches too, while
+ordinary bracketed paste remains text. Typed `Attachment { label, block }`
+records replace the old parallel label/image arrays. Images show on a `📎` line
+and ride the next fresh turn (steering preserves them), reusing the `--image`
+ingestion in `crates/tui/src/clipboard.rs` via `arboard`.
 
 Typing a **`/`** at the start of the line or a **`@`** anywhere opens a
 **completion menu** (plan 38 slice 4, `crates/tui/src/menu.rs`) that floats just
@@ -461,7 +482,10 @@ complete the highlighted entry into the composer (Enter completes rather than
 submits while the menu is open), **Esc** dismisses it, and every other key edits
 the query and re-filters. At most one menu is open at a time, and a pending
 approval prompt or rewind picker takes precedence. The slash menu is suppressed
-while a turn runs (a `/` line is then steering text).
+while a turn runs (a `/` line is then steering text). Trigger detection carries
+the exact byte range and cursor identity through file search and popup accept;
+late results with the same query at another position are rejected instead of
+editing the wrong token.
 
 While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
@@ -1535,7 +1559,10 @@ mutation publishes a revisioned canonical full snapshot. `/clear` preserves the
 ID high-water mark, unconditionally advances the graph revision, and hands the
 TUI its exact empty snapshot as a reset fence against late older events. The
 registry is bounded to 256 tasks, 256 blockers per task, 200-character
-single-line subjects, and 8 KiB descriptions.
+single-line subjects, and 8 KiB descriptions. Task rows, activity, the composer's
+canonical visual rows, and overflow commit all consume the same viewport-height
+budget; no independently counted string-line total can make live chrome freeze
+into scrollback.
 
 Task calls still use the ordinary `toolCall` lifecycle. A successful
 panel-visible mutation additionally emits internal `TaskGraphUpdated`; only the
@@ -2238,11 +2265,12 @@ gpt-5.4-mini via relocation both read its text), with the canonical
 unit-test contract (no official Responses endpoint to hit — same as slice 1 /
 plan 15).
 
-**Not done** (deferred): pasting / drag-drop into the TUI (`--image` is the
-entry point for now); client-side downscaling; a drop-images-when-unsupported
+**Not done** (deferred): client-side downscaling; a drop-images-when-unsupported
 token saver / model-vision capability probe; per-request media-count cap;
-PDF/document blocks; remote-URL images; exposing `detail`. See
-`docs/plan/29-image-input.md`.
+PDF/document blocks; remote-URL images; exposing `detail`. TUI bracketed text
+paste, single-line image-path paste/drag, and OS clipboard image attachment are
+implemented; this dev-only PTY test surface is not a production interactive
+process channel. See `docs/plan/29-image-input.md`.
 
 ## Headless mode (Phase 2, twenty-first slice)
 
@@ -2527,13 +2555,18 @@ session is saved and resumable — see Session persistence above.
   declined).
 - **kloop-tui** — Ui/Approver→channel event contract (call order, confirm
   decision round-trip, dropped-reply-means-deny), App state folding (delta
-  accumulation and splitting, tool status resolution by id, confirm queueing
-  and keyboard capture, popup scroll keys with offset reset on advance,
-  interrupt/quit commands, turn-end cleanup), and pure
-  rendering (CJK-aware wrap/truncate, per-cell-kind lines, tool-row collapse,
-  input window around the cursor, diff-preview coloring by +/- sign, confirm
-  popup windowing a tall diff with pinned options and a scroll hint — verified
-  end-to-end through a TestBackend frame).
+  accumulation and splitting, tool status resolution by id, confirm queueing and
+  keyboard capture, popup scroll keys with offset reset on advance,
+  interrupt/quit commands, turn-end cleanup), and terminal-correct composer
+  contracts: strong byte ranges, whole-grapheme cursor/edit/Delete over combining,
+  ZWJ/skin-tone/flag/CJK input, one hard+soft visual-row layout for navigation,
+  windowing, cursor projection and height, display-column goal preservation, exact
+  completion ranges, stable paste-atom expansion/history/draft/steer behavior, and
+  typed attachments. Pure rendering additionally covers grapheme-safe
+  wrap/truncate, per-cell-kind lines, tool-row collapse, diff colors, live-chrome
+  reservation, exact/narrow cursor bounds, and popup windowing through Ratatui
+  `TestBackend`. TestBackend proves deterministic layout/composition and synthetic
+  scrollback; it does not prove real terminal input or native scrollback retention.
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
   plus duplex-driven exact native protocol 1.0 tests against the real serve loop:
@@ -2585,6 +2618,14 @@ session is saved and resumable — see Session persistence above.
   lock-protected multi-process RMW, `[mcp.servers]`
   parsing (round-trip, malformed rejection), rule-safe name sanitization,
   and `[[hooks]]` parsing (round-trip, defaults, malformed rejection).
+- **kloop TUI PTY (Unix only)** — `cargo test -p kloop --test tui_pty --
+  --nocapture` launches the real default binary in a sealed `portable-pty`, serves
+  deterministic loopback OpenAI-compatible SSE, answers every split/multiple CPR
+  query, and feeds raw output incrementally to a zero-history `vt100` parser. Seven
+  tests cover boot/bracketed-paste/no alternate screen, shrink/grow resize with
+  continued CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
+  restoration, and exact UTF-8 input through grapheme edits. Captured request
+  projections exclude headers/Authorization and raw ANSI is bounded fail-closed.
 
 Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
 rounds. Plan 63 acceptance also runs the real stdio binary for an exact native
@@ -2598,15 +2639,23 @@ mid-session predictive compaction, and truncation recovery.
 CI (`.github/workflows/ci.yml`, at the repo root) runs macOS, Linux, and native
 Windows on every push/PR: `cargo fmt --check`, all-target workspace clippy,
 workspace tests, the keyless mock smoke, and the corpus-only verifier after an
-explicit Python setup. Windows additionally keeps the Plan 61 file-safety gates
-and focused process-tree, Bash, PowerShell, and permission selectors. The full
-exact-binary verifier remains a pinned darwin-host check; Windows native tests
-do not create Claude Code Windows parity evidence. On Windows, corpus-only still
-checks immutable fixture hashes, normalization/tamper gates, generated
-matrix/pairs/bridges, cross-platform native reports, and sensitive-data rules.
-POSIX descriptor/ctime/symlink/publication/PTY self-tests and the Darwin-arm64-
-only Plan 59 report remain platform-gated rather than being presented as
-Windows execution.
+explicit Python setup. Composer/unit/render/TestBackend correctness is therefore
+cross-platform. The real-binary TUI PTY harness is `cfg(unix)` with Unix-only dev
+dependencies: it proves CPR, input/resize, terminal mode sequences, and the
+captured visible viewport on POSIX; a Windows skip/non-applicable build is not a
+ConPTY execution pass. Its `vt100` screen has zero history and is deliberately not
+used to claim DECSTBM/native scrollback retention or terminal-specific grapheme
+shaping — TestBackend remains the synthetic scrollback oracle, and physical
+Terminal.app/iTerm2 behavior is separate manual evidence. This test-only PTY does
+not reopen Plan 30's production `write_stdin`/interactive-process decision.
+Windows additionally keeps the Plan 61 file-safety gates and focused process-tree,
+Bash, PowerShell, and permission selectors. The full exact-binary verifier remains
+a pinned darwin-host check; Windows native tests do not create Claude Code Windows
+parity evidence. On Windows, corpus-only still checks immutable fixture hashes,
+normalization/tamper gates, generated matrix/pairs/bridges, cross-platform native
+reports, and sensitive-data rules. POSIX descriptor/ctime/symlink/publication/PTY
+self-tests and the Darwin-arm64-only Plan 59 report remain platform-gated rather
+than being presented as Windows execution.
 
 ## Layout
 
@@ -2674,9 +2723,12 @@ crates/core/        kloop-core — the agent, network-free
 
 crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
   src/events.rs     AgentEvent + ChannelUi (Ui/Approver over channels)
-  src/app.rs        pure state: transcript cells, input, confirm queue
-  src/render.rs     pure cell→line rendering, wrap/truncate, confirm popup
-  src/lib.rs        terminal lifecycle, agent worker task, event loop
+  src/app.rs        pure state: transcript cells, interactions, completion routing
+  src/composer.rs   byte/grapheme document, paste atoms, visual-row layout/history
+  src/text_layout.rs shared grapheme boundaries, display columns, wrap/truncate
+  src/clipboard.rs  typed OS clipboard image ingestion
+  src/render.rs     pure cell→line/live-chrome layout and modal rendering
+  src/lib.rs        terminal lifecycle, effective viewport, worker/event loop
 
 crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.0)
   src/wire.rs       envelopes + Event→notification projection (project_event)

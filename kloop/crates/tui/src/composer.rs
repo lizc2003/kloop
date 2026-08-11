@@ -1,11 +1,9 @@
-//! The multi-line input composer (plan 38 slice 3).
+//! The multi-line input composer (plan 38 slice 3, hardened in plan 76).
 //!
-//! Replaces the old single-line input: text may contain newlines (Shift+Enter /
-//! Ctrl+J insert one), the cursor moves across logical lines, and Up/Down on the
-//! first/last line step through the input history instead of moving. Large
-//! pastes collapse to a `[Pasted N chars]` placeholder that expands on submit;
-//! pasted image files attach as blocks that ride the turn. Pure with respect to
-//! the terminal — editing and the wrapped view are unit-tested without a TTY.
+//! The document uses UTF-8 byte ranges, while editing moves only across extended
+//! grapheme boundaries. Rendering and vertical navigation consume one canonical
+//! visual-row layout. Large pastes are range-addressed atoms: their visible label
+//! is only a projection, and submission expands the exact atom once.
 
 use kloop_protocol::ContentBlock;
 use ratatui::style::Color;
@@ -13,476 +11,666 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthChar;
 
-/// Left prompt on the first visual row; continuation rows align under it.
+use crate::text_layout::byte_offset_at_display_column;
+use crate::text_layout::display_column;
+use crate::text_layout::display_width;
+use crate::text_layout::grapheme_ranges;
+use crate::text_layout::is_grapheme_boundary;
+use crate::text_layout::next_grapheme_boundary;
+use crate::text_layout::previous_grapheme_boundary;
+use crate::text_layout::snap_grapheme_boundary;
+use crate::text_layout::ByteOffset;
+use crate::text_layout::TextRange;
+
 const PROMPT: &str = "› ";
 const CONT: &str = "  ";
-/// The prompt/continuation column width (both are two columns).
 const GUTTER_W: usize = 2;
-/// The composer never grows past this many rows on screen; taller input scrolls
-/// to keep the cursor visible.
 const MAX_ROWS: usize = 8;
-/// A paste at least this many characters (or this many lines) collapses to a
-/// placeholder rather than flooding the composer.
 const PASTE_CHARS: usize = 400;
 const PASTE_LINES: usize = 5;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
-/// A large paste held out of the visible text: its placeholder shows in the
-/// composer, and submit expands the placeholder back to `content`.
-#[derive(Clone)]
-struct Paste {
-    placeholder: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PasteId(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PasteAtom {
+    id: PasteId,
+    range: TextRange,
+    label: String,
     content: String,
 }
 
-/// One recallable history entry: the compact display text plus the pastes its
-/// placeholders expand to. Recall restores both, so re-submitting a recalled
-/// entry re-expands the paste instead of sending the literal `[Pasted …]`.
-#[derive(Clone)]
-struct HistoryEntry {
-    text: String,
-    pastes: Vec<Paste>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ComposerDocument {
+    display: String,
+    atoms: Vec<PasteAtom>,
 }
 
-/// The composer's rendered layout for one width: the visible rows (already
-/// prefixed and windowed to [`MAX_ROWS`]) and the cursor's position within them.
+impl ComposerDocument {
+    fn text(&self) -> &str {
+        &self.display
+    }
+
+    fn expand(&self) -> String {
+        let mut expanded = String::new();
+        let mut copied = 0;
+        for atom in &self.atoms {
+            expanded.push_str(&self.display[copied..atom.range.start().get()]);
+            expanded.push_str(&atom.content);
+            copied = atom.range.end().get();
+        }
+        expanded.push_str(&self.display[copied..]);
+        expanded
+    }
+
+    fn atom_ending_at(&self, offset: ByteOffset) -> Option<usize> {
+        self.atoms
+            .iter()
+            .position(|atom| atom.range.end() == offset)
+    }
+
+    fn atom_starting_at(&self, offset: ByteOffset) -> Option<usize> {
+        self.atoms
+            .iter()
+            .position(|atom| atom.range.start() == offset)
+    }
+
+    fn insert_atom(
+        &mut self,
+        at: ByteOffset,
+        id: PasteId,
+        label: String,
+        content: String,
+    ) -> ByteOffset {
+        self.assert_boundary(at);
+        debug_assert!(self
+            .atoms
+            .iter()
+            .all(|atom| at <= atom.range.start() || at >= atom.range.end()));
+
+        let mut projected = self.display.clone();
+        projected.insert_str(at.get(), &label);
+        let end = ByteOffset::new(at.get() + label.len());
+        if !is_grapheme_boundary(&projected, at) || !is_grapheme_boundary(&projected, end) {
+            return self.replace(TextRange::empty(at), &content);
+        }
+
+        let cursor = self.replace(TextRange::empty(at), &label);
+        debug_assert_eq!(cursor, end);
+        self.atoms.push(PasteAtom {
+            id,
+            range: TextRange::new(at, end),
+            label,
+            content,
+        });
+        self.atoms.sort_by_key(|atom| atom.range.start());
+        self.assert_invariants();
+        cursor
+    }
+
+    fn replace(&mut self, range: TextRange, replacement: &str) -> ByteOffset {
+        self.assert_range(range);
+        let range = self.materialize_intersections(range);
+        let mut cursor = self.replace_raw(range, replacement);
+        if !is_grapheme_boundary(&self.display, cursor) {
+            let snapped = snap_grapheme_boundary(&self.display, cursor);
+            cursor = if snapped < cursor {
+                next_grapheme_boundary(&self.display, cursor)
+            } else {
+                snapped
+            };
+        }
+
+        while let Some(index) = self.atoms.iter().position(|atom| {
+            !is_grapheme_boundary(&self.display, atom.range.start())
+                || !is_grapheme_boundary(&self.display, atom.range.end())
+        }) {
+            cursor = self.materialize_atom(index, cursor);
+        }
+        self.assert_invariants();
+        cursor
+    }
+
+    fn delete_atom(&mut self, index: usize) -> ByteOffset {
+        let atom = self.atoms.remove(index);
+        let cursor = self.replace_raw(atom.range, "");
+        self.assert_invariants();
+        cursor
+    }
+
+    fn materialize_intersections(&mut self, mut range: TextRange) -> TextRange {
+        if range.is_empty() {
+            return range;
+        }
+        while let Some(index) = self
+            .atoms
+            .iter()
+            .position(|atom| atom.range.intersects(range))
+        {
+            let atom = self.atoms.remove(index);
+            let old = atom.range;
+            let materialized_end = ByteOffset::new(old.start().get() + atom.content.len());
+            let start = map_start(range.start(), old, materialized_end);
+            let end = map_end(range.end(), old, materialized_end);
+            self.replace_raw(old, &atom.content);
+            range = TextRange::new(start, end);
+        }
+        range
+    }
+
+    fn materialize_atom(&mut self, index: usize, cursor: ByteOffset) -> ByteOffset {
+        let atom = self.atoms.remove(index);
+        let old = atom.range;
+        let materialized_end = ByteOffset::new(old.start().get() + atom.content.len());
+        let cursor = map_end(cursor, old, materialized_end);
+        self.replace_raw(old, &atom.content);
+        if is_grapheme_boundary(&self.display, cursor) {
+            cursor
+        } else {
+            next_grapheme_boundary(&self.display, cursor)
+        }
+    }
+
+    fn replace_raw(&mut self, range: TextRange, replacement: &str) -> ByteOffset {
+        let old_len = range.len();
+        self.display
+            .replace_range(range.start().get()..range.end().get(), replacement);
+        for atom in &mut self.atoms {
+            if atom.range.start() >= range.end() {
+                atom.range = shift_range(atom.range, old_len, replacement.len());
+            } else {
+                debug_assert!(atom.range.end() <= range.start());
+            }
+        }
+        ByteOffset::new(range.start().get() + replacement.len())
+    }
+
+    fn assert_boundary(&self, offset: ByteOffset) {
+        assert!(
+            is_grapheme_boundary(&self.display, offset),
+            "document offset must be a grapheme boundary"
+        );
+    }
+
+    fn assert_range(&self, range: TextRange) {
+        assert!(
+            range.end().get() <= self.display.len(),
+            "range past document end"
+        );
+        self.assert_boundary(range.start());
+        self.assert_boundary(range.end());
+    }
+
+    fn assert_invariants(&self) {
+        let mut previous_end = ByteOffset::ZERO;
+        for atom in &self.atoms {
+            debug_assert!(previous_end <= atom.range.start());
+            debug_assert!(atom.range.end().get() <= self.display.len());
+            debug_assert!(is_grapheme_boundary(&self.display, atom.range.start()));
+            debug_assert!(is_grapheme_boundary(&self.display, atom.range.end()));
+            debug_assert_eq!(
+                &self.display[atom.range.start().get()..atom.range.end().get()],
+                atom.label
+            );
+            previous_end = atom.range.end();
+        }
+    }
+}
+
+fn shift_range(range: TextRange, removed: usize, inserted: usize) -> TextRange {
+    TextRange::new(
+        shift_offset(range.start(), removed, inserted),
+        shift_offset(range.end(), removed, inserted),
+    )
+}
+
+fn shift_offset(offset: ByteOffset, removed: usize, inserted: usize) -> ByteOffset {
+    if inserted >= removed {
+        ByteOffset::new(offset.get() + inserted - removed)
+    } else {
+        ByteOffset::new(offset.get() - (removed - inserted))
+    }
+}
+
+fn map_start(offset: ByteOffset, old: TextRange, materialized_end: ByteOffset) -> ByteOffset {
+    if offset <= old.start() {
+        offset
+    } else if offset >= old.end() {
+        shift_offset(
+            offset,
+            old.len(),
+            materialized_end.get() - old.start().get(),
+        )
+    } else {
+        old.start()
+    }
+}
+
+fn map_end(offset: ByteOffset, old: TextRange, materialized_end: ByteOffset) -> ByteOffset {
+    if offset <= old.start() {
+        offset
+    } else if offset >= old.end() {
+        shift_offset(
+            offset,
+            old.len(),
+            materialized_end.get() - old.start().get(),
+        )
+    } else {
+        materialized_end
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    document: ComposerDocument,
+}
+
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub label: String,
+    block: ContentBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowBreak {
+    Soft,
+    Hard,
+    End,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisualRow {
+    source: TextRange,
+    break_kind: RowBreak,
+    display_width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComposerLayout {
+    rows: Vec<VisualRow>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+impl ComposerLayout {
+    fn new(text: &str, cursor: ByteOffset, width: usize) -> Self {
+        assert!(is_grapheme_boundary(text, cursor));
+        let content_width = width.max(GUTTER_W + 1) - GUTTER_W;
+        let mut rows = Vec::new();
+        let mut row_start = ByteOffset::ZERO;
+        let mut row_width = 0;
+
+        for (range, grapheme) in grapheme_ranges(text) {
+            if grapheme.ends_with('\n') {
+                rows.push(VisualRow {
+                    source: TextRange::new(row_start, range.start()),
+                    break_kind: RowBreak::Hard,
+                    display_width: row_width,
+                });
+                row_start = range.end();
+                row_width = 0;
+                continue;
+            }
+
+            let grapheme_width = display_width(grapheme);
+            if row_width + grapheme_width > content_width && range.start() > row_start {
+                rows.push(VisualRow {
+                    source: TextRange::new(row_start, range.start()),
+                    break_kind: RowBreak::Soft,
+                    display_width: row_width,
+                });
+                row_start = range.start();
+                row_width = 0;
+            }
+            row_width += grapheme_width;
+        }
+        if row_width == content_width && row_start.get() < text.len() {
+            rows.push(VisualRow {
+                source: TextRange::new(row_start, ByteOffset::new(text.len())),
+                break_kind: RowBreak::Soft,
+                display_width: row_width,
+            });
+            row_start = ByteOffset::new(text.len());
+            row_width = 0;
+        }
+        rows.push(VisualRow {
+            source: TextRange::new(row_start, ByteOffset::new(text.len())),
+            break_kind: RowBreak::End,
+            display_width: row_width,
+        });
+
+        let cursor_row = rows
+            .iter()
+            .position(|row| {
+                row.source.contains(cursor)
+                    || (row.break_kind != RowBreak::Soft && row.source.end() == cursor)
+            })
+            .unwrap_or(rows.len() - 1);
+        let row = &rows[cursor_row];
+        let cursor_column = display_column(
+            &text[row.source.start().get()..row.source.end().get()],
+            ByteOffset::new(cursor.get().saturating_sub(row.source.start().get())),
+        );
+        Self {
+            rows,
+            cursor_row,
+            cursor_column,
+        }
+    }
+
+    fn offset_at_column(&self, text: &str, row: usize, column: usize) -> ByteOffset {
+        let source = self.rows[row].source;
+        let relative =
+            byte_offset_at_display_column(&text[source.start().get()..source.end().get()], column);
+        ByteOffset::new(source.start().get() + relative.get())
+    }
+}
+
 pub struct View {
     pub rows: Vec<Line<'static>>,
     pub cursor_row: u16,
     pub cursor_col: u16,
 }
 
-/// The result of a submit: the expanded text and any attached images.
 pub struct Submission {
     pub text: String,
     pub images: Vec<ContentBlock>,
 }
 
 pub struct Composer {
-    /// The editable text (may contain newlines and paste/`nothing`
-    /// placeholders); the cursor is a char index into it.
-    text: String,
-    cursor: usize,
-    /// Submitted entries, oldest first, for Up/Down recall.
+    document: ComposerDocument,
+    cursor: ByteOffset,
     history: Vec<HistoryEntry>,
-    /// Which history entry is being viewed (None = editing the live draft).
     hist: Option<usize>,
-    /// The live draft saved while browsing history, restored on the way back
-    /// (with its own pastes, so a drafted-then-shelved paste survives a browse).
-    draft: String,
-    draft_pastes: Vec<Paste>,
-    /// Stashed large pastes, expanded into the text at submit.
-    pastes: Vec<Paste>,
-    /// Attached images (built by the event loop from pasted paths) and their
-    /// display labels.
-    images: Vec<ContentBlock>,
-    labels: Vec<String>,
-    /// The column vertical movement aims for, so Up/Down over short lines don't
-    /// lose the horizontal position. Cleared by any horizontal edit.
-    goal_col: Option<usize>,
+    draft: ComposerDocument,
+    attachments: Vec<Attachment>,
+    goal_column: Option<usize>,
+    next_paste_id: u64,
 }
 
 impl Composer {
     pub fn new() -> Self {
         Self {
-            text: String::new(),
-            cursor: 0,
+            document: ComposerDocument::default(),
+            cursor: ByteOffset::ZERO,
             history: Vec::new(),
             hist: None,
-            draft: String::new(),
-            draft_pastes: Vec::new(),
-            pastes: Vec::new(),
-            images: Vec::new(),
-            labels: Vec::new(),
-            goal_col: None,
+            draft: ComposerDocument::default(),
+            attachments: Vec::new(),
+            goal_column: None,
+            next_paste_id: 1,
         }
     }
 
-    // --- queries -----------------------------------------------------------
-
-    /// The current visible text (with placeholders, unexpanded). Used for the
-    /// empty check and slash-command detection.
     pub fn text(&self) -> &str {
-        &self.text
+        self.document.text()
     }
 
     pub fn is_blank(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty()
+        self.text().trim().is_empty() && self.attachments.is_empty()
     }
 
-    /// The cursor's char index into [`text`](Self::text), for the completion
-    /// menu's trigger detection ([`crate::menu::detect_trigger`]).
-    pub fn cursor(&self) -> usize {
+    pub fn cursor(&self) -> ByteOffset {
         self.cursor
     }
 
-    /// Display labels of attached images, for the attachment line.
-    pub fn attachments(&self) -> &[String] {
-        &self.labels
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
     }
 
-    fn char_count(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    // --- editing -----------------------------------------------------------
-
-    pub fn insert_char(&mut self, c: char) {
+    pub fn insert_char(&mut self, character: char) {
         self.begin_edit();
-        let at = byte_index(&self.text, self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
-        self.goal_col = None;
+        self.cursor = self
+            .document
+            .replace(TextRange::empty(self.cursor), &character.to_string());
+        self.goal_column = None;
     }
 
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
 
-    /// Insert a paste: small text goes in verbatim, a large one collapses to a
-    /// placeholder that submit expands.
-    pub fn paste(&mut self, s: &str) {
+    pub fn paste(&mut self, text: &str) {
         self.begin_edit();
-        let big = s.chars().count() >= PASTE_CHARS || s.split('\n').count() >= PASTE_LINES;
-        if big {
-            let n = s.chars().count();
-            let placeholder = format!("[Pasted #{}: {n} chars]", self.pastes.len() + 1);
-            self.insert_str(&placeholder);
-            self.pastes.push(Paste {
-                placeholder,
-                content: s.to_string(),
-            });
+        let character_count = text.chars().count();
+        let is_large = character_count >= PASTE_CHARS || text.split('\n').count() >= PASTE_LINES;
+        if is_large {
+            let id = PasteId(self.next_paste_id);
+            self.next_paste_id = self
+                .next_paste_id
+                .checked_add(1)
+                .expect("paste id high-water exhausted");
+            let label = format!("[Pasted #{}: {character_count} chars]", id.0);
+            self.cursor = self
+                .document
+                .insert_atom(self.cursor, id, label, text.to_string());
         } else {
-            self.insert_str(s);
+            self.cursor = self.document.replace(TextRange::empty(self.cursor), text);
         }
+        self.goal_column = None;
     }
 
-    fn insert_str(&mut self, s: &str) {
-        let at = byte_index(&self.text, self.cursor);
-        self.text.insert_str(at, s);
-        self.cursor += s.chars().count();
-        self.goal_col = None;
-    }
-
-    /// Replace the current whitespace-delimited token (the run of non-space
-    /// chars ending at the cursor) with `replacement` plus a trailing space, and
-    /// put the cursor after it. Used by the completion menu to insert a chosen
-    /// command or file path; the replacement includes its `/`/`@` prefix, so the
-    /// typed trigger is overwritten in place. A completed token is ordinary text,
-    /// so pastes and history are left untouched.
-    pub fn replace_token(&mut self, replacement: &str) {
+    pub fn replace_range(
+        &mut self,
+        range: TextRange,
+        expected_cursor: ByteOffset,
+        replacement: &str,
+    ) -> bool {
+        if self.cursor != expected_cursor || range.end() != expected_cursor {
+            return false;
+        }
+        if range.end().get() > self.text().len()
+            || !is_grapheme_boundary(self.text(), range.start())
+            || !is_grapheme_boundary(self.text(), range.end())
+        {
+            return false;
+        }
         self.begin_edit();
-        let chars: Vec<char> = self.text.chars().collect();
-        let cursor = self.cursor.min(chars.len());
-        let mut start = cursor;
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        let start_b = byte_index(&self.text, start);
-        let end_b = byte_index(&self.text, cursor);
-        let insert = format!("{replacement} ");
-        self.text.replace_range(start_b..end_b, &insert);
-        self.cursor = start + insert.chars().count();
-        self.goal_col = None;
+        self.cursor = self.document.replace(range, &format!("{replacement} "));
+        self.goal_column = None;
+        true
     }
 
-    /// Attach an image (block already built by the loop) with a display label.
     pub fn attach_image(&mut self, label: String, block: ContentBlock) {
-        self.images.push(block);
-        self.labels.push(label);
+        self.attachments.push(Attachment { label, block });
     }
 
     pub fn backspace(&mut self) {
         self.begin_edit();
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let at = byte_index(&self.text, self.cursor);
-            self.text.remove(at);
+        if let Some(index) = self.document.atom_ending_at(self.cursor) {
+            self.cursor = self.document.delete_atom(index);
+        } else if self.cursor > ByteOffset::ZERO {
+            let previous = previous_grapheme_boundary(self.text(), self.cursor);
+            self.cursor = self
+                .document
+                .replace(TextRange::new(previous, self.cursor), "");
         }
-        self.goal_col = None;
+        self.goal_column = None;
+    }
+
+    pub fn delete(&mut self) {
+        self.begin_edit();
+        if let Some(index) = self.document.atom_starting_at(self.cursor) {
+            self.cursor = self.document.delete_atom(index);
+        } else if self.cursor.get() < self.text().len() {
+            let next = next_grapheme_boundary(self.text(), self.cursor);
+            self.cursor = self.document.replace(TextRange::new(self.cursor, next), "");
+        }
+        self.goal_column = None;
     }
 
     pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-        self.goal_col = None;
+        if let Some(index) = self.document.atom_ending_at(self.cursor) {
+            self.cursor = self.document.atoms[index].range.start();
+        } else {
+            self.cursor = previous_grapheme_boundary(self.text(), self.cursor);
+        }
+        self.goal_column = None;
     }
 
     pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
-        self.goal_col = None;
+        if let Some(index) = self.document.atom_starting_at(self.cursor) {
+            self.cursor = self.document.atoms[index].range.end();
+        } else {
+            self.cursor = next_grapheme_boundary(self.text(), self.cursor);
+        }
+        self.goal_column = None;
     }
 
     pub fn home(&mut self) {
-        let (row, _) = self.row_col();
-        self.cursor = self.line_starts()[row];
-        self.goal_col = None;
+        let prefix = &self.text()[..self.cursor.get()];
+        self.cursor = prefix
+            .rfind('\n')
+            .map(|index| ByteOffset::new(index + 1))
+            .unwrap_or(ByteOffset::ZERO);
+        self.goal_column = None;
     }
 
     pub fn end(&mut self) {
-        let (row, _) = self.row_col();
-        let starts = self.line_starts();
-        self.cursor = self.line_end(&starts, row);
-        self.goal_col = None;
+        let suffix = &self.text()[self.cursor.get()..];
+        let raw = suffix
+            .find('\n')
+            .map(|index| self.cursor.get() + index)
+            .unwrap_or_else(|| self.text().len());
+        self.cursor = if is_grapheme_boundary(self.text(), ByteOffset::new(raw)) {
+            ByteOffset::new(raw)
+        } else {
+            previous_grapheme_boundary(self.text(), ByteOffset::new(raw + 1))
+        };
+        self.goal_column = None;
     }
 
-    /// Up: move to the previous line (keeping the goal column), or recall the
-    /// previous history entry when already on the first line. Returns true if it
-    /// moved the cursor rather than recalling history — the caller does not care,
-    /// but tests do.
-    pub fn up(&mut self) {
-        let (row, col) = self.row_col();
-        if row == 0 {
+    pub fn up(&mut self, width: usize) {
+        let layout = ComposerLayout::new(self.text(), self.cursor, width);
+        if layout.cursor_row == 0 {
             self.history_prev();
         } else {
-            self.move_to_row(row - 1, col);
+            let goal = self.goal_column.unwrap_or(layout.cursor_column);
+            self.cursor = layout.offset_at_column(self.text(), layout.cursor_row - 1, goal);
+            self.goal_column = Some(goal);
         }
     }
 
-    pub fn down(&mut self) {
-        let (row, col) = self.row_col();
-        let last = self.line_starts().len() - 1;
-        if row == last {
+    pub fn down(&mut self, width: usize) {
+        let layout = ComposerLayout::new(self.text(), self.cursor, width);
+        if layout.cursor_row + 1 == layout.rows.len() {
             self.history_next();
         } else {
-            self.move_to_row(row + 1, col);
+            let goal = self.goal_column.unwrap_or(layout.cursor_column);
+            self.cursor = layout.offset_at_column(self.text(), layout.cursor_row + 1, goal);
+            self.goal_column = Some(goal);
         }
     }
-
-    fn move_to_row(&mut self, target: usize, col: usize) {
-        let goal = self.goal_col.unwrap_or(col);
-        let starts = self.line_starts();
-        let start = starts[target];
-        let len = self.line_end(&starts, target) - start;
-        self.cursor = start + goal.min(len);
-        self.goal_col = Some(goal);
-    }
-
-    // --- history -----------------------------------------------------------
 
     fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
         }
-        let idx = match self.hist {
+        let index = match self.hist {
             None => {
-                self.draft = self.text.clone();
-                self.draft_pastes = self.pastes.clone();
+                self.draft = self.document.clone();
                 self.history.len() - 1
             }
             Some(0) => return,
-            Some(i) => i - 1,
+            Some(index) => index - 1,
         };
-        self.load_history(idx);
+        self.load_history(index);
     }
 
     fn history_next(&mut self) {
         match self.hist {
             None => {}
-            Some(i) if i + 1 < self.history.len() => self.load_history(i + 1),
+            Some(index) if index + 1 < self.history.len() => self.load_history(index + 1),
             Some(_) => {
-                // Past the newest entry: back to the live draft (and its pastes).
                 self.hist = None;
-                self.text = std::mem::take(&mut self.draft);
-                self.pastes = std::mem::take(&mut self.draft_pastes);
-                self.cursor = self.char_count();
-                self.goal_col = None;
+                self.document = std::mem::take(&mut self.draft);
+                self.cursor = ByteOffset::new(self.text().len());
+                self.goal_column = None;
             }
         }
     }
 
-    fn load_history(&mut self, idx: usize) {
-        self.hist = Some(idx);
-        self.text = self.history[idx].text.clone();
-        // Restore the entry's pastes so a re-submit re-expands its placeholders.
-        self.pastes = self.history[idx].pastes.clone();
-        self.cursor = self.char_count();
-        self.goal_col = None;
+    fn load_history(&mut self, index: usize) {
+        self.hist = Some(index);
+        self.document = self.history[index].document.clone();
+        self.cursor = ByteOffset::new(self.text().len());
+        self.goal_column = None;
     }
 
-    /// The first edit after recalling a history entry adopts it as the new draft.
     fn begin_edit(&mut self) {
         self.hist = None;
     }
 
-    // --- submit ------------------------------------------------------------
-
-    /// Expand pastes, take the images, push the entry to history, and clear the
-    /// composer. Returns None when there is nothing to send.
     pub fn submit(&mut self) -> Option<Submission> {
         if self.is_blank() {
             return None;
         }
         let text = self.take_text();
-        let images = std::mem::take(&mut self.images);
-        self.labels.clear();
+        let images = std::mem::take(&mut self.attachments)
+            .into_iter()
+            .map(|attachment| attachment.block)
+            .collect();
         Some(Submission { text, images })
     }
 
-    /// Take only the text (expanding pastes, recording history, clearing the
-    /// input) and LEAVE attached images on the composer. Used while a turn is
-    /// running: the text steers the turn, but a steer has no image channel, so
-    /// images wait for the next fresh turn instead of being stranded. Returns
-    /// None when there is no text to steer (e.g. only an image is attached).
     pub fn submit_text(&mut self) -> Option<String> {
-        if self.text.trim().is_empty() {
+        if self.text().trim().is_empty() {
             return None;
         }
         Some(self.take_text())
     }
 
-    /// Expand pastes into the text, record the compact display form to history,
-    /// and clear the text line + cursor state (but not images). The shared core
-    /// of [`submit`] and [`submit_text`].
     fn take_text(&mut self) -> String {
-        let display = std::mem::take(&mut self.text);
-        let entry_pastes = std::mem::take(&mut self.pastes);
-        let mut text = display.clone();
-        for p in &entry_pastes {
-            text = text.replace(&p.placeholder, &p.content);
+        let document = std::mem::take(&mut self.document);
+        let text = document.expand();
+        if !document.display.trim().is_empty()
+            && self.history.last().map(|entry| &entry.document) != Some(&document)
+        {
+            self.history.push(HistoryEntry { document });
         }
-        // History keeps the compact display form (placeholders), like the user
-        // saw it, plus the pastes it expands to — so recalling and re-submitting
-        // re-expands rather than sending the literal placeholder. A blank line
-        // (image-only submit) is not worth recalling.
-        if !display.trim().is_empty() && self.history.last().map(|e| &e.text) != Some(&display) {
-            self.history.push(HistoryEntry {
-                text: display,
-                pastes: entry_pastes,
-            });
-        }
-        self.cursor = 0;
+        self.cursor = ByteOffset::ZERO;
         self.hist = None;
-        self.draft.clear();
-        self.draft_pastes.clear();
-        self.goal_col = None;
+        self.draft = ComposerDocument::default();
+        self.goal_column = None;
         text
     }
 
-    /// Clear the composer (Esc when idle) without touching history.
     pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-        self.pastes.clear();
-        self.images.clear();
-        self.labels.clear();
+        self.document = ComposerDocument::default();
+        self.cursor = ByteOffset::ZERO;
+        self.attachments.clear();
         self.hist = None;
-        self.goal_col = None;
+        self.draft = ComposerDocument::default();
+        self.goal_column = None;
     }
 
-    // --- line geometry -----------------------------------------------------
-
-    /// Char index where each logical line starts (line 0 at 0, each subsequent
-    /// line just after a '\n').
-    fn line_starts(&self) -> Vec<usize> {
-        let mut starts = vec![0];
-        for (i, c) in self.text.chars().enumerate() {
-            if c == '\n' {
-                starts.push(i + 1);
-            }
-        }
-        starts
-    }
-
-    /// Char index at the end of logical line `row` (before its '\n', or the text
-    /// end for the last line).
-    fn line_end(&self, starts: &[usize], row: usize) -> usize {
-        if row + 1 < starts.len() {
-            starts[row + 1] - 1
-        } else {
-            self.char_count()
-        }
-    }
-
-    /// The cursor's (logical row, column-in-chars).
-    fn row_col(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for (i, c) in self.text.chars().enumerate() {
-            if i == self.cursor {
-                return (row, col);
-            }
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (row, col)
-    }
-
-    // --- rendering ---------------------------------------------------------
-
-    /// Wrap the text to `width`, prefix the prompt/continuation gutter, window to
-    /// [`MAX_ROWS`] around the cursor, and report the cursor's on-screen position.
     pub fn view(&self, width: usize) -> View {
         let width = width.max(GUTTER_W + 1);
-        let content_w = width - GUTTER_W;
-
-        // Empty draft: prompt + a dim placeholder, cursor just after the prompt.
-        if self.text.is_empty() {
-            let row = Line::from(vec![
-                Span::styled(PROMPT.to_string(), Style::new().fg(Color::Cyan)),
-                Span::styled(
-                    "Type a message…  (Shift+Enter for newline)".to_string(),
-                    DIM,
-                ),
-            ]);
+        if self.text().is_empty() {
             return View {
-                rows: vec![row],
+                rows: vec![Line::from(vec![
+                    Span::styled(PROMPT.to_string(), Style::new().fg(Color::Cyan)),
+                    Span::styled(
+                        "Type a message…  (Shift+Enter for newline)".to_string(),
+                        DIM,
+                    ),
+                ])],
                 cursor_row: 0,
                 cursor_col: GUTTER_W as u16,
             };
         }
 
-        // Wrap every logical line to content columns, remembering the cursor's
-        // visual cell as we lay chars down.
-        let mut rows: Vec<String> = Vec::new();
-        let mut cur_row = 0usize;
-        let mut cur_col = 0usize;
-        let mut line = String::new();
-        let mut col = 0usize;
-        let mut idx = 0usize;
-        let logical: Vec<&str> = self.text.split('\n').collect();
-        for (li, seg) in logical.iter().enumerate() {
-            for c in seg.chars() {
-                if idx == self.cursor {
-                    cur_row = rows.len();
-                    cur_col = col;
-                }
-                let w = c.width().unwrap_or(0);
-                if col + w > content_w && !line.is_empty() {
-                    rows.push(std::mem::take(&mut line));
-                    col = 0;
-                }
-                line.push(c);
-                col += w;
-                idx += 1;
-            }
-            // Cursor at the end of this logical line (before its '\n').
-            if idx == self.cursor {
-                cur_row = rows.len();
-                cur_col = col;
-            }
-            rows.push(std::mem::take(&mut line));
-            col = 0;
-            if li + 1 < logical.len() {
-                idx += 1; // the '\n' between logical lines
-            }
-        }
-
-        // Window to MAX_ROWS keeping the cursor visible.
-        let start = cur_row.saturating_sub(MAX_ROWS - 1);
-        let end = (start + MAX_ROWS).min(rows.len());
-        let visible = &rows[start..end];
-        let lines: Vec<Line<'static>> = visible
+        let layout = ComposerLayout::new(self.text(), self.cursor, width);
+        let start = layout.cursor_row.saturating_sub(MAX_ROWS - 1);
+        let end = (start + MAX_ROWS).min(layout.rows.len());
+        let rows = layout.rows[start..end]
             .iter()
             .enumerate()
-            .map(|(i, content)| {
-                let is_first = start + i == 0;
+            .map(|(visible_index, row)| {
+                let is_first = start + visible_index == 0;
                 let (gutter, style) = if is_first {
                     (PROMPT, Style::new().fg(Color::Cyan))
                 } else {
@@ -490,330 +678,328 @@ impl Composer {
                 };
                 Line::from(vec![
                     Span::styled(gutter.to_string(), style),
-                    Span::raw(content.clone()),
+                    Span::raw(
+                        self.text()[row.source.start().get()..row.source.end().get()].to_string(),
+                    ),
                 ])
             })
             .collect();
-
+        let cursor_col = (layout.cursor_column + GUTTER_W).min(width - 1);
         View {
-            rows: lines,
-            cursor_row: (cur_row - start) as u16,
-            cursor_col: (cur_col + GUTTER_W) as u16,
+            rows,
+            cursor_row: (layout.cursor_row - start) as u16,
+            cursor_col: cursor_col as u16,
         }
     }
-}
-
-/// Byte offset of the `n`-th char (or the end), for splitting `String` at a char
-/// boundary.
-fn byte_index(s: &str, char_index: usize) -> usize {
-    s.char_indices()
-        .nth(char_index)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_segmentation::UnicodeSegmentation;
 
-    fn typed(s: &str) -> Composer {
-        let mut c = Composer::new();
-        for ch in s.chars() {
-            c.insert_char(ch);
+    const WIDTH: usize = 80;
+    const GRAPHEMES: &[&str] = &["e\u{301}", "👨‍👩‍👧‍👦", "👩🏽‍💻", "👍🏽", "🇨🇳", "❤️", "1️⃣"];
+
+    fn typed(text: &str) -> Composer {
+        let mut composer = Composer::new();
+        for character in text.chars() {
+            composer.insert_char(character);
         }
-        c
+        composer
     }
 
-    fn row_texts(v: &View) -> Vec<String> {
-        v.rows
+    fn row_texts(view: &View) -> Vec<String> {
+        view.rows
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect()
     }
 
-    #[test]
-    fn typing_newlines_and_cursor_movement() {
-        let mut c = typed("ab");
-        c.insert_newline();
-        for ch in "cd".chars() {
-            c.insert_char(ch);
+    fn image() -> ContentBlock {
+        ContentBlock::Image {
+            source: kloop_protocol::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
         }
-        assert_eq!(c.text(), "ab\ncd");
-        // Cursor at end (row 1, col 2).
-        assert_eq!(c.row_col(), (1, 2));
-        // Up keeps the column, landing on row 0 col 2 (end of "ab").
-        c.up();
-        assert_eq!(c.row_col(), (0, 2));
-        // Home/End move within the logical line.
-        c.home();
-        assert_eq!(c.row_col(), (0, 0));
-        c.end();
-        assert_eq!(c.row_col(), (0, 2));
-        // Down returns to row 1 at the goal column.
-        c.down();
-        assert_eq!(c.row_col(), (1, 2));
     }
 
     #[test]
-    fn goal_column_survives_a_short_line() {
-        // Column 4 on a long line, then up over a short line, then up again:
-        // the goal column is preserved, not clamped to the short line.
-        let mut c = Composer::new();
-        for ch in "long line\nhi\nlonger line".chars() {
-            c.insert_char(ch);
+    fn grapheme_navigation_and_deletion_keep_clusters_whole() {
+        for grapheme in GRAPHEMES {
+            let mut composer = typed(&format!("a{grapheme}z"));
+            composer.left();
+            let before_z = composer.cursor();
+            composer.left();
+            assert_eq!(composer.cursor(), ByteOffset::new(1), "{grapheme:?}");
+            composer.right();
+            assert_eq!(composer.cursor(), before_z, "{grapheme:?}");
+            composer.backspace();
+            assert_eq!(composer.text(), "az", "{grapheme:?}");
+
+            let mut composer = typed(&format!("a{grapheme}z"));
+            composer.home();
+            composer.right();
+            composer.delete();
+            assert_eq!(composer.text(), "az", "{grapheme:?}");
+            assert!(is_grapheme_boundary(composer.text(), composer.cursor()));
         }
-        // Cursor at end of "longer line" (row 2, col 11). Put it at col 4.
-        c.home();
-        for _ in 0..4 {
-            c.right();
-        }
-        assert_eq!(c.row_col(), (2, 4));
-        c.up(); // onto "hi" (len 2) — clamps to col 2 but remembers goal 4
-        assert_eq!(c.row_col(), (1, 2));
-        c.up(); // onto "long line" — restores goal col 4
-        assert_eq!(c.row_col(), (0, 4));
     }
 
     #[test]
-    fn up_down_at_edges_recall_history() {
-        let mut c = Composer::new();
-        // Two submitted entries.
-        for ch in "first".chars() {
-            c.insert_char(ch);
-        }
-        c.submit();
-        for ch in "second".chars() {
-            c.insert_char(ch);
-        }
-        c.submit();
-        assert_eq!(c.text(), "");
-
-        // A partial draft, then Up recalls newest-first.
-        for ch in "dra".chars() {
-            c.insert_char(ch);
-        }
-        c.up();
-        assert_eq!(c.text(), "second");
-        c.up();
-        assert_eq!(c.text(), "first");
-        c.up(); // already oldest: stays
-        assert_eq!(c.text(), "first");
-        // Down walks back to the saved draft.
-        c.down();
-        assert_eq!(c.text(), "second");
-        c.down();
-        assert_eq!(c.text(), "dra", "returns to the live draft");
+    fn insertion_that_joins_a_cluster_normalizes_cursor_to_its_end() {
+        let mut composer = typed("\u{301}z");
+        composer.home();
+        composer.insert_char('e');
+        assert_eq!(composer.text(), "e\u{301}z");
+        assert_eq!(composer.cursor(), ByteOffset::new("e\u{301}".len()));
     }
 
     #[test]
-    fn editing_a_recalled_entry_adopts_it_as_the_draft() {
-        let mut c = typed("hello");
-        c.submit();
-        c.up();
-        assert_eq!(c.text(), "hello");
-        c.insert_char('!');
-        assert_eq!(c.text(), "hello!");
-        // Down no longer walks history (we left it by editing).
-        c.down();
-        assert_eq!(c.text(), "hello!");
+    fn visual_navigation_wraps_and_preserves_display_goal() {
+        let mut composer = typed("abcdef\n你x\nabcdefgh");
+        let narrow = 6; // four content columns
+        composer.left();
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), narrow);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (4, 3));
+        composer.up(narrow);
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), narrow);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (3, 3));
+        composer.up(narrow);
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), narrow);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (2, 3));
+        composer.up(narrow);
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), narrow);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 2));
+        composer.up(narrow);
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), narrow);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 3));
     }
 
     #[test]
-    fn large_paste_collapses_to_a_placeholder_and_expands_on_submit() {
-        let mut c = typed("see: ");
-        let big = "x".repeat(500);
-        c.paste(&big);
-        assert_eq!(c.text(), "see: [Pasted #1: 500 chars]");
-        let sub = c.submit().unwrap();
-        assert_eq!(sub.text, format!("see: {big}"));
-        assert!(sub.images.is_empty());
-        // History keeps the compact form.
-        c.up();
-        assert_eq!(c.text(), "see: [Pasted #1: 500 chars]");
-    }
-
-    /// Recalling a history entry that carried a large paste and re-submitting it
-    /// re-expands the paste — the model gets the pasted content, not the literal
-    /// `[Pasted …]` placeholder. Regression: submit dropped the paste mapping, so
-    /// a recalled entry re-sent the placeholder text verbatim.
-    #[test]
-    fn recalled_paste_re_expands_on_resubmit() {
-        let mut c = typed("see: ");
-        let big = "x".repeat(500);
-        c.paste(&big);
-        assert_eq!(c.submit().unwrap().text, format!("see: {big}"));
-        // Recall the entry (shows the compact placeholder) and re-submit it.
-        c.up();
-        assert_eq!(c.text(), "see: [Pasted #1: 500 chars]");
-        let sub = c.submit().unwrap();
+    fn visual_edges_recall_history_but_soft_rows_do_not() {
+        let mut composer = typed("history");
+        composer.submit();
+        composer.paste("abcdefgh");
+        composer.up(6);
+        assert_eq!(composer.text(), "abcdefgh");
         assert_eq!(
-            sub.text,
-            format!("see: {big}"),
-            "resend must re-expand, not send the placeholder"
+            ComposerLayout::new(composer.text(), composer.cursor(), 6).cursor_row,
+            1
         );
-    }
-
-    /// A large paste shelved into the draft (by browsing history away and back)
-    /// survives with its content, so submitting the restored draft still expands.
-    #[test]
-    fn drafted_paste_survives_a_history_browse() {
-        let mut c = typed("first");
-        c.submit(); // seed one history entry
-        let big = "y".repeat(500);
-        c.paste(&big); // draft now holds a paste placeholder
-        c.up(); // browse to "first" (draft with the paste is stashed)
-        assert_eq!(c.text(), "first");
-        c.down(); // back to the draft
-        let sub = c.submit().unwrap();
-        assert_eq!(sub.text, big, "the shelved draft paste still expands");
-    }
-
-    #[test]
-    fn small_paste_inserts_verbatim() {
-        let mut c = typed("a");
-        c.paste("bc");
-        assert_eq!(c.text(), "abc");
-        assert!(c.submit().unwrap().text == "abc");
-    }
-
-    #[test]
-    fn image_attachment_rides_the_submission() {
-        let mut c = Composer::new();
-        let block = ContentBlock::Image {
-            source: kloop_protocol::ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "aGk=".into(),
-            },
-        };
-        c.attach_image("shot.png".into(), block.clone());
-        assert_eq!(c.attachments(), &["shot.png".to_string()]);
-        // Image-only submit is allowed even with no text.
-        assert!(!c.is_blank());
-        let sub = c.submit().unwrap();
-        assert_eq!(sub.text, "");
-        assert_eq!(sub.images, vec![block]);
-        assert!(c.attachments().is_empty(), "cleared after submit");
-    }
-
-    /// `submit_text` (the steering path) takes only the text and leaves the
-    /// image attached, so it rides the next fresh turn instead of being dropped.
-    #[test]
-    fn submit_text_steers_text_and_keeps_the_image() {
-        let mut c = Composer::new();
-        let block = ContentBlock::Image {
-            source: kloop_protocol::ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "aGk=".into(),
-            },
-        };
-        c.attach_image("shot.png".into(), block.clone());
-        for ch in "keep going".chars() {
-            c.insert_char(ch);
-        }
-        assert_eq!(c.submit_text().as_deref(), Some("keep going"));
-        assert_eq!(c.text(), "");
-        assert_eq!(c.attachments(), &["shot.png".to_string()], "image kept");
-        // A later real submit still carries the image.
-        assert_eq!(c.submit().unwrap().images, vec![block]);
-    }
-
-    /// An image-only steer has no text to send, so `submit_text` is a no-op that
-    /// keeps the image attached (rather than steering an empty string).
-    #[test]
-    fn submit_text_is_none_for_image_only() {
-        let mut c = Composer::new();
-        c.attach_image(
-            "a.png".into(),
-            ContentBlock::Image {
-                source: kloop_protocol::ImageSource::Base64 {
-                    media_type: "image/png".into(),
-                    data: "aGk=".into(),
-                },
-            },
+        composer.up(6);
+        assert_eq!(
+            ComposerLayout::new(composer.text(), composer.cursor(), 6).cursor_row,
+            0
         );
-        assert!(c.submit_text().is_none());
-        assert_eq!(c.attachments(), &["a.png".to_string()], "image kept");
+        composer.up(6);
+        assert_eq!(composer.text(), "history");
+        composer.down(6);
+        assert_eq!(composer.text(), "abcdefgh");
+    }
+
+    #[test]
+    fn resize_recomputes_visual_rows_without_document_state() {
+        let composer = typed("你好abcdef");
+        let narrow = ComposerLayout::new(composer.text(), composer.cursor(), 6);
+        let wide = ComposerLayout::new(composer.text(), composer.cursor(), 20);
+        assert_eq!(narrow.rows.len(), 3);
+        assert_eq!(wide.rows.len(), 1);
+    }
+
+    #[test]
+    fn home_and_end_keep_hard_line_semantics() {
+        let mut composer = typed("abcdef\nxy");
+        composer.home();
+        assert_eq!(composer.cursor(), ByteOffset::new(7));
+        composer.home();
+        assert_eq!(composer.cursor(), ByteOffset::new(7));
+        composer.end();
+        assert_eq!(composer.cursor(), ByteOffset::new(9));
+        composer.left();
+        composer.up(6);
+        assert_eq!(composer.text(), "abcdef\nxy");
+    }
+
+    #[test]
+    fn history_adopts_edits_and_restores_full_draft_document() {
+        let mut composer = typed("first");
+        composer.submit();
+        let pasted = "x".repeat(500);
+        composer.paste(&pasted);
+        composer.up(WIDTH);
+        assert_eq!(composer.text(), "first");
+        composer.down(WIDTH);
+        assert!(composer.text().starts_with("[Pasted #1:"));
+        assert_eq!(composer.submit().unwrap().text, pasted);
+
+        composer.up(WIDTH);
+        composer.insert_char('!');
+        composer.down(WIDTH);
+        assert!(composer.text().ends_with('!'));
+    }
+
+    #[test]
+    fn paste_atoms_expand_exactly_once_without_literal_collision() {
+        let mut composer = typed("literal [Pasted #1: 500 chars] ");
+        let first = "x".repeat(500);
+        let second = format!("{} tail", "[Pasted #2: 500 chars]");
+        composer.paste(&first);
+        composer.paste(&second.repeat(20));
+        let submission = composer.submit().unwrap().text;
+        assert!(submission.starts_with("literal [Pasted #1: 500 chars] "));
+        assert!(submission.contains(&first));
+        assert!(submission.ends_with(&second.repeat(20)));
+    }
+
+    #[test]
+    fn large_paste_at_an_atom_boundary_inserts_a_distinct_atom() {
+        let first = "x".repeat(500);
+        let second = "y".repeat(500);
+        let mut composer = Composer::new();
+        composer.paste(&first);
+        composer.left();
+        composer.paste(&second);
+
+        assert_eq!(composer.document.atoms.len(), 2);
+        assert_eq!(composer.submit().unwrap().text, format!("{second}{first}"));
+    }
+
+    #[test]
+    fn adjacent_delete_removes_a_whole_paste_atom() {
+        let big = "x".repeat(500);
+        let mut composer = typed("a");
+        composer.paste(&big);
+        composer.backspace();
+        assert_eq!(composer.text(), "a");
+
+        composer.paste(&big);
+        composer.home();
+        composer.right();
+        composer.delete();
+        assert_eq!(composer.text(), "a");
+    }
+
+    #[test]
+    fn cutting_an_atom_materializes_payload_before_editing() {
+        let big = "abcdef".repeat(100);
+        let mut document = ComposerDocument::default();
+        let cursor = document.insert_atom(
+            ByteOffset::ZERO,
+            PasteId(1),
+            "[Pasted #1: 600 chars]".into(),
+            big.clone(),
+        );
+        let cut = TextRange::new(ByteOffset::ZERO, cursor);
+        let cursor = document.replace(cut, "replacement");
+        assert_eq!(document.text(), "replacement");
+        assert_eq!(cursor, ByteOffset::new("replacement".len()));
+        assert!(document.atoms.is_empty());
+    }
+
+    #[test]
+    fn paste_id_high_water_survives_submit_and_clear() {
+        let mut composer = Composer::new();
+        composer.paste(&"x".repeat(500));
+        assert!(composer.text().contains("#1"));
+        composer.submit();
+        composer.paste(&"y".repeat(500));
+        assert!(composer.text().contains("#2"));
+        composer.clear();
+        composer.paste(&"z".repeat(500));
+        assert!(composer.text().contains("#3"));
+    }
+
+    #[test]
+    fn image_attachment_rides_submit_and_survives_steer() {
+        let block = image();
+        let mut composer = Composer::new();
+        composer.attach_image("shot.png".into(), block.clone());
+        assert_eq!(composer.attachments()[0].label, "shot.png");
+        assert!(!composer.is_blank());
+        assert!(composer.submit_text().is_none());
+        composer.paste("keep going");
+        assert_eq!(composer.submit_text().as_deref(), Some("keep going"));
+        assert_eq!(composer.attachments()[0].label, "shot.png");
+        assert_eq!(composer.submit().unwrap().images, vec![block]);
+        assert!(composer.attachments().is_empty());
     }
 
     #[test]
     fn blank_submit_returns_none() {
-        let mut c = Composer::new();
-        assert!(c.submit().is_none());
-        for ch in "   ".chars() {
-            c.insert_char(ch);
+        let mut composer = Composer::new();
+        assert!(composer.submit().is_none());
+        composer.paste("   ");
+        assert!(composer.submit().is_none());
+    }
+
+    #[test]
+    fn canonical_layout_drives_view_and_cursor_window() {
+        let mut composer = typed("abcdef");
+        let view = composer.view(6);
+        assert_eq!(row_texts(&view), vec!["› abcd", "  ef"]);
+        assert_eq!((view.cursor_row, view.cursor_col), (1, 4));
+        composer.home();
+        assert_eq!(
+            (composer.view(6).cursor_row, composer.view(6).cursor_col),
+            (0, 2)
+        );
+
+        let mut tall = Composer::new();
+        for index in 0..20 {
+            tall.paste(&format!("line{index}"));
+            tall.insert_newline();
         }
-        assert!(c.submit().is_none());
+        let view = tall.view(40);
+        assert_eq!(view.rows.len(), MAX_ROWS);
+        assert_eq!(view.cursor_row, (MAX_ROWS - 1) as u16);
     }
 
     #[test]
-    fn view_wraps_and_places_the_cursor() {
-        // Width 6 → content width 4 (after the 2-col gutter).
-        let mut c = typed("abcdef");
-        let v = c.view(6);
-        assert_eq!(row_texts(&v), vec!["› abcd", "  ef"]);
-        // Cursor at end: row 1, col 2 (gutter) + 2 = 4.
-        assert_eq!((v.cursor_row, v.cursor_col), (1, 4));
+    fn exact_width_projects_cursor_to_the_next_visual_row() {
+        let mut composer = typed("abcd");
+        let exact = composer.view(6);
+        assert_eq!(row_texts(&exact), vec!["› abcd", "  "]);
+        assert_eq!((exact.cursor_row, exact.cursor_col), (1, 2));
 
-        // Move home: cursor back to the first row just after the prompt.
-        c.home();
-        let v = c.view(6);
-        assert_eq!((v.cursor_row, v.cursor_col), (0, 2));
+        composer.left();
+        assert_eq!(
+            (composer.view(6).cursor_row, composer.view(6).cursor_col),
+            (0, 5)
+        );
+        composer.right();
+        assert_eq!(
+            (composer.view(6).cursor_row, composer.view(6).cursor_col),
+            (1, 2)
+        );
+
+        let narrow = typed("你").view(3);
+        assert!(narrow.cursor_col < 3);
+        assert_eq!(row_texts(&narrow), vec!["› 你"]);
     }
 
     #[test]
-    fn view_shows_placeholder_when_empty() {
-        let c = Composer::new();
-        let v = c.view(40);
-        assert_eq!(v.rows.len(), 1);
-        let text: String = v.rows[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert!(text.starts_with("› Type a message"));
-        assert_eq!((v.cursor_row, v.cursor_col), (0, 2));
-    }
-
-    #[test]
-    fn view_windows_tall_input_to_keep_cursor_visible() {
-        let mut c = Composer::new();
-        for i in 0..20 {
-            for ch in format!("line{i}").chars() {
-                c.insert_char(ch);
+    fn layout_ranges_reconstruct_display_across_hard_and_soft_breaks() {
+        let composer = typed("abcdef\n你好");
+        let layout = ComposerLayout::new(composer.text(), composer.cursor(), 6);
+        let mut reconstructed = String::new();
+        for row in &layout.rows {
+            reconstructed
+                .push_str(&composer.text()[row.source.start().get()..row.source.end().get()]);
+            if row.break_kind == RowBreak::Hard {
+                let next = composer.text()[row.source.end().get()..]
+                    .graphemes(true)
+                    .next()
+                    .expect("hard break has separator");
+                reconstructed.push_str(next);
             }
-            c.insert_newline();
         }
-        // Cursor is on the last (empty) line; the window shows the last MAX_ROWS.
-        let v = c.view(40);
-        assert_eq!(v.rows.len(), MAX_ROWS);
-        assert_eq!(v.cursor_row, (MAX_ROWS - 1) as u16);
-    }
-
-    #[test]
-    fn replace_token_swaps_the_current_word_and_trails_a_space() {
-        // Slash completion: the whole `/co` token becomes `/compact `.
-        let mut c = typed("/co");
-        c.replace_token("/compact");
-        assert_eq!(c.text(), "/compact ");
-        assert_eq!(c.cursor(), 9);
-
-        // File completion mid-line: only the `@` token is replaced.
-        let mut c = typed("review @src/ma");
-        c.replace_token("@src/main.rs");
-        assert_eq!(c.text(), "review @src/main.rs ");
-
-        // Cursor mid-token replaces only up to the cursor (the suffix stays).
-        let mut c = typed("@src/main");
-        c.left(); // cursor before the trailing 'n'... actually after "@src/mai"
-        c.replace_token("@src/lib");
-        assert_eq!(c.text(), "@src/lib n");
-    }
-
-    #[test]
-    fn cjk_width_in_view() {
-        // Two double-width chars fill content width 4 exactly, one wraps.
-        let c = typed("你好世");
-        let v = c.view(6);
-        assert_eq!(row_texts(&v), vec!["› 你好", "  世"]);
+        assert_eq!(reconstructed, composer.text());
     }
 }

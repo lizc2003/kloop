@@ -203,8 +203,8 @@ pub enum Command {
     PasteClipboardImage,
     /// The composer's current `@`-token asks for file candidates: the loop walks
     /// the tree (an I/O search) and feeds matches back via
-    /// [`App::set_file_results`]. Carries the query after the `@`.
-    SearchFiles(String),
+    /// [`App::set_file_results`]. Carries the exact target identity.
+    SearchFiles(menu::CompletionTarget),
     Quit,
 }
 
@@ -887,7 +887,7 @@ impl App {
         });
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Command {
+    pub fn on_key(&mut self, composer_width: usize, key: KeyEvent) -> Command {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+C is a two-tap quit on every surface — main input, confirm popup,
         // rewind picker: the first press arms a hint, the second quits, any other
@@ -971,10 +971,11 @@ impl App {
             }
             // Up/Down move the composer cursor, or step through input history at
             // the first/last line (plan 38 slice 3).
-            (KeyCode::Up, _) => self.composer.up(),
-            (KeyCode::Down, _) => self.composer.down(),
+            (KeyCode::Up, _) => self.composer.up(composer_width),
+            (KeyCode::Down, _) => self.composer.down(composer_width),
             (KeyCode::Char(c), false) => self.composer.insert_char(c),
             (KeyCode::Backspace, _) => self.composer.backspace(),
+            (KeyCode::Delete, _) => self.composer.delete(),
             (KeyCode::Left, _) => self.composer.left(),
             (KeyCode::Right, _) => self.composer.right(),
             (KeyCode::Home, _) => self.composer.home(),
@@ -997,11 +998,10 @@ impl App {
     /// returns [`Command::None`].
     fn after_edit(&mut self) -> Command {
         match menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running) {
-            Some(menu::Trigger::Slash(query)) => {
-                let items = menu::slash_items(&self.commands, &query);
+            Some(target) if target.kind == menu::PopupKind::Slash => {
+                let items = menu::slash_items(&self.commands, &target.query);
                 self.popup = (!items.is_empty()).then_some(menu::Popup {
-                    kind: menu::PopupKind::Slash,
-                    query,
+                    target,
                     items,
                     cursor: 0,
                 });
@@ -1009,7 +1009,7 @@ impl App {
             }
             // The loop searches and calls `set_file_results`; leave the current
             // popup (if any) until the results land so the menu doesn't flicker.
-            Some(menu::Trigger::File(query)) => Command::SearchFiles(query),
+            Some(target) => Command::SearchFiles(target),
             None => {
                 self.popup = None;
                 Command::None
@@ -1059,25 +1059,30 @@ impl App {
     /// completed token carries a trailing space, so its trigger no longer fires.
     fn accept_popup(&mut self) {
         if let Some(popup) = self.popup.take() {
+            let current =
+                menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running);
+            if current.as_ref() != Some(&popup.target) {
+                return;
+            }
             if let Some(item) = popup.selected() {
-                self.composer.replace_token(&item.insert);
+                self.composer
+                    .replace_range(popup.target.range, popup.target.cursor, &item.insert);
             }
         }
     }
 
-    /// Fill the file menu with the loop's search results for `query`. Ignored if
-    /// the composer has moved on (the `@`-token no longer matches `query`), so a
-    /// late result can't reopen a stale menu; an empty result closes the popup.
-    pub fn set_file_results(&mut self, query: &str, paths: Vec<String>) {
+    /// Fill the file menu with the loop's search results for `target`. Ignored if
+    /// the composer has moved on, so a late result cannot reopen a same-query
+    /// token at another byte range; an empty result closes the popup.
+    pub fn set_file_results(&mut self, target: menu::CompletionTarget, paths: Vec<String>) {
         let current =
             menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running);
-        if !matches!(&current, Some(menu::Trigger::File(q)) if q == query) {
+        if current.as_ref() != Some(&target) || target.kind != menu::PopupKind::File {
             return;
         }
         let items = menu::file_items(paths);
         self.popup = (!items.is_empty()).then_some(menu::Popup {
-            kind: menu::PopupKind::File,
-            query: query.to_string(),
+            target,
             items,
             cursor: 0,
         });
@@ -1096,7 +1101,7 @@ impl App {
         // A slash command runs only when idle; it is not a message, so no User
         // cell. While a turn runs, a '/'-line is steering.
         if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
-            let _ = self.composer.submit();
+            let _ = self.composer.submit_text();
             self.running = true;
             return Command::Slash(display);
         }
@@ -1115,7 +1120,12 @@ impl App {
                 None => Command::None,
             };
         }
-        let labels = self.composer.attachments().to_vec();
+        let labels: Vec<String> = self
+            .composer
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.label.clone())
+            .collect();
         let sub = self.composer.submit().expect("checked not blank");
         self.submit_images = sub.images;
         if !display.is_empty() {
@@ -1137,14 +1147,15 @@ impl App {
 
     /// A bracketed-paste of text (the event loop routes image-file pastes to
     /// [`App::attach_image`] instead).
-    pub fn paste_text(&mut self, s: &str) {
+    pub fn paste_text(&mut self, s: &str) -> Command {
         if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() {
             if matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes) {
                 question.editor.push_str(s);
-                return;
+                return Command::None;
             }
         }
         self.composer.paste(s);
+        self.after_edit()
     }
 
     pub fn interaction_active(&self) -> bool {
@@ -1733,7 +1744,7 @@ mod tests {
 
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
-            app.on_key(key(KeyCode::Char(c)));
+            app.on_key(80, key(KeyCode::Char(c)));
         }
     }
 
@@ -1745,17 +1756,17 @@ mod tests {
         let mut app = App::new("s".into());
         assert_eq!(app.mode, Mode::Manual);
         assert_eq!(
-            app.on_key(key(KeyCode::BackTab)),
+            app.on_key(80, key(KeyCode::BackTab)),
             Command::SetMode(Mode::AcceptEdits)
         );
         assert_eq!(app.mode, Mode::AcceptEdits);
         assert_eq!(
-            app.on_key(key(KeyCode::BackTab)),
+            app.on_key(80, key(KeyCode::BackTab)),
             Command::SetMode(Mode::Plan)
         );
         assert_eq!(app.mode, Mode::Plan);
         assert_eq!(
-            app.on_key(key(KeyCode::BackTab)),
+            app.on_key(80, key(KeyCode::BackTab)),
             Command::SetMode(Mode::Manual)
         );
         assert_eq!(app.mode, Mode::Manual);
@@ -1795,10 +1806,10 @@ mod tests {
         assert!(app.streaming_assistant());
 
         assert!(app.show_task_graph);
-        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('t')), Command::None);
         assert!(!app.show_task_graph);
         assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
-        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('t')), Command::None);
         assert!(app.show_task_graph);
 
         app.apply(turn_ended(EndReason::Completed));
@@ -1811,7 +1822,7 @@ mod tests {
         )));
         assert!(app.task_graph.as_ref().unwrap().tasks.is_empty());
         assert!(app.show_task_graph);
-        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('t')), Command::None);
         assert!(app.show_task_graph, "an empty graph has no toggle target");
     }
 
@@ -2014,17 +2025,44 @@ mod tests {
     }
 
     #[test]
+    fn forward_delete_routes_to_a_whole_grapheme() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "a👩🏽‍💻z");
+        app.on_key(80, key(KeyCode::Home));
+        app.on_key(80, key(KeyCode::Right));
+        assert_eq!(app.on_key(80, key(KeyCode::Delete)), Command::None);
+        assert_eq!(app.composer.text(), "az");
+        app.on_key(80, key(KeyCode::End));
+        assert_eq!(app.on_key(80, key(KeyCode::Delete)), Command::None);
+        assert_eq!(app.composer.text(), "az");
+    }
+
+    #[test]
+    fn vertical_navigation_uses_the_current_composer_width() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "history");
+        app.composer.submit();
+        type_str(&mut app, "abcdefgh");
+        app.on_key(6, key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "abcdefgh", "soft row, not history");
+        app.on_key(6, key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "abcdefgh", "soft row, not history");
+        app.on_key(6, key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "history");
+    }
+
+    #[test]
     fn typing_editing_and_submit() {
         let mut app = App::new("s".into());
         type_str(&mut app, "你好ab");
-        app.on_key(key(KeyCode::Left));
-        app.on_key(key(KeyCode::Backspace)); // removes 'a'
-        app.on_key(key(KeyCode::Home));
-        app.on_key(key(KeyCode::Right));
+        app.on_key(80, key(KeyCode::Left));
+        app.on_key(80, key(KeyCode::Backspace)); // removes 'a'
+        app.on_key(80, key(KeyCode::Home));
+        app.on_key(80, key(KeyCode::Right));
         type_str(&mut app, "x");
         assert_eq!(app.composer.text(), "你x好b");
 
-        let cmd = app.on_key(key(KeyCode::Enter));
+        let cmd = app.on_key(80, key(KeyCode::Enter));
         assert_eq!(cmd, Command::Submit("你x好b".into()));
         assert!(app.running);
         assert_eq!(app.composer.text(), "");
@@ -2033,7 +2071,7 @@ mod tests {
         // While running, Enter steers instead of starting a new turn.
         type_str(&mut app, "next");
         assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
+            app.on_key(80, key(KeyCode::Enter)),
             Command::Steer("next".into())
         );
         assert_eq!(
@@ -2054,7 +2092,7 @@ mod tests {
         ))));
         app.show_task_graph = false;
         type_str(&mut app, "also do X");
-        let cmd = app.on_key(key(KeyCode::Enter));
+        let cmd = app.on_key(80, key(KeyCode::Enter));
         assert_eq!(cmd, Command::Steer("also do X".into()));
         assert!(app.running, "steering does not end or restart the turn");
         assert_eq!(app.composer.text(), "");
@@ -2085,22 +2123,22 @@ mod tests {
         app.attach_image("shot.png".into(), block.clone());
         type_str(&mut app, "keep going");
         assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
+            app.on_key(80, key(KeyCode::Enter)),
             Command::Steer("keep going".into())
         );
         // No [image:] cell, and the steer carries no image.
         assert_eq!(app.cells, vec![Cell::User("keep going".into())]);
         assert!(app.take_submit_images().is_empty(), "steer sends no image");
         assert_eq!(
-            app.composer.attachments(),
-            &["shot.png".to_string()],
+            app.composer.attachments()[0].label,
+            "shot.png",
             "image kept for a fresh turn"
         );
 
         // The turn ends; a fresh Enter now delivers the still-attached image.
         app.running = false;
         assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
+            app.on_key(80, key(KeyCode::Enter)),
             Command::Submit(String::new())
         );
         assert_eq!(
@@ -2117,7 +2155,7 @@ mod tests {
     fn slash_command_routes_only_when_idle() {
         let mut app = App::new("s".into());
         type_str(&mut app, "/help");
-        let cmd = app.on_key(key(KeyCode::Enter));
+        let cmd = app.on_key(80, key(KeyCode::Enter));
         assert_eq!(cmd, Command::Slash("/help".into()));
         assert!(app.running, "the app shows busy until the worker replies");
         assert_eq!(app.composer.text(), "");
@@ -2126,7 +2164,7 @@ mod tests {
         // While running, a '/'-line is just steering text, not a command.
         type_str(&mut app, "/cost");
         assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
+            app.on_key(80, key(KeyCode::Enter)),
             Command::Steer("/cost".into())
         );
         assert_eq!(app.cells, vec![Cell::User("/cost".into())]);
@@ -2192,9 +2230,9 @@ mod tests {
     #[test]
     fn ctrl_r_requests_fork_points_only_when_idle() {
         let mut app = App::new("s".into());
-        assert_eq!(app.on_key(ctrl('r')), Command::RequestForkPoints);
+        assert_eq!(app.on_key(80, ctrl('r')), Command::RequestForkPoints);
         app.running = true;
-        assert_eq!(app.on_key(ctrl('r')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('r')), Command::None);
     }
 
     /// The picker opens on ForkPoints with the cursor on the newest turn; ↑
@@ -2207,12 +2245,12 @@ mod tests {
         assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 1, "starts newest");
 
         // A stray character is captured by the picker, not inserted as input.
-        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(80, key(KeyCode::Char('x')));
         assert_eq!(app.composer.text(), "");
 
-        app.on_key(key(KeyCode::Up));
+        app.on_key(80, key(KeyCode::Up));
         assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 0);
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::Fork(4));
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::Fork(4));
         assert!(app.fork_picker.is_none(), "selecting closes the picker");
     }
 
@@ -2221,7 +2259,7 @@ mod tests {
     fn fork_picker_esc_cancels() {
         let mut app = App::new("s".into());
         app.apply(AgentEvent::ForkPoints(vec![fp(4, "two")]));
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert!(app.fork_picker.is_none());
     }
 
@@ -2275,9 +2313,9 @@ mod tests {
     #[test]
     fn empty_input_never_submits() {
         let mut app = App::new("s".into());
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         type_str(&mut app, "   ");
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert!(!app.running);
         assert!(app.cells.is_empty());
     }
@@ -2290,29 +2328,29 @@ mod tests {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
         // First Ctrl+C arms (no quit, input untouched).
-        assert_eq!(app.on_key(ctrl('c')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('c')), Command::None);
         assert!(app.ctrl_c_exit_armed);
         assert_eq!(app.composer.text(), "draft");
         // Second Ctrl+C quits.
-        assert_eq!(app.on_key(ctrl('c')), Command::Quit);
+        assert_eq!(app.on_key(80, ctrl('c')), Command::Quit);
 
         // Any other key between the taps disarms it.
-        app.on_key(ctrl('c'));
-        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(80, ctrl('c'));
+        app.on_key(80, key(KeyCode::Char('x')));
         assert!(!app.ctrl_c_exit_armed, "a non-Ctrl+C key disarms");
         assert_eq!(
-            app.on_key(ctrl('c')),
+            app.on_key(80, ctrl('c')),
             Command::None,
             "back to the first tap"
         );
 
         // Works while running too (quit aborts the turn).
-        app.on_key(key(KeyCode::Char('y'))); // disarm
+        app.on_key(80, key(KeyCode::Char('y'))); // disarm
         app.running = true;
-        assert_eq!(app.on_key(ctrl('c')), Command::None);
-        assert_eq!(app.on_key(ctrl('c')), Command::Quit);
+        assert_eq!(app.on_key(80, ctrl('c')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('c')), Command::Quit);
         // Ctrl+D is disabled — the only quit path is the two-tap Ctrl+C.
-        assert_eq!(app.on_key(ctrl('d')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('d')), Command::None);
     }
 
     /// Ctrl+V and Alt+V request an OS-clipboard image paste (the loop performs
@@ -2320,11 +2358,11 @@ mod tests {
     #[test]
     fn ctrl_or_alt_v_requests_clipboard_image() {
         let mut app = App::new("s".into());
-        assert_eq!(app.on_key(ctrl('v')), Command::PasteClipboardImage);
+        assert_eq!(app.on_key(80, ctrl('v')), Command::PasteClipboardImage);
         let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
-        assert_eq!(app.on_key(alt_v), Command::PasteClipboardImage);
+        assert_eq!(app.on_key(80, alt_v), Command::PasteClipboardImage);
         // A plain 'v' just types.
-        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(80, key(KeyCode::Char('v')));
         assert_eq!(app.composer.text(), "v");
     }
 
@@ -2335,11 +2373,11 @@ mod tests {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
         // Idle: Esc clears the line.
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert_eq!(app.composer.text(), "");
         // Running: Esc interrupts.
         app.running = true;
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::Interrupt);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
     }
 
     /// Ctrl+C is the same two-tap quit inside a popup as in the main input —
@@ -2360,28 +2398,28 @@ mod tests {
             },
             reply,
         });
-        assert_eq!(app.on_key(ctrl('c')), Command::None, "first tap arms");
+        assert_eq!(app.on_key(80, ctrl('c')), Command::None, "first tap arms");
         assert!(app.ctrl_c_exit_armed);
         assert!(
             !app.interactions.is_empty(),
             "the prompt is untouched by the tap"
         );
-        assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
+        assert_eq!(app.on_key(80, ctrl('c')), Command::Quit, "second tap quits");
 
         // Rewind picker up.
         let mut app = App::new("s".into());
         app.apply(AgentEvent::ForkPoints(vec![fp(4, "one")]));
-        assert_eq!(app.on_key(ctrl('c')), Command::None, "first tap arms");
+        assert_eq!(app.on_key(80, ctrl('c')), Command::None, "first tap arms");
         assert!(
             app.fork_picker.is_some(),
             "the picker is untouched by the tap"
         );
-        assert_eq!(app.on_key(ctrl('c')), Command::Quit, "second tap quits");
+        assert_eq!(app.on_key(80, ctrl('c')), Command::Quit, "second tap quits");
 
         // Ctrl+D is disabled in popups too (inert Ctrl combo).
         let mut app = App::new("s".into());
         app.apply(AgentEvent::ForkPoints(vec![fp(4, "one")]));
-        assert_eq!(app.on_key(ctrl('d')), Command::None);
+        assert_eq!(app.on_key(80, ctrl('d')), Command::None);
     }
 
     #[tokio::test]
@@ -2404,11 +2442,11 @@ mod tests {
         });
 
         // Normal typing is captured by the prompt, not the input line.
-        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(80, key(KeyCode::Char('x')));
         assert_eq!(app.composer.text(), "");
         assert!(rx.try_recv().is_err());
 
-        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(80, key(KeyCode::Char('a')));
         assert_eq!(
             rx.try_recv().unwrap(),
             Decision::Allow(kloop_core::permissions::ApprovalScope::WorkspaceSession)
@@ -2440,26 +2478,26 @@ mod tests {
         });
 
         // Scrolling keys adjust the offset and are captured by the prompt.
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(80, key(KeyCode::Down));
+        app.on_key(80, key(KeyCode::Char('j')));
         assert_eq!(app.confirm_scroll, 2);
-        app.on_key(key(KeyCode::PageDown));
+        app.on_key(80, key(KeyCode::PageDown));
         assert_eq!(app.confirm_scroll, 12);
-        app.on_key(key(KeyCode::Up));
-        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(80, key(KeyCode::Up));
+        app.on_key(80, key(KeyCode::Char('k')));
         assert_eq!(app.confirm_scroll, 10);
-        app.on_key(key(KeyCode::PageUp));
+        app.on_key(80, key(KeyCode::PageUp));
         assert_eq!(app.confirm_scroll, 0);
         // None of that reached the input line.
         assert_eq!(app.composer.text(), "");
         // Below-zero is saturated, not wrapped.
-        app.on_key(key(KeyCode::Up));
+        app.on_key(80, key(KeyCode::Up));
         assert_eq!(app.confirm_scroll, 0);
 
         // Scroll into the first diff, then answer: the next prompt starts fresh.
-        app.on_key(key(KeyCode::PageDown));
+        app.on_key(80, key(KeyCode::PageDown));
         assert_eq!(app.confirm_scroll, 10);
-        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(80, key(KeyCode::Char('y')));
         assert_eq!(front_confirm_description(&app), "second");
         assert_eq!(app.confirm_scroll, 0, "the next prompt is unscrolled");
     }
@@ -2484,16 +2522,16 @@ mod tests {
             reply: r2,
         });
 
-        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(80, key(KeyCode::Char('a')));
         assert!(rx1.try_recv().is_err());
         assert_eq!(front_confirm_description(&app), "first");
-        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(80, key(KeyCode::Char('y')));
         assert_eq!(
             rx1.try_recv().unwrap(),
             Decision::Allow(kloop_core::permissions::ApprovalScope::Once)
         );
         assert_eq!(front_confirm_description(&app), "second");
-        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(80, key(KeyCode::Char('n')));
         assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
     }
 
@@ -2506,14 +2544,14 @@ mod tests {
             reply,
         });
 
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
             panic!("expected question interaction");
         };
         assert_eq!(question.phase, QuestionPhase::Notes);
         assert_eq!(question.selected_preview(), Some("preview A"));
         app.paste_text("ship it");
-        app.on_key(key(KeyCode::Enter));
+        app.on_key(80, key(KeyCode::Enter));
         assert_eq!(
             rx.try_recv().unwrap(),
             QuestionOutcome::Answered(vec![QuestionAnswer {
@@ -2530,7 +2568,7 @@ mod tests {
             req: question_request(false, None),
             reply,
         });
-        app.on_key(key(KeyCode::Esc));
+        app.on_key(80, key(KeyCode::Esc));
         assert_eq!(rx.try_recv().unwrap(), QuestionOutcome::Cancelled);
     }
 
@@ -2553,7 +2591,7 @@ mod tests {
             reply: question_reply,
         });
 
-        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(80, key(KeyCode::Char('y')));
         assert_eq!(
             confirm_rx.try_recv().unwrap(),
             Decision::Allow(kloop_core::permissions::ApprovalScope::Once)
@@ -2564,14 +2602,14 @@ mod tests {
         ));
 
         // Toggle A, move to Other, enter free text, then submit both.
-        app.on_key(key(KeyCode::Char(' ')));
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Enter));
+        app.on_key(80, key(KeyCode::Char(' ')));
+        app.on_key(80, key(KeyCode::Down));
+        app.on_key(80, key(KeyCode::Down));
+        app.on_key(80, key(KeyCode::Enter));
         assert!(app.question_editor_active());
         app.paste_text("custom");
         assert_eq!(app.composer.text(), "", "paste stays in the modal editor");
-        app.on_key(key(KeyCode::Enter));
+        app.on_key(80, key(KeyCode::Enter));
         assert_eq!(
             question_rx.try_recv().unwrap(),
             QuestionOutcome::Answered(vec![QuestionAnswer {
@@ -2793,17 +2831,17 @@ mod tests {
         let mut app = app_with_commands();
         type_str(&mut app, "/co");
         let popup = app.popup.as_ref().expect("slash menu open");
-        assert_eq!(popup.kind, menu::PopupKind::Slash);
+        assert_eq!(popup.target.kind, menu::PopupKind::Slash);
         let labels: Vec<&str> = popup.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["/cost", "/compact"]);
 
         // Down highlights the second, and is captured (no submit, no history).
-        assert_eq!(app.on_key(key(KeyCode::Down)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Down)), Command::None);
         assert_eq!(app.popup.as_ref().unwrap().cursor, 1);
 
         // Enter completes it into the composer and closes the menu — it does not
         // start a turn (that is a second Enter).
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert!(app.popup.is_none(), "menu closed after accept");
         assert_eq!(app.composer.text(), "/compact ");
         assert!(!app.running, "accept did not submit");
@@ -2816,7 +2854,7 @@ mod tests {
         let mut app = app_with_commands();
         type_str(&mut app, "/he");
         assert!(app.popup.is_some());
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert!(app.popup.is_none());
         assert_eq!(app.composer.text(), "/he", "composer untouched");
     }
@@ -2829,7 +2867,7 @@ mod tests {
         type_str(&mut app, "/zzz");
         assert!(app.popup.is_none());
         assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
+            app.on_key(80, key(KeyCode::Enter)),
             Command::Slash("/zzz".into())
         );
     }
@@ -2848,37 +2886,59 @@ mod tests {
     #[test]
     fn at_token_requests_search_then_completes_a_file() {
         let mut app = app_with_commands();
-        // Each keystroke of the token re-issues the search with the new query.
+        // Each keystroke of the token re-issues the search with the new target.
         type_str(&mut app, "see @sr");
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('c'))),
-            Command::SearchFiles("src".into())
-        );
+        let target = match app.on_key(80, key(KeyCode::Char('c'))) {
+            Command::SearchFiles(target) => {
+                assert_eq!(target.query, "src");
+                target
+            }
+            other => panic!("expected file search, got {other:?}"),
+        };
 
-        app.set_file_results("src", vec!["src/main.rs".into(), "src/lib.rs".into()]);
+        app.set_file_results(target, vec!["src/main.rs".into(), "src/lib.rs".into()]);
         let popup = app.popup.as_ref().expect("file menu open");
-        assert_eq!(popup.kind, menu::PopupKind::File);
+        assert_eq!(popup.target.kind, menu::PopupKind::File);
         assert_eq!(popup.items[0].label, "src/main.rs");
 
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert!(app.popup.is_none());
         assert_eq!(app.composer.text(), "see @src/main.rs ");
     }
 
-    /// A stale search result (the composer moved past the query) is ignored, and
-    /// an empty result closes the menu.
     #[test]
-    fn file_results_ignore_stale_queries_and_close_on_empty() {
+    fn bracketed_paste_at_token_requests_file_search() {
+        let mut app = app_with_commands();
+        let target = match app.paste_text("see @src") {
+            Command::SearchFiles(target) => target,
+            other => panic!("expected file search, got {other:?}"),
+        };
+        assert_eq!(target.kind, menu::PopupKind::File);
+        assert_eq!(target.query, "src");
+        assert_eq!(target.range.start().get(), "see ".len());
+        assert_eq!(target.range.end().get(), "see @src".len());
+    }
+
+    /// A late result is matched by the whole target, not only its query, and an
+    /// empty result closes the menu.
+    #[test]
+    fn file_results_ignore_stale_targets_and_close_on_empty() {
         let mut app = app_with_commands();
         type_str(&mut app, "@ab");
-        // Result for an older query the composer no longer shows: ignored.
-        app.set_file_results("a", vec!["a.txt".into()]);
-        assert!(app.popup.is_none(), "stale query ignored");
-        // Matching query but no matches: menu stays closed.
-        app.set_file_results("ab", vec![]);
+        let first = menu::detect_trigger(app.composer.text(), app.composer.cursor(), true).unwrap();
+
+        app.composer.clear();
+        type_str(&mut app, "see @ab");
+        let second =
+            menu::detect_trigger(app.composer.text(), app.composer.cursor(), true).unwrap();
+        assert_eq!(first.query, second.query);
+        assert_ne!(first.range, second.range);
+
+        app.set_file_results(first, vec!["stale.rs".into()]);
+        assert!(app.popup.is_none(), "same-query stale range ignored");
+        app.set_file_results(second.clone(), vec![]);
         assert!(app.popup.is_none());
-        // Matching query with matches: opens.
-        app.set_file_results("ab", vec!["abc.rs".into()]);
+        app.set_file_results(second, vec!["abc.rs".into()]);
         assert!(app.popup.is_some());
     }
 

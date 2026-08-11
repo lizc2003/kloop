@@ -13,7 +13,6 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
 
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
@@ -33,6 +32,9 @@ use crate::app::QuestionPhase;
 use crate::app::ToolStatus;
 use crate::menu;
 use crate::menu::Popup;
+use crate::text_layout::display_width;
+use crate::text_layout::truncate;
+use crate::text_layout::wrap;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// kloop's brand accent: a vivid cyan-blue marks the agent's own presence —
@@ -85,7 +87,9 @@ fn task_panel_allowed(app: &App) -> bool {
 /// Compute all mutable chrome that lives between transcript cells and the
 /// composer. Draw and native-scrollback commit use this exact helper so a Task
 /// row can never be counted on screen but omitted from the frozen-height budget.
-pub fn live_chrome_layout(app: &App, width: usize, terminal_height: usize) -> LiveChromeLayout {
+pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
+    let width = usize::from(viewport.width).max(1);
+    let terminal_height = usize::from(viewport.height);
     let activity_visible = has_activity_line(app);
     let activity_spacer = activity_visible && !app.cells.is_empty();
     let activity_rows = usize::from(activity_visible) + usize::from(activity_spacer);
@@ -274,54 +278,6 @@ pub fn task_panel_lines(
     }
     debug_assert!(lines.len() <= cap);
     lines
-}
-
-/// Hard-wrap `text` to `width` display columns (CJK chars count as 2),
-/// breaking on newlines and at column boundaries. Never returns an empty vec.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for raw in text.split('\n') {
-        let mut line = String::new();
-        let mut cols = 0;
-        for c in raw.chars() {
-            let w = c.width().unwrap_or(0);
-            if cols + w > width && !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-                cols = 0;
-            }
-            line.push(c);
-            cols += w;
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-/// Truncate to `width` columns, appending `…` when anything was cut.
-pub fn truncate(text: &str, width: usize) -> String {
-    let width = width.max(1);
-    let mut cols = 0;
-    let mut out = String::new();
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if cols + w > width.saturating_sub(1) {
-            // Might still fit whole if this is the last char; check cheaply.
-            let rest_w: usize = text[out.len()..]
-                .chars()
-                .map(|c| c.width().unwrap_or(0))
-                .sum();
-            if cols + rest_w <= width {
-                out.push_str(&text[out.len()..]);
-                return out;
-            }
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-        cols += w;
-    }
-    out
 }
 
 /// The one-line thinking display (plan 38 slice 5): a `∗` gutter + a CC-style
@@ -868,10 +824,15 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     let full = f.area();
     let width = full.width as usize;
     let view = app.composer.view(width.max(1));
-    let labels: Vec<String> = app.composer.attachments().to_vec();
+    let labels: Vec<String> = app
+        .composer
+        .attachments()
+        .iter()
+        .map(|attachment| attachment.label.clone())
+        .collect();
     let attach_h = u16::from(!labels.is_empty());
     let composer_h = (view.rows.len() as u16 + attach_h).max(1);
-    let chrome = live_chrome_layout(app, width.max(1), full.height as usize);
+    let chrome = live_chrome_layout(app, full);
     let [transcript_area, rule_top, input_area, rule_bottom, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -940,9 +901,11 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
         if let Some(popup) = &app.popup {
             draw_menu(f, popup, rule_top, width);
         }
+        let cursor_col = view.cursor_col.min(input_area.width.saturating_sub(1));
+        let cursor_row = (attach_h + view.cursor_row).min(input_area.height.saturating_sub(1));
         f.set_cursor_position((
-            input_area.x + view.cursor_col,
-            input_area.y + attach_h + view.cursor_row,
+            (input_area.x + cursor_col).min(full.right().saturating_sub(1)),
+            (input_area.y + cursor_row).min(full.bottom().saturating_sub(1)),
         ));
     }
 }
@@ -1020,11 +983,6 @@ fn pad(text: &str, width: usize) -> String {
         s.push_str(&" ".repeat(width - w));
     }
     s
-}
-
-/// Display width of `s` in terminal columns (CJK counts as 2).
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// The rewind picker popup (plan 18): one row per fork point, the cursor row
@@ -1385,6 +1343,16 @@ fn diff_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
+    fn completion_target(kind: menu::PopupKind, query: &str) -> menu::CompletionTarget {
+        let cursor = crate::text_layout::ByteOffset::new(query.len() + 1);
+        menu::CompletionTarget {
+            kind,
+            query: query.into(),
+            range: crate::text_layout::TextRange::new(crate::text_layout::ByteOffset::ZERO, cursor),
+            cursor,
+        }
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -1493,7 +1461,7 @@ mod tests {
             TaskStatus::Pending,
             &[],
         )]));
-        let normal = live_chrome_layout(&app, 80, 24);
+        let normal = live_chrome_layout(&app, Rect::new(0, 0, 80, 24));
         assert_eq!(normal.task_lines.len(), 1);
         assert_eq!(normal.reserved_rows(), 1);
 
@@ -1501,7 +1469,9 @@ mod tests {
             points: Vec::new(),
             cursor: 0,
         });
-        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+            .task_lines
+            .is_empty());
         app.fork_picker = None;
 
         let (confirm_reply, _confirm_rx) = tokio::sync::oneshot::channel();
@@ -1514,7 +1484,9 @@ mod tests {
             },
             reply: confirm_reply,
         });
-        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+            .task_lines
+            .is_empty());
         app.interactions.clear();
 
         let (question_reply, _question_rx) = tokio::sync::oneshot::channel();
@@ -1534,12 +1506,13 @@ mod tests {
             },
             reply: question_reply,
         });
-        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+            .task_lines
+            .is_empty());
         app.interactions.clear();
 
         app.popup = Some(Popup {
-            kind: menu::PopupKind::Slash,
-            query: String::new(),
+            target: completion_target(menu::PopupKind::Slash, ""),
             items: vec![menu::MenuItem {
                 label: "/help".into(),
                 detail: "help".into(),
@@ -1547,12 +1520,18 @@ mod tests {
             }],
             cursor: 0,
         });
-        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+            .task_lines
+            .is_empty());
         app.popup = None;
 
-        assert!(live_chrome_layout(&app, 80, 5).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 5))
+            .task_lines
+            .is_empty());
         app.show_task_graph = false;
-        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+            .task_lines
+            .is_empty());
     }
 
     #[test]
@@ -1666,7 +1645,7 @@ mod tests {
         assert!(visible.contains("⎿ ◻ Toggle me"), "{visible}");
         assert!(visible.contains("ctrl+t to hide tasks"), "{visible}");
 
-        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
             .draw(|frame| draw(frame, &mut app, &Hud::default()))
             .unwrap();
@@ -1674,7 +1653,7 @@ mod tests {
         assert!(!hidden.contains("Toggle me"), "{hidden}");
         assert!(hidden.contains("ctrl+t to show tasks"), "{hidden}");
 
-        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
             .draw(|frame| draw(frame, &mut app, &Hud::default()))
             .unwrap();
@@ -1686,8 +1665,10 @@ mod tests {
         assert_eq!(wrap("你好世界", 4), vec!["你好", "世界"]);
         assert_eq!(wrap("ab\ncd", 10), vec!["ab", "cd"]);
         assert_eq!(wrap("", 10), vec![""]);
-        // A double-width char never straddles the boundary.
+        // A wide grapheme never straddles the boundary or splits into codepoints.
         assert_eq!(wrap("a你b", 2), vec!["a", "你", "b"]);
+        assert_eq!(wrap("a👩🏽‍💻b", 2), vec!["a", "👩🏽‍💻", "b"]);
+        assert_eq!(wrap("ae\u{301}b", 2), vec!["ae\u{301}", "b"]);
         assert_eq!(wrap("abc", 0), vec!["a", "b", "c"]);
     }
 
@@ -1697,6 +1678,8 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello!", 5), "hell…");
         assert_eq!(truncate("你好世界", 5), "你好…");
+        assert_eq!(truncate("👩🏽‍💻x", 2), "…");
+        assert_eq!(truncate("e\u{301}x", 1), "…");
     }
 
     #[test]
@@ -1878,8 +1861,7 @@ mod tests {
             })
             .collect();
         let popup = Popup {
-            kind: menu::PopupKind::Slash,
-            query: String::new(),
+            target: completion_target(menu::PopupKind::Slash, ""),
             items,
             cursor: 12,
         };
@@ -1910,8 +1892,7 @@ mod tests {
     #[test]
     fn draw_floats_the_menu_above_the_composer() {
         let popup = Popup {
-            kind: menu::PopupKind::Slash,
-            query: "co".into(),
+            target: completion_target(menu::PopupKind::Slash, "co"),
             items: vec![
                 menu::MenuItem {
                     label: "/cost".into(),
@@ -2053,6 +2034,41 @@ mod tests {
         assert!(screen.contains("sonnet-5"), "{screen}");
         assert!(screen.contains("main"), "{screen}");
         assert!(screen.contains('╭') && screen.contains('╯'), "{screen}");
+    }
+
+    #[test]
+    fn exact_width_cursor_renders_on_the_next_composer_row() {
+        use ratatui::backend::Backend;
+
+        let backend = ratatui::backend::TestBackend::new(6, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = App::new("cursor".into());
+        app.composer.paste("abcd");
+        terminal
+            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .unwrap();
+
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(cursor, ratatui::layout::Position::new(2, 5));
+        assert_eq!(terminal.backend().buffer()[(5, 4)].symbol(), "d");
+    }
+
+    #[test]
+    fn ultra_narrow_cursor_is_clamped_inside_the_frame() {
+        use ratatui::backend::Backend;
+
+        for width in [1, 2] {
+            let backend = ratatui::backend::TestBackend::new(width, 5);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut app = App::new(format!("width-{width}"));
+            terminal
+                .draw(|frame| draw(frame, &mut app, &Hud::default()))
+                .unwrap();
+
+            let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+            assert!(cursor.x < width, "width={width}, cursor={cursor:?}");
+            assert!(cursor.y < 5, "width={width}, cursor={cursor:?}");
+        }
     }
 
     #[test]

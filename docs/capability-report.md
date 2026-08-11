@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-07,plan 1–66、68 完成（plan 39 仍按已完成切片计；plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
+> 基线:2026-08-11,plan 1–59、61–66、68–76 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -65,7 +65,7 @@
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | plan 49 明确返回 unsupported；不在 canonical provider wire 未统一时伪兼容 | 真实 PDF 需求 |
-| 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门) | 真痛感再重启,连 PTY 一起 |
+| 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门)；Plan 76 的 TUI PTY 仅为测试 harness，不是 production process channel | 真痛感再重启,连 PTY 一起 |
 | 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
@@ -281,6 +281,8 @@ worktree Git subprocess 不继承用户 Git config；负边界不冒充缺席 tr
 
 Plan 74 只对 kloop native extension 增补当前生成物：不改 218 份 pinned raw/normalized capture，static evidence 为 215 条，matrix 为 63 行/504 cells（24 same / 141 compatible / 177 intentional-diff / 5 missing / 133 unknown / 24 n/a）；新增 `task-clear@clean-cli` 八维 intentional-diff，故当前为 4 个 kloop-only row / 32 cells。7 个 pair 与 108 个 profile bridge 无实质变化。
 
+Plan 76 同样只增加 **kloop-native correctness evidence**：cross-platform Composer/unit/TestBackend 与 Unix real-binary PTY 不修改 218 份 pinned captures、matrix、pair、bridge 或 Claude Code scope，也不升级任何 `same`/`compatible` 裁决。PTY 的 input/CPR/ANSI/visible-viewport 证据、TestBackend 的 synthetic scrollback oracle、真实终端的 native scrollback/字形行为是三个独立裁决面。
+
 Plan 59 同时纠正 Plan 53 的过度裁决：AskUserQuestion 为 C/C/C/C/D/C/D/D，EnterPlanMode
 为 C/C/U/C/C/C/D/C，ExitPlanMode 为 C/D/D/C/D/N/C/C，StructuredOutput 为
 D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/type/null/options/unknown-field 负例，report 只按显式 row/dimension mapping 投影。C/D/U/N 分别表示 `compatible`、
@@ -366,6 +368,7 @@ codex 拉取式增量观察。
 | `--image`、TUI 图片路径/剪贴板附件 | — | **✅ Plan 29 + Plan 38** | 已完成 |
 | TUI 模式/档位状态栏显示 | 两家皆有 | **✅ Plan 37 + Plan 38 HUD** | 已完成 |
 | Task graph TUI live projection | — | **✅ Plan 74（2026-08-11）**：revisioned full snapshot、composer 上方 non-Cell live chrome、Ctrl+T、blocked hint 与有界折叠；plain/server/headless 无 checklist/native wire | 已完成 |
+| TUI grapheme / visual-row / paste-atom correctness | kloop native correctness surface | **✅ Plan 76（2026-08-11）**：strong byte ranges、whole-grapheme edit/Delete、canonical hard+soft row layout、exact-width EOL cursor、exact completion target、stable paste atom、completed-frame viewport geometry；cross-platform unit/TestBackend，real-binary PTY 仅 Unix | 已完成；本次 macOS 实跑，不外推 ConPTY/native scrollback parity |
 | server 不转发 thinking delta | — | HANDOFF 记录在案 | client 需要时 |
 | scheduled prompt 空闲投递 | kloop 原生；CC timed runtime 证据仍有 unknown | **✅ Plan 58（2026-08-03）**：TUI idle Wake、plain stdin/Inbox select、server single-flight 完整 turn；不伪造 `turnId:0` | 已完成 |
 | vim mode / 主题 / statusline | cc 单家 | 不立 | 定位外 |
@@ -384,6 +387,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 | 远端 CI 首次实跑(workflow 只做过本地等价验证) | workflow 已扩为 macOS/Linux/Windows 全 workspace + mock + corpus-only；仍待可用远端执行 | 用户提供/启用 runner |
 | Windows Plan 62 原生 lifecycle gate | **✅ 2026-08-05 本地 Windows 10 x64 全门通过**；focused selectors 继续进 workflow | 已完成；远端 CI 持续门禁 |
 | Plan 63 project permission / native protocol 1.0 | **✅ 2026-08-06**：kloop fmt/clippy/workspace/mock、real binary v1/v2-refusal smoke；Desktop 887 pass/52 skip/0 fail、TS/build、Tauri 229 tests；companion `54056dc5` | 已完成；private-store Windows target check/clippy已过，本次未做原生Windows runtime或真实Tauri GUI点击smoke |
+| Plan 76 TUI correctness evidence boundary | **✅ 2026-08-11**：Composer/render/TestBackend 为 cross-platform suite，本次 macOS workspace 实跑；CI 已配置 macOS/Linux/Windows，`cfg(unix)` real-binary PTY 回答 `ESC[6n`、驱动 resize/input、解析有界 raw ANSI/current viewport | Windows 的 n/a/skip 不是 ConPTY pass；vt100 不证明 DECSTBM native scrollback，真实终端字形/scrollback 另作人工证据 |
 | Linux 平台测试(连带沙箱 Linux 片) | Plan 19 余片 | 可用远端 Linux runner |
 | 自审遗留:低危项与重复代码清理 | 教训 25 尾注挂账 | 顺手 |
 
@@ -393,8 +397,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood**:
 - **Task graph/TUI 已销账（Plan 71–74，2026-08-11）**：session-scoped `task_create/get/update/list/clear`、稳定 ID 与强约束 dependency graph、root-owned/result-only child 边界、atomic rollover 与 clear revision fence、composer 上方 TUI live panel 均已落地；当前原生契约没有 assignment/owner 字段，plain/server/headless 无 Task checklist/public wire，`todo_write` 已删除。继续用真实任务 dogfood；下一产品切片回到 PDF 原生分页读取；
 - 之后每个 plan 的实现会话尽量在 kloop 里跑,痛点直接变本报告新行;
-- 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯五类边界(多字节、
-  大小写、Drop/Weak、预算耗尽、截断累积)。
+- 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯边界：UTF-8 byte offset / grapheme cluster / display column、combining/ZWJ/wide glyph、logical line / visual row、paste atom identity/recall/steer/exact-once、大小写、Drop/Weak、预算耗尽、截断累积。
 - **销账:2026-07-20 对 plan 33–38(baseline b3e79d1)跑了一轮多 agent 对抗式自审
   (8 区域精读 → 每发现两路对抗验证)**,查实并已修 4 个 correctness bug + 1 个一致性
   项(提交 fe2224e/86cc139/d38beae/be1d511/c5e3766,均带回归测试):① bypass 下带

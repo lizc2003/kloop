@@ -28,7 +28,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthChar;
 
-use crate::render::wrap;
+use crate::text_layout::wrap;
 
 /// Dim-grey background behind code (inline spans and fenced blocks). A neutral
 /// backdrop reads as "code"; fenced blocks additionally carry per-token

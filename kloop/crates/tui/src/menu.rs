@@ -1,27 +1,22 @@
-//! Completion popups for the composer (plan 38 slice 4): the `/` slash-command
-//! menu and the `@` file menu. A single flat menu backs both — pure trigger
-//! detection, slash filtering, and cursor state, all unit-tested without a TTY;
-//! the file list is filled by the event loop (an I/O search, [`crate::App`]).
-//! At most one popup is open at a time (the App holds `Option<Popup>`), and the
-//! rendering lives in [`crate::render`] beside the other draw code.
+//! Completion popups for the composer (plan 38 slice 4, hardened in plan 76).
+//!
+//! Trigger detection returns an exact UTF-8 byte range and cursor identity. The
+//! file-search result and popup acceptance both carry that target, so an equal
+//! query at another document position cannot edit the wrong token.
 
-/// How many file candidates the `@` search returns (and thus the tallest the
-/// file menu can be before its window scrolls).
+use crate::text_layout::is_grapheme_boundary;
+use crate::text_layout::ByteOffset;
+use crate::text_layout::TextRange;
+
 pub const FILE_MENU_MAX: usize = 50;
-
-/// The most menu rows shown at once; a longer list windows around the cursor.
 pub const MENU_ROWS: usize = 8;
 
-/// One entry in the slash-command catalog, built once at startup from the
-/// built-ins and loaded skills/commands. `name` has no leading `/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandInfo {
     pub name: String,
     pub description: String,
 }
 
-/// A row in an open menu. `label` and `detail` are what the user sees; `insert`
-/// is the full token (prefix included) that replaces the typed one on accept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuItem {
     pub label: String,
@@ -35,12 +30,17 @@ pub enum PopupKind {
     File,
 }
 
-/// An open completion popup: which trigger opened it, the query typed after the
-/// trigger char, the candidate rows, and the highlighted one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Popup {
+pub struct CompletionTarget {
     pub kind: PopupKind,
     pub query: String,
+    pub range: TextRange,
+    pub cursor: ByteOffset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Popup {
+    pub target: CompletionTarget,
     pub items: Vec<MenuItem>,
     pub cursor: usize,
 }
@@ -61,65 +61,64 @@ impl Popup {
     }
 }
 
-/// Which completion the composer's current token asks for, if any.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Trigger {
-    /// `/` at the very start of the input: the string after the slash.
-    Slash(String),
-    /// `@` anywhere: the string after the at-sign.
-    File(String),
-}
-
-/// Inspect the composer text and cursor for an active completion trigger. The
-/// current token is the run of non-whitespace chars ending at the cursor (the
-/// same span [`crate::composer::Composer::replace_token`] would replace). A `/`
-/// token counts only at the very start of the input (a command line); an `@`
-/// token counts anywhere (a file mention). `allow_slash` is false while a turn
-/// runs — a `/` line is then steering text, not a command.
-pub fn detect_trigger(text: &str, cursor: usize, allow_slash: bool) -> Option<Trigger> {
-    let chars: Vec<char> = text.chars().collect();
-    let cursor = cursor.min(chars.len());
-    let mut start = cursor;
-    while start > 0 && !chars[start - 1].is_whitespace() {
-        start -= 1;
+pub fn detect_trigger(
+    text: &str,
+    cursor: ByteOffset,
+    allow_slash: bool,
+) -> Option<CompletionTarget> {
+    if cursor.get() > text.len() || !is_grapheme_boundary(text, cursor) {
+        return None;
     }
-    let token: String = chars[start..cursor].iter().collect();
-    if let Some(rest) = token.strip_prefix('@') {
-        return Some(Trigger::File(rest.to_string()));
+    let prefix = &text[..cursor.get()];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    let token = &text[start..cursor.get()];
+    let range = TextRange::new(ByteOffset::new(start), cursor);
+    if let Some(query) = token.strip_prefix('@') {
+        return Some(CompletionTarget {
+            kind: PopupKind::File,
+            query: query.to_string(),
+            range,
+            cursor,
+        });
     }
     if allow_slash && start == 0 {
-        if let Some(rest) = token.strip_prefix('/') {
-            return Some(Trigger::Slash(rest.to_string()));
+        if let Some(query) = token.strip_prefix('/') {
+            return Some(CompletionTarget {
+                kind: PopupKind::Slash,
+                query: query.to_string(),
+                range,
+                cursor,
+            });
         }
     }
     None
 }
 
-/// The slash-menu rows for `query`: every command whose name starts with it
-/// (case-insensitive), in catalog order (built-ins first). Empty when nothing
-/// matches — the caller then shows no popup, so an unknown `/name` still runs
-/// and reports itself.
 pub fn slash_items(commands: &[CommandInfo], query: &str) -> Vec<MenuItem> {
-    let q = query.to_lowercase();
+    let query = query.to_lowercase();
     commands
         .iter()
-        .filter(|c| c.name.to_lowercase().starts_with(&q))
-        .map(|c| MenuItem {
-            label: format!("/{}", c.name),
-            detail: c.description.clone(),
-            insert: format!("/{}", c.name),
+        .filter(|command| command.name.to_lowercase().starts_with(&query))
+        .map(|command| MenuItem {
+            label: format!("/{}", command.name),
+            detail: command.description.clone(),
+            insert: format!("/{}", command.name),
         })
         .collect()
 }
 
-/// The file-menu rows for a set of found paths.
 pub fn file_items(paths: Vec<String>) -> Vec<MenuItem> {
     paths
         .into_iter()
-        .map(|p| MenuItem {
-            insert: format!("@{p}"),
+        .map(|path| MenuItem {
+            insert: format!("@{path}"),
             detail: String::new(),
-            label: p,
+            label: path,
         })
         .collect()
 }
@@ -131,89 +130,119 @@ mod tests {
     fn catalog() -> Vec<CommandInfo> {
         ["help", "cost", "compact", "clear", "exit"]
             .iter()
-            .map(|n| CommandInfo {
-                name: n.to_string(),
-                description: format!("the {n} command"),
+            .map(|name| CommandInfo {
+                name: name.to_string(),
+                description: format!("the {name} command"),
             })
             .collect()
+    }
+
+    fn target(kind: PopupKind, query: &str, start: usize, end: usize) -> CompletionTarget {
+        CompletionTarget {
+            kind,
+            query: query.into(),
+            range: TextRange::new(ByteOffset::new(start), ByteOffset::new(end)),
+            cursor: ByteOffset::new(end),
+        }
     }
 
     #[test]
     fn slash_trigger_only_at_start_of_input() {
         assert_eq!(
-            detect_trigger("/co", 3, true),
-            Some(Trigger::Slash("co".into()))
+            detect_trigger("/co", ByteOffset::new(3), true),
+            Some(target(PopupKind::Slash, "co", 0, 3))
         );
-        // Bare slash: empty query, still a trigger (shows the full menu).
         assert_eq!(
-            detect_trigger("/", 1, true),
-            Some(Trigger::Slash(String::new()))
+            detect_trigger("/", ByteOffset::new(1), true),
+            Some(target(PopupKind::Slash, "", 0, 1))
         );
-        // A slash mid-line is not a command.
-        assert_eq!(detect_trigger("go /co", 6, true), None);
-        // Suppressed while running.
-        assert_eq!(detect_trigger("/co", 3, false), None);
+        assert_eq!(detect_trigger("go /co", ByteOffset::new(6), true), None);
+        assert_eq!(detect_trigger("/co", ByteOffset::new(3), false), None);
     }
 
     #[test]
-    fn file_trigger_anywhere() {
+    fn file_trigger_carries_unicode_byte_range() {
+        let text = "审阅 @src/界";
+        let start = "审阅 ".len();
         assert_eq!(
-            detect_trigger("review @src/ma", 14, true),
-            Some(Trigger::File("src/ma".into()))
+            detect_trigger(text, ByteOffset::new(text.len()), true),
+            Some(target(PopupKind::File, "src/界", start, text.len()))
         );
-        // At the very start too.
         assert_eq!(
-            detect_trigger("@a", 2, true),
-            Some(Trigger::File("a".into()))
+            detect_trigger("@a", ByteOffset::new(2), true),
+            Some(target(PopupKind::File, "a", 0, 2))
         );
-        // Bare at-sign: empty query.
         assert_eq!(
-            detect_trigger("@", 1, true),
-            Some(Trigger::File(String::new()))
+            detect_trigger("@", ByteOffset::new(1), true),
+            Some(target(PopupKind::File, "", 0, 1))
         );
     }
 
     #[test]
-    fn no_trigger_for_plain_text_or_after_whitespace() {
-        assert_eq!(detect_trigger("hello", 5, true), None);
-        // Cursor after the token's trailing space: the token is empty.
-        assert_eq!(detect_trigger("@a ", 3, true), None);
+    fn no_trigger_for_plain_text_whitespace_or_non_boundary_cursor() {
+        assert_eq!(detect_trigger("hello", ByteOffset::new(5), true), None);
+        assert_eq!(detect_trigger("@a ", ByteOffset::new(3), true), None);
+        assert_eq!(detect_trigger("@界", ByteOffset::new(2), true), None);
     }
 
     #[test]
-    fn cursor_mid_token_uses_only_the_prefix() {
-        // "@src/main" with the cursor after "@src" → query "src".
+    fn cursor_mid_token_targets_only_the_prefix() {
         assert_eq!(
-            detect_trigger("@src/main", 4, true),
-            Some(Trigger::File("src".into()))
+            detect_trigger("@src/main", ByteOffset::new(4), true),
+            Some(target(PopupKind::File, "src", 0, 4))
         );
+        let text = "前 @界/后";
+        let cursor = ByteOffset::new("前 @界".len());
+        assert_eq!(
+            detect_trigger(text, cursor, true),
+            Some(target(PopupKind::File, "界", "前 ".len(), cursor.get()))
+        );
+    }
+
+    #[test]
+    fn identical_queries_at_different_ranges_are_distinct_targets() {
+        let first = detect_trigger("@src", ByteOffset::new(4), true).unwrap();
+        let second_text = "see @src";
+        let second = detect_trigger(second_text, ByteOffset::new(second_text.len()), true).unwrap();
+        assert_eq!(first.query, second.query);
+        assert_ne!(first, second);
     }
 
     #[test]
     fn slash_items_filter_by_prefix_in_catalog_order() {
         let items = slash_items(&catalog(), "c");
-        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["/cost", "/compact", "/clear"]);
         assert_eq!(items[0].insert, "/cost");
-        // Case-insensitive, exact-prefix.
         assert_eq!(slash_items(&catalog(), "COMP").len(), 1);
         assert!(slash_items(&catalog(), "zzz").is_empty());
     }
 
     #[test]
+    fn file_items_preserve_path_and_add_trigger() {
+        assert_eq!(
+            file_items(vec!["src/main.rs".into()]),
+            vec![MenuItem {
+                label: "src/main.rs".into(),
+                detail: String::new(),
+                insert: "@src/main.rs".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn cursor_moves_and_clamps() {
-        let mut p = Popup {
-            kind: PopupKind::Slash,
-            query: "c".into(),
+        let mut popup = Popup {
+            target: target(PopupKind::Slash, "c", 0, 2),
             items: slash_items(&catalog(), "c"),
             cursor: 0,
         };
-        p.move_up(); // clamps at 0
-        assert_eq!(p.cursor, 0);
-        p.move_down();
-        p.move_down();
-        p.move_down(); // clamps at len-1 (3 items)
-        assert_eq!(p.cursor, 2);
-        assert_eq!(p.selected().unwrap().label, "/clear");
+        popup.move_up();
+        assert_eq!(popup.cursor, 0);
+        popup.move_down();
+        popup.move_down();
+        popup.move_down();
+        assert_eq!(popup.cursor, 2);
+        assert_eq!(popup.selected().unwrap().label, "/clear");
     }
 }

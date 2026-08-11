@@ -16,10 +16,10 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use serde_json::Value;
-use unicode_width::UnicodeWidthChar;
 
 use crate::app::ToolStatus;
-use crate::render::truncate;
+use crate::text_layout::display_width;
+use crate::text_layout::truncate;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// Preview budget under a tool row: at most this many lines and characters, then
@@ -62,7 +62,7 @@ fn header_line(name: &str, input: &str, status: ToolStatus, width: usize) -> Lin
     ];
     if !detail.is_empty() {
         // mark+space (2) + verb + one space before the detail.
-        let used = 2 + dwidth(&verb) + 1;
+        let used = 2 + display_width(&verb) + 1;
         spans.push(Span::raw(" ".to_string()));
         spans.push(Span::styled(
             truncate(&clean(&detail), width.saturating_sub(used).max(1)),
@@ -196,7 +196,7 @@ fn edit_diff_lines(input: &str, width: usize) -> Vec<Line<'static>> {
     if old.is_empty() && new.is_empty() {
         return Vec::new();
     }
-    let content_w = width.saturating_sub(GUTTER.chars().count() + 2).max(1);
+    let content_w = width.saturating_sub(display_width(GUTTER) + 2).max(1);
     vec![
         diff_line(GUTTER, "- ", old, Color::Red, content_w),
         diff_line(GUTTER_CONT, "+ ", new, Color::Green, content_w),
@@ -221,7 +221,7 @@ fn preview_lines(out: &str, is_error: bool, width: usize) -> Vec<Line<'static>> 
     if body.trim().is_empty() {
         return Vec::new();
     }
-    let content_w = width.saturating_sub(GUTTER.chars().count()).max(1);
+    let content_w = width.saturating_sub(display_width(GUTTER)).max(1);
     let style = if is_error {
         Style::new().fg(Color::Red)
     } else {
@@ -290,10 +290,6 @@ fn clean(s: &str) -> String {
         .map(|c| if c == '\t' { ' ' } else { c })
         .filter(|c| !c.is_control())
         .collect()
-}
-
-fn dwidth(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 #[cfg(test)]

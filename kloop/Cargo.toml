@@ -45,6 +45,7 @@ chrono-tz = "0.10"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 ratatui = "0.29"
+unicode-segmentation = "1.13"
 unicode-width = "0.2"
 globset = "0.4"
 grep-matcher = "0.1"
@@ -106,4 +107,7 @@ windows-sys = { version = "0.52", features = [
 ] }
 
 # test-only
+portable-pty = "0.9"
+tempfile = "3"
+vt100 = "0.15.2"
 wiremock = "0.6"

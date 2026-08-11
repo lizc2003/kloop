@@ -17,6 +17,7 @@ mod events;
 mod markdown;
 mod menu;
 mod render;
+mod text_layout;
 mod toolrow;
 
 use std::io::Write as _;
@@ -29,6 +30,7 @@ use std::time::Instant;
 use anyhow::Result;
 use crossterm::event::Event;
 use crossterm::event::KeyEventKind;
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget as _;
@@ -455,7 +457,105 @@ fn fork_here(
     Ok((session_id_of(&fork_path), messages, rollout))
 }
 
-type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+struct PinnedBackend<B> {
+    inner: B,
+    pinned_size: Option<ratatui::layout::Size>,
+}
+
+impl<B> PinnedBackend<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            pinned_size: None,
+        }
+    }
+}
+
+impl<B: ratatui::backend::Backend> PinnedBackend<B> {
+    fn pin_current_size(&mut self) -> std::io::Result<()> {
+        self.pinned_size = Some(self.inner.size()?);
+        Ok(())
+    }
+
+    fn unpin_size(&mut self) {
+        self.pinned_size = None;
+    }
+}
+
+impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B> {
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, lines: u16) -> std::io::Result<()> {
+        self.inner.append_lines(lines)
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.pinned_size.map_or_else(|| self.inner.size(), Ok)
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        let mut size = self.inner.window_size()?;
+        if let Some(pinned) = self.pinned_size {
+            size.columns_rows = pinned;
+        }
+        Ok(size)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn scroll_region_up(
+        &mut self,
+        region: std::ops::Range<u16>,
+        line_count: u16,
+    ) -> std::io::Result<()> {
+        self.inner.scroll_region_up(region, line_count)
+    }
+
+    fn scroll_region_down(
+        &mut self,
+        region: std::ops::Range<u16>,
+        line_count: u16,
+    ) -> std::io::Result<()> {
+        self.inner.scroll_region_down(region, line_count)
+    }
+}
+
+type Terminal =
+    ratatui::Terminal<PinnedBackend<ratatui::backend::CrosstermBackend<std::io::Stdout>>>;
 
 fn setup_terminal() -> Result<Terminal> {
     crossterm::terminal::enable_raw_mode()?;
@@ -479,7 +579,7 @@ fn setup_terminal() -> Result<Terminal> {
     // (cursor-position query) runs before the input thread starts, so nothing
     // races it for stdin.
     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let backend = PinnedBackend::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()));
     let terminal = ratatui::Terminal::with_options(
         backend,
         TerminalOptions {
@@ -566,10 +666,12 @@ where
     Ok(())
 }
 
-fn overflow_commit_count(app: &App, width: usize, height: usize) -> usize {
+fn overflow_commit_count(app: &App, viewport: Rect) -> usize {
+    let width = usize::from(viewport.width).max(1);
+    let height = usize::from(viewport.height);
     // Draw and commit share one mutable-chrome calculation: activity plus the
     // revisioned Task panel must both stay out of native scrollback.
-    let chrome = render::live_chrome_layout(app, width, height);
+    let chrome = render::live_chrome_layout(app, viewport);
     let reserve = 2 + render::composer_height(app, width) + 1 + chrome.reserved_rows();
     let active_h = height.saturating_sub(reserve).max(1);
     render::commit_count(&app.cells, width, active_h, |index| {
@@ -577,16 +679,22 @@ fn overflow_commit_count(app: &App, width: usize, height: usize) -> usize {
     })
 }
 
-/// Freeze the finalized cells that overflow the live region into native
-/// scrollback via `insert_before`, then drop them from the app's tail. Called
-/// before each draw (unless a popup owns the screen), so the viewport only ever
-/// holds the recent, still-mutable tail.
-fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
-    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-    let width = (w as usize).max(1);
-    let n = overflow_commit_count(app, width, h as usize);
+/// Freeze finalized cells that overflow the last successfully drawn live region
+/// into native scrollback, then drop them from the app's tail. The caller must
+/// pass the viewport from that draw; committing from a pre-draw size probe would
+/// race Ratatui's own autoresize and could irreversibly freeze the wrong prefix.
+fn commit_overflow<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+    viewport: Rect,
+) -> Result<bool>
+where
+    B: ratatui::backend::Backend,
+{
+    let width = usize::from(viewport.width).max(1);
+    let n = overflow_commit_count(app, viewport);
     if n == 0 {
-        return Ok(());
+        return Ok(false);
     }
     // Render each cell to fixed-height lines up front so the borrow of
     // `app.cells` ends before `drain_committed` takes it mutably.
@@ -596,7 +704,55 @@ fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
         .collect();
     insert_scrollback_blocks(terminal, blocks)?;
     app.drain_committed(n);
-    Ok(())
+    Ok(true)
+}
+
+/// Draw once so Ratatui's internal autoresize establishes the authoritative
+/// viewport. Before an irreversible commit, the backend captures and pins one
+/// physical size: autoresize confirmation, insert/drain, and the required repaint
+/// therefore share one geometry even if a resize arrives mid-transaction. The
+/// returned geometry belongs to the final frame and drives the next key event.
+fn draw_frame<B>(
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
+    app: &mut App,
+    hud: &render::Hud,
+) -> Result<Rect>
+where
+    B: ratatui::backend::Backend,
+{
+    for retry in 0..=1 {
+        terminal.draw(|frame| render::draw(frame, app, hud))?;
+        let drawn_viewport = terminal.get_frame().area();
+        let overlay_open =
+            !app.interactions.is_empty() || app.fork_picker.is_some() || app.popup.is_some();
+        if overlay_open {
+            return Ok(drawn_viewport);
+        }
+
+        terminal.backend_mut().pin_current_size()?;
+        let attempt: Result<Option<Rect>> = (|| {
+            terminal.autoresize()?;
+            let confirmed_viewport = terminal.get_frame().area();
+            if confirmed_viewport != drawn_viewport {
+                return Ok(None);
+            }
+            if commit_overflow(terminal, app, confirmed_viewport)? {
+                terminal.draw(|frame| render::draw(frame, app, hud))?;
+            }
+            Ok(Some(terminal.get_frame().area()))
+        })();
+        terminal.backend_mut().unpin_size();
+
+        match attempt? {
+            Some(viewport) => return Ok(viewport),
+            None if retry == 0 => continue,
+            None => {
+                terminal.draw(|frame| render::draw(frame, app, hud))?;
+                return Ok(terminal.get_frame().area());
+            }
+        }
+    }
+    unreachable!("bounded geometry retry loop always returns")
 }
 
 /// Recognize a pasted/dragged image-file path and load it into an Image block
@@ -622,6 +778,16 @@ fn load_image_paste(s: &str) -> Option<(String, ContentBlock)> {
         .unwrap_or(path)
         .to_string();
     Some((label, block))
+}
+
+async fn search_files(cwd: &std::path::Path, target: &menu::CompletionTarget) -> Vec<String> {
+    let root = cwd.to_path_buf();
+    let query = target.query.clone();
+    tokio::task::spawn_blocking(move || {
+        kloop_core::fs_complete::complete_files(&root, &query, menu::FILE_MENU_MAX)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -706,21 +872,13 @@ async fn ui_loop(
             reduced_motion,
         };
 
-        // Match the inline viewport to the terminal (repositions on resize),
-        // then freeze finalized overflow into scrollback before drawing the
-        // tail. Skip committing while a popup owns the screen — scrolling
-        // content out from under an overlay would corrupt it.
-        if let Err(e) = terminal.autoresize() {
-            break Err(e.into());
-        }
-        if app.interactions.is_empty() && app.fork_picker.is_none() && app.popup.is_none() {
-            if let Err(e) = commit_overflow(terminal, &mut app) {
-                break Err(e);
-            }
-        }
-        if let Err(e) = terminal.draw(|f| render::draw(f, &mut app, &hud)) {
-            break Err(e.into());
-        }
+        // Ratatui's draw owns autoresize. Commit only from the viewport of that
+        // completed frame; if a commit clears it, `draw_frame` immediately
+        // repaints and returns the final geometry used by key navigation.
+        let viewport = match draw_frame(terminal, &mut app, &hud) {
+            Ok(viewport) => viewport,
+            Err(error) => break Err(error),
+        };
         // Animation self-drives: while a turn runs (and no overlay owns the
         // screen), a frame tick wakes the loop to advance the spinner/elapsed;
         // idle, the tick is disabled so `select` blocks with zero CPU (the
@@ -733,7 +891,7 @@ async fn ui_loop(
         tokio::select! {
             input = input_rx.recv() => match input {
                 Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    match app.on_key(k) {
+                    match app.on_key(usize::from(viewport.width), k) {
                         Command::Submit(text) => {
                             let cancel = CancellationToken::new();
                             current_cancel = Some(cancel.clone());
@@ -786,23 +944,9 @@ async fn ui_loop(
                                 Err(e) => app.apply(AgentEvent::Core(CoreEvent::Note(e))),
                             }
                         }
-                        Command::SearchFiles(query) => {
-                            // Walk the tree off-thread (the `@` menu's I/O) and
-                            // feed matches back. Awaited inline: the composer
-                            // hasn't changed by the time results land, so the
-                            // menu shows before the next draw with no stale race.
-                            let root = cwd.clone();
-                            let q = query.clone();
-                            let paths = tokio::task::spawn_blocking(move || {
-                                kloop_core::fs_complete::complete_files(
-                                    &root,
-                                    &q,
-                                    menu::FILE_MENU_MAX,
-                                )
-                            })
-                            .await
-                            .unwrap_or_default();
-                            app.set_file_results(&query, paths);
+                        Command::SearchFiles(target) => {
+                            let paths = search_files(&cwd, &target).await;
+                            app.set_file_results(target, paths);
                         }
                         Command::Quit => break Ok(()),
                         Command::None => {}
@@ -811,10 +955,17 @@ async fn ui_loop(
                 // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
                 // path attaches as an image, anything else goes to the composer
                 // (a large paste collapses to a placeholder there).
-                Some(Event::Paste(s)) if app.question_editor_active() => app.paste_text(&s),
+                Some(Event::Paste(s)) if app.question_editor_active() => {
+                    let _ = app.paste_text(&s);
+                }
                 Some(Event::Paste(s)) => match load_image_paste(&s) {
                     Some((label, block)) => app.attach_image(label, block),
-                    None => app.paste_text(&s),
+                    None => {
+                        if let Command::SearchFiles(target) = app.paste_text(&s) {
+                            let paths = search_files(&cwd, &target).await;
+                            app.set_file_results(target, paths);
+                        }
+                    }
                 },
                 // Resize repositions the viewport (handled by the autoresize at
                 // the top of the loop); any other event just needs a redraw.
@@ -891,9 +1042,121 @@ async fn ui_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell as StateCell;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::io;
+
+    use ratatui::backend::Backend;
+    use ratatui::backend::ClearType;
+    use ratatui::backend::TestBackend;
+    use ratatui::backend::WindowSize;
+    use ratatui::buffer::Cell as BufferCell;
+    use ratatui::layout::Position;
+    use ratatui::layout::Size;
+
     use super::*;
     use kloop_core::rollout::Rollout;
     use kloop_protocol::ContentBlock;
+
+    struct StagedSizeBackend {
+        inner: TestBackend,
+        sizes: RefCell<VecDeque<Size>>,
+        last_size: StateCell<Size>,
+        events: RefCell<Vec<&'static str>>,
+    }
+
+    impl StagedSizeBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                sizes: RefCell::new(VecDeque::new()),
+                last_size: StateCell::new(Size::new(width, height)),
+                events: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn stage_sizes(&self, sizes: impl IntoIterator<Item = Size>) {
+            self.sizes.borrow_mut().extend(sizes);
+            self.events.borrow_mut().clear();
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events.borrow_mut().push(event);
+        }
+    }
+
+    impl Backend for StagedSizeBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+        {
+            self.record("draw");
+            self.inner.draw(content)
+        }
+
+        fn append_lines(&mut self, lines: u16) -> io::Result<()> {
+            self.inner.append_lines(lines)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            self.record("size");
+            if let Some(size) = self.sizes.borrow_mut().pop_front() {
+                self.last_size.set(size);
+            }
+            Ok(self.last_size.get())
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> io::Result<()> {
+            self.record("scroll");
+            self.inner.scroll_region_up(region, line_count)
+        }
+
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> io::Result<()> {
+            self.record("scroll");
+            self.inner.scroll_region_down(region, line_count)
+        }
+    }
 
     /// The worker's rewind primitive: fork the live session's file at a cut,
     /// derive the sessions dir from the rollout path, and hand back the branch's
@@ -1053,19 +1316,111 @@ mod tests {
     }
 
     #[test]
+    fn resize_before_commit_repaints_without_stale_overflow() {
+        let backend = PinnedBackend::new(StagedSizeBackend::new(80, 24));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .unwrap();
+        terminal
+            .backend()
+            .inner
+            .stage_sizes([Size::new(80, 6), Size::new(80, 24)]);
+
+        let mut app = App::new("resize-race".into());
+        app.cells = (1..=12)
+            .map(|index| Cell::Assistant(format!("history {index}")))
+            .collect();
+        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+
+        let events = terminal.backend().inner.events.borrow();
+        assert!(events.contains(&"draw"));
+        assert!(!events.contains(&"scroll"));
+        assert_eq!((viewport.width, viewport.height), (80, 24));
+        assert_eq!(app.cells.len(), 12);
+    }
+
+    #[test]
+    fn size_pin_keeps_commit_and_repaint_on_confirmed_geometry() {
+        let backend = PinnedBackend::new(StagedSizeBackend::new(80, 24));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .unwrap();
+        terminal.backend().inner.stage_sizes([
+            Size::new(80, 6),
+            Size::new(80, 6),
+            Size::new(80, 24),
+        ]);
+
+        let mut app = App::new("stable-small".into());
+        app.cells = (1..=12)
+            .map(|index| Cell::Assistant(format!("history {index}")))
+            .collect();
+        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+
+        let events = terminal.backend().inner.events.borrow();
+        let first_draw = events
+            .iter()
+            .position(|event| *event == "draw")
+            .expect("frame was drawn");
+        let first_scroll = events
+            .iter()
+            .position(|event| *event == "scroll")
+            .expect("overflow was committed");
+        assert!(first_draw < first_scroll, "events: {events:?}");
+        assert_eq!((viewport.width, viewport.height), (80, 6));
+        assert!(app.cells.len() < 12);
+        drop(events);
+
+        let grown = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        assert_eq!((grown.width, grown.height), (80, 24));
+    }
+
+    #[test]
     fn overflow_budget_reserves_live_tasks_without_committing_them() {
         let mut app = App::new("task-overflow".into());
         app.cells = (1..=8)
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
         let cells = app.cells.clone();
-        let without_tasks = overflow_commit_count(&app, 40, 10);
+        let without_tasks = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
 
         app.task_graph = Some(snapshot(1, 3));
-        let with_tasks = overflow_commit_count(&app, 40, 10);
+        let with_tasks = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
         assert!(with_tasks > without_tasks);
         assert_eq!(app.cells, cells);
         assert_eq!(app.task_graph.as_ref().unwrap().tasks.len(), 3);
+    }
+
+    #[test]
+    fn inline_growth_uses_effective_viewport_for_overflow_budget() {
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(6),
+            },
+        )
+        .unwrap();
+        terminal.backend_mut().resize(40, 12);
+        terminal.autoresize().unwrap();
+        let viewport = terminal.get_frame().area();
+        assert_eq!((viewport.width, viewport.height), (40, 6));
+
+        let mut app = App::new("inline-growth".into());
+        app.cells = (1..=12)
+            .map(|index| Cell::Assistant(format!("history {index}")))
+            .collect();
+        let effective = overflow_commit_count(&app, viewport);
+        let physical = overflow_commit_count(&app, Rect::new(0, 0, 40, 12));
+        assert!(effective > physical);
     }
 
     #[tokio::test]

@@ -22,5 +22,6 @@ pulldown-cmark = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 synoptic = "2.2.9"
