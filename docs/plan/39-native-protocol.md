@@ -243,3 +243,11 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 - **验证(kloop)**:`cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、全工作区 `cargo test` 全绿。同步原生协议 E2E 核对 model/config allowlist/project skill/connected+unavailable MCP、`config/write=-32601` 与 secret projection clean；安全回归另证 mock skills hermetic、未知参数 `-32602`、MCP stderr clean；真 key `/slice4-e2e` 返回 `SLICE4_SKILL_OK`。
 - **验证(app)**:全量 Bun **885 pass / 52 capability skips / 0 fail**(937 tests / 130 files)，`bun run ts:check`、`bun run build:test` 全绿；Rust `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、**227 tests** 全绿。真实完整 Tauri Eval 以 `ENGINE_BIN=target/debug/kloop` 跑 case `39-04` 得 `completed`（threadId/turnId 均存在、error=null）。
 - **提交**:`桌面前端仓库` 专用 `kloop` 分支 `934e325d`；既有 `codex` gitlink 修改保持 unstaged/未提交。kloop 提交:本提交。
+
+### 当前演进指针（Plan 77）
+
+Plan 77 在仍然唯一的 native protocol `1.0` 契约内增加必备
+`events:{sequence,sync,snapshot}`、generation-scoped string sequence、typed `eventCursor` 与
+`thread/events/sync`。它直接替换当前 notification 消费契约，不保留旧 shape、opt-in、fallback 或双栈；
+rollout/provider history 与 public display projection 继续分层，Task graph 仍不进入 server wire。历史切片的
+完成事实不回写，当前完整契约与验收以 `77-native-event-sequence-cursor-snapshot.md` 为准。

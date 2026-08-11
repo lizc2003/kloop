@@ -523,9 +523,11 @@ approval schema in place because the native protocol had no external users; it
 does not add a compatibility adapter, fallback, alias, or silent downgrade.
 Capabilities are structured: `{streaming, subagents, mcp,
 images, approvals:{scopes:["once","workspaceSession","project"]}, questions,
-threads:{list,
+events:{sequence:true,sync:true,snapshot:true}, threads:{list,
 read,resume,fork}, models:{list}, config:{read}, skills:{list},
-mcpServers:{status}}`.
+mcpServers:{status}}`. Event recovery is part of the only current protocol contract,
+not an opt-in compatibility switch; the Desktop adapter rejects a server that does
+not advertise all three event capabilities.
 
 **Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`;
 `thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
@@ -570,8 +572,14 @@ state and already-connected MCP tool sources remain process-shared;
 session/offload roots remain the app-server's `ServerPaths`, not the thread
 project directory.
 
-**Events** stream per thread, tagged with `threadId` (and `turnId` for
-turn-scoped ones): `turn/started {turn:{id}}`; then the turn's items as
+**Events** stream per active thread. Every public notification carries
+`threadId`, one opaque `eventGeneration`, and a decimal-string `seq`; `seq`
+starts at `"1"`, increases strictly across turns in that generation, and never
+uses a JavaScript number. Turn-scoped notifications also carry `turnId` where
+applicable. JSON-RPC responses/errors and the `approval/request` /
+`question/request` reverse requests are outside this sequence and use the
+independent request-id space. The public methods are: `turn/started {turn:{id}}`;
+then the turn's items as
 `item/started` / `item/delta {itemId, channel, text}` (channel ∈
 `text`/`reasoning`/`output`) / `item/completed`, where `item.type` ∈
 `assistantMessage` / `reasoning` / `toolCall` / `subAgent` (a tool call
@@ -592,6 +600,44 @@ error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
 model: its output comes back as a `system` notification, `/clear` also emits
 `thread/cleared`, and the turn bracket is unchanged.
 
+**Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
+atomic recovery entry point for an active thread. The typed cursor is
+`{threadId,generation,seq}` and is unrelated to the `thread/list` pagination
+cursor. Its thread/generation strings must be non-empty and `seq` must be a
+base-10 `u64` string; a foreign thread, malformed/overflow value, or a
+same-generation future sequence is `INVALID_PARAMS`. Dormant threads must first
+be resumed.
+
+With a retained same-generation cursor, sync returns
+`{mode:"replay",generation,highWaterSeq,events,eventCursor}`. `events` is the
+continuous interval `(cursor.seq, highWaterSeq]` using the exact live
+`{method,params}` envelopes; a cursor already at high water produces an empty
+replay. With no cursor, an old generation, or a cursor older than retention, it
+returns `{mode:"snapshot",reason:"initial"|"generationChanged"|"cursorExpired",
+generation,highWaterSeq,snapshot,eventCursor}`. Snapshot schema v1 contains the
+rollout-seeded persisted messages/runtime/terminals plus the current
+generation's materialized turns/items/notices and latest thread-scoped state.
+It is a read-only display projection, never an instruction to redispatch a tool,
+restart a process, redeliver mailbox content, or recreate an approval.
+
+Each active thread retains at most 4,096 public envelopes or 16 MiB of encoded
+event data, whichever limit is reached first. Eviction affects replay only; the
+materialized snapshot remains complete. The generation, ring, and snapshot tail
+are process memory, not a durable public-event journal. Resume or server restart
+creates a new generation, seeds persisted history from the rollout, resets
+volatile execution state, and resolves an old cursor with a
+`generationChanged` full snapshot. Sequence/cursor/envelope data is never
+written into rollout history or provider replay.
+
+The client starts sync as soon as `thread/start`, `thread/resume`, or
+`thread/fork` has produced an active thread and buffers live notifications while
+the request is pending. It installs a snapshot by full replacement, applies a
+replay from the existing baseline, drops same-generation duplicates, and only
+advances through strictly contiguous sequences. A gap starts another sync;
+unknown but well-formed sequenced methods still advance the cursor before the
+business adapter ignores them. A missing or malformed generation/sequence is a
+hard protocol failure—there is no direct-ingest fallback.
+
 **Interactions use two independent reverse requests.** Permission decisions use
 `approval/request {threadId, turnId, kind:"command"|"fileChange",
 description, preview?, rememberRules?, approvalScopes}` (server ids are integers
@@ -610,24 +656,33 @@ dropped replies fail closed and pending reverse requests are removed when their
 turn is interrupted.
 
 ```jsonc
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":{"scopes":["once","workspaceSession","project"]},"questions":true,"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":{"scopes":["once","workspaceSession","project"]},"questions":true,"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
-→ {"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
-← {"jsonrpc":"2.0","id":3,"result":{"turn":{"id":1}}}
-← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","turn":{"id":1}}}
+→ {"jsonrpc":"2.0","id":3,"method":"thread/events/sync","params":{"threadId":"20260721-135146"}}
+← {"jsonrpc":"2.0","id":3,"result":{"mode":"snapshot","reason":"initial","generation":"g","highWaterSeq":"0","snapshot":{"schemaVersion":1,"thread":{"id":"20260721-135146","cwd":"…","model":"…","resumable":true},"history":{"messages":[],"runtime":{"cwd":"…","model":"…"},"terminals":[]},"tail":{"turns":[],"notices":[],"backgroundTasks":[],"agentMessages":[],"scheduledTasks":[],"tokenUsage":null,"cwd":{"path":"…","branch":null}},"recovery":{"source":"fresh","volatileState":"live"}},"eventCursor":{"threadId":"20260721-135146","generation":"g","seq":"0"}}}
+→ {"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
+← {"jsonrpc":"2.0","id":4,"result":{"turn":{"id":1}}}
+← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","eventGeneration":"g","seq":"1","turn":{"id":1}}}
 ← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"threadId":"…","turnId":1,"kind":"fileChange","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"approvalScopes":["once","workspaceSession","project"],"preview":"(new file)\n+1  hello"}}
 → {"jsonrpc":"2.0","id":1,"result":{"decision":"acceptForProject"}}
-← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
-← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","turn":{"id":1,"status":"completed"}}}
+← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","eventGeneration":"g","seq":"7","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
+← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","eventGeneration":"g","seq":"8","turn":{"id":1,"status":"completed"}}}
 ```
 
 ### Codex Desktop adapter (plan 39 slices 2–4)
 
 The `桌面前端仓库` repository's dedicated `kloop` branch launches this
 server through `ENGINE_BIN` and consumes native protocol 1.0 directly (it
-does not emulate the old Codex app-server wire). Its adapter requires the structured
+does not emulate the old Codex app-server wire). Its initialize request declares
+the mandatory event recovery shape and hard-rejects a server missing any of
+`events.sequence`, `events.sync`, or `events.snapshot`. The Tauri reader also
+rejects and terminates the native child on any malformed public sequence instead
+of forwarding an unsequenced event. A per-thread TypeScript coordinator owns
+initial attach, replay/gap repair, duplicate suppression, generation replacement,
+and generation-scoped UI item identities; snapshots use a dedicated full-replace
+normalizer rather than synthetic live events. The adapter also requires the structured
 approval capability, validates each `approvalScopes` payload, offers only the
 advertised Once / Workspace session / Project actions, sends
 `acceptForProject`, and rejects a mismatched handshake or malformed/unknown approval:

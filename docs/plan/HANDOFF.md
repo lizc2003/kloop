@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–76 已完成；Plan 76 TUI terminal correctness 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–77 已完成；Plan 77 native event recovery 已完成)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -261,6 +261,10 @@
 > **Plan 76 已完成（2026-08-11）**：`76-tui-terminal-correctness.md` 把 Composer 坐标一次性迁到 strong UTF-8 byte offset/range，Left/Right/Backspace/Delete 只跨 extended grapheme；`ComposerLayout` 统一 hard+soft visual rows、display-column goal、八行窗口、cursor 与 height，exact-width EOL 投影到下一 visual row，1–2 列 frame 由 renderer clamp。completion 携 exact target，bracketed-paste 的 `@` SearchFiles 不丢；大粘贴改为 monotonic `PasteId + TextRange + payload` atom，history/draft/steer exact-once 展开且 atom 边界可继续粘贴，图片改 typed Attachment。event loop 让 draw 的 internal autoresize 先建立 authoritative Rect，随后 capture physical size 并 pin backend `size()` 贯穿 confirmation、不可逆 commit 与强制 repaint；已变化先 redraw、连续变化跳过当帧 commit，事务中 resize 留给下一 frame，按键使用 final frame geometry。
 >
 > **Plan 76 验收与边界**：TUI 164 tests、Unix PTY 7 tests、core 638 tests 与 workspace 全绿；all-target/all-feature Clippy `-D warnings` 通过。real-binary harness 使用 sealed HOME/env + loopback OpenAI-compatible SSE，持续回答 CPR，覆盖 full-lifecycle no-alt-screen、以 composer cursor column 证实应用采用 shrink/grow geometry、ordered overflow ANSI、双 Ctrl+C restore 与逐 cluster combining/CJK/ZWJ edit closure；request 只存脱敏投影，raw capture 有界。Ratatui 0.29 锁定 `unicode-width =0.2.0`，故 dev parser 使用 API 等价的 `vt100 0.15.2`（0.16 要求 `unicode-width ^0.2.1`，Cargo 无法与该基线统一），不升级生产终端栈。PTY/current viewport、TestBackend synthetic scrollback、真实终端 native scrollback/字形是独立证据面；本次非交互执行未伪报 physical-terminal 手工检查。提交 SHA 以本条所在提交为准。
+>
+> **Plan 77 已完成（2026-08-11）**：native protocol 1.0 已原位升级为唯一的 event-recovery 契约，没有旧 notification、client opt-in、fallback 或双栈。每个 active thread 拥有进程内 opaque generation、checked `u64`/decimal-string sequence、4,096 条或 16 MiB 的 bounded replay ring，以及 rollout-seeded materialized snapshot；`thread/events/sync` 用 typed cursor 统一 initial attach、连续 replay、retention expiry 与 generation replacement。`ThreadProjection` 的单 mutex 同时覆盖 reducer、ring、sequence 和 outbound enqueue，reverse request ID 保持独立。resume/restart 建新 generation，只从 rollout 恢复 persisted history，volatile execution state 明确 reset；Task Graph、usage ledger、approval/process checkpoint 和 side-effect replay 都没有进入 public projection。Desktop 专用 `kloop` 分支硬校验 events capability，Tauri reader 对 malformed sequence fail closed，per-thread coordinator 在 start/resume/fork 后主动 sync，buffer live event，做 gap repair/duplicate drop/full replace，并以 generation scope UI item identity；commit 记录见 Plan 77。
+>
+> **Plan 77 分层与教训**：rollout/provider history、public display projection、live execution state 是三层不同真值。公共恢复只需要“新 generation + 持久 history seed + 当前 generation 的 materialized display snapshot”，不能为了假装跨崩溃连续 replay 而复制 rollout、持久化 delta，或重放 tool/mailbox/scheduler side effect。原子 handoff 的关键不是让 sync response 抢在 live writer 前面，而是 server 在一个 projection lock 下冻结 high-water、client 在 pending 期间 buffer 并只按连续 cursor 前进。materialized state 也不能保留 envelope 元数据；例如 mailbox snapshot 只留语义字段，不把 thread/generation/seq patch 原样塞回 snapshot。
 >
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现

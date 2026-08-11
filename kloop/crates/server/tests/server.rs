@@ -452,6 +452,10 @@ async fn handshake_gates_and_negotiates() {
     assert_eq!(caps["skills"], json!({"list": true}));
     assert_eq!(caps["mcpServers"], json!({"status": true}));
     assert_eq!(
+        caps["events"],
+        json!({"sequence": true, "sync": true, "snapshot": true})
+    );
+    assert_eq!(
         caps["threads"],
         json!({"list": true, "read": true, "resume": true, "fork": true})
     );
@@ -556,6 +560,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         json!({
             "approvals": {"scopes": ["once", "workspaceSession", "project"]},
             "config": {"read": true},
+            "events": {"sequence": true, "snapshot": true, "sync": true},
             "images": true,
             "mcp": true,
             "mcpServers": {"status": true},
@@ -1133,6 +1138,19 @@ async fn turn_streams_item_events_and_completes() {
             "turn/completed",
         ]
     );
+    let sequenced = log
+        .iter()
+        .filter(|message| message["params"]["threadId"] == thread_id)
+        .collect::<Vec<_>>();
+    let generation = sequenced[0]["params"]["eventGeneration"]
+        .as_str()
+        .expect("event generation")
+        .to_string();
+    assert!(!generation.is_empty());
+    for (index, message) in sequenced.iter().enumerate() {
+        assert_eq!(message["params"]["eventGeneration"], generation);
+        assert_eq!(message["params"]["seq"], (index + 1).to_string());
+    }
     // Every item event carries the turn id.
     for m in &log {
         if let Some(t) = m["params"]["turnId"].as_u64() {
@@ -1161,6 +1179,172 @@ async fn turn_streams_item_events_and_completes() {
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
             .unwrap();
     assert_eq!(messages.len(), 2);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history() {
+    let dirs = test_dirs("event-sync");
+    let mut client = start_server(
+        factory(
+            vec![vec![text("first reply")], vec![text("second reply")]],
+            dirs.offload.clone(),
+            false,
+        ),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+
+    let sync_id = client
+        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .await;
+    let initial = client.recv().await;
+    assert_eq!(initial["id"], sync_id);
+    assert_eq!(initial["result"]["mode"], "snapshot");
+    assert_eq!(initial["result"]["reason"], "initial");
+    assert_eq!(initial["result"]["highWaterSeq"], "0");
+    assert_eq!(initial["result"]["snapshot"]["schemaVersion"], 1);
+    assert_eq!(
+        initial["result"]["snapshot"]["recovery"],
+        json!({"source": "fresh", "volatileState": "live"})
+    );
+    let initial_cursor = initial["result"]["eventCursor"].clone();
+    let generation = initial_cursor["generation"].as_str().unwrap().to_string();
+
+    client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": "first input"}),
+        )
+        .await;
+    let live = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    let live_events = live
+        .iter()
+        .filter(|message| message["params"]["threadId"] == thread_id)
+        .map(|message| {
+            json!({
+                "method": message["method"].clone(),
+                "params": message["params"].clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(!live_events.is_empty());
+
+    let replay_id = client
+        .request(
+            "thread/events/sync",
+            json!({"threadId": thread_id, "eventCursor": initial_cursor}),
+        )
+        .await;
+    let replay = client.recv().await;
+    assert_eq!(replay["id"], replay_id);
+    assert_eq!(replay["result"]["mode"], "replay");
+    assert_eq!(replay["result"]["generation"], generation);
+    assert_eq!(replay["result"]["events"], json!(live_events));
+    let high_water_cursor = replay["result"]["eventCursor"].clone();
+
+    let current_id = client
+        .request(
+            "thread/events/sync",
+            json!({"threadId": thread_id, "eventCursor": high_water_cursor.clone()}),
+        )
+        .await;
+    let current = client.recv().await;
+    assert_eq!(current["id"], current_id);
+    assert_eq!(current["result"]["mode"], "replay");
+    assert_eq!(current["result"]["events"], json!([]));
+
+    let snapshot_id = client
+        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .await;
+    let snapshot = client.recv().await;
+    assert_eq!(snapshot["id"], snapshot_id);
+    assert_eq!(
+        snapshot["result"]["snapshot"]["tail"]["turns"][0]["input"],
+        json!([{"type": "text", "text": "first input"}])
+    );
+    assert_eq!(
+        snapshot["result"]["snapshot"]["tail"]["turns"][0]["items"][0]["text"],
+        "first reply"
+    );
+
+    client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": "second input"}),
+        )
+        .await;
+    let second_live = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    let first_second_seq = second_live
+        .iter()
+        .find_map(|message| message["params"]["seq"].as_str())
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let first_high_water = high_water_cursor["seq"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(first_second_seq, first_high_water + 1);
+
+    for bad_cursor in [
+        json!({"threadId": thread_id, "generation": generation, "seq": 1}),
+        json!({"threadId": "other", "generation": generation, "seq": "0"}),
+        json!({"threadId": thread_id, "generation": generation, "seq": "18446744073709551616"}),
+        json!({"threadId": thread_id, "generation": generation, "seq": "999999"}),
+    ] {
+        let id = client
+            .request(
+                "thread/events/sync",
+                json!({"threadId": thread_id, "eventCursor": bad_cursor}),
+            )
+            .await;
+        let error = client.recv().await;
+        assert_eq!(error["id"], id);
+        assert_eq!(error["error"]["code"], -32602);
+    }
+
+    client.shutdown().await;
+
+    let mut resumed = start_server(
+        factory(vec![vec![text("unused")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    resumed.initialize().await;
+    let resume_id = resumed
+        .request("thread/resume", json!({"threadId": thread_id}))
+        .await;
+    assert_eq!(resumed.recv().await["id"], resume_id);
+    let changed_id = resumed
+        .request(
+            "thread/events/sync",
+            json!({"threadId": thread_id, "eventCursor": high_water_cursor}),
+        )
+        .await;
+    let changed = resumed.recv().await;
+    assert_eq!(changed["id"], changed_id);
+    assert_eq!(changed["result"]["mode"], "snapshot");
+    assert_eq!(changed["result"]["reason"], "generationChanged");
+    assert_ne!(changed["result"]["generation"], generation);
+    assert_eq!(
+        changed["result"]["snapshot"]["recovery"],
+        json!({"source": "resumed", "volatileState": "reset"})
+    );
+    assert_eq!(
+        changed["result"]["snapshot"]["history"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(changed["result"]["snapshot"]["tail"]["turns"], json!([]));
+
+    resumed.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
@@ -1501,6 +1685,8 @@ async fn approval_declined_then_accepted() {
         .await;
     let request = log.last().unwrap();
     let srv_id = request["id"].as_i64().unwrap();
+    assert!(request["params"].get("eventGeneration").is_none());
+    assert!(request["params"].get("seq").is_none());
     assert_eq!(request["params"]["kind"], "fileChange");
     assert!(request["params"]["description"]
         .as_str()

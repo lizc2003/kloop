@@ -11,6 +11,7 @@
 //! leak across threads. All output funnels through one writer task, one JSON
 //! object per line.
 
+mod events;
 mod wire;
 
 pub use wire::project_event;
@@ -68,6 +69,9 @@ use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
+use events::EventsSyncParams;
+use events::RecoverySource;
+use events::ThreadProjection;
 use wire::Incoming;
 use wire::Outgoing;
 
@@ -285,7 +289,7 @@ where
         out: out_tx,
         threads: HashMap::new(),
         pending: Arc::new(Mutex::new(HashMap::new())),
-        srv_seq: Arc::new(AtomicU64::new(1)),
+        reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
         models,
@@ -368,6 +372,9 @@ struct ThreadHandle {
     /// These are the persisted thread runtime, not a transient active worktree.
     cwd: PathBuf,
     model: String,
+    /// Generation-scoped public display projection, shared with ThreadUi and
+    /// thread/events/sync.
+    projection: Arc<ThreadProjection>,
 }
 
 enum PendingInteraction {
@@ -395,7 +402,7 @@ struct Server {
     out: mpsc::UnboundedSender<Value>,
     threads: HashMap<String, ThreadHandle>,
     pending: PendingInteractions,
-    srv_seq: Arc<AtomicU64>,
+    reverse_request_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
     /// Immutable process-level catalogs/snapshots assembled by the CLI.
@@ -462,6 +469,7 @@ impl Server {
             "thread/fork" => self.thread_fork(&params),
             "thread/list" => self.thread_list(&params),
             "thread/read" => self.thread_read(&params),
+            "thread/events/sync" => self.thread_events_sync(&params),
             "model/list" => self.model_list(&params),
             "config/read" => self.config_read(&params),
             "skills/list" => self.skills_list(&params),
@@ -517,6 +525,11 @@ impl Server {
                 "config": {"read": true},
                 "skills": {"list": true},
                 "mcpServers": {"status": true},
+                "events": {
+                    "sequence": true,
+                    "sync": true,
+                    "snapshot": true,
+                },
                 "threads": {
                     "list": true,
                     "read": true,
@@ -586,7 +599,7 @@ impl Server {
             })?;
         let mut history = History::new(self.paths.offload_dir.clone());
         history.attach_rollout(rollout);
-        self.spawn_thread(thread_id.clone(), history, options)?;
+        self.spawn_thread(thread_id.clone(), history, options, RecoverySource::Fresh)?;
         Ok(json!({"thread": {"id": thread_id}}))
     }
 
@@ -614,7 +627,12 @@ impl Server {
         }
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(thread_id.to_string(), history, options.clone())?;
+        self.spawn_thread(
+            thread_id.to_string(),
+            history,
+            options.clone(),
+            RecoverySource::Resumed,
+        )?;
         Ok(json!({
             "thread": thread_runtime_json(thread_id, &options),
             "messageCount": count,
@@ -670,7 +688,12 @@ impl Server {
             })?;
         let count = messages.len();
         let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
-        self.spawn_thread(new_id.clone(), history, options.clone())?;
+        self.spawn_thread(
+            new_id.clone(),
+            history,
+            options.clone(),
+            RecoverySource::Resumed,
+        )?;
         Ok(json!({
             "thread": thread_runtime_json(&new_id, &options),
             "messageCount": count,
@@ -766,6 +789,30 @@ impl Server {
                 "terminals": snapshot.terminals,
             }
         }))
+    }
+
+    fn thread_events_sync(&self, params: &Value) -> MethodResult {
+        let params =
+            EventsSyncParams::parse(params).map_err(|message| (wire::INVALID_PARAMS, message))?;
+        let handle = self.threads.get(&params.thread_id).ok_or_else(|| {
+            (
+                wire::INVALID_PARAMS,
+                format!(
+                    "thread '{}' is not active; resume it before syncing events",
+                    params.thread_id
+                ),
+            )
+        })?;
+        let sync = handle
+            .projection
+            .sync(params.event_cursor.as_ref())
+            .map_err(|error| (wire::INVALID_PARAMS, error.to_string()))?;
+        serde_json::to_value(sync).map_err(|error| {
+            (
+                wire::SERVER_ERROR,
+                format!("cannot encode event sync: {error}"),
+            )
+        })
     }
 
     fn model_list(&self, params: &Value) -> MethodResult {
@@ -872,6 +919,9 @@ impl Server {
         *handle.turn.lock().unwrap() = Some(turn_id);
         let cancel = CancellationToken::new();
         *handle.current_cancel.lock().unwrap() = Some(cancel.clone());
+        handle
+            .projection
+            .record_input(Some(turn_id), &params["input"]);
         if handle
             .turn_tx
             .send(Turn {
@@ -886,6 +936,7 @@ impl Server {
             handle.running.store(false, Ordering::SeqCst);
             *handle.current_cancel.lock().unwrap() = None;
             *handle.turn.lock().unwrap() = None;
+            handle.projection.discard_turn(turn_id);
             return Err((wire::SERVER_ERROR, "thread worker is gone".into()));
         }
         Ok(json!({"turn": {"id": turn_id}}))
@@ -908,8 +959,10 @@ impl Server {
                 format!("no active thread '{thread_id}'"),
             )
         })?;
+        let input = Value::String(text.clone());
         handle.inbox.push(InboxItem::Steer(text));
         let turn_id = *handle.turn.lock().unwrap();
+        handle.projection.record_input(turn_id, &input);
         Ok(json!({"turnId": turn_id}))
     }
 
@@ -932,7 +985,30 @@ impl Server {
         thread_id: String,
         mut history: History,
         options: ThreadStartOptions,
+        recovery_source: RecoverySource,
     ) -> Result<(), (i64, String)> {
+        let snapshot_path = rollout::session_path(&self.paths.sessions_dir, &thread_id);
+        let seed = rollout::load_session_snapshot(&snapshot_path).map_err(|e| {
+            (
+                wire::SERVER_ERROR,
+                format!("cannot seed event snapshot: {e}"),
+            )
+        })?;
+        let projection = Arc::new(
+            ThreadProjection::new(
+                thread_id.clone(),
+                options.cwd.to_string_lossy().to_string(),
+                options.model.clone().unwrap_or_default(),
+                seed,
+                recovery_source,
+            )
+            .map_err(|e| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot create event generation: {e}"),
+                )
+            })?,
+        );
         // The running turn's id, shared between the ThreadUi (which tags item
         // events with it) and the handle (which `turn/steer` reads).
         let turn = Arc::new(Mutex::new(None));
@@ -940,8 +1016,9 @@ impl Server {
             thread_id: thread_id.clone(),
             out: self.out.clone(),
             pending: self.pending.clone(),
-            srv_seq: self.srv_seq.clone(),
+            reverse_request_seq: self.reverse_request_seq.clone(),
             turn: turn.clone(),
+            projection: projection.clone(),
         });
         let note_ui = ui.clone();
         let questioner: Option<Arc<dyn Questioner>> = self
@@ -968,6 +1045,17 @@ impl Server {
         // events' session id is stamped here.
         cfg.bind_session(thread_id.clone())
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot bind session: {e:#}")))?;
+        let refreshed_seed = rollout::load_session_snapshot(&snapshot_path).map_err(|e| {
+            (
+                wire::SERVER_ERROR,
+                format!("cannot refresh event snapshot: {e}"),
+            )
+        })?;
+        projection.refresh_seed(
+            cfg.cwd.to_string_lossy().to_string(),
+            cfg.model.clone(),
+            refreshed_seed,
+        );
         let handle_cwd = cfg.cwd.clone();
         let handle_model = cfg.model.clone();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
@@ -995,6 +1083,7 @@ impl Server {
                 turn,
                 cwd: handle_cwd,
                 model: handle_model,
+                projection,
             },
         );
         Ok(())
@@ -1356,17 +1445,18 @@ struct ThreadUi {
     thread_id: String,
     out: mpsc::UnboundedSender<Value>,
     pending: PendingInteractions,
-    srv_seq: Arc<AtomicU64>,
+    reverse_request_seq: Arc<AtomicU64>,
     /// The running turn's id (shared with the handle), used to tag item events.
     turn: Arc<Mutex<Option<u64>>>,
+    projection: Arc<ThreadProjection>,
 }
 
 impl ThreadUi {
-    fn notify(&self, method: &'static str, mut params: Value) {
-        params["threadId"] = Value::String(self.thread_id.clone());
-        let _ = self
-            .out
-            .send(Outgoing::Notification { method, params }.to_json());
+    fn notify(&self, method: &'static str, params: Value) {
+        let out = self.out.clone();
+        let _ = self.projection.publish(method, params, move |params| {
+            let _ = out.send(Outgoing::Notification { method, params }.to_json());
+        });
     }
 
     fn active_turn_id(&self) -> Option<u64> {
@@ -1415,7 +1505,7 @@ impl Approver for ThreadUi {
     ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
         // Server reverse-request ids live in the server's own integer counter
         // space (§ wire): a no-method response always answers one of ours.
-        let id = RequestId::Num(self.srv_seq.fetch_add(1, Ordering::SeqCst) as i64);
+        let id = RequestId::Num(self.reverse_request_seq.fetch_add(1, Ordering::SeqCst) as i64);
         let (reply, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -1486,7 +1576,8 @@ impl Questioner for ThreadUi {
                         "question requested outside an active turn".into(),
                     );
                 };
-                let id = RequestId::Num(self.srv_seq.fetch_add(1, Ordering::SeqCst) as i64);
+                let id =
+                    RequestId::Num(self.reverse_request_seq.fetch_add(1, Ordering::SeqCst) as i64);
                 let (reply, rx) = oneshot::channel();
                 self.pending.lock().unwrap().insert(
                     id.clone(),

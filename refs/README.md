@@ -43,6 +43,22 @@ cleanup 是机会式触发，checkpoint receipt 也不等于 Interrupted worker 
 
 完整证据位置、kloop 对照入口、测试/CI 边界与下一会话拍板顺序见 Plan 60；本节只作导读，不代替该文档。
 
+## Prime Agent 固定源码调研（2026-08-11）
+
+Prime Agent 的架构判断固定到 `PrimeIntellect-ai/prime-agent` commit
+`e9ef5777409001faf91382227b12bf09496078fa`，不以滚动 `main` 补写既有结论。可借鉴的是 daemon
+把每个 resident session 的公开事件投影为 generation/sequence/cursor/snapshot，使客户端能检测 gap、
+从 bounded tail replay，并在 worker 重建后用 snapshot 重新建立显示基线。kloop 的 Plan 77 采用相同问题
+分层，但不复制其执行真值：公开 projection 只存在 server 内存，跨进程恢复以 rollout-seeded snapshot
+建立新 generation；tool、approval、process、scheduler delivery 与其他 side effect 都不能由 replay 或
+snapshot 重新触发。
+
+Prime 的 resident IPython、detached child admission、usage attribution 和 compaction lifecycle 可继续作专项
+参考；其中 usage ledger 后置为独立计划。明确不照搬默认继承宿主权限的无沙箱执行、可执行 extension/
+project config、明文或弱原子 session/config 持久化、第二套 parent/Task/UI registry，以及把巨型 session
+orchestrator 当作代码组织模板。kloop 继续以 core permission/sandbox、rollout/provider history、root-owned
+Task graph 和各 execution registry 为各自唯一真值。
+
 ## Claude Code 2.1.220 工具对齐基线(2026-07-27)
 
 Plan 48 将工具对齐目标钉死在本机精确二进制,不再拿滚动产品文档或旧逆向源码补实现:
