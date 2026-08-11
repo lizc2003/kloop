@@ -8,7 +8,7 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–71 已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–73、75 已完成；Plan 74 待实施)
 
 > **Plan 48 已完成（2026-07-27）**:`48-claude-code-2.1.220-tool-parity.md` 已将目标固定为
 > 精确 Claude Code 2.1.220 二进制，提交 exact-bundle 静态证据、38 组隔离 raw/normalized
@@ -253,6 +253,10 @@
 > ④严格 schema 不能约束内部调用或 event projection；runtime boundary 要重验 control/Unicode separator/
 > metadata budget，无效模型输入也不能把巨型 target/unknown field 复制到 UI。⑤系统失败通知要按 typed
 > message ID 聚合，否则多 sibling 同时 stop 会绕过 peer mailbox 的数量预算。
+>
+> **Plan 75 已完成（2026-08-11）**：`75-responses-reasoning-status-compat.md` 修复真实 OpenAI Responses 三原语执行。生产 capture 证明 reasoning 的 `response.output_item.added|done` 均可无 `status`，而同轮 function_call 仍带 `in_progress|completed`；adapter 现在只允许 reasoning 省略该字段，字段存在时仍严格校验，message/function_call 缺失、reasoning 显式 null/错误值继续 protocol fail closed。真实 evaluator 随后证明该 Responses 模型会物化 optional key：先生成空 description/agent_type，再在 schema 加非空约束后伪造 `general-purpose` 与 `run-placeholder`。最终模型 schema 用 nullable option表达省略、用 minLength/pattern表达非空 identity；无自定义 Agent type时从实际 request删除 `agent_type`，有类型时只允许 null或精确配置名称，未实现的Workflow `name`不再广告。runtime strict parser没有把空 identity放宽成默认值。
+>
+> **Plan 75 验收与教训**：三原语 ignored native evaluator 新增 `openai-responses` gate并把 `KLOOP_EFFORT` 转入temp-HOME child；真实 `gpt-5.6-sol` 完成1次前台Agent、2次same-source Program（仅1次child spawn并journal resume）、后台Agent/Program、Workflow、3个唯一后台terminal和3次exactly-once delivery。Responses/provider-config/三原语focused、fmt、all-target Clippy、workspace tests（core 634）、mock与diff check全绿；无key/endpoint/raw response入日志或提交。新判据：**schema optional、模型是否省略key、runtime默认值是三件事**；会物化所有property的rail必须能用`null`表达真正省略，无能力的property应从当轮catalog删除，绝不能靠接受空串/伪alias削弱执行边界。
 >
 > **Plan 62 原生验收前实现基线（2026-08-05，历史记录）**：新增共享 `process_tree`
 > façade；Unix 保持 process group，Windows 以 RAII Job/process/thread/attribute/pipe handle 实现

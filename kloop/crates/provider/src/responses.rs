@@ -338,12 +338,46 @@ fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
     }))
 }
 
-fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
-    let status = required_str(&item["status"], "output item status")?;
-    if status != "in_progress" {
-        return Err(protocol("added output item was not in_progress"));
+#[derive(Clone, Copy)]
+enum ItemStatusPolicy {
+    Required,
+    Optional,
+}
+
+fn check_item_status(
+    item: &Value,
+    field: &str,
+    expected: &str,
+    policy: ItemStatusPolicy,
+    mismatch: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(status) = item.get("status") else {
+        return match policy {
+            ItemStatusPolicy::Required => required_str(&item["status"], field).map(|_| ()),
+            ItemStatusPolicy::Optional => Ok(()),
+        };
+    };
+    if required_str(status, field)? != expected {
+        return Err(protocol(mismatch));
     }
-    let kind = match required_str(&item["type"], "output item type")? {
+    Ok(())
+}
+
+fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
+    let item_type = required_str(&item["type"], "output item type")?;
+    let status_policy = if item_type == "reasoning" {
+        ItemStatusPolicy::Optional
+    } else {
+        ItemStatusPolicy::Required
+    };
+    check_item_status(
+        item,
+        "output item status",
+        "in_progress",
+        status_policy,
+        "added output item was not in_progress",
+    )?;
+    let kind = match item_type {
         "message" => {
             if required_str(&item["role"], "message role")? != "assistant" {
                 return Err(protocol("output message role was not assistant"));
@@ -482,14 +516,21 @@ fn reasoning_part_mut(
     Ok(part)
 }
 
-fn check_final_item_status(item: &Value, expected_type: &str) -> Result<(), ProviderFailure> {
+fn check_final_item_status(
+    item: &Value,
+    expected_type: &str,
+    status_policy: ItemStatusPolicy,
+) -> Result<(), ProviderFailure> {
     if required_str(&item["type"], "final output item type")? != expected_type {
         return Err(protocol("final output item type changed"));
     }
-    if required_str(&item["status"], "final output item status")? != "completed" {
-        return Err(protocol("final output item was not completed"));
-    }
-    Ok(())
+    check_item_status(
+        item,
+        "final output item status",
+        "completed",
+        status_policy,
+        "final output item was not completed",
+    )
 }
 
 fn finish_message(
@@ -497,7 +538,7 @@ fn finish_message(
     item: &Value,
     refusal_seen: &mut bool,
 ) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "message")?;
+    check_final_item_status(item, "message", ItemStatusPolicy::Required)?;
     if required_str(&item["role"], "final message role")? != "assistant" {
         return Err(protocol("final output message role was not assistant"));
     }
@@ -590,7 +631,7 @@ fn finish_reasoning(
     state: ItemState,
     item: &Value,
 ) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "reasoning")?;
+    check_final_item_status(item, "reasoning", ItemStatusPolicy::Optional)?;
     let ItemKind::Reasoning { summary, content } = state.kind else {
         return Err(protocol("final reasoning referenced the wrong item type"));
     };
@@ -617,7 +658,7 @@ fn finish_function_call(
     state: ItemState,
     item: &Value,
 ) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "function_call")?;
+    check_final_item_status(item, "function_call", ItemStatusPolicy::Required)?;
     let ItemKind::FunctionCall {
         call_id,
         name,

@@ -681,11 +681,11 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string", "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes the prompt or result."},
+                    "description": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes the prompt or result."},
                     "prompt": {"type": "string", "description": "Complete standalone work description"},
-                    "agent_type": {"type": "string", "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
+                    "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
                     "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
-                    "max_rounds": {"type": "integer", "minimum": 1, "description": "Optional round cap; omitted means no round limit"},
+                    "max_rounds": {"type": ["integer", "null"], "minimum": 1, "description": "Optional round cap; omitted means no round limit"},
                     "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}
                 },
                 "required": ["prompt"],
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_and_program_schemas_bound_display_description() {
+    fn agent_and_program_schemas_match_strict_optional_string_parsers() {
         let definitions = tool_defs(0, &ShellPrograms::native_posix());
         for name in ["run_agent", "run_program"] {
             let definition = definitions
@@ -1715,6 +1715,7 @@ mod tests {
                 definition.schema["properties"]["description"],
                 json!({
                     "type": "string",
+                    "minLength": 1,
                     "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS,
                     "description": if name == "run_agent" {
                         "Optional short, single-line display label. It never changes the prompt or result."
@@ -1724,6 +1725,31 @@ mod tests {
                 })
             );
         }
+        let run_agent = definitions
+            .iter()
+            .find(|definition| definition.name == "run_agent")
+            .unwrap();
+        assert_eq!(run_agent.schema["properties"]["agent_type"]["minLength"], 1);
+        assert_eq!(
+            run_agent.schema["properties"]["agent_type"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            run_agent.schema["properties"]["max_rounds"]["type"],
+            json!(["integer", "null"])
+        );
+        let run_program = definitions
+            .iter()
+            .find(|definition| definition.name == "run_program")
+            .unwrap();
+        assert_eq!(
+            run_program.schema["properties"]["resume_from_run_id"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            run_program.schema["properties"]["resume_from_run_id"]["pattern"],
+            "^run-[A-Za-z0-9_-]+$"
+        );
     }
 
     #[test]

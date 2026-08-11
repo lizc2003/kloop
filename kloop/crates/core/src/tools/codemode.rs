@@ -737,10 +737,10 @@ the program:\n",
         schema: json!({
             "type": "object",
             "properties": {
-                "description": {"type": "string", "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
+                "description": {"type": "string", "minLength": 1, "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
                 "source": {"type": "string", "description": "The JavaScript program to run"},
                 "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
-                "resume_from_run_id": {"type": "string", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v2 agent calls are reused."}
+                "resume_from_run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9_-]+$", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v2 agent calls are reused."}
             },
             "required": ["source"],
             "additionalProperties": false

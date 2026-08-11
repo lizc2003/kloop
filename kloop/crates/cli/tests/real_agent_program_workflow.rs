@@ -109,6 +109,7 @@ impl NativeClient {
         for name in [
             "KLOOP_PROVIDER",
             "KLOOP_MODEL",
+            "KLOOP_EFFORT",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
@@ -265,7 +266,15 @@ fn tool_items<'a>(messages: &'a [Value], method: &str, name: &str) -> Vec<&'a Va
 fn assert_tool_pairs(messages: &[Value], name: &str, expected: usize) -> Vec<String> {
     let starts = tool_items(messages, "item/started", name);
     let completed = tool_items(messages, "item/completed", name);
-    assert_eq!(starts.len(), expected, "unexpected tool start count");
+    assert_eq!(
+        starts.len(),
+        expected,
+        "unexpected tool start count; inputs={:?}",
+        starts
+            .iter()
+            .map(|message| &message["params"]["item"]["input"])
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         completed.len(),
         expected,
@@ -378,13 +387,22 @@ fn assert_path_within(path: &Path, root: &Path) -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires real Anthropic or OpenAI Chat credentials"]
+#[ignore = "requires real Anthropic, OpenAI Chat, or OpenAI Responses credentials"]
 fn real_agent_program_workflow_contract() {
     let provider = std::env::var("KLOOP_PROVIDER").expect("set KLOOP_PROVIDER");
     assert!(
-        matches!(provider.as_str(), "anthropic" | "openai"),
-        "real evaluator supports anthropic or OpenAI Chat only"
+        matches!(
+            provider.as_str(),
+            "anthropic" | "openai" | "openai-responses"
+        ),
+        "real evaluator supports Anthropic, OpenAI Chat, or OpenAI Responses"
     );
+    if provider == "openai-responses" {
+        std::env::var("KLOOP_EFFORT")
+            .ok()
+            .filter(|effort| !effort.is_empty())
+            .expect("set KLOOP_EFFORT so the Responses evaluator exercises reasoning items");
+    }
     let model_var = if provider == "anthropic" {
         "ANTHROPIC_MODEL"
     } else {
@@ -412,17 +430,20 @@ fn real_agent_program_workflow_contract() {
     let agent_messages = client.run_turn(
         &thread_id,
         &format!(
-            "Acceptance case Agent. Call run_agent exactly once in foreground with prompt `Reply exactly {AGENT_SENTINEL}`. Do not use Program or Workflow. After its successful tool result, answer `AGENT_CASE_DONE_68`."
+            "Acceptance case Agent. Call run_agent exactly once in foreground with prompt `Reply exactly {AGENT_SENTINEL}`. Omit agent_type, isolation, max_rounds, background, and description. Do not use Program or Workflow. After its successful tool result, answer `AGENT_CASE_DONE_68`."
         ),
     );
     let agent_outputs = assert_tool_pairs(&agent_messages, "run_agent", 1);
+    let agent_input =
+        &tool_items(&agent_messages, "item/started", "run_agent")[0]["params"]["item"]["input"];
     assert!(
         agent_outputs[0].contains(AGENT_SENTINEL),
-        "direct Agent sentinel missing"
+        "direct Agent sentinel missing; input={agent_input}; output={}",
+        agent_outputs[0]
     );
 
     let program_prompt = format!(
-        "Acceptance case Program. Call run_program exactly twice and do not call run_agent or Workflow directly. First call it in foreground with the exact JavaScript source below and no resume id. It is expected to fail after one child Agent. Read the reported durable run-* id, then call run_program a second time with the byte-identical source and that resume_from_run_id. The second failure is expected; do not retry again. Finish with `PROGRAM_CASE_DONE_68`.\n\n```js\n{PROGRAM_SOURCE}\n```"
+        "Acceptance case Program. Call run_program exactly twice and do not call run_agent or Workflow directly. First call it in foreground with the exact JavaScript source below and omit description, background, and resume_from_run_id. It is expected to fail after one child Agent. Read the reported durable run-* id, then call run_program a second time with the byte-identical source and that resume_from_run_id, again omitting description and background. The second failure is expected; do not retry again. Finish with `PROGRAM_CASE_DONE_68`.\n\n```js\n{PROGRAM_SOURCE}\n```"
     );
     let program_messages = client.run_turn(&thread_id, &program_prompt);
     let program_outputs = assert_tool_pairs(&program_messages, "run_program", 2);
@@ -430,7 +451,11 @@ fn real_agent_program_workflow_contract() {
         program_outputs
             .iter()
             .all(|output| output.contains(PROGRAM_FAILURE_SENTINEL)),
-        "Program expected failure sentinel missing"
+        "Program expected failure sentinel missing; inputs={:?}; outputs={program_outputs:?}",
+        tool_items(&program_messages, "item/started", "run_program")
+            .iter()
+            .map(|message| &message["params"]["item"]["input"])
+            .collect::<Vec<_>>()
     );
     let run_id = program_outputs
         .iter()
@@ -486,7 +511,7 @@ fn real_agent_program_workflow_contract() {
     );
 
     let background_agent_prompt = format!(
-        "Acceptance case background Agent. Call run_agent exactly once with background=true, description `{BACKGROUND_AGENT_DESCRIPTION}`, and prompt `Reply exactly {BACKGROUND_AGENT_SENTINEL}`. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching any more tools."
+        "Acceptance case background Agent. Call run_agent exactly once with background=true, description `{BACKGROUND_AGENT_DESCRIPTION}`, and prompt `Reply exactly {BACKGROUND_AGENT_SENTINEL}`. Omit agent_type, isolation, and max_rounds. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching any more tools."
     );
     let initial_background_agent = client.run_turn(&thread_id, &background_agent_prompt);
     let background_agent_messages =
@@ -516,7 +541,7 @@ fn real_agent_program_workflow_contract() {
     assert!(no_agent_run_id.is_none());
 
     let background_program_prompt = format!(
-        "Acceptance case background Program. Call run_program exactly once with background=true, description `{BACKGROUND_PROGRAM_DESCRIPTION}`, and the exact JavaScript source below. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching another Program.\n\n```js\n{BACKGROUND_PROGRAM_SOURCE}\n```"
+        "Acceptance case background Program. Call run_program exactly once with background=true, description `{BACKGROUND_PROGRAM_DESCRIPTION}`, and the exact JavaScript source below; omit resume_from_run_id. Do not call wait_for_activity. After launch, keep working normally; when its automatically delivered result arrives, acknowledge it without launching another Program.\n\n```js\n{BACKGROUND_PROGRAM_SOURCE}\n```"
     );
     let initial_background_program = client.run_turn(&thread_id, &background_program_prompt);
     let background_program_messages =
@@ -569,7 +594,7 @@ fn real_agent_program_workflow_contract() {
     );
 
     let workflow_prompt = format!(
-        "Acceptance case Workflow. I explicitly authorize multi-agent Workflow orchestration. Call workflow exactly once with the exact script below and no args. Do not call wait_for_activity, run_agent, or run_program directly; the Workflow result will be delivered automatically. Finish after the delivered result is folded in.\n\n```js\n{WORKFLOW_SCRIPT}\n```"
+        "Acceptance case Workflow. I explicitly authorize multi-agent Workflow orchestration. Call workflow exactly once with the exact script below and omit args, script_path, resume_from_run_id, name, description, and title. Do not call wait_for_activity, run_agent, or run_program directly; the Workflow result will be delivered automatically. Finish after the delivered result is folded in.\n\n```js\n{WORKFLOW_SCRIPT}\n```"
     );
     let initial_workflow = client.run_turn(&thread_id, &workflow_prompt);
     let workflow_messages = client.collect_background_delivery(initial_workflow, "workflow");

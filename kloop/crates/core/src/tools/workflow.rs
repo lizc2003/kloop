@@ -66,9 +66,8 @@ pub(super) fn workflow_def() -> ToolDef {
             "properties": {
                 "script": {"type": "string", "maxLength": 524288},
                 "args": {},
-                "script_path": {"type": "string", "description": "Managed script path returned by a previous workflow launch; use with resume_from_run_id."},
-                "resume_from_run_id": {"type": "string", "pattern": "^wf_[A-Za-z0-9_-]+$"},
-                "name": {"type": "string", "description": "Reserved; named workflow registry is not implemented."},
+                "script_path": {"type": ["string", "null"], "minLength": 1, "description": "Managed script path returned by a previous workflow launch; use with resume_from_run_id."},
+                "resume_from_run_id": {"type": ["string", "null"], "pattern": "^wf_[A-Za-z0-9_-]+$"},
                 "description": {"type": "string", "description": "Ignored; set meta.description in the script."},
                 "title": {"type": "string", "description": "Ignored; set meta.name in the script."}
             },
@@ -549,6 +548,16 @@ mod tests {
         let def = workflow_def();
         assert_eq!(def.name, "workflow");
         assert_eq!(def.schema["additionalProperties"], false);
+        assert_eq!(def.schema["properties"]["script_path"]["minLength"], 1);
+        assert_eq!(
+            def.schema["properties"]["script_path"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            def.schema["properties"]["resume_from_run_id"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(def.schema["properties"].get("name").is_none());
         assert!(!def.description.contains("tools."));
     }
 

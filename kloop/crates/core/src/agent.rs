@@ -164,6 +164,37 @@ async fn run_turn_with_options(
     outcome
 }
 
+fn specialize_run_agent_def(
+    tools: &mut [kloop_protocol::ToolDef],
+    agent_types: &[crate::agent_type::AgentType],
+) {
+    let Some(run_agent) = tools.iter_mut().find(|tool| tool.name == "run_agent") else {
+        return;
+    };
+    let properties = run_agent.schema["properties"]
+        .as_object_mut()
+        .expect("run_agent schema properties are an object");
+    if agent_types.is_empty() {
+        properties.remove("agent_type");
+        return;
+    }
+    let agent_type = properties
+        .get_mut("agent_type")
+        .expect("run_agent schema declares agent_type");
+    agent_type["enum"] = Value::Array(
+        std::iter::once(Value::Null)
+            .chain(
+                agent_types
+                    .iter()
+                    .map(|agent_type| Value::String(agent_type.name.clone())),
+            )
+            .collect(),
+    );
+    run_agent
+        .description
+        .push_str(&crate::agent_type::agent_types_hint(agent_types));
+}
+
 async fn turn_rounds(
     cfg: &Arc<Config>,
     history: &mut History,
@@ -208,14 +239,8 @@ async fn turn_rounds(
             // protocol, never a user-configurable capability or ordinary tool.
             tools.push(crate::structured_output::tool_def(schema));
         }
-        // At depth 0 run_agent exists; list configured agent types in its
-        // description so the model knows what it can dispatch to.
-        if depth == 0 && !cfg.agent_types.is_empty() {
-            if let Some(run_agent) = tools.iter_mut().find(|tool| tool.name == "run_agent") {
-                run_agent
-                    .description
-                    .push_str(&crate::agent_type::agent_types_hint(&cfg.agent_types));
-            }
+        if depth == 0 {
+            specialize_run_agent_def(&mut tools, &cfg.agent_types);
         }
         tools
     };

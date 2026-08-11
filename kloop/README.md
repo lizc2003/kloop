@@ -2365,7 +2365,15 @@ cargo run
 # Responses requires response.completed/incomplete; Chat requires finish_reason
 # ([DONE] only ends the transport). Complete frames and EOF residuals are strict
 # UTF-8; malformed JSON, unknown semantic events, unclosed output items/parts,
-# missing final tool identity, and non-object arguments fail closed.
+# missing final tool identity, and non-object arguments fail closed. Responses
+# message/function_call item status remains required. A reasoning item may omit
+# status on added/done (a production wire shape); when present it must still be
+# in_progress/completed respectively, and explicit null or another value fails.
+# Optional Agent/Program/Workflow string controls likewise expose the same
+# non-empty ID/metadata constraints enforced by their strict runtime parsers;
+# nullable options use null for omission, while an empty identity remains invalid.
+# run_agent advertises agent_type only when custom types exist, as null or an
+# enum of the configured names, and does not invent a general-purpose alias.
 #
 # Adapters publish only Text/Thinking/RedactedThinking/ToolUse blocks plus a
 # mandatory typed outcome. EndTurn, ToolUse, output limits, refusal, filtering,
@@ -2376,6 +2384,14 @@ cargo run
 # with partial text close as failed on stream error, while completed blocks stay
 # completed; native protocol 1.0 keeps the existing item/completed method and
 # carries that distinction in the item's status field.
+#
+# The ignored native primitive evaluator accepts all three rails. Responses must
+# be selected explicitly and needs KLOOP_EFFORT so it actually produces and
+# validates reasoning items; provide the normal private OPENAI_* compatibility
+# env without printing or committing it:
+# KLOOP_PROVIDER=openai-responses KLOOP_EFFORT=high \
+#   cargo test -p kloop --test real_agent_program_workflow \
+#   real_agent_program_workflow_contract -- --exact --ignored --nocapture
 
 # line-based REPL instead of the TUI
 cargo run -- --plain

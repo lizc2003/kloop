@@ -21,6 +21,42 @@ impl Ui for NullUi {
 }
 
 #[test]
+fn run_agent_schema_only_advertises_configured_agent_types() {
+    let mut tools =
+        crate::tools::tool_defs(0, &crate::shell_programs::ShellPrograms::native_posix());
+    specialize_run_agent_def(&mut tools, &[]);
+    let run_agent = tools.iter().find(|tool| tool.name == "run_agent").unwrap();
+    assert!(run_agent.schema["properties"].get("agent_type").is_none());
+
+    let mut tools =
+        crate::tools::tool_defs(0, &crate::shell_programs::ShellPrograms::native_posix());
+    let agent_types = vec![
+        crate::agent_type::AgentType {
+            name: "researcher".into(),
+            description: "Searches broadly".into(),
+            system: None,
+            model: None,
+            tools: None,
+        },
+        crate::agent_type::AgentType {
+            name: "reviewer".into(),
+            description: "Reviews changes".into(),
+            system: None,
+            model: None,
+            tools: None,
+        },
+    ];
+    specialize_run_agent_def(&mut tools, &agent_types);
+    let run_agent = tools.iter().find(|tool| tool.name == "run_agent").unwrap();
+    assert_eq!(
+        run_agent.schema["properties"]["agent_type"]["enum"],
+        json!([null, "researcher", "reviewer"])
+    );
+    assert!(run_agent.description.contains("researcher"));
+    assert!(run_agent.description.contains("reviewer"));
+}
+
+#[test]
 fn drain_inbox_offloads_only_large_machine_results() {
     let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

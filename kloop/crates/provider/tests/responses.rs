@@ -290,6 +290,137 @@ async fn streams_reasoning_text_and_function_call() {
     assert_eq!(ok.len(), 8);
 }
 
+#[tokio::test]
+async fn reasoning_output_item_status_may_be_omitted() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "summary": [], "content": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "summary": [], "content": [],
+                "encrypted_content": "enc"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "r", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::BlockDone(AssistantBlock::Thinking {
+            thinking,
+            signature
+        }) if thinking.is_empty() && signature == "enc"
+    ));
+    assert!(matches!(
+        &events[1],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
+    ));
+    assert_eq!(events.len(), 2);
+}
+
+#[tokio::test]
+async fn output_item_status_stays_strict_outside_omitted_reasoning() {
+    let cases = vec![
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "role": "assistant", "content": []
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc", "call_id": "c", "name": "bash",
+                "arguments": ""
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress", "role": "assistant",
+                "content": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "role": "assistant", "content": []
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc", "status": "in_progress",
+                "call_id": "c", "name": "bash", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc", "arguments": ""}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc", "call_id": "c", "name": "bash",
+                "arguments": ""
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "completed", "summary": [],
+                "content": []
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": null, "summary": [],
+                "content": []
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress", "summary": [],
+                "content": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress", "summary": [],
+                "content": []
+            }}),
+        ],
+        vec![
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress", "summary": [],
+                "content": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": null, "summary": [],
+                "content": []
+            }}),
+        ],
+    ];
+
+    let server = MockServer::start().await;
+    for (index, wire) in cases.into_iter().enumerate() {
+        mount_sse(&server, sse_body(&wire)).await;
+        let events = collect(responses(&server)).await;
+        assert_eq!(events.len(), 1, "case {index}");
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "case {index}");
+        assert!(!error.is_retryable(), "case {index}");
+        assert!(!error.after_semantic_output(), "case {index}");
+        server.reset().await;
+    }
+}
+
 /// A response cut off by max_output_tokens maps to the "length" stop_reason
 /// so the agent's truncation-continue nudge applies unchanged.
 #[tokio::test]
