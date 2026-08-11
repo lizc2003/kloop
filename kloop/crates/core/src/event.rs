@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::agent::EndReason;
 use crate::permissions::Mode;
+use crate::tools::TaskGraphSnapshot;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalMessageId;
 
@@ -122,6 +123,10 @@ pub enum Event {
         id: ItemId,
         item: Item,
     },
+    /// Full read-only projection of the root-owned session task graph. The
+    /// revision lets front-ends discard delayed snapshots without parsing tool
+    /// results or applying task-local patches.
+    TaskGraphUpdated(TaskGraphSnapshot),
     /// A session-scoped background shell/agent/program changed state. Unlike an
     /// item event this deliberately has no turn owner: the terminal update may
     /// arrive after the launching turn completed.
@@ -301,6 +306,7 @@ impl Event {
                     .unwrap_or_default();
                 Some(format!("{origin} {} {state}{detail}", task.id))
             }
+            Event::TaskGraphUpdated(_) => None,
             _ => None,
         }
     }

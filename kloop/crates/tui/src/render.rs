@@ -18,7 +18,11 @@ use unicode_width::UnicodeWidthChar;
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
+use kloop_core::tools::TaskGraphSnapshot;
+use kloop_core::tools::TaskGraphTask;
+use kloop_core::tools::TaskStatus;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::app::App;
@@ -47,6 +51,229 @@ pub struct Hud {
     pub thinking: Option<Duration>,
     pub phase: usize,
     pub reduced_motion: bool,
+}
+
+const TASK_PANEL_MAX_ROWS: usize = 8;
+const TASK_PANEL_COMPLETED_LIMIT: usize = 3;
+
+#[derive(Debug)]
+pub struct LiveChromeLayout {
+    pub activity_visible: bool,
+    pub activity_spacer: bool,
+    pub task_lines: Vec<Line<'static>>,
+}
+
+impl LiveChromeLayout {
+    pub fn reserved_rows(&self) -> usize {
+        usize::from(self.activity_visible)
+            + usize::from(self.activity_spacer)
+            + self.task_lines.len()
+    }
+}
+
+fn task_panel_allowed(app: &App) -> bool {
+    app.show_task_graph
+        && app.interactions.is_empty()
+        && app.fork_picker.is_none()
+        && app.popup.is_none()
+        && app
+            .task_graph
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.tasks.is_empty())
+}
+
+/// Compute all mutable chrome that lives between transcript cells and the
+/// composer. Draw and native-scrollback commit use this exact helper so a Task
+/// row can never be counted on screen but omitted from the frozen-height budget.
+pub fn live_chrome_layout(app: &App, width: usize, terminal_height: usize) -> LiveChromeLayout {
+    let activity_visible = has_activity_line(app);
+    let activity_spacer = activity_visible && !app.cells.is_empty();
+    let activity_rows = usize::from(activity_visible) + usize::from(activity_spacer);
+    let fixed_bottom = 2 + composer_height(app, width) + 1;
+    let transcript_capacity = terminal_height.saturating_sub(fixed_bottom).max(1);
+    let max_task_rows = transcript_capacity
+        .saturating_sub(activity_rows)
+        .saturating_sub(1)
+        .min(TASK_PANEL_MAX_ROWS);
+    let task_lines = if task_panel_allowed(app) && max_task_rows > 0 {
+        task_panel_lines(
+            app.task_graph.as_ref().expect("allowed graph exists"),
+            width,
+            max_task_rows,
+        )
+    } else {
+        Vec::new()
+    };
+    LiveChromeLayout {
+        activity_visible,
+        activity_spacer,
+        task_lines,
+    }
+}
+
+fn open_blockers<'a>(task: &'a TaskGraphTask, completed: &HashSet<&str>) -> Vec<&'a str> {
+    let mut blockers = task
+        .blocked_by
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !completed.contains(id))
+        .collect::<Vec<_>>();
+    blockers.sort_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX));
+    blockers
+}
+
+fn task_line(
+    task: &TaskGraphTask,
+    completed: &HashSet<&str>,
+    first: bool,
+    width: usize,
+) -> Line<'static> {
+    let prefix = if first { "⎿ " } else { "   " };
+    let (glyph, glyph_style, subject_style) = match task.status {
+        TaskStatus::InProgress => (
+            "◼",
+            Style::new().fg(Color::Cyan),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        TaskStatus::Pending => ("◻", DIM, DIM),
+        TaskStatus::Completed => (
+            "✔",
+            Style::new().fg(Color::Green),
+            DIM.add_modifier(Modifier::CROSSED_OUT),
+        ),
+    };
+    let fixed_width = display_width(prefix) + display_width(glyph) + 1;
+    let body_width = width.saturating_sub(fixed_width);
+    let blockers = if task.status == TaskStatus::Pending {
+        open_blockers(task, completed)
+    } else {
+        Vec::new()
+    };
+    let hint = (!blockers.is_empty()).then(|| {
+        format!(
+            " › blocked by {}",
+            blockers
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    });
+
+    let (subject, hint) = match hint {
+        None => (truncate(&task.subject, body_width.max(1)), None),
+        Some(hint) => {
+            let hint_budget = display_width(&hint).min((body_width / 2).max(1));
+            let hint = truncate(&hint, hint_budget);
+            let subject_budget = body_width.saturating_sub(display_width(&hint)).max(1);
+            (truncate(&task.subject, subject_budget), Some(hint))
+        }
+    };
+    let mut spans = vec![
+        Span::styled(prefix.to_string(), DIM),
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::raw(" "),
+        Span::styled(subject, subject_style),
+    ];
+    if let Some(hint) = hint {
+        spans.push(Span::styled(hint, DIM));
+    }
+    Line::from(spans)
+}
+
+fn task_summary_line(label: String, first: bool, width: usize) -> Line<'static> {
+    let prefix = if first { "⎿ " } else { "   " };
+    let budget = width.saturating_sub(display_width(prefix)).max(1);
+    Line::from(vec![
+        Span::styled(prefix.to_string(), DIM),
+        Span::styled(truncate(&label, budget), DIM),
+    ])
+}
+
+fn visible_task_counts(unfinished: usize, completed: usize, cap: usize) -> (usize, usize) {
+    let mut best = (0, 0);
+    for visible_unfinished in 0..=unfinished.min(cap) {
+        for visible_completed in 0..=completed.min(TASK_PANEL_COMPLETED_LIMIT).min(cap) {
+            let rows = visible_unfinished
+                + visible_completed
+                + usize::from(visible_unfinished < unfinished)
+                + usize::from(visible_completed < completed);
+            if rows <= cap && (visible_unfinished, visible_completed) > best {
+                best = (visible_unfinished, visible_completed);
+            }
+        }
+    }
+    best
+}
+
+pub fn task_panel_lines(
+    snapshot: &TaskGraphSnapshot,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if snapshot.tasks.is_empty() || max_rows == 0 || width < 8 {
+        return Vec::new();
+    }
+    let completed_ids = snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .map(|task| task.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut in_progress = Vec::new();
+    let mut pending = Vec::new();
+    let mut blocked = Vec::new();
+    let mut completed = Vec::new();
+    for task in &snapshot.tasks {
+        match task.status {
+            TaskStatus::InProgress => in_progress.push(task),
+            TaskStatus::Pending if open_blockers(task, &completed_ids).is_empty() => {
+                pending.push(task)
+            }
+            TaskStatus::Pending => blocked.push(task),
+            TaskStatus::Completed => completed.push(task),
+        }
+    }
+    let unfinished = in_progress
+        .into_iter()
+        .chain(pending)
+        .chain(blocked)
+        .collect::<Vec<_>>();
+    let cap = max_rows.min(TASK_PANEL_MAX_ROWS);
+    let (visible_unfinished, visible_completed) =
+        visible_task_counts(unfinished.len(), completed.len(), cap);
+    if visible_unfinished == 0
+        && visible_completed == 0
+        && usize::from(!unfinished.is_empty()) + usize::from(!completed.is_empty()) > cap
+    {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for task in unfinished.iter().take(visible_unfinished) {
+        lines.push(task_line(task, &completed_ids, lines.is_empty(), width));
+    }
+    let hidden_unfinished = unfinished.len().saturating_sub(visible_unfinished);
+    if hidden_unfinished > 0 {
+        lines.push(task_summary_line(
+            format!("… +{hidden_unfinished} unfinished"),
+            lines.is_empty(),
+            width,
+        ));
+    }
+    for task in completed.iter().take(visible_completed) {
+        lines.push(task_line(task, &completed_ids, lines.is_empty(), width));
+    }
+    let hidden_completed = completed.len().saturating_sub(visible_completed);
+    if hidden_completed > 0 {
+        lines.push(task_summary_line(
+            format!("… +{hidden_completed} completed"),
+            lines.is_empty(),
+            width,
+        ));
+    }
+    debug_assert!(lines.len() <= cap);
+    lines
 }
 
 /// Hard-wrap `text` to `width` display columns (CJK chars count as 2),
@@ -573,11 +800,22 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     // The mode badge carries the brand accent (CC's brand-coloured mode line);
     // the hints stay dim so only the badge draws the eye.
     let badge = format!("[{}]  ", app.mode.label());
-    let hints = if app.running {
+    let mut hints = if app.running {
         "esc to interrupt · Ctrl+C to exit".to_string()
     } else {
         "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
     };
+    if app
+        .task_graph
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.tasks.is_empty())
+    {
+        hints.push_str(if app.show_task_graph {
+            " · ctrl+t to hide tasks"
+        } else {
+            " · ctrl+t to show tasks"
+        });
+    }
     // Right-aligned system status; dropped if the row is too narrow to fit it
     // after the badge + hints (those matter more).
     let right = system_status(app);
@@ -633,6 +871,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     let labels: Vec<String> = app.composer.attachments().to_vec();
     let attach_h = u16::from(!labels.is_empty());
     let composer_h = (view.rows.len() as u16 + attach_h).max(1);
+    let chrome = live_chrome_layout(app, width.max(1), full.height as usize);
     let [transcript_area, rule_top, input_area, rule_bottom, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -643,14 +882,17 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     .areas(full);
 
     let mut lines = visible_transcript(app, hud, width.max(1));
-    // The activity status is the last transcript line — rendered here, never a
-    // cell, so it is never frozen into scrollback. A blank spacer sets it off.
-    if let Some(activity) = activity_line(app, hud) {
-        if !lines.is_empty() {
+    // Activity and tasks are mutable live chrome, never transcript Cells. The
+    // shared layout helper above also supplies commit_overflow's reserve.
+    if chrome.activity_visible {
+        if chrome.activity_spacer {
             lines.push(Line::default());
         }
-        lines.push(activity);
+        if let Some(activity) = activity_line(app, hud) {
+            lines.push(activity);
+        }
     }
+    lines.extend(chrome.task_lines);
     let height = transcript_area.height as usize;
     // Bottom-anchor the uncommitted tail just above the composer. The event loop
     // has already frozen anything that overflowed into native scrollback, so
@@ -1147,11 +1389,296 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn task(id: u64, subject: &str, status: TaskStatus, blocked_by: &[u64]) -> TaskGraphTask {
+        TaskGraphTask {
+            id: id.to_string(),
+            subject: subject.into(),
+            status,
+            blocked_by: blocked_by.iter().map(u64::to_string).collect(),
+            blocks: Vec::new(),
+        }
+    }
+
+    fn task_graph(tasks: Vec<TaskGraphTask>) -> TaskGraphSnapshot {
+        TaskGraphSnapshot { revision: 1, tasks }
+    }
+
     #[test]
     fn brand_accent_is_vivid_cyan_blue() {
         assert_eq!(BRAND, Color::Rgb(79, 179, 200));
         assert_ne!(BRAND, Color::Magenta);
         assert_ne!(BRAND, Color::Cyan);
+    }
+
+    #[test]
+    fn task_panel_sorts_styles_blocks_and_collapses_completed() {
+        let snapshot = task_graph(vec![
+            task(1, "Done one", TaskStatus::Completed, &[]),
+            task(2, "Active", TaskStatus::InProgress, &[]),
+            task(3, "Ready", TaskStatus::Pending, &[1]),
+            task(4, "Blocked", TaskStatus::Pending, &[2, 1]),
+            task(5, "Done five", TaskStatus::Completed, &[]),
+            task(6, "Done six", TaskStatus::Completed, &[]),
+            task(7, "Done seven", TaskStatus::Completed, &[]),
+        ]);
+        let lines = task_panel_lines(&snapshot, 80, TASK_PANEL_MAX_ROWS);
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "⎿ ◼ Active",
+                "   ◻ Ready",
+                "   ◻ Blocked › blocked by #2",
+                "   ✔ Done one",
+                "   ✔ Done five",
+                "   ✔ Done six",
+                "   … +1 completed",
+            ]
+        );
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Cyan));
+        assert!(lines[3].spans[3]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+        assert!(lines[3].spans[3].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn task_panel_hard_cap_preserves_accurate_group_summaries_and_width() {
+        let mut tasks = (1..=12)
+            .map(|id| task(id, &format!("未完成任务{id}"), TaskStatus::Pending, &[]))
+            .collect::<Vec<_>>();
+        tasks.extend(
+            (13..=17).map(|id| task(id, &format!("已完成任务{id}"), TaskStatus::Completed, &[])),
+        );
+        let snapshot = task_graph(tasks);
+        let lines = task_panel_lines(&snapshot, 18, TASK_PANEL_MAX_ROWS);
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(lines.len(), TASK_PANEL_MAX_ROWS);
+        assert!(texts.iter().any(|line| line == "   … +6 unfinished"));
+        assert!(texts.iter().any(|line| line == "   … +5 completed"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line_text(line)) <= 18),
+            "{texts:?}"
+        );
+
+        let completed_only = task_graph(
+            (1..=5)
+                .map(|id| task(id, &format!("Done {id}"), TaskStatus::Completed, &[]))
+                .collect(),
+        );
+        assert_eq!(
+            task_panel_lines(&completed_only, 40, 8)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec![
+                "⎿ ✔ Done 1",
+                "   ✔ Done 2",
+                "   ✔ Done 3",
+                "   … +2 completed",
+            ]
+        );
+    }
+
+    #[test]
+    fn live_chrome_hides_tasks_for_overlays_and_tiny_terminals() {
+        let mut app = App::new("s".into());
+        app.cells.push(Cell::Assistant("transcript".into()));
+        app.task_graph = Some(task_graph(vec![task(
+            1,
+            "Visible",
+            TaskStatus::Pending,
+            &[],
+        )]));
+        let normal = live_chrome_layout(&app, 80, 24);
+        assert_eq!(normal.task_lines.len(), 1);
+        assert_eq!(normal.reserved_rows(), 1);
+
+        app.fork_picker = Some(crate::app::ForkPicker {
+            points: Vec::new(),
+            cursor: 0,
+        });
+        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        app.fork_picker = None;
+
+        let (confirm_reply, _confirm_rx) = tokio::sync::oneshot::channel();
+        app.apply(crate::events::AgentEvent::Confirm {
+            req: kloop_core::permissions::ConfirmRequest {
+                description: "confirm".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                remember_rules: None,
+                preview: None,
+            },
+            reply: confirm_reply,
+        });
+        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        app.interactions.clear();
+
+        let (question_reply, _question_rx) = tokio::sync::oneshot::channel();
+        app.apply(crate::events::AgentEvent::Question {
+            req: kloop_core::interaction::QuestionRequest {
+                questions: vec![kloop_core::interaction::Question {
+                    question: "Choose?".into(),
+                    header: "Choice".into(),
+                    options: vec![kloop_core::interaction::QuestionOption {
+                        label: "One".into(),
+                        description: "first".into(),
+                        preview: None,
+                    }],
+                    multi_select: false,
+                }],
+                metadata: None,
+            },
+            reply: question_reply,
+        });
+        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        app.interactions.clear();
+
+        app.popup = Some(Popup {
+            kind: menu::PopupKind::Slash,
+            query: String::new(),
+            items: vec![menu::MenuItem {
+                label: "/help".into(),
+                detail: "help".into(),
+                insert: "/help".into(),
+            }],
+            cursor: 0,
+        });
+        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+        app.popup = None;
+
+        assert!(live_chrome_layout(&app, 80, 5).task_lines.is_empty());
+        app.show_task_graph = false;
+        assert!(live_chrome_layout(&app, 80, 24).task_lines.is_empty());
+    }
+
+    #[test]
+    fn draw_keeps_activity_then_tasks_immediately_above_composer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new("s".into());
+        app.cells.push(Cell::Assistant("history".into()));
+        app.running = true;
+        app.task_graph = Some(task_graph(vec![
+            task(1, "Done one", TaskStatus::Completed, &[]),
+            task(2, "Active", TaskStatus::InProgress, &[]),
+            task(
+                3,
+                "需要处理一个非常非常长的中文任务标题",
+                TaskStatus::Pending,
+                &[2],
+            ),
+            task(4, "Done four", TaskStatus::Completed, &[]),
+            task(5, "Done five", TaskStatus::Completed, &[]),
+            task(6, "Done six", TaskStatus::Completed, &[]),
+            task(7, "Done seven", TaskStatus::Completed, &[]),
+        ]));
+        let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(""))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let activity = rows
+            .iter()
+            .position(|row| row.contains("Working"))
+            .expect("activity row");
+        let first_task = rows
+            .iter()
+            .position(|row| row.contains("⎿ ◼ Active"))
+            .expect("first task row");
+        let blocked = rows
+            .iter()
+            .position(|row| row.contains('需') && row.contains("blocked by #2"))
+            .unwrap_or_else(|| panic!("blocked CJK task row: {rows:#?}"));
+        assert!(
+            rows[blocked].contains('…'),
+            "CJK subject truncates: {rows:#?}"
+        );
+        let completed_summary = rows
+            .iter()
+            .position(|row| row.contains("… +2 completed"))
+            .expect("completed folding row");
+        let rule = rows
+            .iter()
+            .enumerate()
+            .skip(blocked + 1)
+            .find(|(_, row)| row.trim_matches('─').is_empty() && row.contains('─'))
+            .map(|(index, _)| index)
+            .expect("composer top rule");
+        assert!(
+            activity < first_task
+                && first_task < blocked
+                && blocked < completed_summary
+                && completed_summary < rule
+        );
+        assert_eq!(
+            app.cells,
+            vec![Cell::Assistant("history".into())],
+            "Task projection is not a transcript Cell"
+        );
+    }
+
+    #[test]
+    fn draw_ctrl_t_toggles_panel_and_footer_hint_together() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        fn screen(terminal: &Terminal<TestBackend>) -> String {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(""))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut app = App::new("s".into());
+        app.cells.push(Cell::Assistant("history".into()));
+        app.task_graph = Some(task_graph(vec![task(
+            1,
+            "Toggle me",
+            TaskStatus::Pending,
+            &[],
+        )]));
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .unwrap();
+        let visible = screen(&terminal);
+        assert!(visible.contains("⎿ ◻ Toggle me"), "{visible}");
+        assert!(visible.contains("ctrl+t to hide tasks"), "{visible}");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        terminal
+            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .unwrap();
+        let hidden = screen(&terminal);
+        assert!(!hidden.contains("Toggle me"), "{hidden}");
+        assert!(hidden.contains("ctrl+t to show tasks"), "{hidden}");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        terminal
+            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .unwrap();
+        assert!(screen(&terminal).contains("⎿ ◻ Toggle me"));
     }
 
     #[test]
@@ -1562,6 +2089,17 @@ mod tests {
         assert_eq!(footer.spans[1].style, DIM);
         assert!(activity_line(&app, &hud).is_none());
         assert!(!has_activity_line(&app));
+
+        app.task_graph = Some(task_graph(vec![task(
+            1,
+            "Visible",
+            TaskStatus::Pending,
+            &[],
+        )]));
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
+        app.show_task_graph = false;
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to show tasks"));
+        app.show_task_graph = true;
 
         app.mode = Mode::Plan;
         assert!(line_text(&footer_line(&app, 80)).starts_with("[plan]  "));

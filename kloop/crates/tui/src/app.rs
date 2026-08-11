@@ -25,6 +25,7 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
+use kloop_core::tools::TaskGraphSnapshot;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
@@ -213,6 +214,13 @@ pub struct App {
     /// finalized ones the viewport shows. Older finalized cells have left for
     /// native scrollback (see [`Cell`], [`App::drain_committed`]).
     pub cells: Vec<Cell>,
+    /// Latest immutable projection of the root-owned task graph. `None` means the
+    /// startup seed has not arrived yet; an accepted revision-0 empty snapshot is
+    /// therefore distinct from uninitialized state.
+    pub task_graph: Option<TaskGraphSnapshot>,
+    /// Pure display preference. Snapshot updates, turns, rewinds, and `/clear`
+    /// never reset it; Ctrl+T is its only mutator.
+    pub show_task_graph: bool,
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
     pub composer: Composer,
@@ -286,6 +294,8 @@ impl App {
         Self {
             session_id,
             cells: Vec::new(),
+            task_graph: None,
+            show_task_graph: true,
             composer: Composer::new(),
             submit_images: Vec::new(),
             running: false,
@@ -539,6 +549,15 @@ impl App {
                 ..
             }
             | Event::TurnStarted => {}
+            Event::TaskGraphUpdated(snapshot) => {
+                let accept = self
+                    .task_graph
+                    .as_ref()
+                    .is_none_or(|current| snapshot.revision > current.revision);
+                if accept {
+                    self.task_graph = Some(snapshot);
+                }
+            }
             Event::ItemStarted {
                 id,
                 item: Item::ToolCall {
@@ -880,6 +899,16 @@ impl App {
                 return Command::Quit;
             }
             self.ctrl_c_exit_armed = true;
+            return Command::None;
+        }
+        if ctrl
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+            && self
+                .task_graph
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.tasks.is_empty())
+        {
+            self.show_task_graph = !self.show_task_graph;
             return Command::None;
         }
         // A pending interaction captures the keyboard.
@@ -1523,9 +1552,23 @@ mod tests {
             },
         })
     }
+    fn task_snapshot(revision: u64, subject: &str) -> TaskGraphSnapshot {
+        TaskGraphSnapshot {
+            revision,
+            tasks: vec![kloop_core::tools::TaskGraphTask {
+                id: "1".into(),
+                subject: subject.into(),
+                status: kloop_core::tools::TaskStatus::Pending,
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+            }],
+        }
+    }
+
     fn usage(u: u64) -> AgentEvent {
         AgentEvent::Core(Event::Usage(u))
     }
+
     fn turn_ended(reason: EndReason) -> AgentEvent {
         AgentEvent::Core(Event::TurnEnded(reason))
     }
@@ -1721,6 +1764,55 @@ mod tests {
         app.mode = Mode::Plan;
         app.apply(mode_changed(Mode::AcceptEdits));
         assert_eq!(app.mode, Mode::AcceptEdits);
+    }
+
+    #[test]
+    fn task_graph_revisions_replace_atomically_and_ctrl_t_is_display_only() {
+        let mut app = App::new("s".into());
+        app.apply(text_delta("streaming"));
+        let cells = app.cells.clone();
+        assert!(app.streaming_assistant());
+
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            0, "Seed",
+        ))));
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 0);
+        assert_eq!(app.cells, cells);
+        assert!(app.streaming_assistant());
+
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            2, "Newest",
+        ))));
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            1, "Stale",
+        ))));
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            2,
+            "Duplicate",
+        ))));
+        assert_eq!(app.task_graph.as_ref().unwrap().tasks[0].subject, "Newest");
+        assert_eq!(app.cells, cells);
+        assert!(app.streaming_assistant());
+
+        assert!(app.show_task_graph);
+        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert!(!app.show_task_graph);
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
+        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert!(app.show_task_graph);
+
+        app.apply(turn_ended(EndReason::Completed));
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(
+            TaskGraphSnapshot {
+                revision: 3,
+                tasks: Vec::new(),
+            },
+        )));
+        assert!(app.task_graph.as_ref().unwrap().tasks.is_empty());
+        assert!(app.show_task_graph);
+        assert_eq!(app.on_key(ctrl('t')), Command::None);
+        assert!(app.show_task_graph, "an empty graph has no toggle target");
     }
 
     #[test]
@@ -1956,12 +2048,23 @@ mod tests {
     fn steering_while_running_queues_without_a_new_turn() {
         let mut app = App::new("s".into());
         app.running = true;
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            4,
+            "Retained while steering",
+        ))));
+        app.show_task_graph = false;
         type_str(&mut app, "also do X");
         let cmd = app.on_key(key(KeyCode::Enter));
         assert_eq!(cmd, Command::Steer("also do X".into()));
         assert!(app.running, "steering does not end or restart the turn");
         assert_eq!(app.composer.text(), "");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 4);
+        assert_eq!(
+            app.task_graph.as_ref().unwrap().tasks[0].subject,
+            "Retained while steering"
+        );
+        assert!(!app.show_task_graph);
     }
 
     /// Steering with an image attached: only the text steers the running turn;
@@ -2049,11 +2152,15 @@ mod tests {
 
         app.background_task_cells.insert("agent-8".into(), 0);
         app.frozen_background_tasks.insert("program-8".into());
+        app.task_graph = Some(task_snapshot(4, "Keep until fenced"));
+        app.show_task_graph = false;
         app.apply(AgentEvent::ClearTranscript);
         assert!(app.cells.is_empty());
         assert!(app.tool_cells.is_empty());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 4);
+        assert!(!app.show_task_graph);
 
         // A terminal update arriving after clear has no stale row to mutate, so it
         // starts a fresh linked lifecycle row rather than disappearing.
@@ -2138,6 +2245,8 @@ mod tests {
         app.cells.push(Cell::User("stale".into()));
         app.background_task_cells.insert("agent-old".into(), 0);
         app.frozen_background_tasks.insert("program-old".into());
+        app.task_graph = Some(task_snapshot(7, "Shared registry"));
+        app.show_task_graph = false;
         app.apply(AgentEvent::Forked {
             session_id: "new".into(),
             messages: vec![
@@ -2159,6 +2268,8 @@ mod tests {
         assert!(app.fork_picker.is_none());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 7);
+        assert!(!app.show_task_graph);
     }
 
     #[test]

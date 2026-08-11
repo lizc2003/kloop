@@ -1241,7 +1241,7 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// Task V2 uses the ordinary toolCall lifecycle; the native wire has no
+/// Task tools use the ordinary toolCall lifecycle; the native wire has no
 /// task-board or retired todo item type.
 #[tokio::test]
 async fn task_create_surfaces_as_an_ordinary_tool_call() {
@@ -1263,6 +1263,18 @@ async fn task_create_surfaces_as_an_ordinary_tool_call() {
         !log.iter()
             .any(|message| message["params"]["item"]["type"] == "todo"),
         "the retired todo item type must be absent: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|message| {
+            message["method"]
+                .as_str()
+                .is_some_and(|method| method.to_ascii_lowercase().contains("taskgraph"))
+                || matches!(
+                    message["params"]["item"]["type"].as_str(),
+                    Some("task" | "taskGraph")
+                )
+        }),
+        "the internal Task graph snapshot must not become public wire: {log:?}"
     );
     let calls = log
         .iter()

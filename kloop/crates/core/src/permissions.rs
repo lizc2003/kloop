@@ -1187,7 +1187,7 @@ impl CallFacts {
             // The task graph mutates only session memory — nothing on the
             // user's system to sign off on. Dispatcher concurrency still
             // serializes create/update independently of this permission fact.
-            "task_create" | "task_get" | "task_update" | "task_list" => true,
+            "task_create" | "task_get" | "task_update" | "task_list" | "task_clear" => true,
             // skill only loads a local skill file's instructions into the
             // conversation — no system side effect (cc never prompts to
             // activate one); tools those instructions later prompt are gated
@@ -1735,7 +1735,13 @@ mod tests {
         assert!(ok(&p, "tool_search", json!({"query": "select:x"})).await);
         assert!(ok(&p, "skill", json!({"name": "fixture"})).await);
         assert!(ok(&p, "list_mcp_resources", json!({})).await);
-        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+        for task_tool in [
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ] {
             assert!(ok(&p, task_tool, json!({})).await);
         }
         assert!(ok(&p, "bash", bash("git status && ls | wc -l")).await);
@@ -2633,7 +2639,13 @@ mod tests {
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "bash", bash("git status && ls")).await);
         assert!(ok(&p, "run_agent", json!({"prompt": "look around"})).await);
-        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+        for task_tool in [
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ] {
             assert!(ok(&p, task_tool, json!({})).await);
         }
         assert!(ok(&p, "exit_plan_mode", json!({"plan": "do X"})).await);

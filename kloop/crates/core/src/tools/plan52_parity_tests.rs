@@ -56,6 +56,10 @@ impl RecordingUi {
         self.events.lock().unwrap().clone()
     }
 
+    fn take_events(&self) -> Vec<Event> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+
     async fn wait_for_background(&self, expected: BackgroundTaskStatus) {
         let mut activity = self.activity.subscribe();
         loop {
@@ -218,6 +222,36 @@ fn projected_background_events(events: &[Event], agent_id: &str) -> Vec<Value> {
                     "detail": task.detail,
                 }))
             }
+            _ => None,
+        })
+        .collect()
+}
+
+fn projected_task_events(events: &[Event], tool_name: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ItemStarted {
+                item: Item::ToolCall { name, .. },
+                ..
+            } if name == tool_name => Some(json!({"kind": "item_started", "tool": name})),
+            Event::TaskGraphUpdated(snapshot) => Some(json!({
+                "kind": "task_graph_updated",
+                "revision": snapshot.revision,
+                "task_ids": snapshot.tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>(),
+            })),
+            Event::ItemCompleted {
+                item: Item::ToolCall { name, status, .. },
+                ..
+            } if name == tool_name => Some(json!({
+                "kind": "item_completed",
+                "tool": name,
+                "status": match status {
+                    ItemStatus::InProgress => "in_progress",
+                    ItemStatus::Completed => "completed",
+                    ItemStatus::Failed => "failed",
+                },
+            })),
             _ => None,
         })
         .collect()
@@ -449,17 +483,24 @@ async fn inbox_final_boundary_report() -> Value {
 }
 
 async fn native_surface_report() -> Value {
-    const EXPECTED_NATIVE: [&str; 8] = [
+    const EXPECTED_NATIVE: [&str; 9] = [
         "run_agent",
         "task_create",
         "task_get",
         "task_update",
         "task_list",
+        "task_clear",
         "wait_for_activity",
         "stop_agent",
         "stop_program",
     ];
-    const TASK_TOOLS: [&str; 4] = ["task_create", "task_get", "task_update", "task_list"];
+    const TASK_TOOLS: [&str; 5] = [
+        "task_create",
+        "task_get",
+        "task_update",
+        "task_list",
+        "task_clear",
+    ];
     const CLAUDE_SURFACES: [&str; 10] = [
         "Agent",
         "TaskCreate",
@@ -525,7 +566,9 @@ async fn native_surface_report() -> Value {
         })
         .collect::<serde_json::Map<String, Value>>();
 
-    let ctx = test_ctx(0, "plan52-native-surface");
+    let task_ui = Arc::new(RecordingUi::default());
+    let mut ctx = test_ctx(0, "plan52-native-surface");
+    ctx.ui = task_ui.clone();
     let mut owner_field_gate = Vec::new();
     for (owner_kind, owner) in [("string", json!("assistant")), ("null", Value::Null)] {
         let (result, is_error) = run_tool(
@@ -624,6 +667,7 @@ async fn native_surface_report() -> Value {
         ("task_get", json!({"task_id":"2"})),
         ("task_update", json!({"task_id":"2","status":"completed"})),
         ("task_list", json!({})),
+        ("task_clear", json!({})),
     ] {
         let (result, is_error) = run_tool(name, input, &child_ctx).await;
         assert!(is_error, "{name}: {result}");
@@ -646,6 +690,51 @@ async fn native_surface_report() -> Value {
     assert!(!complete_dependent_error, "{complete_dependent}");
     let (list_tasks, list_tasks_error) = run_tool("task_list", json!({}), &ctx).await;
     assert!(!list_tasks_error, "{list_tasks}");
+    let _ = task_ui.take_events();
+    let (description_only, description_only_error) = run_tool(
+        "task_update",
+        json!({"task_id":"2","description":"display projection unchanged"}),
+        &ctx,
+    )
+    .await;
+    assert!(!description_only_error, "{description_only}");
+    let description_only_events = projected_task_events(&task_ui.take_events(), "task_update");
+
+    let (no_op, no_op_error) = run_tool(
+        "task_update",
+        json!({"task_id":"2","description":"display projection unchanged"}),
+        &ctx,
+    )
+    .await;
+    assert!(!no_op_error, "{no_op}");
+    let no_op_events = projected_task_events(&task_ui.take_events(), "task_update");
+
+    let (rollover, rollover_error) = run_tool(
+        "task_create",
+        json!({"subject":"new epoch","description":"independent work"}),
+        &ctx,
+    )
+    .await;
+    assert!(!rollover_error, "{rollover}");
+    let rollover_events = projected_task_events(&task_ui.take_events(), "task_create");
+
+    let (strict_clear, strict_clear_error) =
+        run_tool("task_clear", json!({"unexpected": true}), &ctx).await;
+    assert!(strict_clear_error, "{strict_clear}");
+    let strict_clear_events = projected_task_events(&task_ui.take_events(), "task_clear");
+
+    let (clear, clear_error) = run_tool("task_clear", json!({}), &ctx).await;
+    assert!(!clear_error, "{clear}");
+    let clear_events = projected_task_events(&task_ui.take_events(), "task_clear");
+
+    let (after_clear, after_clear_error) = run_tool(
+        "task_create",
+        json!({"subject":"after clear","description":"high water survives"}),
+        &ctx,
+    )
+    .await;
+    assert!(!after_clear_error, "{after_clear}");
+    let after_clear_events = projected_task_events(&task_ui.take_events(), "task_create");
 
     ctx.cfg
         .inbox
@@ -677,6 +766,31 @@ async fn native_surface_report() -> Value {
             "get_dependent": get_dependent,
             "complete_dependent": complete_dependent,
             "list": list_tasks,
+            "description_only": {
+                "result": description_only,
+                "events": description_only_events,
+            },
+            "no_op": {
+                "result": no_op,
+                "events": no_op_events,
+            },
+            "rollover": {
+                "result": rollover,
+                "events": rollover_events,
+            },
+            "strict_clear": {
+                "result": strict_clear,
+                "is_error": strict_clear_error,
+                "events": strict_clear_events,
+            },
+            "clear": {
+                "result": clear,
+                "events": clear_events,
+            },
+            "after_clear": {
+                "result": after_clear,
+                "events": after_clear_events,
+            },
         },
         "owner_field_gate": owner_field_gate,
         "child_task_gate": child_task_gate,

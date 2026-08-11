@@ -1146,6 +1146,7 @@ fn program_surface_excludes_agent_and_task_control_tools() {
         "task_get",
         "task_update",
         "task_list",
+        "task_clear",
     ] {
         assert!(
             !names.iter().any(|name| name == excluded),

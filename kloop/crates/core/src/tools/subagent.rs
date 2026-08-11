@@ -1615,7 +1615,7 @@ mod tests {
         assert!(ctx.cfg.inbox.is_empty());
     }
 
-    /// A foreground child may forge a Task V2 call, but the depth gate rejects
+    /// A foreground child may forge a Task tool call, but the depth gate rejects
     /// it; the child still returns its result and only root advances the task.
     #[tokio::test]
     async fn foreground_subagent_reports_without_mutating_the_root_task() {

@@ -11,12 +11,15 @@ use crate::history::History;
 pub const SUMMARY: &str = "clear the conversation and start fresh";
 
 pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
+    // Advance the graph revision before touching the other session state. This is
+    // the reset fence the TUI uses to reject any delayed pre-clear snapshot.
+    let (_, snapshot) = match cfg.tasks.clear() {
+        Ok(cleared) => cleared,
+        Err(error) => return SlashResult::message(format!("clear failed: {error:#}")),
+    };
     // Replacing with an empty history writes a compacted marker; the usage
     // anchor is dropped and the next turn starts on a blank context.
     history.replace_all(Vec::new());
-    // Process-state that lives outside History resets too. Keep the task ID
-    // high-water mark so a running peer can never observe an ID being reused.
-    cfg.tasks.clear();
     cfg.inbox.drain();
-    SlashResult::cleared_message("conversation cleared")
+    SlashResult::cleared_message("conversation cleared", snapshot)
 }

@@ -377,6 +377,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_graph_snapshot_has_no_plain_projection() {
+        let ui = StdoutUi::default();
+        let event = Event::TaskGraphUpdated(kloop_core::tools::TaskGraphSnapshot {
+            revision: 1,
+            tasks: vec![kloop_core::tools::TaskGraphTask {
+                id: "1".into(),
+                subject: "Do not print me".into(),
+                status: kloop_core::tools::TaskStatus::Pending,
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+            }],
+        });
+        assert_eq!(event.as_note(), None);
+        ui.emit(&event);
+        assert!(ui.items.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn color_diff_wraps_lines_by_sign() {
         assert_eq!(
             color_diff("+1  add\n-2  del\n 3  ctx"),

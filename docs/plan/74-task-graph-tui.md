@@ -1,6 +1,8 @@
 # Plan 74 — Task graph 的 TUI 实时投影
 
-> 状态：📋 待实施（2026-08-11）
+> 状态：✅ 已完成（2026-08-11；提交 SHA 以本条所在提交为准）
+>
+> 完成结论：TaskRegistry revisioned full snapshot、strict `task_clear`、atomic rollover、`/clear` reset fence、TUI non-Cell live chrome 与 clear/fork 保留顺序均已落地；Plan 52 report/matrix 与 README/HANDOFF/capability/refs 已同步。
 >
 > 基线：`d9d843b`（Plan 73）
 >
@@ -28,7 +30,7 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
 - snapshot 在 registry 写锁内与 commit 一起生成，包含 numeric-ID 稳定投影 `id/subject/status/blocked_by/blocks`，不含长 description、owner 或 execution identity。
 - `/clear` 清图但保 ID 高水位，无条件推进 revision，并把精确的 revisioned empty snapshot 送给 TUI，作为压过旧事件的 reset fence。
 - TUI graph 跨 turn/steer 保留，graph 非空时默认可见且**固定排在输入区上方**，不进入右侧栏或 transcript 历史；`Ctrl+T` 只切换显隐，重新显示时仍来自最新 snapshot。现有 in-process TUI fork 仍共享同一个 `Config.tasks`，所以 fork 后继续显示同一 graph；解决 fork runtime rebinding 不在本计划。新进程、resume、server thread/fork 仍从空 registry 开始。
-- 首片只做 TUI。plain 不打印 checklist，server/headless 不新增 Task notification/native item；四工具继续保留 ordinary `toolCall` 生命周期和 root-only/result-only child 边界。
+- 首片只做 TUI。plain 不打印 checklist，server/headless 不新增 Task notification/native item；五工具继续保留 ordinary `toolCall` 生命周期和 root-only/result-only child 边界。
 
 ## 实施步骤
 
@@ -149,5 +151,12 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
    - root-only、child result-only、DAG/owner strict reject和server thread isolation保持；Plan 52/matrix显式更新为五个 Task tools，mock/headless仍只输出普通 ToolCall。
 5. 全质量门：fmt、all-target/all-feature clippy、workspace tests、matrix check、full/corpus verifier、`git diff --check`。
 6. 端到端：
-   - `--mock` TUI 走 create/dependency/update/list，人工与 TestBackend 确认 panel 实时替换、折叠和 `/clear`；再覆盖 all-completed 后新 create 自动换 epoch，以及未完成 graph 通过 `task_clear` 重置。
-   - 使用现有 gitignored provider env，OpenAI Chat 与 Anthropic 各跑一次真实 Task lifecycle：完成一轮后创建独立新 Task 得到干净 panel；另一路模拟用户放弃未完成任务，模型显式 `task_clear` 后重新规划。只记录过滤后的 event/screen 字段，不保留 key、endpoint 或 raw response。
+   - `cargo run -p kloop -- --mock` 只作既有 plain smoke；TUI 用 App/TestBackend 与 PTY/真实 provider 确认 panel 实时替换、折叠、`Ctrl+T` 和 `/clear`，并覆盖 all-completed 后新 create 自动换 epoch、未完成 graph 经 `task_clear` 重置。
+
+## 完成验收记录
+
+- Rust 门：`cargo fmt --all -- --check`、workspace all-target/all-feature clippy `-D warnings`、`cargo test --workspace`、`git diff --check` 全绿；最终 core 主 suite 638 tests、TUI 148 tests、server integration 28 tests 均通过。
+- 证据门：matrix generator/check 为 63 rows / 504 cells、7 pairs、108 profile bridges、218 immutable fixtures；full exact-binary 与 `--corpus-only` verifier 均通过。`paired-parity.json`、`profile-bridges.json` 和 pinned raw/normalized fixtures无实质 diff。
+- 前端门：App/TestBackend/worker seam 覆盖 revision seed/stale fence、glyph/blocked hint/折叠/CJK/overlay、`Ctrl+T` hide/show、`ClearTranscript → empty snapshot → System` 与 shared scrollback budget；真实 Anthropic PTY 过滤观测确认 live panel 出现 canonical glyph 和 `blocked by #1`，未保存原始屏幕流。
+- 真实 provider：Anthropic lifecycle 得到 create IDs `1,2,3`，完成 `1,2` 后最终 `task_list == [3]`，证明 atomic epoch rollover；OpenAI Chat lifecycle 得到 create IDs `1,2`，中间 `task_clear` 返回 `cleared_count=1`、empty revision 2，最终 `task_list == [2]`，证明显式 clear 与 high-water。只记录这些过滤事实，未记录 key、endpoint 或 raw response。
+- plain smoke：`cargo run -p kloop -- --mock` 正常完成，仍只显示 ordinary tool notes，不打印 Task checklist。

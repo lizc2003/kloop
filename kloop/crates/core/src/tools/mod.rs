@@ -53,7 +53,10 @@ pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the run_agent sub-agent machinery.
 pub(crate) use subagent::fork_skill;
+pub use task::TaskGraphSnapshot;
+pub use task::TaskGraphTask;
 pub use task::TaskRegistry;
+pub use task::TaskStatus;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -776,7 +779,7 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         "ask_user_question" | "workflow" | "cron_list" | "list_agents" | "task_get"
         | "task_list" => true,
         "send_message" | "cron_create" | "cron_delete" | "schedule_wakeup" | "task_create"
-        | "task_update" => false,
+        | "task_update" | "task_clear" => false,
         // Consecutive run_agent calls may run in parallel; child tool calls are
         // still gated independently.
         "run_agent" => true,
@@ -863,7 +866,7 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 fn is_root_task_tool(name: &str) -> bool {
     matches!(
         name,
-        "task_create" | "task_get" | "task_update" | "task_list"
+        "task_create" | "task_get" | "task_update" | "task_list" | "task_clear"
     )
 }
 
@@ -898,7 +901,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if name == "bash" && input.get("run_in_background").is_some() {
             bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
         }
-        // The catalog hides Task V2 from child Agents, but stale context or a
+        // The catalog hides Task tools from child Agents, but stale context or a
         // forged call must fail before allowlists, hooks, permissions, or the
         // registry handler can observe it.
         if ctx.depth > 0 && is_root_task_tool(&name) {
@@ -1224,6 +1227,7 @@ fn execute_tool<'a>(
             "task_get" => task::task_get_tool(input, ctx),
             "task_update" => task::task_update_tool(input, ctx),
             "task_list" => task::task_list_tool(input, ctx),
+            "task_clear" => task::task_clear_tool(input, ctx),
             "skill" => skill::skill_tool(input, ctx, workspace).await,
             "tool_search" => tool_search::tool_search_tool(input, ctx).await,
             // Only malformed envelopes reach this arm — well-formed ones were
@@ -1895,7 +1899,13 @@ mod tests {
         let child = names(1);
         assert!(root.iter().any(|name| name == "run_agent"));
         assert!(!child.iter().any(|name| name == "run_agent"));
-        for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+        for task_tool in [
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ] {
             assert!(root.iter().any(|name| name == task_tool), "{task_tool}");
             assert!(!child.iter().any(|name| name == task_tool), "{task_tool}");
         }
@@ -2016,6 +2026,7 @@ mod tests {
                 "task_get",
                 "task_update",
                 "task_list",
+                "task_clear",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2241,7 +2252,11 @@ mod tests {
         let warnings =
             tool_merge_warnings(&big, TOOL_DEFER_THRESHOLD, &ShellPrograms::native_posix());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("61 tools"), "got: {warnings:?}");
+        assert!(
+            warnings[0]
+                .contains(&(tool_defs(0, &ShellPrograms::native_posix()).len() + 40).to_string()),
+            "got: {warnings:?}"
+        );
         assert!(warnings[0].contains("tool_search"), "got: {warnings:?}");
     }
 
@@ -2439,7 +2454,7 @@ mod tests {
         assert!(!out.contains("not available to this agent type"), "{out}");
     }
 
-    /// A child cannot gain root Task V2 capability through an explicit custom
+    /// A child cannot gain root Task graph capability through an explicit custom
     /// allowlist, a forged call, or the deferred call_tool envelope.
     #[tokio::test]
     async fn child_task_calls_fail_before_the_registry_even_when_allowlisted() {
@@ -2452,7 +2467,13 @@ mod tests {
         .await;
         assert!(!is_error, "{created}");
 
-        let task_tools = ["task_create", "task_get", "task_update", "task_list"];
+        let task_tools = [
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ];
         let mut cfg = root.cfg.test_clone();
         cfg.tool_allowlist = Some(Arc::new(
             task_tools.into_iter().map(str::to_string).collect(),
@@ -2470,6 +2491,7 @@ mod tests {
             ("task_get", json!({"task_id":"1"})),
             ("task_update", json!({"task_id":"1","status":"completed"})),
             ("task_list", json!({})),
+            ("task_clear", json!({})),
         ] {
             let (output, is_error) = run_tool(name, input, &child).await;
             assert!(is_error, "{name}: {output}");
@@ -2828,6 +2850,7 @@ mod tests {
         ));
         assert!(is_concurrency_safe("task_get", &json!({"task_id":"1"})));
         assert!(is_concurrency_safe("task_list", &json!({})));
+        assert!(!is_concurrency_safe("task_clear", &json!({})));
         assert!(!is_concurrency_safe(
             "task_create",
             &json!({"subject":"x","description":"y"})

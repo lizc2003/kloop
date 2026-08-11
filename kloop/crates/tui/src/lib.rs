@@ -172,6 +172,10 @@ pub async fn run(
             mode: permissions.mode().label().to_string(),
         },
     );
+    // Seed through the same event seam used by live mutations. Keeping revision 0
+    // as a real first snapshot lets App distinguish an empty graph from a seed
+    // that has not arrived yet.
+    channel_ui.emit(&CoreEvent::TaskGraphUpdated(cfg.tasks.snapshot()));
     let cwd = effective_cwd;
 
     let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
@@ -282,6 +286,29 @@ fn slash_catalog(cfg: &Config) -> Vec<menu::CommandInfo> {
     out
 }
 
+fn send_command_result_events(
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    result: &kloop_core::commands::SlashResult,
+) -> bool {
+    if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
+        return false;
+    }
+    if let Some(snapshot) = &result.task_graph {
+        if events
+            .send(AgentEvent::Core(CoreEvent::TaskGraphUpdated(
+                snapshot.clone(),
+            )))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    result.output.is_empty()
+        || events
+            .send(AgentEvent::System(result.output.clone()))
+            .is_ok()
+}
+
 /// Owns History for its whole lifetime and runs turns strictly one at a time;
 /// the UI loop enforces single-flight by ignoring Enter while running.
 async fn agent_worker(
@@ -343,14 +370,9 @@ async fn agent_worker(
             }
             WorkerMsg::Command { line, cancel } => {
                 let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
-                // Clear first (drops the old cells), then show the result on
-                // the now-blank transcript.
-                if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
-                    return;
-                }
-                if !result.output.is_empty()
-                    && events.send(AgentEvent::System(result.output)).is_err()
-                {
+                // Clear first (drops the old cells), then apply the exact empty
+                // graph fence, then show the result on the now-blank transcript.
+                if !send_command_result_events(&events, &result) {
                     return;
                 }
                 // `/exit`: tell the loop to quit (it tears the terminal down
@@ -544,6 +566,17 @@ where
     Ok(())
 }
 
+fn overflow_commit_count(app: &App, width: usize, height: usize) -> usize {
+    // Draw and commit share one mutable-chrome calculation: activity plus the
+    // revisioned Task panel must both stay out of native scrollback.
+    let chrome = render::live_chrome_layout(app, width, height);
+    let reserve = 2 + render::composer_height(app, width) + 1 + chrome.reserved_rows();
+    let active_h = height.saturating_sub(reserve).max(1);
+    render::commit_count(&app.cells, width, active_h, |index| {
+        app.display_cell_live(index)
+    })
+}
+
 /// Freeze the finalized cells that overflow the live region into native
 /// scrollback via `insert_before`, then drop them from the app's tail. Called
 /// before each draw (unless a popup owns the screen), so the viewport only ever
@@ -551,21 +584,7 @@ where
 fn commit_overflow(terminal: &mut Terminal, app: &mut App) -> Result<()> {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (w as usize).max(1);
-    // The live region is the viewport minus the bottom chrome: two rules that
-    // fence the composer, the composer itself (now multi-line, plan 38 slice 3),
-    // and the footer. When an activity line is showing it eats a blank spacer +
-    // its own row at the transcript bottom, so reserve two more (see render::draw).
-    let reserve = 2 + render::composer_height(app, width) + 1 + {
-        if render::has_activity_line(app) {
-            2
-        } else {
-            0
-        }
-    };
-    let active_h = (h as usize).saturating_sub(reserve).max(1);
-    let n = render::commit_count(&app.cells, width, active_h, |index| {
-        app.display_cell_live(index)
-    });
+    let n = overflow_commit_count(app, width, h as usize);
     if n == 0 {
         return Ok(());
     }
@@ -977,6 +996,76 @@ mod tests {
             "────────────────────────",
             "[manual]                ",
         ]);
+    }
+
+    fn snapshot(revision: u64, tasks: usize) -> kloop_core::tools::TaskGraphSnapshot {
+        kloop_core::tools::TaskGraphSnapshot {
+            revision,
+            tasks: (1..=tasks)
+                .map(|id| kloop_core::tools::TaskGraphTask {
+                    id: id.to_string(),
+                    subject: format!("Task {id}"),
+                    status: kloop_core::tools::TaskStatus::Pending,
+                    blocked_by: Vec::new(),
+                    blocks: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn startup_seed_uses_the_channel_ui_event_seam() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ui = ChannelUi::new(tx);
+        ui.emit(&CoreEvent::TaskGraphUpdated(snapshot(0, 0)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::Core(CoreEvent::TaskGraphUpdated(graph))
+                if graph.revision == 0 && graph.tasks.is_empty()
+        ));
+    }
+
+    #[test]
+    fn clear_command_events_order_transcript_then_graph_fence_then_system() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = kloop_core::commands::SlashResult {
+            output: "cleared".into(),
+            cleared: true,
+            run_turn: None,
+            task_graph: Some(snapshot(7, 0)),
+            quit: false,
+        };
+        assert!(send_command_result_events(&tx, &result));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ClearTranscript
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::Core(CoreEvent::TaskGraphUpdated(graph))
+                if graph.revision == 7 && graph.tasks.is_empty()
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::System(output) if output == "cleared"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn overflow_budget_reserves_live_tasks_without_committing_them() {
+        let mut app = App::new("task-overflow".into());
+        app.cells = (1..=8)
+            .map(|index| Cell::Assistant(format!("history {index}")))
+            .collect();
+        let cells = app.cells.clone();
+        let without_tasks = overflow_commit_count(&app, 40, 10);
+
+        app.task_graph = Some(snapshot(1, 3));
+        let with_tasks = overflow_commit_count(&app, 40, 10);
+        assert!(with_tasks > without_tasks);
+        assert_eq!(app.cells, cells);
+        assert_eq!(app.task_graph.as_ref().unwrap().tasks.len(), 3);
     }
 
     #[tokio::test]

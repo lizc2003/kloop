@@ -1490,30 +1490,37 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session task graph (Plans 71–73)
+## Root-owned session task graph (Plans 71–74)
 
-Task V2 is a **session-scoped structured work graph owned by the root/main
-Agent**. Only depth 0 receives or may execute its four native snake_case tools:
+The Task graph is a **session-scoped structured work graph owned by the
+root/main Agent**. Only depth 0 receives or may execute its five native
+snake_case Task tools:
 
 - `task_create {subject, description, blocked_by?}` creates a pending task and
-  returns an opaque stable ID (`"1"`, `"2"`, …).
+  returns an opaque stable ID (`"1"`, `"2"`, …). If the existing non-empty graph
+  is entirely completed and the new task has no dependencies, the same write
+  transaction atomically rolls to a new epoch containing only that task.
 - `task_get {task_id}` returns the full record, including direct `blocked_by`
   dependencies and the computed reverse `blocks` projection.
 - `task_update {task_id, ...patch}` atomically changes subject, description,
   status, or the complete `blocked_by` list.
 - `task_list {}` returns compact records in numeric-ID order; use `task_get`
   for the full description.
+- `task_clear {}` explicitly abandons the graph without clearing conversation
+  history or stopping Agent, Program, Workflow, or Bash work. It preserves the
+  stable-ID high-water mark.
 
 Statuses are `pending | in_progress | completed`. They move only forward:
 `pending` may become in-progress or completed, and in-progress may complete;
 completed tasks cannot reopen. A task cannot enter a non-pending state until
 all blockers are completed. Missing dependencies, self-dependencies, duplicate
-edges, and cycles fail atomically without consuming an ID or partially changing
-the graph. Completed tasks remain addressable; the first slice has no delete,
-filters, pagination, metadata, or active-form field.
+edges, cycles, invalid text, and failed rollover/clear validation fail atomically
+without consuming an ID or partially changing the graph. Completed tasks remain
+addressable until rollover or clear; there is no single-task delete, filter,
+pagination, metadata, or active-form field.
 
 The registry is an `Arc<TaskRegistry>` on `Config`. Child Configs retain the Arc
-as an internal session service, but their depth>0 catalogs omit all four tools
+as an internal session service, but their depth>0 catalogs omit all five tools
 and the dispatcher rejects stale or forged calls before allowlists, hooks,
 permissions, or registry handlers. Foreground children return through their
 `run_agent` tool result; background children return through `SubAgentResult` in
@@ -1522,20 +1529,24 @@ to call `task_update`. There is no per-child task list, assignment/owner field,
 Team claim, or task-to-execution binding.
 
 Independent CLI sessions/native server threads and a resumed process get fresh
-empty registries. The graph is not written to rollout or reconstructed from
-history. `/clear` empties it but keeps the live registry's ID high-water mark so
-stale model context or late child results cannot make an old ID refer to new
-work. The registry is bounded to 256 tasks, 256 blockers per task,
-200-character single-line subjects and 8 KiB descriptions.
+empty registries. An in-process TUI fork keeps the same live registry; the graph
+is not written to rollout or reconstructed from history. Every panel-visible
+mutation publishes a revisioned canonical full snapshot. `/clear` preserves the
+ID high-water mark, unconditionally advances the graph revision, and hands the
+TUI its exact empty snapshot as a reset fence against late older events. The
+registry is bounded to 256 tasks, 256 blockers per task, 200-character
+single-line subjects, and 8 KiB descriptions.
 
-Root Task calls use the ordinary `toolCall` event/wire lifecycle; there is no
-task board item or special frontend state. The permission gate auto-allows
-these session-memory operations (including in plan mode), while dispatcher
-classification keeps create/update serial and get/list concurrency-safe.
-Program/Workflow JavaScript cannot call Task V2 directly, and real child Agents
-they launch are depth>0 and likewise have no Task capability. `todo_write` and
-its checklist UI/wire path were removed rather than retained as a second,
-drifting task model.
+Task calls still use the ordinary `toolCall` lifecycle. A successful
+panel-visible mutation additionally emits internal `TaskGraphUpdated`; only the
+TUI projects it as a read-only live graph immediately above the composer.
+`Ctrl+T` toggles that projection without mutating the registry. Plain mode prints
+no checklist, and server/headless add no Task notification, native item, or
+public wire. The permission gate auto-allows these session-memory operations
+(including in plan mode); create/update/clear are serial and get/list are
+concurrency-safe. Program/Workflow JavaScript and real child Agents cannot call
+these tools. `todo_write` and its old checklist/wire path remain deleted rather
+than forming a second writable task model.
 
 ## Steering — mid-turn injection (Phase 2, fifteenth slice)
 
@@ -1979,10 +1990,11 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
   Code `Agent` requires both `description` and `prompt` and defaults to background
   unless `run_in_background:false` is explicit.
-- kloop exposes the native snake_case `task_create/get/update/list` graph above
-  only to the depth-0 root Agent, not as PascalCase Claude Code adapters or a
-  child/Team collaboration surface. Child completion is an execution result;
-  root explicitly advances graph state. There are no `TaskOutput`/`TaskStop`
+- kloop exposes the native snake_case `task_create/get/update/list/clear` graph
+  above only to the depth-0 root Agent, not as PascalCase Claude Code adapters
+  or a child/Team collaboration surface. Child completion is an execution
+  result; root explicitly advances graph state. The TUI-only internal snapshot
+  projection is not a public Task wire. There are no `TaskOutput`/`TaskStop`
   aliases: those names belong to execution resources in Claude Code, while
   kloop keeps graph state separate from Agent/Program/Workflow/Shell lifecycle.
 - `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
@@ -2000,10 +2012,16 @@ dispatcher tests separately lock all twelve cross-resource stop combinations,
 the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 added
 Task V2 and removed the old checklist; Plan 72 supersedes only its child-sharing
 contract by making the session graph root-owned and child execution result-only.
-See `docs/plan/52-agent-task-team-parity.md`,
+Plan 74 extends the current native graph to five tools and locks strict clear,
+atomic rollover, ID high-water, revisioned full-snapshot ordering, ordinary
+ToolCall rows, and the absence of public Task wire without changing any pinned
+Claude Code raw/normalized fixture. See
+`docs/plan/52-agent-task-team-parity.md`,
 `docs/plan/66-background-tool-naming.md`,
-`docs/plan/71-task-v2-session-graph.md`, and
-`docs/plan/72-task-v2-root-owned-session-graph.md`.
+`docs/plan/71-task-v2-session-graph.md`,
+`docs/plan/72-task-v2-root-owned-session-graph.md`,
+`docs/plan/73-task-v2-remove-owner.md`, and
+`docs/plan/74-task-graph-tui.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

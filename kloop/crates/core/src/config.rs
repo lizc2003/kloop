@@ -352,7 +352,7 @@ pub struct Config {
     /// carry over.
     pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashMap<String, u64>>>,
     /// Root-owned, session-scoped structured task graph. Child Configs retain
-    /// this Arc as an internal session service, but depth gates keep Task V2 out
+    /// this Arc as an internal session service, but depth gates keep Task tools out
     /// of child catalogs and reject forged child calls. It is process state,
     /// not history or durable storage: a fresh Config (including resume) starts
     /// with an empty graph.

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::history::History;
+use crate::tools::TaskGraphSnapshot;
 
 mod clear;
 mod compact;
@@ -39,6 +40,7 @@ pub struct SlashResult {
     /// a skill invoked as `/name args` expands to a prompt to act on, unlike
     /// the built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
+    pub task_graph: Option<TaskGraphSnapshot>,
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
@@ -53,16 +55,18 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
+            task_graph: None,
             quit: false,
         }
     }
 
     /// `/clear`: text plus a transcript reset.
-    fn cleared_message(output: impl Into<String>) -> Self {
+    fn cleared_message(output: impl Into<String>, task_graph: TaskGraphSnapshot) -> Self {
         Self {
             output: output.into(),
             cleared: true,
             run_turn: None,
+            task_graph: Some(task_graph),
             quit: false,
         }
     }
@@ -73,6 +77,7 @@ impl SlashResult {
             output: String::new(),
             cleared: false,
             run_turn: Some(prompt),
+            task_graph: None,
             quit: false,
         }
     }
@@ -83,6 +88,7 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
+            task_graph: None,
             quit: true,
         }
     }
@@ -319,7 +325,16 @@ mod tests {
             .push(crate::inbox::InboxItem::Steer("stale steer".into()));
 
         let result = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
-        assert_eq!(result, SlashResult::cleared_message("conversation cleared"));
+        assert_eq!(
+            result,
+            SlashResult::cleared_message(
+                "conversation cleared",
+                TaskGraphSnapshot {
+                    revision: 2,
+                    tasks: Vec::new(),
+                },
+            )
+        );
         assert!(history.messages().is_empty());
         let (tasks, is_error) =
             crate::tools::testutil::run_tool("task_list", serde_json::json!({}), &task_ctx).await;

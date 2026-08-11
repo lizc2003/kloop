@@ -12,6 +12,7 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::ToolCtx;
+use crate::event::Event;
 
 const MAX_TASKS: usize = 256;
 const MAX_SUBJECT_CHARS: usize = 200;
@@ -67,16 +68,23 @@ pub struct TaskView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct TaskSummary {
-    id: String,
-    subject: String,
-    status: TaskStatus,
-    blocked_by: Vec<String>,
-    blocks: Vec<String>,
+pub struct TaskGraphTask {
+    pub id: String,
+    pub subject: String,
+    pub status: TaskStatus,
+    pub blocked_by: Vec<String>,
+    pub blocks: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TaskGraphSnapshot {
+    pub revision: u64,
+    pub tasks: Vec<TaskGraphTask>,
 }
 
 struct TaskRegistryState {
     next_id: u64,
+    revision: u64,
     tasks: BTreeMap<u64, StoredTask>,
 }
 
@@ -84,6 +92,7 @@ impl Default for TaskRegistryState {
     fn default() -> Self {
         Self {
             next_id: 1,
+            revision: 0,
             tasks: BTreeMap::new(),
         }
     }
@@ -95,10 +104,16 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
-    fn create(&self, input: TaskCreateInput) -> Result<TaskView> {
+    fn create(&self, input: TaskCreateInput) -> Result<(TaskView, TaskGraphSnapshot)> {
         validate_task_text(&input.subject, &input.description, "task_create")?;
         let mut state = self.state.write().unwrap();
-        if state.tasks.len() >= MAX_TASKS {
+        let rollover = !state.tasks.is_empty()
+            && input.blocked_by.is_empty()
+            && state
+                .tasks
+                .values()
+                .all(|task| task.status == TaskStatus::Completed);
+        if !rollover && state.tasks.len() >= MAX_TASKS {
             bail!("task_create: task limit of {MAX_TASKS} reached");
         }
         let id = state.next_id;
@@ -106,6 +121,7 @@ impl TaskRegistry {
             .checked_add(1)
             .ok_or_else(|| anyhow!("task_create: task id space exhausted"))?;
         validate_dependencies(&state.tasks, id, &input.blocked_by, "task_create")?;
+        let revision = next_revision(state.revision, "task_create")?;
         let task = StoredTask {
             id,
             subject: input.subject,
@@ -113,9 +129,14 @@ impl TaskRegistry {
             status: TaskStatus::Pending,
             blocked_by: input.blocked_by,
         };
+        if rollover {
+            state.tasks.clear();
+        }
         state.tasks.insert(id, task);
         state.next_id = next_id;
-        Ok(task_view(&state.tasks, id).expect("created task exists"))
+        state.revision = revision;
+        let task = task_view(&state.tasks, id).expect("created task exists");
+        Ok((task, task_graph_snapshot(&state)))
     }
 
     fn get(&self, id: u64) -> Result<TaskView> {
@@ -123,7 +144,7 @@ impl TaskRegistry {
         task_view(&state.tasks, id).ok_or_else(|| anyhow!("task_get: task {id} not found"))
     }
 
-    fn update(&self, id: u64, patch: TaskPatch) -> Result<TaskView> {
+    fn update(&self, id: u64, patch: TaskPatch) -> Result<(TaskView, Option<TaskGraphSnapshot>)> {
         let mut state = self.state.write().unwrap();
         let current = state
             .tasks
@@ -158,22 +179,63 @@ impl TaskRegistry {
         }
         validate_blocker_statuses(&state.tasks, &candidate)?;
 
+        if candidate == current {
+            let task = task_view(&state.tasks, id).expect("unchanged task exists");
+            return Ok((task, None));
+        }
+        let display_changed = candidate.subject != current.subject
+            || candidate.status != current.status
+            || candidate.blocked_by != current.blocked_by;
+        let revision = display_changed
+            .then(|| next_revision(state.revision, "task_update"))
+            .transpose()?;
         state.tasks.insert(id, candidate);
-        Ok(task_view(&state.tasks, id).expect("updated task exists"))
+        if let Some(revision) = revision {
+            state.revision = revision;
+        }
+        let task = task_view(&state.tasks, id).expect("updated task exists");
+        let snapshot = display_changed.then(|| task_graph_snapshot(&state));
+        Ok((task, snapshot))
     }
 
-    fn list(&self) -> Vec<TaskSummary> {
+    fn list(&self) -> Vec<TaskGraphTask> {
         let state = self.state.read().unwrap();
-        state
-            .tasks
-            .keys()
-            .map(|id| task_summary(&state.tasks, *id).expect("listed task exists"))
-            .collect()
+        task_graph_tasks(&state.tasks)
     }
 
-    pub fn clear(&self) {
-        self.state.write().unwrap().tasks.clear();
+    pub fn snapshot(&self) -> TaskGraphSnapshot {
+        let state = self.state.read().unwrap();
+        task_graph_snapshot(&state)
     }
+
+    pub fn clear(&self) -> Result<(usize, TaskGraphSnapshot)> {
+        let mut state = self.state.write().unwrap();
+        let revision = next_revision(state.revision, "task_clear")?;
+        let cleared_count = state.tasks.len();
+        state.tasks.clear();
+        state.revision = revision;
+        Ok((cleared_count, task_graph_snapshot(&state)))
+    }
+}
+
+fn next_revision(revision: u64, tool: &str) -> Result<u64> {
+    revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("{tool}: task graph revision exhausted"))
+}
+
+fn task_graph_snapshot(state: &TaskRegistryState) -> TaskGraphSnapshot {
+    TaskGraphSnapshot {
+        revision: state.revision,
+        tasks: task_graph_tasks(&state.tasks),
+    }
+}
+
+fn task_graph_tasks(tasks: &BTreeMap<u64, StoredTask>) -> Vec<TaskGraphTask> {
+    tasks
+        .keys()
+        .map(|id| task_graph_task(tasks, *id).expect("listed task exists"))
+        .collect()
 }
 
 fn validate_task_text(subject: &str, description: &str, tool: &str) -> Result<()> {
@@ -284,9 +346,9 @@ fn task_view(tasks: &BTreeMap<u64, StoredTask>, id: u64) -> Option<TaskView> {
     })
 }
 
-fn task_summary(tasks: &BTreeMap<u64, StoredTask>, id: u64) -> Option<TaskSummary> {
+fn task_graph_task(tasks: &BTreeMap<u64, StoredTask>, id: u64) -> Option<TaskGraphTask> {
     let task = tasks.get(&id)?;
-    Some(TaskSummary {
+    Some(TaskGraphTask {
         id: task.id.to_string(),
         subject: task.subject.clone(),
         status: task.status,
@@ -328,7 +390,7 @@ struct TaskPatch {
     blocked_by: Option<Vec<u64>>,
 }
 
-pub(super) fn tool_defs() -> [ToolDef; 4] {
+pub(super) fn tool_defs() -> [ToolDef; 5] {
     [
         ToolDef {
             name: "task_create".into(),
@@ -379,12 +441,22 @@ pub(super) fn tool_defs() -> [ToolDef; 4] {
                 "additionalProperties": false
             }),
         },
+        ToolDef {
+            name: "task_clear".into(),
+            description: "Clear every task from this live session's root-owned task graph and start a new task epoch. Keeps the stable task ID high-water mark and does not clear the conversation or stop any Agent, Program, Workflow, or Bash execution. Use only when the root agent is explicitly abandoning or replacing an unfinished graph.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
 pub(super) fn task_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let parsed = parse_create(input)?;
-    let task = ctx.cfg.tasks.create(parsed)?;
+    let (task, snapshot) = ctx.cfg.tasks.create(parsed)?;
+    ctx.ui.emit(&Event::TaskGraphUpdated(snapshot));
     Ok(json!({"task": task}).to_string())
 }
 
@@ -397,13 +469,23 @@ pub(super) fn task_get_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub(super) fn task_update_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let (id, patch) = parse_update(input)?;
-    let task = ctx.cfg.tasks.update(id, patch)?;
+    let (task, snapshot) = ctx.cfg.tasks.update(id, patch)?;
+    if let Some(snapshot) = snapshot {
+        ctx.ui.emit(&Event::TaskGraphUpdated(snapshot));
+    }
     Ok(json!({"task": task}).to_string())
 }
 
 pub(super) fn task_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     strict_object(input, &[], "task_list")?;
     Ok(json!({"tasks": ctx.cfg.tasks.list()}).to_string())
+}
+
+pub(super) fn task_clear_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    strict_object(input, &[], "task_clear")?;
+    let (cleared_count, snapshot) = ctx.cfg.tasks.clear()?;
+    ctx.ui.emit(&Event::TaskGraphUpdated(snapshot.clone()));
+    Ok(json!({"cleared_count": cleared_count, "graph": snapshot}).to_string())
 }
 
 fn parse_create(input: &Value) -> Result<TaskCreateInput> {
@@ -537,8 +619,29 @@ fn bounded_diagnostic(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Ui;
+    use crate::event::Item;
+    use crate::tools::background_executions::ExecutionKind;
+    use crate::tools::background_executions::ExecutionStatus;
     use crate::tools::testutil::run_tool;
     use crate::tools::testutil::test_ctx;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingUi(Mutex<Vec<Event>>);
+
+    impl Ui for RecordingUi {
+        fn emit(&self, event: &Event) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    impl RecordingUi {
+        fn take(&self) -> Vec<Event> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
 
     async fn create(ctx: &ToolCtx, subject: &str, blocked_by: &[&str]) -> Value {
         let (output, is_error) = run_tool(
@@ -730,7 +833,7 @@ mod tests {
         .await;
         assert!(is_error, "{output}");
         assert_eq!(create(&ctx, "First", &[]).await["task"]["id"], "1");
-        ctx.cfg.tasks.clear();
+        ctx.cfg.tasks.clear().unwrap();
         assert_eq!(create(&ctx, "Second", &[]).await["task"]["id"], "2");
     }
 
@@ -788,6 +891,7 @@ mod tests {
             ("task_update", json!({"task_id":"1","status":null})),
             ("task_update", json!({"task_id":"1","blocked_by":null})),
             ("task_list", json!({"status":"pending"})),
+            ("task_clear", json!("not an object")),
         ] {
             let (output, is_error) = run_tool(name, input, &ctx).await;
             assert!(is_error, "{name}: {output}");
@@ -868,6 +972,7 @@ mod tests {
                             blocked_by: Vec::new(),
                         })
                         .unwrap()
+                        .0
                         .id
                         .parse::<u64>()
                         .unwrap()
@@ -892,6 +997,7 @@ mod tests {
                     blocked_by: Vec::new(),
                 })
                 .unwrap()
+                .0
                 .id,
             "1"
         );
@@ -933,6 +1039,461 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_revision_and_epoch_rollover_are_atomic() {
+        fn input(subject: &str, blocked_by: Vec<u64>) -> TaskCreateInput {
+            TaskCreateInput {
+                subject: subject.into(),
+                description: format!("Description for {subject}"),
+                blocked_by,
+            }
+        }
+        fn patch_status(status: TaskStatus) -> TaskPatch {
+            TaskPatch {
+                subject: None,
+                description: None,
+                status: Some(status),
+                blocked_by: None,
+            }
+        }
+
+        let registry = TaskRegistry::default();
+        assert_eq!(
+            registry.snapshot(),
+            TaskGraphSnapshot {
+                revision: 0,
+                tasks: Vec::new(),
+            }
+        );
+        let (_, created) = registry.create(input("First", Vec::new())).unwrap();
+        assert_eq!(created.revision, 1);
+        assert_eq!(created.tasks[0].id, "1");
+
+        let (description_only, snapshot) = registry
+            .update(
+                1,
+                TaskPatch {
+                    subject: None,
+                    description: Some("New private description".into()),
+                    status: None,
+                    blocked_by: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(description_only.description, "New private description");
+        assert_eq!(snapshot, None);
+        assert_eq!(registry.snapshot().revision, 1);
+
+        let (_, visible) = registry
+            .update(
+                1,
+                TaskPatch {
+                    subject: Some("Renamed".into()),
+                    description: None,
+                    status: None,
+                    blocked_by: None,
+                },
+            )
+            .unwrap();
+        let visible = visible.unwrap();
+        assert_eq!(visible.revision, 2);
+        assert_eq!(visible.tasks[0].subject, "Renamed");
+
+        let (cleared_count, cleared) = registry.clear().unwrap();
+        assert_eq!(cleared_count, 1);
+        assert_eq!(cleared.revision, 3);
+        assert!(cleared.tasks.is_empty());
+        let (cleared_count, repeated) = registry.clear().unwrap();
+        assert_eq!(cleared_count, 0);
+        assert_eq!(repeated.revision, 4);
+        let (task, after_clear) = registry.create(input("After clear", Vec::new())).unwrap();
+        assert_eq!(task.id, "2");
+        assert_eq!(after_clear.revision, 5);
+
+        let rollover = TaskRegistry::default();
+        rollover.create(input("Old", Vec::new())).unwrap();
+        rollover
+            .update(1, patch_status(TaskStatus::Completed))
+            .unwrap();
+        let (new_task, snapshot) = rollover.create(input("New epoch", Vec::new())).unwrap();
+        assert_eq!(new_task.id, "2");
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2"]
+        );
+
+        let dependent = TaskRegistry::default();
+        dependent.create(input("Old", Vec::new())).unwrap();
+        dependent
+            .update(1, patch_status(TaskStatus::Completed))
+            .unwrap();
+        let (_, snapshot) = dependent.create(input("Same graph", vec![1])).unwrap();
+        assert_eq!(
+            snapshot,
+            TaskGraphSnapshot {
+                revision: 3,
+                tasks: vec![
+                    TaskGraphTask {
+                        id: "1".into(),
+                        subject: "Old".into(),
+                        status: TaskStatus::Completed,
+                        blocked_by: Vec::new(),
+                        blocks: vec!["2".into()],
+                    },
+                    TaskGraphTask {
+                        id: "2".into(),
+                        subject: "Same graph".into(),
+                        status: TaskStatus::Pending,
+                        blocked_by: vec!["1".into()],
+                        blocks: Vec::new(),
+                    },
+                ],
+            }
+        );
+        dependent
+            .create(input("Replacement blocker", Vec::new()))
+            .unwrap();
+        let (_, snapshot) = dependent
+            .update(
+                2,
+                TaskPatch {
+                    subject: None,
+                    description: None,
+                    status: None,
+                    blocked_by: Some(vec![3]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot.unwrap(),
+            TaskGraphSnapshot {
+                revision: 5,
+                tasks: vec![
+                    TaskGraphTask {
+                        id: "1".into(),
+                        subject: "Old".into(),
+                        status: TaskStatus::Completed,
+                        blocked_by: Vec::new(),
+                        blocks: Vec::new(),
+                    },
+                    TaskGraphTask {
+                        id: "2".into(),
+                        subject: "Same graph".into(),
+                        status: TaskStatus::Pending,
+                        blocked_by: vec!["3".into()],
+                        blocks: Vec::new(),
+                    },
+                    TaskGraphTask {
+                        id: "3".into(),
+                        subject: "Replacement blocker".into(),
+                        status: TaskStatus::Pending,
+                        blocked_by: Vec::new(),
+                        blocks: vec!["2".into()],
+                    },
+                ],
+            }
+        );
+
+        let unfinished = TaskRegistry::default();
+        unfinished
+            .create(input("Still pending", Vec::new()))
+            .unwrap();
+        let (_, snapshot) = unfinished
+            .create(input("Also pending", Vec::new()))
+            .unwrap();
+        assert_eq!(snapshot.tasks.len(), 2);
+
+        let failed = TaskRegistry::default();
+        failed.create(input("Completed", Vec::new())).unwrap();
+        failed
+            .update(1, patch_status(TaskStatus::Completed))
+            .unwrap();
+        let before = failed.snapshot();
+        assert!(failed.create(input("Invalid", vec![99])).is_err());
+        assert_eq!(failed.snapshot(), before);
+        let (task, snapshot) = failed.create(input("Valid new epoch", Vec::new())).unwrap();
+        assert_eq!(task.id, "2");
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].id, "2");
+    }
+
+    #[test]
+    fn id_and_revision_overflow_fail_before_mutation() {
+        let input = |subject: &str| TaskCreateInput {
+            subject: subject.into(),
+            description: "overflow probe".into(),
+            blocked_by: Vec::new(),
+        };
+        let registry = TaskRegistry::default();
+        registry.create(input("Existing")).unwrap();
+
+        registry.state.write().unwrap().next_id = u64::MAX;
+        let before = registry.snapshot();
+        assert!(registry.create(input("ID overflow")).is_err());
+        assert_eq!(registry.snapshot(), before);
+        assert_eq!(registry.state.read().unwrap().next_id, u64::MAX);
+
+        {
+            let mut state = registry.state.write().unwrap();
+            state.next_id = 2;
+            state.revision = u64::MAX;
+        }
+        let before = registry.snapshot();
+        let next_id = registry.state.read().unwrap().next_id;
+        assert!(registry.create(input("Revision overflow")).is_err());
+        assert_eq!(registry.snapshot(), before);
+        assert_eq!(registry.state.read().unwrap().next_id, next_id);
+
+        assert!(registry
+            .update(
+                1,
+                TaskPatch {
+                    subject: Some("Visible revision overflow".into()),
+                    description: None,
+                    status: None,
+                    blocked_by: None,
+                },
+            )
+            .is_err());
+        assert_eq!(registry.snapshot(), before);
+        assert_eq!(registry.state.read().unwrap().next_id, next_id);
+
+        assert!(registry.clear().is_err());
+        assert_eq!(registry.snapshot(), before);
+        assert_eq!(registry.state.read().unwrap().next_id, next_id);
+    }
+
+    #[tokio::test]
+    async fn mutations_emit_full_snapshots_inside_ordinary_tool_lifecycle() {
+        let ui = Arc::new(RecordingUi::default());
+        let mut ctx = test_ctx(0, "task-events");
+        ctx.ui = ui.clone();
+
+        let (output, is_error) = run_tool(
+            "task_create",
+            json!({"subject":"Visible","description":"Private"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        let events = ui.take();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            Event::ItemStarted {
+                item: Item::ToolCall { name, .. },
+                ..
+            } if name == "task_create"
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::TaskGraphUpdated(snapshot)
+                if snapshot.revision == 1 && snapshot.tasks.len() == 1
+        ));
+        assert!(matches!(
+            &events[2],
+            Event::ItemCompleted {
+                item: Item::ToolCall { name, .. },
+                ..
+            } if name == "task_create"
+        ));
+
+        for input in [
+            json!({"task_id":"1","description":"Changed privately"}),
+            json!({"task_id":"1","description":"Changed privately"}),
+        ] {
+            let (output, is_error) = run_tool("task_update", input, &ctx).await;
+            assert!(!is_error, "{output}");
+            let events = ui.take();
+            assert_eq!(events.len(), 2);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+        }
+
+        let (output, is_error) = run_tool(
+            "task_update",
+            json!({"task_id":"1","subject":"Visible rename"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        let events = ui.take();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[1],
+            Event::TaskGraphUpdated(snapshot)
+                if snapshot.revision == 2 && snapshot.tasks[0].subject == "Visible rename"
+        ));
+
+        let before_failures = ctx.cfg.tasks.snapshot();
+        let next_id = ctx.cfg.tasks.state.read().unwrap().next_id;
+        for (name, input) in [
+            (
+                "task_create",
+                json!({
+                    "subject":"Invalid create",
+                    "description":"must not commit",
+                    "blocked_by":["99"]
+                }),
+            ),
+            (
+                "task_update",
+                json!({
+                    "task_id":"1",
+                    "subject":"Invalid candidate",
+                    "blocked_by":["99"]
+                }),
+            ),
+        ] {
+            let (output, is_error) = run_tool(name, input, &ctx).await;
+            assert!(is_error, "{name}: {output}");
+            assert_eq!(ctx.cfg.tasks.snapshot(), before_failures);
+            assert_eq!(ctx.cfg.tasks.state.read().unwrap().next_id, next_id);
+            let events = ui.take();
+            assert_eq!(events.len(), 2);
+            assert!(matches!(
+                &events[..],
+                [
+                    Event::ItemStarted {
+                        item: Item::ToolCall { name: started, .. },
+                        ..
+                    },
+                    Event::ItemCompleted {
+                        item: Item::ToolCall {
+                            name: completed,
+                            status: crate::event::ItemStatus::Failed,
+                            ..
+                        },
+                        ..
+                    }
+                ] if started == name && completed == name
+            ));
+        }
+
+        for (name, input) in [
+            ("task_get", json!({"task_id":"1"})),
+            ("task_list", json!({})),
+        ] {
+            let (output, is_error) = run_tool(name, input, &ctx).await;
+            assert!(!is_error, "{output}");
+            let events = ui.take();
+            assert_eq!(events.len(), 2);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+        }
+
+        let nonempty_before = ctx.cfg.tasks.snapshot();
+        assert_eq!(nonempty_before.tasks.len(), 1);
+        let next_id = ctx.cfg.tasks.state.read().unwrap().next_id;
+        for input in [json!({"unexpected":true}), json!("not an object")] {
+            let (output, is_error) = run_tool("task_clear", input, &ctx).await;
+            assert!(is_error, "{output}");
+            assert_eq!(ctx.cfg.tasks.snapshot(), nonempty_before);
+            assert_eq!(ctx.cfg.tasks.state.read().unwrap().next_id, next_id);
+            let events = ui.take();
+            assert_eq!(events.len(), 2);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+        }
+
+        let (output, is_error) = run_tool("task_clear", json!({}), &ctx).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap(),
+            json!({
+                "cleared_count": 1,
+                "graph": {"revision": 3, "tasks": []},
+            })
+        );
+        let events = ui.take();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[1],
+            Event::TaskGraphUpdated(snapshot)
+                if snapshot.revision == 3 && snapshot.tasks.is_empty()
+        ));
+        assert_eq!(events[1].as_note(), None);
+
+        let before = ctx.cfg.tasks.snapshot();
+        for input in [json!({"unexpected":true}), json!("not an object")] {
+            let (output, is_error) = run_tool("task_clear", input, &ctx).await;
+            assert!(is_error, "{output}");
+            assert_eq!(ctx.cfg.tasks.snapshot(), before);
+            let events = ui.take();
+            assert_eq!(events.len(), 2);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_changes_only_the_task_registry() {
+        let ctx = test_ctx(0, "task-clear-scope");
+        let executions = [
+            (ExecutionKind::Agent, "agent-task-clear"),
+            (ExecutionKind::Program, "program-task-clear"),
+            (ExecutionKind::Workflow, "workflow-task-clear"),
+        ];
+        for (kind, id) in executions {
+            ctx.cfg
+                .background_executions
+                .register(
+                    kind,
+                    id,
+                    "must survive task_clear",
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .unwrap();
+        }
+
+        #[cfg(unix)]
+        let bash_id = {
+            let (output, is_error) = run_tool(
+                "bash",
+                json!({"command":"sleep 30","background":true}),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{output}");
+            output
+                .strip_prefix("Command running in background with ID: ")
+                .and_then(|rest| rest.split('.').next())
+                .expect("background Bash result has an id")
+                .to_string()
+        };
+
+        create(&ctx, "Discarded task", &[]).await;
+        let (output, is_error) = run_tool("task_clear", json!({}), &ctx).await;
+        assert!(!is_error, "{output}");
+        assert!(ctx.cfg.tasks.snapshot().tasks.is_empty());
+        assert_eq!(ctx.cfg.background_executions.running_count(), 3);
+        #[cfg(unix)]
+        assert_eq!(ctx.cfg.background_shells.running_count(), 1);
+
+        #[cfg(unix)]
+        {
+            let (output, is_error) = run_tool("stop_bash", json!({"bash_id":bash_id}), &ctx).await;
+            assert!(!is_error, "{output}");
+        }
+        for (_, id) in executions {
+            assert_eq!(
+                ctx.cfg
+                    .background_executions
+                    .finish(id, ExecutionStatus::Completed, |_, _| {}),
+                Some(ExecutionStatus::Completed)
+            );
+        }
+    }
+
+    #[test]
     fn definitions_are_strict_and_root_only() {
         let defs = tool_defs();
         let task_names = defs
@@ -941,7 +1502,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             task_names,
-            vec!["task_create", "task_get", "task_update", "task_list"]
+            vec![
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
+                "task_clear",
+            ]
         );
         for definition in defs {
             assert_eq!(definition.schema["additionalProperties"], false);
@@ -956,7 +1523,13 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
-            for task_tool in ["task_create", "task_get", "task_update", "task_list"] {
+            for task_tool in [
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
+                "task_clear",
+            ] {
                 assert_eq!(
                     names.iter().any(|name| name == task_tool),
                     depth == 0,

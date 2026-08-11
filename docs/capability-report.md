@@ -279,12 +279,14 @@ kloop `kloop_entrypoint=core-dispatch-test-harness`，不把 core test context �
 回灌按 framing 精确计数，ToolSource 共享 trace 实测 approval-before-dispatch 和 deny 后零调用，
 worktree Git subprocess 不继承用户 Git config；负边界不冒充缺席 transport/process 的执行通过。
 
+Plan 74 只对 kloop native extension 增补当前生成物：不改 218 份 pinned raw/normalized capture，static evidence 为 215 条，matrix 为 63 行/504 cells（24 same / 141 compatible / 177 intentional-diff / 5 missing / 133 unknown / 24 n/a）；新增 `task-clear@clean-cli` 八维 intentional-diff，故当前为 4 个 kloop-only row / 32 cells。7 个 pair 与 108 个 profile bridge 无实质变化。
+
 Plan 59 同时纠正 Plan 53 的过度裁决：AskUserQuestion 为 C/C/C/C/D/C/D/D，EnterPlanMode
 为 C/C/U/C/C/C/D/C，ExitPlanMode 为 C/D/D/C/D/N/C/C，StructuredOutput 为
 D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/type/null/options/unknown-field 负例，report 只按显式 row/dimension mapping 投影。C/D/U/N 分别表示 `compatible`、
 `intentional-diff`、`unknown`、`n/a`，没有新增 `same`。
 
-### 5. 子 agent / 多 agent——✅ 本地执行齐，registry/team 有意保留
+### 5. 子 agent / 多 agent——✅ 本地执行与 Task graph 已落地，Team/remote 有意保留
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
@@ -292,7 +294,7 @@ D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/t
 | session Enter/Exit worktree | CC 单家 + kloop 原生 | **✅ Plan 56（2026-07-31）**：strict name/path、显式 keep/remove/discard、effective cwd 全链切换 | 已完成 |
 | ownership/provenance-safe removal | 安全产品边界 | **✅ Plan 56**：仅当前 session Managed 可删，External/task/previous-session 与 provenance mismatch fail closed | 已完成 |
 | Worktree 条件注册 | 表面策略分歧 | kloop 保留 depth-0 + `SurfaceCapabilities.worktree` gate，matrix 记 `intentional-diff` | 有意保留 |
-| 独立 stable-ID Task registry | CC/CodeWhale 有独立状态层 | **Plan 52 拍板不实现**；todo 与执行 registry 分层保留 | 原生多 agent 共享任务分配成为产品需求时另立计划 |
+| 独立 stable-ID Task graph + TUI projection | CC/CodeWhale 有独立状态层 | **✅ Plan 71–73**：session stable-ID root-owned graph；**✅ Plan 74（2026-08-11）**：五工具、atomic rollover/clear fence 与 TUI live projection | 已完成 |
 | send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **✅ Plan 70（2026-08-10）**：同 session `main ↔ agent-N` 与 sibling，typed local identity、严格有界 FIFO、safe-boundary delivery、独立 lifecycle；A2A 1.0 aligned 但不是 A2A endpoint/support | 已完成 |
 | ListAgents / local live roster | CC exact bundle 有 descriptor/gate；远程/team profile 不权威 | **✅ Plan 70（2026-08-10）**：严格 `list_agents {}` 只列同 directory Open peers；不做 remote discovery、Agent Card 或团队持久态 | 已完成 |
 | Agent 并发上限 | exact 2.1.220 当前 profile 未测出统一 cap | 保留 kloop：同步批并发；后台 agent/program 每 session 8 | native 压测或失控实例证明需排队策略时 |
@@ -363,6 +365,7 @@ codex 拉取式增量观察。
 | slash / `@file` / 历史补全 | 两家皆有 | **✅ Plan 38 切片 4** | 已完成 |
 | `--image`、TUI 图片路径/剪贴板附件 | — | **✅ Plan 29 + Plan 38** | 已完成 |
 | TUI 模式/档位状态栏显示 | 两家皆有 | **✅ Plan 37 + Plan 38 HUD** | 已完成 |
+| Task graph TUI live projection | — | **✅ Plan 74（2026-08-11）**：revisioned full snapshot、composer 上方 non-Cell live chrome、Ctrl+T、blocked hint 与有界折叠；plain/server/headless 无 checklist/native wire | 已完成 |
 | server 不转发 thinking delta | — | HANDOFF 记录在案 | client 需要时 |
 | scheduled prompt 空闲投递 | kloop 原生；CC timed runtime 证据仍有 unknown | **✅ Plan 58（2026-08-03）**：TUI idle Wake、plain stdin/Inbox select、server single-flight 完整 turn；不伪造 `turnId:0` | 已完成 |
 | vim mode / 主题 / statusline | cc 单家 | 不立 | 定位外 |
@@ -388,7 +391,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 
 两家被海量用户长期锤过;kloop 的真 key 验收是每能力单场景闭环。长会话稳定性、大
 repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood**:
-- **Task V2 已销账（Plan 71 + Plan 72 + Plan 73，2026-08-10）**：session-scoped `task_create/get/update/list`、稳定 ID 与强约束 dependency graph 已落地；当前原生契约没有 assignment/owner 字段。图由 depth-0 root Agent 管理，foreground/background child 只回报结果，root 显式更新，`todo_write` 已删除。继续用真实任务 dogfood；下一产品切片回到 PDF 原生分页读取；
+- **Task graph/TUI 已销账（Plan 71–74，2026-08-11）**：session-scoped `task_create/get/update/list/clear`、稳定 ID 与强约束 dependency graph、root-owned/result-only child 边界、atomic rollover 与 clear revision fence、composer 上方 TUI live panel 均已落地；当前原生契约没有 assignment/owner 字段，plain/server/headless 无 Task checklist/public wire，`todo_write` 已删除。继续用真实任务 dogfood；下一产品切片回到 PDF 原生分页读取；
 - 之后每个 plan 的实现会话尽量在 kloop 里跑,痛点直接变本报告新行;
 - 自审(教训 25 的 7 路并行精读)每完成 4–5 个 plan 复跑一轮,盯五类边界(多字节、
   大小写、Drop/Weak、预算耗尽、截断累积)。
@@ -401,7 +404,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 下一产品切片**：`read_file` PDF 原生分页读取仍待实现。session-scoped Task V2 已由 **Plan 71 + Plan 72 + Plan 73（2026-08-10）** 完成：`task_create/get/update/list`、稳定 ID、强依赖图、无 assignment/owner 字段、root-owned/result-only child 边界；旧 `todo_write` 已删除。
+- **T0 下一产品切片**：`read_file` PDF 原生分页读取仍待实现。session-scoped Task graph/TUI 已由 **Plan 71–74（2026-08-11）** 完成：五工具、稳定 ID/DAG、无 owner、root-owned/result-only child 边界、revisioned snapshot、atomic rollover/clear fence 与 TUI-only live panel；旧 `todo_write` 已删除。
 - **T0 架构与 correctness**：Plan 61–66 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，Plan 66 已把后台资源名与 ID 域分开。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。

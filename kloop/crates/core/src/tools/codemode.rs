@@ -95,6 +95,7 @@ fn is_program_callable(name: &str) -> bool {
             | "task_get"
             | "task_update"
             | "task_list"
+            | "task_clear"
     )
 }
 
