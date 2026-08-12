@@ -618,6 +618,7 @@ async fn plain_main(
             break;
         }
         if matches!(input, PlainInput::CtrlC) {
+            println!();
             break;
         }
         if matches!(input, PlainInput::Inbox) {

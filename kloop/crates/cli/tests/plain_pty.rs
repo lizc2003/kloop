@@ -54,6 +54,12 @@ async fn idle_ctrl_c_exits_once_without_advertising_ctrl_d() -> Result<()> {
         status.exit_code(),
         String::from_utf8_lossy(&harness.raw())
     );
+    let raw = harness.raw();
+    assert!(
+        raw.ends_with(b"\r\n"),
+        "raw={}",
+        String::from_utf8_lossy(&raw)
+    );
     assert!(!harness.emergency_killed());
     Ok(())
 }
