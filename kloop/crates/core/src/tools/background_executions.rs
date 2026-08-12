@@ -14,17 +14,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::strict_str_arg;
 use super::ToolCtx;
+use super::strict_str_arg;
 
 /// How many background executions may run at once. A loose cap to catch runaway
 /// fan-out. The parent collects results at step boundaries and may observe activity
@@ -870,10 +870,12 @@ mod tests {
             .unwrap();
         assert_eq!(description, "build the thing");
         assert!(cancel.is_cancelled());
-        assert!(registry
-            .request_stop(ExecutionKind::Agent, "agent-1")
-            .unwrap_err()
-            .contains("already requested"));
+        assert!(
+            registry
+                .request_stop(ExecutionKind::Agent, "agent-1")
+                .unwrap_err()
+                .contains("already requested")
+        );
 
         let delivered = AtomicUsize::new(0);
         assert_eq!(
@@ -914,10 +916,12 @@ mod tests {
             None
         );
         assert_eq!(deliveries.load(Ordering::SeqCst), 1);
-        assert!(registry
-            .request_stop(ExecutionKind::Agent, "agent-1")
-            .unwrap_err()
-            .contains("completed"));
+        assert!(
+            registry
+                .request_stop(ExecutionKind::Agent, "agent-1")
+                .unwrap_err()
+                .contains("completed")
+        );
     }
 
     #[tokio::test]

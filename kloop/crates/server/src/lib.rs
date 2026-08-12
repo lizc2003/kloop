@@ -14,27 +14,27 @@
 mod events;
 mod wire;
 
+pub use wire::PROTOCOL_VERSION;
+pub use wire::RequestId;
 pub use wire::project_event;
 pub use wire::turn_completed_params;
 pub use wire::turn_started_params;
-pub use wire::RequestId;
-pub use wire::PROTOCOL_VERSION;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use anyhow::Context as _;
 use anyhow::Result;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -44,9 +44,10 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use kloop_core::agent::run_turn;
+use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::agent::run_turn;
 use kloop_core::commands;
 use kloop_core::event::Event;
 use kloop_core::history::History;
@@ -65,7 +66,6 @@ use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::rollout::TurnTerminal;
-use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
@@ -310,12 +310,14 @@ where
     // Input closed: cancel in-flight turns so workers wind down, then drop
     // our sender so the writer drains and exits once every worker is gone.
     for handle in server.threads.values() {
-        if let Some(cancel) = handle.current_cancel.lock().unwrap().take() {
+        let mut current_cancel = handle.current_cancel.lock().unwrap();
+        if let Some(cancel) = current_cancel.take() {
             cancel.cancel();
         }
     }
     server.pending.lock().unwrap().clear();
     drop(server);
+
     writer.await.context("writer task panicked")?
 }
 
@@ -435,7 +437,7 @@ impl Server {
                     id: None,
                     code: wire::PARSE_ERROR,
                     message: format!("unparseable line: {e}"),
-                })
+                });
             }
         };
         match (incoming.method, incoming.id) {
@@ -724,7 +726,7 @@ impl Server {
                 return Err((
                     wire::INVALID_PARAMS,
                     "'cursor' must be a string".to_string(),
-                ))
+                ));
             }
         };
         let paths: Vec<PathBuf> = rollout::sessions_by_recency(&self.paths.sessions_dir)
@@ -842,7 +844,7 @@ impl Server {
                 return Err((
                     wire::INVALID_PARAMS,
                     "'forceReload' must be a boolean".into(),
-                ))
+                ));
             }
         }
         let (cwd, _) = self.read_scope(params)?;
@@ -1149,7 +1151,7 @@ fn resolve_cwd(value: Option<&Value>, default_cwd: &Path) -> Result<PathBuf, (i6
             })?
         }
         Some(Value::String(_)) => {
-            return Err((wire::INVALID_PARAMS, "'cwd' must not be empty".into()))
+            return Err((wire::INVALID_PARAMS, "'cwd' must not be empty".into()));
         }
         Some(_) => return Err((wire::INVALID_PARAMS, "'cwd' must be a string".into())),
     };
@@ -1238,7 +1240,7 @@ fn parse_thread_start_options(
         None | Some(Value::Null) => None,
         Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
         Some(Value::String(_)) => {
-            return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()))
+            return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()));
         }
         Some(_) => return Err((wire::INVALID_PARAMS, "'model' must be a string".into())),
     };
@@ -1351,7 +1353,8 @@ async fn thread_worker(
             "{remaining} background task(s) missed the shutdown deadline"
         )));
     }
-    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+    let active_worktree = kloop_core::worktree::finish_active(&cfg).await;
+    if let Some(note) = active_worktree {
         ui.emit(&Event::Note(note.trim().to_string()));
     }
 }
@@ -1434,9 +1437,8 @@ async fn run_turn_or_command(
     };
     history.record(msg);
     let dyn_ui: Arc<dyn Ui> = ui.clone();
-    run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
-        .await
-        .reason
+    let reason = run_turn(cfg, history, &dyn_ui, &turn.cancel, 0).await;
+    reason.reason
 }
 
 /// Per-thread `Ui` + `Approver`: events become thread-tagged notifications,
@@ -1557,8 +1559,8 @@ impl Approver for ThreadUi {
             if !sent {
                 return Decision::Deny;
             }
-            // Dropped sender (input closed, server shutting down) = deny.
-            rx.await.unwrap_or(Decision::Deny)
+            let decision = rx.await;
+            decision.unwrap_or(Decision::Deny)
         })
     }
 }
@@ -1623,11 +1625,11 @@ impl Questioner for ThreadUi {
                     QuestionOutcome::Answered(_) => {
                         return QuestionOutcome::Unavailable(
                             "question response contained the wrong answer count".into(),
-                        )
+                        );
                     }
                     QuestionOutcome::Cancelled => return QuestionOutcome::Cancelled,
                     QuestionOutcome::Unavailable(error) => {
-                        return QuestionOutcome::Unavailable(error)
+                        return QuestionOutcome::Unavailable(error);
                     }
                 }
             }

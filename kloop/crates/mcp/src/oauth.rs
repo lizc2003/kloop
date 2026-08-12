@@ -12,24 +12,24 @@
 //! "small crate, not a framework" line the SSE parser and HTML→text follow.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::anyhow;
+use anyhow::bail;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::io::AsyncReadExt;
@@ -169,16 +169,14 @@ async fn discover_prm_url(http: &reqwest::Client, server_url: &str) -> Result<St
         .header(ACCEPT, "application/json")
         .send()
         .await;
-    if let Ok(resp) = resp {
-        if let Some(header) = resp
+    if let Ok(resp) = resp
+        && let Some(header) = resp
             .headers()
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
-        {
-            if let Some(url) = parse_resource_metadata(header) {
-                return Ok(url);
-            }
-        }
+        && let Some(url) = parse_resource_metadata(header)
+    {
+        return Ok(url);
     }
     let origin = origin_of(server_url)?;
     Ok(format!("{origin}/.well-known/oauth-protected-resource"))
@@ -224,12 +222,12 @@ async fn fetch_prm(http: &reqwest::Client, prm_url: &str) -> Result<(String, Opt
 async fn fetch_as_metadata(http: &reqwest::Client, issuer: &str) -> Result<AuthServerMetadata> {
     let mut last_err = None;
     for candidate in as_metadata_candidates(issuer)? {
-        match http
+        let response = http
             .get(&candidate)
             .header(ACCEPT, "application/json")
             .send()
-            .await
-        {
+            .await;
+        match response {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(doc) => {
                     if let Some(meta) = parse_as_metadata(&doc) {
@@ -680,6 +678,7 @@ impl OAuthSession {
         if self.token.lock().unwrap().access_token != stale {
             return Ok(());
         }
+
         self.do_refresh().await
     }
 
@@ -728,12 +727,12 @@ impl OAuthSession {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use wiremock::matchers::body_string_contains;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_string_contains;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     #[test]
     fn parse_resource_metadata_handles_quoted_bare_and_absent() {

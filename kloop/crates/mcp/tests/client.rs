@@ -2,8 +2,8 @@
 //! speaks scripted newline-delimited JSON-RPC, and every assertion is on the
 //! exact JSON the client put on (or accepted from) the wire.
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;

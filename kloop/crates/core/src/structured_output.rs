@@ -1,7 +1,7 @@
 //! Internal schema-specialized turn support used only by Workflow child agents.
 
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::anyhow;
 use serde_json::Value;
 
 use kloop_protocol::ToolDef;
@@ -72,7 +72,8 @@ pub(crate) fn validate_value(schema: &Value, value: &Value) -> Result<(), String
     }
     let validator = jsonschema::validator_for(schema)
         .map_err(|error| format!("invalid structured output schema: {error}"))?;
-    match validator.validate(value) {
+    let validation = validator.validate(value);
+    match validation {
         Ok(()) => Ok(()),
         Err(error) => {
             let raw = error.to_string();

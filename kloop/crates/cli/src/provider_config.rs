@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use toml::Value;
 use url::Url;
 
@@ -261,10 +261,11 @@ fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
             profiles.insert(name.clone(), parse_profile(name, spec)?);
         }
     }
-    if let Some(selected) = &model_provider {
-        if !profiles.contains_key(selected) && infer_builtin_rail(selected).is_none() {
-            bail!("model_provider '{selected}' has no matching model_providers profile");
-        }
+    if let Some(selected) = &model_provider
+        && !profiles.contains_key(selected)
+        && infer_builtin_rail(selected).is_none()
+    {
+        bail!("model_provider '{selected}' has no matching model_providers profile");
     }
     Ok(GlobalFile {
         model,
@@ -373,12 +374,11 @@ fn parse_headers(
             bail!("model_providers.{name}.http_headers contains a duplicate header");
         }
     }
-    if wire != Rail::Anthropic {
-        if let Some(value) = headers.get("authorization") {
-            if bearer_from_header(value).is_none() {
-                bail!("model_providers.{name}.http_headers.Authorization must use Bearer authentication");
-            }
-        }
+    if wire != Rail::Anthropic
+        && let Some(value) = headers.get("authorization")
+        && bearer_from_header(value).is_none()
+    {
+        bail!("model_providers.{name}.http_headers.Authorization must use Bearer authentication");
     }
     Ok(headers)
 }
@@ -646,11 +646,13 @@ model_provider = "custom"
 [model_providers.custom]
 http_headers = { Authorization = "Bearer key" }
 "#;
-        assert!(resolve(Some(no_wire), &env(&[]))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("wire_api"));
+        assert!(
+            resolve(Some(no_wire), &env(&[]))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("wire_api")
+        );
 
         for base in [
             "https://example.test/v1/responses",

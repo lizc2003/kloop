@@ -254,7 +254,7 @@ pub(crate) async fn send_checked(
         Ok(Err(error)) => {
             return Err(ProviderFailure::transport(format!(
                 "{label} request failed: {error}"
-            )))
+            )));
         }
         Err(()) => {
             return Err(ProviderFailure::timeout(
@@ -263,7 +263,7 @@ pub(crate) async fn send_checked(
                     "{label} response headers did not arrive within {}s",
                     STREAM_OPEN_TIMEOUT.as_secs()
                 ),
-            ))
+            ));
         }
     };
     if resp.status().is_success() {
@@ -309,7 +309,8 @@ async fn bounded_http_error_body(mut response: reqwest::Response) -> String {
         let mut bytes = Vec::new();
         let mut truncated = false;
         loop {
-            match response.chunk().await {
+            let next = response.chunk().await;
+            match next {
                 Ok(Some(chunk)) => {
                     let remaining = HTTP_ERROR_BODY_BYTES.saturating_sub(bytes.len());
                     if chunk.len() >= remaining {

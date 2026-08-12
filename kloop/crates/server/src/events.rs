@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use serde::de::Error as _;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
-use serde_json::json;
+use serde::de::Error as _;
 use serde_json::Value;
+use serde_json::json;
 
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
@@ -1011,8 +1011,8 @@ mod tests {
 
     #[test]
     fn sync_cannot_cross_publishs_reducer_ring_enqueue_barrier() {
-        use std::sync::mpsc;
         use std::sync::Arc;
+        use std::sync::mpsc;
         use std::time::Duration;
 
         let projection = Arc::new(projection(8, usize::MAX));

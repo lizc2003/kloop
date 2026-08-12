@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
-use super::is_overflow_message;
-use super::sse::SseFrame;
-use super::sse::SseParser;
 use super::GuardedBody;
 use super::ProviderFailure;
 use super::StreamCompletion;
 use super::StreamSink;
+use super::is_overflow_message;
+use super::sse::SseFrame;
+use super::sse::SseParser;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::IncompleteReason;
@@ -36,10 +36,8 @@ pub(super) fn tools_value(tools: &[ToolDef], cache: bool) -> Value {
             })
         })
         .collect();
-    if cache {
-        if let Some(last) = items.last_mut() {
-            last["cache_control"] = json!({"type": "ephemeral"});
-        }
+    if cache && let Some(last) = items.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
     }
     Value::Array(items)
 }
@@ -127,10 +125,10 @@ fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
 
 fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
     let kind = required_str(&value["type"], "event type")?;
-    if let Some(wire) = frame.event.as_deref() {
-        if wire != kind {
-            return Err(protocol("SSE event name did not match payload type"));
-        }
+    if let Some(wire) = frame.event.as_deref()
+        && wire != kind
+    {
+        return Err(protocol("SSE event name did not match payload type"));
     }
     Ok(kind)
 }
@@ -247,7 +245,11 @@ pub(super) async fn stream(
     let mut cache_read = 0;
     let mut cache_creation = 0;
 
-    while let Some(chunk) = byte_stream.next().await? {
+    loop {
+        let next = byte_stream.next().await?;
+        let Some(chunk) = next else {
+            break;
+        };
         for frame in parser.feed(&chunk)? {
             let value = crate::parse_sse_json("anthropic", &frame.data)?;
             let event = event_type(&frame, &value)?;

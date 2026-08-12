@@ -12,8 +12,6 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::LockResult;
 #[cfg(test)]
@@ -23,13 +21,15 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -357,7 +357,9 @@ pub(crate) fn compute_overrides(
         || parent_identity.project_id() != expected_project
         || worktree_identity.project_id() != expected_project
     {
-        bail!("worktree project identity is unavailable or does not match the permission policy's project");
+        bail!(
+            "worktree project identity is unavailable or does not match the permission policy's project"
+        );
     }
     let old = format!("- Working directory: {}", base_cwd.display());
     let new = format!("- Working directory: {}", worktree_path.display());

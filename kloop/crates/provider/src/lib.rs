@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 pub use failure::ProviderFailure;
 pub use failure::ProviderFailureKind;
@@ -23,17 +23,17 @@ pub use failure::TimeoutStage;
 pub use stream::ProviderStream;
 pub use stream::StreamResult;
 
-pub(crate) use stream::send_checked;
-use stream::spawn_stream;
 pub(crate) use stream::GuardedBody;
 pub(crate) use stream::StreamCompletion;
 pub(crate) use stream::StreamSink;
+pub(crate) use stream::send_checked;
+use stream::spawn_stream;
 
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
+use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
 use kloop_protocol::ToolDef;
-use kloop_protocol::MAX_OUTPUT_TOKENS;
 
 /// One process-wide HTTP client shared by every adapter. reqwest pools
 /// connections and reuses TLS sessions, but only within a single `Client`, so

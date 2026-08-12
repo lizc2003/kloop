@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-11,plan 1–59、61–66、68–76 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
+> 基线:2026-08-12,plan 1–59、61–66、68–79 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -285,6 +285,8 @@ Plan 76 同样只增加 **kloop-native correctness evidence**：cross-platform C
 
 Plan 78 继续只增加 **maintenance/correctness evidence**：workspace MSRV 固定为 Rust 1.88，terminal dependency set 升到 Ratatui 0.30.2/Crossterm 0.29.0/`unicode-width` 0.2.2/Unix test-only vt100 0.16.2，并以 `Backend::Error` 迁移、Unicode/TestBackend/real-binary PTY 回归和 target dependency graph 证明现有契约未退化。它不修改 pinned captures、matrix、pair、bridge 或 Claude Code scope，也不升级任何 `same`/`compatible` 裁决；Windows graph 排除 Unix-only PTY edges 不是 ConPTY/native-scrollback 执行证据。
 
+Plan 79 仍只增加 **engineering maintenance evidence**：workspace 迁移到 Rust 1.96 / edition 2024，本地 toolchain pin 为 1.96.1；compiler diagnostics 驱动的 compatibility 修复、host gates 与既有回归证明当前 macOS 路径未退化。它不修改 pinned captures、matrix、pair、bridge、Claude Code scope 或任何 parity 裁决；本机 Windows cross-target 因缺 std/sysroot 与 MSVC C toolchain 未完成，也不替代 Windows native lifecycle evidence。
+
 Plan 59 同时纠正 Plan 53 的过度裁决：AskUserQuestion 为 C/C/C/C/D/C/D/D，EnterPlanMode
 为 C/C/U/C/C/C/D/C，ExitPlanMode 为 C/D/D/C/D/N/C/C，StructuredOutput 为
 D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/type/null/options/unknown-field 负例，report 只按显式 row/dimension mapping 投影。C/D/U/N 分别表示 `compatible`、
@@ -391,6 +393,7 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 | Plan 63 project permission / native protocol 1.0 | **✅ 2026-08-06**：kloop fmt/clippy/workspace/mock、real binary v1/v2-refusal smoke；Desktop 887 pass/52 skip/0 fail、TS/build、Tauri 229 tests；companion `54056dc5` | 已完成；private-store Windows target check/clippy已过，本次未做原生Windows runtime或真实Tauri GUI点击smoke |
 | Plan 76 TUI correctness evidence boundary | **✅ 2026-08-11**：Composer/render/TestBackend 为 cross-platform suite，本次 macOS workspace 实跑；CI 已配置 macOS/Linux/Windows，`cfg(unix)` real-binary PTY 回答 `ESC[6n`、驱动 resize/input、解析有界 raw ANSI/current viewport | Windows 的 n/a/skip 不是 ConPTY pass；vt100 不证明 DECSTBM native scrollback，真实终端字形/scrollback 另作人工证据 |
 | Plan 78 terminal dependency/MSRV maintenance | **✅ 2026-08-12**：Rust 1.88 workspace MSRV；Ratatui 0.30.2/Crossterm 0.29.0/Unicode/vt100 受控升级；associated backend error、target graph 与既有 TUI/PTY gates 验证原契约 | maintenance/correctness only；不改变 parity 裁决，Windows graph 排除 Unix PTY edges 不是 ConPTY pass |
+| Plan 79 Rust 1.96 / edition 2024 maintenance | **✅ 2026-08-12**：10-package workspace 迁移到 edition 2024 / MSRV 1.96，本地 pin 1.96.1；host compatibility Clippy、workspace gates 与资源生命周期回归通过 | engineering maintenance only；不改变 parity 裁决；Darwin cross-target 未完成，不能冒充 Windows native pass |
 | Linux 平台测试(连带沙箱 Linux 片) | Plan 19 余片 | 可用远端 Linux runner |
 | 自审遗留:低危项与重复代码清理 | 教训 25 尾注挂账 | 顺手 |
 

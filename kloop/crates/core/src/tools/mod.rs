@@ -60,15 +60,15 @@ pub use task::TaskStatus;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
+use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::Result;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Ui;
@@ -893,7 +893,9 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
     let local_send_committed = AtomicBool::new(false);
     let gated = async {
         match name.as_str() {
-            "task" => bail!("tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"),
+            "task" => bail!(
+                "tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"
+            ),
             "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
             "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
             _ => {}
@@ -917,12 +919,16 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         if matches!(name.as_str(), "bash" | "bash_output" | "stop_bash")
             && !ctx.cfg.shell_programs.bash_available()
         {
-            bail!("tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session");
+            bail!(
+                "tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session"
+            );
         }
         if name == "powershell"
             && (!cfg!(windows) || !ctx.cfg.shell_programs.powershell_available())
         {
-            bail!("tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session");
+            bail!(
+                "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
+            );
         }
         // Locked deferred tools bounce before hooks and permissions: the
         // model skipped tool_search, and neither automation policy nor the
@@ -1239,9 +1245,7 @@ fn execute_tool<'a>(
             "send_message" => {
                 let result = agent_message::send_message_tool(input, ctx);
                 if result.is_ok() {
-                    prepared
-                        .local_send_committed
-                        .store(true, Ordering::Release);
+                    prepared.local_send_committed.store(true, Ordering::Release);
                 }
                 result
             }
@@ -1251,9 +1255,7 @@ fn execute_tool<'a>(
             "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
             "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
             "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
-            "wait_for_activity" => {
-                background_executions::wait_for_activity_tool(input, ctx).await
-            }
+            "wait_for_activity" => background_executions::wait_for_activity_tool(input, ctx).await,
             "stop_agent" => background_executions::stop_agent_tool(input, ctx).await,
             "stop_program" => background_executions::stop_program_tool(input, ctx).await,
             "stop_workflow" => background_executions::stop_workflow_tool(input, ctx).await,
@@ -1488,13 +1490,15 @@ pub(crate) mod testutil {
             &["config", "user.name", "t"],
             &["commit", "--allow-empty", "-qm", "base"],
         ] {
-            assert!(std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(a)
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(a)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         std::fs::canonicalize(&root).unwrap()
     }
@@ -1700,11 +1704,13 @@ mod tests {
                 .to_string();
             assert!(error.contains(message), "{error}");
         }
-        assert!(optional_display_description(
-            &json!({"description": "界".repeat(MAX_DISPLAY_DESCRIPTION_CHARS)}),
-            "run_program",
-        )
-        .is_ok());
+        assert!(
+            optional_display_description(
+                &json!({"description": "界".repeat(MAX_DISPLAY_DESCRIPTION_CHARS)}),
+                "run_program",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1792,9 +1798,11 @@ mod tests {
                 .find(|definition| definition.name == "bash")
                 .expect("Git Bash is registered when available");
             assert!(bash.schema["properties"].get("disable_sandbox").is_none());
-            assert!(powershell
-                .description
-                .contains("background execution and Windows shell sandboxing are unavailable"));
+            assert!(
+                powershell
+                    .description
+                    .contains("background execution and Windows shell sandboxing are unavailable")
+            );
             let run_program = definitions
                 .iter()
                 .find(|definition| definition.name == "run_program")
@@ -1802,9 +1810,11 @@ mod tests {
             assert!(run_program.description.contains("powershell"));
         }
         #[cfg(not(windows))]
-        assert!(!definitions
-            .iter()
-            .any(|definition| definition.name == "powershell"));
+        assert!(
+            !definitions
+                .iter()
+                .any(|definition| definition.name == "powershell")
+        );
     }
 
     #[cfg(windows)]
@@ -2648,11 +2658,13 @@ mod tests {
         let first = root.join("first.fifo");
         let second = root.join("second.fifo");
         for path in [&first, &second] {
-            assert!(std::process::Command::new("mkfifo")
-                .arg(path)
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
 
         let ctx = test_ctx(0, "concurrent-bash-cancel");

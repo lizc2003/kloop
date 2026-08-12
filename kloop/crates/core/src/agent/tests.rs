@@ -326,10 +326,12 @@ async fn ordinary_turn_never_exposes_structured_output() {
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "plain result");
-    assert!(seen.lock().unwrap()[0]
-        .tools
-        .iter()
-        .all(|tool| tool.name != "structured_output"));
+    assert!(
+        seen.lock().unwrap()[0]
+            .tools
+            .iter()
+            .all(|tool| tool.name != "structured_output")
+    );
 }
 
 #[tokio::test]
@@ -453,6 +455,7 @@ async fn structured_turn_cancellation_never_accepts_a_late_value() {
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("return a string"));
+
         run_structured_turn(
             &cfg,
             &mut history,
@@ -602,7 +605,7 @@ async fn mock_end_to_end_three_rounds() {
 /// path, and its final message.
 #[tokio::test]
 async fn subagent_turn_routes_to_subagent_hooks() {
-    use crate::hooks::{HookDef, HookEvent, Hooks, DEFAULT_TIMEOUT_MS};
+    use crate::hooks::{DEFAULT_TIMEOUT_MS, HookDef, HookEvent, Hooks};
     let dir = std::env::temp_dir().join(format!("kloop-subhook-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1701,10 +1704,12 @@ async fn project_instructions_injected_per_request_not_recorded() {
     // The real history follows the synthetic message untouched…
     assert_eq!(seen[1].messages[1], Message::user_text("go"));
     // …and never absorbs it.
-    assert!(history
-        .messages()
-        .iter()
-        .all(|m| *m != Message::user_text(instructions)));
+    assert!(
+        history
+            .messages()
+            .iter()
+            .all(|m| *m != Message::user_text(instructions))
+    );
 }
 
 /// Skills end to end over Mock: with a skill configured, every request
@@ -2087,13 +2092,15 @@ async fn deferred_tools_shrink_defs_inject_notice_and_gate_dispatch() {
         }
     );
     // The notice never entered history.
-    assert!(history
-        .messages()
-        .iter()
-        .all(|m| m.content.iter().all(|b| !matches!(
-            b,
-            ContentBlock::Text { text } if text.contains("<system-reminder>")
-        ))));
+    assert!(
+        history
+            .messages()
+            .iter()
+            .all(|m| m.content.iter().all(|b| !matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("<system-reminder>")
+            )))
+    );
 }
 
 /// The injected instructions count toward the overflow prediction even
@@ -2126,13 +2133,15 @@ async fn instructions_count_toward_predictive_compaction() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2, "compaction request + the real request");
     // Request 0 is the compaction summary: plain history, no injection.
-    assert!(seen[0]
-        .messages
-        .iter()
-        .all(|m| m.content.iter().all(|b| !matches!(
-            b,
-            ContentBlock::Text { text } if text.starts_with("rrr")
-        ))));
+    assert!(
+        seen[0]
+            .messages
+            .iter()
+            .all(|m| m.content.iter().all(|b| !matches!(
+                b,
+                ContentBlock::Text { text } if text.starts_with("rrr")
+            )))
+    );
     // Request 1 is the real one: instructions first, compacted history after.
     assert_eq!(seen[1].messages[0], Message::user_text("r".repeat(8_000)));
 }
@@ -2537,10 +2546,10 @@ async fn subagent_does_not_drain_parent_steering() {
                 item: Item::ToolCall { agent, .. },
                 ..
             } = ev
+                && !agent.is_empty()
+                && !self.fired.swap(true, Ordering::SeqCst)
             {
-                if !agent.is_empty() && !self.fired.swap(true, Ordering::SeqCst) {
-                    self.inbox.push(InboxItem::Steer("parent steer".into()));
-                }
+                self.inbox.push(InboxItem::Steer("parent steer".into()));
             }
         }
     }

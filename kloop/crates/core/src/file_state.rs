@@ -129,20 +129,19 @@ impl FileState {
                 path,
                 mut observation,
             } => {
-                if let Some(existing) = inner.observations.get(&path) {
-                    if existing.observation.version == observation.version
-                        && existing.observation.identity == observation.identity
-                        && existing.observation.notebook_cells == observation.notebook_cells
+                if let Some(existing) = inner.observations.get(&path)
+                    && existing.observation.version == observation.version
+                    && existing.observation.identity == observation.identity
+                    && existing.observation.notebook_cells == observation.notebook_cells
+                {
+                    if existing.observation.coverage.complete {
+                        observation.coverage.complete = true;
+                    } else if existing.observation.coverage.total_units
+                        == observation.coverage.total_units
                     {
-                        if existing.observation.coverage.complete {
-                            observation.coverage.complete = true;
-                        } else if existing.observation.coverage.total_units
-                            == observation.coverage.total_units
-                        {
-                            observation
-                                .coverage
-                                .merge(&existing.observation.coverage, self.max_ranges);
-                        }
+                        observation
+                            .coverage
+                            .merge(&existing.observation.coverage, self.max_ranges);
                     }
                 }
                 inner.observations.insert(
@@ -182,7 +181,8 @@ impl FileState {
         let lock = {
             let mut inner = self.inner.lock().unwrap();
             inner.locks.retain(|_, lock| lock.strong_count() > 0);
-            match inner.locks.get(path).and_then(Weak::upgrade) {
+            let existing = inner.locks.get(path).and_then(Weak::upgrade);
+            match existing {
                 Some(lock) => lock,
                 None => {
                     let lock = Arc::new(AsyncMutex::new(()));
@@ -399,11 +399,11 @@ impl ReadCoverage {
         self.ranges.sort_by_key(|range| (range.start, range.end));
         let mut merged: Vec<Range<u64>> = Vec::new();
         for range in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if range.start <= last.end {
-                    last.end = last.end.max(range.end);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+                continue;
             }
             if merged.len() < max_ranges {
                 merged.push(range);
@@ -568,13 +568,15 @@ mod tests {
             });
         }
         assert_eq!(state.len(), 2);
-        assert!(state
-            .inner
-            .lock()
-            .unwrap()
-            .observations
-            .keys()
-            .all(|path| !path.ends_with("kloop-file-state-a")));
+        assert!(
+            state
+                .inner
+                .lock()
+                .unwrap()
+                .observations
+                .keys()
+                .all(|path| !path.ends_with("kloop-file-state-a"))
+        );
 
         let tiny = FileState::with_limits(10, 1, 4);
         let (path, metadata) = temp_file("tiny", b"x");

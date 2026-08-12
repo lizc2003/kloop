@@ -1,15 +1,15 @@
 use std::path::Path;
 
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
+use anyhow::bail;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 
+use super::ToolCtx;
 use super::bash;
 use super::str_arg;
-use super::ToolCtx;
 use crate::config::EffectiveWorkspace;
 use crate::process_tree::ProcessSpec;
 use crate::shell_programs::ShellFlavor;
@@ -199,10 +199,12 @@ mod tests {
             .map(std::ffi::OsString::from)
         );
         assert_eq!(spec.args.len(), 5);
-        assert!(!spec
-            .args
-            .iter()
-            .any(|arg| arg.to_string_lossy().contains("ExecutionPolicy")));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("ExecutionPolicy"))
+        );
     }
 
     #[test]
@@ -250,8 +252,8 @@ mod tests {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
         use windows_sys::Win32::System::Threading::OpenProcess;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
         use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         fn installed_programs() -> Vec<ShellProgram> {
             let (programs, _) = crate::shell_programs::resolve_shell_programs(Default::default())

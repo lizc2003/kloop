@@ -12,9 +12,9 @@
 //! start a delivery turn. cc and codex independently converge on "enqueue at a
 //! step boundary, never interleave with an in-flight request".
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalAgentMessage;
@@ -43,8 +43,7 @@ below — fold it into your work, and if you were waiting on it, continue from h
 const PROGRAM_PREFIX: &str = "A background program you launched has finished. Its return value is \
 below — fold it into your work, and if you were waiting on it, continue from here:";
 
-const WORKFLOW_PREFIX: &str =
-    "A background Workflow you launched has finished. Its bounded result is \
+const WORKFLOW_PREFIX: &str = "A background Workflow you launched has finished. Its bounded result is \
 below; the full result is persisted at the supplied output file:";
 
 /// Framing for a background shell's terminal notification (plan 51). The

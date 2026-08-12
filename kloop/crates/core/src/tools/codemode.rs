@@ -11,28 +11,28 @@
 //! gate lives here because the gate is what makes code-mode safe.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::ToolCtx;
 use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
 use super::run_store::RunId;
 use super::run_store::RunLease;
 use super::run_store::RunNamespace;
 use super::run_store::RunStore;
-use super::ToolCtx;
 use crate::event::BackgroundTaskKind;
 use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
@@ -194,7 +194,9 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
     // progress narration out of the context is the whole point of code-mode.
-    match kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await {
+    let outcome =
+        kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await;
+    match outcome {
         Ok(out) => Ok(program_output(out)),
         Err(e) => Err(resume_hint(e, &journal, &run_id)),
     }
@@ -342,6 +344,7 @@ fn spawn_background_program(
     let worker_cancel = own_cancel.clone();
     let worker = tokio::spawn(async move {
         let _lease = lease;
+
         kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
     });
     background_executions.attach_abort(&label, worker.abort_handle());

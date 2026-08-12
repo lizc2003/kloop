@@ -554,9 +554,11 @@ mod tests {
     #[test]
     fn parse_rejects_missing_frontmatter_and_missing_description() {
         assert!(Skill::parse("s", "/s", "just a body, no fence").is_err());
-        assert!(Skill::parse("s", "/s", "---\nname: s\n---\nbody")
-            .unwrap_err()
-            .contains("description"));
+        assert!(
+            Skill::parse("s", "/s", "---\nname: s\n---\nbody")
+                .unwrap_err()
+                .contains("description")
+        );
         // Empty description is treated as missing.
         assert!(Skill::parse("s", "/s", "---\ndescription:   \n---\nbody").is_err());
     }
@@ -593,8 +595,10 @@ mod tests {
         assert_eq!(skills_catalog(&[]), None);
         let catalog = skills_catalog(&skills()).unwrap();
         assert!(catalog.starts_with("<system-reminder>"));
-        assert!(catalog
-            .contains("\n- commit: Write a conventional-commit message. Use when committing."));
+        assert!(
+            catalog
+                .contains("\n- commit: Write a conventional-commit message. Use when committing.")
+        );
         assert!(catalog.contains("\n- review: Review a diff."));
         assert!(catalog.contains("`skill` tool"));
         assert!(catalog.ends_with("</system-reminder>"));

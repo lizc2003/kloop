@@ -7,15 +7,15 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use kloop_core::context::BASE_SYSTEM;
+use kloop_core::context::EnvInfo;
+use kloop_core::context::GitInfo;
+use kloop_core::context::INSTRUCTIONS_MAX_BYTES;
+use kloop_core::context::InstructionFile;
+use kloop_core::context::InstructionScope;
 use kloop_core::context::assemble_instructions;
 use kloop_core::context::assemble_system;
 use kloop_core::context::utc_today;
-use kloop_core::context::EnvInfo;
-use kloop_core::context::GitInfo;
-use kloop_core::context::InstructionFile;
-use kloop_core::context::InstructionScope;
-use kloop_core::context::BASE_SYSTEM;
-use kloop_core::context::INSTRUCTIONS_MAX_BYTES;
 
 /// What Config needs from the project, gathered once per process — server
 /// threads share the process cwd, so they share one assembly too.
@@ -554,10 +554,11 @@ mod tests {
         write(&root, "AGENTS.md", "main\n@./nope.md");
         let d = discover_instruction_files(&root, None, Some(&root));
         assert_eq!(d.files.len(), 1);
-        assert!(d
-            .warnings
-            .iter()
-            .any(|w| w.contains("not found") && w.contains("nope.md")));
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("not found") && w.contains("nope.md"))
+        );
     }
 
     #[test]

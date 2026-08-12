@@ -185,10 +185,12 @@ mod tests {
             }
         );
         let result = run("");
-        assert!(result
-            .run_turn
-            .unwrap()
-            .contains(AUTONOMOUS_DYNAMIC_SENTINEL));
+        assert!(
+            result
+                .run_turn
+                .unwrap()
+                .contains(AUTONOMOUS_DYNAMIC_SENTINEL)
+        );
     }
 
     #[test]

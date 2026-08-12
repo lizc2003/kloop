@@ -7,12 +7,14 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 
 use kloop_core::history::History;
 use kloop_core::permissions::Mode;
+use kloop_core::rollout::Rollout;
+use kloop_core::rollout::SessionOrigin;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
@@ -24,8 +26,6 @@ use kloop_core::rollout::session_id_of;
 use kloop_core::rollout::session_origin;
 use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
-use kloop_core::rollout::Rollout;
-use kloop_core::rollout::SessionOrigin;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionChoice {

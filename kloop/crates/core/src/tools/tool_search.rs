@@ -4,14 +4,14 @@
 //! generation returned by a search hit; catalog refresh invalidates it. The
 //! provider tool array does not change merely because a tool was unlocked.
 
-use anyhow::bail;
 use anyhow::Result;
-use serde_json::json;
+use anyhow::bail;
 use serde_json::Value;
+use serde_json::json;
 
+use super::ToolCtx;
 use super::deferred_tool_defs;
 use super::str_arg;
-use super::ToolCtx;
 use crate::config::Config;
 use kloop_protocol::ToolDef;
 
@@ -286,7 +286,9 @@ fn keyword_score(def: &ToolDef, terms: &[SearchTerm]) -> Option<u32> {
 fn render(found: &[ToolDef], notes: &[String], total_deferred: usize) -> String {
     let mut out = String::new();
     if found.is_empty() && notes.is_empty() {
-        return format!("No matching deferred tools found ({total_deferred} deferred tools exist; their names are listed in the context).");
+        return format!(
+            "No matching deferred tools found ({total_deferred} deferred tools exist; their names are listed in the context)."
+        );
     }
     if !found.is_empty() {
         out.push_str(&format!(
@@ -313,8 +315,8 @@ fn render(found: &[ToolDef], notes: &[String], total_deferred: usize) -> String 
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tools::testutil::*;
     use crate::tools::ToolSource;
+    use crate::tools::testutil::*;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;

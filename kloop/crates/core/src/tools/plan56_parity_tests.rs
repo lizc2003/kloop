@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use kloop_protocol::ContentBlock;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 use super::all_tool_defs;
 use super::dispatch_tools;

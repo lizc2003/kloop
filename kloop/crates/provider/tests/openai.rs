@@ -11,13 +11,13 @@ use kloop_protocol::Usage;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::StreamResult;
-use serde_json::json;
 use serde_json::Value;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
+use serde_json::json;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn sse_body(chunks: &[Value], done: bool) -> String {
     let mut body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();

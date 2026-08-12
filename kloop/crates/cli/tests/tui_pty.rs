@@ -5,15 +5,15 @@ mod tui_pty_support;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::bail;
 use tokio::sync::Mutex;
 
+use tui_pty_support::ChatFixture;
+use tui_pty_support::PtyHarness;
 use tui_pty_support::contains_bytes;
 use tui_pty_support::find_bytes;
 use tui_pty_support::sse_text;
-use tui_pty_support::ChatFixture;
-use tui_pty_support::PtyHarness;
 
 static PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 

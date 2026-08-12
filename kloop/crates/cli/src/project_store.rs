@@ -7,9 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -69,10 +69,11 @@ impl ProjectStore {
         let project_lock = self.project_lock(&project_id);
         let _guard = project_lock.lock().await;
         let store = self.clone();
-        tokio::task::spawn_blocking(move || store.append_blocking(&project_id, additions))
-            .await
-            .map_err(|_| ProjectPolicyStoreError::PersistenceFailed)?
-            .map_err(|_| ProjectPolicyStoreError::PersistenceFailed)
+        let result =
+            tokio::task::spawn_blocking(move || store.append_blocking(&project_id, additions))
+                .await
+                .map_err(|_| ProjectPolicyStoreError::PersistenceFailed)?;
+        result.map_err(|_| ProjectPolicyStoreError::PersistenceFailed)
     }
 
     fn append_blocking(

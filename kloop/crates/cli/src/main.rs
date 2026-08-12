@@ -30,29 +30,29 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
 
-use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::agent::run_turn;
 use kloop_core::history::History;
 use kloop_core::skills::Skill;
-use kloop_core::tools::tool_merge_warnings;
 use kloop_core::tools::ToolSource;
+use kloop_core::tools::tool_merge_warnings;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_server::SkillsReader;
 use kloop_server::SkillsSnapshot;
 
+use crate::args::CliArgs;
 use crate::args::list_sessions;
 use crate::args::open_history;
 use crate::args::parse_args;
-use crate::args::CliArgs;
 use crate::provider_config::ResolvedProviderSettings;
+use crate::startup::RuntimeSettings;
 use crate::startup::build_sandbox;
 use crate::startup::config_from_settings;
 use crate::startup::load_skills;
 use crate::startup::server_config_snapshot;
 use crate::startup::server_skills_snapshot;
-use crate::startup::RuntimeSettings;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
 
@@ -296,11 +296,11 @@ async fn main() -> Result<ExitCode> {
         let cfg = Arc::new(cfg);
         // `--worktree`: run this headless turn inside an isolated tree (plan 35
         // slice 2). Fail-closed — abort if it can't be created.
-        if let Some(name) = &args.worktree {
-            if let Err(e) = kloop_core::worktree::enter(&cfg, name).await {
-                eprintln!("worktree: {e:#}");
-                return Ok(ExitCode::FAILURE);
-            }
+        if let Some(name) = &args.worktree
+            && let Err(e) = kloop_core::worktree::enter(&cfg, name).await
+        {
+            eprintln!("worktree: {e:#}");
+            return Ok(ExitCode::FAILURE);
         }
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c(cancel.clone());

@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 
 use crate::private_store::read_private_string;
 #[cfg(test)]

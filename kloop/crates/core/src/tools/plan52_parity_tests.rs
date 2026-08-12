@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kloop_protocol::AssistantBlock;
@@ -12,19 +12,19 @@ use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_provider::MockTurn;
 use kloop_provider::Provider;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use super::ToolCtx;
 use super::all_tool_defs;
 use super::dispatch_tools;
 use super::testutil::run_tool;
 use super::testutil::test_ctx;
 use super::testutil::with_provider;
-use super::ToolCtx;
-use crate::agent::run_turn;
 use crate::agent::Ui;
+use crate::agent::run_turn;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
 use crate::event::Event;

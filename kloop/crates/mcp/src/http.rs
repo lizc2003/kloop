@@ -13,29 +13,29 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use futures::StreamExt;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
 use reqwest::header::ACCEPT;
 use reqwest::header::AUTHORIZATION;
 use reqwest::header::CONTENT_TYPE;
-use serde_json::json;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderName;
+use reqwest::header::HeaderValue;
 use serde_json::Value;
+use serde_json::json;
 
-use crate::oauth::OAuthSession;
-use crate::sse::SseParser;
 use crate::McpRpcError;
 use crate::Transport;
+use crate::oauth::OAuthSession;
+use crate::sse::SseParser;
 
 /// codex's schedule: back off 250ms, then 1s, then one final attempt (3
 /// tries total). Only 408/429/5xx and transient network errors retry.
@@ -120,7 +120,8 @@ impl HttpTransport {
     ) -> std::result::Result<Option<Value>, PostError> {
         let mut attempt = 0;
         loop {
-            match self.post_once(body, expect_id, timeout).await {
+            let outcome = self.post_once(body, expect_id, timeout).await;
+            match outcome {
                 Ok(v) => return Ok(v),
                 Err(Attempt::SessionExpired) => return Err(PostError::SessionExpired),
                 Err(Attempt::Unauthorized(bearer)) => return Err(PostError::Unauthorized(bearer)),
@@ -206,10 +207,10 @@ impl HttpTransport {
             }
             // With OAuth, a 401 means the token was rejected — refresh it once
             // and replay (handled in `request`). Without OAuth it's terminal.
-            if code == 401 {
-                if let Some(bearer) = used_bearer {
-                    return Err(Attempt::Unauthorized(bearer));
-                }
+            if code == 401
+                && let Some(bearer) = used_bearer
+            {
+                return Err(Attempt::Unauthorized(bearer));
             }
             let bytes = read_body_bounded(resp).await?;
             let text = String::from_utf8_lossy(&bytes);
@@ -331,7 +332,7 @@ impl Transport for HttpTransport {
                             return Err(anyhow!(
                                 "mcp http: still unauthorized after refreshing the OAuth token; \
                                  re-run `kloop mcp login`"
-                            ))
+                            ));
                         }
                         Err(other) => return Err(other.into_anyhow()),
                     }
@@ -400,7 +401,11 @@ async fn read_body_bounded(resp: reqwest::Response) -> std::result::Result<Vec<u
     }
     let mut body = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = stream.next().await;
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk
             .map_err(|error| Attempt::Fatal(anyhow!("mcp http: reading body failed: {error}")))?;
         if body.len().saturating_add(chunk.len()) > crate::MAX_WIRE_MESSAGE_BYTES {
@@ -425,7 +430,11 @@ async fn read_sse_message(
     let mut parser = SseParser::default();
     let mut stream = resp.bytes_stream();
     let mut total_bytes = 0usize;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = stream.next().await;
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk
             .map_err(|e| Attempt::Fatal(anyhow!("mcp http: reading event stream failed: {e}")))?;
         total_bytes = total_bytes.saturating_add(chunk.len());
@@ -468,18 +477,18 @@ fn pick_message(value: &Value, want: u64) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::OAuthToken;
     use crate::McpClient;
+    use crate::oauth::OAuthToken;
     use serde_json::json;
-    use wiremock::matchers::body_partial_json;
-    use wiremock::matchers::header;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::Request;
     use wiremock::Respond;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_partial_json;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     fn client(url: String, headers: BTreeMap<String, String>) -> McpClient {
         client_with_oauth(url, headers, None)

@@ -25,13 +25,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::anyhow;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::bash;
 use super::ToolCtx;
+use super::bash;
 use crate::agent::Ui;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
@@ -73,6 +73,7 @@ pub(crate) async fn expand_slash_injections(
         program_result: None,
     };
     let workspace = cfg.effective_workspace();
+
     expand(body, &ctx, &workspace).await
 }
 

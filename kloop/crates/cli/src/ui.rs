@@ -111,7 +111,8 @@ impl Questioner for CliApprover {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
         Box::pin(async move {
             let _one_at_a_time = self.prompting.lock().await;
-            match tokio::task::spawn_blocking(move || prompt_questions(&request)).await {
+            let prompt = tokio::task::spawn_blocking(move || prompt_questions(&request)).await;
+            match prompt {
                 Ok(outcome) => outcome,
                 Err(error) => QuestionOutcome::Unavailable(format!(
                     "terminal question reader panicked: {error}"
@@ -157,12 +158,12 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
             let line = match read_terminal_line() {
                 Ok(Some(line)) => line,
                 Ok(None) => {
-                    return QuestionOutcome::Unavailable("terminal input reached EOF".into())
+                    return QuestionOutcome::Unavailable("terminal input reached EOF".into());
                 }
                 Err(error) => {
                     return QuestionOutcome::Unavailable(format!(
                         "cannot read terminal input: {error}"
-                    ))
+                    ));
                 }
             };
             if matches!(line.trim().to_ascii_lowercase().as_str(), "c" | "cancel") {
@@ -193,12 +194,12 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
                     Ok(None) => {
                         return QuestionOutcome::Unavailable(
                             "terminal input reached EOF while entering Other".into(),
-                        )
+                        );
                     }
                     Err(error) => {
                         return QuestionOutcome::Unavailable(format!(
                             "cannot read Other answer: {error}"
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -219,10 +220,10 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
                     Ok(None) => {
                         return QuestionOutcome::Unavailable(
                             "terminal input reached EOF while entering notes".into(),
-                        )
+                        );
                     }
                     Err(error) => {
-                        return QuestionOutcome::Unavailable(format!("cannot read notes: {error}"))
+                        return QuestionOutcome::Unavailable(format!("cannot read notes: {error}"));
                     }
                 }
             } else {

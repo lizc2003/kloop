@@ -3,15 +3,15 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
-use super::is_overflow_message;
-use super::sse::SseParser;
 use super::GuardedBody;
 use super::ProviderFailure;
 use super::StreamCompletion;
 use super::StreamSink;
+use super::is_overflow_message;
+use super::sse::SseParser;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -290,10 +290,10 @@ async fn apply_choice_payload(
     {
         return Err(protocol("returned an unknown semantic delta field"));
     }
-    if let Some(role) = semantic_string(payload, "role")? {
-        if role != "assistant" {
-            return Err(protocol("delta role was not assistant"));
-        }
+    if let Some(role) = semantic_string(payload, "role")?
+        && role != "assistant"
+    {
+        return Err(protocol("delta role was not assistant"));
     }
 
     let mut semantic = false;
@@ -301,33 +301,33 @@ async fn apply_choice_payload(
     let reasoning = semantic_string(payload, "reasoning")?;
     let reasoning_piece = match (reasoning_content, reasoning) {
         (Some(left), Some(right)) if left != right => {
-            return Err(protocol("reasoning aliases conflicted"))
+            return Err(protocol("reasoning aliases conflicted"));
         }
         (Some(value), _) | (_, Some(value)) => Some(value),
         (None, None) => None,
     };
-    if let Some(piece) = reasoning_piece {
-        if !piece.is_empty() {
-            semantic = true;
-            thinking.push_str(piece);
-            sink.thinking_delta(piece.to_string()).await?;
-        }
+    if let Some(piece) = reasoning_piece
+        && !piece.is_empty()
+    {
+        semantic = true;
+        thinking.push_str(piece);
+        sink.thinking_delta(piece.to_string()).await?;
     }
-    if let Some(piece) = semantic_string(payload, "content")? {
-        if !piece.is_empty() {
-            semantic = true;
-            text.push_str(piece);
-            display_text.push_str(piece);
-            sink.text_delta(piece.to_string()).await?;
-        }
+    if let Some(piece) = semantic_string(payload, "content")?
+        && !piece.is_empty()
+    {
+        semantic = true;
+        text.push_str(piece);
+        display_text.push_str(piece);
+        sink.text_delta(piece.to_string()).await?;
     }
-    if let Some(piece) = semantic_string(payload, "refusal")? {
-        if !piece.is_empty() {
-            semantic = true;
-            *refusal_seen = true;
-            display_text.push_str(piece);
-            sink.text_delta(piece.to_string()).await?;
-        }
+    if let Some(piece) = semantic_string(payload, "refusal")?
+        && !piece.is_empty()
+    {
+        semantic = true;
+        *refusal_seen = true;
+        display_text.push_str(piece);
+        sink.text_delta(piece.to_string()).await?;
     }
 
     if let Some(tool_calls) = payload.get("tool_calls") {
@@ -342,10 +342,10 @@ async fn apply_choice_payload(
             let index = call["index"]
                 .as_u64()
                 .ok_or_else(|| protocol("tool call was missing its wire index"))?;
-            if let Some(kind) = call.get("type") {
-                if kind.as_str() != Some("function") {
-                    return Err(protocol("tool call type was not function"));
-                }
+            if let Some(kind) = call.get("type")
+                && kind.as_str() != Some("function")
+            {
+                return Err(protocol("tool call type was not function"));
             }
             let acc = calls.entry(index).or_default();
             lock_identity(&mut acc.id, &call["id"], "id")?;
@@ -428,13 +428,13 @@ pub(super) async fn stream(
                 return Err(protocol(format!("stream error ({code})")));
             }
 
-            if let Some(raw_usage) = value.get("usage") {
-                if !raw_usage.is_null() {
-                    if usage.is_some() {
-                        return Err(protocol("received duplicate usage"));
-                    }
-                    usage = Some(parse_usage(raw_usage)?);
+            if let Some(raw_usage) = value.get("usage")
+                && !raw_usage.is_null()
+            {
+                if usage.is_some() {
+                    return Err(protocol("received duplicate usage"));
                 }
+                usage = Some(parse_usage(raw_usage)?);
             }
 
             let choices = value
@@ -456,7 +456,7 @@ pub(super) async fn stream(
                 .ok_or_else(|| protocol("choice was missing its index"))?;
             match choice_index {
                 Some(current) if current != index => {
-                    return Err(protocol("choice index changed during streaming"))
+                    return Err(protocol("choice index changed during streaming"));
                 }
                 None => choice_index = Some(index),
                 Some(_) => {}
@@ -466,7 +466,7 @@ pub(super) async fn stream(
                 (Some(Value::Object(delta)), None) => delta,
                 (None, Some(Value::Object(message))) => message,
                 (Some(Value::Object(_)), Some(Value::Object(_))) => {
-                    return Err(protocol("choice contained both delta and final message"))
+                    return Err(protocol("choice contained both delta and final message"));
                 }
                 _ => return Err(protocol("choice was missing a delta object")),
             };
@@ -484,21 +484,21 @@ pub(super) async fn stream(
                 return Err(protocol("semantic delta arrived after finish reason"));
             }
 
-            if let Some(reason) = choice.get("finish_reason") {
-                if !reason.is_null() {
-                    let reason = reason
-                        .as_str()
-                        .ok_or_else(|| protocol("finish_reason was not a string"))?;
-                    if outcome.is_some() {
-                        return Err(protocol("received duplicate finish_reason"));
-                    }
-                    let mapped = map_finish_reason(reason)?;
-                    outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
-                        AssistantOutcome::Refused
-                    } else {
-                        mapped
-                    });
+            if let Some(reason) = choice.get("finish_reason")
+                && !reason.is_null()
+            {
+                let reason = reason
+                    .as_str()
+                    .ok_or_else(|| protocol("finish_reason was not a string"))?;
+                if outcome.is_some() {
+                    return Err(protocol("received duplicate finish_reason"));
                 }
+                let mapped = map_finish_reason(reason)?;
+                outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
+                    AssistantOutcome::Refused
+                } else {
+                    mapped
+                });
             }
         }
 

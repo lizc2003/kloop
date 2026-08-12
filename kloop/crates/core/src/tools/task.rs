@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 
+use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::Result;
 use kloop_protocol::ToolDef;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Map;
 use serde_json::Value;
+use serde_json::json;
 
 use super::ToolCtx;
 use crate::event::Event;
@@ -1248,17 +1248,19 @@ mod tests {
         assert_eq!(registry.snapshot(), before);
         assert_eq!(registry.state.read().unwrap().next_id, next_id);
 
-        assert!(registry
-            .update(
-                1,
-                TaskPatch {
-                    subject: Some("Visible revision overflow".into()),
-                    description: None,
-                    status: None,
-                    blocked_by: None,
-                },
-            )
-            .is_err());
+        assert!(
+            registry
+                .update(
+                    1,
+                    TaskPatch {
+                        subject: Some("Visible revision overflow".into()),
+                        description: None,
+                        status: None,
+                        blocked_by: None,
+                    },
+                )
+                .is_err()
+        );
         assert_eq!(registry.snapshot(), before);
         assert_eq!(registry.state.read().unwrap().next_id, next_id);
 
@@ -1310,9 +1312,11 @@ mod tests {
             assert!(!is_error, "{output}");
             let events = ui.take();
             assert_eq!(events.len(), 2);
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::TaskGraphUpdated(_)))
+            );
         }
 
         let (output, is_error) = run_tool(
@@ -1383,9 +1387,11 @@ mod tests {
             assert!(!is_error, "{output}");
             let events = ui.take();
             assert_eq!(events.len(), 2);
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::TaskGraphUpdated(_)))
+            );
         }
 
         let nonempty_before = ctx.cfg.tasks.snapshot();
@@ -1398,9 +1404,11 @@ mod tests {
             assert_eq!(ctx.cfg.tasks.state.read().unwrap().next_id, next_id);
             let events = ui.take();
             assert_eq!(events.len(), 2);
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::TaskGraphUpdated(_)))
+            );
         }
 
         let (output, is_error) = run_tool("task_clear", json!({}), &ctx).await;
@@ -1428,9 +1436,11 @@ mod tests {
             assert_eq!(ctx.cfg.tasks.snapshot(), before);
             let events = ui.take();
             assert_eq!(events.len(), 2);
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, Event::TaskGraphUpdated(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::TaskGraphUpdated(_)))
+            );
         }
     }
 

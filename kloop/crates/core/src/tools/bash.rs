@@ -11,17 +11,17 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncRead;
@@ -29,9 +29,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use super::ToolCtx;
 use super::str_arg;
 use super::strict_str_arg;
-use super::ToolCtx;
 use crate::agent::Ui;
 use crate::config::EffectiveWorkspace;
 use crate::event::BackgroundTask;
@@ -169,7 +169,9 @@ pub(super) async fn bash_tool(
 ) -> Result<String> {
     #[cfg(windows)]
     if input.get("disable_sandbox").is_some() {
-        bail!("bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented");
+        bail!(
+            "bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented"
+        );
     }
     let parsed = parse_bash_input(input)?;
     let command = parsed.command.as_str();
@@ -213,35 +215,33 @@ pub(super) async fn bash_tool(
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
     // disable_sandbox / no policy leaves `sandbox` None and skips it.
-    if let Some(policy) = &sandbox {
-        if !output.status.success()
-            && sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
-        {
-            if policy.escalate {
-                // The code-level escalation loop (codex's retry-on-denial):
-                // ask once, and on approval re-run the command unsandboxed —
-                // one fewer model round-trip than the disable_sandbox hint.
-                match workspace
-                    .permissions
-                    .escalate_sandbox(command, ctx.depth)
-                    .await
-                {
-                    EscalationOutcome::Approved => {
-                        let raw =
-                            run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel)
-                                .await?;
-                        return Ok(format!(
-                            "{}{}",
-                            sandbox::ESCALATED_PREFIX,
-                            format_output(&raw)
-                        ));
-                    }
-                    EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
-                    EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
+    if let Some(policy) = &sandbox
+        && !output.status.success()
+        && sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
+    {
+        if policy.escalate {
+            // The code-level escalation loop (codex's retry-on-denial):
+            // ask once, and on approval re-run the command unsandboxed —
+            // one fewer model round-trip than the disable_sandbox hint.
+            match workspace
+                .permissions
+                .escalate_sandbox(command, ctx.depth)
+                .await
+            {
+                EscalationOutcome::Approved => {
+                    let raw =
+                        run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel).await?;
+                    return Ok(format!(
+                        "{}{}",
+                        sandbox::ESCALATED_PREFIX,
+                        format_output(&raw)
+                    ));
                 }
-            } else {
-                text.push_str(sandbox::DENIAL_HINT);
+                EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
+                EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
             }
+        } else {
+            text.push_str(sandbox::DENIAL_HINT);
         }
     }
     Ok(text)
@@ -479,11 +479,11 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         _ => format!("{id}: {}", status_text(&status)),
     };
     let mut tail = read_tail(&path).await;
-    if let (BgStatus::Exited(code), Some(sb)) = (&status, sandboxed) {
-        if *code != Some(0) && sandbox::is_likely_sandbox_denied(*code, &tail, sb.network_disabled)
-        {
-            tail.push_str(sandbox::DENIAL_HINT);
-        }
+    if let (BgStatus::Exited(code), Some(sb)) = (&status, sandboxed)
+        && *code != Some(0)
+        && sandbox::is_likely_sandbox_denied(*code, &tail, sb.network_disabled)
+    {
+        tail.push_str(sandbox::DENIAL_HINT);
     }
     Ok(format!(
         "{status_line}\noutput file: {}\n--- output ---\n{tail}",
@@ -937,60 +937,59 @@ async fn monitor(monitor: BackgroundMonitor) {
     };
     // The session may have ended while this shell ran; if so Drop already
     // group-killed it and there is no live frontend to notify.
-    if let Some(shells) = shells.upgrade() {
-        if let Some(status) = shells.begin_finish(&id, observed) {
-            let (event_status, detail) = match &status {
-                BgStatus::Exited(Some(0)) => {
-                    (BackgroundTaskStatus::Completed, Some("exit 0".into()))
-                }
-                BgStatus::Exited(Some(code)) => {
-                    (BackgroundTaskStatus::Failed, Some(format!("exit {code}")))
-                }
-                BgStatus::Exited(None) => (
-                    BackgroundTaskStatus::Failed,
-                    Some("killed by signal".into()),
-                ),
-                BgStatus::Killed(reason) => (BackgroundTaskStatus::Cancelled, Some(reason.clone())),
-                BgStatus::Failed(reason) => (BackgroundTaskStatus::Failed, Some(reason.clone())),
-                BgStatus::Running | BgStatus::Stopping | BgStatus::Finishing => {
-                    unreachable!("monitor produced active status")
-                }
-            };
-            let status_label = match event_status {
-                BackgroundTaskStatus::Running => unreachable!("monitor emitted running"),
-                BackgroundTaskStatus::Completed => "completed",
-                BackgroundTaskStatus::Failed => "failed",
-                BackgroundTaskStatus::Cancelled => "cancelled",
-            };
-            let output_path = output_path.to_string_lossy().to_string();
-            let summary = match detail.as_deref() {
-                Some(detail) => format!("Background command {command:?} {status_label}: {detail}"),
-                None => format!("Background command {command:?} {status_label}"),
-            };
-            ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
-                id: id.clone(),
-                run_id: None,
-                kind: BackgroundTaskKind::Shell,
-                description: command,
-                status: event_status,
-                output_path: Some(output_path.clone()),
-                detail: detail.clone(),
-            }));
-            let closing = event_status == BackgroundTaskStatus::Cancelled
-                && matches!(
-                    detail.as_deref(),
-                    Some("session shutdown" | "session dropped")
-                );
-            if !closing {
-                inbox.push(InboxItem::ShellResult {
-                    id: id.clone(),
-                    status: status_label.into(),
-                    output_path,
-                    summary,
-                });
+    let live_shells = shells.upgrade();
+    if let Some(shells) = live_shells
+        && let Some(status) = shells.begin_finish(&id, observed)
+    {
+        let (event_status, detail) = match &status {
+            BgStatus::Exited(Some(0)) => (BackgroundTaskStatus::Completed, Some("exit 0".into())),
+            BgStatus::Exited(Some(code)) => {
+                (BackgroundTaskStatus::Failed, Some(format!("exit {code}")))
             }
-            debug_assert!(shells.complete_finish(&id, status));
+            BgStatus::Exited(None) => (
+                BackgroundTaskStatus::Failed,
+                Some("killed by signal".into()),
+            ),
+            BgStatus::Killed(reason) => (BackgroundTaskStatus::Cancelled, Some(reason.clone())),
+            BgStatus::Failed(reason) => (BackgroundTaskStatus::Failed, Some(reason.clone())),
+            BgStatus::Running | BgStatus::Stopping | BgStatus::Finishing => {
+                unreachable!("monitor produced active status")
+            }
+        };
+        let status_label = match event_status {
+            BackgroundTaskStatus::Running => unreachable!("monitor emitted running"),
+            BackgroundTaskStatus::Completed => "completed",
+            BackgroundTaskStatus::Failed => "failed",
+            BackgroundTaskStatus::Cancelled => "cancelled",
+        };
+        let output_path = output_path.to_string_lossy().to_string();
+        let summary = match detail.as_deref() {
+            Some(detail) => format!("Background command {command:?} {status_label}: {detail}"),
+            None => format!("Background command {command:?} {status_label}"),
+        };
+        ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+            id: id.clone(),
+            run_id: None,
+            kind: BackgroundTaskKind::Shell,
+            description: command,
+            status: event_status,
+            output_path: Some(output_path.clone()),
+            detail: detail.clone(),
+        }));
+        let closing = event_status == BackgroundTaskStatus::Cancelled
+            && matches!(
+                detail.as_deref(),
+                Some("session shutdown" | "session dropped")
+            );
+        if !closing {
+            inbox.push(InboxItem::ShellResult {
+                id: id.clone(),
+                status: status_label.into(),
+                output_path,
+                summary,
+            });
         }
+        debug_assert!(shells.complete_finish(&id, status));
     }
 }
 
@@ -1034,12 +1033,12 @@ mod tests {
     use std::path::Path;
     #[cfg(any(unix, windows))]
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     #[cfg(any(unix, windows))]
     use std::sync::atomic::AtomicUsize;
     #[cfg(any(unix, windows))]
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     #[cfg(any(unix, windows))]
     static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -1217,9 +1216,9 @@ Wait-Process -Id $grandchild.Id
     #[cfg(windows)]
     fn windows_process_alive(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
         use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
@@ -1249,11 +1248,11 @@ Wait-Process -Id $grandchild.Id
     fn terminate_windows_process(pid: u32) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::INFINITE;
         use windows_sys::Win32::System::Threading::OpenProcess;
+        use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
         use windows_sys::Win32::System::Threading::TerminateProcess;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        use windows_sys::Win32::System::Threading::INFINITE;
-        use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
 
         let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
         if process == 0 {
@@ -1999,9 +1998,9 @@ Wait-Process -Id $grandchild.Id
         use super::*;
         use crate::sandbox::SandboxPolicy;
         use crate::sandbox::WritableRoot;
+        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
-        use std::sync::Arc;
 
         /// A ctx whose bash runs sandboxed with exactly one writable root
         /// (returned canonicalized, seatbelt matches resolved paths).
@@ -2494,6 +2493,7 @@ Wait-Process -Id $grandchild.Id
         assert!(is_error);
         assert!(out.contains("no background command"), "{out}");
 
+        // Keep the test-module evidence range stable for the pinned parity corpus.
         let (out, is_error) = run_tool("bash_output", json!({}), &ctx).await;
         assert!(is_error);
         assert!(

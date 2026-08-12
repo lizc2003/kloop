@@ -608,23 +608,22 @@ impl App {
                 if !agent.is_empty() {
                     return;
                 }
-                if let Some(&i) = self.tool_cells.get(&id) {
-                    if let Some(Cell::Tool {
+                if let Some(&i) = self.tool_cells.get(&id)
+                    && let Some(Cell::Tool {
                         status: cell_status,
                         output: out,
                         ..
                     }) = self.cells.get_mut(i)
-                    {
-                        *cell_status = if status == ItemStatus::Completed {
-                            ToolStatus::Ok
-                        } else {
-                            ToolStatus::Failed
-                        };
-                        // Keep the preview for the transcript; empty output
-                        // leaves the row a single line.
-                        if let Some(text) = output {
-                            *out = Some(text);
-                        }
+                {
+                    *cell_status = if status == ItemStatus::Completed {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Failed
+                    };
+                    // Keep the preview for the transcript; empty output
+                    // leaves the row a single line.
+                    if let Some(text) = output {
+                        *out = Some(text);
                     }
                 }
             }
@@ -772,10 +771,10 @@ impl App {
                 // sub-agent's completion may never arrive: no row may outlive
                 // its turn still spinning.
                 for cell in &mut self.cells {
-                    if let Cell::Agent { status, .. } = cell {
-                        if *status == ToolStatus::Running {
-                            *status = ToolStatus::Failed;
-                        }
+                    if let Cell::Agent { status, .. } = cell
+                        && *status == ToolStatus::Running
+                    {
+                        *status = ToolStatus::Failed;
                     }
                 }
                 match reason {
@@ -922,10 +921,10 @@ impl App {
         // An open completion popup (slash `/` or file `@`) captures navigation /
         // accept / cancel; every other key falls through to edit the composer,
         // after which the tail re-syncs the popup (re-filter or close).
-        if self.popup.is_some() {
-            if let Some(cmd) = self.on_popup_key(key) {
-                return cmd;
-            }
+        if self.popup.is_some()
+            && let Some(cmd) = self.on_popup_key(key)
+        {
+            return cmd;
         }
         // A newline inside the composer instead of a submit: Ctrl+J (the reliable
         // LF), or Shift/Alt+Enter where the terminal distinguishes it (many do
@@ -1148,11 +1147,11 @@ impl App {
     /// A bracketed-paste of text (the event loop routes image-file pastes to
     /// [`App::attach_image`] instead).
     pub fn paste_text(&mut self, s: &str) -> Command {
-        if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() {
-            if matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes) {
-                question.editor.push_str(s);
-                return Command::None;
-            }
+        if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut()
+            && matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes)
+        {
+            question.editor.push_str(s);
+            return Command::None;
         }
         self.composer.paste(s);
         self.after_edit()
@@ -2678,7 +2677,10 @@ mod tests {
             cells_from_history(&messages),
             vec![
                 Cell::User("do two things".into()),
-                Cell::Thinking { text: "planning".into(), seconds: None },
+                Cell::Thinking {
+                    text: "planning".into(),
+                    seconds: None
+                },
                 Cell::Assistant("on it".into()),
                 Cell::Tool {
                     name: "bash".into(),
@@ -2949,7 +2951,7 @@ mod tests {
         let mut app = app_with_commands();
         type_str(&mut app, "/c");
         assert_eq!(app.popup.as_ref().unwrap().items.len(), 3); // cost, compact, clear
-                                                                // A printable key falls through: edits the composer, refilters the menu.
+        // A printable key falls through: edits the composer, refilters the menu.
         type_str(&mut app, "o");
         assert_eq!(app.composer.text(), "/co");
         let labels: Vec<&str> = app

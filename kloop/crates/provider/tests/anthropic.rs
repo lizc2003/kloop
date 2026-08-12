@@ -17,11 +17,11 @@ use kloop_provider::ProviderFailureKind;
 use kloop_provider::StreamResult;
 use kloop_provider::ThinkingMode;
 use serde_json::json;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn sse_body(events: &[serde_json::Value]) -> String {
     events

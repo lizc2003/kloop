@@ -4,9 +4,9 @@
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use reqwest::Url;
 
 use crate::limits;
@@ -96,11 +96,14 @@ fn same_site(from: &Url, to: &Url) -> bool {
 async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut download_truncated = false;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("web_fetch: reading body from {url} failed"))?
-    {
+    loop {
+        let next = resp
+            .chunk()
+            .await
+            .with_context(|| format!("web_fetch: reading body from {url} failed"))?;
+        let Some(chunk) = next else {
+            break;
+        };
         bytes.extend_from_slice(&chunk);
         if bytes.len() > limits::MAX_DOWNLOAD_BYTES {
             bytes.truncate(limits::MAX_DOWNLOAD_BYTES);
@@ -118,7 +121,9 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
         || content_type.contains("javascript")
         || content_type.is_empty();
     if !is_html && !is_text {
-        bail!("web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)");
+        bail!(
+            "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
+        );
     }
     let mut text = if is_html {
         crate::html::html_to_text(&raw)
@@ -239,11 +244,11 @@ fn ip_is_public(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::testutil::fetch_private;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     #[test]
     fn ip_publicness_table() {

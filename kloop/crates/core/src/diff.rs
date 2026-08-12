@@ -30,9 +30,9 @@ use serde_json::Value;
 use similar::ChangeTag;
 use similar::TextDiff;
 
-use crate::file_io::read_bounded;
 use crate::file_io::BoundedRead;
 use crate::file_io::FileReadError;
+use crate::file_io::read_bounded;
 use crate::text_edit::apply_text_edit;
 
 /// Cap on preview body lines before a `… (N more line(s))` marker. Generous:
@@ -155,12 +155,12 @@ fn oversized_file(error: &anyhow::Error) -> Option<u64> {
 /// large, or `old_string` doesn't uniquely match (the same degradation
 /// claude-code uses).
 async fn edit_preview(path: &str, old: &str, new: &str, replace_all: bool) -> String {
-    if let Ok(snapshot) = read_preview_file(path).await {
-        if let Ok(content) = String::from_utf8(snapshot.bytes) {
-            let edit = apply_text_edit(&content, old, new, replace_all);
-            if let Some(updated) = edit.updated {
-                return numbered_diff(&content, &updated);
-            }
+    if let Ok(snapshot) = read_preview_file(path).await
+        && let Ok(content) = String::from_utf8(snapshot.bytes)
+    {
+        let edit = apply_text_edit(&content, old, new, replace_all);
+        if let Some(updated) = edit.updated {
+            return numbered_diff(&content, &updated);
         }
     }
     numbered_diff(old, new)
@@ -433,15 +433,19 @@ mod tests {
         assert_eq!(preview, "-1  foo\n+1  bar");
 
         // A no-op edit and non-file tools produce nothing.
-        assert!(file_change_preview(
-            "edit_file",
-            &json!({"path": "/no/such/file", "old_string": "x", "new_string": "x"})
-        )
-        .await
-        .is_none());
-        assert!(file_change_preview("bash", &json!({"command": "ls"}))
+        assert!(
+            file_change_preview(
+                "edit_file",
+                &json!({"path": "/no/such/file", "old_string": "x", "new_string": "x"})
+            )
             .await
-            .is_none());
+            .is_none()
+        );
+        assert!(
+            file_change_preview("bash", &json!({"command": "ls"}))
+                .await
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

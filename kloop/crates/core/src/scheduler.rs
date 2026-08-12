@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Datelike, Local, TimeZone as _, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -389,8 +389,8 @@ fn unlock_store_file(file: &File) -> Result<()> {
 #[cfg(windows)]
 fn lock_store_file(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
     use windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -1372,11 +1372,13 @@ mod tests {
         fs::write(&path, b"{bad json").unwrap();
         assert!(store.load().is_err());
         assert_eq!(fs::read(&path).unwrap(), b"{bad json");
-        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".tmp-")));
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

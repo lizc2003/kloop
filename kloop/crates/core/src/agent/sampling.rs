@@ -12,8 +12,8 @@ use std::time::UNIX_EPOCH;
 
 use tokio_util::sync::CancellationToken;
 
-use super::injected_context;
 use super::Ui;
+use super::injected_context;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
 use crate::event::Delta;
@@ -120,7 +120,7 @@ pub(super) async fn sample_with_retry(
                 return Sampled::Partial {
                     error,
                     blocks: partial,
-                }
+                };
             }
             Err(SampleError::Provider(error)) => {
                 if !error.is_retryable() {

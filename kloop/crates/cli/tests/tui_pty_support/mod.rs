@@ -2,34 +2,34 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use portable_pty::native_pty_system;
+use anyhow::bail;
 use portable_pty::Child;
 use portable_pty::CommandBuilder;
 use portable_pty::ExitStatus;
 use portable_pty::MasterPty;
 use portable_pty::PtySize;
+use portable_pty::native_pty_system;
 use serde_json::Value;
 use tempfile::TempDir;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::Request;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const CPR_QUERY: &[u8] = b"\x1b[6n";
 const RAW_LIMIT: usize = 512 * 1024;
@@ -457,15 +457,15 @@ impl PtyHarness {
                 .unwrap_or_else(|error| error.into_inner());
             drop(state);
 
-            if self.exit_status.is_none() {
-                if let Some(status) = self.child.try_wait().context("poll PTY child")? {
-                    self.exit_status = Some(status.clone());
-                    bail!(
-                        "{description}: child exited early ({})\n{}\nraw: {raw_summary}",
-                        status.exit_code(),
-                        snapshot.debug_dump()
-                    );
-                }
+            if self.exit_status.is_none()
+                && let Some(status) = self.child.try_wait().context("poll PTY child")?
+            {
+                self.exit_status = Some(status.clone());
+                bail!(
+                    "{description}: child exited early ({})\n{}\nraw: {raw_summary}",
+                    status.exit_code(),
+                    snapshot.debug_dump()
+                );
             }
             if Instant::now() >= deadline {
                 bail!(

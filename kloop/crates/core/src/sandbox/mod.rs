@@ -387,8 +387,7 @@ mod tests {
             false,
         );
         let (profile, params) = seatbelt_profile(&policy);
-        let expected_dynamic =
-            "; kloop dynamic policy: full-disk read minus credentials, allow-listed writes\n\
+        let expected_dynamic = "; kloop dynamic policy: full-disk read minus credentials, allow-listed writes\n\
              (allow file-read*)\n\
              (allow file-write*\n\
              (require-all (subpath (param \"WRITABLE_ROOT_0\")) \

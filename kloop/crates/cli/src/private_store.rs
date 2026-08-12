@@ -14,10 +14,10 @@ use std::path::Path;
 #[cfg(not(any(unix, windows)))]
 use std::path::PathBuf;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 
 pub(crate) fn read_private_string(path: &Path, label: &str) -> Result<Option<String>> {
     read_private_string_impl(path, label)
@@ -494,10 +494,10 @@ struct WindowsOpenResult {
 #[cfg(windows)]
 fn validate_windows_opened_file(file: &std::fs::File, label: &str, directory: bool) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
     use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
 
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
@@ -574,11 +574,11 @@ fn open_windows_relative(
     use std::os::windows::io::AsRawHandle as _;
     use std::os::windows::io::FromRawHandle as _;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
     use windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
     use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_REPARSE_POINT;
     use windows_sys::Wdk::Storage::FileSystem::FILE_SYNCHRONOUS_IO_NONALERT;
+    use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_PATH_NOT_FOUND;
@@ -589,9 +589,9 @@ fn open_windows_relative(
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
     use windows_sys::Win32::System::Kernel::OBJ_DONT_REPARSE;
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     validate_component(name, label)?;
     let mut wide: Vec<u16> = name.encode_wide().collect();
@@ -748,9 +748,9 @@ fn rename_windows_private_file(
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0;
     use windows_sys::Win32::Storage::FileSystem::FileRenameInfo;
     use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
-    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0;
 
     #[repr(C)]
     struct RenameInfo {
@@ -789,9 +789,9 @@ fn rename_windows_private_file(
 #[cfg(windows)]
 fn delete_windows_private_file(file: &std::fs::File) {
     use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
     use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
     use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
-    use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
 
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
     let _ = unsafe {
@@ -1127,8 +1127,8 @@ fn unlock_file(file: &std::fs::File) -> Result<()> {
 #[cfg(windows)]
 fn lock_file(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
     use windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -1250,19 +1250,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join("projects/v1")).unwrap();
-        assert!(PrivateDir::open(
-            &root,
-            &[OsStr::new("projects"), OsStr::new("v1")],
-            "test private store"
-        )
-        .is_err());
+        assert!(
+            PrivateDir::open(
+                &root,
+                &[OsStr::new("projects"), OsStr::new("v1")],
+                "test private store"
+            )
+            .is_err()
+        );
 
         let fifo = root.join("projects/policy");
         let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(status.success());
-        assert!(dir
-            .read_string(OsStr::new("policy"), "test policy")
-            .is_err());
+        assert!(
+            dir.read_string(OsStr::new("policy"), "test policy")
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
     }

@@ -45,17 +45,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::bail;
 use globset::GlobMatcher;
 use serde_json::Value;
 
+use crate::shell::BashAnalysis;
 use crate::shell::analyze_bash;
 use crate::shell::argv_is_dangerous;
 use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
-use crate::shell::BashAnalysis;
 
 /// The scope a human may grant to one approval request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +334,9 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                 Ok(Rule::BashPrefix { tokens, wildcard })
             }
             "powershell" => {
-                bail!("rule '{entry}': powershell(...) prefix rules are unsupported; PowerShell v1 only accepts the whole-tool rule 'powershell'")
+                bail!(
+                    "rule '{entry}': powershell(...) prefix rules are unsupported; PowerShell v1 only accepts the whole-tool rule 'powershell'"
+                )
             }
             "write_file" | "edit_file" | "read_file" | "notebook_edit" => {
                 // Match case-insensitively on case-folding filesystems so a
@@ -1138,13 +1140,12 @@ impl CallFacts {
                 tag: "sensitive PowerShell path",
             });
         }
-        if let Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))) = &self.shell {
-            if cmds
+        if let Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))) = &self.shell
+            && cmds
                 .iter()
                 .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
-            {
-                return Some(Hazard { tag: "destructive" });
-            }
+        {
+            return Some(Hazard { tag: "destructive" });
         }
         if matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && self.path.as_ref().is_some_and(|p| p.sensitive)
@@ -1271,10 +1272,10 @@ fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
     if raw == "~" {
         return std::env::home_dir().unwrap_or_else(|| cwd.to_path_buf());
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::home_dir()
+    {
+        return home.join(rest);
     }
     lexical_normalize(cwd, Path::new(raw))
 }
@@ -1967,9 +1968,11 @@ mod tests {
             2,
             "AllowSession must not stick for sensitive paths"
         );
-        assert!(asked
-            .iter()
-            .all(|r| r.description.contains("[sensitive path]")));
+        assert!(
+            asked
+                .iter()
+                .all(|r| r.description.contains("[sensitive path]"))
+        );
         assert!(asked.iter().all(|r| r.remember_rules.is_none()));
 
         // more of the sensitive list, incl. escapes out of cwd
@@ -2037,19 +2040,23 @@ mod tests {
             Some(approver.clone()),
         )
         .unwrap();
-        assert!(permissions
-            .check("read_file", &json!({"path": alias}), 0)
-            .await
-            .is_err());
-        assert!(permissions
-            .check_call(
-                "bash",
-                &bash(&format!("cat {}", root.join("innocent.toml").display())),
-                0,
-                true,
-            )
-            .await
-            .is_err());
+        assert!(
+            permissions
+                .check("read_file", &json!({"path": alias}), 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            permissions
+                .check_call(
+                    "bash",
+                    &bash(&format!("cat {}", root.join("innocent.toml").display())),
+                    0,
+                    true,
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(approver.ask_count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2074,10 +2081,12 @@ mod tests {
             Some(approver.clone()),
         )
         .unwrap();
-        assert!(permissions
-            .check("write_file", &file("innocent/pre-commit"), 0)
-            .await
-            .is_err());
+        assert!(
+            permissions
+                .check("write_file", &file("innocent/pre-commit"), 0)
+                .await
+                .is_err()
+        );
         let asked = approver.asked();
         assert_eq!(asked.len(), 1, "sensitive alias must not auto-allow");
         assert!(asked[0].description.contains("[sensitive path]"));
@@ -2498,15 +2507,16 @@ mod tests {
 
         // Same non-readonly call, not contained: reaches the ask layer
         // (empty script = deny).
-        assert!(p
-            .check_call(
+        assert!(
+            p.check_call(
                 "bash",
                 &bash("cargo build"),
                 0,
                 /*sandbox_auto_allow*/ false
             )
             .await
-            .is_err());
+            .is_err()
+        );
         assert_eq!(approver.ask_count(), 1);
     }
 
@@ -2521,18 +2531,20 @@ mod tests {
             rules(&[], &["bash(git push *)"], &[]),
             approver.clone(),
         );
-        assert!(p
-            .check_call("bash", &bash("git push origin"), 0, true)
-            .await
-            .is_err());
+        assert!(
+            p.check_call("bash", &bash("git push origin"), 0, true)
+                .await
+                .is_err()
+        );
         assert_eq!(approver.ask_count(), 0, "deny is a verdict, not a question");
 
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(p
-            .check_call("bash", &bash("rm -rf /tmp/x"), 0, true)
-            .await
-            .is_err());
+        assert!(
+            p.check_call("bash", &bash("rm -rf /tmp/x"), 0, true)
+                .await
+                .is_err()
+        );
         assert!(approver.asked()[0].description.contains("[destructive]"));
 
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
@@ -2541,10 +2553,11 @@ mod tests {
             rules(&[], &[], &["bash(cargo publish *)"]),
             approver.clone(),
         );
-        assert!(p
-            .check_call("bash", &bash("cargo publish --dry-run"), 0, true)
-            .await
-            .is_ok());
+        assert!(
+            p.check_call("bash", &bash("cargo publish --dry-run"), 0, true)
+                .await
+                .is_ok()
+        );
         assert_eq!(
             approver.ask_count(),
             1,
@@ -2569,9 +2582,11 @@ mod tests {
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 2);
-        assert!(approver.asked()[0]
-            .description
-            .contains("[sandbox denied — run without sandbox?] bash: npm install"));
+        assert!(
+            approver.asked()[0]
+                .description
+                .contains("[sandbox denied — run without sandbox?] bash: npm install")
+        );
 
         // Bypass (--permission-mode bypass): escalate without asking.
         let approver = ScriptedApprover::new(vec![]);
@@ -2618,10 +2633,11 @@ mod tests {
     async fn allow_all_skips_every_layer() {
         let p = Permissions::allow_all();
         assert!(p.check("bash", &bash("rm -rf /"), 0).await.is_ok());
-        assert!(p
-            .check("write_file", &file(".git/hooks/x"), 0)
-            .await
-            .is_ok());
+        assert!(
+            p.check("write_file", &file(".git/hooks/x"), 0)
+                .await
+                .is_ok()
+        );
     }
 
     // ── plan mode ───────────────────────────────────────────────────────
@@ -2816,17 +2832,21 @@ mod tests {
             assert_eq!(approver.ask_count(), 1, "{mode:?} must ask");
             let request = &approver.asked()[0];
             assert_eq!(request.remember_rules, None);
-            assert!(request
-                .description
-                .contains("[unclassified PowerShell] powershell: Get-ChildItem"));
+            assert!(
+                request
+                    .description
+                    .contains("[unclassified PowerShell] powershell: Get-ChildItem")
+            );
         }
 
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(permissions
-            .check_call("powershell", &input, 0, /*sandbox_auto_allow*/ true)
-            .await
-            .is_ok());
+        assert!(
+            permissions
+                .check_call("powershell", &input, 0, /*sandbox_auto_allow*/ true)
+                .await
+                .is_ok()
+        );
         assert_eq!(approver.ask_count(), 1, "sandbox auto-allow never applies");
     }
 
@@ -2873,10 +2893,12 @@ mod tests {
             2,
             "opaque PowerShell is neither cached nor persisted"
         );
-        assert!(approver
-            .asked()
-            .iter()
-            .all(|request| request.remember_rules.is_none()));
+        assert!(
+            approver
+                .asked()
+                .iter()
+                .all(|request| request.remember_rules.is_none())
+        );
     }
 
     #[tokio::test]
@@ -2895,10 +2917,12 @@ mod tests {
                 rules(&["powershell"], &[], &[]),
                 approver.clone(),
             );
-            assert!(permissions
-                .check("powershell", &json!({"command": command}), 0)
-                .await
-                .is_ok());
+            assert!(
+                permissions
+                    .check("powershell", &json!({"command": command}), 0)
+                    .await
+                    .is_ok()
+            );
             assert_eq!(approver.ask_count(), 1, "{command}");
             let request = &approver.asked()[0];
             assert!(request.description.contains("[sensitive PowerShell path]"));

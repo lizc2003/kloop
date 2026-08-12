@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use kloop_protocol::{AssistantBlock, ContentBlock, Message};
 use kloop_provider::{MockTurn, Provider};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::testutil::{run_tool, test_ctx};
-use super::{all_tool_defs, is_concurrency_safe, ToolCtx};
-use crate::agent::{run_structured_turn, run_turn, EndReason, Ui};
+use super::{ToolCtx, all_tool_defs, is_concurrency_safe};
+use crate::agent::{EndReason, Ui, run_structured_turn, run_turn};
 use crate::config::SurfaceCapabilities;
 use crate::event::{BackgroundTaskStatus, Event};
 use crate::history::History;
@@ -206,18 +206,26 @@ fn native_surface_report() -> Value {
         "exit_plan_mode",
         "workflow",
     ];
-    assert!(names
-        .iter()
-        .all(|name| enabled.iter().any(|definition| definition.name == *name)));
-    assert!(names
-        .iter()
-        .all(|name| disabled.iter().all(|definition| definition.name != *name)));
-    assert!(names
-        .iter()
-        .all(|name| depth_one.iter().all(|definition| definition.name != *name)));
-    assert!(enabled
-        .iter()
-        .all(|definition| definition.name != "structured_output"));
+    assert!(
+        names
+            .iter()
+            .all(|name| enabled.iter().any(|definition| definition.name == *name))
+    );
+    assert!(
+        names
+            .iter()
+            .all(|name| disabled.iter().all(|definition| definition.name != *name))
+    );
+    assert!(
+        names
+            .iter()
+            .all(|name| depth_one.iter().all(|definition| definition.name != *name))
+    );
+    assert!(
+        enabled
+            .iter()
+            .all(|definition| definition.name != "structured_output")
+    );
     let run_program = enabled
         .iter()
         .find(|definition| definition.name == "run_program")
@@ -455,11 +463,13 @@ async fn workflow_report() -> Value {
     }
     assert_eq!(context.cfg.background_executions.running_count(), 0);
     let items = context.cfg.inbox.drain();
-    let [InboxItem::WorkflowResult {
-        summary,
-        output_path,
-        ..
-    }] = items.as_slice()
+    let [
+        InboxItem::WorkflowResult {
+            summary,
+            output_path,
+            ..
+        },
+    ] = items.as_slice()
     else {
         panic!("expected one Workflow result: {items:?}")
     };
@@ -574,10 +584,12 @@ async fn structured_output_report() -> Value {
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.structured_output, Some(json!({"count": 53})));
     assert_eq!(seen.lock().unwrap().len(), 2);
-    assert!(seen.lock().unwrap().iter().all(|request| request
-        .tools
-        .iter()
-        .any(|definition| definition.name == "structured_output" && definition.schema == schema)));
+    assert!(seen.lock().unwrap().iter().all(|request| {
+        request
+            .tools
+            .iter()
+            .any(|definition| definition.name == "structured_output" && definition.schema == schema)
+    }));
     assert!(matches!(
         &history.messages()[2].content[0],
         ContentBlock::ToolResult { is_error: true, .. }
@@ -607,10 +619,12 @@ async fn structured_output_report() -> Value {
     )
     .await;
     assert_eq!(ordinary.reason, EndReason::Completed);
-    assert!(ordinary_seen.lock().unwrap()[0]
-        .tools
-        .iter()
-        .all(|definition| definition.name != "structured_output"));
+    assert!(
+        ordinary_seen.lock().unwrap()[0]
+            .tools
+            .iter()
+            .all(|definition| definition.name != "structured_output")
+    );
 
     json!({
         "ordinary_turn_absent": true,

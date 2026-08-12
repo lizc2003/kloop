@@ -2,9 +2,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::bail;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellFlavor {
@@ -358,10 +358,10 @@ fn discover_git_bash(env: &ShellDiscoveryEnv) -> Option<ShellProgram> {
     if let Some(path) = &env.path {
         for dir in std::env::split_paths(path) {
             let git = dir.join("git.exe");
-            if git.is_file() {
-                if let Some(root) = git_install_root(&git) {
-                    push_unique(&mut roots, root);
-                }
+            if git.is_file()
+                && let Some(root) = git_install_root(&git)
+            {
+                push_unique(&mut roots, root);
             }
         }
     }
@@ -555,15 +555,15 @@ fn validate_absolute_regular(path: &Path, label: &str) -> Result<()> {
 fn powershell_executable_version(path: &Path) -> PowerShellVersionProbe {
     use std::os::windows::ffi::OsStrExt as _;
 
-    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::ERROR_RESOURCE_DATA_NOT_FOUND;
     use windows_sys::Win32::Foundation::ERROR_RESOURCE_LANG_NOT_FOUND;
     use windows_sys::Win32::Foundation::ERROR_RESOURCE_NAME_NOT_FOUND;
     use windows_sys::Win32::Foundation::ERROR_RESOURCE_TYPE_NOT_FOUND;
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::GetFileVersionInfoSizeW;
     use windows_sys::Win32::Storage::FileSystem::GetFileVersionInfoW;
-    use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
     use windows_sys::Win32::Storage::FileSystem::VS_FIXEDFILEINFO;
+    use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
 
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut ignored = 0u32;

@@ -11,12 +11,12 @@ use std::time::Duration;
 use chrono::{TimeZone as _, Utc};
 use kloop_protocol::{AssistantBlock, ContentBlock, Message};
 use kloop_provider::Provider;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::testutil::{run_tool, test_ctx};
-use super::{all_tool_defs, is_concurrency_safe, ToolCtx};
-use crate::agent::{run_turn, Ui};
+use super::{ToolCtx, all_tool_defs, is_concurrency_safe};
+use crate::agent::{Ui, run_turn};
 use crate::config::SurfaceCapabilities;
 use crate::event::{Event, ScheduledTaskStatus};
 use crate::history::History;
@@ -172,9 +172,11 @@ fn schema_report() -> Value {
     assert_eq!(scheduler[1].schema["required"], json!(["id"]));
     assert!(scheduler[2].schema.get("required").is_none());
     assert!(scheduler[3].schema.get("required").is_none());
-    assert!(scheduler
-        .iter()
-        .all(|definition| definition.schema["additionalProperties"] == false));
+    assert!(
+        scheduler
+            .iter()
+            .all(|definition| definition.schema["additionalProperties"] == false)
+    );
     let depth_one = all_tool_defs(
         1,
         &[],
@@ -182,9 +184,11 @@ fn schema_report() -> Value {
         surface,
         &crate::shell_programs::ShellPrograms::native_posix(),
     );
-    assert!(names
-        .iter()
-        .all(|name| !depth_one.iter().any(|definition| definition.name == *name)));
+    assert!(
+        names
+            .iter()
+            .all(|name| !depth_one.iter().any(|definition| definition.name == *name))
+    );
     let disabled = all_tool_defs(
         0,
         &[],
@@ -192,9 +196,11 @@ fn schema_report() -> Value {
         Default::default(),
         &crate::shell_programs::ShellPrograms::native_posix(),
     );
-    assert!(names
-        .iter()
-        .all(|name| !disabled.iter().any(|definition| definition.name == *name)));
+    assert!(
+        names
+            .iter()
+            .all(|name| !disabled.iter().any(|definition| definition.name == *name))
+    );
     let run_program = definitions
         .iter()
         .find(|definition| definition.name == "run_program")
@@ -536,11 +542,13 @@ async fn durable_report() -> Value {
     );
     assert!(corrupt.bind_owner("owner-a").is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"{bad json");
-    assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".tmp-")));
+    assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")
+    }));
 
     json!({
         "session_file_written": false,
@@ -602,11 +610,12 @@ async fn permission_report() -> Value {
     let plan =
         Permissions::new(Mode::Plan, &PermissionRules::default(), cwd.clone(), None).unwrap();
     for name in ["cron_create", "cron_delete", "schedule_wakeup"] {
-        assert!(plan
-            .check(name, &json!({}), 0)
-            .await
-            .unwrap_err()
-            .contains("plan mode"));
+        assert!(
+            plan.check(name, &json!({}), 0)
+                .await
+                .unwrap_err()
+                .contains("plan mode")
+        );
     }
     assert!(plan.check("cron_list", &json!({}), 0).await.is_ok());
 
@@ -620,11 +629,12 @@ async fn permission_report() -> Value {
         None,
     )
     .unwrap();
-    assert!(deny
-        .check("cron_create", &json!({}), 0)
-        .await
-        .unwrap_err()
-        .contains("deny permission rule"));
+    assert!(
+        deny.check("cron_create", &json!({}), 0)
+            .await
+            .unwrap_err()
+            .contains("deny permission rule")
+    );
 
     let approver = ScriptedApprover::new([Decision::Deny]);
     let ask = Permissions::new(
@@ -637,11 +647,12 @@ async fn permission_report() -> Value {
         Some(approver.clone()),
     )
     .unwrap();
-    assert!(ask
-        .check("schedule_wakeup", &json!({}), 0)
-        .await
-        .unwrap_err()
-        .contains("declined"));
+    assert!(
+        ask.check("schedule_wakeup", &json!({}), 0)
+            .await
+            .unwrap_err()
+            .contains("declined")
+    );
     assert_eq!(approver.requests.lock().unwrap().len(), 1);
 
     json!({
@@ -695,9 +706,11 @@ async fn loop_report() -> Value {
     let seconds =
         crate::commands::run("/loop 30s check", &mut history, &context.cfg, &cancel).await;
     assert!(seconds.run_turn.is_none());
-    assert!(seconds
-        .output
-        .contains("minimum fixed interval is 1 minute"));
+    assert!(
+        seconds
+            .output
+            .contains("minimum fixed interval is 1 minute")
+    );
 
     json!({
         "first_tick_now": true,

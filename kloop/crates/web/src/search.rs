@@ -4,9 +4,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use reqwest::Url;
 use serde_json::Value;
 
@@ -128,11 +128,14 @@ async fn send_and_parse(req: reqwest::RequestBuilder, name: &str) -> Result<Valu
         .with_context(|| format!("web_search: request to {name} failed"))?;
     let status = resp.status();
     let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("web_search: reading {name} response failed"))?
-    {
+    loop {
+        let next = resp
+            .chunk()
+            .await
+            .with_context(|| format!("web_search: reading {name} response failed"))?;
+        let Some(chunk) = next else {
+            break;
+        };
         if body.len().saturating_add(chunk.len()) > limits::MAX_DOWNLOAD_BYTES {
             bail!("web_search: {name} response exceeded 5MB");
         }
@@ -258,13 +261,13 @@ impl SearchBackend for Tavily {
 mod tests {
     use super::*;
     use serde_json::json;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
     use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::matchers::query_param;
-    use wiremock::Mock;
-    use wiremock::MockServer;
-    use wiremock::ResponseTemplate;
 
     fn brave_at(server: &MockServer) -> Brave {
         Brave::with_base("test-key".into(), server.uri())

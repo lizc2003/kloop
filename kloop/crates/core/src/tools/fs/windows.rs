@@ -5,12 +5,10 @@ use std::os::windows::io::AsRawHandle as _;
 use std::os::windows::io::FromRawHandle as _;
 use std::ptr;
 
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::bail;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
-use windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile;
 use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
 use windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
@@ -18,19 +16,15 @@ use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_IF;
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_REPARSE_POINT;
 use windows_sys::Wdk::Storage::FileSystem::FILE_SYNCHRONOUS_IO_NONALERT;
-use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
+use windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile;
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
 use windows_sys::Win32::Foundation::UNICODE_STRING;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-use windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
-use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
-use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
-use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
-use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
-use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
@@ -49,10 +43,16 @@ use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_MODE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO;
+use windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
+use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
+use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
+use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
+use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
+use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 
 use crate::file_state::FileIdentity;
 
@@ -398,7 +398,8 @@ fn raw_handle(file: &std::fs::File) -> HANDLE {
 }
 
 unsafe fn file_from_handle(handle: HANDLE) -> std::fs::File {
-    std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void)
+    // SAFETY: callers validate a live handle and transfer its ownership exactly once.
+    unsafe { std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void) }
 }
 
 #[cfg(test)]

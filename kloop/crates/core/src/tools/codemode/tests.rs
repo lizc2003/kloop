@@ -10,6 +10,8 @@ use crate::event::ItemStatus;
 use crate::permissions::Mode;
 use crate::permissions::PermissionRules;
 use crate::permissions::Permissions;
+use crate::tools::ToolCtx;
+use crate::tools::ToolSource;
 #[cfg(windows)]
 use crate::tools::testutil::assert_powershell_done;
 #[cfg(windows)]
@@ -21,8 +23,6 @@ use crate::tools::testutil::with_defer_threshold;
 #[cfg(windows)]
 use crate::tools::testutil::with_powershell_gate_probe;
 use crate::tools::testutil::with_provider;
-use crate::tools::ToolCtx;
-use crate::tools::ToolSource;
 use kloop_protocol::ToolDef;
 
 use super::*;

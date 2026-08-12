@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalAgentMessage;
@@ -954,29 +954,33 @@ mod tests {
         assert_eq!(root.list_agents().unwrap().len(), 2);
         assert_eq!(left.list_agents().unwrap().len(), 2);
         drop(left_lease);
-        assert!(!root
-            .directory
-            .state
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(left.agent_id()));
+        assert!(
+            !root
+                .directory
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(left.agent_id())
+        );
         assert_eq!(right.list_agents().unwrap().len(), 1);
         assert_eq!(right.list_agents().unwrap()[0].id, LocalAgentId::Main);
         let ui_trait: Arc<dyn Ui> = ui.clone();
-        assert!(root
-            .send(
+        assert!(
+            root.send(
                 left.agent_id().clone(),
                 "closed".into(),
                 "x".into(),
                 &ui_trait,
             )
             .unwrap_err()
-            .contains("not a live local Agent"));
-        assert!(root
-            .send(LocalAgentId::Main, "self".into(), "x".into(), &ui_trait,)
-            .unwrap_err()
-            .contains("self"));
+            .contains("not a live local Agent")
+        );
+        assert!(
+            root.send(LocalAgentId::Main, "self".into(), "x".into(), &ui_trait,)
+                .unwrap_err()
+                .contains("self")
+        );
     }
 
     #[test]
@@ -1160,24 +1164,26 @@ mod tests {
         assert!(agent_type.len() <= MAX_SUMMARY_BYTES);
         assert!(!roster[0].description.contains('\n'));
         assert!(roster[0].description.chars().count() <= MAX_SUMMARY_CHARS);
-        assert!(root
-            .send(
+        assert!(
+            root.send(
                 context.agent_id().clone(),
                 "bad\u{2028}summary".into(),
                 "body".into(),
                 &ui_trait,
             )
             .unwrap_err()
-            .contains("single line"));
-        assert!(root
-            .send(
+            .contains("single line")
+        );
+        assert!(
+            root.send(
                 context.agent_id().clone(),
                 "summary".into(),
                 "body\u{0000}".into(),
                 &ui_trait,
             )
             .unwrap_err()
-            .contains("control"));
+            .contains("control")
+        );
         assert!(ui.0.lock().unwrap().is_empty());
     }
 
@@ -1203,15 +1209,16 @@ mod tests {
         let second = target.claim_boundary().unwrap();
         assert_eq!(second.items().len(), 1);
         second.commit(&ui_trait);
-        assert!(root
-            .send(
+        assert!(
+            root.send(
                 target.agent_id().clone(),
                 "too large".into(),
                 "x".repeat(MAX_MESSAGE_BYTES + 1),
                 &ui_trait,
             )
             .unwrap_err()
-            .contains("8192-byte"));
+            .contains("8192-byte")
+        );
 
         let mailbox_root = LocalAgentContext::root(Arc::new(Inbox::default()));
         let (mailbox, _, _mailbox_lease) = child(&mailbox_root, 11, &ui);
@@ -1225,15 +1232,17 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(mailbox_root
-            .send(
-                mailbox.agent_id().clone(),
-                "mailbox bytes".into(),
-                "x".into(),
-                &ui_trait,
-            )
-            .unwrap_err()
-            .contains("131072-byte"));
+        assert!(
+            mailbox_root
+                .send(
+                    mailbox.agent_id().clone(),
+                    "mailbox bytes".into(),
+                    "x".into(),
+                    &ui_trait,
+                )
+                .unwrap_err()
+                .contains("131072-byte")
+        );
 
         let session_root = LocalAgentContext::root(Arc::new(Inbox::default()));
         let (sender, _, _sender_lease) = child(&session_root, 12, &ui);
@@ -1250,15 +1259,17 @@ mod tests {
             let batch = receiver.claim_boundary().unwrap();
             batch.commit(&ui_trait);
         }
-        assert!(session_root
-            .send(
-                receiver.agent_id().clone(),
-                "session body overflow".into(),
-                "x".into(),
-                &ui_trait,
-            )
-            .unwrap_err()
-            .contains("524288-byte"));
+        assert!(
+            session_root
+                .send(
+                    receiver.agent_id().clone(),
+                    "session body overflow".into(),
+                    "x".into(),
+                    &ui_trait,
+                )
+                .unwrap_err()
+                .contains("524288-byte")
+        );
     }
 
     #[test]
@@ -1281,25 +1292,29 @@ mod tests {
                 let batch = root.claim_boundary().unwrap();
                 batch.commit(&ui_trait);
             }
-            assert!(sender
+            assert!(
+                sender
+                    .send(
+                        LocalAgentId::Main,
+                        "sender overflow".into(),
+                        "x".into(),
+                        &ui_trait,
+                    )
+                    .unwrap_err()
+                    .contains("64-message")
+            );
+        }
+        assert!(
+            senders[4]
                 .send(
                     LocalAgentId::Main,
-                    "sender overflow".into(),
+                    "session overflow".into(),
                     "x".into(),
                     &ui_trait,
                 )
                 .unwrap_err()
-                .contains("64-message"));
-        }
-        assert!(senders[4]
-            .send(
-                LocalAgentId::Main,
-                "session overflow".into(),
-                "x".into(),
-                &ui_trait,
-            )
-            .unwrap_err()
-            .contains("256-message"));
+                .contains("256-message")
+        );
         drop(leases);
     }
 
@@ -1318,15 +1333,16 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(root
-            .send(
+        assert!(
+            root.send(
                 agent.agent_id().clone(),
                 "overflow".into(),
                 "x".into(),
                 &ui_trait,
             )
             .unwrap_err()
-            .contains("32 pending"));
+            .contains("32 pending")
+        );
         let batch = agent.claim_boundary().unwrap();
         assert_eq!(batch.items().len(), MAX_BOUNDARY_MESSAGES);
         batch.commit(&ui_trait);

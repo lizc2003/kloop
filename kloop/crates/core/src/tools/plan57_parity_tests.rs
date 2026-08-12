@@ -5,23 +5,23 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolResultContent;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
+use super::ToolCtx;
 use super::all_tool_defs;
 use super::dispatch_tools;
 use super::testutil::git_ctx;
 use super::testutil::run_tool;
 use super::testutil::temp_git_repo;
 use super::testutil::test_ctx;
-use super::ToolCtx;
 use crate::agent::Ui;
 use crate::event::Event;
 use crate::event::Item;
@@ -201,9 +201,11 @@ fn schema_report() -> Value {
         Default::default(),
         &crate::shell_programs::ShellPrograms::native_posix(),
     );
-    assert!(depth_one
-        .iter()
-        .any(|definition| definition.name == "notebook_edit"));
+    assert!(
+        depth_one
+            .iter()
+            .any(|definition| definition.name == "notebook_edit")
+    );
     json!({
         "name": notebook.name,
         "schema": notebook.schema,
@@ -312,16 +314,20 @@ async fn mutation_report() -> Value {
     assert_eq!(value["cells"][2]["outputs"], json!([]));
     assert_eq!(value["cells"][2]["metadata"]["collapsed"], false);
     assert_eq!(value["unknown_top"]["preserve"], true);
-    assert!(value["cells"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|cell| cell["id"] != "raw-003"));
+    assert!(
+        value["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|cell| cell["id"] != "raw-003")
+    );
     let inserted_id = value["cells"][1]["id"].as_str().unwrap();
     assert_eq!(inserted_id.len(), 8);
-    assert!(inserted_id
-        .chars()
-        .all(|character| character.is_ascii_hexdigit()));
+    assert!(
+        inserted_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
     assert!(!std::fs::read(&path).unwrap().ends_with(b"\n"));
 
     json!({
@@ -554,10 +560,12 @@ async fn permission_report() -> Value {
     assert!(requests[0].description.contains("notebook_edit"));
     assert!(requests[0].description.contains(&absolute));
     assert!(!requests[0].description.contains("/sub/../"));
-    assert!(requests[0]
-        .preview
-        .as_deref()
-        .is_some_and(|preview| preview.starts_with("(replace notebook cell code-002)")));
+    assert!(
+        requests[0]
+            .preview
+            .as_deref()
+            .is_some_and(|preview| preview.starts_with("(replace notebook cell code-002)"))
+    );
 
     let accept = Permissions::new(
         Mode::AcceptEdits,
@@ -566,14 +574,16 @@ async fn permission_report() -> Value {
         None,
     )
     .unwrap();
-    assert!(accept
-        .check(
-            "notebook_edit",
-            &json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
-            0,
-        )
-        .await
-        .is_ok());
+    assert!(
+        accept
+            .check(
+                "notebook_edit",
+                &json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
+                0,
+            )
+            .await
+            .is_ok()
+    );
     let plan = Permissions::new(
         Mode::Plan,
         &PermissionRules::default(),

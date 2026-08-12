@@ -1,23 +1,23 @@
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use super::ToolCtx;
 use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
 use super::str_arg;
-use super::ToolCtx;
-use crate::agent::run_structured_turn;
-use crate::agent::run_turn;
 use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
+use crate::agent::run_structured_turn;
+use crate::agent::run_turn;
 use crate::agent_type::AgentType;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
@@ -29,8 +29,8 @@ use crate::event::Item;
 use crate::event::ItemStatus;
 use crate::history::History;
 use crate::inbox::InboxItem;
-use crate::rollout::session_path;
 use crate::rollout::Rollout;
+use crate::rollout::session_path;
 use crate::skills::Skill;
 use crate::worktree;
 use kloop_protocol::Message;
@@ -226,6 +226,7 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
             let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
+
             run_structured_turn(&sub_cfg, &mut history, &ui, &cancel, depth, schema).await
         }
     });
@@ -446,6 +447,7 @@ async fn run_sub_agent_sync(
             let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
+
             run_turn(&sub_cfg, &mut history, &ui, &cancel, depth).await
         }
     });
@@ -613,6 +615,7 @@ async fn spawn_background(
             let _lease = lease;
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
+
             run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await
         }
     });
@@ -702,11 +705,11 @@ async fn spawn_background(
 /// dropped rollout leaves the sub-agent in-memory, exactly as before.
 fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> History {
     let mut history = History::new(cfg.offload_dir.clone());
-    if let Some(parent_line) = subagent_of {
-        if !cfg.session_id.is_empty() {
-            let path = session_path(&cfg.sessions_dir, &child_session_id(cfg, agent));
-            history.attach_rollout(Rollout::new_subagent(path, parent_line.to_string()));
-        }
+    if let Some(parent_line) = subagent_of
+        && !cfg.session_id.is_empty()
+    {
+        let path = session_path(&cfg.sessions_dir, &child_session_id(cfg, agent));
+        history.attach_rollout(Rollout::new_subagent(path, parent_line.to_string()));
     }
     history
 }
@@ -768,15 +771,15 @@ fn background_terminal_detail(
     cleanup_detail: Option<String>,
 ) -> Option<String> {
     let mut detail = execution_status_detail(status);
-    if status == ExecutionStatus::Aborted {
-        if let Some(cleanup) = cleanup_detail {
-            match &mut detail {
-                Some(text) => {
-                    text.push_str(": ");
-                    text.push_str(&cleanup);
-                }
-                None => detail = Some(cleanup),
+    if status == ExecutionStatus::Aborted
+        && let Some(cleanup) = cleanup_detail
+    {
+        match &mut detail {
+            Some(text) => {
+                text.push_str(": ");
+                text.push_str(&cleanup);
             }
+            None => detail = Some(cleanup),
         }
     }
     detail
@@ -1041,13 +1044,15 @@ mod tests {
             &["add", "active-only.txt"][..],
             &["commit", "-qm", "active-only"],
         ] {
-            assert!(std::process::Command::new("git")
-                .arg("-C")
-                .arg(&active)
-                .args(args)
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&active)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
 
         let (out, is_error) = run_tool(
@@ -1716,10 +1721,12 @@ mod tests {
         assert_eq!(task["task"]["status"], "pending");
         let delivered = ctx.cfg.inbox.drain();
         assert_eq!(delivered.len(), 1);
-        assert!(delivered[0]
-            .clone()
-            .into_message()
-            .contains("background task done"));
+        assert!(
+            delivered[0]
+                .clone()
+                .into_message()
+                .contains("background task done")
+        );
 
         let (updated, is_error) = run_tool(
             "task_update",
@@ -2004,8 +2011,8 @@ mod tests {
     #[tokio::test]
     async fn subagent_persists_to_its_own_session_file() {
         use crate::rollout::{
-            is_subagent_session, load_session, session_id_of, session_origin, sessions_by_recency,
-            SessionOrigin,
+            SessionOrigin, is_subagent_session, load_session, session_id_of, session_origin,
+            sessions_by_recency,
         };
 
         let root = std::env::temp_dir().join(format!("kloop-subpersist-{}", std::process::id()));

@@ -17,8 +17,8 @@
 
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 use kloop_core::agent::EndReason;
 use kloop_core::event::Delta;

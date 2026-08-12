@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
+use anyhow::anyhow;
+use anyhow::bail;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use indexmap::IndexMap;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolResultContent;
@@ -135,30 +135,30 @@ pub(super) fn read_notebook(bytes: &[u8]) -> Result<NotebookReadOutput> {
             &mut blocks,
             format!("<cell id=\"{escaped_id}\">{tags}{source}</cell id=\"{escaped_id}\">"),
         );
-        if cell_type == "code" {
-            if let Some(outputs) = object.get("outputs") {
-                for output in outputs
-                    .as_array()
-                    .with_context(|| format!("Notebook code cell {id} has non-array outputs"))?
-                {
-                    let (text, output_images) = render_output(output, &id)?;
-                    if let Some(text) = text.filter(|text| !text.is_empty()) {
-                        push_merged_text(&mut blocks, format!("\n{text}"));
+        if cell_type == "code"
+            && let Some(outputs) = object.get("outputs")
+        {
+            for output in outputs
+                .as_array()
+                .with_context(|| format!("Notebook code cell {id} has non-array outputs"))?
+            {
+                let (text, output_images) = render_output(output, &id)?;
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    push_merged_text(&mut blocks, format!("\n{text}"));
+                }
+                for image in output_images {
+                    image_count += 1;
+                    total_image_bytes = total_image_bytes.saturating_add(image.len());
+                    if image_count > MAX_NOTEBOOK_IMAGES
+                        || total_image_bytes > MAX_NOTEBOOK_IMAGE_BYTES
+                    {
+                        bail!(
+                            "Notebook images exceed the bounded result limit ({MAX_NOTEBOOK_IMAGES} images or {MAX_NOTEBOOK_IMAGE_BYTES} decoded bytes)"
+                        );
                     }
-                    for image in output_images {
-                        image_count += 1;
-                        total_image_bytes = total_image_bytes.saturating_add(image.len());
-                        if image_count > MAX_NOTEBOOK_IMAGES
-                            || total_image_bytes > MAX_NOTEBOOK_IMAGE_BYTES
-                        {
-                            bail!(
-                                "Notebook images exceed the bounded result limit ({MAX_NOTEBOOK_IMAGES} images or {MAX_NOTEBOOK_IMAGE_BYTES} decoded bytes)"
-                            );
-                        }
-                        blocks.push(image_block_from_bytes(&image).with_context(|| {
-                            format!("Notebook code cell {id} contains an invalid image output")
-                        })?);
-                    }
+                    blocks.push(image_block_from_bytes(&image).with_context(|| {
+                        format!("Notebook code cell {id} contains an invalid image output")
+                    })?);
                 }
             }
         }
@@ -717,9 +717,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&inserted.bytes).unwrap();
         let id = value["cells"][1]["id"].as_str().unwrap();
         assert_eq!(id.len(), 8);
-        assert!(id
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
         assert_eq!(value["cells"][1]["execution_count"], Value::Null);
         assert_eq!(value["cells"][1]["outputs"], json!([]));
 
@@ -774,10 +775,12 @@ mod tests {
         .unwrap();
         let output = read_notebook(&bytes).unwrap();
         assert!(!output.editable);
-        assert!(output
-            .content
-            .as_text()
-            .contains("[notebook output truncated"));
+        assert!(
+            output
+                .content
+                .as_text()
+                .contains("[notebook output truncated")
+        );
     }
 
     #[test]

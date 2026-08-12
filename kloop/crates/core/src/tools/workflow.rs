@@ -1,19 +1,20 @@
 //! Standalone, always-background Workflow orchestration.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::ToolCtx;
 use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
 use super::codemode::journal::Claim;
@@ -23,7 +24,6 @@ use super::run_store::RunId;
 use super::run_store::RunLease;
 use super::run_store::RunNamespace;
 use super::run_store::RunStore;
-use super::ToolCtx;
 use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
@@ -247,6 +247,7 @@ fn launch_workflow(
     let worker_cancel = cancel.clone();
     let worker = tokio::spawn(async move {
         let _lease = lease;
+
         kloop_codemode::run_workflow(&prepared, &args, bridge, worker_cancel, limits).await
     });
     background_executions.attach_abort(&task_id, worker.abort_handle());
@@ -673,12 +674,14 @@ mod tests {
 
         wait_idle(&ctx).await;
         let items = ctx.cfg.inbox.drain();
-        let [InboxItem::WorkflowResult {
-            task_id,
-            run_id,
-            summary,
-            output_path,
-        }] = items.as_slice()
+        let [
+            InboxItem::WorkflowResult {
+                task_id,
+                run_id,
+                summary,
+                output_path,
+            },
+        ] = items.as_slice()
         else {
             panic!("expected one Workflow result: {items:?}");
         };
@@ -700,12 +703,16 @@ mod tests {
         let events = ui.background();
         assert!(events.len() >= 3, "{events:?}");
         assert!(events.iter().all(|event| event.id == launched_task_id));
-        assert!(events
-            .iter()
-            .all(|event| event.run_id.as_deref() == Some(launched_run_id.as_str())));
-        assert!(events
-            .iter()
-            .all(|event| event.description == "return marker"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.run_id.as_deref() == Some(launched_run_id.as_str()))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.description == "return marker")
+        );
         assert_eq!(
             events.first().unwrap().status,
             BackgroundTaskStatus::Running
@@ -738,12 +745,14 @@ mod tests {
         wait_idle(&ctx).await;
 
         let items = ctx.cfg.inbox.drain();
-        let [InboxItem::WorkflowResult {
-            task_id: inbox_task,
-            run_id: inbox_run,
-            summary,
-            output_path,
-        }] = items.as_slice()
+        let [
+            InboxItem::WorkflowResult {
+                task_id: inbox_task,
+                run_id: inbox_run,
+                summary,
+                output_path,
+            },
+        ] = items.as_slice()
         else {
             panic!("expected failed Workflow result: {items:?}");
         };
@@ -751,18 +760,24 @@ mod tests {
         assert_eq!(inbox_run, &run_id);
         assert!(summary.contains("boom-53"), "{summary}");
         assert!(output_path.ends_with("error.txt"), "{output_path}");
-        assert!(std::fs::read_to_string(output_path)
-            .unwrap()
-            .contains("boom-53"));
+        assert!(
+            std::fs::read_to_string(output_path)
+                .unwrap()
+                .contains("boom-53")
+        );
 
         let events = ui.background();
         assert!(events.iter().all(|event| event.id == task_id));
-        assert!(events
-            .iter()
-            .all(|event| event.run_id.as_deref() == Some(run_id.as_str())));
-        assert!(events
-            .iter()
-            .all(|event| event.description == "expected failure"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.run_id.as_deref() == Some(run_id.as_str()))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.description == "expected failure")
+        );
         assert_eq!(
             events
                 .iter()
@@ -956,9 +971,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!events
-            .iter()
-            .any(|event| event.status == BackgroundTaskStatus::Completed));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == BackgroundTaskStatus::Completed)
+        );
         if let Some(path) = launched
             .lines()
             .find_map(|line| line.strip_prefix("Script file: "))
@@ -1016,9 +1033,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!events
-            .iter()
-            .any(|event| event.status == BackgroundTaskStatus::Completed));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == BackgroundTaskStatus::Completed)
+        );
         let script_path = launch_value(&launched, "Script file: ");
         if let Some(path) = std::path::Path::new(script_path).parent() {
             let _ = std::fs::remove_dir_all(path);
@@ -1113,11 +1132,13 @@ mod tests {
         wait_idle(&ctx).await;
         assert_eq!(miss_seen.lock().unwrap().len(), 1);
         let miss = ctx.cfg.inbox.drain();
-        let [InboxItem::WorkflowResult {
-            summary,
-            output_path,
-            ..
-        }] = miss.as_slice()
+        let [
+            InboxItem::WorkflowResult {
+                summary,
+                output_path,
+                ..
+            },
+        ] = miss.as_slice()
         else {
             panic!("expected resumed Workflow result: {miss:?}");
         };
@@ -1153,11 +1174,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         let items = ctx.cfg.inbox.drain();
-        let [InboxItem::WorkflowResult {
-            summary,
-            output_path,
-            ..
-        }] = items.as_slice()
+        let [
+            InboxItem::WorkflowResult {
+                summary,
+                output_path,
+                ..
+            },
+        ] = items.as_slice()
         else {
             panic!("expected structured Workflow result: {items:?}");
         };

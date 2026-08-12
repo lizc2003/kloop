@@ -6,9 +6,9 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 
 use kloop_core::image::image_block_from_bytes;
 use kloop_protocol::ContentBlock;

@@ -12,16 +12,16 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
-use super::is_overflow_message;
-use super::sse::SseFrame;
-use super::sse::SseParser;
 use super::GuardedBody;
 use super::ProviderFailure;
 use super::StreamCompletion;
 use super::StreamSink;
+use super::is_overflow_message;
+use super::sse::SseFrame;
+use super::sse::SseParser;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -264,10 +264,10 @@ fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
 
 fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
     let kind = required_str(&value["type"], "event type")?;
-    if let Some(wire) = frame.event.as_deref() {
-        if wire != kind {
-            return Err(protocol("SSE event name did not match payload type"));
-        }
+    if let Some(wire) = frame.event.as_deref()
+        && wire != kind
+    {
+        return Err(protocol("SSE event name did not match payload type"));
     }
     Ok(kind)
 }
@@ -788,7 +788,11 @@ pub(super) async fn stream(
     let mut has_refusal = false;
     let mut completion = None;
 
-    while let Some(chunk) = byte_stream.next().await? {
+    loop {
+        let next = byte_stream.next().await?;
+        let Some(chunk) = next else {
+            break;
+        };
         for frame in parser.feed(&chunk)? {
             if frame.data.trim() == "[DONE]" {
                 if completion.is_some() {
@@ -1029,7 +1033,7 @@ pub(super) async fn stream(
                             part.part_closed = true;
                         }
                         ItemKind::FunctionCall { .. } => {
-                            return Err(protocol("function call received content_part.done"))
+                            return Err(protocol("function call received content_part.done"));
                         }
                     }
                 }

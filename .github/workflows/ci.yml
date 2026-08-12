@@ -28,25 +28,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: kloop
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings
       - if: runner.os == 'Windows'
         run: |
-          cargo test -p kloop-core file_io::tests
-          cargo test -p kloop-core text_edit::tests
-          cargo test -p kloop-core tools::fs::tests
-          cargo test -p kloop-core tools::fs::windows::tests
-          cargo test -p kloop-core diff::tests
-          cargo test -p kloop-core file_state::tests
-          cargo test -p kloop-core scheduler::tests
-          cargo test -p kloop-process-spawn
-          cargo test -p kloop-core shell_programs::tests
-          cargo test -p kloop-core process_tree
-          cargo test -p kloop-core tools::bash::tests
-          cargo test -p kloop-core tools::powershell::tests
-          cargo test -p kloop-core permissions::tests
-      - run: cargo test --workspace
-      - run: cargo run -p kloop -- --mock
+          cargo +stable test --locked -p kloop-core file_io::tests
+          cargo +stable test --locked -p kloop-core text_edit::tests
+          cargo +stable test --locked -p kloop-core tools::fs::tests
+          cargo +stable test --locked -p kloop-core tools::fs::windows::tests
+          cargo +stable test --locked -p kloop-core diff::tests
+          cargo +stable test --locked -p kloop-core file_state::tests
+          cargo +stable test --locked -p kloop-core scheduler::tests
+          cargo +stable test --locked -p kloop-process-spawn
+          cargo +stable test --locked -p kloop-core shell_programs::tests
+          cargo +stable test --locked -p kloop-core process_tree
+          cargo +stable test --locked -p kloop-core tools::bash::tests
+          cargo +stable test --locked -p kloop-core tools::powershell::tests
+          cargo +stable test --locked -p kloop-core permissions::tests
+      - run: cargo +stable test --locked --workspace
+      - run: cargo +stable run --locked -p kloop -- --mock
       - run: python -B ../refs/claude-code-2.1.220/verify.py --corpus-only
 
   msrv:
@@ -56,8 +56,10 @@ jobs:
         working-directory: kloop
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.96.1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: kloop
-      - run: cargo check --locked --workspace --all-targets --all-features
+      - run: rustc +1.96.1 -Vv
+      - run: cargo +1.96.1 -V
+      - run: cargo +1.96.1 check --locked --workspace --all-targets --all-features

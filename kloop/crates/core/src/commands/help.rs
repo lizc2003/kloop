@@ -1,7 +1,7 @@
 //! `/help` — list the available slash commands.
 
-use super::SlashResult;
 use super::BUILTINS;
+use super::SlashResult;
 
 pub const SUMMARY: &str = "list the slash commands";
 

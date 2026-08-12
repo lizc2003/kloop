@@ -4,10 +4,10 @@
 //! `view_image` tool (slice 2). Pure over its byte input, so both entry points
 //! test the same validation.
 
-use anyhow::bail;
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
+use anyhow::bail;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;

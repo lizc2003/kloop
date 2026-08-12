@@ -9,16 +9,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use serde_json::Value;
 
+use kloop_core::tools::SourceOutput;
+use kloop_core::tools::ToolSource;
 use kloop_core::tools::web;
 use kloop_core::tools::web::WEB_FETCH;
 use kloop_core::tools::web::WEB_SEARCH;
-use kloop_core::tools::SourceOutput;
-use kloop_core::tools::ToolSource;
 use kloop_protocol::ToolDef;
 use kloop_web::Brave;
 use kloop_web::SearchBackend;

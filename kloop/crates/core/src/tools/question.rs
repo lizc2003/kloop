@@ -1,10 +1,10 @@
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 use super::ToolCtx;
 use crate::interaction::QuestionAnswer;
@@ -107,7 +107,9 @@ pub(super) async fn ask_user_question_tool(input: &Value, ctx: &ToolCtx) -> Resu
         .validate()
         .map_err(|error| anyhow!("ask_user_question: {error}"))?;
     let Some(questioner) = &ctx.cfg.questioner else {
-        bail!("ask_user_question: no interactive user is available in this frontend; do not retry waiting for an answer")
+        bail!(
+            "ask_user_question: no interactive user is available in this frontend; do not retry waiting for an answer"
+        )
     };
     match questioner.ask(request.clone()).await {
         QuestionOutcome::Answered(answers) => {

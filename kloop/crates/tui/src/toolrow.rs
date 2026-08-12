@@ -315,10 +315,12 @@ mod tests {
         assert_eq!(texts(&lines), vec!["● Bash $ ls -la"]);
         // Running mark is cyan (status indicator), verb bold.
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
-        assert!(lines[0].spans[1]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]

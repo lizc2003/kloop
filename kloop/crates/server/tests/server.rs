@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -18,16 +18,15 @@ use tokio::io::DuplexStream;
 use tokio::io::Lines;
 use tokio::task::JoinHandle;
 
+use kloop_core::Config;
 use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::Rollout;
-use kloop_core::Config;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_provider::Provider;
-use kloop_server::serve;
 use kloop_server::ConfigFactory;
 use kloop_server::ConfigSnapshot;
 use kloop_server::McpServerState;
@@ -35,6 +34,7 @@ use kloop_server::McpServerStatus;
 use kloop_server::McpToolInfo;
 use kloop_server::McpTransportKind;
 use kloop_server::ModelInfo;
+use kloop_server::PROTOCOL_VERSION;
 use kloop_server::SandboxConfigInfo;
 use kloop_server::ServerConfig;
 use kloop_server::ServerPaths;
@@ -43,7 +43,7 @@ use kloop_server::SkillInfo;
 use kloop_server::SkillScope;
 use kloop_server::SkillsSnapshot;
 use kloop_server::ThreadStartOptions;
-use kloop_server::PROTOCOL_VERSION;
+use kloop_server::serve;
 
 struct TestClient {
     writer: DuplexStream,
@@ -327,13 +327,15 @@ fn temp_git_repo(tag: &str) -> PathBuf {
         &["config", "user.name", "t"],
         &["commit", "--allow-empty", "-qm", "base"],
     ] {
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(a)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(a)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
     std::fs::canonicalize(&root).unwrap()
 }
@@ -421,10 +423,12 @@ async fn handshake_gates_and_negotiates() {
     // A method before `initialize` is rejected.
     client.request("thread/start", json!({})).await;
     let err = client.recv().await;
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not initialized"));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not initialized")
+    );
 
     // A version we don't speak is a hard error (no silent downgrade).
     client
@@ -435,10 +439,12 @@ async fn handshake_gates_and_negotiates() {
         .await;
     let err = client.recv().await;
     assert_eq!(err["error"]["code"], -32602);
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("unsupported protocolVersion"));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported protocolVersion")
+    );
 
     // A good handshake reports capabilities and unlocks the rest.
     let caps = client.initialize().await;
@@ -772,13 +778,13 @@ async fn thread_start_resolves_per_thread_cwd_and_model() {
         json!({"model": ""}),
         json!({"model": 3}),
     ] {
-        if let Some(path) = params.get("cwd").and_then(Value::as_str) {
-            if path.ends_with("not-a-dir") {
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    std::fs::create_dir_all(parent).unwrap();
-                }
-                std::fs::write(path, "x").unwrap();
+        if let Some(path) = params.get("cwd").and_then(Value::as_str)
+            && path.ends_with("not-a-dir")
+        {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(parent).unwrap();
             }
+            std::fs::write(path, "x").unwrap();
         }
         let id = client.request("thread/start", params).await;
         let response = client.recv().await;
@@ -934,10 +940,12 @@ async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
         .request("thread/resume", json!({"threadId": thread_id}))
         .await;
     let error = client.recv().await;
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("supply its original 'cwd'"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("supply its original 'cwd'")
+    );
 
     client
         .request(
@@ -1472,9 +1480,11 @@ async fn task_create_surfaces_as_an_ordinary_tool_call() {
     assert_eq!(calls[0]["params"]["item"]["input"], input);
     assert_eq!(calls[1]["method"], "item/completed");
     assert_eq!(calls[1]["params"]["item"]["status"], "completed");
-    assert!(calls[1]["params"]["item"]["output"]
-        .as_str()
-        .is_some_and(|output| output.contains("\"id\":\"1\"")));
+    assert!(
+        calls[1]["params"]["item"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("\"id\":\"1\""))
+    );
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
@@ -1688,10 +1698,12 @@ async fn approval_declined_then_accepted() {
     assert!(request["params"].get("eventGeneration").is_none());
     assert!(request["params"].get("seq").is_none());
     assert_eq!(request["params"]["kind"], "fileChange");
-    assert!(request["params"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("write_file"));
+    assert!(
+        request["params"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("write_file")
+    );
     assert_eq!(
         request["params"]["approvalScopes"],
         json!(["once", "workspaceSession"])
@@ -1714,10 +1726,12 @@ async fn approval_declined_then_accepted() {
         .request("thread/fork", json!({"threadId": thread_id}))
         .await;
     let fork_error = client.recv().await;
-    assert!(fork_error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("while a turn is running"));
+    assert!(
+        fork_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("while a turn is running")
+    );
     assert_eq!(
         std::fs::read_dir(&dirs.sessions).unwrap().count(),
         files_before,
@@ -2065,10 +2079,12 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
         )
         .await;
     let log = client.recv_until(|m| m["id"] == busy_id).await;
-    assert!(log.last().unwrap()["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("already running"));
+    assert!(
+        log.last().unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already running")
+    );
 
     // Interrupt instead of answering the approval.
     client
@@ -2086,9 +2102,10 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
         )
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
-    assert!(log
-        .iter()
-        .any(|m| m["id"] == next_id && m["result"]["turn"]["id"].is_u64()));
+    assert!(
+        log.iter()
+            .any(|m| m["id"] == next_id && m["result"]["turn"]["id"].is_u64())
+    );
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
@@ -2123,10 +2140,12 @@ async fn protocol_errors_do_not_kill_the_server() {
         .request("thread/resume", json!({"threadId": "ghost"}))
         .await;
     let err = client.recv().await;
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("no session"));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no session")
+    );
 
     // Missing required params.
     client.request("turn/start", json!({})).await;
@@ -2196,10 +2215,12 @@ async fn sessions_survive_a_server_restart() {
         .request("thread/resume", json!({"threadId": thread_id}))
         .await;
     let err = client.recv().await;
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("already active"));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already active")
+    );
 
     client
         .request("turn/start", json!({"threadId": thread_id, "input": "q2"}))
@@ -2303,10 +2324,12 @@ async fn thread_fork_rejects_an_illegal_cut() {
         .request("thread/fork", json!({"threadId": "ghost"}))
         .await;
     let err = client.recv().await;
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("no session"));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no session")
+    );
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

@@ -2,17 +2,17 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
+use super::ToolCtx;
 use super::dispatch_tools;
 use super::testutil::test_ctx;
-use super::ToolCtx;
 use crate::agent::Ui;
 use crate::event::Event;
 use crate::event::Item;
@@ -206,12 +206,16 @@ async fn file_search_report() -> Value {
     assert_success(&readonly, &readonly_ids);
     let readonly_events = project_events(ui.take());
     assert_eq!(readonly_events.len(), 8);
-    assert!(readonly_events[..4]
-        .iter()
-        .all(|event| event["phase"] == "start"));
-    assert!(readonly_events[4..]
-        .iter()
-        .all(|event| event["phase"] == "finish"));
+    assert!(
+        readonly_events[..4]
+            .iter()
+            .all(|event| event["phase"] == "start")
+    );
+    assert!(
+        readonly_events[4..]
+            .iter()
+            .all(|event| event["phase"] == "finish")
+    );
 
     let mixed_ids = [
         "toolu_plan49_policy_mixed_read",

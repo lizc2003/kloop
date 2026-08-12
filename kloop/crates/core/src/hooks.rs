@@ -14,8 +14,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::agent::Ui;
@@ -252,10 +252,10 @@ impl Hooks {
             if def.event != event {
                 continue;
             }
-            if let (Some(matcher), Some(tool)) = (&def.matcher, tool_name) {
-                if matcher != tool {
-                    continue;
-                }
+            if let (Some(matcher), Some(tool)) = (&def.matcher, tool_name)
+                && matcher != tool
+            {
+                continue;
             }
             match run_hook(def, payload).await {
                 HookRun::Allow { stdout } => {

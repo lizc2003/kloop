@@ -97,11 +97,12 @@ mod tests {
             "concurrent process creation bypassed the shared gate"
         );
         drop(guard);
-        assert!(rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-            .success());
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
         worker.join().unwrap();
     }
 }

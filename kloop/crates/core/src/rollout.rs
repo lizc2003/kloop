@@ -1080,9 +1080,9 @@ mod tests {
     /// restart (drop + reload), and a second turn appending to the same file.
     #[tokio::test]
     async fn agent_turn_resumes_across_a_restart() {
-        use crate::agent::{run_turn, EndReason, Ui};
-        use crate::history::History;
         use crate::Config;
+        use crate::agent::{EndReason, Ui, run_turn};
+        use crate::history::History;
         use kloop_provider::Provider;
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;

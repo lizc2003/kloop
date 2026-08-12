@@ -9,19 +9,19 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::history::History;
 use crate::inbox::Inbox;
-use crate::tools::dispatch_tools;
 use crate::tools::ToolCtx;
+use crate::tools::dispatch_tools;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
-use kloop_protocol::Message;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
+use kloop_protocol::Message;
 
 mod sampling;
 
-use sampling::sample_with_retry;
 use sampling::SampleOk;
 use sampling::Sampled;
+use sampling::sample_with_retry;
 
 /// The single output seam: core emits an [`Event`](crate::event::Event) stream
 /// and each front-end projects it (the TUI into cells, the server/headless into
@@ -295,35 +295,35 @@ async fn turn_rounds(
             injected_context(cfg, &workspace, depth).map_or(0, |s| s.len() as u64 / 4);
         // Predictive: compact BEFORE sampling when this round's estimated
         // growth would overflow the window — don't wait to be rejected.
-        if let Some(window) = cfg.context_window {
-            if history.messages().len() >= 2
-                && compact::predicted_overflow(
-                    history.estimated_tokens() + instructions_tokens,
-                    growth,
-                    window,
-                )
-            {
-                ui.emit(&Event::Note(
-                    "predicted context overflow; compacting history".into(),
-                ));
-                match compact::run_compaction(cfg, &active_model, history, cancel).await {
-                    Ok(stats) => ui.emit(&Event::Note(format!(
-                        "history compacted: {} summarized, {} kept verbatim",
-                        stats.summarized, stats.kept
-                    ))),
-                    Err(e) => {
-                        if cancel.is_cancelled() {
-                            return TurnOutcome {
-                                reason: EndReason::Aborted,
-                                final_text: String::new(),
-                                rounds: round,
-                                structured_output: None,
-                            };
-                        }
-                        // Predictive failure is not fatal: fall through and let
-                        // the request itself succeed or overflow reactively.
-                        ui.emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
+        if let Some(window) = cfg.context_window
+            && history.messages().len() >= 2
+            && compact::predicted_overflow(
+                history.estimated_tokens() + instructions_tokens,
+                growth,
+                window,
+            )
+        {
+            ui.emit(&Event::Note(
+                "predicted context overflow; compacting history".into(),
+            ));
+            let compaction = compact::run_compaction(cfg, &active_model, history, cancel).await;
+            match compaction {
+                Ok(stats) => ui.emit(&Event::Note(format!(
+                    "history compacted: {} summarized, {} kept verbatim",
+                    stats.summarized, stats.kept
+                ))),
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        return TurnOutcome {
+                            reason: EndReason::Aborted,
+                            final_text: String::new(),
+                            rounds: round,
+                            structured_output: None,
+                        };
                     }
+                    // Predictive failure is not fatal: fall through and let
+                    // the request itself succeed or overflow reactively.
+                    ui.emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
                 }
             }
         }
@@ -363,7 +363,8 @@ async fn turn_rounds(
                 ui.emit(&Event::Note(
                     "context window exceeded; compacting and retrying".into(),
                 ));
-                match compact::run_compaction(cfg, &active_model, history, cancel).await {
+                let compaction = compact::run_compaction(cfg, &active_model, history, cancel).await;
+                match compaction {
                     Ok(stats) => {
                         ui.emit(&Event::Note(format!(
                             "history compacted: {} summarized, {} kept verbatim",
@@ -381,7 +382,7 @@ async fn turn_rounds(
                             final_text: String::new(),
                             rounds: round,
                             structured_output: None,
-                        }
+                        };
                     }
                 }
             }
@@ -420,14 +421,14 @@ async fn turn_rounds(
             Sampled::Failed(e) => {
                 // Retries exhausted on the primary model: switch to the
                 // fallback (once) instead of surfacing the error.
-                if let Some(fallback) = &cfg.fallback_model {
-                    if *fallback != active_model {
-                        ui.emit(&Event::Note(format!(
+                if let Some(fallback) = &cfg.fallback_model
+                    && *fallback != active_model
+                {
+                    ui.emit(&Event::Note(format!(
                             "sampling failed on {active_model}; switching to fallback model {fallback}: {e}"
                         )));
-                        active_model = fallback.clone();
-                        continue;
-                    }
+                    active_model = fallback.clone();
+                    continue;
                 }
                 return TurnOutcome {
                     reason: EndReason::Error(e),
@@ -689,16 +690,16 @@ fn validate_assistant_result(
     for block in blocks {
         match block {
             ContentBlock::Text { text } if text.is_empty() => {
-                return Err("provider returned an empty assistant text block".into())
+                return Err("provider returned an empty assistant text block".into());
             }
             ContentBlock::RedactedThinking { data } if data.is_empty() => {
-                return Err("provider returned an empty redacted thinking block".into())
+                return Err("provider returned an empty redacted thinking block".into());
             }
             ContentBlock::Thinking {
                 thinking,
                 signature,
             } if thinking.is_empty() && signature.is_empty() => {
-                return Err("provider returned an empty thinking block".into())
+                return Err("provider returned an empty thinking block".into());
             }
             ContentBlock::ToolUse { id, name, input } => {
                 has_tool = true;
@@ -715,7 +716,7 @@ fn validate_assistant_result(
                 }
             }
             ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {
-                return Err("provider returned a non-assistant output block".into())
+                return Err("provider returned a non-assistant output block".into());
             }
             ContentBlock::Text { .. }
             | ContentBlock::Thinking { .. }

@@ -1,6 +1,7 @@
 //! Rendering: pure functions from app state to lines (unit-tested), plus the
 //! one ratatui draw entry point that owns layout and the confirm popup.
 
+use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -12,7 +13,6 @@ use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
@@ -833,7 +833,13 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     let attach_h = u16::from(!labels.is_empty());
     let composer_h = (view.rows.len() as u16 + attach_h).max(1);
     let chrome = live_chrome_layout(app, full);
-    let [transcript_area, rule_top, input_area, rule_bottom, footer_area] = Layout::vertical([
+    let [
+        transcript_area,
+        rule_top,
+        input_area,
+        rule_bottom,
+        footer_area,
+    ] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(composer_h),
@@ -1088,11 +1094,7 @@ fn question_body_lines(question: &PendingQuestion, inner_w: usize) -> Vec<Line<'
     for (index, option) in current.options.iter().enumerate() {
         let selected = question.selected.contains(&index);
         let marker = if current.multi_select {
-            if selected {
-                "[x]"
-            } else {
-                "[ ]"
-            }
+            if selected { "[x]" } else { "[ ]" }
         } else if selected {
             "(●)"
         } else {
@@ -1404,10 +1406,12 @@ mod tests {
             ]
         );
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Cyan));
-        assert!(lines[3].spans[3]
-            .style
-            .add_modifier
-            .contains(Modifier::CROSSED_OUT));
+        assert!(
+            lines[3].spans[3]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
         assert!(lines[3].spans[3].style.add_modifier.contains(Modifier::DIM));
     }
 
@@ -1469,9 +1473,11 @@ mod tests {
             points: Vec::new(),
             cursor: 0,
         });
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+                .task_lines
+                .is_empty()
+        );
         app.fork_picker = None;
 
         let (confirm_reply, _confirm_rx) = tokio::sync::oneshot::channel();
@@ -1484,9 +1490,11 @@ mod tests {
             },
             reply: confirm_reply,
         });
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+                .task_lines
+                .is_empty()
+        );
         app.interactions.clear();
 
         let (question_reply, _question_rx) = tokio::sync::oneshot::channel();
@@ -1506,9 +1514,11 @@ mod tests {
             },
             reply: question_reply,
         });
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+                .task_lines
+                .is_empty()
+        );
         app.interactions.clear();
 
         app.popup = Some(Popup {
@@ -1520,24 +1530,30 @@ mod tests {
             }],
             cursor: 0,
         });
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+                .task_lines
+                .is_empty()
+        );
         app.popup = None;
 
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 5))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 5))
+                .task_lines
+                .is_empty()
+        );
         app.show_task_graph = false;
-        assert!(live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-            .task_lines
-            .is_empty());
+        assert!(
+            live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
+                .task_lines
+                .is_empty()
+        );
     }
 
     #[test]
     fn draw_keeps_activity_then_tasks_immediately_above_composer() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("history".into()));
@@ -1613,8 +1629,8 @@ mod tests {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         fn screen(terminal: &Terminal<TestBackend>) -> String {
             let buffer = terminal.backend().buffer();
@@ -1762,7 +1778,9 @@ mod tests {
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>(),
-            vec!["y allow once · a allow this workspace session · p allow this project across sessions and linked worktrees · n deny"]
+            vec![
+                "y allow once · a allow this workspace session · p allow this project across sessions and linked worktrees · n deny"
+            ]
         );
     }
 
@@ -1774,8 +1792,8 @@ mod tests {
     fn draw_confirm_windows_a_tall_diff_and_pins_the_options() {
         use crate::events::AgentEvent;
         use kloop_core::permissions::ConfirmRequest;
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         use tokio::sync::oneshot;
 
         let rows = |term: &Terminal<TestBackend>| -> Vec<String> {
@@ -1881,10 +1899,12 @@ mod tests {
             "selected row reversed"
         );
         // A non-selected row is not reversed and carries a dim detail span.
-        assert!(!lines[0].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            !lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     /// End-to-end (TestBackend): an open menu floats directly above the composer
@@ -1912,8 +1932,8 @@ mod tests {
         // Type the trigger into the composer so the cursor sits in the input.
         app.composer.paste("/co");
 
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
         term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
         let buf = term.backend().buffer();
@@ -1964,10 +1984,12 @@ mod tests {
         assert!(has("mode", "manual"), "{texts:?}");
         // The border and title carry the brand accent, the title is bold.
         assert_eq!(lines[0].spans[0].style.fg, Some(BRAND));
-        assert!(lines[1].spans[1]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
+        assert!(
+            lines[1].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     /// Off a git repo the branch row is omitted (the header is built with
@@ -2007,8 +2029,8 @@ mod tests {
     /// renders its box and fields into the viewport.
     #[test]
     fn draw_shows_the_session_header() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let mut app = App::new("s".into());
         app.cells.insert(
             0,
@@ -2146,7 +2168,7 @@ mod tests {
         let footer = line_text(&footer_line(&app, 100));
         assert!(footer.contains("sonnet-5"), "{footer}");
         assert!(footer.contains("20% ctx"), "{footer}"); // 40k / 200k
-                                                         // Too narrow for the status: only the hints render.
+        // Too narrow for the status: only the hints render.
         let narrow = line_text(&footer_line(&app, 30));
         assert!(!narrow.contains("sonnet-5"), "{narrow}");
         assert!(narrow.contains("["), "the mode badge still shows: {narrow}");

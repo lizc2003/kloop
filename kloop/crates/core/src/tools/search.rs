@@ -11,10 +11,10 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_regex::RegexMatcherBuilder;
@@ -24,8 +24,8 @@ use grep_searcher::SearcherBuilder;
 use grep_searcher::Sink;
 use grep_searcher::SinkContext;
 use grep_searcher::SinkMatch;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
 
 use std::sync::Arc;

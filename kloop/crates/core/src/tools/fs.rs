@@ -3,13 +3,13 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
@@ -17,22 +17,22 @@ use serde_json::Value;
 #[path = "fs/windows.rs"]
 mod windows;
 
+use super::ToolCtx;
 use super::notebook;
 use super::resolve_path;
 use super::str_arg;
-use super::ToolCtx;
 use crate::config::EffectiveWorkspace;
 use crate::file_io::file_contents_equal;
 use crate::file_io::fingerprint_file;
 use crate::file_io::read_bounded;
-use crate::file_state::normalize_absolute_path;
 use crate::file_state::FileIdentity;
 use crate::file_state::FileObservation;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
+use crate::file_state::normalize_absolute_path;
+use crate::image::MAX_IMAGE_BYTES;
 use crate::image::detect_media_type;
 use crate::image::image_block_from_bytes;
-use crate::image::MAX_IMAGE_BYTES;
 use crate::text_edit::apply_text_edit;
 
 pub(super) struct ReadFileOutput {
@@ -483,7 +483,9 @@ pub(super) async fn prepare_notebook_mutation_input(
         .extension()
         .is_none_or(|extension| extension != "ipynb")
     {
-        bail!("File must be a Jupyter notebook (.ipynb file). For editing other file types, use edit_file.");
+        bail!(
+            "File must be a Jupyter notebook (.ipynb file). For editing other file types, use edit_file."
+        );
     }
     prepare_mutation_input_with_key("notebook_edit", input, "notebook_path", workspace).await
 }
@@ -689,7 +691,9 @@ fn prepare_mutation(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         match std::fs::symlink_metadata(&cursor) {
                             Ok(metadata) if metadata.file_type().is_symlink() => {
-                                bail!("{tool}: refuses symbolic-link parent component in {display_path}")
+                                bail!(
+                                    "{tool}: refuses symbolic-link parent component in {display_path}"
+                                )
                             }
                             Ok(_) => {
                                 bail!(
@@ -908,7 +912,8 @@ fn materialize_parent(
                     });
                 }
             }
-            if let Err(error) = sync_parent(&parent, tool, display_path) {
+            let sync = sync_parent(&parent, tool, display_path);
+            if let Err(error) = sync {
                 drop(child);
                 drop(parent);
                 cleanup_created_directories(created);
@@ -1142,7 +1147,9 @@ fn commit_mutation(
                 }
                 None => {
                     if expected.is_some() {
-                        bail!("{tool}: {display_path} changed since it was read; read it again before modifying it");
+                        bail!(
+                            "{tool}: {display_path} changed since it was read; read it again before modifying it"
+                        );
                     }
                     (None, None)
                 }
@@ -1177,7 +1184,9 @@ fn commit_mutation(
             }
             if edit.match_count > 1 && !replace_all {
                 let count = edit.match_count;
-                bail!("edit_file: old_string matches {count} times in {display_path}; add surrounding context to disambiguate or set replace_all");
+                bail!(
+                    "edit_file: old_string matches {count} times in {display_path}; add surrounding context to disambiguate or set replace_all"
+                );
             }
             let updated = edit
                 .updated
@@ -1230,7 +1239,9 @@ fn commit_mutation(
         .with_context(|| format!("{tool}: cannot verify committed file {display_path}"))?;
     let identity = file_identity(&committed.file)?;
     if !matches {
-        bail!("{tool}: {display_path} changed immediately after commit; read it again before modifying it");
+        bail!(
+            "{tool}: {display_path} changed immediately after commit; read it again before modifying it"
+        );
     }
     Ok(CommitOutcome {
         content,
@@ -1262,7 +1273,9 @@ fn validate_observation_metadata<'a>(
     }
     if expected.identity() != identity || !expected.version().metadata_matches(metadata) {
         if require_notebook {
-            bail!("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.");
+            bail!(
+                "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it."
+            );
         }
         bail!("{tool}: {path} changed since it was read; read it again before modifying it");
     }
@@ -1278,7 +1291,9 @@ fn validate_observation_version(
 ) -> Result<()> {
     if expected.version() != current {
         if require_notebook {
-            bail!("File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.");
+            bail!(
+                "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it."
+            );
         }
         bail!("{tool}: {path} changed since it was read; read it again before modifying it");
     }
@@ -1899,12 +1914,13 @@ mod tests {
         assert!(!is_error);
         assert!(out.chars().count() < 8_000, "{} chars", out.chars().count());
         assert!(out.contains("[read output truncated; call read_file with offset="));
-        assert!(!ctx
-            .cfg
-            .file_state
-            .observation(&long_key)
-            .unwrap()
-            .is_complete());
+        assert!(
+            !ctx.cfg
+                .file_state
+                .observation(&long_key)
+                .unwrap()
+                .is_complete()
+        );
 
         let _ = std::fs::remove_file(empty);
         let _ = std::fs::remove_file(pdf);
@@ -2471,11 +2487,13 @@ mod tests {
         assert!(out.contains("byte limit"), "{out}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(ctx.cfg.file_state.observation(&key).is_none());
-        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".kloop-write-")));
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kloop-write-")
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2767,10 +2785,12 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("symbolic link"), "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

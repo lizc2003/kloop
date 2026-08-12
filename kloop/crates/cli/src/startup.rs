@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use kloop_core::Config;
 use kloop_core::agent_type::AgentType;
 use kloop_core::hooks::HookDef;
 use kloop_core::hooks::HookEvent;
@@ -32,7 +33,6 @@ use kloop_core::skills::Skill;
 use kloop_core::skills::SkillContext as CoreSkillContext;
 use kloop_core::skills::SkillSource;
 use kloop_core::tools::ToolSource;
-use kloop_core::Config;
 use kloop_protocol::AssistantBlock;
 use kloop_provider::Provider;
 use kloop_server::ConfigSnapshot;
@@ -418,7 +418,9 @@ pub(crate) fn load_agent_types(root: &toml::Table) -> Result<Vec<AgentType>> {
             .with_context(|| format!("[agents.{name}] must be a table"))?;
         for key in def.keys() {
             if !matches!(key.as_str(), "description" | "system" | "model" | "tools") {
-                bail!("[agents.{name}] has unknown key '{key}' (description | system | model | tools)");
+                bail!(
+                    "[agents.{name}] has unknown key '{key}' (description | system | model | tools)"
+                );
             }
         }
         let description = def
@@ -1015,8 +1017,14 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             tool_use("t2", "bash", json!({"command": "ls"})),
         ],
         vec![
-            text("Now a non-read-only command with huge output (runs sequentially, result gets offloaded)…\n"),
-            tool_use("t3", "bash", json!({"command": "yes offload-me | head -n 3000"})),
+            text(
+                "Now a non-read-only command with huge output (runs sequentially, result gets offloaded)…\n",
+            ),
+            tool_use(
+                "t3",
+                "bash",
+                json!({"command": "yes offload-me | head -n 3000"}),
+            ),
         ],
         vec![
             text("Reading the offloaded output back…\n"),
@@ -1263,19 +1271,25 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             .unwrap()
             .unwrap();
 
-        assert!(policy
-            .writable_roots
-            .iter()
-            .any(|root| root.root == private_state_root));
+        assert!(
+            policy
+                .writable_roots
+                .iter()
+                .any(|root| root.root == private_state_root)
+        );
         assert!(policy.denied_read_paths.contains(&private_state_root));
         assert!(policy.denied_write_paths.contains(&private_state_root));
         let (_, params) = kloop_core::sandbox::seatbelt_profile(&policy);
-        assert!(params
-            .iter()
-            .any(|(key, path)| key.starts_with("DENIED_READ_") && path == &private_state_root));
-        assert!(params
-            .iter()
-            .any(|(key, path)| key.starts_with("DENIED_WRITE_") && path == &private_state_root));
+        assert!(
+            params
+                .iter()
+                .any(|(key, path)| key.starts_with("DENIED_READ_") && path == &private_state_root)
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(key, path)| key.starts_with("DENIED_WRITE_") && path == &private_state_root)
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1322,9 +1336,11 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     #[test]
     fn agent_types_parse_fields_and_reject_malformed() {
         assert!(load_agent_types(&toml::Table::new()).unwrap().is_empty());
-        assert!(load_agent_types(&config("[permissions]\nallow = []\n"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            load_agent_types(&config("[permissions]\nallow = []\n"))
+                .unwrap()
+                .is_empty()
+        );
 
         let root = config(
             "[agents.researcher]\n\
@@ -1636,9 +1652,11 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         unsafe { std::env::set_var("KLOOP_ALLOW", "bash(secret-command *)") };
         let error = load_permission_rules(&toml::Table::new()).expect_err("accepted KLOOP_ALLOW");
         unsafe { std::env::remove_var("KLOOP_ALLOW") };
-        assert!(error
-            .to_string()
-            .contains("KLOOP_ALLOW is no longer supported"));
+        assert!(
+            error
+                .to_string()
+                .contains("KLOOP_ALLOW is no longer supported")
+        );
         assert!(!error.to_string().contains("secret-command"));
     }
 

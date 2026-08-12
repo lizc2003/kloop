@@ -21,28 +21,29 @@ mod text_layout;
 mod toolrow;
 
 use std::io::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::Event;
 use crossterm::event::KeyEventKind;
+use ratatui::TerminalOptions;
+use ratatui::Viewport;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget as _;
-use ratatui::TerminalOptions;
-use ratatui::Viewport;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use kloop_core::agent::run_turn;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::agent::run_turn;
 // Aliased: `Event` alone is crossterm's terminal event in this module.
+use kloop_core::Config;
 use kloop_core::event::Event as CoreEvent;
 use kloop_core::history::History;
 use kloop_core::inbox::Inbox;
@@ -53,7 +54,6 @@ use kloop_core::rollout::fork_points;
 use kloop_core::rollout::fork_session;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::session_id_of;
-use kloop_core::Config;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 
@@ -295,15 +295,14 @@ fn send_command_result_events(
     if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
         return false;
     }
-    if let Some(snapshot) = &result.task_graph {
-        if events
+    if let Some(snapshot) = &result.task_graph
+        && events
             .send(AgentEvent::Core(CoreEvent::TaskGraphUpdated(
                 snapshot.clone(),
             )))
             .is_err()
-        {
-            return false;
-        }
+    {
+        return false;
     }
     result.output.is_empty()
         || events
@@ -322,7 +321,11 @@ async fn agent_worker(
     // `--image` blocks ride the first user turn; taken once, then empty.
     mut pending_images: Vec<ContentBlock>,
 ) {
-    while let Some(msg) = msgs.recv().await {
+    loop {
+        let next = msgs.recv().await;
+        let Some(msg) = next else {
+            break;
+        };
         match msg {
             WorkerMsg::Turn(turn) => {
                 // `--image` blocks ride the first turn; the composer's attached
@@ -983,7 +986,8 @@ async fn ui_loop(
                 if activity.is_err() {
                     break Ok(());
                 }
-                if let Some(cancel) = dispatch_autowake(&mut app, &inbox, &msgs) {
+                let autowake = dispatch_autowake(&mut app, &inbox, &msgs);
+                if let Some(cancel) = autowake {
                     current_cancel = Some(cancel);
                 }
             }
@@ -1004,7 +1008,11 @@ async fn ui_loop(
                 }
                 // Drain whatever else already arrived (streaming deltas come
                 // in bursts) so we redraw once per batch, not per token.
-                while let Ok(event) = events.try_recv() {
+                loop {
+                    let next = events.try_recv();
+                    let Ok(event) = next else {
+                        break;
+                    };
                     if matches!(event, AgentEvent::Quit) {
                         quit = true;
                     } else {
@@ -1021,17 +1029,17 @@ async fn ui_loop(
                 // cell with its final elapsed when it closes.
                 if app.streaming_thinking() {
                     thinking_started.get_or_insert_with(Instant::now);
-                } else if was_thinking {
-                    if let Some(t) = thinking_started.take() {
+                } else if was_thinking
+                    && let Some(t) = thinking_started.take() {
                         app.seal_thinking(t.elapsed().as_secs());
                     }
-                }
                 // Autowake (plan 26): a background sub-agent finished (its
                 // agent_end woke this select) and left a result in the inbox
                 // while the agent sits idle. Start a turn to deliver it without
                 // waiting for the user. The guard also catches the race where a
                 // reinjection lands just after a turn ends.
-                if let Some(cancel) = dispatch_autowake(&mut app, &inbox, &msgs) {
+                let autowake = dispatch_autowake(&mut app, &inbox, &msgs);
+                if let Some(cancel) = autowake {
                     current_cancel = Some(cancel);
                 }
             }
@@ -1249,13 +1257,15 @@ mod tests {
         // TestBackend's AfterCursor keeps the cursor cell itself; every other
         // visible cell proves that the inline viewport was cleared. The real
         // Crossterm ED sequence clears from the cursor inclusively.
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .skip(1)
-            .all(|cell| cell.symbol() == " "));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .skip(1)
+                .all(|cell| cell.symbol() == " ")
+        );
 
         terminal
             .draw(|frame| {

@@ -2396,10 +2396,13 @@ delegation, `--input-format stream-json`, budget/goal guardrails,
 
 ## Running
 
-Building the workspace requires Rust 1.88 or newer; kloop remains on Rust edition
-2021. The terminal stack is Ratatui 0.30.2 with its explicit `crossterm_0_29`
-integration, Crossterm 0.29.0 (`event-stream` retained), `unicode-width` 0.2.2,
-and `unicode-segmentation` 1.13.3. The Unix-only real-binary PTY harness uses
+Building the workspace requires Rust 1.96 or newer and uses Rust edition
+2024. The repository's `kloop/rust-toolchain.toml` pins local development to
+Rust 1.96.1 with rustfmt and clippy; CI's stable matrix explicitly invokes
+`+stable` so it remains independent from that local pin. The terminal stack is
+Ratatui 0.30.2 with its explicit `crossterm_0_29` integration, Crossterm 0.29.0
+(`event-stream` retained), `unicode-width` 0.2.2, and
+`unicode-segmentation` 1.13.3. The Unix-only real-binary PTY harness uses
 vt100 0.16.2; portable-pty, vt100, tempfile, and its fixture wiremock remain dev
 edges rather than production or Windows dependencies.
 
@@ -2699,10 +2702,11 @@ was not run. Earlier real-key adapter runs cover offload round-trips,
 mid-session predictive compaction, and truncation recovery.
 
 CI (`.github/workflows/ci.yml`, at the repo root) runs macOS, Linux, and native
-Windows on every push/PR: `cargo fmt --all -- --check`, all-target/all-feature
-workspace clippy, workspace tests, the keyless mock smoke, and the corpus-only
-verifier after an explicit Python setup. A separate Linux job uses Rust 1.88.0
-to run `cargo check --locked --workspace --all-targets --all-features`, keeping
+Windows on every push/PR: `cargo +stable fmt --all -- --check`, locked
+all-target/all-feature workspace clippy, locked workspace tests, the keyless
+mock smoke, and the corpus-only verifier after an explicit Python setup. A
+separate Linux job uses Rust 1.96.1 to record compiler/tool versions and run
+`cargo +1.96.1 check --locked --workspace --all-targets --all-features`, keeping
 the declared MSRV and final lockfile executable together. Composer/unit/render/
 TestBackend correctness is therefore cross-platform. The real-binary TUI PTY
 harness is `cfg(unix)` with Unix-only dev

@@ -1065,14 +1065,18 @@ mod tests {
     fn headings_are_bold_and_separated() {
         let lines = markdown_lines("# Title\n\nbody", 40);
         assert_eq!(texts(&lines), vec!["Title", "", "body"]);
-        assert!(lines[0].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
-        assert!(!lines[2].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            !lines[2].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1270,10 +1274,12 @@ mod tests {
         assert!(got.contains(&"now **bol".to_string()), "tail raw: {got:?}");
         // The heading is bold (markdown), proving the prefix went through the
         // parser while the tail stayed literal.
-        assert!(lines[0].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]

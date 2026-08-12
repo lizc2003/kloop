@@ -4,9 +4,9 @@
 //! file-search result and popup acceptance both carry that target, so an equal
 //! query at another document position cannot edit the wrong token.
 
-use crate::text_layout::is_grapheme_boundary;
 use crate::text_layout::ByteOffset;
 use crate::text_layout::TextRange;
+use crate::text_layout::is_grapheme_boundary;
 
 pub const FILE_MENU_MAX: usize = 50;
 pub const MENU_ROWS: usize = 8;
@@ -86,15 +86,16 @@ pub fn detect_trigger(
             cursor,
         });
     }
-    if allow_slash && start == 0 {
-        if let Some(query) = token.strip_prefix('/') {
-            return Some(CompletionTarget {
-                kind: PopupKind::Slash,
-                query: query.to_string(),
-                range,
-                cursor,
-            });
-        }
+    if allow_slash
+        && start == 0
+        && let Some(query) = token.strip_prefix('/')
+    {
+        return Some(CompletionTarget {
+            kind: PopupKind::Slash,
+            query: query.to_string(),
+            range,
+            cursor,
+        });
     }
     None
 }

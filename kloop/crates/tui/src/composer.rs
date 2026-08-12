@@ -12,6 +12,8 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
+use crate::text_layout::ByteOffset;
+use crate::text_layout::TextRange;
 use crate::text_layout::byte_offset_at_display_column;
 use crate::text_layout::display_column;
 use crate::text_layout::display_width;
@@ -20,8 +22,6 @@ use crate::text_layout::is_grapheme_boundary;
 use crate::text_layout::next_grapheme_boundary;
 use crate::text_layout::previous_grapheme_boundary;
 use crate::text_layout::snap_grapheme_boundary;
-use crate::text_layout::ByteOffset;
-use crate::text_layout::TextRange;
 
 const PROMPT: &str = "› ";
 const CONT: &str = "  ";
@@ -86,10 +86,11 @@ impl ComposerDocument {
         content: String,
     ) -> ByteOffset {
         self.assert_boundary(at);
-        debug_assert!(self
-            .atoms
-            .iter()
-            .all(|atom| at <= atom.range.start() || at >= atom.range.end()));
+        debug_assert!(
+            self.atoms
+                .iter()
+                .all(|atom| at <= atom.range.start() || at >= atom.range.end())
+        );
 
         let mut projected = self.display.clone();
         projected.insert_str(at.get(), &label);

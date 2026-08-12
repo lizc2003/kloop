@@ -265,14 +265,15 @@ mod tests {
         assert!(req.validate().unwrap_err().contains("previews"));
 
         let req = request(false, None);
-        assert!(req
-            .validate_answers(&[QuestionAnswer {
+        assert!(
+            req.validate_answers(&[QuestionAnswer {
                 question_index: 0,
                 selected: vec![9],
                 other: None,
                 notes: None,
             }])
             .unwrap_err()
-            .contains("unknown option"));
+            .contains("unknown option")
+        );
     }
 }

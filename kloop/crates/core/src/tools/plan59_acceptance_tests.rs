@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use kloop_protocol::{AssistantBlock, Message, ToolDef};
 use kloop_provider::{MockTurn, Provider};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use super::testutil::{run_tool, test_ctx, test_ctx_with_sources, with_defer_threshold};
-use super::{all_tool_defs, SourceOutput, ToolSource};
-use crate::agent::{run_turn, EndReason};
+use super::{SourceOutput, ToolSource, all_tool_defs};
+use crate::agent::{EndReason, run_turn};
 use crate::config::SurfaceCapabilities;
 use crate::history::History;
 use crate::inbox::{Inbox, InboxItem};
@@ -634,9 +634,11 @@ async fn background_agent_scheduler_report() -> Value {
     )));
 
     let registered = names(context.cfg.surface);
-    assert!(!registered
-        .iter()
-        .any(|name| name == "monitor" || name == "Monitor"));
+    assert!(
+        !registered
+            .iter()
+            .any(|name| name == "monitor" || name == "Monitor")
+    );
 
     json!({
         "rust_scope": "surface-gate",
@@ -686,15 +688,21 @@ async fn mcp_web_toolsource_report() -> Value {
         context.cfg.surface,
         &context.cfg.shell_programs,
     );
-    assert!(definitions
-        .iter()
-        .any(|definition| definition.name == "tool_search"));
-    assert!(definitions
-        .iter()
-        .all(|definition| definition.name != "read_mcp_resource"));
-    assert!(definitions
-        .iter()
-        .any(|definition| definition.name == "web_search"));
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition.name == "tool_search")
+    );
+    assert!(
+        definitions
+            .iter()
+            .all(|definition| definition.name != "read_mcp_resource")
+    );
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition.name == "web_search")
+    );
 
     let (locked, locked_error) = run_tool(
         "read_mcp_resource",
@@ -949,11 +957,13 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let workflow_items = context.cfg.inbox.drain();
     let workflow_delivery_count = workflow_items.len();
     assert_eq!(workflow_delivery_count, 1);
-    let [InboxItem::WorkflowResult {
-        summary,
-        output_path,
-        ..
-    }] = workflow_items.as_slice()
+    let [
+        InboxItem::WorkflowResult {
+            summary,
+            output_path,
+            ..
+        },
+    ] = workflow_items.as_slice()
     else {
         panic!("expected one workflow result: {workflow_items:?}")
     };
@@ -1025,9 +1035,11 @@ async fn ask_plan_workflow_headless_report() -> Value {
         assert!(enabled.iter().any(|name| name == tool));
         assert!(disabled.iter().all(|name| name != tool));
     }
-    assert!(enabled
-        .iter()
-        .all(|name| name != "pty" && name != "PTY" && name != "process_group"));
+    assert!(
+        enabled
+            .iter()
+            .all(|name| name != "pty" && name != "PTY" && name != "process_group")
+    );
 
     json!({
         "rust_scope": "surface-gate",

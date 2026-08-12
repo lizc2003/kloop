@@ -3,11 +3,11 @@
 //! accounting, and shared error markers. Nothing here knows about networks,
 //! filesystems, or the agent loop.
 
-use serde::de::Error as _;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
+use serde::de::Error as _;
 use std::fmt;
 use std::str::FromStr;
 
@@ -881,31 +881,41 @@ mod tests {
 
     #[test]
     fn assistant_block_semantic_payload_preserves_exact_empty_rules() {
-        assert!(!AssistantBlock::Text {
-            text: String::new()
-        }
-        .has_semantic_payload());
+        assert!(
+            !AssistantBlock::Text {
+                text: String::new()
+            }
+            .has_semantic_payload()
+        );
         assert!(AssistantBlock::Text { text: " ".into() }.has_semantic_payload());
-        assert!(!AssistantBlock::RedactedThinking {
-            data: String::new()
-        }
-        .has_semantic_payload());
-        assert!(!AssistantBlock::Thinking {
-            thinking: String::new(),
-            signature: String::new(),
-        }
-        .has_semantic_payload());
-        assert!(AssistantBlock::Thinking {
-            thinking: String::new(),
-            signature: "sig".into(),
-        }
-        .has_semantic_payload());
-        assert!(AssistantBlock::ToolUse {
-            id: "t".into(),
-            name: "bash".into(),
-            input: json!({}),
-        }
-        .has_semantic_payload());
+        assert!(
+            !AssistantBlock::RedactedThinking {
+                data: String::new()
+            }
+            .has_semantic_payload()
+        );
+        assert!(
+            !AssistantBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            }
+            .has_semantic_payload()
+        );
+        assert!(
+            AssistantBlock::Thinking {
+                thinking: String::new(),
+                signature: "sig".into(),
+            }
+            .has_semantic_payload()
+        );
+        assert!(
+            AssistantBlock::ToolUse {
+                id: "t".into(),
+                name: "bash".into(),
+                input: json!({}),
+            }
+            .has_semantic_payload()
+        );
     }
 
     #[test]

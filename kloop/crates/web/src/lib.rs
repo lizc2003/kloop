@@ -10,9 +10,9 @@ mod search;
 
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -118,11 +118,11 @@ mod tests {
     use std::sync::Mutex;
 
     use serde_json::json;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     use super::*;
 

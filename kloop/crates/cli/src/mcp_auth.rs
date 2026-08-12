@@ -9,21 +9,21 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-use kloop_mcp::oauth::login;
 use kloop_mcp::oauth::LoginOutcome;
 use kloop_mcp::oauth::OAuthSession;
 use kloop_mcp::oauth::OAuthToken;
+use kloop_mcp::oauth::login;
 
-use crate::mcp::load_mcp_servers;
 use crate::mcp::McpTransport;
+use crate::mcp::load_mcp_servers;
 use crate::user_config::UserConfig;
 
 const OAUTH_STORE_LABEL: &str = "~/.kloop/mcp-oauth.json";
@@ -183,7 +183,9 @@ pub async fn run_login(server_name: &str) -> Result<()> {
             (url.clone(), oauth_client_id.clone(), oauth_scopes.clone())
         }
         McpTransport::Stdio { .. } => {
-            bail!("server '{server_name}' is a stdio (local) server; OAuth applies to remote (url) servers")
+            bail!(
+                "server '{server_name}' is a stdio (local) server; OAuth applies to remote (url) servers"
+            )
         }
     };
 
@@ -272,10 +274,12 @@ mod tests {
         assert_eq!(got.client_id, "client-1");
         assert_eq!(got.token.access_token, "at-1");
         // A different URL for the same name has no entry (token invalidated).
-        assert!(store
-            .get("gh", "https://mcp.example.com/other")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get("gh", "https://mcp.example.com/other")
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -305,15 +309,19 @@ mod tests {
     fn session_for_is_none_without_a_token() {
         let (store, path) = store_in("none");
         let store = Arc::new(store);
-        assert!(store
-            .session_for("gh", "https://mcp.example.com/mcp")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .session_for("gh", "https://mcp.example.com/mcp")
+                .unwrap()
+                .is_none()
+        );
         store.save("gh", outcome("at-1", "rt-1")).unwrap();
-        assert!(store
-            .session_for("gh", "https://mcp.example.com/mcp")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .session_for("gh", "https://mcp.example.com/mcp")
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -363,8 +363,8 @@ mod windows_tests {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
         use windows_sys::Win32::System::Threading::OpenProcess;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
         use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         let handle =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };

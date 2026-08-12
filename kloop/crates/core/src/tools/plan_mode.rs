@@ -6,13 +6,13 @@
 //! approval itself runs inside `Permissions::confirm_exit_plan` so the plan text
 //! rides the same y/n popup a file-change diff does (its scrollable `preview`).
 
-use anyhow::bail;
 use anyhow::Result;
-use serde_json::json;
+use anyhow::bail;
 use serde_json::Value;
+use serde_json::json;
 
-use super::str_arg;
 use super::ToolCtx;
+use super::str_arg;
 use crate::config::EffectiveWorkspace;
 use crate::permissions::Mode;
 use crate::permissions::PlanExitOutcome;
@@ -110,8 +110,8 @@ mod tests {
     use crate::permissions::Mode;
     use crate::permissions::PermissionRules;
     use crate::permissions::Permissions;
-    use crate::tools::testutil::*;
     use crate::tools::ToolCtx;
+    use crate::tools::testutil::*;
     use serde_json::json;
     use std::future::Future;
     use std::path::PathBuf;

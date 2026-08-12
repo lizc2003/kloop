@@ -13,8 +13,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 const AGENT_SENTINEL: &str = "AGENT_DIRECT_68";
 const BACKGROUND_AGENT_SENTINEL: &str = "BACKGROUND_AGENT_69";
@@ -211,10 +211,10 @@ impl NativeClient {
                 turn_id = message["result"]["turn"]["id"].as_u64();
                 assert!(turn_id.is_some(), "turn/start omitted turn id");
             }
-            if message["method"] == "turn/completed" {
-                if let Some(id) = message["params"]["turn"]["id"].as_u64() {
-                    completed.push(id);
-                }
+            if message["method"] == "turn/completed"
+                && let Some(id) = message["params"]["turn"]["id"].as_u64()
+            {
+                completed.push(id);
             }
             messages.push(message);
             if turn_id.is_some_and(|id| completed.contains(&id)) {
@@ -325,12 +325,16 @@ fn assert_background_lifecycle(
         .as_str()
         .expect("background update omitted execution id")
         .to_string();
-    assert!(updates
-        .iter()
-        .all(|message| message["params"]["task"]["id"] == execution_id));
-    assert!(updates
-        .iter()
-        .any(|message| message["params"]["task"]["status"] == "running"));
+    assert!(
+        updates
+            .iter()
+            .all(|message| message["params"]["task"]["id"] == execution_id)
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|message| message["params"]["task"]["status"] == "running")
+    );
     let terminals: Vec<&Value> = updates
         .iter()
         .copied()
@@ -354,15 +358,19 @@ fn assert_background_lifecycle(
                 .expect("durable background work omitted runId")
                 .to_string();
             assert!(run_id.starts_with(prefix), "unexpected run id shape");
-            assert!(updates
-                .iter()
-                .all(|message| message["params"]["task"]["runId"] == run_id));
+            assert!(
+                updates
+                    .iter()
+                    .all(|message| message["params"]["task"]["runId"] == run_id)
+            );
             Some(run_id)
         }
         None => {
-            assert!(updates
-                .iter()
-                .all(|message| message["params"]["task"].get("runId").is_none()));
+            assert!(
+                updates
+                    .iter()
+                    .all(|message| message["params"]["task"].get("runId").is_none())
+            );
             None
         }
     };
@@ -789,9 +797,11 @@ fn real_local_agent_mailbox_contract() {
                     && message["params"]["task"]["id"] == *id
             })
             .collect::<Vec<_>>();
-        assert!(updates
-            .iter()
-            .any(|message| message["params"]["task"]["status"] == "running"));
+        assert!(
+            updates
+                .iter()
+                .any(|message| message["params"]["task"]["status"] == "running")
+        );
         let terminals = updates
             .iter()
             .filter(|message| message["params"]["task"]["status"] != "running")
@@ -819,9 +829,11 @@ fn real_local_agent_mailbox_contract() {
             && params.get("taskId").is_none()
             && params.get("threadId").is_some()
     }));
-    assert!(updates
-        .iter()
-        .all(|message| message["params"]["status"] != "undeliverable"));
+    assert!(
+        updates
+            .iter()
+            .all(|message| message["params"]["status"] != "undeliverable")
+    );
 
     let mut route_ids = Vec::new();
     for (from, to) in expected_routes {

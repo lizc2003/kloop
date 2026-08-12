@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;

@@ -17,21 +17,21 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anyhow::bail;
 use anyhow::Result;
-use serde_json::json;
+use anyhow::bail;
 use serde_json::Value;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use kloop_core::agent::run_turn;
+use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
+use kloop_core::agent::run_turn;
 use kloop_core::event::Event;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
-use kloop_core::Config;
 #[cfg(test)]
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
@@ -185,10 +185,10 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
         let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-        if !outcome.final_text.is_empty() {
-            if let Ok(mut w) = out.lock() {
-                let _ = writeln!(w, "{}", outcome.final_text);
-            }
+        if !outcome.final_text.is_empty()
+            && let Ok(mut w) = out.lock()
+        {
+            let _ = writeln!(w, "{}", outcome.final_text);
         }
         match &outcome.reason {
             EndReason::Completed => {}

@@ -16,23 +16,23 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::anyhow;
 use anyhow::Result;
-use rquickjs::prelude::Async;
+use anyhow::anyhow;
 use rquickjs::AsyncContext;
 use rquickjs::AsyncRuntime;
 use rquickjs::CatchResultExt;
 use rquickjs::Function;
+use rquickjs::prelude::Async;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -202,10 +202,8 @@ fn named_child_of_kind<'a>(
     kind: &str,
 ) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    let found = node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == kind);
-    found
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
 fn node_text<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> Result<&'a str> {
@@ -426,30 +424,35 @@ async fn run_js(
         .await
         .map_err(|e| anyhow!("codemode: context init failed: {e}"))?;
 
-    ctx.async_with(async |ctx| {
-        install_host_functions(&ctx, bridge, tools_enabled, phase_enabled)?;
-        ctx.eval::<(), _>(prelude.as_bytes())
-            .catch(&ctx)
-            .map_err(|e| anyhow!("codemode: prelude failed: {e}"))?;
-        let outcome: std::result::Result<String, String> = async {
-            let promise: rquickjs::Promise = ctx
-                .eval(wrapped.as_bytes())
-                .catch(&ctx)
-                .map_err(|e| e.to_string())?;
-            promise
-                .into_future::<String>()
-                .await
-                .catch(&ctx)
-                .map_err(|e| e.to_string())
-        }
-        .await;
-        outcome.map_err(|raw| match stop_reason.load(Ordering::Relaxed) {
-            STOP_CANCEL => anyhow!("program interrupted"),
-            STOP_CPU => anyhow!("program killed: exceeded CPU time limit"),
-            _ => anyhow!("{raw}"),
-        })
-    })
-    .await
+    #[allow(clippy::let_and_return)]
+    {
+        let result = ctx
+            .async_with(async |ctx| {
+                install_host_functions(&ctx, bridge, tools_enabled, phase_enabled)?;
+                ctx.eval::<(), _>(prelude.as_bytes())
+                    .catch(&ctx)
+                    .map_err(|e| anyhow!("codemode: prelude failed: {e}"))?;
+                let outcome: std::result::Result<String, String> = async {
+                    let promise: rquickjs::Promise = ctx
+                        .eval(wrapped.as_bytes())
+                        .catch(&ctx)
+                        .map_err(|e| e.to_string())?;
+                    promise
+                        .into_future::<String>()
+                        .await
+                        .catch(&ctx)
+                        .map_err(|e| e.to_string())
+                }
+                .await;
+                outcome.map_err(|raw| match stop_reason.load(Ordering::Relaxed) {
+                    STOP_CANCEL => anyhow!("program interrupted"),
+                    STOP_CPU => anyhow!("program killed: exceeded CPU time limit"),
+                    _ => anyhow!("{raw}"),
+                })
+            })
+            .await;
+        result
+    }
 }
 
 async fn install_interrupt_handler(

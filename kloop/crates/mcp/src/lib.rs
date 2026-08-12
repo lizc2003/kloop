@@ -19,21 +19,21 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use base64::Engine;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
@@ -89,10 +89,10 @@ impl McpServerCapabilities {
             resources_list_changed: capabilities["resources"]["listChanged"]
                 .as_bool()
                 .unwrap_or(false),
-            directory_read: capabilities["extensions"]["io.modelcontextprotocol/skills"]
-                ["directoryRead"]
-                .as_bool()
-                .unwrap_or(false),
+            directory_read:
+                capabilities["extensions"]["io.modelcontextprotocol/skills"]["directoryRead"]
+                    .as_bool()
+                    .unwrap_or(false),
         }
     }
 }

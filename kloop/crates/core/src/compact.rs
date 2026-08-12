@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::bail;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::history::estimate_message_tokens;
 use crate::history::History;
+use crate::history::estimate_message_tokens;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn predicted_overflow_boundary_and_small_window_guard() {
         let growth = max_turn_growth(8_192); // 23_192
-                                             // At and above the line.
+        // At and above the line.
         assert!(predicted_overflow(100_000 - growth, growth, 100_000));
         // One under the line.
         assert!(!predicted_overflow(100_000 - growth - 1, growth, 100_000));

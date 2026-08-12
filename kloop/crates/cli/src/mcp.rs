@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use serde_json::json;
+use anyhow::bail;
 use serde_json::Value;
+use serde_json::json;
 
 use kloop_core::tools::SourceOutput;
 use kloop_core::tools::ToolSource;
@@ -277,10 +277,11 @@ fn parse_server(name: &str, spec: &toml::Table) -> Result<McpServerConfig> {
 fn http_headers_for(
     bearer_token_env_var: &Option<String>,
     http_headers: &BTreeMap<String, String>,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, String>> {
     let mut headers = http_headers.clone();
     if let Some(var) = bearer_token_env_var {
-        let token = std::env::var(var).with_context(|| {
+        let token = env(var).with_context(|| {
             format!("bearer_token_env_var '{var}' is not set in the environment")
         })?;
         headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -604,7 +605,11 @@ impl McpResourceSource {
         }
         let mut groups = Vec::new();
         let mut failures = Vec::new();
-        while let Some(result) = tasks.join_next().await {
+        loop {
+            let next = tasks.join_next().await;
+            let Some(result) = next else {
+                break;
+            };
             let (index, server, result) = result.context("MCP resource listing task failed")?;
             match result {
                 Ok(resources) => groups.push((index, server, resources)),
@@ -688,24 +693,22 @@ impl McpResourceSource {
         self.require_advertised_uri(&server, uri).await?;
         let read = match server.client.read_resource(uri).await {
             Ok(read) => read,
-            Err(error) => {
-                match rpc_code(&error) {
-                    Some(-32601) => bail!(
-                        "Server \"{}\" advertises resource support but does not implement resource reads.",
-                        server.name
-                    ),
-                    Some(-32002 | -32602) => {
-                        let directory_hint = server.capabilities.directory_read.then_some(
-                            " If the URI is a directory resource, use read_mcp_resource_dir instead.",
-                        );
-                        bail!(
-                            "Resource not found: {uri} — it may have been deleted or the URI is stale. Re-run list_mcp_resources to refresh.{}",
-                            directory_hint.unwrap_or("")
-                        )
-                    }
-                    _ => return Err(error),
+            Err(error) => match rpc_code(&error) {
+                Some(-32601) => bail!(
+                    "Server \"{}\" advertises resource support but does not implement resource reads.",
+                    server.name
+                ),
+                Some(-32002 | -32602) => {
+                    let directory_hint = server.capabilities.directory_read.then_some(
+                        " If the URI is a directory resource, use read_mcp_resource_dir instead.",
+                    );
+                    bail!(
+                        "Resource not found: {uri} — it may have been deleted or the URI is stale. Re-run list_mcp_resources to refresh.{}",
+                        directory_hint.unwrap_or("")
+                    )
                 }
-            }
+                _ => return Err(error),
+            },
         };
         let mut rendered = Vec::new();
         let mut images = Vec::new();
@@ -932,7 +935,9 @@ pub async fn connect_servers(
                     http_headers,
                     ..
                 } => {
-                    let headers = http_headers_for(bearer_token_env_var, http_headers)?;
+                    let headers = http_headers_for(bearer_token_env_var, http_headers, &|name| {
+                        std::env::var(name).ok()
+                    })?;
                     let oauth = if bearer_token_env_var.is_none() {
                         store.session_for(&server.name, url)?
                     } else {
@@ -1218,12 +1223,12 @@ oauth_scopes = ["mcp.read", "mcp.write"]
 
     #[test]
     fn http_headers_resolve_bearer_token_from_env() {
-        // Uniquely-named var so the global-env read doesn't race sibling tests.
-        let var = format!("KLOOP_TEST_MCP_TOKEN_{}", std::process::id());
-        std::env::set_var(&var, "sk-abc");
+        let var = "KLOOP_TEST_MCP_TOKEN".to_string();
+        let env = |name: &str| (name == var).then(|| "sk-abc".to_string());
         let headers = http_headers_for(
             &Some(var.clone()),
             &BTreeMap::from([("X-Tenant".into(), "acme".into())]),
+            &env,
         )
         .unwrap();
         assert_eq!(
@@ -1233,12 +1238,17 @@ oauth_scopes = ["mcp.read", "mcp.write"]
                 ("X-Tenant".into(), "acme".into()),
             ])
         );
-        std::env::remove_var(&var);
         // A referenced-but-unset env var is an error, not a silent no-auth.
-        assert!(http_headers_for(&Some(var), &BTreeMap::new()).is_err());
+        let missing_env = |_: &str| None;
+        assert!(http_headers_for(&Some(var), &BTreeMap::new(), &missing_env).is_err());
         // No bearer var ⇒ just the static headers.
         assert_eq!(
-            http_headers_for(&None, &BTreeMap::from([("A".into(), "b".into())])).unwrap(),
+            http_headers_for(
+                &None,
+                &BTreeMap::from([("A".into(), "b".into())]),
+                &missing_env,
+            )
+            .unwrap(),
             BTreeMap::from([("A".into(), "b".into())])
         );
     }
@@ -1327,9 +1337,11 @@ oauth_scopes = ["mcp.read", "mcp.write"]
             Ok(_) => panic!("server failure was reported as an empty catalog"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("resource listing failed for server \"broken\""));
+        assert!(
+            error
+                .to_string()
+                .contains("resource listing failed for server \"broken\"")
+        );
         server_task.await.unwrap();
     }
 
@@ -1362,9 +1374,11 @@ oauth_scopes = ["mcp.read", "mcp.write"]
 
         let output = source.list(None).await.unwrap();
         assert!(output.text.contains("\"server\":\"good\""));
-        assert!(output
-            .text
-            .contains("Resource listing failed for server(s): bad"));
+        assert!(
+            output
+                .text
+                .contains("Resource listing failed for server(s): bad")
+        );
         assert_eq!(
             output.structured,
             Some(Value::Array(vec![json!({
@@ -1426,9 +1440,11 @@ oauth_scopes = ["mcp.read", "mcp.write"]
             Ok(_) => panic!("stale generation unexpectedly dispatched"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("definition changed after discovery"));
+        assert!(
+            error
+                .to_string()
+                .contains("definition changed after discovery")
+        );
     }
 
     #[tokio::test]

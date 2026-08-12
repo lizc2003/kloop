@@ -4,17 +4,17 @@
 //! `crate::skills`. Registered only at depth 0 and only when skills are loaded
 //! (see `turn_rounds`), so it never rides a sub-agent's request.
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
+use super::ToolCtx;
 use super::fork_skill;
 use super::str_arg;
-use super::ToolCtx;
 use crate::config::EffectiveWorkspace;
-use crate::skills::expand_body;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
 use crate::skills::SkillSource;
+use crate::skills::expand_body;
 use kloop_protocol::ToolDef;
 
 /// The `skill` tool definition: how the model triggers a skill. Registered only
