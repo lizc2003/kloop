@@ -26,7 +26,9 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(test)]
 use tokio::io::AsyncBufReadExt;
+#[cfg(test)]
 use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
 
@@ -407,18 +409,140 @@ enum PlainInput {
     Line(std::io::Result<Option<String>>),
     Inbox,
     InboxClosed,
+    CtrlC,
 }
 
-async fn next_plain_input<R: tokio::io::AsyncBufRead + Unpin>(
+struct PlainCtrlC {
+    #[cfg(unix)]
+    signal: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    receiver: tokio::sync::mpsc::UnboundedReceiver<()>,
+    #[cfg(windows)]
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PlainCtrlC {
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            Ok(Self { signal })
+        }
+        #[cfg(windows)]
+        {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                loop {
+                    if tokio::signal::ctrl_c().await.is_err() || sender.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(Self { receiver, task })
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        let _ = self.signal.recv().await;
+        #[cfg(windows)]
+        let _ = self.receiver.recv().await;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PlainCtrlC {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct PlainInputThread {
+    requests: std::sync::mpsc::Sender<()>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Option<String>>>,
+}
+
+impl PlainInputThread {
+    fn spawn() -> std::io::Result<Self> {
+        let (requests, requested) = std::sync::mpsc::channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("kloop-plain-stdin".into())
+            .spawn(move || {
+                while requested.recv().is_ok() {
+                    let mut line = String::new();
+                    let read = std::io::stdin()
+                        .read_line(&mut line)
+                        .map(|bytes| (bytes != 0).then_some(line));
+                    let done = !matches!(read, Ok(Some(_)));
+                    if sender.send(read).is_err() || done {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self { requests, receiver })
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        self.requests.send(()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "plain stdin reader stopped")
+        })?;
+        self.receiver.recv().await.unwrap_or(Ok(None))
+    }
+}
+
+#[cfg(test)]
+async fn next_plain_input_with_lines<R: tokio::io::AsyncBufRead + Unpin>(
     lines: &mut tokio::io::Lines<R>,
     inbox_activity: &mut tokio::sync::watch::Receiver<u64>,
+    ctrl_c: &mut PlainCtrlC,
 ) -> PlainInput {
     tokio::select! {
+        biased;
+        () = ctrl_c.recv() => PlainInput::CtrlC,
         line = lines.next_line() => PlainInput::Line(line),
         activity = inbox_activity.changed() => match activity {
             Ok(()) => PlainInput::Inbox,
             Err(_) => PlainInput::InboxClosed,
+        },
+    }
+}
+
+async fn next_plain_input(
+    input: &mut PlainInputThread,
+    inbox_activity: &mut tokio::sync::watch::Receiver<u64>,
+    ctrl_c: &mut PlainCtrlC,
+) -> PlainInput {
+    tokio::select! {
+        biased;
+        () = ctrl_c.recv() => PlainInput::CtrlC,
+        line = input.next_line() => PlainInput::Line(line),
+        activity = inbox_activity.changed() => match activity {
+            Ok(()) => PlainInput::Inbox,
+            Err(_) => PlainInput::InboxClosed,
+        },
+    }
+}
+
+/// Run one plain-REPL operation while Ctrl+C remains an application-level exit
+/// signal. If it arrives, cancel first so `run_turn` can patch History, then wait
+/// for the operation to finish before the caller tears the session down.
+async fn run_plain_operation<F, T>(
+    operation: F,
+    cancel: &CancellationToken,
+    ctrl_c: &mut PlainCtrlC,
+) -> (T, bool)
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = ctrl_c.recv() => {
+            cancel.cancel();
+            (operation.await, true)
         }
+        result = &mut operation => (result, false),
     }
 }
 
@@ -476,20 +600,24 @@ async fn plain_main(
         }
     }
 
+    let mut ctrl_c = PlainCtrlC::install().context("cannot install plain Ctrl+C handler")?;
     println!(
         "kloop — session {session_id}; type a task, /help for commands, \
-         'exit' or Ctrl+D to quit, Ctrl+C to interrupt a running turn"
+         'exit' or Ctrl+C to quit"
     );
     // `--image` blocks ride the first user turn; taken once, then empty.
     let mut pending_images = pending_images;
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = PlainInputThread::spawn().context("cannot start plain stdin reader")?;
     let mut inbox_activity = cfg.inbox.subscribe_activity();
     let mut input_error = None;
     loop {
         print!("> ");
         let _ = std::io::stdout().flush();
-        let input = next_plain_input(&mut lines, &mut inbox_activity).await;
+        let input = next_plain_input(&mut input, &mut inbox_activity, &mut ctrl_c).await;
         if matches!(input, PlainInput::InboxClosed) {
+            break;
+        }
+        if matches!(input, PlainInput::CtrlC) {
             break;
         }
         if matches!(input, PlainInput::Inbox) {
@@ -497,9 +625,12 @@ async fn plain_main(
                 continue;
             }
             let cancel = CancellationToken::new();
-            let watcher = spawn_ctrl_c(cancel.clone());
-            let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-            watcher.abort();
+            let (outcome, exit_requested) = run_plain_operation(
+                run_turn(&cfg, &mut history, &ui, &cancel, 0),
+                &cancel,
+                &mut ctrl_c,
+            )
+            .await;
             println!();
             match outcome.reason {
                 EndReason::Completed => {}
@@ -507,10 +638,13 @@ async fn plain_main(
                 EndReason::Aborted => println!("[scheduled delivery interrupted]"),
                 EndReason::Error(error) => println!("[scheduled delivery error: {error}]"),
             }
+            if exit_requested {
+                break;
+            }
             continue;
         }
         let PlainInput::Line(line) = input else {
-            unreachable!("inbox input handled above")
+            unreachable!("non-line plain input handled above")
         };
         let line = match line {
             Ok(Some(line)) => line,
@@ -528,18 +662,21 @@ async fn plain_main(
             break;
         }
         // Slash commands run inline: the REPL owns History directly, so no
-        // routing is needed (unlike the TUI). Ctrl+C interrupts a slow one
-        // (e.g. /compact) the same way it interrupts a turn.
+        // routing is needed (unlike the TUI). Ctrl+C cancels a slow one (e.g.
+        // /compact), waits for it to settle, then exits the plain REPL.
         if kloop_core::commands::is_command(&line) {
             let cancel = CancellationToken::new();
-            let watcher = spawn_ctrl_c(cancel.clone());
-            let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
-            watcher.abort();
+            let (result, exit_requested) = run_plain_operation(
+                kloop_core::commands::run(&line, &mut history, &cfg, &cancel),
+                &cancel,
+                &mut ctrl_c,
+            )
+            .await;
             if !result.output.is_empty() {
                 println!("{}", result.output);
             }
             // `/exit` quits the REPL, like the bare `exit` word above.
-            if result.quit {
+            if result.quit || exit_requested {
                 break;
             }
             // A skill invoked as `/name` expands to a prompt; run it as a turn
@@ -557,9 +694,12 @@ async fn plain_main(
         };
         history.record(msg);
         let cancel = CancellationToken::new();
-        let watcher = spawn_ctrl_c(cancel.clone());
-        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-        watcher.abort();
+        let (outcome, exit_requested) = run_plain_operation(
+            run_turn(&cfg, &mut history, &ui, &cancel, 0),
+            &cancel,
+            &mut ctrl_c,
+        )
+        .await;
         println!();
         match outcome.reason {
             EndReason::Completed => {}
@@ -570,10 +710,11 @@ async fn plain_main(
                         .expect("MaxRounds requires a configured limit")
                 )
             }
-            EndReason::Aborted => {
-                println!("[interrupted — history patched; Ctrl+D or 'exit' to quit]")
-            }
+            EndReason::Aborted => println!("[interrupted — history patched; exiting]"),
             EndReason::Error(e) => println!("[error: {e}]"),
+        }
+        if exit_requested {
+            break;
         }
     }
     let remaining = cfg.shutdown_background_work(&ui).await;
@@ -614,9 +755,10 @@ mod tests {
         let mut lines = BufReader::new(reader).lines();
 
         clock.set(wakeup.scheduled_for_ms);
+        let mut ctrl_c = PlainCtrlC::install().unwrap();
         let input = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            next_plain_input(&mut lines, &mut inbox_activity),
+            next_plain_input_with_lines(&mut lines, &mut inbox_activity, &mut ctrl_c),
         )
         .await
         .unwrap();

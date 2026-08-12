@@ -1689,8 +1689,9 @@ the model. The set is small and lives one-file-per-command under
   does **not** fork a new session file). Process-state (the root-owned task graph
   and steering queue) resets too.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
-  teardown as a two-tap Ctrl+C); in server mode it is inert — quitting one
-  thread must not stop a multi-session process, so it just relays a note.
+  teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
+  it is inert — quitting one thread must not stop a multi-session process, so it
+  just relays a note.
 
 An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). Commands run **only when idle** — they read or
@@ -2540,9 +2541,11 @@ KLOOP_SANDBOX=off cargo run                        # remove OS fs/network sandbo
 ```
 
 Interrupting a running turn patches history so it stays legal either way. In
-the TUI, Esc interrupts and Ctrl+C (two taps) exits (see the TUI section); in
-`--plain`, Ctrl+C interrupts the turn and Ctrl+D (or `exit`) quits. Every
-session is saved and resumable — see Session persistence above.
+the TUI, Esc interrupts and Ctrl+C (two taps) exits (see the TUI section). In
+`--plain`, one Ctrl+C cancels any running operation, waits for that repair, and
+then exits; `exit` and `/exit` also quit. As in a conventional line-based REPL,
+an actual stdin EOF ends input, but it is not advertised as an application key.
+Every session is saved and resumable — see Session persistence above.
 
 ## Verification
 

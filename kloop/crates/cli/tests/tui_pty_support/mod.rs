@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
@@ -49,6 +51,7 @@ struct FixtureState {
 #[derive(Clone)]
 struct QueueResponder {
     state: Arc<Mutex<FixtureState>>,
+    delay: Option<Duration>,
 }
 
 impl Respond for QueueResponder {
@@ -73,10 +76,14 @@ impl Respond for QueueResponder {
         let Some(response) = state.responses.pop_front() else {
             return ResponseTemplate::new(500).set_body_string("no synthetic response queued");
         };
-        ResponseTemplate::new(200)
+        let template = ResponseTemplate::new(200)
             .insert_header("content-type", "text/event-stream")
             .insert_header("connection", "close")
-            .set_body_raw(response, "text/event-stream")
+            .set_body_raw(response, "text/event-stream");
+        match self.delay {
+            Some(delay) => template.set_delay(delay),
+            None => template,
+        }
     }
 }
 
@@ -100,6 +107,14 @@ pub struct ChatFixture {
 
 impl ChatFixture {
     pub async fn start(responses: Vec<String>) -> Self {
+        Self::start_with_delay(responses, None).await
+    }
+
+    pub async fn start_delayed(responses: Vec<String>, delay: Duration) -> Self {
+        Self::start_with_delay(responses, Some(delay)).await
+    }
+
+    async fn start_with_delay(responses: Vec<String>, delay: Option<Duration>) -> Self {
         let server = MockServer::start().await;
         let state = Arc::new(Mutex::new(FixtureState {
             responses: responses.into(),
@@ -109,6 +124,7 @@ impl ChatFixture {
             .and(path("/chat/completions"))
             .respond_with(QueueResponder {
                 state: Arc::clone(&state),
+                delay,
             })
             .mount(&server)
             .await;
@@ -258,6 +274,16 @@ pub struct PtyHarness {
 
 impl PtyHarness {
     pub fn spawn(program: &Path, base_url: &str, rows: u16, cols: u16) -> Result<Self> {
+        Self::spawn_with_args(program, base_url, rows, cols, &[])
+    }
+
+    pub fn spawn_with_args(
+        program: &Path,
+        base_url: &str,
+        rows: u16,
+        cols: u16,
+        args: &[&str],
+    ) -> Result<Self> {
         let sandbox = tempfile::tempdir().context("create PTY sandbox")?;
         let home = sandbox.path().join("home");
         let xdg_config = sandbox.path().join("xdg-config");
@@ -277,6 +303,7 @@ impl PtyHarness {
             })
             .context("open PTY")?;
         let mut command = CommandBuilder::new(program);
+        command.args(args);
         command.env_clear();
         command.cwd(&workspace);
         command.env("HOME", &home);
