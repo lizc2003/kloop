@@ -472,7 +472,7 @@ impl<B> PinnedBackend<B> {
 }
 
 impl<B: ratatui::backend::Backend> PinnedBackend<B> {
-    fn pin_current_size(&mut self) -> std::io::Result<()> {
+    fn pin_current_size(&mut self) -> std::result::Result<(), B::Error> {
         self.pinned_size = Some(self.inner.size()?);
         Ok(())
     }
@@ -483,49 +483,56 @@ impl<B: ratatui::backend::Backend> PinnedBackend<B> {
 }
 
 impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B> {
-    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
         self.inner.draw(content)
     }
 
-    fn append_lines(&mut self, lines: u16) -> std::io::Result<()> {
+    fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
         self.inner.append_lines(lines)
     }
 
-    fn hide_cursor(&mut self) -> std::io::Result<()> {
+    fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.hide_cursor()
     }
 
-    fn show_cursor(&mut self) -> std::io::Result<()> {
+    fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.show_cursor()
     }
 
-    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+    fn get_cursor_position(
+        &mut self,
+    ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
         self.inner.get_cursor_position()
     }
 
     fn set_cursor_position<P: Into<ratatui::layout::Position>>(
         &mut self,
         position: P,
-    ) -> std::io::Result<()> {
+    ) -> std::result::Result<(), Self::Error> {
         self.inner.set_cursor_position(position)
     }
 
-    fn clear(&mut self) -> std::io::Result<()> {
+    fn clear(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.clear()
     }
 
-    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+    fn clear_region(
+        &mut self,
+        clear_type: ratatui::backend::ClearType,
+    ) -> std::result::Result<(), Self::Error> {
         self.inner.clear_region(clear_type)
     }
 
-    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+    fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
         self.pinned_size.map_or_else(|| self.inner.size(), Ok)
     }
 
-    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+    fn window_size(&mut self) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
         let mut size = self.inner.window_size()?;
         if let Some(pinned) = self.pinned_size {
             size.columns_rows = pinned;
@@ -533,7 +540,7 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
         Ok(size)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.flush()
     }
 
@@ -541,7 +548,7 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
         &mut self,
         region: std::ops::Range<u16>,
         line_count: u16,
-    ) -> std::io::Result<()> {
+    ) -> std::result::Result<(), Self::Error> {
         self.inner.scroll_region_up(region, line_count)
     }
 
@@ -549,7 +556,7 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
         &mut self,
         region: std::ops::Range<u16>,
         line_count: u16,
-    ) -> std::io::Result<()> {
+    ) -> std::result::Result<(), Self::Error> {
         self.inner.scroll_region_down(region, line_count)
     }
 }
@@ -646,7 +653,7 @@ fn spawn_input_thread(
 fn insert_scrollback_blocks<B>(
     terminal: &mut ratatui::Terminal<B>,
     blocks: Vec<Vec<Line<'static>>>,
-) -> Result<()>
+) -> std::result::Result<(), B::Error>
 where
     B: ratatui::backend::Backend,
 {
@@ -687,7 +694,7 @@ fn commit_overflow<B>(
     terminal: &mut ratatui::Terminal<B>,
     app: &mut App,
     viewport: Rect,
-) -> Result<bool>
+) -> std::result::Result<bool, B::Error>
 where
     B: ratatui::backend::Backend,
 {
@@ -716,7 +723,7 @@ fn draw_frame<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
     hud: &render::Hud,
-) -> Result<Rect>
+) -> std::result::Result<Rect, B::Error>
 where
     B: ratatui::backend::Backend,
 {
@@ -730,7 +737,7 @@ where
         }
 
         terminal.backend_mut().pin_current_size()?;
-        let attempt: Result<Option<Rect>> = (|| {
+        let attempt: std::result::Result<Option<Rect>, B::Error> = (|| {
             terminal.autoresize()?;
             let confirmed_viewport = terminal.get_frame().area();
             if confirmed_viewport != drawn_viewport {
@@ -1037,7 +1044,8 @@ async fn ui_loop(
     // caller restores the terminal, so no stray read lands after teardown.
     stop.store(true, Ordering::Relaxed);
     let _ = input_thread.join();
-    outcome
+    outcome?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1045,7 +1053,6 @@ mod tests {
     use std::cell::Cell as StateCell;
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::io;
 
     use ratatui::backend::Backend;
     use ratatui::backend::ClearType;
@@ -1087,7 +1094,9 @@ mod tests {
     }
 
     impl Backend for StagedSizeBackend {
-        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        type Error = <TestBackend as Backend>::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
         where
             I: Iterator<Item = (u16, u16, &'a BufferCell)>,
         {
@@ -1095,35 +1104,38 @@ mod tests {
             self.inner.draw(content)
         }
 
-        fn append_lines(&mut self, lines: u16) -> io::Result<()> {
+        fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
             self.inner.append_lines(lines)
         }
 
-        fn hide_cursor(&mut self) -> io::Result<()> {
+        fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.hide_cursor()
         }
 
-        fn show_cursor(&mut self) -> io::Result<()> {
+        fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.show_cursor()
         }
 
-        fn get_cursor_position(&mut self) -> io::Result<Position> {
+        fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
             self.inner.get_cursor_position()
         }
 
-        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> std::result::Result<(), Self::Error> {
             self.inner.set_cursor_position(position)
         }
 
-        fn clear(&mut self) -> io::Result<()> {
+        fn clear(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.clear()
         }
 
-        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        fn clear_region(&mut self, clear_type: ClearType) -> std::result::Result<(), Self::Error> {
             self.inner.clear_region(clear_type)
         }
 
-        fn size(&self) -> io::Result<Size> {
+        fn size(&self) -> std::result::Result<Size, Self::Error> {
             self.record("size");
             if let Some(size) = self.sizes.borrow_mut().pop_front() {
                 self.last_size.set(size);
@@ -1131,11 +1143,11 @@ mod tests {
             Ok(self.last_size.get())
         }
 
-        fn window_size(&mut self) -> io::Result<WindowSize> {
+        fn window_size(&mut self) -> std::result::Result<WindowSize, Self::Error> {
             self.inner.window_size()
         }
 
-        fn flush(&mut self) -> io::Result<()> {
+        fn flush(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.flush()
         }
 
@@ -1143,7 +1155,7 @@ mod tests {
             &mut self,
             region: std::ops::Range<u16>,
             line_count: u16,
-        ) -> io::Result<()> {
+        ) -> std::result::Result<(), Self::Error> {
             self.record("scroll");
             self.inner.scroll_region_up(region, line_count)
         }
@@ -1152,7 +1164,7 @@ mod tests {
             &mut self,
             region: std::ops::Range<u16>,
             line_count: u16,
-        ) -> io::Result<()> {
+        ) -> std::result::Result<(), Self::Error> {
             self.record("scroll");
             self.inner.scroll_region_down(region, line_count)
         }

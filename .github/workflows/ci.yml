@@ -28,8 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: kloop
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - if: runner.os == 'Windows'
         run: |
           cargo test -p kloop-core file_io::tests
@@ -48,3 +48,16 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run -p kloop -- --mock
       - run: python -B ../refs/claude-code-2.1.220/verify.py --corpus-only
+
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kloop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kloop
+      - run: cargo check --locked --workspace --all-targets --all-features

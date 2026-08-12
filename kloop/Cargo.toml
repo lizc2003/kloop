@@ -16,6 +16,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 [workspace.dependencies]
 kloop-core = { path = "crates/core" }
@@ -42,11 +43,11 @@ png = "0.17"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures = "0.3"
-ratatui = "0.29"
-unicode-segmentation = "1.13"
-unicode-width = "0.2"
+ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 globset = "0.4"
 grep-matcher = "0.1"
 grep-regex = "0.1"
@@ -109,5 +110,5 @@ windows-sys = { version = "0.52", features = [
 # test-only
 portable-pty = "0.9"
 tempfile = "3"
-vt100 = "0.15.2"
+vt100 = "0.16.2"
 wiremock = "0.6"

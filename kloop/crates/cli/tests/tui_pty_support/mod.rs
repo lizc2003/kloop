@@ -389,7 +389,7 @@ impl PtyHarness {
         // vt100 cannot observe the PTY ioctl itself. This only resizes the ANSI
         // decoding canvas; resize cases must separately assert application layout
         // facts (for example, the composer's width-dependent cursor column).
-        state.parser.set_size(rows, cols);
+        state.parser.screen_mut().set_size(rows, cols);
         changed.notify_all();
         Ok(())
     }

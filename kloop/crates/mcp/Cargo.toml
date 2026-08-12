@@ -2,6 +2,7 @@
 name = "kloop-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 kloop-process-spawn = { workspace = true }
