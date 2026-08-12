@@ -620,15 +620,16 @@ impl Server {
         let snapshot = rollout::load_session_snapshot(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
         let (options, migrate) = resume_options(&snapshot, params, &self.default_cwd)?;
-        let (messages, mut rollout) = rollout::resume_session(&path)
+        let mut resumed = rollout::resume_session(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
         if migrate {
-            rollout
+            resumed
+                .rollout
                 .append_runtime(&runtime_from_options(&options))
                 .map_err(|e| (wire::SERVER_ERROR, format!("cannot migrate session: {e}")))?;
         }
-        let count = messages.len();
-        let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
+        let count = resumed.messages.len();
+        let history = History::resume(self.paths.offload_dir.clone(), resumed);
         self.spawn_thread(
             thread_id.to_string(),
             history,
@@ -675,12 +676,13 @@ impl Server {
         let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
-        let (messages, mut rollout) = rollout::resume_session(&new_path)
+        let mut resumed = rollout::resume_session(&new_path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume fork: {e}")))?;
         // The requested cut may precede the source's runtime line. Always stamp
         // the effective canonical runtime onto the fork so it remains resumable
         // after this server process exits.
-        rollout
+        resumed
+            .rollout
             .append_runtime(&runtime_from_options(&options))
             .map_err(|e| {
                 (
@@ -688,8 +690,8 @@ impl Server {
                     format!("cannot persist fork runtime: {e}"),
                 )
             })?;
-        let count = messages.len();
-        let history = History::resume(self.paths.offload_dir.clone(), messages, rollout);
+        let count = resumed.messages.len();
+        let history = History::resume(self.paths.offload_dir.clone(), resumed);
         self.spawn_thread(
             new_id.clone(),
             history,

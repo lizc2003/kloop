@@ -1,7 +1,4 @@
-//! `/cost` — the current model and how much of the context window is in use.
-//! Only the running context size is tracked today (the usage anchor + a
-//! char/4 tail estimate); a cumulative token/dollar total would need
-//! per-response accounting the history does not yet keep.
+//! `/cost` — current context estimate plus durable provider-reported usage.
 
 use std::sync::Arc;
 
@@ -9,11 +6,11 @@ use super::SlashResult;
 use crate::config::Config;
 use crate::history::History;
 
-pub const SUMMARY: &str = "show model and context-window usage";
+pub const SUMMARY: &str = "show model, context, and provider-reported usage";
 
 pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
     let used = history.estimated_tokens();
-    let output = match cfg.context_window {
+    let mut output = match cfg.context_window {
         Some(window) => {
             let pct = (used as f64 / window as f64 * 100.0).round() as u64;
             format!(
@@ -26,5 +23,21 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
             cfg.model
         ),
     };
+    output.push_str("\nprovider-reported usage across all models: ");
+    match history.provider_usage().aggregate() {
+        Ok(None) => output.push_str("unavailable"),
+        Ok(Some(aggregate)) => {
+            let usage = aggregate.usage;
+            output.push_str(&format!(
+                "\n  input tokens: {}\n  output tokens: {}\n  cache read input tokens: {}\n  cache creation input tokens: {}\n  {} reported responses",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+                aggregate.reported_responses,
+            ));
+        }
+        Err(error) => output.push_str(&format!("unavailable ({error})")),
+    }
     SlashResult::message(output)
 }

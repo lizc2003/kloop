@@ -87,7 +87,10 @@ fork:
 Compaction itself asks the model for a structured handoff summary, keeps a
 ~2k-token recent tail verbatim (never splitting a tool_use/tool_result pair
 at the boundary), and replaces the rest with the summary — the one
-sanctioned rewrite of the append-only history.
+sanctioned rewrite of the append-only history. A successful summary response
+with provider usage also enters the durable usage ledger before the compacted
+marker; compaction rewrites provider history, not the transcript's accumulated
+provider facts.
 
 `KLOOP_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
 `off` disables compaction).
@@ -95,9 +98,14 @@ sanctioned rewrite of the append-only history.
 ## Session persistence (Phase 2, second slice)
 
 Every session is persisted to `.kloop/sessions/{id}.jsonl`
-(`crates/core/src/rollout.rs`), one JSON line per recorded message, written
-through as the history records — so a killed process loses at most the line
-being written. The same append-only chain also carries recovery-only `session`
+(`crates/core/src/rollout.rs`), one JSON line per recorded message or
+provider-usage record, written through as the history records — so a killed
+process loses at most the line being written. A `provider_usage` line preserves
+the actual model, operation (`sampling` or `compaction`), and all four canonical
+provider-reported categories (input, output, cache-read input, cache-creation
+input). It is historical transcript data, separate from the resettable context
+estimate and never enters provider replay, public display events, or snapshots.
+The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display-only `turn_terminal`
 records (completed/maxRounds/aborted/error, positioned after a message index);
 neither enters provider replay or token accounting. If a stream fails or is
@@ -127,7 +135,8 @@ Resume replays the file, then makes the history legal and consistent again:
 - the process-global offload counter advances past every `off-NNNN.txt`
   already on disk, so new spills never clobber files the resumed history
   points at (usage anchors are not persisted — the estimate re-anchors on
-  the first sampled response).
+  the first sampled response; provider-usage records replay in the same scan,
+  with a complete usage line retained even if the following message line tore).
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
@@ -163,8 +172,10 @@ codex's `thread/fork` both copy, neither replays across files):
   point *before* one forks the raw pre-compaction history, which never
   left the file;
 - offload files are shared across branches (pointers are copied text; the
-  dir-scanning counter already prevents clobbering), and usage anchors are
-  not persisted, so a fork re-anchors on its first sampled response.
+  dir-scanning counter already prevents clobbering);
+- usage records in the kept raw prefix become the branch's baseline, while
+  records after the cut remain only on the source; the branches then accumulate
+  independently. Context anchors still reset and re-anchor after the fork.
 
 Server mode exposes the same mechanism as `thread/fork {threadId, cut?}`
 (omit `cut` to fork at the end): it copies the prefix, restores the source's
@@ -1678,16 +1689,20 @@ the model. The set is small and lives one-file-per-command under
 `core/src/commands/` (the directory listing *is* the catalog):
 
 - `/help` — list the commands.
-- `/cost` — the current model and context-window usage (`~used / window
-  tokens (pct%)`, from the same usage anchor + char/4 estimate compaction
-  uses; a cumulative token/dollar total would need per-response accounting the
-  history does not yet keep).
+- `/cost` — the current model and context-window estimate (`~used / window
+  tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
+  durable provider-reported usage across all models in the current transcript:
+  input, output, cache-read input, cache-creation input, and reported-response
+  count. An empty ledger is `unavailable`; a reported all-zero response remains
+  available as four zeros. The command reports no prices, billable total,
+  quota, or budget, and it does not aggregate child-agent transcripts.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an
   append-only compacted-to-nothing marker that resume replays to empty; it
-  does **not** fork a new session file). Process-state (the root-owned task graph
-  and steering queue) resets too.
+  does **not** fork a new session file). The same transcript's durable
+  provider-usage ledger remains cumulative. Process-state (the root-owned task
+  graph and steering queue) resets too.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
   it is inert — quitting one thread must not stop a multi-session process, so it
@@ -2758,7 +2773,8 @@ crates/process-spawn/ process-wide child-creation gate shared across crates
 crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
   src/history.rs    append-only history, record-time offloading,
-                    usage-anchored token estimation
+                    context estimation, provider usage ledger ownership
+  src/usage.rs      canonical per-response records + checked aggregate
   src/process_tree/ cross-platform owned shell process trees
     mod.rs          ProcessSpec/Child/Killer façade and lifecycle tests
     unix.rs         process-group spawn, kill, reap, and residual checks
@@ -2789,8 +2805,9 @@ crates/core/        kloop-core — the agent, network-free
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,
                     instruction-file concatenation under a byte budget
-  src/rollout.rs    append-only session persistence: message/compacted +
-                    runtime/turn-terminal records, snapshot reads, resume/fork
+  src/rollout.rs    append-only session persistence: message/provider-usage/
+                    compacted + runtime/turn-terminal records, snapshots,
+                    resume/fork
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/tui/         kloop-tui — the ratatui frontend; owns the terminal

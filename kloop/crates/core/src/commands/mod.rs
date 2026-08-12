@@ -273,7 +273,9 @@ mod tests {
         let result = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
         assert_eq!(
             result,
-            SlashResult::message("model: test-model\ncontext: ~20000 / 200000 tokens (10%)")
+            SlashResult::message(
+                "model: test-model\ncontext: ~20000 / 200000 tokens (10%)\nprovider-reported usage across all models: unavailable"
+            )
         );
     }
 
@@ -283,6 +285,87 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         let result = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
         assert!(result.output.contains("window limit off"));
+    }
+
+    #[tokio::test]
+    async fn cost_distinguishes_unavailable_reported_zero_and_multiple_models() {
+        use crate::usage::{ProviderUsageRecord, UsageOperation};
+        use kloop_protocol::Usage;
+
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        assert!(
+            run("/cost", &mut history, &cfg, &CancellationToken::new())
+                .await
+                .output
+                .ends_with("provider-reported usage across all models: unavailable")
+        );
+
+        history.record_provider_usage(ProviderUsageRecord {
+            model: "primary".into(),
+            operation: UsageOperation::Sampling,
+            usage: Usage::default(),
+        });
+        assert_eq!(
+            run("/cost", &mut history, &cfg, &CancellationToken::new())
+                .await
+                .output,
+            "model: test-model\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage across all models: \n  input tokens: 0\n  output tokens: 0\n  cache read input tokens: 0\n  cache creation input tokens: 0\n  1 reported responses"
+        );
+        history.record_provider_usage(ProviderUsageRecord {
+            model: "fallback".into(),
+            operation: UsageOperation::Compaction,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_input_tokens: 30,
+                cache_creation_input_tokens: 40,
+            },
+        });
+        let output = run("/cost", &mut history, &cfg, &CancellationToken::new())
+            .await
+            .output;
+        assert_eq!(
+            output,
+            "model: test-model\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage across all models: \n  input tokens: 10\n  output tokens: 20\n  cache read input tokens: 30\n  cache creation input tokens: 40\n  2 reported responses"
+        );
+        for forbidden in [
+            "$", "currency", "price", "quota", "budget", "coverage", "total",
+        ] {
+            assert!(
+                !output.contains(forbidden),
+                "unexpected {forbidden}: {output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_preserves_provider_usage_for_the_same_transcript() {
+        use crate::usage::{ProviderUsageRecord, UsageOperation};
+        use kloop_protocol::Usage;
+
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("some earlier work"));
+        history.record_provider_usage(ProviderUsageRecord {
+            model: "model".into(),
+            operation: UsageOperation::Sampling,
+            usage: Usage {
+                input_tokens: 1,
+                ..Usage::default()
+            },
+        });
+
+        let _ = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
+        let cost = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
+
+        assert!(history.messages().is_empty());
+        assert!(cost.output.contains("input tokens: 1"), "{}", cost.output);
+        assert!(
+            cost.output.contains("1 reported responses"),
+            "{}",
+            cost.output
+        );
     }
 
     #[tokio::test]

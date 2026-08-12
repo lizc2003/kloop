@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use crate::rollout::ResumedSession;
 use crate::rollout::Rollout;
 use crate::rollout::SessionRuntime;
 use crate::rollout::TurnTerminal;
+use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::ToolResultContent;
@@ -27,6 +29,7 @@ pub struct History {
     /// (items recorded at that point, total context tokens the provider
     /// reported for the request covering them). Anchors the estimate.
     usage_anchor: Option<(usize, u64)>,
+    provider_usage: UsageLedger,
     /// Session file written through on every record/replace_all; None for
     /// in-memory-only histories (sub-agents, tests).
     rollout: Option<Rollout>,
@@ -39,6 +42,7 @@ impl History {
             offload_dir,
             cap: 8000,
             usage_anchor: None,
+            provider_usage: UsageLedger::default(),
             rollout: None,
         }
     }
@@ -51,14 +55,15 @@ impl History {
     /// first recorded, so they are installed verbatim — no re-spill, and no
     /// re-append to the session file. The usage anchor starts empty and
     /// re-anchors on the first sampled response.
-    pub fn resume(offload_dir: PathBuf, items: Vec<Message>, rollout: Rollout) -> Self {
+    pub fn resume(offload_dir: PathBuf, resumed: ResumedSession) -> Self {
         sync_offload_counter(&offload_dir);
         Self {
-            items,
+            items: resumed.messages,
             offload_dir,
             cap: 8000,
             usage_anchor: None,
-            rollout: Some(rollout),
+            provider_usage: resumed.provider_usage,
+            rollout: Some(resumed.rollout),
         }
     }
 
@@ -67,9 +72,10 @@ impl History {
     /// store (branches share it, like resume). The usage anchor resets so the
     /// next sampled response re-anchors the estimate. The old rollout is dropped
     /// unwritten — the branch it wrote already lives in its own file on disk.
-    pub fn rebase(&mut self, items: Vec<Message>, rollout: Rollout) {
-        self.items = items;
-        self.rollout = Some(rollout);
+    pub fn rebase(&mut self, resumed: ResumedSession) {
+        self.items = resumed.messages;
+        self.provider_usage = resumed.provider_usage;
+        self.rollout = Some(resumed.rollout);
         self.usage_anchor = None;
     }
 
@@ -133,6 +139,15 @@ impl History {
 
     pub fn messages(&self) -> &[Message] {
         &self.items
+    }
+
+    pub fn provider_usage(&self) -> &UsageLedger {
+        &self.provider_usage
+    }
+
+    pub fn record_provider_usage(&mut self, record: ProviderUsageRecord) {
+        self.persist(|rollout| rollout.append_provider_usage(&record));
+        self.provider_usage.push(record);
     }
 
     /// Id of the last line persisted to the session file (`{stem}#{seq}`), or
@@ -376,6 +391,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_writes_through_and_survives_compaction() {
+        let dir = temp_dir("usage-writethrough");
+        let session = dir.join("session.jsonl");
+        let mut history = History::new(dir.clone());
+        history.attach_rollout(Rollout::new(session.clone()));
+        let record = ProviderUsageRecord {
+            model: "model".into(),
+            operation: crate::usage::UsageOperation::Sampling,
+            usage: kloop_protocol::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+            },
+        };
+        history.record_provider_usage(record.clone());
+        history.replace_all(Vec::new());
+
+        assert_eq!(
+            history.provider_usage().records(),
+            std::slice::from_ref(&record)
+        );
+        assert_eq!(
+            crate::rollout::resume_session(&session)
+                .unwrap()
+                .provider_usage
+                .records(),
+            &[record]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resumed_history_installs_items_without_reappending() {
         let dir = temp_dir("resume");
         let session = dir.join("session.jsonl");
@@ -385,8 +433,8 @@ mod tests {
             .unwrap();
         drop(rollout);
 
-        let (items, resumed) = crate::rollout::resume_session(&session).unwrap();
-        let mut h = History::resume(dir.clone(), items, resumed);
+        let resumed = crate::rollout::resume_session(&session).unwrap();
+        let mut h = History::resume(dir.clone(), resumed);
         assert_eq!(h.messages(), &[Message::user_text("earlier")]);
         // New records append after the resumed content, once each.
         h.record(Message::user_text("later"));
@@ -416,8 +464,8 @@ mod tests {
         // Fork before the "two" turn (cut at #2) and rewind the live history
         // onto that branch.
         let fork_path = fork_session(&session, Some(2), &dir).unwrap();
-        let (items, rollout) = crate::rollout::resume_session(&fork_path).unwrap();
-        h.rebase(items, rollout);
+        let resumed = crate::rollout::resume_session(&fork_path).unwrap();
+        h.rebase(resumed);
         assert_eq!(
             h.messages(),
             &[

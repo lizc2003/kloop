@@ -7,11 +7,13 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::history::History;
 use crate::history::estimate_message_tokens;
+use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::StreamEvent;
+use kloop_protocol::Usage;
 
 /// Cap on how much of the output limit the growth estimate reserves.
 const OUTPUT_GROWTH_CAP: u64 = 20_000;
@@ -114,7 +116,7 @@ pub async fn run_compaction(
 
     let mut request = messages[..keep_from].to_vec();
     request.push(Message::user_text(COMPACT_INSTRUCTION));
-    let summary = sample_summary(cfg, model, &request, cancel).await?;
+    let (summary, usage) = sample_summary(cfg, model, &request, cancel).await?;
     if summary.trim().is_empty() {
         bail!("compaction model returned an empty summary");
     }
@@ -123,6 +125,13 @@ pub async fn run_compaction(
     items.extend_from_slice(&messages[keep_from..]);
     let summarized = keep_from;
     let kept = items.len() - 1;
+    if let Some(usage) = usage {
+        history.record_provider_usage(ProviderUsageRecord {
+            model: model.to_string(),
+            operation: UsageOperation::Compaction,
+            usage,
+        });
+    }
     history.replace_all(items);
     Ok(CompactionStats { summarized, kept })
 }
@@ -133,7 +142,7 @@ async fn sample_summary(
     model: &str,
     request: &[Message],
     cancel: &CancellationToken,
-) -> Result<String> {
+) -> Result<(String, Option<Usage>)> {
     let mut rx = cfg.provider.stream(model, COMPACT_SYSTEM, request, &[]);
     let mut summary = String::new();
     loop {
@@ -153,8 +162,8 @@ async fn sample_summary(
                 Some(Ok(StreamEvent::BlockDone(_))) => {}
                 Some(Ok(StreamEvent::Terminal {
                     outcome: AssistantOutcome::EndTurn,
-                    ..
-                })) => return Ok(summary),
+                    usage,
+                })) => return Ok((summary, usage)),
                 Some(Ok(StreamEvent::Terminal { outcome, .. })) => {
                     bail!("compaction ended with non-success outcome {outcome:?}")
                 }
@@ -209,6 +218,15 @@ mod tests {
         })
     }
 
+    fn usage(input_tokens: u64) -> Usage {
+        Usage {
+            input_tokens,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 4,
+        }
+    }
+
     fn seeded_history(offload_dir: std::path::PathBuf) -> History {
         let mut h = History::new(offload_dir);
         h.record(Message::user_text("old request"));
@@ -248,6 +266,105 @@ mod tests {
         );
         assert_eq!(msgs.last().unwrap(), &Message::user_text("current request"));
         assert!(msgs.len() < 4);
+    }
+
+    #[tokio::test]
+    async fn accepted_summary_records_usage_before_compacted_marker() {
+        let dir = std::env::temp_dir().join(format!("kloop-compact-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = dir.join("session.jsonl");
+        let provider =
+            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Response {
+                blocks: vec![AssistantBlock::Text {
+                    text: "summary".into(),
+                }],
+                outcome: AssistantOutcome::EndTurn,
+                usage: usage(10),
+            }]);
+        let cfg = compact_test_cfg(provider, "usage");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+
+        run_compaction(
+            &cfg,
+            "actual-model",
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            history.provider_usage().records(),
+            &[ProviderUsageRecord {
+                model: "actual-model".into(),
+                operation: UsageOperation::Compaction,
+                usage: usage(10),
+            }]
+        );
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&session)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.iter().map(|line| &line["type"]).collect::<Vec<_>>(),
+            vec!["provider_usage", "compacted"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compaction_without_usage_still_succeeds_without_a_record() {
+        let provider = kloop_provider::Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "summary".into(),
+        }]]);
+        let cfg = compact_test_cfg(provider, "no-usage");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(history.provider_usage().records().is_empty());
+        assert_eq!(
+            history.messages()[0].content[0],
+            ContentBlock::Text {
+                text: format!("{SUMMARY_PREFIX}summary"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_summary_usage_is_not_recorded() {
+        let cases = [
+            kloop_provider::MockTurn::Response {
+                blocks: vec![AssistantBlock::Text { text: "   ".into() }],
+                outcome: AssistantOutcome::EndTurn,
+                usage: usage(10),
+            },
+            kloop_provider::MockTurn::Response {
+                blocks: vec![AssistantBlock::Text {
+                    text: "not accepted".into(),
+                }],
+                outcome: AssistantOutcome::Refused,
+                usage: usage(20),
+            },
+        ];
+        for (index, turn) in cases.into_iter().enumerate() {
+            let provider = kloop_provider::Provider::mock_scripted(vec![turn]);
+            let cfg = compact_test_cfg(provider, &format!("rejected-usage-{index}"));
+            let mut history = seeded_history(cfg.offload_dir.clone());
+            let before = history.messages().to_vec();
+
+            assert!(
+                run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(history.messages(), before);
+            assert!(history.provider_usage().records().is_empty());
+        }
     }
 
     /// Compaction samples on the model it is handed, not `cfg.model` — so a

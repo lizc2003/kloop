@@ -404,7 +404,7 @@ pub const MAX_OUTPUT_TOKENS: u64 = 8192;
 /// reported separately but still occupy the context window, so the full
 /// context size at the request is `total()` — which anchors the
 /// char-heuristic estimate for messages recorded afterwards.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -864,6 +864,27 @@ mod tests {
         assert!(LocalContextId::new("").is_err());
         assert!(LocalContextId::new("bad\ncontext").is_err());
         assert!(LocalContextId::new("x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn usage_serde_round_trip_preserves_canonical_fields() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 42,
+            cache_read_input_tokens: 900,
+            cache_creation_input_tokens: 8,
+        };
+        let wire = serde_json::to_value(usage).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 42,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 8,
+            })
+        );
+        assert_eq!(serde_json::from_value::<Usage>(wire).unwrap(), usage);
     }
 
     /// total() is the full context size: cached prompt tokens still occupy

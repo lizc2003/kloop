@@ -59,7 +59,12 @@ project config、明文或弱原子 session/config 持久化、第二套 parent/
 orchestrator 当作代码组织模板。kloop 继续以 core permission/sandbox、rollout/provider history、root-owned
 Task graph 和各 execution registry 为各自唯一真值。
 
-## Claude Code 2.1.220 工具对齐基线(2026-07-27)
+## Pi AgentHarness usage ledger 调研（2026-08-12）
+
+Plan 81 的参考基线固定为 `earendil-works/pi@2e4d23959485279aa2da1a45103de2ea22d46395`。Pi 将逐响应 usage record、append-only log、reducer 与 session storage 分层，证明“provider 返回的一次 usage 是历史事实，而当前 context estimate 是可失效预测状态”这一切法可独立落地。kloop 只重实现这个机制：沿既有 canonical `Usage`、rollout replay/fork/torn-tail 与 `History` owner，记录 validated sampling 和 accepted compaction 的实际 model/operation，并让 `/cost` 聚合当前 transcript 四个 token 分类。
+
+Pi 不成为依赖或架构上游；未复制源码、第三方资产、extension 信任模型、remote runtime、失败 attempt 推测、价格表、全局归因或 parent 汇总 child。kloop 也不因 ledger 放宽 permission/sandbox 边界，且不把它塞入 Plan 77 的 public event/snapshot projection。
+
 
 Plan 48 将工具对齐目标钉死在本机精确二进制,不再拿滚动产品文档或旧逆向源码补实现:
 

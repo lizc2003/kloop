@@ -422,8 +422,9 @@ async fn agent_worker(
             }
             WorkerMsg::Fork { seq } => {
                 let event = match fork_here(&history, seq) {
-                    Ok((session_id, messages, rollout)) => {
-                        history.rebase(messages.clone(), rollout);
+                    Ok((session_id, resumed)) => {
+                        let messages = resumed.messages.clone();
+                        history.rebase(resumed);
                         AgentEvent::Forked {
                             session_id,
                             messages,
@@ -448,7 +449,7 @@ async fn agent_worker(
 fn fork_here(
     history: &History,
     seq: u64,
-) -> std::io::Result<(String, Vec<Message>, kloop_core::rollout::Rollout)> {
+) -> std::io::Result<(String, kloop_core::rollout::ResumedSession)> {
     let src = history.rollout_path().ok_or_else(|| {
         std::io::Error::other("this session is not being saved, so it cannot be rewound")
     })?;
@@ -456,8 +457,8 @@ fn fork_here(
         .parent()
         .ok_or_else(|| std::io::Error::other("session file has no parent directory"))?;
     let fork_path = fork_session(src, Some(seq), sessions_dir)?;
-    let (messages, rollout) = resume_session(&fork_path)?;
-    Ok((session_id_of(&fork_path), messages, rollout))
+    let resumed = resume_session(&fork_path)?;
+    Ok((session_id_of(&fork_path), resumed))
 }
 
 struct PinnedBackend<B> {
@@ -1199,10 +1200,10 @@ mod tests {
         }]));
 
         // Cut at #2 keeps the first turn only; the branch gets a fresh id.
-        let (id, messages, _rollout) = fork_here(&history, 2).unwrap();
+        let (id, resumed) = fork_here(&history, 2).unwrap();
         assert_ne!(id, "session");
         assert_eq!(
-            messages,
+            resumed.messages,
             vec![
                 Message::user_text("one"),
                 Message::assistant(vec![ContentBlock::Text {

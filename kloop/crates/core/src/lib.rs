@@ -38,6 +38,7 @@ pub mod skills;
 mod structured_output;
 mod text_edit;
 pub mod tools;
+pub mod usage;
 pub mod worktree;
 
 pub use config::Config;

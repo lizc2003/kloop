@@ -34,6 +34,7 @@ use kloop_protocol::AssistantOutcome;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
 use kloop_protocol::ToolDef;
+use kloop_protocol::Usage;
 
 /// One process-wide HTTP client shared by every adapter. reqwest pools
 /// connections and reuses TLS sessions, but only within a single `Client`, so
@@ -63,6 +64,12 @@ pub enum MockTurn {
     Outcome {
         blocks: Vec<AssistantBlock>,
         outcome: AssistantOutcome,
+    },
+    /// Return an explicit semantic terminal and canonical usage after the supplied blocks.
+    Response {
+        blocks: Vec<AssistantBlock>,
+        outcome: AssistantOutcome,
+        usage: Usage,
     },
     /// Report that sampling started, then wait for an explicit release before
     /// emitting blocks. Tests use this to coordinate concurrent and cancelled
@@ -358,16 +365,21 @@ async fn run_mock_turn(
     turn: MockTurn,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let (blocks, outcome, with_deltas) = match turn {
+    let (blocks, outcome, usage, with_deltas) = match turn {
         MockTurn::Blocks(blocks) => {
             let outcome = mock_outcome(&blocks);
-            (blocks, outcome, true)
+            (blocks, outcome, None, true)
         }
         MockTurn::BlocksWithoutDeltas(blocks) => {
             let outcome = mock_outcome(&blocks);
-            (blocks, outcome, false)
+            (blocks, outcome, None, false)
         }
-        MockTurn::Outcome { blocks, outcome } => (blocks, outcome, true),
+        MockTurn::Outcome { blocks, outcome } => (blocks, outcome, None, true),
+        MockTurn::Response {
+            blocks,
+            outcome,
+            usage,
+        } => (blocks, outcome, Some(usage), true),
         MockTurn::Gate {
             started,
             release,
@@ -376,11 +388,12 @@ async fn run_mock_turn(
             let _ = started.send(());
             let _ = release.await;
             let outcome = mock_outcome(&blocks);
-            (blocks, outcome, true)
+            (blocks, outcome, None, true)
         }
         MockTurn::Truncated(blocks) => (
             blocks,
             AssistantOutcome::OutputLimit(kloop_protocol::OutputLimitKind::MaxOutputTokens),
+            None,
             true,
         ),
         MockTurn::PartialError(blocks, message) => {
@@ -404,7 +417,7 @@ async fn run_mock_turn(
             sink.block_done(block).await?;
         }
     }
-    Ok(StreamCompletion::new(outcome, None))
+    Ok(StreamCompletion::new(outcome, usage))
 }
 
 async fn emit_deltas(blocks: &[AssistantBlock], sink: &StreamSink) -> Result<(), ProviderFailure> {

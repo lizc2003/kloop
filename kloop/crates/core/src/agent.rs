@@ -11,6 +11,7 @@ use crate::history::History;
 use crate::inbox::Inbox;
 use crate::tools::ToolCtx;
 use crate::tools::dispatch_tools;
+use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
@@ -445,6 +446,13 @@ async fn turn_rounds(
                 rounds: round + 1,
                 structured_output: None,
             };
+        }
+        if let Some(usage) = usage {
+            history.record_provider_usage(ProviderUsageRecord {
+                model: active_model.clone(),
+                operation: UsageOperation::Sampling,
+                usage,
+            });
         }
         if !blocks.is_empty() {
             history.record(Message::assistant(blocks.clone()));

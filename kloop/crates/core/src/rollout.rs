@@ -28,6 +28,7 @@ use serde::Serialize;
 
 use crate::inbox::STEERING_PREFIX;
 use crate::tools::interrupted;
+use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
@@ -96,6 +97,12 @@ enum RolloutLine {
         #[serde(flatten)]
         message: Message,
     },
+    ProviderUsage {
+        #[serde(flatten)]
+        meta: LineMeta,
+        #[serde(flatten)]
+        record: ProviderUsageRecord,
+    },
     Compacted {
         #[serde(flatten)]
         meta: LineMeta,
@@ -115,6 +122,7 @@ impl RolloutLine {
         match self {
             RolloutLine::Session { meta, .. }
             | RolloutLine::Message { meta, .. }
+            | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. } => meta,
         }
@@ -125,6 +133,7 @@ impl RolloutLine {
         match self {
             RolloutLine::Session { meta, .. }
             | RolloutLine::Message { meta, .. }
+            | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. } => meta,
         }
@@ -203,6 +212,13 @@ impl Rollout {
         })
     }
 
+    pub fn append_provider_usage(&mut self, record: &ProviderUsageRecord) -> io::Result<()> {
+        self.append_line(RolloutLine::ProviderUsage {
+            meta: self.next_meta(),
+            record: record.clone(),
+        })
+    }
+
     pub fn append_compacted(&mut self, replacement: &[Message]) -> io::Result<()> {
         self.append_line(RolloutLine::Compacted {
             meta: self.next_meta(),
@@ -262,6 +278,7 @@ fn id_prefix(path: &Path) -> String {
 /// chain state needed to keep appending, and where the intact content ends.
 struct ParsedSession {
     items: Vec<Message>,
+    provider_usage: UsageLedger,
     runtime: Option<SessionRuntime>,
     terminals: Vec<SnapshotTerminal>,
     last_id: Option<String>,
@@ -306,6 +323,7 @@ fn parse_session(raw: &str) -> ParsedSession {
     let (lines, intact_end) = intact_lines(raw);
     let mut parsed = ParsedSession {
         items: Vec::new(),
+        provider_usage: UsageLedger::default(),
         runtime: None,
         terminals: Vec::new(),
         last_id: None,
@@ -320,6 +338,10 @@ fn parse_session(raw: &str) -> ParsedSession {
             }
             RolloutLine::Message { meta, message } => {
                 parsed.items.push(message);
+                meta
+            }
+            RolloutLine::ProviderUsage { meta, record } => {
+                parsed.provider_usage.push(record);
                 meta
             }
             RolloutLine::Compacted { meta, replacement } => {
@@ -363,11 +385,17 @@ pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
     })
 }
 
+pub struct ResumedSession {
+    pub messages: Vec<Message>,
+    pub provider_usage: UsageLedger,
+    pub rollout: Rollout,
+}
+
 /// Open a session for continuation: replay like [`load_session`], but also
 /// TRUNCATE any torn tail off the file — appending after leftover partial
 /// bytes would merge into them and make every later line unreadable — and
 /// return a [`Rollout`] whose id chain continues where the file left off.
-pub fn resume_session(path: &Path) -> io::Result<(Vec<Message>, Rollout)> {
+pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
     let raw = std::fs::read_to_string(path)?;
     let parsed = parse_session(&raw);
     if parsed.intact_end < raw.len() {
@@ -385,7 +413,11 @@ pub fn resume_session(path: &Path) -> io::Result<(Vec<Message>, Rollout)> {
         // appends never sit at seq 1, so this is never consulted.
         subagent_of: None,
     };
-    Ok((repair_pairing(parsed.items), rollout))
+    Ok(ResumedSession {
+        messages: repair_pairing(parsed.items),
+        provider_usage: parsed.provider_usage,
+        rollout,
+    })
 }
 
 /// Fork a session: copy lines `#1..=#{cut}` of `src` into a brand-new
@@ -455,6 +487,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 meta: remeta(meta),
                 message,
             },
+            RolloutLine::ProviderUsage { meta, record } => RolloutLine::ProviderUsage {
+                meta: remeta(meta),
+                record,
+            },
             RolloutLine::Compacted { meta, replacement } => RolloutLine::Compacted {
                 meta: remeta(meta),
                 replacement,
@@ -492,6 +528,7 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         }
         RolloutLine::Session { .. }
+        | RolloutLine::ProviderUsage { .. }
         | RolloutLine::Compacted { .. }
         | RolloutLine::TurnTerminal { .. } => false,
     }
@@ -832,6 +869,19 @@ mod tests {
         }
     }
 
+    fn usage_record(model: &str, input_tokens: u64) -> ProviderUsageRecord {
+        ProviderUsageRecord {
+            model: model.into(),
+            operation: crate::usage::UsageOperation::Sampling,
+            usage: kloop_protocol::Usage {
+                input_tokens,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+            },
+        }
+    }
+
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -873,6 +923,65 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_roundtrips_without_entering_message_snapshot() {
+        let path = temp_file("provider-usage");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout
+            .append_provider_usage(&usage_record("actual-model", 120))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]))
+            .unwrap();
+
+        let lines = raw_lines(&path);
+        assert_eq!(
+            lines[1],
+            json!({
+                "type": "provider_usage",
+                "id": "session#2",
+                "parent": "session#1",
+                "ts": lines[1]["ts"],
+                "model": "actual-model",
+                "operation": "sampling",
+                "usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 4,
+                },
+            })
+        );
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(
+            resumed.provider_usage.records(),
+            &[usage_record("actual-model", 120)]
+        );
+        assert_eq!(
+            resumed.messages,
+            vec![
+                Message::user_text("one"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+            ]
+        );
+        let snapshot = load_session_snapshot(&path).unwrap();
+        assert_eq!(snapshot.messages, resumed.messages);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            json!({
+                "messages": resumed.messages,
+                "runtime": null,
+                "terminals": [],
+            })
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn envelope_forms_a_sequential_chain() {
         let path = temp_file("envelope");
         let mut rollout = Rollout::new(path.clone());
@@ -906,9 +1015,10 @@ mod tests {
         rollout.append_message(&Message::user_text("two")).unwrap();
         drop(rollout);
 
-        let (messages, mut resumed) = resume_session(&path).unwrap();
-        assert_eq!(messages.len(), 2);
+        let mut resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages.len(), 2);
         resumed
+            .rollout
             .append_message(&Message::user_text("three"))
             .unwrap();
 
@@ -937,6 +1047,29 @@ mod tests {
         assert_eq!(
             load_session(&path).unwrap(),
             vec![Message::user_text("old"), Message::user_text("new")]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compacted_marker_preserves_provider_usage_ledger() {
+        let path = temp_file("compacted-usage");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_provider_usage(&usage_record("before", 10))
+            .unwrap();
+        rollout
+            .append_compacted(&[Message::user_text("[summary]")])
+            .unwrap();
+        rollout
+            .append_provider_usage(&usage_record("after", 20))
+            .unwrap();
+
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages, vec![Message::user_text("[summary]")]);
+        assert_eq!(
+            resumed.provider_usage.records(),
+            &[usage_record("before", 10), usage_record("after", 20)]
         );
         cleanup(&path);
     }
@@ -1153,15 +1286,15 @@ mod tests {
         drop(history);
 
         // Second run: resume from disk and continue the conversation.
-        let (resumed, rollout) = resume_session(&path).unwrap();
-        assert_eq!(resumed, before_restart);
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages, before_restart);
         let cfg = cfg_with(
             Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
                 text: "it was kumquat".into(),
             }]]),
             &dir,
         );
-        let mut history = History::resume(dir.clone(), resumed, rollout);
+        let mut history = History::resume(dir.clone(), resumed);
         history.record(Message::user_text("what was the magic word?"));
         let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
         assert_eq!(outcome.reason, EndReason::Completed);
@@ -1219,11 +1352,11 @@ mod tests {
         }
 
         // Both branches keep appending without seeing each other.
-        let (_, mut fork_rollout) = resume_session(&fork_path).unwrap();
+        let mut fork_rollout = resume_session(&fork_path).unwrap().rollout;
         fork_rollout
             .append_message(&Message::user_text("fork branch"))
             .unwrap();
-        let (_, mut src_rollout) = resume_session(&path).unwrap();
+        let mut src_rollout = resume_session(&path).unwrap().rollout;
         src_rollout
             .append_message(&Message::user_text("main branch"))
             .unwrap();
@@ -1236,6 +1369,51 @@ mod tests {
         let appended = raw_lines(&fork_path);
         assert_eq!(appended[4]["id"], format!("{fork_stem}#5"));
         assert_eq!(appended[4]["parent"], format!("{fork_stem}#4"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_inherits_only_usage_lines_before_the_cut() {
+        let path = temp_file("fork-usage");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout
+            .append_provider_usage(&usage_record("primary", 10))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]))
+            .unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+        rollout
+            .append_provider_usage(&usage_record("fallback", 20))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "bye".into(),
+            }]))
+            .unwrap();
+
+        let fork_path = fork_session(&path, Some(3), &dir).unwrap();
+        let forked = resume_session(&fork_path).unwrap();
+        assert_eq!(
+            forked.provider_usage.records(),
+            &[usage_record("primary", 10)]
+        );
+        assert_eq!(
+            resume_session(&path).unwrap().provider_usage.records(),
+            &[usage_record("primary", 10), usage_record("fallback", 20),]
+        );
+        let fork_of_fork = fork_session(&fork_path, None, &dir).unwrap();
+        assert_eq!(
+            resume_session(&fork_of_fork)
+                .unwrap()
+                .provider_usage
+                .records(),
+            &[usage_record("primary", 10)]
+        );
         cleanup(&path);
     }
 
@@ -1386,8 +1564,8 @@ mod tests {
         // Resume both branches against the shared offload dir and spill from
         // each: the ids must never collide (counter is dir-global).
         let spill_from = |session: &Path| {
-            let (messages, rollout) = resume_session(session).unwrap();
-            let mut history = History::resume(dir.clone(), messages, rollout);
+            let resumed = resume_session(session).unwrap();
+            let mut history = History::resume(dir.clone(), resumed);
             history.record(Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "big".into(),
                 content: "x".repeat(9_000).into(),
@@ -1602,6 +1780,46 @@ mod tests {
         cleanup(&path);
     }
 
+    #[test]
+    fn complete_usage_before_torn_tail_is_recovered() {
+        let path = temp_file("usage-before-torn");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_provider_usage(&usage_record("model", 10))
+            .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"type\":\"message");
+        std::fs::write(&path, raw).unwrap();
+
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(
+            resumed.provider_usage.records(),
+            &[usage_record("model", 10)]
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn torn_usage_line_is_ignored_and_truncated() {
+        let path = temp_file("torn-usage");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::user_text("intact"))
+            .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"type\":\"provider_usage\",\"id\":\"session#2\"");
+        std::fs::write(&path, raw).unwrap();
+
+        let resumed = resume_session(&path).unwrap();
+        assert!(resumed.provider_usage.records().is_empty());
+        assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+        cleanup(&path);
+    }
+
     /// The plan-7 latent bug: appending after a torn tail merges into the
     /// partial line and everything after becomes unreadable. Resume must
     /// physically truncate the tail before the chain continues.
@@ -1617,14 +1835,15 @@ mod tests {
         raw.push_str("{\"type\":\"mess"); // torn write, no newline
         std::fs::write(&path, &raw).unwrap();
 
-        let (messages, mut resumed) = resume_session(&path).unwrap();
-        assert_eq!(messages, vec![Message::user_text("intact")]);
+        let mut resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             good_len,
             "torn tail physically removed"
         );
         resumed
+            .rollout
             .append_message(&Message::user_text("after crash"))
             .unwrap();
         assert_eq!(

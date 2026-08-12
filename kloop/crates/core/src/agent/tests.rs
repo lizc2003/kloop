@@ -10,6 +10,7 @@ use kloop_protocol::AssistantOutcome;
 use kloop_protocol::IncompleteReason;
 use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
+use kloop_protocol::Usage;
 use kloop_provider::MockTurn;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
@@ -18,6 +19,15 @@ use serde_json::json;
 struct NullUi;
 impl Ui for NullUi {
     fn emit(&self, _: &Event) {}
+}
+
+fn usage(input_tokens: u64) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens: input_tokens + 1,
+        cache_read_input_tokens: input_tokens + 2,
+        cache_creation_input_tokens: input_tokens + 3,
+    }
 }
 
 #[test]
@@ -897,6 +907,150 @@ async fn truncation_recovery_is_bounded() {
         .filter(|m| *m == &Message::user_text(super::TRUNCATION_CONTINUE_MSG))
         .count();
     assert_eq!(nudges, 3);
+}
+
+#[tokio::test]
+async fn validated_terminal_usage_is_recorded_before_assistant_message() {
+    let dir = std::env::temp_dir().join(format!("kloop-usage-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let session = dir.join("session.jsonl");
+    let provider = Provider::mock_scripted(vec![MockTurn::Response {
+        blocks: text("answer"),
+        outcome: AssistantOutcome::EndTurn,
+        usage: usage(10),
+    }]);
+    let cfg = compaction_cfg(provider, 200_000, "usage-order");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+    history.record(Message::user_text("question"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        history.provider_usage().records(),
+        &[ProviderUsageRecord {
+            model: "mock".into(),
+            operation: UsageOperation::Sampling,
+            usage: usage(10),
+        }]
+    );
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&session)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines.iter().map(|line| &line["type"]).collect::<Vec<_>>(),
+        vec!["message", "provider_usage", "message"]
+    );
+    assert_eq!(lines[1]["parent"], lines[0]["id"]);
+    assert_eq!(lines[2]["parent"], lines[1]["id"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn every_valid_terminal_outcome_keeps_reported_usage() {
+    let outcomes = [
+        AssistantOutcome::EndTurn,
+        AssistantOutcome::ToolUse,
+        AssistantOutcome::OutputLimit(kloop_protocol::OutputLimitKind::MaxOutputTokens),
+        AssistantOutcome::Refused,
+        AssistantOutcome::Filtered,
+        AssistantOutcome::Incomplete(IncompleteReason::Provider("paused".into())),
+    ];
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        let blocks = if matches!(outcome, AssistantOutcome::ToolUse) {
+            vec![tool_use("t1", "echo hi")]
+        } else {
+            text("answer")
+        };
+        let provider = Provider::mock_scripted(vec![MockTurn::Response {
+            blocks,
+            outcome,
+            usage: usage(index as u64 + 1),
+        }]);
+        let mut cfg =
+            compaction_cfg(provider, 200_000, &format!("usage-outcome-{index}")).test_clone();
+        cfg.max_rounds = Some(1);
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("request"));
+
+        let _ = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(
+            history.provider_usage().records(),
+            &[ProviderUsageRecord {
+                model: "mock".into(),
+                operation: UsageOperation::Sampling,
+                usage: usage(index as u64 + 1),
+            }],
+            "terminal case {index}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failures_and_missing_usage_do_not_create_records() {
+    let cases = vec![
+        vec![MockTurn::Blocks(text("no usage"))],
+        vec![MockTurn::Failure(ProviderFailure::protocol("bad frame"))],
+        vec![MockTurn::Overflow],
+        vec![MockTurn::PartialError(text("partial"), "dropped".into())],
+    ];
+    for (index, turns) in cases.into_iter().enumerate() {
+        let provider = Provider::mock_scripted(turns);
+        let mut cfg =
+            compaction_cfg(provider, 200_000, &format!("usage-none-{index}")).test_clone();
+        cfg.fallback_model = None;
+        let cfg = Arc::new(cfg);
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("request"));
+
+        let _ = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert!(
+            history.provider_usage().records().is_empty(),
+            "failure case {index}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Error("primary one".into()),
+        MockTurn::Error("primary two".into()),
+        MockTurn::Error("primary three".into()),
+        MockTurn::Response {
+            blocks: text("fallback answer"),
+            outcome: AssistantOutcome::EndTurn,
+            usage: usage(7),
+        },
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "usage-fallback").test_clone();
+    cfg.model = "primary".into();
+    cfg.fallback_model = Some("fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("request"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        history.provider_usage().records(),
+        &[ProviderUsageRecord {
+            model: "fallback".into(),
+            operation: UsageOperation::Sampling,
+            usage: usage(7),
+        }]
+    );
 }
 
 #[tokio::test]

@@ -37,6 +37,8 @@
 
 ### 1. 生存层(压缩/恢复/token 记账)——🟡,对 codex 反超
 
+Plan 81（2026-08-12）已销账当前 transcript 的 durable provider-reported token 分类：validated terminal sampling 与 accepted compaction 逐响应写 append-only rollout，resume/fork/clear 按 raw prefix/同 transcript 语义恢复，`/cost` 累计 input/output/cache-read/cache-creation 与 reported-response count。该能力不是金额、billable total、失败 attempt telemetry、parent+child 全局归因或 provider 账单对账；context estimate 仍是独立且可失效的预测状态。
+
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | 压缩后重注入最近读过的 ≤5 文件 | cc 单家 | 未立 | dogfood 出现"压缩后失忆"痛感 |
@@ -417,7 +419,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 - **T0 架构与 correctness**：Plan 61–66 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，Plan 66 已把后台资源名与 ID 域分开。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
-- **T2 痛感驱动**：hooks JSON 协议、`/cost` 累计花费、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
+- **T2 痛感驱动**：hooks JSON 协议、provider/model 价格与跨 transcript/child 全局金额归因、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训
   24)、并发 pacing、V8 引擎、旧版 SSE 传输、worktree 自动合回、bedrock/vertex、
   vim/主题。

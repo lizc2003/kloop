@@ -379,10 +379,13 @@ pub(crate) fn open_history(
         }
     };
     let id = session_id_of(&resume_path);
-    let (messages, rollout) = resume_session(&resume_path)
+    let resumed = resume_session(&resume_path)
         .with_context(|| format!("cannot read session file {}", resume_path.display()))?;
-    println!("[resumed session {id}: {} message(s)]", messages.len());
-    let history = History::resume(offload_dir, messages, rollout);
+    println!(
+        "[resumed session {id}: {} message(s)]",
+        resumed.messages.len()
+    );
+    let history = History::resume(offload_dir, resumed);
     Ok((history, id))
 }
 #[cfg(test)]
