@@ -23,6 +23,9 @@ const RIGHT: &[u8] = b"\x1b[C";
 const BACKSPACE: &[u8] = b"\x7f";
 const DELETE: &[u8] = b"\x1b[3~";
 const ENTER: &[u8] = b"\r";
+const SHIFT_ENTER_CSI_U: &[u8] = b"\x1b[13;2u";
+const KEYBOARD_ENHANCEMENT_PUSH: &[u8] = b"\x1b[>1u";
+const KEYBOARD_ENHANCEMENT_POP: &[u8] = b"\x1b[<1u";
 const ALTERNATE_SCREEN_SEQUENCES: &[&[u8]] = &[
     b"\x1b[?47h",
     b"\x1b[?47l",
@@ -86,6 +89,8 @@ async fn boot_answers_cpr_without_alternate_screen() -> Result<()> {
     let raw = harness.raw();
     assert!(contains_bytes(&raw, b"\x1b[6n"));
     assert!(contains_bytes(&raw, b"\x1b[?2004h"));
+    assert!(contains_bytes(&raw, KEYBOARD_ENHANCEMENT_PUSH));
+    assert!(contains_bytes(&raw, KEYBOARD_ENHANCEMENT_POP));
     assert_no_alternate_screen(&raw);
     assert!(!harness.emergency_killed());
     Ok(())
@@ -198,9 +203,40 @@ async fn double_ctrl_c_restores_terminal_modes_without_emergency_kill() -> Resul
     let raw = harness.raw();
     assert_no_alternate_screen(&raw);
     let restore = &raw[mark.min(raw.len())..];
-    assert!(contains_bytes(restore, b"\x1b[?2004l"));
+    let keyboard_pop =
+        find_bytes(restore, KEYBOARD_ENHANCEMENT_POP, 0).expect("keyboard enhancement pop");
+    let paste_disable =
+        find_bytes(restore, b"\x1b[?2004l", keyboard_pop).expect("bracketed paste disable");
+    assert!(keyboard_pop < paste_disable);
     assert!(contains_bytes(restore, b"\x1b[?25h"));
     assert!(restore.ends_with(b"\r\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn csi_u_shift_enter_submits_a_multiline_message() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("MULTILINE_ACK")]).await;
+    let mut harness = spawn(&fixture, 24, 100)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.write(b"first")?;
+    harness.write(SHIFT_ENTER_CSI_U)?;
+    harness.write(b"second")?;
+    harness.write(ENTER)?;
+    harness.wait_for("multiline response", Duration::from_secs(8), |frame| {
+        frame.contains("MULTILINE_ACK") && !frame.contains("Working")
+    })?;
+
+    let requests = fixture.requests();
+    let request = requests.last().expect("one OpenAI request");
+    assert_eq!(request.model, "tui-pty-model");
+    assert_eq!(
+        request.user_texts.last().map(String::as_str),
+        Some("first\nsecond")
+    );
+
+    graceful_exit(&mut harness)?;
     Ok(())
 }
 

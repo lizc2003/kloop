@@ -465,9 +465,14 @@ visual rows** at the current viewport width, preserve a display-column goal over
 short/CJK rows, and enter history only at the first/last visual row. One canonical
 layout drives wrapping, cursor row/column, the eight-row window, and composer
 height, so Unicode scalar count, grapheme boundaries, display columns, and visual
-rows are never treated as interchangeable coordinates. **Shift+Enter /
-Alt+Enter / Ctrl+J** insert a newline (Ctrl+J is the portable one — many terminals
-do not distinguish Shift+Enter).
+rows are never treated as interchangeable coordinates. On Unix, kloop
+best-effort requests the terminal's keyboard-enhancement disambiguation mode;
+when the terminal and any multiplexer/SSH hop pass CSI-u through,
+**Shift+Enter** inserts a newline instead of submitting. **Alt+Enter / Ctrl+J**
+do the same, with Ctrl+J remaining the reliable fallback for legacy terminals
+that encode Shift+Enter as ordinary Enter. Composer newline keys keep this
+meaning while a completion menu is open; bare **Tab / Enter** still accepts the
+highlighted completion.
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,

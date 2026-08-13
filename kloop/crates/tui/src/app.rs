@@ -36,6 +36,13 @@ use crate::composer::Composer;
 use crate::events::AgentEvent;
 use crate::menu;
 
+fn is_composer_newline_key(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    (key.code == KeyCode::Enter && (shift || alt)) || (key.code == KeyCode::Char('j') && ctrl)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
@@ -918,6 +925,13 @@ impl App {
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
         }
+        // A newline inside the composer instead of a submit: Ctrl+J (the reliable
+        // LF), or Shift/Alt+Enter where the terminal distinguishes it. Handle it
+        // before completion accept so an open menu cannot steal Shift+Enter.
+        if is_composer_newline_key(&key) {
+            self.composer.insert_newline();
+            return self.after_edit();
+        }
         // An open completion popup (slash `/` or file `@`) captures navigation /
         // accept / cancel; every other key falls through to edit the composer,
         // after which the tail re-syncs the popup (re-filter or close).
@@ -926,17 +940,7 @@ impl App {
         {
             return cmd;
         }
-        // A newline inside the composer instead of a submit: Ctrl+J (the reliable
-        // LF), or Shift/Alt+Enter where the terminal distinguishes it (many do
-        // not — Ctrl+J is the portable path).
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        if (key.code == KeyCode::Enter && (shift || alt))
-            || (key.code == KeyCode::Char('j') && ctrl)
-        {
-            self.composer.insert_newline();
-            return self.after_edit();
-        }
         // Ctrl+V / Alt+V pastes an image off the OS clipboard (the terminal keeps
         // Cmd+V for its own text paste, so a distinct key like codex / CC). The
         // read is a side effect the loop performs.
@@ -2037,6 +2041,31 @@ mod tests {
     }
 
     #[test]
+    fn newline_shortcuts_insert_without_submit_then_enter_submits_multiline() {
+        let shortcuts = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ];
+
+        for shortcut in shortcuts {
+            let mut app = App::new("s".into());
+            type_str(&mut app, "first");
+            assert_eq!(app.on_key(80, shortcut), Command::None);
+            assert_eq!(app.composer.text(), "first\n");
+            assert!(!app.running);
+            assert!(app.cells.is_empty());
+
+            type_str(&mut app, "second");
+            assert_eq!(
+                app.on_key(80, key(KeyCode::Enter)),
+                Command::Submit("first\nsecond".into())
+            );
+            assert_eq!(app.cells, vec![Cell::User("first\nsecond".into())]);
+        }
+    }
+
+    #[test]
     fn vertical_navigation_uses_the_current_composer_width() {
         let mut app = App::new("s".into());
         type_str(&mut app, "history");
@@ -2847,6 +2876,23 @@ mod tests {
         assert!(app.popup.is_none(), "menu closed after accept");
         assert_eq!(app.composer.text(), "/compact ");
         assert!(!app.running, "accept did not submit");
+    }
+
+    /// Shift+Enter is a composer edit even while completion is open; it must not
+    /// accept the highlighted entry. Bare Enter remains the completion key.
+    #[test]
+    fn shift_enter_in_an_open_menu_inserts_newline_without_accepting() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/co");
+        assert!(app.popup.is_some());
+
+        assert_eq!(
+            app.on_key(80, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),),
+            Command::None
+        );
+        assert_eq!(app.composer.text(), "/co\n");
+        assert!(app.popup.is_none(), "newline ends the completion token");
+        assert!(!app.running);
     }
 
     /// Esc closes an open menu but leaves the composer text alone (a running

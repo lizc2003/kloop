@@ -1,6 +1,6 @@
 //! ratatui terminal UI for kloop: an inline viewport (plan 38 slice 0) whose
-//! finalized cells scroll into the terminal's native scrollback, a one-line
-//! input, per-tool-call status rows, and a centered permission popup.
+//! finalized cells scroll into the terminal's native scrollback, a multi-line
+//! composer, per-tool-call status rows, and a centered permission popup.
 //!
 //! Split of responsibilities: the agent runs on its own tokio task and only
 //! talks through channels ([`events::ChannelUi`] implements both `Ui` and
@@ -30,6 +30,12 @@ use std::time::Instant;
 use anyhow::Result;
 use crossterm::event::Event;
 use crossterm::event::KeyEventKind;
+#[cfg(unix)]
+use crossterm::event::KeyboardEnhancementFlags;
+#[cfg(unix)]
+use crossterm::event::PopKeyboardEnhancementFlags;
+#[cfg(unix)]
+use crossterm::event::PushKeyboardEnhancementFlags;
 use ratatui::TerminalOptions;
 use ratatui::Viewport;
 use ratatui::layout::Rect;
@@ -182,14 +188,6 @@ pub async fn run(
 
     let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-    let worker = tokio::spawn(agent_worker(
-        cfg,
-        history,
-        channel_ui as Arc<dyn Ui>,
-        msg_rx,
-        event_tx,
-        pending_images,
-    ));
 
     // Setup can fail AFTER raw mode is enabled (e.g. the inline viewport's CPR
     // probe times out on a PTY that never answers, or an intermediate write
@@ -200,20 +198,38 @@ pub async fn run(
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
-            restore_terminal();
             let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
             if remaining > 0 {
                 eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
             }
-            worker.abort();
             if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
                 eprintln!("{}", note.trim());
             }
             return Err(e);
         }
     };
+
+    // A panic in the worker task is otherwise absorbed by JoinHandle and leaves
+    // the UI reading/drawing against a terminal whose owner is still alive. Ask
+    // the single UI owner to stop; TerminalSession then performs the only full
+    // restore, rather than having a panic hook race normal drawing.
+    let panic_events = event_tx.clone();
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = panic_events.send(AgentEvent::Quit);
+        panic_hook(info);
+    }));
+    let worker = tokio::spawn(agent_worker(
+        cfg,
+        history,
+        channel_ui as Arc<dyn Ui>,
+        msg_rx,
+        event_tx,
+        pending_images,
+    ));
+
     let result = ui_loop(
-        &mut terminal,
+        &mut terminal.terminal,
         event_rx,
         msg_tx,
         inbox,
@@ -222,7 +238,7 @@ pub async fn run(
         cwd,
     )
     .await;
-    restore_terminal();
+    terminal.restore();
     let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
     if remaining > 0 {
         eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
@@ -568,21 +584,100 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
 type Terminal =
     ratatui::Terminal<PinnedBackend<ratatui::backend::CrosstermBackend<std::io::Stdout>>>;
 
-fn setup_terminal() -> Result<Terminal> {
+#[cfg(unix)]
+struct KeyboardEnhancementGuard {
+    pushed: bool,
+}
+
+#[cfg(unix)]
+impl KeyboardEnhancementGuard {
+    fn push() -> Self {
+        let pushed = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+        Self { pushed }
+    }
+
+    fn pop(&mut self, out: &mut std::io::Stdout) {
+        if self.pushed {
+            let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
+            self.pushed = false;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct KeyboardEnhancementGuard;
+
+#[cfg(not(unix))]
+impl KeyboardEnhancementGuard {
+    fn push() -> Self {
+        Self
+    }
+
+    fn pop(&mut self, _out: &mut std::io::Stdout) {}
+}
+
+struct TerminalModes {
+    keyboard_enhancement: KeyboardEnhancementGuard,
+    restored: bool,
+}
+
+impl TerminalModes {
+    fn new(keyboard_enhancement: KeyboardEnhancementGuard) -> Self {
+        Self {
+            keyboard_enhancement,
+            restored: false,
+        }
+    }
+
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        restore_terminal(&mut self.keyboard_enhancement);
+        self.restored = true;
+    }
+}
+
+impl Drop for TerminalModes {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+struct TerminalSession {
+    terminal: Terminal,
+    modes: TerminalModes,
+}
+
+impl TerminalSession {
+    fn restore(&mut self) {
+        self.modes.restore();
+    }
+}
+
+fn setup_terminal() -> Result<TerminalSession> {
     crossterm::terminal::enable_raw_mode()?;
     // Bracketed paste (plan 38 slice 3): the terminal wraps pasted text so a
     // large paste arrives as one `Event::Paste` (collapsed to a placeholder)
     // instead of a burst of keystrokes, and a dragged image-file path can be
     // recognized. This is a plain control sequence — no CPR, so it does not race
     // stdin like the viewport probe does.
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
-    // A panic elsewhere (agent task, draw code) must not leave the terminal in
-    // raw mode with no visible output.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        hook(info);
-    }));
+    if let Err(error) =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)
+    {
+        let _ = crossterm::terminal::disable_raw_mode();
+        return Err(error.into());
+    }
+    // Ask compatible Unix terminals to report modified keys through CSI-u, so
+    // Shift+Enter reaches App as Enter+SHIFT instead of the same CR as Enter.
+    // This is best-effort: legacy terminals ignore the push. Do not use
+    // supports_keyboard_enhancement() here — its stdin query may block for two
+    // seconds and would add another reader beside the inline viewport's CPR.
+    let keyboard_enhancement = KeyboardEnhancementGuard::push();
     // Inline viewport, no alternate screen (plan 38 slice 0): the transcript
     // scrolls into native scrollback, so the mouse wheel / selection / Cmd+F
     // reach history directly. The viewport is the full terminal height, so
@@ -591,22 +686,31 @@ fn setup_terminal() -> Result<Terminal> {
     // races it for stdin.
     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
     let backend = PinnedBackend::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()));
-    let terminal = ratatui::Terminal::with_options(
+    match ratatui::Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(height.max(1)),
         },
-    )?;
-    Ok(terminal)
+    ) {
+        Ok(terminal) => Ok(TerminalSession {
+            terminal,
+            modes: TerminalModes::new(keyboard_enhancement),
+        }),
+        Err(error) => {
+            let mut keyboard_enhancement = keyboard_enhancement;
+            restore_terminal(&mut keyboard_enhancement);
+            Err(error.into())
+        }
+    }
 }
 
-fn restore_terminal() {
-    let _ = crossterm::terminal::disable_raw_mode();
+fn restore_terminal(keyboard_enhancement: &mut KeyboardEnhancementGuard) {
     // No alternate screen to leave. The last draw left the cursor mid-viewport
     // (at the composer); drop it to the bottom row and emit an explicit CR+LF so
     // the shell prompt returns on a fresh line at column 0 — otherwise zsh marks
     // the partial line with a "%". The last frame stays in scrollback.
     let mut out = std::io::stdout();
+    keyboard_enhancement.pop(&mut out);
     let bottom = crossterm::terminal::size()
         .map(|(_, h)| h.saturating_sub(1))
         .unwrap_or(0);
@@ -618,6 +722,7 @@ fn restore_terminal() {
         crossterm::style::Print("\r\n"),
     );
     let _ = out.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 /// Read terminal events on a dedicated OS thread and forward them to the async
