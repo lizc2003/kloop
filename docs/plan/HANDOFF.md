@@ -8,7 +8,11 @@
 2. 目标模型双轨:Claude(sonnet-5)为主、OpenAI-compat 为副。
 3. 对 codex 上游只保持"可跟随性",不追求可合并。
 
-## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–82 已完成；Plan 82 TUI Shift+Enter 多行输入已完成)
+## 二、当前状态(plan 1–38 + plan 39 切片 0–2、3A engine、4 + plan 40–59、61–66、68–83 已完成；Plan 83 TUI 粘贴多行换行已完成)
+
+> **Plan 83 已完成（2026-08-13）**：TUI bracketed paste ingress 统一将 CRLF 与孤立 CR 规范化为 LF，再交给 Composer 或 question editor；不 trim，不删除前后空格和尾随换行。这样复制 `abc`/`def` 两行时，CR 不再作为终端控制字符覆盖前一行，Composer、paste atom、history、steering 与 provider payload 都共享 canonical LF 文本。普通未包裹 raw CR burst 仍按 Enter/提交语义处理，Plan 38 的 PasteBurst 范围不变。
+>
+> App unit 覆盖 LF/CRLF/CR、空格/尾随 LF 和 submit payload；question notes 粘贴覆盖 canonical LF；Unix PTY 真实发送 bracketed `abc\\r\\ndef` 后提交，mock provider 收到 `abc\\ndef`。本次未执行物理终端手工场景；提交 SHA 以本条所在提交为准。
 
 > **Plan 82 已完成（2026-08-13）**：`82-tui-shift-enter-multiline.md` 没有重写既有 Composer，而是补齐真实 terminal→Crossterm→App 闭环。Unix TUI 在 raw mode 与 bracketed paste 建立后、inline CPR/input poll thread 之前 best-effort Push `DISAMBIGUATE_ESCAPE_CODES`；只在写成功后记录自己拥有的一层，normal/setup-error/panic restore 由 session-owned guard 幂等 Pop，再恢复 paste/cursor/raw mode。没有启用 event-types/alternate/all-keys，也没有调用可能读 stdin 并等待约 2 秒的 capability query。App 的 newline predicate 现在低于 modal interaction/rewind、高于 completion accept，故 popup 打开时 Shift/Alt+Enter 或 Ctrl+J 仍插入换行，裸 Tab/Enter 仍补全。
 >

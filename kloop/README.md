@@ -477,15 +477,21 @@ highlighted completion.
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,
 history recall, draft restore, and steering expand that exact payload once, while
-identical text typed by the user remains literal. The cursor cannot enter an
-atom; adjacent Backspace/Delete removes it whole, and a range edit that cuts one
-materializes its payload before editing. **Ctrl+V / Alt+V** pastes an image
-straight off the OS clipboard (a screenshot, browser copy, or Finder-copied
-file); a pasted or dragged single-line **image-file path** attaches too, while
-ordinary bracketed paste remains text. Typed `Attachment { label, block }`
-records replace the old parallel label/image arrays. Images show on a `📎` line
-and ride the next fresh turn (steering preserves them), reusing the `--image`
-ingestion in `crates/tui/src/clipboard.rs` via `arboard`.
+identical text typed by the user remains literal. Bracketed paste canonicalizes
+CRLF and CR line endings to the Composer's LF logical newline at the TUI ingress;
+other characters, surrounding spaces, and trailing newlines are preserved (no
+trim). The cursor cannot enter an atom; adjacent Backspace/Delete removes it
+whole, and a range edit that cuts one materializes its payload before editing.
+**Ctrl+V / Alt+V** pastes an image straight off the OS clipboard (a screenshot,
+browser copy, or Finder-copied file); a pasted or dragged single-line
+**image-file path** attaches too, while ordinary bracketed paste remains text.
+Typed `Attachment { label, block }` records replace the old parallel label/image
+arrays. Images show on a `📎` line and ride the next fresh turn (steering
+preserves them), reusing the `--image` ingestion in `crates/tui/src/clipboard.rs`
+via `arboard`.
+
+Copying two lines therefore keeps one logical newline between them even when the
+terminal supplies CRLF or CR bytes.
 
 Typing a **`/`** at the start of the line or a **`@`** anywhere opens a
 **completion menu** (plan 38 slice 4, `crates/tui/src/menu.rs`) that floats just

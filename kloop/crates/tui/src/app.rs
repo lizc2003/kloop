@@ -36,6 +36,22 @@ use crate::composer::Composer;
 use crate::events::AgentEvent;
 use crate::menu;
 
+fn canonicalize_paste_newlines(text: &str) -> String {
+    let mut canonical = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            canonical.push('\n');
+        } else {
+            canonical.push(character);
+        }
+    }
+    canonical
+}
+
 fn is_composer_newline_key(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1151,13 +1167,14 @@ impl App {
     /// A bracketed-paste of text (the event loop routes image-file pastes to
     /// [`App::attach_image`] instead).
     pub fn paste_text(&mut self, s: &str) -> Command {
+        let text = canonicalize_paste_newlines(s);
         if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut()
             && matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes)
         {
-            question.editor.push_str(s);
+            question.editor.push_str(&text);
             return Command::None;
         }
-        self.composer.paste(s);
+        self.composer.paste(&text);
         self.after_edit()
     }
 
@@ -2041,6 +2058,26 @@ mod tests {
     }
 
     #[test]
+    fn paste_newlines_are_canonicalized_without_trimming_content() {
+        for (input, expected) in [
+            ("abc\ndef", "abc\ndef"),
+            ("abc\r\ndef", "abc\ndef"),
+            ("abc\rdef", "abc\ndef"),
+            (" abc\r\ndef \n", " abc\ndef \n"),
+        ] {
+            assert_eq!(canonicalize_paste_newlines(input), expected);
+
+            let mut app = App::new("s".into());
+            assert_eq!(app.paste_text(input), Command::None);
+            assert_eq!(app.composer.text(), expected);
+            assert_eq!(
+                app.on_key(80, key(KeyCode::Enter)),
+                Command::Submit(expected.into())
+            );
+        }
+    }
+
+    #[test]
     fn newline_shortcuts_insert_without_submit_then_enter_submits_multiline() {
         let shortcuts = [
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
@@ -2578,7 +2615,7 @@ mod tests {
         };
         assert_eq!(question.phase, QuestionPhase::Notes);
         assert_eq!(question.selected_preview(), Some("preview A"));
-        app.paste_text("ship it");
+        app.paste_text("ship\r\nit");
         app.on_key(80, key(KeyCode::Enter));
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -2586,7 +2623,7 @@ mod tests {
                 question_index: 0,
                 selected: vec![0],
                 other: None,
-                notes: Some("ship it".into()),
+                notes: Some("ship\nit".into()),
             }])
         );
         assert!(app.interactions.is_empty());

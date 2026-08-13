@@ -24,6 +24,8 @@ const BACKSPACE: &[u8] = b"\x7f";
 const DELETE: &[u8] = b"\x1b[3~";
 const ENTER: &[u8] = b"\r";
 const SHIFT_ENTER_CSI_U: &[u8] = b"\x1b[13;2u";
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const KEYBOARD_ENHANCEMENT_PUSH: &[u8] = b"\x1b[>1u";
 const KEYBOARD_ENHANCEMENT_POP: &[u8] = b"\x1b[<1u";
 const ALTERNATE_SCREEN_SEQUENCES: &[&[u8]] = &[
@@ -210,6 +212,34 @@ async fn double_ctrl_c_restores_terminal_modes_without_emergency_kill() -> Resul
     assert!(keyboard_pop < paste_disable);
     assert!(contains_bytes(restore, b"\x1b[?25h"));
     assert!(restore.ends_with(b"\r\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bracketed_crlf_paste_submits_a_logical_multiline_message() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("PASTE_ACK")]).await;
+    let mut harness = spawn(&fixture, 24, 100)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.write(BRACKETED_PASTE_START)?;
+    harness.write(b"abc\r\ndef")?;
+    harness.write(BRACKETED_PASTE_END)?;
+    harness.write(ENTER)?;
+    harness.wait_for(
+        "pasted multiline response",
+        Duration::from_secs(8),
+        |frame| frame.contains("PASTE_ACK") && !frame.contains("Working"),
+    )?;
+
+    let requests = fixture.requests();
+    let request = requests.last().expect("one OpenAI request");
+    assert_eq!(
+        request.user_texts.last().map(String::as_str),
+        Some("abc\ndef")
+    );
+
+    graceful_exit(&mut harness)?;
     Ok(())
 }
 
