@@ -429,6 +429,87 @@ mod tests {
         assert_eq!(history.messages(), &before[..]);
     }
 
+    #[test]
+    fn keep_boundary_walks_back_before_oversized_tool_pair() {
+        let tool_use = Message::assistant(vec![
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!({"command": "x".repeat(10_000)}),
+            },
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "read_file".into(),
+                input: json!({"path": "small.txt"}),
+            },
+        ]);
+        let tool_result = Message::tool_results(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "first result".into(),
+                is_error: false,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t2".into(),
+                content: "second result".into(),
+                is_error: false,
+            },
+        ]);
+        let messages = vec![
+            Message::user_text("old request"),
+            tool_use,
+            tool_result,
+            Message::assistant(vec![ContentBlock::Text {
+                text: "recent tail".into(),
+            }]),
+        ];
+
+        // The result and recent tail fit the keep budget, but the preceding
+        // assistant tool-use does not. The boundary must therefore move before
+        // the whole assistant/result pair rather than retain an orphan result.
+        assert_eq!(keep_from_index(&messages), 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_retains_complete_tool_pair_at_boundary() {
+        let provider = kloop_provider::Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "summary".into(),
+        }]]);
+        let cfg = compact_test_cfg(provider, "tool-boundary");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("old request"));
+        history.record(Message::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({"command": "x".repeat(10_000)}),
+        }]));
+        history.record(Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "ok".into(),
+            is_error: false,
+        }]));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "recent tail".into(),
+        }]));
+
+        let stats = run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
+            .await
+            .expect("compaction should preserve the tool pair");
+        assert_eq!(stats.summarized, 1);
+        assert_eq!(stats.kept, 3);
+        assert!(matches!(
+            history.messages(),
+            [
+                Message { role: kloop_protocol::Role::User, content },
+                Message { role: kloop_protocol::Role::Assistant, content: tool_use },
+                Message { role: kloop_protocol::Role::User, content: tool_result },
+                Message { role: kloop_protocol::Role::Assistant, content: tail },
+            ] if content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)))
+                && tool_use.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "t1"))
+                && tool_result.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"))
+                && tail.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "recent tail"))
+        ));
+    }
     #[tokio::test]
     async fn too_short_history_is_not_compacted() {
         let provider = kloop_provider::Provider::mock(vec![]);

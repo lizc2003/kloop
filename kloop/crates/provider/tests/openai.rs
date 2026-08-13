@@ -217,6 +217,52 @@ async fn cached_prompt_tokens_are_split_out_of_input() {
     );
 }
 
+#[tokio::test]
+async fn null_tool_calls_are_ignored_but_non_arrays_fail_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"index": 0, "delta": {"content": "ok", "tool_calls": null}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            ],
+            true,
+        ),
+    )
+    .await;
+    let events = collect(openai(&server)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Ok(StreamEvent::TextDelta(text)),
+            Ok(StreamEvent::BlockDone(AssistantBlock::Text { text: block_text })),
+            Ok(StreamEvent::Terminal {
+                outcome: AssistantOutcome::EndTurn,
+                ..
+            })
+        ] if text == "ok" && block_text == "ok"
+    ));
+
+    for invalid in [json!({"not": "an array"}), json!("not an array"), json!(42)] {
+        server.reset().await;
+        mount_sse(
+            &server,
+            sse_body(
+                &[json!({
+                    "choices": [{"index": 0, "delta": {"tool_calls": invalid}}]
+                })],
+                false,
+            ),
+        )
+        .await;
+        let events = collect(openai(&server)).await;
+        assert_eq!(events.len(), 1);
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(error.to_string().contains("tool_calls was not an array"));
+    }
+}
 /// Non-empty malformed tool arguments fail closed before a ToolUse or Done is emitted.
 #[tokio::test]
 async fn empty_tool_identity_must_eventually_fill_and_nonempty_values_cannot_change() {

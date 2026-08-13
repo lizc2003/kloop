@@ -172,6 +172,16 @@ async fn request_body_carries_cache_breakpoints() {
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_eq!(requests[0].url.path(), "/v1/messages");
+    assert_eq!(requests[0].headers["x-api-key"], "test-key");
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert!(
+        requests[0].headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(
         body,

@@ -8,10 +8,24 @@ kloop 设计时对比研究过四个代码库。本文件是关于"别人代码"
 |---|---|---|
 | **codex** | `refs/codex` | codex 生产级 fork。分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`tools/parallel.rs`;压缩全家桶:`compact*.rs`、`fork_proactive_trim.rs`;会话落盘:`rollout/`;扩展范式:`ext/worktree`;集成测试:`core/tests/suite`(mock SSE + wiremock 范式) |
 | **claude-code(逆向 TS 版)** | `~/work/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
-| **claw-code** | `./claw-code/`(本地克隆,已删 target/) | **不可作底座**(见结论 3)。仅三样值得抄:① `rust/crates/mock-anthropic-service` + `rusty-claude-cli/tests/output_format_contract.rs` 的 mock 契约测试纪律;② `rust/crates/api/src/providers/openai_compat.rs` 的 tool_calls 流式翻译状态机;③ `rust/crates/runtime/src/compact.rs:129-166` 的压缩边界回退(不切开 tool_use/tool_result 对) |
+| **claw-code（已退休）** | 历史快照 `claw-code@b71afddae100ced324457337925a694686b8fef2`（本地 clone 已移除） | **不可作底座**。只保留四项局部结论：① mock/request-capture 与 CLI output-contract 测试纪律；② OpenAI-compatible tool_calls 流式 reducer 的兼容边界；③ compact 不切开 tool_use/tool_result pair 的边界回归；④ typed lifecycle/degraded error 的阅读材料。kloop 已按自身协议和安全边界重实现，不复制 claw runtime。
 | **CodeWhale** | `./codewhale/`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
 
-`./claw-code/` 与 `./codewhale/` 都由根 `.gitignore` 排除，只作为本机只读参考，不随 kloop 提交；不得在其中开发或推送。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
+`./codewhale/` 由根 `.gitignore` 排除，只作为本机只读参考，不随 kloop 提交；不得在其中开发或推送。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
+
+Plan 84 实际吸收了 claw 的四项局部测试/兼容纪律：真实 CLI stdout/stderr/NDJSON contract、wiremock request capture、OpenAI `tool_calls: null` 等同缺失但保持其他协议错误、以及 compaction tool pair boundary regression。未吸收 local placeholder auth、MCP failure phase、doctor 或第二套 registry。
+
+## Plan 84 claw-code 退休记录
+
+`claw-code` 本地 clone 已于 2026-08-13 退休。删除前固定核验为
+`claw-code@b71afddae100ced324457337925a694686b8fef2`，`main` 跟踪
+`origin/main` 且 ahead/behind 为 `0/0`、工作树干净；删除后仅保留本文历史结论和 parity provenance。
+
+Plan 84 实际吸收四项局部纪律：真实 CLI stdout/stderr/NDJSON contract、wiremock
+request capture、OpenAI `tool_calls: null` 等同缺失但其他协议结构继续严格拒绝，以及
+compaction tool-use/tool-result pair boundary regression。没有吸收 local placeholder auth、MCP
+failure phase、doctor、global registry 或 claw runtime；kloop 的 canonical protocol、权限、rollout
+和 ToolSource ownership 保持不变。
 
 ## CodeWhale 固定源码审计(2026-07-27)
 
@@ -91,7 +105,7 @@ output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 - `~/work/claude-code` commit `<redacted>`;
 - `refs/codex` commit
   `bb21ed4b8d8f74567cd6fecb3c7d4fba795bc6e3`;
-- `refs/claw-code` commit `4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d`。
+- archived snapshot: `claw-code@4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d` (the local clone was later verified at `b71afddae100ced324457337925a694686b8fef2` before retirement).
 
 回源交叉核对的收敛点:工具计划/条件注册与执行分发分层;编辑前保存并校验文件读取状态;
 并发能力按调用事实判定而非把所有工具一刀切;worktree 是带创建、持久化、清理决策的会话资源。
@@ -538,8 +552,8 @@ drain + `src/utils/messages.ts:5988` framing;codex `core/src/session/input_queue
 三家的编辑审批 diff 交叉核对(细节可再查:cc `src/utils/diff.ts` `structuredPatch` +
 `src/components/FileEditToolDiff.tsx` `getPatchForDisplay`,`packages/color-diff-napi`
 渲染;codex `tui/src/diff_render.rs` `create_diff_summary`(`diffy` crate)+ `git-utils/
-src/turn_diff.rs`(`similar`);claw `refs/claw-code/rust/crates/runtime/src/file_ops.rs`
-`make_patch`):
+src/turn_diff.rs`(`similar`);claw `claw-code@b71afddae100ced324457337925a694686b8fef2:rust/crates/runtime/src/file_ops.rs`
+`make_patch`;本地 clone 已退休):
 
 - **收敛点(两个正经实现独立都做,kloop 已抄)**:① **读文件、应用编辑、整文件 diff 带
   真实行号**——不是直 diff old_string/new_string 两串;改动显示在文件里的真实周围上下文 +

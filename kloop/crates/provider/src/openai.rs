@@ -331,9 +331,12 @@ async fn apply_choice_payload(
     }
 
     if let Some(tool_calls) = payload.get("tool_calls") {
-        let tool_calls = tool_calls
-            .as_array()
-            .ok_or_else(|| protocol("delta tool_calls was not an array"))?;
+        let Some(tool_calls) = tool_calls.as_array() else {
+            if tool_calls.is_null() {
+                return Ok(semantic);
+            }
+            return Err(protocol("delta tool_calls was not an array"));
+        };
         for call in tool_calls {
             semantic = true;
             let call_object = call
