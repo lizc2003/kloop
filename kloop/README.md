@@ -122,7 +122,7 @@ dependency), `parent` (previous line's id, linked across resumed runs), `ts`
 first line carries a cross-file parent (see Fork below). Unknown fields are
 ignored on read (locked by test), so the format grows additively.
 
-Resume replays the file, then makes the history legal and consistent again:
+Resume replays the file, then makes the history legal and consistent again. Read-only inspection (`thread/read`, `thread/list`, session pickers and event seeds) performs the same normalization only in memory and never changes the JSONL file:
 
 - pairing is repaired in both directions (as in claude-code): unanswered
   `tool_use` blocks get the same `is_error` "interrupted" results the live
@@ -130,13 +130,25 @@ Resume replays the file, then makes the history legal and consistent again:
   dropped;
 - a torn tail (crash mid-append) is truncated to the last intact line —
   physically, before appending resumes, so the partial bytes can't merge
-  with the next line and orphan everything after (read-only paths like
-  `--list-sessions` never modify the file);
+  with the next line and orphan everything after (read-only paths never modify
+  the file, including invalid UTF-8 tail bytes);
+- when in-memory pairing repair changes a legacy session, explicit resume
+  appends one `repaired` rollout marker containing the canonical messages,
+  terminal boundaries and repair statistics. The marker is replay-only metadata:
+  it does not enter provider history, public protocol/events or the provider
+  usage ledger. A second resume is a no-op and does not append another marker;
 - the process-global offload counter advances past every `off-NNNN.txt`
   already on disk, so new spills never clobber files the resumed history
   points at (usage anchors are not persisted — the estimate re-anchors on
   the first sampled response; provider-usage records replay in the same scan,
   with a complete usage line retained even if the following message line tore).
+
+
+Server and CLI client-supplied session ids are restricted to one safe filename
+component; path separators, traversal forms, absolute paths, control characters
+and symlinked session leaves are rejected before any session file is read or
+written. Server thread creation claims a new JSONL with an atomic create-new
+operation, so a timestamp collision cannot truncate an existing transcript.
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume

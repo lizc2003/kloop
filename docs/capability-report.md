@@ -39,6 +39,8 @@
 
 Plan 81（2026-08-12）已销账当前 transcript 的 durable provider-reported token 分类：validated terminal sampling 与 accepted compaction 逐响应写 append-only rollout，resume/fork/clear 按 raw prefix/同 transcript 语义恢复，`/cost` 累计 input/output/cache-read/cache-creation 与 reported-response count。该能力不是金额、billable total、失败 attempt telemetry、parent+child 全局归因或 provider 账单对账；context estimate 仍是独立且可失效的预测状态。
 
+Plan 85（2026-08-14）补齐 session persistence 的 correctness seam：只读 snapshot/list/read/spawn seed 不修盘，显式 resume/fork 才 truncate torn tail 或追加 pairing `repaired` marker；repair stats、terminal boundary remap、invalid UTF-8 tail、sequence exhaustion 和 client session-id traversal rejection 均有 core/server 回归。该维护切片不新增 public protocol/event journal、跨进程 recovery lock、fsync/exactly-once 或 provider/billing 能力。
+
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | 压缩后重注入最近读过的 ≤5 文件 | cc 单家 | 未立 | dogfood 出现"压缩后失忆"痛感 |

@@ -15,6 +15,7 @@ use kloop_core::history::History;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionOrigin;
+use kloop_core::rollout::checked_session_path;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
@@ -350,7 +351,8 @@ pub(crate) fn open_history(
             return Ok((history, id));
         }
         SessionChoice::Resume(id) => {
-            let path = session_path(sessions_dir, id);
+            let path = checked_session_path(sessions_dir, id)
+                .with_context(|| format!("invalid session id '{id}'"))?;
             if !path.exists() {
                 bail!("no session '{id}' (try --list-sessions)");
             }
@@ -362,7 +364,8 @@ pub(crate) fn open_history(
             .context("no saved sessions to continue")?,
         SessionChoice::Pick => pick_session(sessions_dir)?,
         SessionChoice::Fork { id, cut } => {
-            let src = session_path(sessions_dir, id);
+            let src = checked_session_path(sessions_dir, id)
+                .with_context(|| format!("invalid session id '{id}'"))?;
             if !src.exists() {
                 bail!("no session '{id}' (try --list-sessions)");
             }

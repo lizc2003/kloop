@@ -23,6 +23,7 @@ use kloop_core::permissions::Mode;
 use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::Rollout;
+use kloop_core::rollout::SessionRuntime;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -963,6 +964,138 @@ async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
         snapshot.runtime.unwrap().cwd,
         std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
     );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn read_methods_do_not_repair_torn_tail() {
+    let dirs = test_dirs("read-only-tail");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let path = dirs.sessions.join("torn.jsonl");
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    let mut rollout = Rollout::new_with_runtime(
+        path.clone(),
+        SessionRuntime {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model: Some("model".into()),
+        },
+    )
+    .unwrap();
+    rollout
+        .append_message(&Message::user_text("intact"))
+        .unwrap();
+    let intact_len = std::fs::metadata(&path).unwrap().len();
+    let mut raw = std::fs::read(&path).unwrap();
+    raw.extend_from_slice(b"{\"type\":\"message\",\"role\":\"user\"");
+    std::fs::write(&path, &raw).unwrap();
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request("thread/read", json!({"threadId": "torn"}))
+        .await;
+    let read = client.recv().await;
+    assert!(read["error"].is_null());
+    assert_eq!(std::fs::read(&path).unwrap(), raw);
+    client.shutdown().await;
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request("thread/resume", json!({"threadId": "torn"}))
+        .await;
+    let resumed = client.recv().await;
+    assert!(resumed["error"].is_null(), "resume failed: {resumed}");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), intact_len);
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn client_thread_ids_cannot_escape_sessions_dir() {
+    let dirs = test_dirs("safe-thread-id");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let outside = dirs.root.join("outside.jsonl");
+    std::fs::write(&outside, b"external bytes").unwrap();
+    let absolute = outside.to_string_lossy().into_owned();
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+
+    for (method, params) in [
+        ("thread/read", json!({"threadId": "../outside"})),
+        ("thread/resume", json!({"threadId": "../outside"})),
+        ("thread/fork", json!({"threadId": "../outside"})),
+        ("config/read", json!({"threadId": "../outside"})),
+        ("thread/read", json!({"threadId": absolute})),
+        ("thread/read", json!({"threadId": "a/b"})),
+        ("thread/read", json!({"threadId": ".."})),
+    ] {
+        client.request(method, params).await;
+        let response = client.recv().await;
+        assert_eq!(response["error"]["code"], -32602, "{method}: {response}");
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"external bytes");
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
+    let dirs = test_dirs("repair-server");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let path = dirs.sessions.join("repair.jsonl");
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    let mut rollout = Rollout::new_with_runtime(
+        path.clone(),
+        SessionRuntime {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model: Some("model".into()),
+        },
+    )
+    .unwrap();
+    rollout
+        .append_message(&Message::assistant(vec![ContentBlock::ToolUse {
+            id: "missing".into(),
+            name: "bash".into(),
+            input: json!({"command": "true"}),
+        }]))
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request("thread/read", json!({"threadId": "repair"}))
+        .await;
+    let read = client.recv().await;
+    assert_eq!(
+        read["result"]["thread"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    client.shutdown().await;
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request("thread/resume", json!({"threadId": "repair"}))
+        .await;
+    assert!(client.recv().await["error"].is_null());
+    let marker_bytes = std::fs::read(&path).unwrap();
+    assert!(String::from_utf8_lossy(&marker_bytes).contains("\"type\":\"repaired\""));
+    client.shutdown().await;
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client
+        .request("thread/resume", json!({"threadId": "repair"}))
+        .await;
+    assert!(client.recv().await["error"].is_null());
+    assert_eq!(std::fs::read(&path).unwrap(), marker_bytes);
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

@@ -49,12 +49,12 @@ pub struct TurnTerminal {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotTerminal {
     pub after_message: usize,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -64,6 +64,26 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub runtime: Option<SessionRuntime>,
     pub terminals: Vec<SnapshotTerminal>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingRepairStats {
+    pub messages_before: usize,
+    pub messages_after: usize,
+    pub dropped_tool_results: usize,
+    pub duplicate_results: usize,
+    pub dropped_messages: usize,
+    pub inserted_tool_results: usize,
+    pub changed_messages: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PairingRepair {
+    messages: Vec<Message>,
+    terminals: Vec<SnapshotTerminal>,
+    stats: PairingRepairStats,
+    changed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +134,14 @@ enum RolloutLine {
         #[serde(flatten)]
         terminal: TurnTerminal,
     },
+    Repaired {
+        #[serde(flatten)]
+        meta: LineMeta,
+        kind: String,
+        replacement: Vec<Message>,
+        terminals: Vec<SnapshotTerminal>,
+        stats: PairingRepairStats,
+    },
 }
 
 impl RolloutLine {
@@ -124,7 +152,8 @@ impl RolloutLine {
             | RolloutLine::Message { meta, .. }
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
-            | RolloutLine::TurnTerminal { meta, .. } => meta,
+            | RolloutLine::TurnTerminal { meta, .. }
+            | RolloutLine::Repaired { meta, .. } => meta,
         }
     }
 
@@ -135,7 +164,8 @@ impl RolloutLine {
             | RolloutLine::Message { meta, .. }
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
-            | RolloutLine::TurnTerminal { meta, .. } => meta,
+            | RolloutLine::TurnTerminal { meta, .. }
+            | RolloutLine::Repaired { meta, .. } => meta,
         }
     }
 }
@@ -233,6 +263,16 @@ impl Rollout {
         })
     }
 
+    fn append_repaired(&mut self, repair: &PairingRepair) -> io::Result<()> {
+        self.append_line(RolloutLine::Repaired {
+            meta: self.next_meta(),
+            kind: "pairing".into(),
+            replacement: repair.messages.clone(),
+            terminals: repair.terminals.clone(),
+            stats: repair.stats.clone(),
+        })
+    }
+
     fn next_meta(&self) -> LineMeta {
         LineMeta {
             id: format!("{}#{}", self.prefix, self.next_seq),
@@ -251,6 +291,12 @@ impl Rollout {
     }
 
     fn append_line(&mut self, line: RolloutLine) -> io::Result<()> {
+        if self.next_seq == u64::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session sequence exhausted",
+            ));
+        }
         let json = serde_json::to_string(&line).map_err(io::Error::other)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -262,7 +308,9 @@ impl Rollout {
         writeln!(file, "{json}")?;
         // Only advance the chain once the line is durably in the file.
         self.last_id = Some(line.into_meta().id);
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session sequence exhausted")
+        })?;
         Ok(())
     }
 }
@@ -289,16 +337,18 @@ struct ParsedSession {
 }
 
 /// Every intact line in file order, plus the byte offset just past the last
-/// one; anything after that offset is a malformed or unterminated tail
-/// (crash mid-append).
-fn intact_lines(raw: &str) -> (Vec<RolloutLine>, usize) {
+/// one; anything after that offset is a malformed or unterminated tail.
+fn intact_lines(raw: &[u8]) -> (Vec<RolloutLine>, usize) {
     let mut lines = Vec::new();
     let mut intact_end = 0;
-    for line in raw.split_inclusive('\n') {
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
         // An unterminated final line is a torn write, never trustworthy.
-        if !line.ends_with('\n') {
+        if !line.ends_with(b"\n") {
             break;
         }
+        let Ok(line) = std::str::from_utf8(line) else {
+            break;
+        };
         let content = line.trim();
         if !content.is_empty() {
             match serde_json::from_str(content) {
@@ -311,15 +361,23 @@ fn intact_lines(raw: &str) -> (Vec<RolloutLine>, usize) {
     (lines, intact_end)
 }
 
-fn seq_of(meta: &LineMeta) -> u64 {
+fn checked_seq_of(meta: &LineMeta) -> io::Result<u64> {
     meta.id
-        .rsplit('#')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+        .rsplit_once('#')
+        .and_then(|(_, seq)| seq.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid session line id '{}'", meta.id),
+            )
+        })
 }
 
-fn parse_session(raw: &str) -> ParsedSession {
+fn seq_of(meta: &LineMeta) -> u64 {
+    checked_seq_of(meta).unwrap_or(0)
+}
+
+fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let (lines, intact_end) = intact_lines(raw);
     let mut parsed = ParsedSession {
         items: Vec::new(),
@@ -357,67 +415,134 @@ fn parse_session(raw: &str) -> ParsedSession {
                 });
                 meta
             }
+            RolloutLine::Repaired {
+                meta,
+                kind: _,
+                replacement,
+                terminals,
+                stats: _,
+            } => {
+                parsed.items = replacement;
+                parsed.terminals = terminals;
+                meta
+            }
         };
-        parsed.max_seq = parsed.max_seq.max(seq_of(&meta));
+        let seq = checked_seq_of(&meta)?;
+        parsed.max_seq = parsed.max_seq.max(seq);
         parsed.last_id = Some(meta.id);
     }
-    parsed
+    Ok(parsed)
 }
 
-/// Read-only replay (used by `--list-sessions`): message lines append, a
-/// compacted marker replaces everything read so far, a malformed tail is
-/// ignored, and orphaned tool pairing is repaired in the returned history.
-pub fn load_session(path: &Path) -> io::Result<Vec<Message>> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(repair_pairing(parse_session(&raw).items))
+/// The result of a single, strictly read-only session inspection. The same
+/// result is consumed by list/read/seed callers or by an explicit recovery.
+pub struct SessionRead {
+    snapshot: SessionSnapshot,
+    provider_usage: UsageLedger,
+    repair: PairingRepair,
+    path: PathBuf,
+    raw_len: usize,
+    intact_end: usize,
+    last_id: Option<String>,
+    max_seq: u64,
 }
 
-/// Read the persisted session for a history client. Runtime and terminal records
-/// are display/recovery metadata only; provider replay still consumes only
-/// `messages` through [`load_session`] / [`resume_session`].
-pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
-    let raw = std::fs::read_to_string(path)?;
-    let parsed = parse_session(&raw);
-    Ok(SessionSnapshot {
-        messages: repair_pairing(parsed.items),
+impl SessionRead {
+    pub fn snapshot(&self) -> SessionSnapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn provider_usage(&self) -> &UsageLedger {
+        &self.provider_usage
+    }
+
+    pub fn repair_stats(&self) -> &PairingRepairStats {
+        &self.repair.stats
+    }
+
+    /// Perform the only on-disk recovery operation: truncate an intact prefix
+    /// and, when necessary, append one canonical pairing marker.
+    pub fn recover(self) -> io::Result<ResumedSession> {
+        let next_seq = self.max_seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session sequence exhausted")
+        })?;
+        if next_seq == u64::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session sequence exhausted",
+            ));
+        }
+        let mut rollout = Rollout {
+            path: self.path.clone(),
+            prefix: id_prefix(&self.path),
+            next_seq,
+            last_id: self.last_id,
+            subagent_of: None,
+        };
+        if self.intact_end < self.raw_len {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)?
+                .set_len(self.intact_end as u64)?;
+        }
+        if self.repair.changed {
+            rollout.append_repaired(&self.repair)?;
+        }
+        Ok(ResumedSession {
+            messages: self.snapshot.messages.clone(),
+            provider_usage: self.provider_usage,
+            snapshot: self.snapshot,
+            repair: self.repair.stats,
+            rollout,
+        })
+    }
+}
+
+pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
+    let raw = std::fs::read(path)?;
+    let parsed = parse_session(&raw)?;
+    let repair = repair_pairing(parsed.items, parsed.terminals);
+    let snapshot = SessionSnapshot {
+        messages: repair.messages.clone(),
         runtime: parsed.runtime,
-        terminals: parsed.terminals,
+        terminals: repair.terminals.clone(),
+    };
+    Ok(SessionRead {
+        snapshot,
+        provider_usage: parsed.provider_usage,
+        repair,
+        path: path.to_path_buf(),
+        raw_len: raw.len(),
+        intact_end: parsed.intact_end,
+        last_id: parsed.last_id,
+        max_seq: parsed.max_seq,
     })
+}
+
+/// Read-only replay (used by `--list-sessions`): a malformed tail is ignored,
+/// and orphaned tool pairing is repaired only in the returned history.
+pub fn load_session(path: &Path) -> io::Result<Vec<Message>> {
+    Ok(inspect_session(path)?.snapshot.messages)
+}
+
+/// Read the persisted session for a history client. Runtime and terminal
+/// records are display/recovery metadata only.
+pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
+    Ok(inspect_session(path)?.snapshot)
 }
 
 pub struct ResumedSession {
     pub messages: Vec<Message>,
     pub provider_usage: UsageLedger,
+    pub snapshot: SessionSnapshot,
+    pub repair: PairingRepairStats,
     pub rollout: Rollout,
 }
 
-/// Open a session for continuation: replay like [`load_session`], but also
-/// TRUNCATE any torn tail off the file — appending after leftover partial
-/// bytes would merge into them and make every later line unreadable — and
-/// return a [`Rollout`] whose id chain continues where the file left off.
+/// Open a session for continuation. Unlike the read-only load functions this
+/// explicitly truncates torn tail bytes and persists canonical pairing repair.
 pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
-    let raw = std::fs::read_to_string(path)?;
-    let parsed = parse_session(&raw);
-    if parsed.intact_end < raw.len() {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .set_len(parsed.intact_end as u64)?;
-    }
-    let rollout = Rollout {
-        path: path.to_path_buf(),
-        prefix: id_prefix(path),
-        next_seq: parsed.max_seq + 1,
-        last_id: parsed.last_id,
-        // The first line (with any subagent_of) is already on disk; resumed
-        // appends never sit at seq 1, so this is never consulted.
-        subagent_of: None,
-    };
-    Ok(ResumedSession {
-        messages: repair_pairing(parsed.items),
-        provider_usage: parsed.provider_usage,
-        rollout,
-    })
+    inspect_session(path)?.recover()
 }
 
 /// Fork a session: copy lines `#1..=#{cut}` of `src` into a brand-new
@@ -436,7 +561,7 @@ pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
 /// still in the file. `None` forks at the end.
 pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Result<PathBuf> {
     let illegal = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
-    let raw = std::fs::read_to_string(src)?;
+    let raw = std::fs::read(src)?;
     let (lines, _) = intact_lines(&raw);
     let legal = legal_cut_seqs(&lines);
     let Some(&last) = legal.last() else {
@@ -499,6 +624,19 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 meta: remeta(meta),
                 terminal,
             },
+            RolloutLine::Repaired {
+                meta,
+                kind,
+                replacement,
+                terminals,
+                stats,
+            } => RolloutLine::Repaired {
+                meta: remeta(meta),
+                kind,
+                replacement,
+                terminals,
+                stats,
+            },
         };
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
         out.push('\n');
@@ -530,7 +668,8 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
         RolloutLine::Session { .. }
         | RolloutLine::ProviderUsage { .. }
         | RolloutLine::Compacted { .. }
-        | RolloutLine::TurnTerminal { .. } => false,
+        | RolloutLine::TurnTerminal { .. }
+        | RolloutLine::Repaired { .. } => false,
     }
 }
 
@@ -570,7 +709,7 @@ pub struct ForkPoint {
 /// exactly the non-tip entries of `legal_cut_seqs`, so `fork_session` accepts any
 /// of them. Reads the whole file.
 pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
-    let raw = std::fs::read_to_string(path)?;
+    let raw = std::fs::read(path)?;
     let (lines, _) = intact_lines(&raw);
     let mut points = Vec::new();
     let mut seen_user_turn = false;
@@ -668,29 +807,66 @@ fn read_first_meta(path: &Path) -> Option<LineMeta> {
 /// assistant message — strays are dropped (a message stripped empty goes
 /// entirely) — and every tool_use left unanswered gets the same is_error
 /// result the interrupt path uses.
-fn repair_pairing(items: Vec<Message>) -> Vec<Message> {
-    // Reverse: drop tool_results that answer nothing.
-    let mut repaired: Vec<Message> = Vec::with_capacity(items.len());
-    for mut msg in items {
-        let prev_uses = repaired.last().map(tool_use_ids).unwrap_or_default();
+fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> PairingRepair {
+    #[derive(Debug)]
+    struct Entry {
+        message: Message,
+        origin: Option<usize>,
+        inserted_after: Option<usize>,
+    }
+
+    let messages_before = items.len();
+    // Reverse: drop tool_results that answer nothing while retaining the
+    // original message index for terminal boundary remapping.
+    let mut repaired: Vec<Entry> = Vec::with_capacity(items.len());
+    let mut dropped_tool_results = 0;
+    let mut duplicate_results = 0;
+    let mut dropped_messages = 0;
+    for (index, mut msg) in items.into_iter().enumerate() {
+        let prev_uses = repaired
+            .last()
+            .map(|entry| tool_use_ids(&entry.message))
+            .unwrap_or_default();
+        let mut answered_ids = HashSet::new();
+        let before_blocks = msg.content.len();
         msg.content.retain(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => prev_uses.contains(tool_use_id),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                if prev_uses.contains(tool_use_id) {
+                    if answered_ids.insert(tool_use_id.clone()) {
+                        true
+                    } else {
+                        duplicate_results += 1;
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
             _ => true,
         });
+        dropped_tool_results += before_blocks - msg.content.len();
         if !msg.content.is_empty() {
-            repaired.push(msg);
+            repaired.push(Entry {
+                message: msg,
+                origin: Some(index),
+                inserted_after: None,
+            });
+        } else {
+            dropped_messages += 1;
         }
     }
 
     // Forward: patch tool_uses left unanswered.
+    let mut inserted_tool_results = 0;
     let mut i = 0;
     while i < repaired.len() {
-        let uses = tool_use_ids(&repaired[i]);
+        let uses = tool_use_ids(&repaired[i].message);
         if !uses.is_empty() {
             let answered: HashSet<String> = repaired
                 .get(i + 1)
                 .map(|next| {
-                    next.content
+                    next.message
+                        .content
                         .iter()
                         .filter_map(|block| match block {
                             ContentBlock::ToolResult { tool_use_id, .. } => {
@@ -706,19 +882,69 @@ fn repair_pairing(items: Vec<Message>) -> Vec<Message> {
                 .filter(|id| !answered.contains(*id))
                 .map(|id| interrupted(id))
                 .collect();
+            inserted_tool_results += missing.len();
             if !missing.is_empty() {
+                let origin = repaired[i].origin;
                 if answered.is_empty() {
-                    repaired.insert(i + 1, Message::tool_results(missing));
+                    repaired.insert(
+                        i + 1,
+                        Entry {
+                            message: Message::tool_results(missing),
+                            origin: None,
+                            inserted_after: origin,
+                        },
+                    );
                 } else {
                     // A partially written results message: complete it in
                     // place rather than splitting results across two messages.
-                    repaired[i + 1].content.extend(missing);
+                    repaired[i + 1].message.content.extend(missing);
                 }
             }
         }
         i += 1;
     }
-    repaired
+
+    let messages: Vec<Message> = repaired.iter().map(|entry| entry.message.clone()).collect();
+    let original_terminals = terminals.clone();
+    let mut canonical_terminals = Vec::with_capacity(terminals.len());
+    for terminal in terminals {
+        let boundary = terminal.after_message;
+        let after_message = repaired
+            .iter()
+            .filter(|entry| {
+                entry.origin.is_some_and(|origin| origin < boundary)
+                    || entry.inserted_after.is_some_and(|origin| origin < boundary)
+            })
+            .count();
+        canonical_terminals.push(SnapshotTerminal {
+            after_message,
+            ..terminal
+        });
+    }
+    let changed_messages = repaired
+        .iter()
+        .filter(|entry| entry.origin.is_none())
+        .count()
+        + dropped_messages;
+    let stats = PairingRepairStats {
+        messages_before,
+        messages_after: messages.len(),
+        dropped_tool_results,
+        duplicate_results,
+        dropped_messages,
+        inserted_tool_results,
+        changed_messages,
+    };
+    let changed = dropped_tool_results != 0
+        || dropped_messages != 0
+        || inserted_tool_results != 0
+        || canonical_terminals != original_terminals;
+    PairingRepair {
+        messages,
+        terminals: canonical_terminals,
+        stats,
+        changed,
+    }
 }
 
 fn tool_use_ids(message: &Message) -> HashSet<String> {
@@ -787,6 +1013,32 @@ pub fn session_path(sessions_dir: &Path, id: &str) -> PathBuf {
     sessions_dir.join(format!("{id}.jsonl"))
 }
 
+pub fn checked_session_path(sessions_dir: &Path, id: &str) -> io::Result<PathBuf> {
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.chars().any(char::is_control)
+        || Path::new(id).components().count() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session id must be a single safe filename",
+        ));
+    }
+    let path = session_path(sessions_dir, id);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session path is not a regular file",
+        ));
+    }
+    Ok(path)
+}
+
 /// All session files, most recently modified first (modified = last active,
 /// which is what "continue the latest" should pick up).
 pub fn sessions_by_recency(sessions_dir: &Path) -> Vec<PathBuf> {
@@ -794,6 +1046,7 @@ pub fn sessions_by_recency(sessions_dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|file_type| file_type.is_file()))
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
@@ -1853,6 +2106,158 @@ mod tests {
                 Message::user_text("after crash"),
             ]
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_is_side_effect_free_but_recovery_persists_pairing_marker() {
+        let path = temp_file("repair-marker");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::assistant(vec![tool_use("missing")]))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let inspected = inspect_session(&path).unwrap();
+        assert_eq!(inspected.repair_stats().inserted_tool_results, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let resumed = inspected.recover().unwrap();
+        assert_eq!(resumed.repair.inserted_tool_results, 1);
+        let lines = raw_lines(&path);
+        assert_eq!(lines.last().unwrap()["type"], "repaired");
+        let after_marker = lines.len();
+        drop(resumed);
+
+        let inspected = inspect_session(&path).unwrap();
+        assert_eq!(
+            inspected.repair_stats(),
+            &PairingRepairStats {
+                messages_before: 2,
+                messages_after: 2,
+                ..PairingRepairStats::default()
+            }
+        );
+        let resumed = inspected.recover().unwrap();
+        assert_eq!(
+            resumed.repair,
+            PairingRepairStats {
+                messages_before: 2,
+                messages_after: 2,
+                ..PairingRepairStats::default()
+            }
+        );
+        assert_eq!(raw_lines(&path).len(), after_marker);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn repair_remaps_snapshot_terminal_boundaries() {
+        let path = temp_file("repair-terminal-boundary");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::assistant(vec![tool_use("missing")]))
+            .unwrap();
+        rollout
+            .append_turn_terminal(&TurnTerminal {
+                status: "error".into(),
+                error: None,
+            })
+            .unwrap();
+
+        let snapshot = load_session_snapshot(&path).unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.terminals[0].after_message, 2);
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.snapshot.terminals[0].after_message, 2);
+        assert_eq!(load_session_snapshot(&path).unwrap(), resumed.snapshot);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn invalid_utf8_tail_is_read_only_until_explicit_recovery() {
+        let path = temp_file("invalid-utf8-tail");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("good")).unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(b"{\"type\":\"message\",\"content\":\xff");
+        std::fs::write(&path, &raw).unwrap();
+
+        assert_eq!(
+            load_session(&path).unwrap(),
+            vec![Message::user_text("good")]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        resume_session(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checked_session_paths_reject_traversal_and_symlink_leaves() {
+        let path = temp_file("checked-path");
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        for id in ["", ".", "..", "../outside", "a/b", "a\\\\b", "/tmp/out"] {
+            assert!(checked_session_path(dir, id).is_err(), "accepted {id:?}");
+        }
+        let target = dir.join("outside.jsonl");
+        std::fs::write(&target, b"not a session").unwrap();
+        let leaf = dir.join("link.jsonl");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+        #[cfg(unix)]
+        assert!(checked_session_path(dir, "link").is_err());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn duplicate_tool_results_are_dropped_and_counted() {
+        let path = temp_file("duplicate-results");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::assistant(vec![tool_use("same")]))
+            .unwrap();
+        rollout
+            .append_message(&Message::tool_results(vec![
+                tool_result("same"),
+                tool_result("same"),
+            ]))
+            .unwrap();
+        let inspected = inspect_session(&path).unwrap();
+        assert_eq!(inspected.repair_stats().duplicate_results, 1);
+        assert_eq!(inspected.snapshot().messages[1].content.len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sequence_exhaustion_at_next_line_fails_before_recovery_truncates() {
+        let path = temp_file("sequence-next-overflow");
+        let raw = format!(
+            "{{\"type\":\"message\",\"id\":\"session#{}\",\"ts\":1,\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"x\"}}]}}\n{{\"type\":\"message\"",
+            u64::MAX - 1
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, raw.as_bytes()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(resume_session(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sequence_exhaustion_fails_before_recovery_truncates() {
+        let path = temp_file("sequence-overflow");
+        let raw = format!(
+            "{{\"type\":\"message\",\"id\":\"session#{}\",\"ts\":1,\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"x\"}}]}}\n{{\"type\":\"message\"",
+            u64::MAX
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, raw.as_bytes()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(resume_session(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         cleanup(&path);
     }
 }

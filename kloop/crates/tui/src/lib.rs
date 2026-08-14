@@ -58,7 +58,7 @@ use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::rollout::fork_points;
 use kloop_core::rollout::fork_session;
-use kloop_core::rollout::resume_session;
+use kloop_core::rollout::inspect_session;
 use kloop_core::rollout::session_id_of;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -473,7 +473,7 @@ fn fork_here(
         .parent()
         .ok_or_else(|| std::io::Error::other("session file has no parent directory"))?;
     let fork_path = fork_session(src, Some(seq), sessions_dir)?;
-    let resumed = resume_session(&fork_path)?;
+    let resumed = inspect_session(&fork_path)?.recover()?;
     Ok((session_id_of(&fork_path), resumed))
 }
 
