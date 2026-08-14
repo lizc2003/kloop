@@ -307,12 +307,20 @@ async fn turn_rounds(
             ui.emit(&Event::Note(
                 "predicted context overflow; compacting history".into(),
             ));
-            let compaction = compact::run_compaction(cfg, &active_model, history, cancel).await;
+            let compaction = compact::compact_once(
+                cfg,
+                &active_model,
+                compact::CompactionTrigger::Predictive,
+                history,
+                cancel,
+            )
+            .await;
             match compaction {
-                Ok(stats) => ui.emit(&Event::Note(format!(
+                Ok(compact::CompactionOutcome::Applied(receipt)) => ui.emit(&Event::Note(format!(
                     "history compacted: {} summarized, {} kept verbatim",
-                    stats.summarized, stats.kept
+                    receipt.summarized, receipt.kept
                 ))),
+                Ok(compact::CompactionOutcome::NoOp(_)) => {}
                 Err(e) => {
                     if cancel.is_cancelled() {
                         return TurnOutcome {
@@ -364,14 +372,29 @@ async fn turn_rounds(
                 ui.emit(&Event::Note(
                     "context window exceeded; compacting and retrying".into(),
                 ));
-                let compaction = compact::run_compaction(cfg, &active_model, history, cancel).await;
+                let compaction = compact::compact_once(
+                    cfg,
+                    &active_model,
+                    compact::CompactionTrigger::Reactive,
+                    history,
+                    cancel,
+                )
+                .await;
                 match compaction {
-                    Ok(stats) => {
+                    Ok(compact::CompactionOutcome::Applied(receipt)) => {
                         ui.emit(&Event::Note(format!(
                             "history compacted: {} summarized, {} kept verbatim",
-                            stats.summarized, stats.kept
+                            receipt.summarized, receipt.kept
                         )));
                         continue;
+                    }
+                    Ok(compact::CompactionOutcome::NoOp(_)) => {
+                        return TurnOutcome {
+                            reason: EndReason::Error("reactive compaction made no changes".into()),
+                            final_text: String::new(),
+                            rounds: round,
+                            structured_output: None,
+                        };
                     }
                     Err(e) => {
                         return TurnOutcome {

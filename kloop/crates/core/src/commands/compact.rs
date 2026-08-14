@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::SlashResult;
-use crate::compact::run_compaction;
+use crate::compact::CompactionOutcome;
+use crate::compact::CompactionTrigger;
+use crate::compact::compact_once;
 use crate::config::Config;
 use crate::history::History;
 
@@ -17,14 +19,17 @@ pub async fn run(
     cfg: &Arc<Config>,
     cancel: &CancellationToken,
 ) -> SlashResult {
-    let output = match run_compaction(cfg, &cfg.model, history, cancel).await {
-        Ok(stats) => format!(
-            "history compacted: {} summarized, {} kept verbatim",
-            stats.summarized, stats.kept
-        ),
-        // A too-short history or a failed summary request leaves History
-        // untouched (run_compaction's invariant); just report why.
-        Err(e) => format!("compaction failed: {e:#}"),
-    };
+    let output =
+        match compact_once(cfg, &cfg.model, CompactionTrigger::Manual, history, cancel).await {
+            Ok(CompactionOutcome::Applied(receipt)) => format!(
+                "history compacted: {} summarized, {} kept verbatim",
+                receipt.summarized, receipt.kept
+            ),
+            Ok(CompactionOutcome::NoOp(_)) => {
+                "history already compacted: nothing new to summarize".into()
+            }
+            // A failed summary request leaves History untouched; just report why.
+            Err(e) => format!("compaction failed: {e:#}"),
+        };
     SlashResult::message(output)
 }

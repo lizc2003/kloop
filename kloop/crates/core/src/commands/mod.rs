@@ -391,6 +391,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_reports_noop_without_sampling() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(Vec::new());
+        let cfg = test_cfg(provider, Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("only message"));
+
+        let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
+
+        assert_eq!(
+            result,
+            SlashResult::message("history already compacted: nothing new to summarize")
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(history.messages(), &[Message::user_text("only message")]);
+    }
+
+    #[tokio::test]
+    async fn compact_reports_provider_error_without_mutating_history() {
+        let provider =
+            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Error(
+                "summarizer unavailable".into(),
+            )]);
+        let cfg = test_cfg(provider, Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("old request"));
+        history.record(Message::user_text("current request"));
+        let before = history.messages().to_vec();
+
+        let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
+
+        assert!(result.output.starts_with("compaction failed: "));
+        assert_eq!(history.messages(), before.as_slice());
+        assert!(history.provider_usage().records().is_empty());
+    }
+
+    #[tokio::test]
     async fn clear_empties_history_and_process_state() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());

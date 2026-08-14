@@ -84,13 +84,7 @@ fork:
   `context_length_exceeded`) compacts once per turn and retries; a second
   overflow surfaces as an error instead of looping.
 
-Compaction itself asks the model for a structured handoff summary, keeps a
-~2k-token recent tail verbatim (never splitting a tool_use/tool_result pair
-at the boundary), and replaces the rest with the summary — the one
-sanctioned rewrite of the append-only history. A successful summary response
-with provider usage also enters the durable usage ledger before the compacted
-marker; compaction rewrites provider history, not the transcript's accumulated
-provider facts.
+Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary, canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a ~2k-token recent tail verbatim (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. Failed or cancelled summary requests leave history untouched.
 
 `KLOOP_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
 `off` disables compaction).

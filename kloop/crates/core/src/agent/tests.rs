@@ -834,6 +834,88 @@ async fn repeated_overflow_surfaces_error() {
     );
 }
 
+/// Predictive NoOp leaves the original sampling request on the normal path.
+#[tokio::test]
+async fn predictive_noop_continues_sampling_without_provider_compaction() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("answer"))]);
+    let cfg = compaction_cfg(provider, 30_000, "predictive-noop");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text(format!(
+        "{}{}",
+        crate::compact::SUMMARY_PREFIX,
+        "x".repeat(30_000)
+    )));
+    history.record(Message::user_text("current request"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "answer");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "NoOp must not consume a compaction turn");
+    assert_eq!(seen[0].system, "test");
+}
+
+/// Reactive NoOp ends the turn instead of retrying an unchanged request.
+#[tokio::test]
+async fn reactive_noop_does_not_retry_after_overflow() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Overflow]);
+    let cfg = compaction_cfg(provider, 200_000, "reactive-noop");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text(format!(
+        "{prefix}already compacted",
+        prefix = crate::compact::SUMMARY_PREFIX
+    )));
+    history.record(Message::user_text("current request"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(outcome.reason, EndReason::Error(ref error) if error.contains("made no changes")),
+        "reactive NoOp should terminate the turn: {:?}",
+        outcome.reason
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// A fallback model remains the active model for reactive compaction.
+#[tokio::test]
+async fn reactive_compaction_uses_the_active_fallback_model() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Error("primary 1".into()),
+        MockTurn::Error("primary 2".into()),
+        MockTurn::Error("primary 3".into()),
+        MockTurn::Overflow,
+        MockTurn::Blocks(text("fallback summary")),
+        MockTurn::Blocks(text("fallback answer")),
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "reactive-fallback").test_clone();
+    cfg.fallback_model = Some("mock-fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("earlier context"));
+    history.record(Message::assistant(vec![ContentBlock::Text {
+        text: "earlier reply".into(),
+    }]));
+    history.record(Message::user_text("current request"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "fallback answer");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[3].model, "mock-fallback");
+    assert_eq!(seen[4].model, "mock-fallback");
+    assert!(
+        seen[4]
+            .system
+            .starts_with("You summarize an in-progress coding-agent session")
+    );
+}
+
 fn text(t: &str) -> Vec<AssistantBlock> {
     vec![AssistantBlock::Text { text: t.into() }]
 }

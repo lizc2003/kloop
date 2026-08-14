@@ -1,6 +1,6 @@
 # Plan 86 — CodeWhale 借鉴：cache-stable agent compaction seam
 
-> 状态：规划中
+> 状态：实施完成，验证记录见文末
 >
 > 基线：`3cca84a`（Plan 84）
 >
@@ -160,3 +160,12 @@ cd .. && git diff --check
 - README、HANDOFF、Plan 86 与必要 capability/reference 记录同步，未宣称未实现的 server-side/provider-specific 能力。
 - fmt、clippy、workspace tests、mock smoke、diff check 全绿；不新增依赖、不修改 Desktop、不 push。
 - 实施完成后以一次范围明确的 kloop commit 收口，回填实际日期、commit SHA、focused/workspace 验证结果与未执行环境。
+
+## 实施记录（2026-08-14）
+
+- 已实现：`compact_once` 统一 predictive/reactive/manual；纯 `CompactionPlan` 与 `NoOpReason`；canonical summary replacement；ToolUse/ToolResult pair-safe recent tail；实际 active model；accepted usage→compacted 顺序；失败/NoOp 零 history/ledger/rollout mutation。
+- 已补测试：Plan 86 focused filters 为 compact 30、agent 138、history 18；core crate 675 tests 全绿（含新增 predictive/reactive/manual/no-provider/fallback/canonical/duplicate coverage）；manual applied/no-op/error 文案已锁定。
+- 已通过：`cargo fmt --all -- --check`、workspace clippy `-D warnings`、`cargo test --locked -p kloop-core`（675 passed）、`cargo test --locked --workspace`（全绿，2 项真实 provider credential tests ignored）、三个 `--mock` smoke（plain/headless/headless JSON）与 `git diff --check`。
+- 真实 provider 验收：通过 `.kloop/env.local` 的 `anthropic` rail、实际模型 `claude-sonnet-4-6` 运行两个 ignored 合约，`real_agent_program_workflow_contract`（64.15s）与 `real_local_agent_mailbox_contract`（49.24s）均通过。真实 `--plain` 首轮 `/compact` 返回 `1 summarized, 1 kept verbatim`，第二轮返回 NoOp；rollout 只有一条 compaction usage（input 161/output 362）和一条 compacted marker，顺序为 usage→compacted，replacement 为 canonical 单层 prefix + 非空正文 + 完整 tail。另以 `KLOOP_CONTEXT_WINDOW=23193` 驱动真实 predictive path，第二 turn 在 sampling 前完成一次 compaction（input 161/output 12）后继续采样，实际 model 保持一致。凭据未打印、未写入仓库。
+- 未执行：真实 provider 的 reactive overflow（需构造实际 provider 超窗）、server-side/provider-specific compaction、Linux sandbox/CI、Windows、物理终端、Desktop E2E。
+- 最终 commit：以本条所在提交为准。

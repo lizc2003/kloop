@@ -12,6 +12,7 @@ use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::Role;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 
@@ -83,6 +84,42 @@ fn starts_with_tool_result(message: &Message) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
+/// The source of a compaction request. This is lifecycle bookkeeping only and
+/// is deliberately not included in the provider request or rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionTrigger {
+    Manual,
+    Predictive,
+    Reactive,
+}
+
+/// Why a compaction request made no change. No-op is a normal control-flow
+/// outcome, not a provider or persistence failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoOpReason {
+    HistoryTooShort,
+    NoFoldableMessages,
+    PairBoundaryLeavesNothing,
+    ReplacementUnchanged,
+}
+
+/// Outcome of one compaction attempt. The receipt remains core-internal and is
+/// not persisted or projected into the public protocol.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompactionOutcome {
+    Applied(CompactionReceipt),
+    NoOp(NoOpReason),
+}
+
+/// Bounded internal facts about an accepted compaction.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CompactionReceipt {
+    pub summarized: usize,
+    pub kept: usize,
+    pub model: String,
+    pub trigger: CompactionTrigger,
+}
+
 /// Outcome of a successful compaction, for the caller to report — the note
 /// text differs per call site (predictive, reactive, `/compact`).
 #[derive(Debug, PartialEq, Eq)]
@@ -93,38 +130,102 @@ pub struct CompactionStats {
     pub kept: usize,
 }
 
-/// Replace everything before the keep-boundary with a model-written summary.
-/// Fails without touching the history if the summary request fails; reporting
-/// the outcome is the caller's job.
-/// `model` is the caller's currently-active model, which may be the fallback
-/// if the primary already failed this turn — summarizing on the known-broken
-/// primary would just fail the compaction.
-pub async fn run_compaction(
-    cfg: &Arc<Config>,
-    model: &str,
-    history: &mut History,
-    cancel: &CancellationToken,
-) -> Result<CompactionStats> {
-    let messages = history.messages();
+#[derive(Debug, PartialEq)]
+struct CompactionPlan {
+    request: Vec<Message>,
+    tail: Vec<Message>,
+    summarized: usize,
+    kept: usize,
+}
+
+fn is_existing_summary(message: &Message) -> bool {
+    matches!(
+        message,
+        Message {
+            role: Role::User,
+            content,
+        } if content.len() == 1
+            && matches!(&content[0], ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX))
+    )
+}
+
+fn plan_compaction(messages: &[Message]) -> std::result::Result<CompactionPlan, NoOpReason> {
     if messages.len() < 2 {
-        bail!("history too short to compact");
-    }
-    let keep_from = keep_from_index(messages);
-    if keep_from == 0 {
-        bail!("nothing to compact without splitting the kept tail");
+        return Err(NoOpReason::HistoryTooShort);
     }
 
-    let mut request = messages[..keep_from].to_vec();
-    request.push(Message::user_text(COMPACT_INSTRUCTION));
-    let (summary, usage) = sample_summary(cfg, model, &request, cancel).await?;
-    if summary.trim().is_empty() {
+    let has_existing_summary = is_existing_summary(&messages[0]);
+    let keep_from = keep_from_index(messages);
+    let fold_start = if has_existing_summary { 1 } else { 0 };
+    if keep_from <= fold_start {
+        return Err(if has_existing_summary {
+            NoOpReason::NoFoldableMessages
+        } else {
+            NoOpReason::PairBoundaryLeavesNothing
+        });
+    }
+
+    let request = messages[..keep_from].to_vec();
+    let tail = messages[keep_from..].to_vec();
+    Ok(CompactionPlan {
+        request,
+        tail,
+        summarized: keep_from - fold_start,
+        kept: messages.len() - keep_from,
+    })
+}
+
+fn canonicalize_summary(raw: &str) -> Result<String> {
+    let mut summary = raw.trim();
+    let marker = SUMMARY_PREFIX.trim_end();
+    loop {
+        if let Some(rest) = summary.strip_prefix(SUMMARY_PREFIX) {
+            summary = rest.trim();
+        } else if let Some(rest) = summary.strip_prefix(marker) {
+            summary = rest.trim();
+        } else {
+            break;
+        }
+    }
+    if summary.is_empty() {
         bail!("compaction model returned an empty summary");
     }
+    Ok(summary.to_owned())
+}
 
-    let mut items = vec![Message::user_text(format!("{SUMMARY_PREFIX}{summary}"))];
-    items.extend_from_slice(&messages[keep_from..]);
-    let summarized = keep_from;
-    let kept = items.len() - 1;
+fn build_replacement(plan: &CompactionPlan, summary: &str) -> Vec<Message> {
+    let mut items = Vec::with_capacity(plan.tail.len() + 1);
+    items.push(Message::user_text(format!("{SUMMARY_PREFIX}{summary}")));
+    items.extend_from_slice(&plan.tail);
+    items
+}
+
+/// Compact once for one of the predictive, reactive, or manual callers.
+/// Planning happens before provider I/O, and all history mutations happen only
+/// after the provider response has been validated and the replacement changed.
+pub(crate) async fn compact_once(
+    cfg: &Arc<Config>,
+    model: &str,
+    trigger: CompactionTrigger,
+    history: &mut History,
+    cancel: &CancellationToken,
+) -> Result<CompactionOutcome> {
+    let messages = history.messages().to_vec();
+    let mut request_plan = match plan_compaction(&messages) {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(CompactionOutcome::NoOp(reason)),
+    };
+    request_plan
+        .request
+        .push(Message::user_text(COMPACT_INSTRUCTION));
+
+    let (summary, usage) = sample_summary(cfg, model, &request_plan.request, cancel).await?;
+    let summary = canonicalize_summary(&summary)?;
+    let items = build_replacement(&request_plan, &summary);
+    if items == messages {
+        return Ok(CompactionOutcome::NoOp(NoOpReason::ReplacementUnchanged));
+    }
+
     if let Some(usage) = usage {
         history.record_provider_usage(ProviderUsageRecord {
             model: model.to_string(),
@@ -133,7 +234,40 @@ pub async fn run_compaction(
         });
     }
     history.replace_all(items);
-    Ok(CompactionStats { summarized, kept })
+    Ok(CompactionOutcome::Applied(CompactionReceipt {
+        summarized: request_plan.summarized,
+        kept: request_plan.kept,
+        model: model.to_string(),
+        trigger,
+    }))
+}
+
+/// Compatibility wrapper for the original public stats-only API. Production
+/// callers use `compact_once` so they can distinguish a normal NoOp.
+pub async fn run_compaction(
+    cfg: &Arc<Config>,
+    model: &str,
+    history: &mut History,
+    cancel: &CancellationToken,
+) -> Result<CompactionStats> {
+    match compact_once(cfg, model, CompactionTrigger::Manual, history, cancel).await? {
+        CompactionOutcome::Applied(receipt) => Ok(CompactionStats {
+            summarized: receipt.summarized,
+            kept: receipt.kept,
+        }),
+        CompactionOutcome::NoOp(NoOpReason::HistoryTooShort) => {
+            bail!("history too short to compact")
+        }
+        CompactionOutcome::NoOp(NoOpReason::PairBoundaryLeavesNothing) => {
+            bail!("nothing to compact without splitting the kept tail")
+        }
+        CompactionOutcome::NoOp(NoOpReason::NoFoldableMessages) => {
+            bail!("nothing new to compact")
+        }
+        CompactionOutcome::NoOp(NoOpReason::ReplacementUnchanged) => {
+            bail!("compaction replacement unchanged")
+        }
+    }
 }
 
 /// One summarization request: no tools, text collected from BlockDone.
@@ -522,6 +656,162 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(history.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compact_once_returns_noop_for_short_history_before_provider_io() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(Vec::new());
+        let cfg = compact_test_cfg(provider, "short-noop");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("only message"));
+        let before = history.messages().to_vec();
+
+        let result = compact_once(
+            &cfg,
+            &cfg.model,
+            CompactionTrigger::Manual,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, CompactionOutcome::NoOp(NoOpReason::HistoryTooShort));
+        assert_eq!(history.messages(), before.as_slice());
+        assert!(history.provider_usage().records().is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonicalize_summary_trims_and_keeps_one_prefix() {
+        assert_eq!(
+            canonicalize_summary("  summary text  ").unwrap(),
+            "summary text"
+        );
+        assert_eq!(
+            canonicalize_summary(&format!("  {SUMMARY_PREFIX}{SUMMARY_PREFIX}summary text  "))
+                .unwrap(),
+            "summary text"
+        );
+        assert!(canonicalize_summary(&format!(" {SUMMARY_PREFIX} ")).is_err());
+    }
+
+    #[test]
+    fn plan_skips_existing_summary_but_allows_new_foldable_messages() {
+        let summary = Message::user_text(format!("{SUMMARY_PREFIX}old summary"));
+        let current = Message::user_text("current request");
+        assert_eq!(
+            plan_compaction(&[summary.clone(), current.clone()]),
+            Err(NoOpReason::NoFoldableMessages)
+        );
+
+        let old_work = Message::assistant(vec![ContentBlock::Text {
+            text: "old work ".repeat(1_500),
+        }]);
+        let plan = plan_compaction(&[summary.clone(), old_work.clone(), current.clone()])
+            .expect("new work after a summary should be foldable");
+        assert_eq!(plan.summarized, 1);
+        assert_eq!(plan.kept, 1);
+        assert_eq!(plan.request, vec![summary, old_work]);
+        assert_eq!(plan.tail, vec![current]);
+    }
+
+    #[tokio::test]
+    async fn existing_summary_is_replaced_without_prefix_stacking() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: format!("  {SUMMARY_PREFIX}{SUMMARY_PREFIX}new summary  "),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "existing-summary");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text(format!("{SUMMARY_PREFIX}old summary")));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "old work ".repeat(1_500),
+        }]));
+        history.record(Message::user_text("current request"));
+
+        let result = compact_once(
+            &cfg,
+            "fallback-model",
+            CompactionTrigger::Predictive,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            CompactionOutcome::Applied(CompactionReceipt {
+                summarized: 1,
+                kept: 1,
+                model: "fallback-model".into(),
+                trigger: CompactionTrigger::Predictive,
+            })
+        );
+        assert_eq!(
+            history.messages()[0],
+            Message::user_text(format!("{SUMMARY_PREFIX}new summary"))
+        );
+        assert_eq!(
+            history.messages().last(),
+            Some(&Message::user_text("current request"))
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].model, "fallback-model");
+        assert_eq!(seen[0].system, COMPACT_SYSTEM);
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(
+            seen[0].messages.last().unwrap(),
+            &Message::user_text(COMPACT_INSTRUCTION)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_is_a_zero_mutation_noop() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "canonical summary".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "duplicate");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        let first = compact_once(
+            &cfg,
+            &cfg.model,
+            CompactionTrigger::Manual,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, CompactionOutcome::Applied(_)));
+        let after_first = history.messages().to_vec();
+        let usage_after_first = history.provider_usage().records().to_vec();
+
+        let second = compact_once(
+            &cfg,
+            &cfg.model,
+            CompactionTrigger::Manual,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            second,
+            CompactionOutcome::NoOp(NoOpReason::NoFoldableMessages)
+        );
+        assert_eq!(history.messages(), after_first.as_slice());
+        assert_eq!(
+            history.provider_usage().records(),
+            usage_after_first.as_slice()
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
