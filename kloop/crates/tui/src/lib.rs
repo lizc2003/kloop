@@ -441,6 +441,7 @@ async fn agent_worker(
                     Ok((session_id, resumed)) => {
                         let messages = resumed.messages.clone();
                         history.rebase(resumed);
+                        cfg.reset_deferred_tool_capabilities();
                         AgentEvent::Forked {
                             session_id,
                             messages,

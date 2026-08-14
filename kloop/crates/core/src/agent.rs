@@ -204,48 +204,80 @@ async fn turn_rounds(
     depth: u8,
     options: &TurnOptions,
 ) -> TurnOutcome {
-    let build_tools = || {
-        let mut tools = crate::tools::all_tool_defs(
-            depth,
-            &cfg.tool_sources,
-            cfg.defer_threshold,
-            cfg.surface,
-            &cfg.shell_programs,
-        );
-        // The `skill` tool exists only at depth 0 (like `task`) and only when a
-        // model-invocable skill is loaded — user commands (`SkillSource::Command`)
-        // are `/name`-only and don't warrant the tool on their own. Skills are a
-        // top-level orchestration feature: a sub-agent gets a focused task, not the
-        // whole skills catalog (which would otherwise ride every sub-agent request,
-        // and a `fork` skill's own sub-agent could re-trigger it). Added after
-        // all_tool_defs so it is not counted toward the defer threshold or exposed
-        // to run_program's API — it is a prompt-activation seam, not a source tool.
-        // Placed before the allowlist filter so a restricted agent type can gate it
-        // like any tool.
-        let has_model_skill = cfg
-            .skills
-            .iter()
-            .any(|s| s.source == crate::skills::SkillSource::Skill);
-        if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
-            tools.push(crate::tools::skill_tool_def());
+    let build_tools = ||
+     -> std::result::Result<
+        (
+            Vec<kloop_protocol::ToolDef>,
+            Arc<crate::tools::ProgramToolManifest>,
+        ),
+        String,
+    > {
+        for _ in 0..8 {
+            let before = crate::tools::capture_program_tool_manifest(
+                &cfg.tool_sources,
+                &cfg.shell_programs,
+            );
+            let mut tools = crate::tools::all_tool_defs(
+                depth,
+                &cfg.tool_sources,
+                cfg.defer_threshold,
+                cfg.surface,
+                &cfg.shell_programs,
+            );
+            let after = crate::tools::capture_program_tool_manifest(
+                &cfg.tool_sources,
+                &cfg.shell_programs,
+            );
+            if before != after {
+                continue;
+            }
+            // The `skill` tool exists only at depth 0 (like `task`) and only when a
+            // model-invocable skill is loaded — user commands (`SkillSource::Command`)
+            // are `/name`-only and don't warrant the tool on their own. Skills are a
+            // top-level orchestration feature: a sub-agent gets a focused task, not the
+            // whole skills catalog (which would otherwise ride every sub-agent request,
+            // and a `fork` skill's own sub-agent could re-trigger it). Added after
+            // all_tool_defs so it is not counted toward the defer threshold or exposed
+            // to run_program's API — it is a prompt-activation seam, not a source tool.
+            // Placed before the allowlist filter so a restricted agent type can gate it
+            // like any tool.
+            let has_model_skill = cfg
+                .skills
+                .iter()
+                .any(|s| s.source == crate::skills::SkillSource::Skill);
+            if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
+                tools.push(crate::tools::skill_tool_def());
+            }
+            // A custom agent type may restrict this sub-agent's tools; the main agent
+            // (None) keeps them all. read_offloaded is never filtered out.
+            if cfg.tool_allowlist.is_some() {
+                let allow = cfg.tool_allowlist.as_deref();
+                tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
+            }
+            if let Some(schema) = &options.structured_schema {
+                // Appended after agent-type filtering: this is an internal completion
+                // protocol, never a user-configurable capability or ordinary tool.
+                tools.push(crate::structured_output::tool_def(schema));
+            }
+            if depth == 0 {
+                specialize_run_agent_def(&mut tools, &cfg.agent_types);
+            }
+            return Ok((tools, Arc::new(after)));
         }
-        // A custom agent type may restrict this sub-agent's tools; the main agent
-        // (None) keeps them all. read_offloaded is never filtered out.
-        if cfg.tool_allowlist.is_some() {
-            let allow = cfg.tool_allowlist.as_deref();
-            tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
-        }
-        if let Some(schema) = &options.structured_schema {
-            // Appended after agent-type filtering: this is an internal completion
-            // protocol, never a user-configurable capability or ordinary tool.
-            tools.push(crate::structured_output::tool_def(schema));
-        }
-        if depth == 0 {
-            specialize_run_agent_def(&mut tools, &cfg.agent_types);
-        }
-        tools
+        Err("tool catalog changed repeatedly while building the provider request; retry the turn"
+            .into())
     };
-    let mut tools = build_tools();
+    let (mut tools, mut program_tool_manifest) = match build_tools() {
+        Ok(built) => built,
+        Err(error) => {
+            return TurnOutcome {
+                reason: EndReason::Error(error),
+                final_text: String::new(),
+                rounds: 0,
+                structured_output: None,
+            };
+        }
+    };
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
@@ -278,7 +310,20 @@ async fn turn_rounds(
             // MCP list_changed publishes a new source generation between
             // sampling rounds. Never mutate an in-flight request; rebuild the
             // next round from one fresh source snapshot instead.
-            tools = build_tools();
+            match build_tools() {
+                Ok((next_tools, next_manifest)) => {
+                    tools = next_tools;
+                    program_tool_manifest = next_manifest;
+                }
+                Err(error) => {
+                    return TurnOutcome {
+                        reason: EndReason::Error(error),
+                        final_text: String::new(),
+                        rounds,
+                        structured_output: None,
+                    };
+                }
+            }
         }
         let round = rounds;
         rounds += 1;
@@ -601,6 +646,7 @@ async fn turn_rounds(
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_tool_manifest: Some(Arc::clone(&program_tool_manifest)),
             // The assistant message carrying these tool_uses was just recorded,
             // so this is the id of the turn that a spawned sub-agent descends
             // from.

@@ -195,10 +195,11 @@ In the TUI, **Ctrl+R** (when idle) opens a rewind picker: it lists the turn
 boundaries the session can rewind to — each previewed by the user message it
 would drop — and Enter forks at the chosen point *in place*. Unlike `--fork`,
 you don't leave the session: History swaps onto the branch, the transcript
-rebuilds to the earlier state, and the next message continues the new branch
-(the old one stays on disk, forkable/resumable). Esc cancels. The picker's
-points are exactly the cuts `fork_session` accepts, so a selection can never be
-rejected. Rewind is idle-only — a running turn owns History (Ctrl+C first).
+rebuilds to the earlier state, clears non-durable deferred-tool capability
+receipts, and the next message continues the new branch (the old one stays on
+disk, forkable/resumable). Esc cancels. The picker's points are exactly the cuts
+`fork_session` accepts, so a selection can never be rejected. Rewind is
+idle-only — a running turn owns History (Ctrl+C first).
 
 ### Sub-agent sessions
 
@@ -887,20 +888,40 @@ the synthetic context message lists the deferred names:
   direct calls remain a compatibility optimization for providers that permit
   undeclared names.
 
+`tool_search` is an ordering barrier rather than a read-only concurrent call: in
+one assistant response, `tool_search` followed by a deferred source call
+publishes the receipt before that call runs; the reverse order deterministically
+bounces the still-locked call.
+
 Searching never mutates the current provider tool array or deferred-name notice,
 so the request prefix stays cache-friendly. A successful dynamic MCP refresh is
 picked up when the next sampling round rebuilds its source snapshot. Unlocks are
-bound to a definition generation: if the same tool name receives a replacement
-schema, old direct/enveloped calls are rejected until the model searches again.
+capability receipts, not a session-wide `name -> generation` permission: each
+receipt binds the immutable source owner slot and definition generation to the
+current `WorkspaceId`/effective cwd, worktree transition epoch, permission
+policy/session epoch, agent identity/depth, and tool allowlist. If any of those
+scopes changes — including entering/leaving a session worktree, a permission
+mode or cached approval change, a policy refresh/invalidation, or a child
+authority boundary — the old receipt fails closed and the model must search
+again. Operations sharing the same live Config and authority share receipts;
+same-session compaction keeps them, while child agents and fresh resume/fork
+Configs start empty. In-place rewind and `/clear` explicitly clear receipts;
+isolated worktrees never inherit them.
+
 The schema and generation are taken from one atomic source snapshot. MCP calls
 hold a shared generation gate through the wire request; refresh takes the write
 side, so an already-started call completes before publication or a published
 replacement rejects the stale call — no check→await race can route through a
 new catalog. Calling a deferred tool before searching likewise bounces with
 guidance and does not unlock it. Permission rules and the approval cache keep
-whole-tool-name granularity; sub-agents share the parent's generation-bound
-unlock map. Below the threshold ordinary source tools ship inline; source-forced
-helpers remain deferred.
+whole-tool-name granularity; source-forced helpers remain deferred. A
+`run_program` bypasses only the deferred discovery lock because its callable
+manifest was already exposed in that provider request. The manifest freezes each
+source owner/generation and read-only verdict for foreground and background
+execution; a post-sampling refresh, same-name owner switch, or newly appearing
+tool fails closed instead of changing what old JavaScript can call. Workspace,
+permission, sandbox, hooks, and ordinary tool-call gates still apply. Below the
+threshold ordinary source tools ship inline.
 
 ## Hooks (Phase 2, seventh slice)
 
@@ -1718,8 +1739,8 @@ the model. The set is small and lives one-file-per-command under
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an
   append-only compacted-to-nothing marker that resume replays to empty; it
   does **not** fork a new session file). The same transcript's durable
-  provider-usage ledger remains cumulative. Process-state (the root-owned task
-  graph and steering queue) resets too.
+  provider-usage ledger remains cumulative. Process state (the root-owned task
+  graph, steering queue, and deferred-tool capability receipts) resets too.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
   it is inert — quitting one thread must not stop a multi-session process, so it

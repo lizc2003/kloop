@@ -1,21 +1,126 @@
 //! Deferred-tool discovery: the tool_search tool, the injected notice that
 //! tells the model which tools exist but are not loaded, and the dispatch
-//! gate for locked tools. An unlock is bound to the source definition
-//! generation returned by a search hit; catalog refresh invalidates it. The
-//! provider tool array does not change merely because a tool was unlocked.
+//! gate for locked tools. An unlock is a session-memory capability receipt
+//! bound to one source snapshot, effective workspace, permission epoch, and
+//! agent authority. Catalog or scope changes invalidate it; the provider tool
+//! array does not change merely because a tool was unlocked.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::RwLock;
 
 use anyhow::Result;
 use anyhow::bail;
 use serde_json::Value;
 use serde_json::json;
 
+use super::SourceCallBinding;
 use super::ToolCtx;
 use super::deferred_tool_defs;
 use super::str_arg;
 use crate::config::Config;
+use crate::config::EffectiveWorkspace;
+use crate::permissions::PermissionCapabilityEpoch;
+use kloop_protocol::LocalAgentId;
 use kloop_protocol::ToolDef;
 
 const DEFAULT_MAX_RESULTS: usize = 5;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CapabilityBinding {
+    workspace_id: crate::project::WorkspaceId,
+    workspace_cwd: PathBuf,
+    workspace_epoch: u64,
+    permission_epoch: PermissionCapabilityEpoch,
+    agent_id: LocalAgentId,
+    depth: u8,
+    tool_allowlist: Option<Vec<String>>,
+}
+
+impl CapabilityBinding {
+    fn capture(ctx: &ToolCtx, workspace: &EffectiveWorkspace) -> Self {
+        let tool_allowlist = ctx.cfg.tool_allowlist.as_ref().map(|allowlist| {
+            let mut names: Vec<String> = allowlist.iter().cloned().collect();
+            names.sort();
+            names
+        });
+        Self {
+            workspace_id: workspace.identity.workspace_id().clone(),
+            workspace_cwd: workspace.cwd.clone(),
+            workspace_epoch: workspace.workspace_epoch,
+            permission_epoch: workspace.permissions.capability_epoch(),
+            agent_id: ctx.cfg.agent_id().clone(),
+            depth: ctx.depth,
+            tool_allowlist,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UnlockReceipt {
+    tool_name: String,
+    source: SourceCallBinding,
+    capability: CapabilityBinding,
+}
+
+/// Session-memory capability receipts for deferred tools. The public façade is
+/// needed only because external crates still construct Config directly; receipt
+/// fields remain core-private and never enter protocol, history, or rollout.
+#[derive(Default)]
+pub struct DeferredToolUnlocks {
+    receipts: RwLock<HashMap<(String, LocalAgentId, u8), UnlockReceipt>>,
+}
+
+impl DeferredToolUnlocks {
+    fn key(receipt: &UnlockReceipt) -> (String, LocalAgentId, u8) {
+        (
+            receipt.tool_name.clone(),
+            receipt.capability.agent_id.clone(),
+            receipt.capability.depth,
+        )
+    }
+
+    fn record(&self, receipt: UnlockReceipt) {
+        self.receipts
+            .write()
+            .unwrap()
+            .insert(Self::key(&receipt), receipt);
+    }
+
+    fn contains(&self, receipt: &UnlockReceipt) -> bool {
+        self.receipts.read().unwrap().get(&Self::key(receipt)) == Some(receipt)
+    }
+
+    pub(crate) fn clear(&self) {
+        self.receipts.write().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .receipts
+            .read()
+            .unwrap()
+            .values()
+            .map(|receipt| receipt.tool_name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    #[cfg(test)]
+    fn replace_for_test(&self, receipt: UnlockReceipt) {
+        let mut receipts = self.receipts.write().unwrap();
+        receipts.clear();
+        receipts.insert(Self::key(&receipt), receipt);
+    }
+
+    #[cfg(test)]
+    fn receipts(&self) -> Vec<UnlockReceipt> {
+        self.receipts.read().unwrap().values().cloned().collect()
+    }
+}
 
 pub(super) fn tool_search_def() -> ToolDef {
     ToolDef {
@@ -91,27 +196,40 @@ pub fn deferred_notice(cfg: &Config) -> Option<String> {
     ))
 }
 
-/// True when `name` is a deferred tool that has not been unlocked yet —
-/// checked at the top of dispatch, before hooks and the permission gate:
-/// a locked call is a protocol error to bounce back at the model, not
-/// something to ask the human about.
-pub(super) fn locked(name: &str, cfg: &Config) -> bool {
-    let deferred = deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs);
-    if !deferred.iter().any(|def| def.name == name) {
-        return false;
-    }
-    let Some(generation) = super::source_definition_generation(&cfg.tool_sources, name) else {
-        return true;
-    };
-    cfg.unlocked_tools.read().unwrap().get(name).copied() != Some(generation)
-}
-
-pub(super) fn unlocked_generation_for_dispatch(name: &str, cfg: &Config) -> Option<u64> {
+pub(super) fn is_deferred(name: &str, cfg: &Config) -> bool {
     deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs)
         .iter()
-        .any(|def| def.name == name)
-        .then(|| cfg.unlocked_tools.read().unwrap().get(name).copied())
-        .flatten()
+        .any(|definition| definition.name == name)
+}
+
+fn receipt_for_capability(
+    name: &str,
+    source: SourceCallBinding,
+    capability: &CapabilityBinding,
+) -> UnlockReceipt {
+    UnlockReceipt {
+        tool_name: name.to_string(),
+        source,
+        capability: capability.clone(),
+    }
+}
+
+pub(super) fn current_source_binding(name: &str, cfg: &Config) -> Option<SourceCallBinding> {
+    super::source_call_binding(&cfg.tool_sources, name)
+}
+
+/// Return the exact source owner/generation unlocked for this capability scope.
+/// A missing receipt is the deferred locked verdict; callers reject it before
+/// hooks or permission rather than asking the human about an undiscovered tool.
+pub(super) fn unlocked_source_for_dispatch(
+    name: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Option<SourceCallBinding> {
+    let source = current_source_binding(name, &ctx.cfg)?;
+    let capability = CapabilityBinding::capture(ctx, workspace);
+    let receipt = receipt_for_capability(name, source, &capability);
+    ctx.cfg.unlocked_tools.contains(&receipt).then_some(source)
 }
 
 fn max_results(input: &Value) -> Result<usize> {
@@ -126,7 +244,11 @@ fn max_results(input: &Value) -> Result<usize> {
     }
 }
 
-pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn tool_search_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     let query = str_arg(input, "query", "tool_search")?.trim().to_string();
     if query.is_empty() {
         bail!("tool_search: query must not be empty");
@@ -211,23 +333,20 @@ pub(super) async fn tool_search_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         }
     }
 
-    let mut current_found = Vec::with_capacity(found.len());
-    for def in found {
-        if let Some((current, generation)) =
-            super::source_definition_snapshot(&ctx.cfg.tool_sources, &def.name)
-        {
-            current_found.push((current, generation));
-        }
-    }
-    if !current_found.is_empty() {
-        let mut unlocked = ctx.cfg.unlocked_tools.write().unwrap();
-        for (def, generation) in &current_found {
-            unlocked.insert(def.name.clone(), *generation);
-        }
-    }
-    let found: Vec<ToolDef> = current_found
+    let capability = CapabilityBinding::capture(ctx, workspace);
+    let found: Vec<ToolDef> = found
         .into_iter()
-        .map(|(def, _generation)| def)
+        .filter_map(|definition| {
+            super::source_definition_snapshot(&ctx.cfg.tool_sources, &definition.name)
+        })
+        .map(|snapshot| {
+            ctx.cfg.unlocked_tools.record(receipt_for_capability(
+                &snapshot.definition.name,
+                snapshot.binding,
+                &capability,
+            ));
+            snapshot.definition
+        })
         .collect();
     Ok(render(&found, &notes, deferred.len()))
 }
@@ -347,7 +466,7 @@ mod tests {
         }
 
         fn is_readonly(&self, _tool: &str) -> bool {
-            false
+            true
         }
 
         fn call<'a>(
@@ -464,14 +583,307 @@ mod tests {
         }
     }
 
+    struct AppearingSrv {
+        defs_calls: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AppearingSrv {
+        fn definition() -> ToolDef {
+            ToolDef {
+                name: "srv__appearing".into(),
+                description: "Appears during dispatch classification".into(),
+                schema: json!({"type": "object"}),
+            }
+        }
+    }
+
+    impl ToolSource for AppearingSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            let call = self
+                .defs_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call < 2 {
+                Arc::from(Vec::<ToolDef>::new())
+            } else {
+                Arc::from(vec![Self::definition()])
+            }
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            1
+        }
+
+        fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+            (tool == "srv__appearing").then(|| (Self::definition(), 1))
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            true
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(crate::tools::SourceOutput::text("unexpected call".into()))
+            })
+        }
+    }
+
+    struct OwnedSrv {
+        definition: std::sync::RwLock<Option<ToolDef>>,
+        generation: std::sync::atomic::AtomicU64,
+        label: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+        seen_generations: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+
+    impl OwnedSrv {
+        fn new(name: &str, label: &'static str) -> Self {
+            Self {
+                definition: std::sync::RwLock::new(Some(ToolDef {
+                    name: name.into(),
+                    description: format!("owned by {label}"),
+                    schema: json!({"type": "object"}),
+                })),
+                generation: std::sync::atomic::AtomicU64::new(0),
+                label,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                seen_generations: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn remove_definition(&self) {
+            *self.definition.write().unwrap() = None;
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl ToolSource for OwnedSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(
+                self.definition
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+            let definition = self.definition.read().unwrap();
+            definition
+                .as_ref()
+                .filter(|definition| definition.name == tool)
+                .cloned()
+                .map(|definition| (definition, self.definition_generation(tool)))
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            self.call_at_generation(tool, input, None)
+        }
+
+        fn call_at_generation<'a>(
+            &'a self,
+            tool: &'a str,
+            _input: &'a Value,
+            generation: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.seen_generations.lock().unwrap().push(generation);
+                let current = self.definition_generation(tool);
+                if generation.is_some_and(|generation| generation != current) {
+                    bail!("stale generation for {tool}");
+                }
+                if self
+                    .definition
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|definition| definition.name != tool)
+                {
+                    bail!("owner no longer advertises {tool}");
+                }
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(crate::tools::SourceOutput::text(self.label.into()))
+            })
+        }
+    }
+
+    struct WireRaceSrv {
+        definition: ToolDef,
+        generation: std::sync::atomic::AtomicU64,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ToolSource for WireRaceSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![self.definition.clone()])
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+            (tool == self.definition.name)
+                .then(|| (self.definition.clone(), self.definition_generation(tool)))
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            tool: &'a str,
+            input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            self.call_at_generation(tool, input, None)
+        }
+
+        fn call_at_generation<'a>(
+            &'a self,
+            tool: &'a str,
+            _input: &'a Value,
+            generation: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.barrier.wait().await;
+                self.barrier.wait().await;
+                let current = self.definition_generation(tool);
+                if generation != Some(current) {
+                    bail!("wire rejected stale generation for {tool}");
+                }
+                Ok(crate::tools::SourceOutput::text("wire call".into()))
+            })
+        }
+    }
+
+    struct WorkspaceSessionApprover {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::permissions::Approver for WorkspaceSessionApprover {
+        fn confirm(
+            &self,
+            _request: crate::permissions::ConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::permissions::Decision> + Send + '_>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                crate::permissions::Decision::Allow(
+                    crate::permissions::ApprovalScope::WorkspaceSession,
+                )
+            })
+        }
+    }
+
+    struct NoopProjectWriter;
+
+    impl crate::permissions::ProjectPermissionWriter for NoopProjectWriter {
+        fn append_allow(
+            &self,
+            _project_id: crate::project::ProjectId,
+            _additions: crate::permissions::ProjectAllowRules,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            crate::permissions::ProjectPolicySnapshot,
+                            crate::permissions::ProjectPolicyStoreError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { unreachable!("writer is not used by this test") })
+        }
+    }
+
     fn deferred_ctx(tag: &str) -> crate::tools::ToolCtx {
         with_defer_threshold(test_ctx_with_sources(0, tag, vec![srv()]), 0)
     }
 
+    fn deferred_ctx_with_source(tag: &str, source: Arc<dyn ToolSource>) -> crate::tools::ToolCtx {
+        with_defer_threshold(test_ctx_with_sources(0, tag, vec![source]), 0)
+    }
+
+    async fn search_select(ctx: &crate::tools::ToolCtx, name: &str) -> String {
+        let (output, is_error) = run_tool(
+            "tool_search",
+            json!({"query": format!("select:{name}")}),
+            ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        output
+    }
+
+    enum WireRacePath {
+        Discovered,
+        Program,
+    }
+
+    async fn assert_wire_refresh_race(tag: &str, name: &str, path: WireRacePath) {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let source = Arc::new(WireRaceSrv {
+            definition: ToolDef {
+                name: name.into(),
+                description: "refreshes after dispatch".into(),
+                schema: json!({"type": "object"}),
+            },
+            generation: std::sync::atomic::AtomicU64::new(0),
+            barrier: Arc::clone(&barrier),
+        });
+        let mut ctx = deferred_ctx_with_source(tag, source.clone());
+        match path {
+            WireRacePath::Discovered => {
+                search_select(&ctx, name).await;
+            }
+            WireRacePath::Program => ctx.from_program = true,
+        }
+
+        let call = tokio::spawn({
+            let ctx = ctx.clone();
+            let name = name.to_string();
+            async move { run_tool(&name, json!({}), &ctx).await }
+        });
+        barrier.wait().await;
+        source
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        barrier.wait().await;
+        let (output, is_error) = call.await.unwrap();
+        assert!(is_error, "{output}");
+        assert!(
+            output.contains("wire rejected stale generation"),
+            "{output}"
+        );
+    }
+
     fn unlocked(cfg: &Config) -> Vec<String> {
-        let mut names: Vec<String> = cfg.unlocked_tools.read().unwrap().keys().cloned().collect();
-        names.sort();
-        names
+        cfg.unlocked_tools.tool_names()
     }
 
     #[tokio::test]
@@ -498,16 +910,28 @@ mod tests {
         let source: Arc<dyn ToolSource> = Arc::new(SnapshotRaceSrv {
             defs_calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let ctx = with_defer_threshold(test_ctx_with_sources(0, "snapshot-race", vec![source]), 0);
-        let (out, is_error) =
-            run_tool("tool_search", json!({"query": "select:srv__racing"}), &ctx).await;
-        assert!(!is_error, "{out}");
+        let ctx = deferred_ctx_with_source("snapshot-race", source);
+        let out = search_select(&ctx, "srv__racing").await;
         assert!(out.contains(r#""new""#), "{out}");
         assert!(!out.contains(r#""old""#), "{out}");
-        assert_eq!(
-            ctx.cfg.unlocked_tools.read().unwrap().get("srv__racing"),
-            Some(&1)
-        );
+        let receipts = ctx.cfg.unlocked_tools.receipts();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].tool_name, "srv__racing");
+        assert_eq!(receipts[0].source.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_appearance_during_classification_still_requires_discovery() {
+        let source = Arc::new(AppearingSrv {
+            defs_calls: std::sync::atomic::AtomicUsize::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ctx = deferred_ctx_with_source("appearing-source", source.clone());
+
+        let (output, is_error) = run_tool("srv__appearing", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert!(output.contains("deferred and not loaded yet"), "{output}");
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -688,18 +1112,9 @@ mod tests {
     #[tokio::test]
     async fn refreshed_schema_invalidates_the_previous_unlock() {
         let source = Arc::new(ChangingSrv::new("old"));
-        let ctx = with_defer_threshold(
-            test_ctx_with_sources(0, "generation", vec![source.clone()]),
-            0,
-        );
+        let ctx = deferred_ctx_with_source("generation", source.clone());
 
-        let (out, is_error) = run_tool(
-            "tool_search",
-            json!({"query": "select:srv__changing"}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error, "{out}");
+        let out = search_select(&ctx, "srv__changing").await;
         assert!(out.contains(r#""old""#), "{out}");
         let (out, is_error) = run_tool("srv__changing", json!({"old": "x"}), &ctx).await;
         assert!(!is_error, "{out}");
@@ -709,20 +1124,296 @@ mod tests {
         assert!(is_error, "{out}");
         assert!(out.contains("deferred and not loaded yet"), "{out}");
 
-        let (out, is_error) = run_tool(
-            "tool_search",
-            json!({"query": "select:srv__changing"}),
-            &ctx,
-        )
-        .await;
-        assert!(!is_error, "{out}");
+        let out = search_select(&ctx, "srv__changing").await;
         assert!(out.contains(r#""new""#), "{out}");
         let (out, is_error) = run_tool("srv__changing", json!({"new": "x"}), &ctx).await;
         assert!(!is_error, "{out}");
     }
 
-    /// Below the threshold nothing is deferred: source tools dispatch
-    /// directly and tool_search does not exist.
+    #[tokio::test]
+    async fn same_name_winner_change_cannot_reuse_or_hop_an_unlock() {
+        let first = Arc::new(OwnedSrv::new("srv__same", "first"));
+        let second = Arc::new(OwnedSrv::new("srv__same", "second"));
+        let ctx = with_defer_threshold(
+            test_ctx_with_sources(0, "source-owner", vec![first.clone(), second.clone()]),
+            0,
+        );
+
+        let out = search_select(&ctx, "srv__same").await;
+        assert!(out.contains("owned by first"), "{out}");
+        assert_eq!(
+            run_tool("srv__same", json!({}), &ctx).await,
+            ("first".into(), false)
+        );
+
+        first.remove_definition();
+        let (out, is_error) = run_tool("srv__same", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+        assert_eq!(first.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            second.calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a stale receipt must not hop to the later same-name source"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_call_rejects_refresh_after_dispatch_validation() {
+        assert_wire_refresh_race("wire-race", "srv__wire_race", WireRacePath::Discovered).await;
+    }
+
+    #[tokio::test]
+    async fn program_bypasses_discovery_but_keeps_source_generation_binding() {
+        let source = Arc::new(OwnedSrv::new("srv__program", "program"));
+        let mut ctx = deferred_ctx_with_source("program-binding", source.clone());
+        ctx.from_program = true;
+
+        assert_eq!(
+            run_tool("srv__program", json!({}), &ctx).await,
+            ("program".into(), false)
+        );
+        assert_eq!(*source.seen_generations.lock().unwrap(), vec![Some(0)]);
+        assert!(unlocked(&ctx.cfg).is_empty());
+    }
+
+    #[tokio::test]
+    async fn program_refresh_race_still_fails_at_the_wire_gate() {
+        assert_wire_refresh_race(
+            "program-wire-race",
+            "srv__program_race",
+            WireRacePath::Program,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn permission_mode_and_workspace_session_grants_invalidate_future_calls() {
+        let source = Arc::new(OwnedSrv::new("srv__approval", "approved"));
+        let approver = Arc::new(WorkspaceSessionApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut ctx = with_defer_threshold(
+            test_ctx_with_sources(0, "permission-epoch", vec![source.clone()]),
+            0,
+        );
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.permissions = Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &Default::default(),
+                cfg.cwd.clone(),
+                Some(approver.clone()),
+            )
+            .unwrap(),
+        );
+        ctx.cfg = Arc::new(cfg);
+
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__approval"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            run_tool("srv__approval", json!({}), &ctx).await,
+            ("approved".into(), false),
+            "the call whose approval advances the cache epoch still completes"
+        );
+        assert_eq!(approver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let (out, is_error) = run_tool("srv__approval", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+        assert_eq!(
+            approver.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "stale discovery must bounce before permission"
+        );
+
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__approval"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            run_tool("srv__approval", json!({}), &ctx).await,
+            ("approved".into(), false)
+        );
+        assert_eq!(
+            approver.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the remembered workspace grant remains the permission verdict"
+        );
+
+        ctx.cfg
+            .permissions
+            .set_mode(crate::permissions::Mode::AcceptEdits);
+        let (out, is_error) = run_tool("srv__approval", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn project_policy_refresh_and_revision_zero_invalidation_stale_receipts() {
+        let root = temp_git_repo("tool-receipt-policy");
+        let identity = crate::project::WorkspaceIdentity::resolve(&root);
+        let project_id = identity.project_id().unwrap().clone();
+        let registry = crate::permissions::ProjectPolicyRegistry::default();
+        let writer = Arc::new(NoopProjectWriter);
+        let project = registry.get_or_insert(
+            project_id.clone(),
+            crate::permissions::ProjectPolicySnapshot::empty(),
+            writer.clone(),
+        );
+        let project_view = Arc::clone(&project);
+        let source = Arc::new(OwnedSrv::new("srv__policy", "policy"));
+        let mut ctx = with_defer_threshold(
+            test_ctx_with_sources(0, "project-policy-epoch", vec![source]),
+            0,
+        );
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.cwd = root.clone();
+        cfg.permissions = Arc::new(crate::permissions::Permissions::from_layers(
+            Arc::new(crate::permissions::GlobalPermissionPolicy::empty()),
+            project,
+            Arc::new(crate::permissions::PermissionSession::new(
+                crate::permissions::Mode::Bypass,
+                None,
+            )),
+            identity,
+        ));
+        ctx.cfg = Arc::new(cfg);
+
+        run_tool("tool_search", json!({"query": "select:srv__policy"}), &ctx).await;
+        assert_eq!(
+            run_tool("srv__policy", json!({}), &ctx).await,
+            ("policy".into(), false)
+        );
+
+        registry.get_or_insert(
+            project_id.clone(),
+            crate::permissions::ProjectPolicySnapshot {
+                revision: 1,
+                allow: crate::permissions::ProjectAllowRules::empty(),
+            },
+            writer,
+        );
+        let (out, is_error) = run_tool("srv__policy", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+
+        run_tool("tool_search", json!({"query": "select:srv__policy"}), &ctx).await;
+        registry.invalidate(&project_id);
+        assert_eq!(project_view.snapshot().revision, 0);
+        let (out, is_error) = run_tool("srv__policy", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn receipt_field_mutations_fail_before_permission_and_source() {
+        let source = Arc::new(OwnedSrv::new("srv__mutate", "mutated"));
+        let approver = Arc::new(WorkspaceSessionApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut ctx = with_defer_threshold(
+            test_ctx_with_sources(0, "receipt-mutation", vec![source.clone()]),
+            0,
+        );
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.permissions = Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &Default::default(),
+                cfg.cwd.clone(),
+                Some(approver.clone()),
+            )
+            .unwrap(),
+        );
+        ctx.cfg = Arc::new(cfg);
+        run_tool("tool_search", json!({"query": "select:srv__mutate"}), &ctx).await;
+        let receipt = ctx.cfg.unlocked_tools.receipts().pop().unwrap();
+        let other_workspace = crate::project::WorkspaceIdentity::ephemeral(
+            std::env::temp_dir().join("kloop-other-receipt-workspace"),
+        );
+        let mut mutations = Vec::new();
+        let mut changed = receipt.clone();
+        changed.tool_name = "srv__other".into();
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.source.source_slot += 1;
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.source.generation += 1;
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.capability.workspace_id = other_workspace.workspace_id().clone();
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.capability.workspace_cwd.push("other");
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.capability.workspace_epoch += 1;
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.capability.agent_id = "agent-999".parse().unwrap();
+        mutations.push(changed);
+        let mut changed = receipt.clone();
+        changed.capability.depth += 1;
+        mutations.push(changed);
+        let mut changed = receipt;
+        changed.capability.tool_allowlist = Some(vec!["srv__mutate".into()]);
+        mutations.push(changed);
+
+        for mutation in mutations {
+            ctx.cfg.unlocked_tools.replace_for_test(mutation);
+            let (out, is_error) = run_tool("srv__mutate", json!({}), &ctx).await;
+            assert!(is_error, "{out}");
+            assert!(out.contains("deferred and not loaded yet"), "{out}");
+        }
+        assert_eq!(
+            approver.calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "mutated receipts must fail before permission"
+        );
+        assert_eq!(
+            source.calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "mutated receipts must fail before source execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_transitions_require_rediscovery_even_after_returning_to_base() {
+        let root = temp_git_repo("tool-receipt-worktree");
+        let ctx = git_ctx(deferred_ctx("worktree-scope"), &root, true);
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__web_search"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            run_tool("srv__web_search", json!({}), &ctx).await,
+            ("ran srv__web_search".into(), false)
+        );
+
+        crate::worktree::enter(&ctx.cfg, "receipt-scope")
+            .await
+            .unwrap();
+        let (out, is_error) = run_tool("srv__web_search", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        crate::worktree::exit(&ctx.cfg, crate::worktree::ExitAction::Remove, false)
+            .await
+            .unwrap();
+        let (out, is_error) = run_tool("srv__web_search", json!({}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn inactive_regime_leaves_dispatch_untouched() {
         let ctx = test_ctx_with_sources(0, "inactive", vec![srv()]);
@@ -742,17 +1433,37 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("tool_search"), "{notice}");
+        let tools_before = crate::tools::all_tool_defs(
+            ctx.depth,
+            &ctx.cfg.tool_sources,
+            ctx.cfg.defer_threshold,
+            ctx.cfg.surface,
+            &ctx.cfg.shell_programs,
+        );
         // Unlocking must not change the injected text (prompt-cache stability).
-        ctx.cfg
-            .unlocked_tools
-            .write()
-            .unwrap()
-            .insert("srv__web_search".into(), 0);
+        let workspace = ctx.cfg.effective_workspace();
+        let source = current_source_binding("srv__web_search", &ctx.cfg).unwrap();
+        let capability = CapabilityBinding::capture(&ctx, &workspace);
+        ctx.cfg.unlocked_tools.record(receipt_for_capability(
+            "srv__web_search",
+            source,
+            &capability,
+        ));
         assert_eq!(deferred_notice(&ctx.cfg), Some(notice));
+        assert_eq!(
+            crate::tools::all_tool_defs(
+                ctx.depth,
+                &ctx.cfg.tool_sources,
+                ctx.cfg.defer_threshold,
+                ctx.cfg.surface,
+                &ctx.cfg.shell_programs,
+            ),
+            tools_before,
+            "receipt churn must not alter the provider tool array"
+        );
     }
 
-    /// Sub-agent configs are `..parent.clone()` spreads: the unlock set is
-    /// the same Arc, so a parent's discoveries carry over (and vice versa).
+    /// Ordinary same-agent Config clones share one live capability store.
     #[test]
     fn unlock_set_is_shared_into_cloned_configs() {
         let ctx = deferred_ctx("shared");
@@ -767,6 +1478,83 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn conversation_reset_revokes_live_receipts() {
+        let ctx = deferred_ctx("conversation-reset");
+        search_select(&ctx, "srv__web_search").await;
+        assert_eq!(
+            run_tool("srv__web_search", json!({}), &ctx).await,
+            ("ran srv__web_search".into(), false)
+        );
+
+        ctx.cfg.reset_deferred_tool_capabilities();
+        let (output, is_error) = run_tool("srv__web_search", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert!(output.contains("deferred and not loaded yet"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn subagent_has_fresh_receipts_and_cannot_use_a_shared_parent_receipt() {
+        let ctx = deferred_ctx("child-scope");
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__web_search"}),
+            &ctx,
+        )
+        .await;
+        let workspace = ctx.cfg.effective_workspace();
+        let child = ctx
+            .cfg
+            .subagent_from(&workspace, None, "agent-999".parse().unwrap());
+        assert!(!Arc::ptr_eq(&ctx.cfg.unlocked_tools, &child.unlocked_tools));
+        assert!(child.unlocked_tools.tool_names().is_empty());
+
+        let mut child_ctx = ctx.clone();
+        child_ctx.depth = 1;
+        child_ctx.cfg = Arc::new(child);
+        let (out, is_error) = run_tool("srv__web_search", json!({}), &child_ctx).await;
+        assert!(is_error, "{out}");
+
+        let mut forged = child_ctx.cfg.test_clone();
+        forged.unlocked_tools = Arc::clone(&ctx.cfg.unlocked_tools);
+        child_ctx.cfg = Arc::new(forged);
+        let (out, is_error) = run_tool("srv__web_search", json!({}), &child_ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("deferred and not loaded yet"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn allowlist_change_requires_a_scope_specific_receipt() {
+        let ctx = deferred_ctx("allowlist-scope");
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__web_search"}),
+            &ctx,
+        )
+        .await;
+        let mut restricted = ctx.cfg.test_clone();
+        restricted.tool_allowlist = Some(Arc::new(
+            ["tool_search".to_string(), "srv__web_search".to_string()]
+                .into_iter()
+                .collect(),
+        ));
+        let mut restricted_ctx = ctx.clone();
+        restricted_ctx.cfg = Arc::new(restricted);
+
+        let (out, is_error) = run_tool("srv__web_search", json!({}), &restricted_ctx).await;
+        assert!(is_error, "{out}");
+        run_tool(
+            "tool_search",
+            json!({"query": "select:srv__web_search"}),
+            &restricted_ctx,
+        )
+        .await;
+        assert_eq!(
+            run_tool("srv__web_search", json!({}), &restricted_ctx).await,
+            ("ran srv__web_search".into(), false)
+        );
+    }
+
     #[test]
     fn independent_sessions_do_not_share_the_powershell_gate() {
         let first = deferred_ctx("powershell-gate-first");
@@ -778,11 +1566,68 @@ mod tests {
     }
 
     #[test]
-    fn tool_search_is_concurrency_safe() {
-        assert!(crate::tools::is_concurrency_safe(
+    fn tool_search_is_an_ordering_barrier() {
+        assert!(!crate::tools::is_concurrency_safe(
             "tool_search",
             &json!({"query": "x"}),
             &[]
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_response_search_then_readonly_call_observes_request_order() {
+        let ctx = deferred_ctx("same-response-search-first");
+        let results = crate::tools::dispatch_tools(
+            vec![
+                (
+                    "search".into(),
+                    "tool_search".into(),
+                    json!({"query": "select:srv__web_search"}),
+                ),
+                ("call".into(), "srv__web_search".into(), json!({"q": "x"})),
+            ],
+            &ctx,
+        )
+        .await;
+        assert!(matches!(
+            &results[0],
+            kloop_protocol::ContentBlock::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            results[1],
+            kloop_protocol::ContentBlock::ToolResult {
+                tool_use_id: "call".into(),
+                content: "ran srv__web_search".into(),
+                is_error: false,
+            }
+        );
+
+        let ctx = deferred_ctx("same-response-call-first");
+        let results = crate::tools::dispatch_tools(
+            vec![
+                ("call".into(), "srv__web_search".into(), json!({"q": "x"})),
+                (
+                    "search".into(),
+                    "tool_search".into(),
+                    json!({"query": "select:srv__web_search"}),
+                ),
+            ],
+            &ctx,
+        )
+        .await;
+        assert!(matches!(
+            &results[0],
+            kloop_protocol::ContentBlock::ToolResult { is_error: true, .. }
+        ));
+        assert!(matches!(
+            &results[1],
+            kloop_protocol::ContentBlock::ToolResult {
+                is_error: false,
+                ..
+            }
         ));
     }
 

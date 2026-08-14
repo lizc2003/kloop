@@ -2217,6 +2217,128 @@ async fn run_program_returns_only_final_output_to_the_model() {
     let _ = std::fs::remove_file(&file);
 }
 
+#[tokio::test]
+async fn run_program_binds_source_generation_to_the_sampling_request() {
+    struct RefreshingSource {
+        definition: ToolDef,
+        generation: std::sync::atomic::AtomicU64,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolSource for RefreshingSource {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![self.definition.clone()])
+        }
+
+        fn definition_generation(&self, _tool: &str) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+            (tool == self.definition.name).then(|| {
+                (
+                    self.definition.clone(),
+                    self.generation.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            true
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SourceOutput>> + Send + 'a>,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(SourceOutput::text("unexpected call".into())) })
+        }
+    }
+
+    let source = Arc::new(RefreshingSource {
+        definition: ToolDef {
+            name: "srv__sampled".into(),
+            description: "The schema exposed to the sampling request".into(),
+            schema: json!({"type": "object"}),
+        },
+        generation: std::sync::atomic::AtomicU64::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Gate {
+            started: started_tx,
+            release: release_rx,
+            blocks: vec![tool_use_named(
+                "sampled-program",
+                "run_program",
+                json!({"source": "return await tools.srv__sampled({});"}),
+            )],
+        },
+        MockTurn::Blocks(text("done")),
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "program-sampling-manifest").test_clone();
+    cfg.tool_sources = vec![source.clone()];
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("go"));
+
+    let refresh = {
+        let source = source.clone();
+        tokio::spawn(async move {
+            started_rx.await.expect("sampling did not start");
+            source
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release_tx.send(()).expect("sampling request was dropped");
+        })
+    };
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    refresh.await.unwrap();
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let result = history
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .find(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "sampled-program"
+            )
+        })
+        .expect("missing Program tool result");
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = result
+    else {
+        unreachable!()
+    };
+    assert!(is_error);
+    assert!(
+        content
+            .as_text()
+            .contains("source changed after this Program API was generated"),
+        "{}",
+        content.as_text()
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let run_program = seen[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "run_program")
+        .expect("run_program definition missing");
+    assert!(run_program.description.contains("srv__sampled"));
+}
+
 /// Deferred regime end to end over Mock: the request's tool defs shrink
 /// to built-ins + tool_search, the notice rides the injected context
 /// message (after the instructions) without entering history, and a

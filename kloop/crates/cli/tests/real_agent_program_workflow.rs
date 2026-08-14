@@ -581,6 +581,18 @@ fn real_agent_program_workflow_contract() {
     assert!(background_program_id.starts_with("program-"));
     let background_program_run_id = background_program_run_id.unwrap();
     assert!(background_program_outputs[0].contains(&background_program_run_id));
+    let background_program_source = tool_items(
+        &background_program_messages,
+        "item/started",
+        "run_program",
+    )[0]["params"]["item"]["input"]["source"]
+        .as_str()
+        .expect("background run_program omitted source");
+    assert_eq!(
+        background_program_source.trim_end_matches(['\r', '\n']),
+        BACKGROUND_PROGRAM_SOURCE,
+        "model changed the requested background Program source"
+    );
     assert_eq!(
         std::fs::read_to_string(
             root.workspace()
@@ -589,7 +601,7 @@ fn real_agent_program_workflow_contract() {
                 .join("source.js")
         )
         .expect("missing background Program source artifact"),
-        BACKGROUND_PROGRAM_SOURCE
+        background_program_source
     );
     let offloaded_program_result = std::fs::read_dir(root.workspace().join(".kloop/offload"))
         .expect("background Program result was not offloaded")

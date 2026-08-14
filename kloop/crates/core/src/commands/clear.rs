@@ -20,6 +20,7 @@ pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
     // Replacing with an empty history writes a compacted marker; the usage
     // anchor is dropped and the next turn starts on a blank context.
     history.replace_all(Vec::new());
+    cfg.reset_deferred_tool_capabilities();
     cfg.inbox.drain();
     SlashResult::cleared_message("conversation cleared", snapshot)
 }

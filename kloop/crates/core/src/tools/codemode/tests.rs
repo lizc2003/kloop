@@ -1161,7 +1161,10 @@ async fn core_bridge_rejects_names_outside_the_program_catalog() {
         test_ctx(0, "bridge-allowlist"),
         kloop_codemode::Limits::default(),
         None,
-        &["read_file".into()],
+        Arc::new(capture_program_tool_manifest(
+            &[],
+            &crate::shell_programs::ShellPrograms::test_fixture(),
+        )),
     );
     let error = bridge
         .call_tool("run_agent".into(), json!({"prompt": "escape"}))
@@ -1237,6 +1240,146 @@ impl ToolSource for Srv {
             )))
         })
     }
+}
+
+struct MutableSrvState {
+    definition: Option<ToolDef>,
+    generation: u64,
+}
+
+struct MutableSrv {
+    label: &'static str,
+    state: Mutex<MutableSrvState>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl MutableSrv {
+    fn new(label: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            label,
+            state: Mutex::new(MutableSrvState {
+                definition: Some(ToolDef {
+                    name: "srv__same".into(),
+                    description: format!("{label} schema"),
+                    schema: json!({"type": "object"}),
+                }),
+                generation: 0,
+            }),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn refresh(&self, present: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.generation += 1;
+        state.definition = present.then(|| ToolDef {
+            name: "srv__same".into(),
+            description: format!("{} refreshed schema", self.label),
+            schema: json!({"type": "object"}),
+        });
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ToolSource for MutableSrv {
+    fn defs(&self) -> Arc<[ToolDef]> {
+        Arc::from(
+            self.state
+                .lock()
+                .unwrap()
+                .definition
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn definition_generation(&self, _tool: &str) -> u64 {
+        self.state.lock().unwrap().generation
+    }
+
+    fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
+        let state = self.state.lock().unwrap();
+        state
+            .definition
+            .as_ref()
+            .filter(|definition| definition.name == tool)
+            .cloned()
+            .map(|definition| (definition, state.generation))
+    }
+
+    fn is_readonly(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        _tool: &'a str,
+        _input: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<crate::tools::SourceOutput>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let label = self.label;
+        Box::pin(async move { Ok(crate::tools::SourceOutput::text(label.to_string())) })
+    }
+
+    fn call_at_generation<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a serde_json::Value,
+        generation: Option<u64>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<crate::tools::SourceOutput>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let state = self.state.lock().unwrap();
+        let current = state
+            .definition
+            .as_ref()
+            .filter(|definition| definition.name == tool)
+            .map(|_| state.generation);
+        if current != generation {
+            return Box::pin(async { anyhow::bail!("stale source generation") });
+        }
+        drop(state);
+        self.call(tool, input)
+    }
+}
+
+#[tokio::test]
+async fn program_manifest_rejects_same_name_source_owner_hop() {
+    let first = MutableSrv::new("first");
+    let second = MutableSrv::new("second");
+    let sources: Vec<Arc<dyn ToolSource>> = vec![first.clone(), second.clone()];
+    let mut ctx = test_ctx_with_sources(0, "program-owner-hop", sources);
+    ctx.program_tool_manifest = Some(Arc::new(capture_program_tool_manifest(
+        &ctx.cfg.tool_sources,
+        &ctx.cfg.shell_programs,
+    )));
+
+    // The provider saw first-source-wins. Before its returned Program executes,
+    // the first owner disappears and the same qualified name resolves to second.
+    first.refresh(false);
+    let (output, is_error) = run("return await tools.srv__same({});", &ctx).await;
+
+    assert!(is_error, "{output}");
+    assert!(
+        output.contains("source changed after this Program API was generated"),
+        "{output}"
+    );
+    assert_eq!(first.calls(), 0);
+    assert_eq!(second.calls(), 0);
 }
 
 /// Slice 1: below the defer threshold, an external source tool is callable from

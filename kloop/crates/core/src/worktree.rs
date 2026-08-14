@@ -155,6 +155,7 @@ pub struct ActiveWorktree {
 pub struct ActiveWorktreeState {
     current: RwLock<Option<ActiveWorktree>>,
     operation: AsyncMutex<()>,
+    transition_epoch: AtomicU64,
 }
 
 impl Default for ActiveWorktreeState {
@@ -162,6 +163,7 @@ impl Default for ActiveWorktreeState {
         Self {
             current: RwLock::new(None),
             operation: AsyncMutex::new(()),
+            transition_epoch: AtomicU64::new(0),
         }
     }
 }
@@ -173,6 +175,34 @@ impl ActiveWorktreeState {
 
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Option<ActiveWorktree>>> {
         self.current.write()
+    }
+
+    pub(crate) fn transition_epoch(&self) -> u64 {
+        self.transition_epoch.load(Ordering::Acquire)
+    }
+
+    fn advance_transition_epoch(&self) {
+        self.transition_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("worktree transition epoch exhausted");
+    }
+
+    fn take_for_transition(&self) -> Option<ActiveWorktree> {
+        let mut current = self.current.write().unwrap();
+        let active = current.take()?;
+        self.advance_transition_epoch();
+        drop(current);
+        Some(active)
+    }
+
+    fn restore_after_transition(&self, active: ActiveWorktree) {
+        let mut current = self.current.write().unwrap();
+        debug_assert!(current.is_none());
+        *current = Some(active);
+        self.advance_transition_epoch();
+        drop(current);
     }
 }
 
@@ -533,14 +563,17 @@ fn install_active(cfg: &Config, worktree: Worktree, overrides: WorktreeOverrides
         system,
         wt: worktree,
     };
-    if let Some(mut previous) = cfg.active_worktree.write().unwrap().replace(active) {
+    let mut current = cfg.active_worktree.write().unwrap();
+    if let Some(mut previous) = current.replace(active) {
         previous.wt.lifecycle = WorktreeLifecycle::Kept;
     }
+    cfg.active_worktree.advance_transition_epoch();
+    drop(current);
 }
 
 pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Result<String> {
     let _operation = cfg.active_worktree.operation.lock().await;
-    let Some(mut active) = cfg.active_worktree.write().unwrap().take() else {
+    let Some(mut active) = cfg.active_worktree.take_for_transition() else {
         bail!(
             "No-op: there is no active enter_worktree session to exit. This tool only operates on worktrees entered in the current session. No filesystem changes were made."
         );
@@ -558,7 +591,7 @@ pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Re
         || !matches!(active.wt.owner, WorktreeOwner::Session(_))
     {
         let path = active.wt.path.display().to_string();
-        *cfg.active_worktree.write().unwrap() = Some(active);
+        cfg.active_worktree.restore_after_transition(active);
         bail!(
             "This session is not the owner of the worktree at {path}, so exit_worktree will not remove it. Use action: \"keep\" to return to {original_cwd}."
         );
@@ -569,7 +602,7 @@ pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Re
         Ok(changes) => Ok(format_remove_message(&active.wt, &original_cwd, changes)),
         Err(error) => {
             if active.wt.path.exists() {
-                *cfg.active_worktree.write().unwrap() = Some(active);
+                cfg.active_worktree.restore_after_transition(active);
             }
             Err(error)
         }
@@ -651,7 +684,7 @@ fn format_remove_message(
 /// action the active resource is retained, even when clean.
 pub async fn finish_active(cfg: &Config) -> Option<String> {
     let _operation = cfg.active_worktree.operation.lock().await;
-    let mut active = cfg.active_worktree.write().unwrap().take()?;
+    let mut active = cfg.active_worktree.take_for_transition()?;
     active.wt.lifecycle = WorktreeLifecycle::Kept;
     Some(retained_note(&active.wt).trim().to_string())
 }
@@ -1050,13 +1083,17 @@ mod tests {
     async fn remove_requires_discard_and_restores_active_on_refusal() {
         let root = temp_repo("refuse").await;
         let cfg = config_for_repo(&root, "refuse");
+        assert_eq!(cfg.active_worktree.transition_epoch(), 0);
         enter(&cfg, "dirty").await.unwrap();
+        assert_eq!(cfg.active_worktree.transition_epoch(), 1);
         let path = cfg.effective_cwd();
         std::fs::write(path.join("dirty.txt"), "dirty").unwrap();
         let error = exit(&cfg, ExitAction::Remove, false).await.unwrap_err();
+        assert_eq!(cfg.active_worktree.transition_epoch(), 3);
         assert!(error.to_string().contains("1 uncommitted file"));
         assert_eq!(cfg.effective_cwd(), path);
         exit(&cfg, ExitAction::Remove, true).await.unwrap();
+        assert_eq!(cfg.active_worktree.transition_epoch(), 4);
         assert_eq!(cfg.effective_cwd(), root);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(root);

@@ -1,6 +1,6 @@
 # Plan 87 — CodeWhale 借鉴：deferred tool capability binding
 
-> 状态：规划中
+> 状态：✅ 已完成（2026-08-14）
 >
 > 依赖：Plan 16、Plan 54、Plan 63、Plan 86；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 
@@ -51,3 +51,24 @@ kloop 已完成 Plan 16/54 的 deferred ToolSearch、ToolSource immutable snapsh
 ## 完成标准
 
 unlock receipt 与 workspace/worktree/policy/authority/source generation 绑定；所有 stale/跨 scope reuse fail closed；现有 ToolSearch、Program、permission、sandbox、provider tool array 和 child authority 语义不回归；无新增依赖、public protocol 字段、second registry 或 durable unlock truth。
+
+## 实施结果（2026-08-14）
+
+- `DeferredToolUnlocks` 以 session-memory receipt 替代裸 `name → generation` map。receipt 绑定 source owner slot、qualified tool name、definition generation、`WorkspaceId`/effective workspace cwd、session worktree transition epoch、project/mode/workspace-session permission epochs、agent identity/depth 与 tool allowlist。
+- `ToolSource::definition_snapshot` 与 `call_at_generation` 形成 discovery-to-wire 两道 binding seam；dispatch 在 pre-hook 前冻结 workspace/receipt，hook 后复核 discovery capability。`run_program` 的 callable manifest 与同一次 provider request 一起冻结 source owner/generation/readonly verdict，并一路传入 foreground/background `CoreBridge`；`from_program` 只越过 deferred discovery gate，sampling 后的同名 owner hop、generation refresh 或新工具出现都会 fail closed，其他 source generation、hooks、permission、sandbox、concurrency 与 provider/tool contract 仍完整执行。
+- policy refresh/invalidation、workspace-session approval、mode transition 和 session worktree transition 都在各自状态锁内与单调 epoch 原子发布；普通 Config clone 与 same-session compaction 保留同 authority receipt，sub-agent 和 resume/fork 新 Config 使用 fresh state，TUI 原地 rewind 与 `/clear` 显式清空，isolated worktree 不继承；receipt 不进入 history、rollout、protocol 或 durable store。
+- ToolSearch 只记录 receipt，不改 provider tool array 或 deferred notice；它作为 receipt publication ordering barrier，同一 assistant response 内 search→call 按请求顺序确定执行。dispatch 在 source binding 两侧复核动态 defer 分类，refresh、same-name owner collision、workspace/worktree、permission/policy、authority/allowlist 与 mutation-negative 回归覆盖 stale fail-closed 边界。
+
+## 验证记录（2026-08-14）
+
+- `cargo test -p kloop-core`：690 passed；
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：通过；
+- `cargo test --workspace`：通过（2 项真实 provider credential tests ignored）；
+- `cargo run --locked -p kloop -- --mock`、`--mock --headless`、`--mock --headless --json`：通过，JSON smoke 解析 46 行 NDJSON；
+- `cargo fmt --all -- --check`：通过；
+- `git diff --check`：通过；
+- 真实 Anthropic rail（`claude-sonnet-4-6`）：`real_agent_program_workflow_contract` 57.78s、`real_local_agent_mailbox_contract` 58.12s，均通过；
+- 真实 OpenAI Chat rail（`gpt-5.5`）：`real_agent_program_workflow_contract` 66.04s、`real_local_agent_mailbox_contract` 53.53s，均通过。首次 primitive 运行暴露模型在 fenced background Program source 后保留一个 LF；验收现与 foreground 契约一致，允许尾部 CR/LF 做 prompt 等价比较，同时继续逐字节验证 artifact 等于实际 tool input；
+- 未执行 Linux sandbox/CI、Windows、物理终端与 Desktop E2E。
+
+提交 SHA 以本条所在提交为准。

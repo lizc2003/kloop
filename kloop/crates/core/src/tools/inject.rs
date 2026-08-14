@@ -69,6 +69,7 @@ pub(crate) async fn expand_slash_injections(
         depth: 0,
         hook_context: Arc::new(Mutex::new(Vec::new())),
         from_program: false,
+        program_tool_manifest: None,
         parent_rollout_id: None,
         program_result: None,
     };

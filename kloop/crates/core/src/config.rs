@@ -12,6 +12,7 @@ use crate::permissions::Permissions;
 use crate::shell_programs::ShellPrograms;
 use crate::tools::BackgroundExecutions;
 use crate::tools::BackgroundShells;
+use crate::tools::DeferredToolUnlocks;
 use crate::tools::ToolSource;
 
 #[cfg(not(all(test, windows)))]
@@ -244,6 +245,7 @@ pub struct SurfaceCapabilities {
 #[derive(Clone)]
 pub struct EffectiveWorkspace {
     pub identity: crate::project::WorkspaceIdentity,
+    pub workspace_epoch: u64,
     pub cwd: PathBuf,
     pub permissions: Arc<Permissions>,
     pub file_state: Arc<FileState>,
@@ -345,12 +347,10 @@ pub struct Config {
     /// source tools are deferred: excluded from the request's tool defs and
     /// discoverable via the tool_search tool instead. Built-ins never defer.
     pub defer_threshold: usize,
-    /// Deferred tools unlocked by tool_search this session, keyed by the source
-    /// definition generation that was searched. A dynamic source refresh makes
-    /// an old entry stale, forcing the model to discover the replacement schema
-    /// before dispatch. Shared into sub-agent configs so a parent's discoveries
-    /// carry over.
-    pub unlocked_tools: Arc<std::sync::RwLock<std::collections::HashMap<String, u64>>>,
+    /// Session-memory deferred-tool capability receipts. Each receipt binds one
+    /// discovered source snapshot to the current workspace, policy and Agent
+    /// authority; stale bindings fail closed and are never persisted.
+    pub unlocked_tools: Arc<DeferredToolUnlocks>,
     /// Root-owned, session-scoped structured task graph. Child Configs retain
     /// this Arc as an internal session service, but depth gates keep Task tools out
     /// of child catalogs and reject forged child calls. It is process state,
@@ -415,9 +415,10 @@ impl Config {
         self.local_agent.agent_label()
     }
 
-    pub fn base_workspace(&self) -> EffectiveWorkspace {
+    fn base_workspace_at(&self, workspace_epoch: u64) -> EffectiveWorkspace {
         EffectiveWorkspace {
             identity: self.permissions.identity().clone(),
+            workspace_epoch,
             cwd: self.cwd.clone(),
             permissions: Arc::clone(&self.permissions),
             file_state: Arc::clone(&self.file_state),
@@ -427,11 +428,20 @@ impl Config {
         }
     }
 
+    pub fn base_workspace(&self) -> EffectiveWorkspace {
+        let current = self.active_worktree.read().unwrap();
+        let workspace_epoch = self.active_worktree.transition_epoch();
+        drop(current);
+        self.base_workspace_at(workspace_epoch)
+    }
+
     pub fn effective_workspace(&self) -> EffectiveWorkspace {
         let active = self.active_worktree.read().unwrap();
+        let workspace_epoch = self.active_worktree.transition_epoch();
         match active.as_ref() {
             Some(active) => EffectiveWorkspace {
                 identity: active.permissions.identity().clone(),
+                workspace_epoch,
                 cwd: active.cwd.clone(),
                 permissions: Arc::clone(&active.permissions),
                 file_state: Arc::clone(&active.file_state),
@@ -439,7 +449,7 @@ impl Config {
                 system: active.system.clone(),
                 branch: Some(active.branch.clone()),
             },
-            None => self.base_workspace(),
+            None => self.base_workspace_at(workspace_epoch),
         }
     }
 
@@ -477,7 +487,7 @@ impl Config {
             agent_types: Arc::clone(&self.agent_types),
             tool_allowlist: self.tool_allowlist.clone(),
             defer_threshold: self.defer_threshold,
-            unlocked_tools: Arc::clone(&self.unlocked_tools),
+            unlocked_tools: Arc::new(DeferredToolUnlocks::default()),
             tasks: Arc::clone(&self.tasks),
             inbox: Arc::new(Inbox::default()),
             scheduler: Arc::clone(&self.scheduler),
@@ -540,6 +550,12 @@ impl Config {
         self.scheduler.bind_owner(session_id.clone())?;
         self.session_id = session_id;
         Ok(())
+    }
+
+    /// Drop non-durable deferred-tool receipts when the conversation branches or
+    /// resets. Same-session compaction deliberately does not call this method.
+    pub fn reset_deferred_tool_capabilities(&self) {
+        self.unlocked_tools.clear();
     }
 
     /// Stop every session-scoped detached worker before its frontend/runtime is

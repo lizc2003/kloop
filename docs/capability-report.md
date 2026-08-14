@@ -343,6 +343,7 @@ codex 拉取式增量观察。
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | 子目录懒加载(conditionalRules + paths glob) | cc 单家(codex/claw 均无) | plan 32 片 3 挂账,弱收敛 | 大 monorepo 痛感 |
+| deferred tool capability receipt 绑定 | CodeWhale 局部实现 + kloop 原生安全边界 | **✅ Plan 87（2026-08-14）**：unlock receipt 绑定 source owner/generation、WorkspaceId/effective workspace、worktree epoch、permission/policy epoch 与 agent authority；Program callable manifest 同 provider request 冻结 owner/generation/readonly；跨 scope、refresh、owner hop、child/isolated worktree reuse fail closed；provider tool array 保持稳定 | 已完成 |
 | claudeMdExcludes / enterprise 层 | cc 单家 | 不立 | 定位外 |
 
 ### 11. MCP——🟡 tools/resources 主干齐，双向能力缺

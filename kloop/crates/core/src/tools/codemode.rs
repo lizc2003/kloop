@@ -10,7 +10,6 @@
 //! The engine crate stays engine-only; the seam that reaches core's private
 //! gate lives here because the gate is what makes code-mode safe.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -26,6 +25,7 @@ use serde_json::Value;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::SourceCallBinding;
 use super::ToolCtx;
 use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
@@ -99,27 +99,71 @@ fn is_program_callable(name: &str) -> bool {
     )
 }
 
-/// The tool names a program may call: the depth-0 built-ins plus every external
-/// source (MCP) tool, deduplicated. Source tools are always included — deferred
-/// or not — so a `tools.<name>()` call never lands on a missing method; deferral
-/// only trims what the `run_program` *description* declares in full, never what
-/// the runtime exposes (a program call bypasses the deferred-tool lock gate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramToolEntry {
+    name: String,
+    source: Option<SourceCallBinding>,
+    readonly: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramToolManifest {
+    entries: Vec<ProgramToolEntry>,
+}
+
+impl ProgramToolManifest {
+    fn names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    fn get(&self, name: &str) -> Option<&ProgramToolEntry> {
+        self.entries.iter().find(|entry| entry.name == name)
+    }
+}
+
+/// Capture the exact callable source owner/generation and readonly verdict that
+/// accompany one provider request's generated Program API. The agent builds the
+/// API between two equal manifests, so a dynamic refresh cannot splice an old
+/// schema onto a newer runtime owner.
+pub(crate) fn capture_program_tool_manifest(
+    sources: &[Arc<dyn super::ToolSource>],
+    shell_programs: &crate::shell_programs::ShellPrograms,
+) -> ProgramToolManifest {
+    let mut entries: Vec<ProgramToolEntry> = super::builtin_defs(0, shell_programs)
+        .into_iter()
+        .filter(|definition| is_program_callable(&definition.name))
+        .map(|definition| ProgramToolEntry {
+            name: definition.name,
+            source: None,
+            readonly: false,
+        })
+        .collect();
+    entries.extend(
+        super::merged_source_defs(sources)
+            .into_iter()
+            .filter(|definition| is_program_callable(&definition.name))
+            .filter_map(|definition| super::source_definition_snapshot(sources, &definition.name))
+            .filter_map(|snapshot| {
+                let source = sources.get(snapshot.binding.source_slot)?;
+                Some(ProgramToolEntry {
+                    readonly: source.is_readonly(&snapshot.definition.name),
+                    name: snapshot.definition.name,
+                    source: Some(snapshot.binding),
+                })
+            }),
+    );
+    ProgramToolManifest { entries }
+}
+
+#[cfg(test)]
 fn program_tool_names(
     sources: &[Arc<dyn super::ToolSource>],
     shell_programs: &crate::shell_programs::ShellPrograms,
 ) -> Vec<String> {
-    let mut names: Vec<String> = super::builtin_defs(0, shell_programs)
-        .into_iter()
-        .filter(|d| is_program_callable(&d.name))
-        .map(|d| d.name)
-        .collect();
-    names.extend(
-        super::merged_source_defs(sources)
-            .into_iter()
-            .filter(|d| is_program_callable(&d.name))
-            .map(|d| d.name),
-    );
-    names
+    capture_program_tool_manifest(sources, shell_programs).names()
 }
 
 pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -137,7 +181,13 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         background,
         resume_from_run_id,
     } = parsed;
-    let names = program_tool_names(&ctx.cfg.tool_sources, &ctx.cfg.shell_programs);
+    let program_tool_manifest = ctx.program_tool_manifest.clone().unwrap_or_else(|| {
+        Arc::new(capture_program_tool_manifest(
+            &ctx.cfg.tool_sources,
+            &ctx.cfg.shell_programs,
+        ))
+    });
+    let names = program_tool_manifest.names();
     let limits = ctx.cfg.program_limits;
     // Each run has a run_id and an agent()-call journal. A resume passes the old
     // run_id back, reusing the journal dir so completed agent() calls are
@@ -177,6 +227,7 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             ctx,
             source,
             names,
+            program_tool_manifest,
             limits,
             run_id,
             description,
@@ -189,7 +240,7 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         ctx.clone(),
         limits,
         Some(journal.clone()),
-        &names,
+        program_tool_manifest,
     ));
     // `log()` output already streamed live to the UI as it ran; only the
     // program's return value comes back to the model — keeping a program's
@@ -301,6 +352,7 @@ fn spawn_background_program(
     ctx: &ToolCtx,
     source: String,
     names: Vec<String>,
+    program_tool_manifest: Arc<ProgramToolManifest>,
     limits: kloop_codemode::Limits,
     run_id: String,
     description: String,
@@ -329,7 +381,7 @@ fn spawn_background_program(
         bg_ctx,
         limits,
         Some(journal.clone()),
-        &names,
+        program_tool_manifest,
     ));
     super::subagent::emit_background_task(
         &ui,
@@ -449,10 +501,9 @@ struct CoreBridge {
     // writes take the write lock (serialized) so a program can't race two
     // edits to the same file past the ordering a normal round would enforce.
     gate: Arc<tokio::sync::RwLock<()>>,
-    // Exact names installed on this Program's `tools` object. The JS prelude is
-    // convenience, not the security boundary: raw/forged bridge calls are denied
-    // here before hooks, permissions, or dispatch.
-    allowed_tools: Arc<HashSet<String>>,
+    // Exact callable names, source owner/generation and readonly verdict captured
+    // with the provider request that exposed this Program API.
+    program_tools: Arc<ProgramToolManifest>,
     // Total agent() calls so far and the hard ceiling; the (max_agents+1)th is
     // refused. A separate semaphore below paces finite concurrent fan-out.
     agent_count: AtomicU64,
@@ -470,7 +521,7 @@ impl CoreBridge {
         ctx: ToolCtx,
         limits: kloop_codemode::Limits,
         journal: Option<Arc<Journal>>,
-        allowed_tools: &[String],
+        program_tools: Arc<ProgramToolManifest>,
     ) -> Self {
         // Calls a program fires are "from a program": they skip the deferred-tool
         // lock gate, since the tool is already exposed on the program's `tools`
@@ -483,7 +534,7 @@ impl CoreBridge {
             ctx,
             seq: AtomicU64::new(0),
             gate: Arc::new(tokio::sync::RwLock::new(())),
-            allowed_tools: Arc::new(allowed_tools.iter().cloned().collect()),
+            program_tools,
             agent_count: AtomicU64::new(0),
             max_agents: limits.max_agents,
             agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
@@ -494,19 +545,23 @@ impl CoreBridge {
 
 impl HostBridge for CoreBridge {
     fn call_tool(&self, name: String, args: Value) -> BoxFuture<Result<Value, String>> {
-        if !self.allowed_tools.contains(&name) {
+        let Some(tool) = self.program_tools.get(&name).cloned() else {
             return Box::pin(async move {
                 Err(format!(
                     "program tool '{name}' is not in this run's callable catalog"
                 ))
             });
-        }
+        };
         if name == "bash" && args.get("background").and_then(Value::as_bool) == Some(true) {
             return Box::pin(async {
                 Err("program bash calls must stay foreground; background resources are controlled by the parent session".into())
             });
         }
-        let safe = super::is_concurrency_safe(&name, &args, &self.ctx.cfg.tool_sources);
+        let safe = match tool.source {
+            Some(_) => tool.readonly,
+            None => super::is_concurrency_safe(&name, &args, &[]),
+        };
+        let expected_source = tool.source;
         let id = format!("run_program-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         // Fresh per-call sink: execute_tool drops a source tool's structured
         // CallToolResult here, so the program receives the object rather than
@@ -521,7 +576,7 @@ impl HostBridge for CoreBridge {
             } else {
                 Box::new(gate.write_owned().await)
             };
-            let block = super::run_one(id, name, args, ctx).await;
+            let block = super::run_one(id, name, args, ctx, expected_source).await;
             let ContentBlock::ToolResult {
                 content, is_error, ..
             } = block

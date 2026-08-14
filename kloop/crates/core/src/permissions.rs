@@ -374,6 +374,20 @@ fn parse_rules(entries: &[String]) -> Result<Vec<Rule>> {
 struct ModeState {
     current: Mode,
     pre_plan: Mode,
+    capability_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PermissionCapabilityEpoch {
+    project: u64,
+    mode: u64,
+    workspace_session: u64,
+}
+
+fn advance_epoch(epoch: &mut u64, owner: &str) {
+    *epoch = epoch
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("{owner} capability epoch exhausted"));
 }
 
 pub struct GlobalPermissionPolicy {
@@ -397,9 +411,14 @@ impl GlobalPermissionPolicy {
     }
 }
 
+struct ProjectPolicyState {
+    snapshot: ProjectPolicySnapshot,
+    capability_epoch: u64,
+}
+
 pub struct ProjectPermissionPolicy {
     project_id: Option<crate::project::ProjectId>,
-    snapshot: RwLock<ProjectPolicySnapshot>,
+    state: RwLock<ProjectPolicyState>,
     writer: Option<Arc<dyn ProjectPermissionWriter>>,
 }
 
@@ -411,7 +430,10 @@ impl ProjectPermissionPolicy {
     ) -> Self {
         Self {
             project_id: Some(project_id),
-            snapshot: RwLock::new(snapshot),
+            state: RwLock::new(ProjectPolicyState {
+                snapshot,
+                capability_epoch: 0,
+            }),
             writer,
         }
     }
@@ -419,18 +441,25 @@ impl ProjectPermissionPolicy {
     pub fn unavailable() -> Self {
         Self {
             project_id: None,
-            snapshot: RwLock::new(ProjectPolicySnapshot::empty()),
+            state: RwLock::new(ProjectPolicyState {
+                snapshot: ProjectPolicySnapshot::empty(),
+                capability_epoch: 0,
+            }),
             writer: None,
         }
     }
 
     pub fn snapshot(&self) -> ProjectPolicySnapshot {
-        self.snapshot.read().unwrap().clone()
+        self.state.read().unwrap().snapshot.clone()
+    }
+
+    fn capability_epoch(&self) -> u64 {
+        self.state.read().unwrap().capability_epoch
     }
 
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
-        let snapshot = self.snapshot.read().unwrap();
-        allow_rules_match(snapshot.allow.parsed(), name, call)
+        let state = self.state.read().unwrap();
+        allow_rules_match(state.snapshot.allow.parsed(), name, call)
     }
 
     fn can_persist(&self) -> bool {
@@ -438,16 +467,23 @@ impl ProjectPermissionPolicy {
     }
 
     fn refresh_from_store(&self, snapshot: ProjectPolicySnapshot) {
-        let mut current = self.snapshot.write().unwrap();
+        let mut state = self.state.write().unwrap();
         // Store loads can race durable writes. Only a snapshot at least as new
         // as the live policy may refresh it; explicit invalidation is separate.
-        if snapshot.revision >= current.revision {
-            *current = snapshot;
+        if snapshot.revision < state.snapshot.revision || snapshot == state.snapshot {
+            return;
         }
+        state.snapshot = snapshot;
+        advance_epoch(&mut state.capability_epoch, "project policy");
     }
 
     fn invalidate_from_store(&self) {
-        *self.snapshot.write().unwrap() = ProjectPolicySnapshot::empty();
+        let mut state = self.state.write().unwrap();
+        state.snapshot = ProjectPolicySnapshot::empty();
+        // Invalidation is an event even when the durable revision falls back to
+        // zero or the visible rules were already empty. The monotonic epoch keeps
+        // an old deferred-tool receipt from surviving that ABA transition.
+        advance_epoch(&mut state.capability_epoch, "project policy");
     }
 
     async fn persist(
@@ -463,11 +499,15 @@ impl ProjectPermissionPolicy {
             .as_ref()
             .ok_or(ProjectPolicyStoreError::Unavailable)?;
         let published = writer.append_allow(project_id, additions).await?;
-        let mut current = self.snapshot.write().unwrap();
-        if published.revision < current.revision {
+        let mut state = self.state.write().unwrap();
+        if published.revision < state.snapshot.revision {
             return Err(ProjectPolicyStoreError::Invalid);
         }
-        *current = published.clone();
+        if published == state.snapshot {
+            return Ok(published);
+        }
+        state.snapshot = published.clone();
+        advance_epoch(&mut state.capability_epoch, "project policy");
         Ok(published)
     }
 }
@@ -510,9 +550,15 @@ impl ProjectPolicyRegistry {
     }
 }
 
+#[derive(Default)]
+struct WorkspacePermissionCache {
+    signatures: HashSet<String>,
+    capability_epoch: u64,
+}
+
 pub struct PermissionSession {
     mode: Mutex<ModeState>,
-    cache: Mutex<HashMap<crate::project::WorkspaceId, HashSet<String>>>,
+    cache: Mutex<HashMap<crate::project::WorkspaceId, WorkspacePermissionCache>>,
     approver: Option<Arc<dyn Approver>>,
 }
 
@@ -522,6 +568,7 @@ impl PermissionSession {
             mode: Mutex::new(ModeState {
                 current: mode,
                 pre_plan: Mode::Manual,
+                capability_epoch: 0,
             }),
             cache: Mutex::new(HashMap::new()),
             approver,
@@ -599,6 +646,23 @@ impl Permissions {
         &self.identity
     }
 
+    pub(crate) fn capability_epoch(&self) -> PermissionCapabilityEpoch {
+        let project = self.project.capability_epoch();
+        let mode = self.session.mode.lock().unwrap().capability_epoch;
+        let workspace_session = self
+            .session
+            .cache
+            .lock()
+            .unwrap()
+            .get(self.identity.workspace_id())
+            .map_or(0, |cache| cache.capability_epoch);
+        PermissionCapabilityEpoch {
+            project,
+            mode,
+            workspace_session,
+        }
+    }
+
     pub fn for_workspace(&self, identity: crate::project::WorkspaceIdentity) -> Self {
         Self {
             allow_everything: self.allow_everything,
@@ -619,10 +683,14 @@ impl Permissions {
     /// `exit_plan_mode` approval.
     pub fn set_mode(&self, mode: Mode) {
         let mut state = self.session.mode.lock().unwrap();
-        if mode == Mode::Plan && state.current != Mode::Plan {
+        if state.current == mode {
+            return;
+        }
+        if mode == Mode::Plan {
             state.pre_plan = state.current;
         }
         state.current = mode;
+        advance_epoch(&mut state.capability_epoch, "permission mode");
     }
 
     /// Enter plan mode as one session transition. Returns true only when the
@@ -635,6 +703,7 @@ impl Permissions {
         }
         state.pre_plan = state.current;
         state.current = Mode::Plan;
+        advance_epoch(&mut state.capability_epoch, "permission mode");
         true
     }
 
@@ -643,7 +712,11 @@ impl Permissions {
     fn exit_plan(&self) -> Mode {
         let mut state = self.session.mode.lock().unwrap();
         let restore = state.pre_plan;
+        if state.current == restore {
+            return restore;
+        }
         state.current = restore;
+        advance_epoch(&mut state.capability_epoch, "permission mode");
         restore
     }
 
@@ -840,7 +913,7 @@ impl Permissions {
                     remember
                         .signatures
                         .iter()
-                        .all(|signature| cache.contains(signature))
+                        .all(|signature| cache.signatures.contains(signature))
                 })
             {
                 return Ok(None);
@@ -908,13 +981,18 @@ impl Permissions {
                 let Some(remember) = remember else {
                     return Err(user_denial(name));
                 };
-                self.session
-                    .cache
-                    .lock()
-                    .unwrap()
+                let mut caches = self.session.cache.lock().unwrap();
+                let cache = caches
                     .entry(self.identity.workspace_id().clone())
-                    .or_default()
-                    .extend(remember.signatures);
+                    .or_default();
+                let before = cache.signatures.len();
+                cache.signatures.extend(remember.signatures);
+                if cache.signatures.len() != before {
+                    advance_epoch(
+                        &mut cache.capability_epoch,
+                        "workspace permission capability",
+                    );
+                }
                 Ok(None)
             }
             ApprovalScope::Project => {
@@ -2261,7 +2339,16 @@ mod tests {
         let approver =
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let before = p.capability_epoch();
         assert!(ok(&p, "bash", bash("git commit -m one")).await);
+        let after_grant = p.capability_epoch();
+        assert_eq!(
+            after_grant,
+            PermissionCapabilityEpoch {
+                workspace_session: before.workspace_session + 1,
+                ..before
+            }
+        );
         assert!(
             ok(&p, "bash", bash("git commit --amend")).await,
             "same two-word prefix cached"
@@ -2285,6 +2372,7 @@ mod tests {
             ProjectPolicySnapshot::empty(),
             Arc::clone(&writer),
         );
+        let initial_epoch = first.capability_epoch();
         let revision_one = ProjectPolicySnapshot {
             revision: 1,
             allow: ProjectAllowRules::parse(&["bash(cargo *)".to_string()]).unwrap(),
@@ -2296,6 +2384,7 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&first, &refreshed));
         assert_eq!(first.snapshot(), revision_one);
+        assert_eq!(first.capability_epoch(), initial_epoch + 1);
 
         let revision_two = ProjectPolicySnapshot {
             revision: 2,
@@ -2306,12 +2395,15 @@ mod tests {
             revision_two.clone(),
             Arc::clone(&writer),
         );
+        let revision_two_epoch = first.capability_epoch();
+        assert_eq!(revision_two_epoch, initial_epoch + 2);
         registry.get_or_insert(project_id.clone(), revision_one, Arc::clone(&writer));
         registry.get_or_insert(
             project_id.clone(),
             ProjectPolicySnapshot::empty(),
             Arc::clone(&writer),
         );
+        assert_eq!(first.capability_epoch(), revision_two_epoch);
         assert_eq!(
             first.snapshot(),
             revision_two,
@@ -2319,6 +2411,7 @@ mod tests {
         );
 
         registry.invalidate(&project_id);
+        assert_eq!(first.capability_epoch(), revision_two_epoch + 1);
         assert_eq!(
             first.snapshot(),
             ProjectPolicySnapshot::empty(),
@@ -2334,6 +2427,7 @@ mod tests {
         let worktree = base.for_workspace(crate::project::WorkspaceIdentity::ephemeral(
             PathBuf::from("/work/tree"),
         ));
+        let before = base.capability_epoch();
 
         assert!(ok(&worktree, "bash", bash("cargo build")).await);
         assert_eq!(
@@ -2341,6 +2435,7 @@ mod tests {
             &[vec!["bash(cargo build *)".to_string()]]
         );
         assert_eq!(base.project.snapshot().revision, 1);
+        assert_eq!(base.capability_epoch().project, before.project + 1);
         assert!(
             ok(&base, "bash", bash("cargo build --release")).await,
             "the base workspace sees a successfully published project rule"

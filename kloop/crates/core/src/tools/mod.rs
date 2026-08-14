@@ -43,6 +43,9 @@ mod worktree_tool;
 pub use background_executions::BackgroundExecutions;
 pub use background_executions::ExecutionStatus;
 pub use bash::BackgroundShells;
+pub(crate) use codemode::ProgramToolManifest;
+pub(crate) use codemode::capture_program_tool_manifest;
+pub use tool_search::DeferredToolUnlocks;
 // Slash-path prompt injections (`!cmd` / `@file`) for `/name` commands; the
 // dispatch layer (`crate::commands`) calls this before running the turn.
 pub(crate) use inject::expand_slash_injections;
@@ -127,6 +130,17 @@ impl SourceOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SourceCallBinding {
+    source_slot: usize,
+    generation: u64,
+}
+
+struct SourceDefinitionSnapshot {
+    definition: ToolDef,
+    binding: SourceCallBinding,
+}
+
 struct ToolExecution {
     result: Result<ToolResultContent>,
     file_state_update: Option<(
@@ -139,7 +153,7 @@ struct ToolExecution {
 struct PreparedExecution<'a> {
     read: Option<&'a fs::PreparedRead>,
     mutation: Option<&'a fs::PreparedMutation>,
-    source_generation: Option<u64>,
+    source: Option<SourceCallBinding>,
     local_send_committed: &'a AtomicBool,
 }
 
@@ -225,6 +239,9 @@ pub struct ToolCtx {
     /// sandbox, hooks) still applies — this is a discovery bypass, not a
     /// security one.
     pub from_program: bool,
+    /// Callable source owner/generation manifest captured with the provider
+    /// request that exposed run_program. None on non-provider/internal contexts.
+    pub(crate) program_tool_manifest: Option<Arc<ProgramToolManifest>>,
     /// Id of the parent session's line that this round's assistant message was
     /// recorded as (`{stem}#{seq}`), or None for an in-memory-only session. The
     /// run_agent stamps it as the spawned sub-agent's `subagent_of`
@@ -448,33 +465,51 @@ pub fn tool_merge_warnings(
     warnings
 }
 
-fn find_source<'a>(
+fn find_source_slot<'a>(
     sources: &'a [Arc<dyn ToolSource>],
     name: &str,
-) -> Option<&'a Arc<dyn ToolSource>> {
+) -> Option<(usize, &'a Arc<dyn ToolSource>)> {
     let mut reserved = reserved_builtin_names();
     reserve_surface_names(&mut reserved);
     if reserved.contains(name) {
         return None;
     }
-    // First source claiming the name wins, mirroring the merge order.
+    // First source claiming the name wins, mirroring the merge order. The slot
+    // is stable for a Config and binds a deferred receipt to that exact owner.
     sources
         .iter()
-        .find(|source| source.defs().iter().any(|def| def.name == name))
+        .enumerate()
+        .find(|(_, source)| source.defs().iter().any(|def| def.name == name))
 }
 
-pub(super) fn source_definition_snapshot(
-    sources: &[Arc<dyn ToolSource>],
+fn find_source<'a>(
+    sources: &'a [Arc<dyn ToolSource>],
     name: &str,
-) -> Option<(ToolDef, u64)> {
-    find_source(sources, name)?.definition_snapshot(name)
+) -> Option<&'a Arc<dyn ToolSource>> {
+    find_source_slot(sources, name).map(|(_, source)| source)
 }
 
-pub(super) fn source_definition_generation(
+fn source_definition_snapshot(
     sources: &[Arc<dyn ToolSource>],
     name: &str,
-) -> Option<u64> {
-    source_definition_snapshot(sources, name).map(|(_, generation)| generation)
+) -> Option<SourceDefinitionSnapshot> {
+    let (source_slot, source) = find_source_slot(sources, name)?;
+    let (definition, generation) = source.definition_snapshot(name)?;
+    Some(SourceDefinitionSnapshot {
+        definition,
+        binding: SourceCallBinding {
+            source_slot,
+            generation,
+        },
+    })
+}
+
+fn source_call_binding(sources: &[Arc<dyn ToolSource>], name: &str) -> Option<SourceCallBinding> {
+    let (source_slot, source) = find_source_slot(sources, name)?;
+    Some(SourceCallBinding {
+        source_slot,
+        generation: source.definition_generation(name),
+    })
 }
 
 /// The built-in tool defs (bash, file, search, and — at depth 0 — tasks plus
@@ -759,9 +794,10 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
         "read_file" | "read_offloaded" | "grep" | "glob" => true,
         // These inspect or signal resources already created by a gated call.
         "bash_output" | "stop_bash" => true,
-        // tool_search reads defs and grows the unlock set — monotonic,
-        // order-independent state, safe to batch.
-        "tool_search" => true,
+        // tool_search grows the capability store. Keep it as an ordering barrier
+        // so a following read-only deferred call deterministically observes the
+        // receipt while a preceding call deterministically remains locked.
+        "tool_search" => false,
         // skill only reads a skill file and returns its expanded body — pure,
         // no shared-state races (side effects come from tools the returned
         // instructions later prompt, gated individually).
@@ -820,6 +856,11 @@ pub async fn dispatch_tools(
     // judge the inner tool, never the wrapper.
     let tool_uses = normalize_tool_uses(tool_uses);
     let sources = &ctx.cfg.tool_sources;
+    let expected_program_source = |name: &str| {
+        ctx.from_program
+            .then(|| tool_search::current_source_binding(name, &ctx.cfg))
+            .flatten()
+    };
     let mut results = Vec::with_capacity(tool_uses.len());
     let mut i = 0;
     while i < tool_uses.len() {
@@ -835,7 +876,13 @@ pub async fn dispatch_tools(
             results.extend(batch.iter().map(|(id, _, _)| interrupted(id)));
         } else if safe {
             let futs = batch.iter().map(|(id, name, input)| {
-                run_one(id.clone(), name.clone(), input.clone(), ctx.clone())
+                run_one(
+                    id.clone(),
+                    name.clone(),
+                    input.clone(),
+                    ctx.clone(),
+                    expected_program_source(name),
+                )
             });
             results.extend(futures::future::join_all(futs).await);
         } else {
@@ -843,8 +890,16 @@ pub async fn dispatch_tools(
                 if ctx.cancel.is_cancelled() {
                     results.push(interrupted(id));
                 } else {
-                    results
-                        .push(run_one(id.clone(), name.clone(), input.clone(), ctx.clone()).await);
+                    results.push(
+                        run_one(
+                            id.clone(),
+                            name.clone(),
+                            input.clone(),
+                            ctx.clone(),
+                            expected_program_source(name),
+                        )
+                        .await,
+                    );
                 }
             }
         }
@@ -870,7 +925,13 @@ fn is_root_task_tool(name: &str) -> bool {
     )
 }
 
-async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> ContentBlock {
+async fn run_one(
+    id: String,
+    name: String,
+    input: Value,
+    ctx: ToolCtx,
+    expected_program_source: Option<SourceCallBinding>,
+) -> ContentBlock {
     let event_input = agent_message::event_input(&name, &input);
     ctx.ui.emit(&Event::ItemStarted {
         id: id.clone(),
@@ -930,20 +991,44 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
             );
         }
-        // Locked deferred tools bounce before hooks and permissions: the
-        // model skipped tool_search, and neither automation policy nor the
-        // human should be consulted about a call that cannot run. This is
-        // also the only rejection that does NOT unlock — unlocking flows
-        // exclusively through a tool_search hit. A program bypasses this gate:
-        // its `tools` object already exposes the tool, so it is loaded for the
-        // program (the top-level model still must tool_search to direct-call).
-        if !ctx.from_program && tool_search::locked(&name, &ctx.cfg) {
-            bail!(
-                "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
-            );
-        }
-        let expected_source_generation =
-            tool_search::unlocked_generation_for_dispatch(&name, &ctx.cfg);
+        // Freeze the workspace before validating a deferred capability. A stale
+        // call is a discovery error, so neither hooks nor the human permission
+        // gate should observe it. The same workspace snapshot is then used for
+        // prepare, permission, sandbox and execution.
+        let workspace = ctx.cfg.effective_workspace();
+        let (discovery_gated, expected_source) = if ctx.from_program {
+            let current_source = tool_search::current_source_binding(&name, &ctx.cfg);
+            if current_source != expected_program_source {
+                bail!(
+                    "tool '{name}' source changed after this Program API was generated; run the Program again from a fresh sampling round"
+                );
+            }
+            (false, expected_program_source)
+        } else {
+            let deferred_before = tool_search::is_deferred(&name, &ctx.cfg);
+            let source_before = tool_search::current_source_binding(&name, &ctx.cfg);
+            let deferred_after = tool_search::is_deferred(&name, &ctx.cfg);
+            let discovery_gated = deferred_before || deferred_after;
+            let expected_source = if discovery_gated {
+                let source =
+                    tool_search::unlocked_source_for_dispatch(&name, &ctx, &workspace).ok_or_else(
+                        || {
+                            anyhow!(
+                                "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
+                            )
+                        },
+                    )?;
+                if Some(source) != source_before {
+                    bail!(
+                        "tool '{name}' source changed while its deferred capability was classified; call tool_search with query \"select:{name}\" to load its definition again, then retry"
+                    );
+                }
+                Some(source)
+            } else {
+                source_before
+            };
+            (discovery_gated, expected_source)
+        };
         // pre_tool hooks run BEFORE the permission gate: hooks are automation
         // policy, permissions are the human's last word — a hook block means
         // there is nothing left to ask about.
@@ -961,7 +1046,13 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
                 ctx.hook_context.lock().unwrap().extend(context);
             }
         }
-        let workspace = ctx.cfg.effective_workspace();
+        if discovery_gated
+            && tool_search::unlocked_source_for_dispatch(&name, &ctx, &workspace) != expected_source
+        {
+            bail!(
+                "tool '{name}' capability changed while its pre-tool hook ran; call tool_search with query \"select:{name}\" to load its definition again, then retry"
+            );
+        }
         // Prepare mutations after pre-hooks but before permission. The gate sees
         // the canonical effective target, while the executor retains an open
         // parent directory handle across any approval wait.
@@ -1025,7 +1116,7 @@ async fn run_one(id: String, name: String, input: Value, ctx: ToolCtx) -> Conten
         let prepared = PreparedExecution {
             read: prepared_read.as_ref(),
             mutation: prepared_mutation.as_ref(),
-            source_generation: expected_source_generation,
+            source: expected_source,
             local_send_committed: &local_send_committed,
         };
         let execution = execute_tool(&name, &input, prepared, &ctx, &workspace).await;
@@ -1195,9 +1286,14 @@ fn execute_tool<'a>(
         // External source tools can also return images — handle them before the
         // text-returning built-ins so their result can be Text OR Blocks. A
         // program still gets the structured form via the sink.
-        if let Some(source) = find_source(&ctx.cfg.tool_sources, name) {
+        if let Some(binding) = prepared.source {
+            let Some(source) = ctx.cfg.tool_sources.get(binding.source_slot) else {
+                return ToolExecution::from_result(Err(anyhow!(
+                    "source binding for tool '{name}' is no longer registered"
+                )));
+            };
             return match source
-                .call_at_generation(name, input, prepared.source_generation)
+                .call_at_generation(name, input, Some(binding.generation))
                 .await
             {
                 Ok(out) => {
@@ -1235,7 +1331,7 @@ fn execute_tool<'a>(
             "task_list" => task::task_list_tool(input, ctx),
             "task_clear" => task::task_clear_tool(input, ctx),
             "skill" => skill::skill_tool(input, ctx, workspace).await,
-            "tool_search" => tool_search::tool_search_tool(input, ctx).await,
+            "tool_search" => tool_search::tool_search_tool(input, ctx, workspace).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
             "call_tool" => Err(anyhow!(
@@ -1428,6 +1524,7 @@ pub(crate) mod testutil {
             depth,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
         }
@@ -2989,6 +3086,7 @@ mod tests {
             depth: 0,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
+            program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
         };
