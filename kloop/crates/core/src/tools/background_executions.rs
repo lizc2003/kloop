@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
 use super::strict_str_arg;
+use crate::execution_provenance::DeliveryRoute;
+use crate::execution_provenance::ExecutionKind as ProvenanceExecutionKind;
+use crate::execution_provenance::ExecutionProvenanceReceipt;
+use crate::execution_provenance::ExecutionRegistration;
+use crate::execution_provenance::TerminalOwner;
 
 /// How many background executions may run at once. A loose cap to catch runaway
 /// fan-out. The parent collects results at step boundaries and may observe activity
@@ -43,11 +48,14 @@ pub(super) enum ExecutionKind {
 }
 
 impl ExecutionKind {
-    fn id_prefix(self) -> &'static str {
-        match self {
-            Self::Agent => "agent-",
-            Self::Program => "program-",
-            Self::Workflow => "workflow-",
+    fn from_receipt(receipt: &ExecutionProvenanceReceipt) -> Result<Self, String> {
+        match receipt.execution().kind() {
+            ProvenanceExecutionKind::Agent => Ok(Self::Agent),
+            ProvenanceExecutionKind::Program => Ok(Self::Program),
+            ProvenanceExecutionKind::Workflow => Ok(Self::Workflow),
+            ProvenanceExecutionKind::Shell => {
+                Err("background shells belong to BackgroundShells".into())
+            }
         }
     }
 
@@ -96,6 +104,92 @@ pub(super) fn execution_stop_hint(id: &str) -> Option<String> {
     })
 }
 
+#[cfg(test)]
+fn test_background_receipt(
+    kind: ExecutionKind,
+    id: &str,
+) -> Result<Arc<ExecutionProvenanceReceipt>, String> {
+    use crate::config::EffectiveWorkspace;
+    use crate::execution_provenance::AdmissionAuthority;
+    use crate::execution_provenance::AdmissionOrigin;
+    use crate::execution_provenance::AgentExecutionId;
+    use crate::execution_provenance::DurableExecutionId;
+    use crate::execution_provenance::MailboxRoute;
+    use crate::execution_provenance::ProgramExecutionId;
+    use crate::execution_provenance::ProgramRunId;
+    use crate::execution_provenance::ResolvedExecutionAdmission;
+    use crate::execution_provenance::TerminalRoute;
+    use crate::execution_provenance::TransientExecutionId;
+    use crate::execution_provenance::WorkflowExecutionId;
+    use crate::execution_provenance::WorkflowRunId;
+    use crate::execution_provenance::WorkspaceDisposition;
+    use crate::execution_provenance::WorkspaceProvenance;
+    use kloop_protocol::LocalAgentId;
+    use kloop_protocol::LocalContextId;
+
+    let context_id = LocalContextId::new("local-context-1").unwrap();
+    let (execution, durable, mailbox, origin) = match kind {
+        ExecutionKind::Agent => (
+            TransientExecutionId::Agent(
+                AgentExecutionId::parse(id).map_err(|error| format!("{error:#}"))?,
+            ),
+            None,
+            MailboxRoute::Agent {
+                context_id: context_id.clone(),
+                parent: LocalAgentId::Main,
+                child: id.parse()?,
+            },
+            AdmissionOrigin::RunAgent,
+        ),
+        ExecutionKind::Program => (
+            TransientExecutionId::Program(
+                ProgramExecutionId::parse(id).map_err(|error| format!("{error:#}"))?,
+            ),
+            Some(DurableExecutionId::Program(
+                ProgramRunId::parse("run-1-1").unwrap(),
+            )),
+            MailboxRoute::NotMailboxPeer,
+            AdmissionOrigin::Program,
+        ),
+        ExecutionKind::Workflow => (
+            TransientExecutionId::Workflow(
+                WorkflowExecutionId::parse(id).map_err(|error| format!("{error:#}"))?,
+            ),
+            Some(DurableExecutionId::Workflow(
+                WorkflowRunId::parse("wf_1-1").unwrap(),
+            )),
+            MailboxRoute::NotMailboxPeer,
+            AdmissionOrigin::Workflow,
+        ),
+    };
+    let workspace = EffectiveWorkspace {
+        identity: crate::project::WorkspaceIdentity::ephemeral(std::env::temp_dir()),
+        workspace_epoch: 0,
+        cwd: std::env::temp_dir(),
+        permissions: Arc::new(crate::permissions::Permissions::allow_all()),
+        file_state: Arc::default(),
+        sandbox: None,
+        system: String::new(),
+        branch: None,
+    };
+    ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
+        session_id: "",
+        parent: None,
+        execution,
+        durable,
+        mailbox,
+        authority: AdmissionAuthority::new(context_id, LocalAgentId::Main, 0),
+        parent_rollout_id: None,
+        workspace: WorkspaceProvenance::capture(&workspace, WorkspaceDisposition::Base),
+        origin,
+        terminal: TerminalRoute::new(
+            TerminalOwner::BackgroundExecutions,
+            DeliveryRoute::ParentInboxBody,
+        ),
+    })
+    .map_err(|error| format!("{error:#}"))
+}
+
 /// Terminal state of a background execution. `MaxRounds` only arises for a
 /// sub-agent; the rest are shared by all three producers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,8 +234,11 @@ impl ExecutionState {
     }
 }
 
+pub(super) type BackgroundExecutionRegistration = ExecutionRegistration;
+
 struct Entry {
     kind: ExecutionKind,
+    receipt: Arc<ExecutionProvenanceReceipt>,
     /// First line of the prompt/source, for reporting what is outstanding.
     description: String,
     state: ExecutionState,
@@ -183,23 +280,21 @@ impl BackgroundExecutions {
         Arc::default()
     }
 
-    /// Reserve a slot for a newly spawned execution. Duplicate ids, a mismatched
-    /// resource prefix, and a closing session fail instead of replacing a live
-    /// cancellation handle.
-    pub(super) fn register(
+    /// Reserve a slot for a newly admitted execution. Its typed receipt is the
+    /// canonical identity retained through stop and terminal publication.
+    pub(super) fn register_receipt(
         &self,
-        kind: ExecutionKind,
-        id: &str,
+        receipt: Arc<ExecutionProvenanceReceipt>,
         description: &str,
         cancel: CancellationToken,
-    ) -> Result<(), String> {
-        if !id.starts_with(kind.id_prefix()) {
-            return Err(format!(
-                "{} id must start with {} (got {id})",
-                kind.noun(),
-                kind.id_prefix()
-            ));
+    ) -> Result<BackgroundExecutionRegistration, String> {
+        let kind = ExecutionKind::from_receipt(&receipt)?;
+        if receipt.terminal().owner() != TerminalOwner::BackgroundExecutions
+            || receipt.terminal().delivery() != DeliveryRoute::ParentInboxBody
+        {
+            return Err("background execution receipt has the wrong terminal route".into());
         }
+        let id = receipt.execution().as_str();
         let mut registry = self.state.lock().unwrap();
         if registry.closed {
             return Err("the session is closing; no new background executions may start".into());
@@ -224,28 +319,81 @@ impl BackgroundExecutions {
             id.into(),
             Entry {
                 kind,
+                receipt: Arc::clone(&receipt),
                 description: description.into(),
                 state: ExecutionState::Running,
                 cancel,
                 abort: None,
             },
         );
-        Ok(())
+        Ok(ExecutionRegistration::new(receipt))
+    }
+
+    #[cfg(test)]
+    pub(super) fn register(
+        &self,
+        kind: ExecutionKind,
+        id: &str,
+        description: &str,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        self.register_receipt(test_background_receipt(kind, id)?, description, cancel)
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn test_registration(&self, id: &str) -> Option<BackgroundExecutionRegistration> {
+        let registry = self.state.lock().unwrap();
+        let entry = registry.executions.get(id)?;
+        Some(ExecutionRegistration::new(Arc::clone(&entry.receipt)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn attach_abort(&self, id: &str, abort: AbortHandle) {
+        let Some(registration) = self.test_registration(id) else {
+            abort.abort();
+            return;
+        };
+        self.attach_abort_registration(&registration, abort);
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish(
+        &self,
+        id: &str,
+        observed: ExecutionStatus,
+        publish: impl FnOnce(ExecutionStatus, bool),
+    ) -> Option<ExecutionStatus> {
+        let registration = self.test_registration(id)?;
+        self.finish_registration(&registration, observed, |_, status, deliver| {
+            publish(status, deliver);
+        })
     }
 
     /// Attach the worker after spawning it. Shutdown can race this step: an execution
     /// already marked for cancellation is aborted immediately instead of becoming
     /// an untracked detached worker.
-    pub(super) fn attach_abort(&self, id: &str, abort: AbortHandle) {
+    pub(super) fn attach_abort_registration(
+        &self,
+        registration: &BackgroundExecutionRegistration,
+        abort: AbortHandle,
+    ) {
+        let id = registration.id();
         let abort_now = {
             let mut registry = self.state.lock().unwrap();
             let closed = registry.closed;
             match registry.executions.get_mut(id) {
-                Some(entry) if entry.state == ExecutionState::Running && !closed => {
+                Some(entry)
+                    if registration.shares_receipt(&entry.receipt)
+                        && entry.state == ExecutionState::Running
+                        && !closed =>
+                {
                     entry.abort = Some(abort);
                     return;
                 }
-                Some(entry) if entry.state.is_active() => {
+                Some(entry)
+                    if registration.shares_receipt(&entry.receipt) && entry.state.is_active() =>
+                {
                     entry.abort = Some(abort.clone());
                     true
                 }
@@ -262,31 +410,36 @@ impl BackgroundExecutions {
     /// `Finishing` state. A waiter awakened by `publish` cannot observe zero
     /// running executions before the delivery exists. Returns the terminal state only
     /// for the caller that won the one-shot transition.
-    pub(super) fn finish(
+    pub(super) fn finish_registration(
         &self,
-        id: &str,
+        registration: &BackgroundExecutionRegistration,
         observed: ExecutionStatus,
-        publish: impl FnOnce(ExecutionStatus, bool),
+        publish: impl FnOnce(&ExecutionProvenanceReceipt, ExecutionStatus, bool),
     ) -> Option<ExecutionStatus> {
         debug_assert!(observed != ExecutionStatus::Running);
-        let (terminal, deliver) = {
+        let id = registration.id();
+        let (terminal, deliver, receipt) = {
             let mut registry = self.state.lock().unwrap();
             let entry = registry.executions.get_mut(id)?;
+            if !registration.shares_receipt(&entry.receipt) {
+                return None;
+            }
             let (terminal, deliver) = match entry.state {
                 ExecutionState::Running => (observed, true),
                 ExecutionState::CancelRequested => (ExecutionStatus::Aborted, false),
                 ExecutionState::Finishing(_) | ExecutionState::Terminal(_) => return None,
             };
             entry.state = ExecutionState::Finishing(terminal);
-            (terminal, deliver)
+            (terminal, deliver, Arc::clone(&entry.receipt))
         };
-        publish(terminal, deliver);
+        publish(&receipt, terminal, deliver);
         {
             let mut registry = self.state.lock().unwrap();
             let entry = registry
                 .executions
                 .get_mut(id)
                 .expect("finishing background execution disappeared");
+            debug_assert!(registration.shares_receipt(&entry.receipt));
             debug_assert_eq!(entry.state, ExecutionState::Finishing(terminal));
             entry.state = ExecutionState::Terminal(terminal);
         }
@@ -575,7 +728,7 @@ mod tests {
             .background_executions
             .register(
                 ExecutionKind::Agent,
-                "agent-timeout",
+                "agent-99",
                 "still running",
                 CancellationToken::new(),
             )
@@ -672,7 +825,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .unwrap_err();
-        assert!(mismatch.contains("program id must start with program-"));
+        assert!(mismatch.contains("Program execution id must use `program-N`"));
 
         for (kind, id, description) in [
             (ExecutionKind::Agent, "agent-1", "agent"),
@@ -777,7 +930,7 @@ mod tests {
             registry
                 .register(
                     ExecutionKind::Agent,
-                    &format!("agent-{i}"),
+                    &format!("agent-{}", i + 1),
                     "t",
                     CancellationToken::new(),
                 )
@@ -787,7 +940,7 @@ mod tests {
         let error = registry
             .register(
                 ExecutionKind::Agent,
-                "agent-over",
+                "agent-99",
                 "t",
                 CancellationToken::new(),
             )
@@ -818,20 +971,53 @@ mod tests {
     }
 
     #[test]
+    fn typed_registration_rejects_a_stale_receipt_handle() {
+        let registry = BackgroundExecutions::default();
+        let receipt = test_background_receipt(ExecutionKind::Agent, "agent-301").unwrap();
+        let registration = registry
+            .register_receipt(Arc::clone(&receipt), "typed", CancellationToken::new())
+            .unwrap();
+        let forged = ExecutionRegistration::new(
+            test_background_receipt(ExecutionKind::Agent, "agent-301").unwrap(),
+        );
+        assert!(
+            registry
+                .finish_registration(&forged, ExecutionStatus::Completed, |_, _, _| {})
+                .is_none()
+        );
+        assert_eq!(registry.status("agent-301"), Some(ExecutionStatus::Running));
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            registry.finish_registration(
+                &registration,
+                ExecutionStatus::Completed,
+                |registered, status, deliver| {
+                    assert!(std::ptr::eq(registered, receipt.as_ref()));
+                    assert_eq!(status, ExecutionStatus::Completed);
+                    assert!(deliver);
+                    published.fetch_add(1, Ordering::SeqCst);
+                },
+            ),
+            Some(ExecutionStatus::Completed)
+        );
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn finishing_frees_a_slot_once_delivery_exists() {
         let registry = BackgroundExecutions::default();
         for i in 0..MAX_BACKGROUND_EXECUTIONS {
             registry
                 .register(
                     ExecutionKind::Agent,
-                    &format!("agent-{i}"),
+                    &format!("agent-{}", i + 1),
                     "t",
                     CancellationToken::new(),
                 )
                 .unwrap();
         }
         let published = AtomicUsize::new(0);
-        registry.finish("agent-0", ExecutionStatus::Completed, |status, deliver| {
+        registry.finish("agent-1", ExecutionStatus::Completed, |status, deliver| {
             assert_eq!(status, ExecutionStatus::Completed);
             assert!(deliver);
             assert_eq!(
@@ -846,7 +1032,7 @@ mod tests {
         registry
             .register(
                 ExecutionKind::Agent,
-                "agent-new",
+                "agent-99",
                 "t",
                 CancellationToken::new(),
             )

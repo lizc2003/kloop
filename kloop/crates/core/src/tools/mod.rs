@@ -28,6 +28,7 @@ mod plan58_parity_tests;
 mod plan59_acceptance_tests;
 mod plan_mode;
 mod powershell;
+mod provenance_store;
 mod question;
 mod run_store;
 mod scheduler;
@@ -228,6 +229,9 @@ pub struct ToolCtx {
     pub ui: Arc<dyn Ui>,
     pub cancel: CancellationToken,
     pub depth: u8,
+    /// The execution enclosing this tool call. Root turns have none; admitted
+    /// Agent turns and Program/Workflow bridges replace it with their fixed ref.
+    pub(crate) enclosing_execution: Option<crate::execution_provenance::ExecutionRef>,
     /// stdout of allowing tool hooks, collected here because run_one has no
     /// history access; the agent loop drains it into history after the
     /// round's tool results are recorded.
@@ -1359,8 +1363,8 @@ fn execute_tool<'a>(
             "cron_delete" => scheduler::cron_delete_tool(input, ctx).await,
             "cron_list" => scheduler::cron_list_tool(input, ctx).await,
             "schedule_wakeup" => scheduler::schedule_wakeup_tool(input, ctx).await,
-            "run_program" => codemode::run_program_tool(input, ctx).await,
-            "workflow" => workflow::workflow_tool(input, ctx).await,
+            "run_program" => codemode::run_program_tool(input, ctx, workspace).await,
+            "workflow" => workflow::workflow_tool_in_workspace(input, ctx, workspace).await,
             // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
             other => Err(anyhow!("unknown tool: {other}")),
         };
@@ -1522,6 +1526,7 @@ pub(crate) mod testutil {
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,
+            enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
             program_tool_manifest: None,
@@ -3084,6 +3089,7 @@ mod tests {
             ui: Arc::new(NullUi),
             cancel,
             depth: 0,
+            enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
             program_tool_manifest: None,

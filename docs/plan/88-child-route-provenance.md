@@ -1,6 +1,6 @@
 # Plan 88 — CodeWhale 借鉴：child route identity/provenance
 
-> 状态：规划中
+> 状态：✅ 已完成（2026-08-15；提交 SHA 以本文件所在提交为准）
 >
 > 依赖：Plan 17、Plan 18、Plan 68、Plan 70、Plan 72、Plan 73、Plan 77、Plan 87；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 
@@ -52,3 +52,23 @@ provenance 回答“是谁、从哪里、属于哪个执行树”；Plan 87 回�
 ## 完成标准
 
 所有 child/background execution 都能在内部 receipt 中追溯 parent/child route 与 execution kind；mailbox、terminal、journal、native event 生命周期保持分离；resume/fork/worktree/Task ownership 不回归；不新增远程协议、second registry、public wire 字段或 child billing。
+
+## 实施结果（2026-08-15）
+
+- 新增 core-private `ExecutionProvenanceReceipt` v1 与唯一 mint/持久化校验 seam。session/thread 使用不同 domain 的 opaque SHA-256 ref；Agent/Program/Workflow/Shell transient ID 与 Program/Workflow durable ID 分型；parent 是 flat `ExecutionRef`；rollout、workspace disposition、admission authority、terminal/delivery owner 显式保存。非法 kind/mailbox/durable/origin/terminal 组合 fail closed，单份序列化 receipt 硬限 2 KiB。
+- `ToolCtx.enclosing_execution` 将真实 execution parent 传播进 admitted child；Agent 的 mailbox parent 仍是实际 local caller。普通/structured/Skill fork、foreground/background Agent 共用 admission seam，Program/Workflow bridge 分别覆盖为 container receipt ref；隔离 worktree 在 receipt mint 前冻结最终 workspace identity。
+- `BackgroundExecutions` 保留 Agent/Program/Workflow 现有 registry，并让 Entry 与 typed registration handle 持有同一 receipt；attach/finish 以 receipt identity fence，stop 命中后不再从字符串重建 provenance。`BackgroundShells` 继续独立，保存 Shell receipt/handle 并沿用 file-backed output 与 terminal arbitration。
+- 每次 Program（foreground/background/resume）和 Workflow（launch/resume）attempt 都分配 fresh transient ID，并与 durable `run-*`/`wf_*` 关联；持有 run lease 后从有效 sidecar 跳过已用 sequence，因此跨进程 resume 不复用该 run 的旧 attempt ID。RunDir 的受限读取支撑 private `provenance.json` v1：最多 32 attempts、单 receipt 2 KiB、整文件 128 KiB；valid history append-preserve，missing 从当前 attempt 开始，malformed/unknown/oversized/mismatched/cap/IO failure 不覆盖原文件也不阻断执行。background attempt 只在 registry admission 成功后记录，拒绝 launch 不制造审计历史。
+- Program/Workflow journal 新写格式直接升级为 v3。成功 live `agent()` 同时保存 validated child receipt；只有 v3 参与 replay，v1/v2/future safe miss且无迁移/双写。topology + complete input 仍是唯一 cache key；v3 receipt missing/malformed/oversized、非 Agent、或 parent durable run 不匹配时只使 historical evidence unavailable，完整 result 仍可 hit，坏 evidence 不再重写，cache hit 不伪装成 fresh admission。
+- receipt 不含 Task ID，不进入 `LiveAgentDirectory`、mailbox message、provider prompt/history、`Event`、Inbox framing、rollout schema、server wire、CLI/TUI/headless projection、Plan 87 capability receipt或 billing/usage ledger；Program/Workflow/Shell 明确不能声明 local mailbox peer，execution/run/rollout/workspace/worktree/Task identity 不互相 parse 或替代。
+
+## 验证记录（2026-08-15）
+
+- `cargo test -p kloop-core`：706 passed；journal v3 focused 8、Code mode 34、Workflow 13 tests 通过；
+- `cargo test -p kloop-server`：24 unit + 32 integration tests 通过；`cargo test -p kloop` 通过；
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：通过；
+- `cargo test --workspace --all-targets --all-features`：通过（2 项真实 provider credential tests ignored）；
+- `cargo fmt --all -- --check`、`git diff --check`：通过；
+- `cargo run --locked -p kloop -- --mock`、`--mock --headless`、`--mock --headless --json`：通过；
+- `.kloop/env.local` 的真实 Anthropic `claude-sonnet-4-6`：`real_agent_program_workflow_contract` 54.81s 通过，覆盖 foreground Agent、Program resume journal hit、background Agent/Program、Workflow、唯一 terminal/delivery；未记录或提交 key、endpoint、raw response 或 transcript；
+- 未执行 Linux sandbox/CI、Windows、物理终端与 Desktop E2E。

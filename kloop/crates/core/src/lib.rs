@@ -18,6 +18,7 @@ pub mod config;
 pub mod context;
 pub mod diff;
 pub mod event;
+mod execution_provenance;
 mod file_io;
 pub mod file_state;
 pub mod fs_complete;

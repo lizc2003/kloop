@@ -792,7 +792,7 @@ async fn stopped_background_program_does_not_reinject() {
 /// re-spawn would return the second; a journal hit returns the first (cached).
 #[tokio::test]
 async fn resume_replays_completed_agent_calls_from_the_journal() {
-    let run_id = format!("ktr-{}", std::process::id());
+    let run_id = format!("run-{}-101", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&jdir);
     std::fs::create_dir_all(&jdir).unwrap();
@@ -812,6 +812,25 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
     let (out1, e1) = run_tool("run_program", first_args, &ctx).await;
     assert!(!e1, "{out1}");
     assert_eq!(out1, "FIRST");
+    let sidecar: Value =
+        serde_json::from_slice(&std::fs::read(jdir.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(sidecar["version"], 1);
+    assert_eq!(sidecar["durable"], json!({"kind": "program", "id": run_id}));
+    let attempts = sidecar["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    let first_program_id = attempts[0]["execution"]["id"].as_str().unwrap().to_string();
+    assert_eq!(attempts[0]["execution"]["kind"], "program");
+    assert!(first_program_id.starts_with("program-"));
+    assert_eq!(attempts[0]["mailbox"]["kind"], "not_mailbox_peer");
+    let journal_line = std::fs::read_to_string(jdir.join("journal.jsonl")).unwrap();
+    let journal_entry: Value = serde_json::from_str(journal_line.trim()).unwrap();
+    assert_eq!(journal_entry["version"], 3);
+    assert_eq!(journal_entry["provenance"]["execution"]["kind"], "agent");
+    assert_eq!(
+        journal_entry["provenance"]["parent"]["execution"],
+        attempts[0]["execution"]
+    );
+    assert_eq!(journal_entry["provenance"]["mailbox"]["kind"], "agent");
 
     // Run 2 (same run_id + source, different display metadata): the agent() call
     // hits the journal — no re-spawn, so the second provider turn is never consumed.
@@ -830,12 +849,69 @@ async fn resume_replays_completed_agent_calls_from_the_journal() {
         out2, "FIRST",
         "resume replays the cached result, not a re-spawn"
     );
+    let resumed_sidecar: Value =
+        serde_json::from_slice(&std::fs::read(jdir.join("provenance.json")).unwrap()).unwrap();
+    let resumed_attempts = resumed_sidecar["attempts"].as_array().unwrap();
+    assert_eq!(resumed_attempts.len(), 2);
+    assert_eq!(resumed_attempts[0]["execution"]["id"], first_program_id);
+    assert_ne!(
+        resumed_attempts[1]["execution"]["id"],
+        resumed_attempts[0]["execution"]["id"]
+    );
+    assert!(
+        resumed_attempts
+            .iter()
+            .all(|attempt| { attempt["durable"] == json!({"kind": "program", "id": run_id}) })
+    );
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
 #[tokio::test]
+async fn rejected_background_program_does_not_record_an_attempt() {
+    let run_id = format!("run-{}-105", std::process::id());
+    let run_dir = std::env::temp_dir().join("program-runs").join(&run_id);
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let ctx = test_ctx(0, "rejected-background-program");
+    let source = "return 'done';";
+    seed_program_source(&ctx, &run_id, source);
+
+    let (first, first_error) = run_tool(
+        "run_program",
+        json!({"source": source, "resume_from_run_id": run_id}),
+        &ctx,
+    )
+    .await;
+    assert!(!first_error, "{first}");
+    let path = run_dir.join("provenance.json");
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        ctx.cfg
+            .background_executions
+            .shutdown(std::time::Duration::ZERO)
+            .await,
+        0
+    );
+
+    let (rejected, is_error) = run_tool(
+        "run_program",
+        json!({
+            "source": source,
+            "resume_from_run_id": run_id,
+            "background": true
+        }),
+        &ctx,
+    )
+    .await;
+    assert!(is_error, "{rejected}");
+    assert!(rejected.contains("session is closing"), "{rejected}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
 async fn resume_rejects_changed_source_before_spawning_an_agent() {
-    let run_id = format!("ktr-source-{}", std::process::id());
+    let run_id = format!("run-{}-102", std::process::id());
     let run_dir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -866,7 +942,7 @@ async fn resume_rejects_changed_source_before_spawning_an_agent() {
 
 #[tokio::test]
 async fn legacy_program_run_without_source_manifest_fails_closed() {
-    let run_id = format!("ktr-legacy-{}", std::process::id());
+    let run_id = format!("run-{}-103", std::process::id());
     let run_dir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -891,7 +967,7 @@ async fn legacy_program_run_without_source_manifest_fails_closed() {
 
 #[tokio::test]
 async fn concurrent_resume_of_one_program_run_is_rejected() {
-    let run_id = format!("ktrlock-{}", std::process::id());
+    let run_id = format!("run-{}-104", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&jdir);
     std::fs::create_dir_all(&jdir).unwrap();
@@ -934,7 +1010,7 @@ async fn concurrent_resume_of_one_program_run_is_rejected() {
 /// how to resume — so the model can skip the completed work on retry.
 #[tokio::test]
 async fn failure_after_agent_reports_a_resumable_run_id() {
-    let run_id = format!("ktrf-{}", std::process::id());
+    let run_id = format!("run-{}-105", std::process::id());
     let jdir = std::env::temp_dir().join("program-runs").join(&run_id);
     let _ = std::fs::remove_dir_all(&jdir);
     std::fs::create_dir_all(&jdir).unwrap();
@@ -1103,6 +1179,17 @@ fn run_program_def_renders_a_typescript_api() {
     assert!(!d.contains("run_program(args"), "{d}");
     assert!(!d.contains("background?: boolean"), "{d}");
     assert!(d.contains("Program cannot detach shell resources"), "{d}");
+    assert!(d.contains("Journal v3"), "{d}");
+    assert!(
+        d.contains("v1, v2, and future-version entries are safe cache misses"),
+        "{d}"
+    );
+    assert!(
+        def.schema["properties"]["resume_from_run_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("journal-v3")
+    );
 }
 
 #[test]

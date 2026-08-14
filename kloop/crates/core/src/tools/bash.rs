@@ -38,6 +38,18 @@ use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
+use crate::execution_provenance::AdmissionAuthority;
+use crate::execution_provenance::AdmissionOrigin;
+use crate::execution_provenance::BackgroundShellId;
+use crate::execution_provenance::DeliveryRoute;
+use crate::execution_provenance::ExecutionProvenanceReceipt;
+use crate::execution_provenance::ExecutionRegistration;
+use crate::execution_provenance::MailboxRoute;
+use crate::execution_provenance::ResolvedExecutionAdmission;
+use crate::execution_provenance::TerminalOwner;
+use crate::execution_provenance::TerminalRoute;
+use crate::execution_provenance::TransientExecutionId;
+use crate::execution_provenance::WorkspaceProvenance;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
 use crate::permissions::EscalationOutcome;
@@ -196,6 +208,7 @@ pub(super) async fn bash_tool(
             sandbox.as_deref(),
             bash,
             ctx,
+            workspace,
         );
     }
     if ctx.cancel.is_cancelled() {
@@ -553,7 +566,10 @@ struct BgSandbox {
     network_disabled: bool,
 }
 
+type BackgroundShellRegistration = ExecutionRegistration;
+
 struct BgShell {
+    receipt: Arc<ExecutionProvenanceReceipt>,
     command: String,
     output_path: PathBuf,
     status: BgStatus,
@@ -603,11 +619,32 @@ impl BackgroundShells {
         sandbox: Option<&SandboxPolicy>,
         bash: &ShellProgram,
         ctx: &ToolCtx,
+        workspace: &EffectiveWorkspace,
     ) -> Result<String> {
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
         let id = format!("bg-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
+        let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
+            session_id: &ctx.cfg.session_id,
+            parent: ctx.enclosing_execution.clone(),
+            execution: TransientExecutionId::Shell(BackgroundShellId::parse(&id)?),
+            durable: None,
+            mailbox: MailboxRoute::NotMailboxPeer,
+            authority: AdmissionAuthority::new(
+                ctx.cfg.local_agent.context_id(),
+                ctx.cfg.agent_id().clone(),
+                ctx.depth,
+            ),
+            parent_rollout_id: ctx.parent_rollout_id.as_deref(),
+            workspace: WorkspaceProvenance::capture_current(workspace),
+            origin: AdmissionOrigin::BackgroundShell,
+            terminal: TerminalRoute::new(
+                TerminalOwner::BackgroundShells,
+                DeliveryRoute::ShellOutputPointer,
+            ),
+        })?;
+        let registration = ExecutionRegistration::new(Arc::clone(&receipt));
         let path = offload_dir.join(format!("{id}.out"));
         let stdout = std::fs::File::create(&path)
             .with_context(|| format!("bash: cannot create {}", path.display()))?;
@@ -633,6 +670,7 @@ impl BackgroundShells {
             registry.shells.insert(
                 id.clone(),
                 BgShell {
+                    receipt,
                     command: command.to_string(),
                     output_path: path.clone(),
                     status: BgStatus::Running,
@@ -659,7 +697,7 @@ impl BackgroundShells {
         // long as any shell runs, so the synchronous Drop fallback could not fire.
         tokio::spawn(monitor(BackgroundMonitor {
             shells: Arc::downgrade(self),
-            id: id.clone(),
+            registration,
             command: command.to_string(),
             child,
             killer,
@@ -727,10 +765,17 @@ impl BackgroundShells {
     /// Claim the one terminal transition. A stop that linearized first overrides
     /// a concurrently observed natural exit. `Finishing` stays active until the
     /// frontend event and inbox delivery have both been published.
-    fn begin_finish(&self, id: &str, observed: BgStatus) -> Option<BgStatus> {
+    fn begin_finish(
+        &self,
+        registration: &BackgroundShellRegistration,
+        observed: BgStatus,
+    ) -> Option<BgStatus> {
         debug_assert!(!observed.is_active());
         let mut registry = self.state.lock().unwrap();
-        let shell = registry.shells.get_mut(id)?;
+        let shell = registry.shells.get_mut(registration.id())?;
+        if !registration.shares_receipt(&shell.receipt) {
+            return None;
+        }
         let terminal = match &shell.status {
             BgStatus::Running => observed,
             BgStatus::Stopping => BgStatus::Killed(
@@ -751,13 +796,19 @@ impl BackgroundShells {
         Some(terminal)
     }
 
-    fn complete_finish(&self, id: &str, status: BgStatus) -> bool {
+    fn complete_finish(
+        &self,
+        registration: &BackgroundShellRegistration,
+        status: BgStatus,
+    ) -> bool {
         let changed = {
             let mut registry = self.state.lock().unwrap();
-            let Some(shell) = registry.shells.get_mut(id) else {
+            let Some(shell) = registry.shells.get_mut(registration.id()) else {
                 return false;
             };
-            if !matches!(shell.status, BgStatus::Finishing) {
+            if !registration.shares_receipt(&shell.receipt)
+                || !matches!(shell.status, BgStatus::Finishing)
+            {
                 return false;
             }
             shell.status = status;
@@ -872,7 +923,7 @@ impl Drop for BackgroundShells {
 
 struct BackgroundMonitor {
     shells: Weak<BackgroundShells>,
-    id: String,
+    registration: BackgroundShellRegistration,
     command: String,
     child: ProcessTreeChild,
     killer: ProcessTreeKiller,
@@ -888,7 +939,7 @@ struct BackgroundMonitor {
 async fn monitor(monitor: BackgroundMonitor) {
     let BackgroundMonitor {
         shells,
-        id,
+        registration,
         command,
         mut child,
         killer,
@@ -897,6 +948,7 @@ async fn monitor(monitor: BackgroundMonitor) {
         ui,
         inbox,
     } = monitor;
+    let id = registration.id().to_string();
     let mut watchdog = tokio::time::interval(WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failure_reason: Option<String> = None;
@@ -939,7 +991,7 @@ async fn monitor(monitor: BackgroundMonitor) {
     // group-killed it and there is no live frontend to notify.
     let live_shells = shells.upgrade();
     if let Some(shells) = live_shells
-        && let Some(status) = shells.begin_finish(&id, observed)
+        && let Some(status) = shells.begin_finish(&registration, observed)
     {
         let (event_status, detail) = match &status {
             BgStatus::Exited(Some(0)) => (BackgroundTaskStatus::Completed, Some("exit 0".into())),
@@ -989,7 +1041,7 @@ async fn monitor(monitor: BackgroundMonitor) {
                 summary,
             });
         }
-        debug_assert!(shells.complete_finish(&id, status));
+        debug_assert!(shells.complete_finish(&registration, status));
     }
 }
 
@@ -1024,6 +1076,9 @@ mod tests {
     use super::FOREGROUND_OUTPUT_CAP_CHARS;
     use crate::event::BackgroundTaskStatus;
     use crate::event::Event;
+    use crate::execution_provenance::DeliveryRoute;
+    use crate::execution_provenance::MailboxRoute;
+    use crate::execution_provenance::TerminalOwner;
     use crate::inbox::InboxItem;
     use crate::tools::testutil::*;
     #[cfg(windows)]
@@ -1598,6 +1653,20 @@ Wait-Process -Id $grandchild.Id
         assert!(out.contains("Command running in background with ID: bg-"));
         assert!(out.contains("Output is being written to:"));
         let id = bg_id(&out);
+        let receipt = {
+            let registry = ctx.cfg.background_shells.state.lock().unwrap();
+            Arc::clone(&registry.shells.get(&id).unwrap().receipt)
+        };
+        assert_eq!(
+            receipt.execution().kind(),
+            crate::execution_provenance::ExecutionKind::Shell
+        );
+        assert!(matches!(receipt.mailbox(), MailboxRoute::NotMailboxPeer));
+        assert_eq!(receipt.terminal().owner(), TerminalOwner::BackgroundShells);
+        assert_eq!(
+            receipt.terminal().delivery(),
+            DeliveryRoute::ShellOutputPointer
+        );
 
         // block=true (default) waits for completion.
         let (out, is_error) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;

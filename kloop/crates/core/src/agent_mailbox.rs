@@ -65,6 +65,10 @@ impl LocalAgentContext {
         &self.current
     }
 
+    pub(crate) fn context_id(&self) -> LocalContextId {
+        self.directory.state.lock().unwrap().context_id.clone()
+    }
+
     pub fn parent_agent_id(&self) -> Option<&LocalAgentId> {
         self.parent.as_ref()
     }

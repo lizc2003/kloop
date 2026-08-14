@@ -67,6 +67,7 @@ pub(crate) async fn expand_slash_injections(
         ui: Arc::new(SilentUi),
         cancel: cancel.clone(),
         depth: 0,
+        enclosing_execution: None,
         hook_context: Arc::new(Mutex::new(Vec::new())),
         from_program: false,
         program_tool_manifest: None,

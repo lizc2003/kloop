@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::compact;
 use crate::config::Config;
 use crate::event::Event;
+use crate::execution_provenance::ExecutionRef;
 use crate::history::History;
 use crate::inbox::Inbox;
 use crate::tools::ToolCtx;
@@ -58,6 +59,7 @@ struct TurnOptions {
     structured_schema: Option<Value>,
 }
 
+#[cfg(test)]
 pub(crate) async fn run_structured_turn(
     cfg: &Arc<Config>,
     history: &mut History,
@@ -65,6 +67,31 @@ pub(crate) async fn run_structured_turn(
     cancel: &CancellationToken,
     depth: u8,
     schema: Value,
+) -> TurnOutcome {
+    run_structured_turn_in_context(cfg, history, ui, cancel, depth, schema, None).await
+}
+
+pub(crate) async fn run_structured_turn_in_execution(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    schema: Value,
+    execution: ExecutionRef,
+) -> TurnOutcome {
+    run_structured_turn_in_context(cfg, history, ui, cancel, depth, schema, Some(execution)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_structured_turn_in_context(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    schema: Value,
+    enclosing_execution: Option<ExecutionRef>,
 ) -> TurnOutcome {
     if let Err(error) = crate::structured_output::validate_schema(&schema) {
         return TurnOutcome {
@@ -83,6 +110,7 @@ pub(crate) async fn run_structured_turn(
         TurnOptions {
             structured_schema: Some(schema),
         },
+        enclosing_execution,
     )
     .await
 }
@@ -100,7 +128,36 @@ pub async fn run_turn(
     cancel: &CancellationToken,
     depth: u8,
 ) -> TurnOutcome {
-    run_turn_with_options(cfg, history, ui, cancel, depth, TurnOptions::default()).await
+    run_turn_with_options(
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        TurnOptions::default(),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_turn_in_execution(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    execution: ExecutionRef,
+) -> TurnOutcome {
+    run_turn_with_options(
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        TurnOptions::default(),
+        Some(execution),
+    )
+    .await
 }
 
 async fn run_turn_with_options(
@@ -110,6 +167,7 @@ async fn run_turn_with_options(
     cancel: &CancellationToken,
     depth: u8,
     options: TurnOptions,
+    enclosing_execution: Option<ExecutionRef>,
 ) -> TurnOutcome {
     // A sub-agent (typed local identity set) fires subagent_start/subagent_stop instead
     // of pre_turn/post_turn — the split both cc and codex converge on (a
@@ -143,7 +201,16 @@ async fn run_turn_with_options(
             }
         }
     }
-    let outcome = turn_rounds(cfg, history, ui, cancel, depth, &options).await;
+    let outcome = turn_rounds(
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        &options,
+        enclosing_execution.as_ref(),
+    )
+    .await;
     let stop_context = if agent.is_empty() {
         cfg.hooks.post_turn(&cfg.session_id, ui.as_ref()).await
     } else {
@@ -203,6 +270,7 @@ async fn turn_rounds(
     cancel: &CancellationToken,
     depth: u8,
     options: &TurnOptions,
+    enclosing_execution: Option<&ExecutionRef>,
 ) -> TurnOutcome {
     let build_tools = ||
      -> std::result::Result<
@@ -644,6 +712,7 @@ async fn turn_rounds(
             ui: ui.clone(),
             cancel: cancel.clone(),
             depth,
+            enclosing_execution: enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
             program_tool_manifest: Some(Arc::clone(&program_tool_manifest)),

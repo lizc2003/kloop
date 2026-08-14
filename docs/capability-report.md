@@ -1,6 +1,6 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-12,plan 1–59、61–66、68–79 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
+> 基线:2026-08-15,plan 1–59、61–66、68–88 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
 > parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
@@ -185,8 +185,9 @@ Named/nested workflow、token budget、remote execution 与 per-child provider e
 模型纪律的边界收进宿主。QuickJS raw `__*` bridge 在私有闭包捕获后删除，core 另以 Program 精确
 catalog 在 hook/permission/dispatch 前二次拒绝；source tool 也不能用控制面同名逃逸。Program 恢复
 原子保存并 byte-compare `source.js`/manifest，后台启动同时返回 transient `program-N` 与 durable
-`run-*`。journal v2 以 root/helper/branch/item/stage 拓扑 ID + 完整结构化 prompt/options 匹配，v1
-不猜测；并发 callback 必须用显式 scope，pipeline 保持 item-local/no-stage-barrier。Program/Workflow
+`run-*`。Plan 68 当时引入的 journal v2 以 root/helper/branch/item/stage 拓扑 ID + 完整结构化
+prompt/options 匹配；现行由 Plan 88 升级为 journal v3，仅 v3 replay，v1/v2/future safe miss且无迁移/
+双写；并发 callback 必须用显式 scope，pipeline 保持 item-local/no-stage-barrier。Program/Workflow
 live agents 默认 16 路、总量 1000、单 helper 4096；排队可取消，journal hit 不占 live slot。超大后台
 Agent/Program 成功结果复用 History offload，Workflow 继续 bounded summary + `result.json`。`phase`
 只投影进度，不是 checkpoint/exactly-once。plain 与 native server 的 inbox activity idle delivery 文档也
@@ -307,6 +308,7 @@ D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/t
 | 独立 stable-ID Task graph + TUI projection | CC/CodeWhale 有独立状态层 | **✅ Plan 71–73**：session stable-ID root-owned graph；**✅ Plan 74（2026-08-11）**：五工具、atomic rollover/clear fence 与 TUI live projection | 已完成 |
 | send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **✅ Plan 70（2026-08-10）**：同 session `main ↔ agent-N` 与 sibling，typed local identity、严格有界 FIFO、safe-boundary delivery、独立 lifecycle；A2A 1.0 aligned 但不是 A2A endpoint/support | 已完成 |
 | ListAgents / local live roster | CC exact bundle 有 descriptor/gate；远程/team profile 不权威 | **✅ Plan 70（2026-08-10）**：严格 `list_agents {}` 只列同 directory Open peers；不做 remote discovery、Agent Card 或团队持久态 | 已完成 |
+| child/background execution provenance | CodeWhale receipt 思路 + kloop 分型生命周期 | **✅ Plan 88（2026-08-15）**：core-private 2 KiB typed receipt 冻结 execution parent、Agent-only mailbox、transient/durable、rollout、workspace 与 terminal owner；现有 registries 持 receipt/typed handle；Program/Workflow bounded `provenance.json` 与 journal v3 保存审计 evidence，v1/v2 不兼容 replay，public wire/Task/billing 不变 | 已完成 |
 | Agent 并发上限 | exact 2.1.220 当前 profile 未测出统一 cap | 保留 kloop：同步批并发；后台 agent/program 每 session 8 | native 压测或失控实例证明需排队策略时 |
 | agent 类型 per-type effort/max_turns | cc 单家 | plan 17 片 2 未做节 | 有真实 agent 类型库再说 |
 

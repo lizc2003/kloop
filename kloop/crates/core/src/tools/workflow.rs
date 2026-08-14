@@ -15,7 +15,6 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
-use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
 use super::codemode::journal::Claim;
 use super::codemode::journal::Journal;
@@ -24,10 +23,25 @@ use super::run_store::RunId;
 use super::run_store::RunLease;
 use super::run_store::RunNamespace;
 use super::run_store::RunStore;
+use crate::config::EffectiveWorkspace;
 use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
 use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
+use crate::execution_provenance::AdmissionAuthority;
+use crate::execution_provenance::AdmissionOrigin;
+use crate::execution_provenance::DeliveryRoute;
+use crate::execution_provenance::DurableExecutionId;
+use crate::execution_provenance::ExecutionKind;
+use crate::execution_provenance::ExecutionProvenanceReceipt;
+use crate::execution_provenance::MailboxRoute;
+use crate::execution_provenance::ResolvedExecutionAdmission;
+use crate::execution_provenance::TerminalOwner;
+use crate::execution_provenance::TerminalRoute;
+use crate::execution_provenance::TransientExecutionId;
+use crate::execution_provenance::WorkflowExecutionId;
+use crate::execution_provenance::WorkflowRunId;
+use crate::execution_provenance::WorkspaceProvenance;
 use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
 use kloop_codemode::HostBridge;
@@ -35,7 +49,7 @@ use kloop_codemode::PreparedWorkflow;
 use kloop_protocol::ToolDef;
 
 const MAX_REINJECT_CHARS: usize = 8_000;
-static WORKFLOW_SEQ: AtomicUsize = AtomicUsize::new(1);
+static WORKFLOW_SEQ: AtomicU64 = AtomicU64::new(1);
 static WORKFLOW_RUN_SEQ: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Deserialize)]
@@ -60,7 +74,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and run_program for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v2 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered automatically later. Call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop only workflow-N with stop_workflow. Resume may edit the managed script; only calls whose stable ID and complete input still match are replayed best-effort. Structured agent schemas use the internal structured_output protocol.".into(),
+        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and run_program for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v3 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered automatically later. Call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop only workflow-N with stop_workflow. Resume may edit the managed script; journal v3 replays only calls whose stable ID and complete input still match, while v1, v2, and future-version entries are safe cache misses. Structured agent schemas use the internal structured_output protocol.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -91,7 +105,17 @@ pub(super) fn stop_workflow_def() -> ToolDef {
     }
 }
 
-pub(super) async fn workflow_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+#[cfg(test)]
+async fn workflow_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    let workspace = ctx.cfg.effective_workspace();
+    workflow_tool_in_workspace(input, ctx, &workspace).await
+}
+
+pub(super) async fn workflow_tool_in_workspace(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     if ctx.depth != 0 || !ctx.cfg.surface.workflow {
         bail!("workflow: only an enabled top-level session can launch workflows");
     }
@@ -147,12 +171,40 @@ pub(super) async fn workflow_tool(input: &Value, ctx: &ToolCtx) -> Result<String
         (run_id, run_dir, source, args)
     };
     let prepared = kloop_codemode::prepare_workflow(&source)?;
+    let run_id_text = run_id.as_str().to_string();
     let lease = run_dir
         .acquire()
         .context("workflow: run is already active")?;
+    let sequence = super::provenance_store::reserve_attempt_sequence(
+        &run_dir,
+        ExecutionKind::Workflow,
+        &WORKFLOW_SEQ,
+    )
+    .context("workflow: cannot allocate execution id")?;
+    let execution_id = format!("workflow-{sequence}");
+    let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
+        session_id: &ctx.cfg.session_id,
+        parent: ctx.enclosing_execution.clone(),
+        execution: TransientExecutionId::Workflow(WorkflowExecutionId::parse(&execution_id)?),
+        durable: Some(DurableExecutionId::Workflow(WorkflowRunId::parse(
+            &run_id_text,
+        )?)),
+        mailbox: MailboxRoute::NotMailboxPeer,
+        authority: AdmissionAuthority::new(
+            ctx.cfg.local_agent.context_id(),
+            ctx.cfg.agent_id().clone(),
+            ctx.depth,
+        ),
+        parent_rollout_id: ctx.parent_rollout_id.as_deref(),
+        workspace: WorkspaceProvenance::capture_current(workspace),
+        origin: AdmissionOrigin::Workflow,
+        terminal: TerminalRoute::new(
+            TerminalOwner::BackgroundExecutions,
+            DeliveryRoute::ParentInboxBody,
+        ),
+    })?;
     persist_inputs(&run_dir, &prepared, &source, &args)?;
-    let journal = Arc::new(Journal::open_run(run_dir.clone(), "journal.jsonl"));
-    launch_workflow(ctx, run_id, run_dir, lease, prepared, args, journal)
+    launch_workflow(ctx, run_dir, lease, prepared, args, execution_id, receipt)
 }
 
 fn read_managed_script(run_dir: &RunDir, supplied: &str) -> Result<String> {
@@ -199,44 +251,46 @@ fn new_run_id() -> String {
 
 fn launch_workflow(
     ctx: &ToolCtx,
-    run_id: RunId,
     run_dir: RunDir,
     lease: RunLease,
     prepared: PreparedWorkflow,
     args: Value,
-    journal: Arc<Journal>,
+    execution_id: String,
+    receipt: Arc<ExecutionProvenanceReceipt>,
 ) -> Result<String> {
     let output_script = run_dir.file_path("script.js")?;
-    let run_id_text = run_id.as_str().to_string();
-    let task_id = format!("workflow-{}", WORKFLOW_SEQ.fetch_add(1, Ordering::Relaxed));
+    let run_id_text = run_dir.id().as_str().to_string();
     let cancel = CancellationToken::new();
-    ctx.cfg
+    let registration = ctx
+        .cfg
         .background_executions
-        .register(
-            ExecutionKind::Workflow,
-            &task_id,
+        .register_receipt(
+            Arc::clone(&receipt),
             &prepared.meta.description,
             cancel.clone(),
         )
         .map_err(|error| anyhow!("workflow: {error}"))?;
+    super::provenance_store::record_attempt(&run_dir, &receipt);
+    let journal = Arc::new(Journal::open_run(run_dir.clone(), "journal.jsonl"));
     let ui = ctx.ui.clone();
     let background_executions = ctx.cfg.background_executions.clone();
     let parent_inbox = ctx.cfg.inbox.clone();
     let limits = ctx.cfg.program_limits;
     let mut workflow_ctx = ctx.clone();
     workflow_ctx.cancel = cancel.clone();
+    workflow_ctx.enclosing_execution = Some(receipt.as_execution_ref());
     let description = prepared.meta.description.clone();
     let bridge = Arc::new(WorkflowBridge::new(
         workflow_ctx,
         limits,
         journal,
-        task_id.clone(),
+        execution_id.clone(),
         run_id_text.clone(),
         description.clone(),
     ));
     emit_workflow(
         &ui,
-        &task_id,
+        &execution_id,
         &run_id_text,
         &description,
         ExecutionStatus::Running,
@@ -250,8 +304,8 @@ fn launch_workflow(
 
         kloop_codemode::run_workflow(&prepared, &args, bridge, worker_cancel, limits).await
     });
-    background_executions.attach_abort(&task_id, worker.abort_handle());
-    let task_id_for_supervisor = task_id.clone();
+    background_executions.attach_abort_registration(&registration, worker.abort_handle());
+    let execution_id_for_supervisor = registration.id().to_string();
     let supervisor_run_id = run_id_text.clone();
     let supervisor_description = description.clone();
     tokio::spawn(async move {
@@ -280,11 +334,17 @@ fn launch_workflow(
             ),
             Err(error) => persist_error(&run_dir, format!("workflow task panicked: {error}")),
         };
-        let terminal =
-            background_executions.finish(&task_id_for_supervisor, observed, |actual, deliver| {
+        let terminal = background_executions.finish_registration(
+            &registration,
+            observed,
+            |registered_receipt, actual, deliver| {
+                debug_assert_eq!(
+                    registered_receipt.execution().as_str(),
+                    execution_id_for_supervisor
+                );
                 if deliver && actual != ExecutionStatus::Aborted {
                     parent_inbox.push(InboxItem::WorkflowResult {
-                        task_id: task_id_for_supervisor.clone(),
+                        task_id: execution_id_for_supervisor.clone(),
                         run_id: supervisor_run_id.clone(),
                         summary: summary.clone(),
                         output_path: output_path.to_string_lossy().to_string(),
@@ -292,11 +352,12 @@ fn launch_workflow(
                 } else {
                     parent_inbox.notify_activity();
                 }
-            });
+            },
+        );
         if let Some(terminal) = terminal {
             emit_workflow(
                 &ui,
-                &task_id_for_supervisor,
+                &execution_id_for_supervisor,
                 &supervisor_run_id,
                 &supervisor_description,
                 terminal,
@@ -307,7 +368,7 @@ fn launch_workflow(
     });
 
     Ok(format!(
-        "Workflow launched in background. Workflow ID: {task_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nIts bounded result will be delivered automatically when it completes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_workflow {{\"workflow_id\": \"{task_id}\"}}.",
+        "Workflow launched in background. Workflow ID: {execution_id}\nSummary: {}\nScript file: {}\nRun ID: {}\nTo resume after editing the managed script, call workflow with script_path and resume_from_run_id.\n\nIts bounded result will be delivered automatically when it completes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_workflow {{\"workflow_id\": \"{execution_id}\"}}.",
         description,
         output_script.display(),
         run_id_text,
@@ -376,7 +437,7 @@ struct WorkflowBridge {
     max_agents: u64,
     agent_slots: Arc<tokio::sync::Semaphore>,
     journal: Arc<Journal>,
-    task_id: String,
+    workflow_id: String,
     run_id: String,
     description: String,
 }
@@ -386,7 +447,7 @@ impl WorkflowBridge {
         ctx: ToolCtx,
         limits: kloop_codemode::Limits,
         journal: Arc<Journal>,
-        task_id: String,
+        workflow_id: String,
         run_id: String,
         description: String,
     ) -> Self {
@@ -396,7 +457,7 @@ impl WorkflowBridge {
             max_agents: limits.max_agents,
             agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
             journal,
-            task_id,
+            workflow_id,
             run_id,
             description,
         }
@@ -446,19 +507,30 @@ impl HostBridge for WorkflowBridge {
             copy_option(&opts, &mut input, "isolation", "isolation");
             copy_option(&opts, &mut input, "model", "model");
             let workspace = ctx.cfg.effective_workspace();
-            let result = match schema {
-                Some(schema) => super::subagent::structured_agent(&input, schema, &ctx)
+            let admitted = match schema {
+                Some(schema) => {
+                    super::subagent::structured_agent_admitted(&input, schema, &ctx).await
+                }
+                None => super::subagent::run_agent_admitted(&input, &ctx, &workspace)
                     .await
-                    .map_err(|error| format!("{error:#}")),
-                None => super::subagent::run_agent_tool(&input, &ctx, &workspace)
-                    .await
-                    .map(Value::String)
-                    .map_err(|error| format!("{error:#}")),
+                    .map(|admitted| super::subagent::Admitted {
+                        value: Value::String(admitted.value),
+                        receipt: admitted.receipt,
+                    }),
             };
-            if let Ok(value) = &result {
-                journal.record(call_id, prompt, opts, value.clone());
+            match admitted {
+                Ok(admitted) => {
+                    journal.record(
+                        call_id,
+                        prompt,
+                        opts,
+                        admitted.value.clone(),
+                        &admitted.receipt,
+                    );
+                    Ok(admitted.value)
+                }
+                Err(error) => Err(format!("{error:#}")),
             }
-            result
         })
     }
 
@@ -469,7 +541,7 @@ impl HostBridge for WorkflowBridge {
     fn phase(&self, title: String) {
         emit_workflow(
             &self.ctx.ui,
-            &self.task_id,
+            &self.workflow_id,
             &self.run_id,
             &self.description,
             ExecutionStatus::Running,
@@ -560,6 +632,11 @@ mod tests {
         );
         assert!(def.schema["properties"].get("name").is_none());
         assert!(!def.description.contains("tools."));
+        assert!(def.description.contains("journal-v3"));
+        assert!(
+            def.description
+                .contains("v1, v2, and future-version entries are safe cache misses")
+        );
     }
 
     #[test]
@@ -699,6 +776,19 @@ mod tests {
         assert_eq!(manifest["meta"]["name"], "minimal");
         assert_eq!(manifest["meta"]["description"], "return marker");
         assert!(!manifest.to_string().contains("ignored top-level"));
+        let provenance: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("provenance.json")).unwrap())
+                .unwrap();
+        assert_eq!(provenance["version"], 1);
+        assert_eq!(
+            provenance["durable"],
+            json!({"kind": "workflow", "id": launched_run_id})
+        );
+        let attempts = provenance["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["execution"]["kind"], "workflow");
+        assert_eq!(attempts[0]["execution"]["id"], launched_task_id);
+        assert_eq!(attempts[0]["mailbox"]["kind"], "not_mailbox_peer");
 
         let events = ui.background();
         assert!(events.len() >= 3, "{events:?}");
@@ -724,6 +814,42 @@ mod tests {
             events.last().unwrap().status,
             BackgroundTaskStatus::Completed
         );
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[tokio::test]
+    async fn rejected_workflow_does_not_record_an_attempt() {
+        let ctx = enabled_ctx("rejected-workflow");
+        let script = "export const meta = { name: 'admission', description: 'admission fence' }; return 'done';";
+        let launched = workflow_tool(&json!({"script": script}), &ctx)
+            .await
+            .unwrap();
+        let run_id = launch_value(&launched, "Run ID: ").to_string();
+        let script_path = launch_value(&launched, "Script file: ").to_string();
+        wait_idle(&ctx).await;
+        ctx.cfg.inbox.drain();
+        let run_dir = std::path::Path::new(&script_path).parent().unwrap();
+        let provenance_path = run_dir.join("provenance.json");
+        let before = std::fs::read(&provenance_path).unwrap();
+        assert_eq!(
+            ctx.cfg
+                .background_executions
+                .shutdown(std::time::Duration::ZERO)
+                .await,
+            0
+        );
+
+        let error = workflow_tool(
+            &json!({"script": script, "resume_from_run_id": run_id}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("session is closing"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&provenance_path).unwrap(), before);
         let _ = std::fs::remove_dir_all(run_dir);
     }
 
@@ -1071,6 +1197,22 @@ mod tests {
             first.as_slice(),
             [InboxItem::WorkflowResult { summary, .. }] if summary.contains("\"got\":7")
         ));
+        let run_dir = std::path::Path::new(&script_path).parent().unwrap();
+        let first_sidecar: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("provenance.json")).unwrap())
+                .unwrap();
+        let first_workflow_id = first_sidecar["attempts"][0]["execution"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let journal_line = std::fs::read_to_string(run_dir.join("journal.jsonl")).unwrap();
+        let journal_entry: Value = serde_json::from_str(journal_line.trim()).unwrap();
+        assert_eq!(journal_entry["provenance"]["execution"]["kind"], "agent");
+        assert_eq!(
+            journal_entry["provenance"]["parent"]["execution"]["id"],
+            first_workflow_id
+        );
+        assert_eq!(journal_entry["provenance"]["mailbox"]["kind"], "agent");
 
         let (provider, hit_seen) = kloop_provider::Provider::mock_recording(Vec::new());
         let mut cfg = ctx.cfg.test_clone();
@@ -1095,6 +1237,16 @@ mod tests {
             hit.as_slice(),
             [InboxItem::WorkflowResult { summary, .. }] if summary.contains("\"got\":7")
         ));
+        let resumed_sidecar: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("provenance.json")).unwrap())
+                .unwrap();
+        let resumed_attempts = resumed_sidecar["attempts"].as_array().unwrap();
+        assert_eq!(resumed_attempts.len(), 2);
+        assert_eq!(resumed_attempts[0]["execution"]["id"], first_workflow_id);
+        assert_ne!(
+            resumed_attempts[1]["execution"]["id"],
+            resumed_attempts[0]["execution"]["id"]
+        );
 
         let error = workflow_tool(
             &json!({

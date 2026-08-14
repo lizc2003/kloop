@@ -1896,21 +1896,32 @@ cell/observation-frontier machinery (incremental pull-based output streamed to
 the model between `yield`s) — kloop is push-based on completion and `log()`
 already streams progress to the user live.
 
-**Journal resume v2**: every new Program run atomically persists the original
+**Journal resume v3**: every new Program run atomically persists the original
 `source.js` and a versioned manifest before any worker starts. Resume first
 validates the Program namespace/run ID and requires byte-identical source; a
-changed source or a legacy run without the source contract fails before opening
-the journal or spawning an agent. Each completed `agent()` is stored as a
+changed source or a run without the source contract fails before opening the
+journal or spawning an agent. Each completed live `agent()` is stored as a
 structured record containing its topology call ID, complete prompt/options JSON,
-and result in `.kloop/program-runs/<run-id>/journal.jsonl`. Top-level calls use a
-root ordinal; scoped helper calls include helper/branch/item/stage and local
-ordinal. A hit requires both identity and complete input, so opposite future
-completion orders and repeated prompts cannot cross-wire results. Version-1
-sequence/string entries are not guessed: Program rejects their missing source
-contract, while Workflow treats them as safe cache misses. Only successful
-`agent()` calls are journaled. Replay is best-effort memoization of that model
-call — it does not make generated text deterministic, prove unchanged workspace
-state, or provide exactly-once semantics for external side effects.
+result, and its validated private child-execution receipt in
+`.kloop/program-runs/<run-id>/journal.jsonl`. Top-level calls use a root ordinal;
+scoped helper calls include helper/branch/item/stage and local ordinal. A hit
+requires both identity and complete input, so opposite future completion orders
+and repeated prompts cannot cross-wire results. Journal v1/v2 and future-version
+entries are safe cache misses; there is no migration or dual-write path. A
+missing or invalid receipt on an otherwise valid v3 result remains unavailable
+audit evidence rather than becoming a cache key or execution checkpoint. Only
+successful `agent()` calls are journaled. Replay is best-effort memoization of
+that model call — it does not make generated text deterministic, prove unchanged
+workspace state, or provide exactly-once semantics for external side effects.
+
+Each Program attempt, including foreground and resume, also gets a fresh private
+`program-N` linked to its durable `run-*` in bounded
+`.kloop/program-runs/<run-id>/provenance.json`. The append-preserved v1 sidecar
+stores at most 32 validated 2 KiB receipts in a 128 KiB file. It is private audit
+metadata: no prompt, command, raw path, endpoint, credential, provider/model,
+billing field, Event, Inbox body, or server wire field is stored there. Missing
+metadata starts with the current attempt; malformed/unknown/oversized history is
+left untouched and cannot block execution or authorize/infer a route.
 
 **Not done** (deferred, with reason): a token `budget` primitive — cc's
 `budget.total` ships as a hardcoded `null` placeholder (its hard cap never
@@ -1958,12 +1969,20 @@ per-item/no-stage-barrier. `phase()` updates display-only background detail and
 exactly-once boundary, and neither changes the return value.
 
 Each run is stored under `.kloop/workflow-runs/<run-id>/`; a versioned
-manifest governs its managed script, args, journal, and terminal result/error.
-A later call with `resume_from_run_id` may use an edited managed script: journal
-v2 reuses only `agent()` results whose topology ID and complete structured input
-still match, including native JSON objects/arrays; moved or changed calls run
-live, and v1 entries are safe cache misses. This remains best-effort model-call
-memoization rather than workspace validation or exactly-once side effects.
+manifest governs its managed script, args, journal, terminal result/error, and
+private bounded `provenance.json` attempt history. Every launch/resume receives a
+fresh `workflow-N` while retaining the same durable `wf_*`; the Workflow itself
+is explicitly not a local mailbox peer. A later call with `resume_from_run_id`
+may use an edited managed script: journal v3 reuses only `agent()` results whose
+topology ID and complete structured input still match, including native JSON
+objects/arrays; moved or changed calls run live, and v1, v2, and future-version
+entries are safe cache misses with no migration or dual write. A missing or
+invalid receipt in an otherwise complete v3 result means only that historical
+audit evidence is unavailable; it does not invalidate the cache result or infer
+a live route. The sidecar follows the same 32-attempt/2 KiB-per-receipt/128 KiB
+bounds and preserve-on-invalid policy as Program. Both remain best-effort model-
+call memoization/audit evidence rather than workspace validation, authorization,
+or exactly-once side effects.
 `script_path` is accepted only when it resolves to that run's managed script;
 arbitrary workspace paths, separators, traversal, and symlink escapes are
 rejected. On Unix, namespace/run directories and artifact read/write/rename/
@@ -2024,6 +2043,19 @@ resource-ID field, and a non-boolean `background` never falls back to foreground
 execution. This keeps agent results, code-mode results, Workflow artifacts, and
 shell output files from collapsing into a misleading universal task handle.
 
+Internally, every admitted Agent, Program attempt, Workflow attempt, and
+background shell mints one immutable, validated execution-provenance receipt.
+Its typed transient/durable identities, flat enclosing-execution reference,
+Agent-only mailbox route, rollout references, workspace disposition, admission
+authority, and terminal/delivery owner are frozen before registration or spawn.
+Session/thread are domain-separated opaque references even though both currently
+originate from the session ID. Program, Workflow, and Shell receipts cannot claim
+mailbox membership; execution, durable run, worktree ownership, rollout, and
+root Task identities are never parsed into one another. Receipts are core-private
+and bounded to 2 KiB: Events, tool results, provider history, Inbox framing,
+native/server wire, CLI/TUI/headless projections, Task ownership, and usage
+accounting keep their existing shapes.
+
 Mechanism: the detached sub-agent (its own tokio task, on its **own** cancel
 token so a finished parent turn never kills it) reinjects its result into the
 parent's `Config.inbox` — the same step-boundary queue as steering — as a framed
@@ -2037,16 +2069,19 @@ re-dispatch guidance; an **interrupted sub-agent reinjects nothing** (codex's
 `is_final` — its partial output is noise, and cc diverges here by delivering a
 `killed` partial). A `BackgroundExecutions`
 registry (`core/src/tools/background_executions.rs`) tracks detached agents,
-programs, and Workflows with their resource kind, enforces one shared concurrency
-cap (8), and reaps on session end. It remains separate from the background-shell
-registry because shell output is file-backed. It retains Plan 51's atomic
-stop-vs-completion arbitration and a supervisor around each worker, so
-panic/forced abort still publishes exactly one terminal state. Both
-registries project through the same session-scoped `BackgroundTaskUpdated`
-event; this shared DTO is the compatibility seam, not a forced internal merge.
-Agent, Program, and Workflow completion messages retain typed provenance as
-`[Agent agent-N]`, `[Program program-N] run run-*`, and
-`[Workflow workflow-N] run wf_*`; only the result body is eligible for offload.
+programs, and Workflows with the admission receipt itself, enforces one shared
+concurrency cap (8), and reaps on session end. Its typed registration handle
+fences attach/finish against the exact stored receipt, while stop input is parsed
+only to locate the entry and provide wrong-tool diagnostics. It remains separate
+from the background-shell registry because shell output is file-backed; that
+registry stores its own typed shell receipt/registration. Both retain Plan 51's
+atomic stop-vs-completion arbitration, so panic/forced abort still publishes
+exactly one terminal state. Both registries project through the same session-
+scoped `BackgroundTaskUpdated` event; this shared DTO is the compatibility seam,
+not a forced internal merge. Agent, Program, and Workflow completion messages
+retain their canonical typed IDs as `[Agent agent-N]`, `[Program program-N] run
+run-*`, and `[Workflow workflow-N] run wf_*`; the private receipt is never placed
+in the message, and only the result body is eligible for offload.
 
 The TUI renders this event as a session-owned lifecycle row, not as a turn-owned
 sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the

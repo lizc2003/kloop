@@ -27,13 +27,28 @@ use tokio_util::sync::CancellationToken;
 
 use super::SourceCallBinding;
 use super::ToolCtx;
-use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
+use super::run_store::RunDir;
 use super::run_store::RunId;
 use super::run_store::RunLease;
 use super::run_store::RunNamespace;
 use super::run_store::RunStore;
+use crate::config::EffectiveWorkspace;
 use crate::event::BackgroundTaskKind;
+use crate::execution_provenance::AdmissionAuthority;
+use crate::execution_provenance::AdmissionOrigin;
+use crate::execution_provenance::DeliveryRoute;
+use crate::execution_provenance::DurableExecutionId;
+use crate::execution_provenance::ExecutionKind;
+use crate::execution_provenance::ExecutionProvenanceReceipt;
+use crate::execution_provenance::MailboxRoute;
+use crate::execution_provenance::ProgramExecutionId;
+use crate::execution_provenance::ProgramRunId;
+use crate::execution_provenance::ResolvedExecutionAdmission;
+use crate::execution_provenance::TerminalOwner;
+use crate::execution_provenance::TerminalRoute;
+use crate::execution_provenance::TransientExecutionId;
+use crate::execution_provenance::WorkspaceProvenance;
 use crate::inbox::InboxItem;
 use kloop_codemode::BoxFuture;
 use kloop_codemode::HostBridge;
@@ -47,7 +62,7 @@ const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 
 /// Process-global so parallel background spawns never collide on a label — same
 /// reasoning as the offload/agent counters.
-static PROGRAM_SEQ: AtomicUsize = AtomicUsize::new(1);
+static PROGRAM_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,7 +181,11 @@ fn program_tool_names(
     capture_program_tool_manifest(sources, shell_programs).names()
 }
 
-pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+pub(super) async fn run_program_tool(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
     let parsed: RunProgramInput =
         serde_json::from_value(input.clone()).context("run_program: invalid input")?;
     let explicit_description = super::optional_display_description(input, "run_program")?;
@@ -214,14 +233,47 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             (id, run)
         }
     };
-    let run_id = run_id.as_str().to_string();
+    let run_id_text = run_id.as_str().to_string();
     let lease = run_dir
         .acquire()
         .map_err(|error| anyhow!("run_program: run is already active: {error:#}"))?;
-    let journal = Arc::new(Journal::open_run(run_dir, "journal.jsonl"));
-
-    // Fire-and-forget: spawn detached, return a program id now, reinject the
-    // return value at the next round boundary (reuses the plan-26 async path).
+    let sequence = super::provenance_store::reserve_attempt_sequence(
+        &run_dir,
+        ExecutionKind::Program,
+        &PROGRAM_SEQ,
+    )
+    .map_err(|error| anyhow!("run_program: cannot allocate execution id: {error:#}"))?;
+    let label = format!("program-{sequence}");
+    let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
+        session_id: &ctx.cfg.session_id,
+        parent: ctx.enclosing_execution.clone(),
+        execution: TransientExecutionId::Program(ProgramExecutionId::parse(&label)?),
+        durable: Some(DurableExecutionId::Program(ProgramRunId::parse(
+            &run_id_text,
+        )?)),
+        mailbox: MailboxRoute::NotMailboxPeer,
+        authority: AdmissionAuthority::new(
+            ctx.cfg.local_agent.context_id(),
+            ctx.cfg.agent_id().clone(),
+            ctx.depth,
+        ),
+        parent_rollout_id: ctx.parent_rollout_id.as_deref(),
+        workspace: WorkspaceProvenance::capture_current(workspace),
+        origin: AdmissionOrigin::Program,
+        terminal: if background {
+            TerminalRoute::new(
+                TerminalOwner::BackgroundExecutions,
+                DeliveryRoute::ParentInboxBody,
+            )
+        } else {
+            TerminalRoute::new(
+                TerminalOwner::ForegroundCaller,
+                DeliveryRoute::DirectToolResult,
+            )
+        },
+    })?;
+    // Fire-and-forget: registration is the admission boundary. Do not persist an
+    // attempt that the shared background registry rejects.
     if background {
         return spawn_background_program(
             ctx,
@@ -229,15 +281,21 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
             names,
             program_tool_manifest,
             limits,
-            run_id,
+            label,
+            run_id_text,
             description,
-            journal,
+            run_dir,
             lease,
+            receipt,
         );
     }
+    super::provenance_store::record_attempt(&run_dir, &receipt);
+    let journal = Arc::new(Journal::open_run(run_dir, "journal.jsonl"));
     let _lease = lease;
+    let mut program_ctx = ctx.clone();
+    program_ctx.enclosing_execution = Some(receipt.as_execution_ref());
     let bridge = Arc::new(CoreBridge::new(
-        ctx.clone(),
+        program_ctx,
         limits,
         Some(journal.clone()),
         program_tool_manifest,
@@ -249,7 +307,7 @@ pub(super) async fn run_program_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         kloop_codemode::run_program(&source, &names, bridge, ctx.cancel.clone(), limits).await;
     match outcome {
         Ok(out) => Ok(program_output(out)),
-        Err(e) => Err(resume_hint(e, &journal, &run_id)),
+        Err(e) => Err(resume_hint(e, &journal, &run_id_text)),
     }
 }
 
@@ -354,22 +412,21 @@ fn spawn_background_program(
     names: Vec<String>,
     program_tool_manifest: Arc<ProgramToolManifest>,
     limits: kloop_codemode::Limits,
+    label: String,
     run_id: String,
     description: String,
-    journal: Arc<Journal>,
+    run_dir: RunDir,
     lease: RunLease,
+    receipt: Arc<ExecutionProvenanceReceipt>,
 ) -> Result<String> {
-    let label = format!("program-{}", PROGRAM_SEQ.fetch_add(1, Ordering::Relaxed));
     let own_cancel = CancellationToken::new();
-    ctx.cfg
+    let registration = ctx
+        .cfg
         .background_executions
-        .register(
-            ExecutionKind::Program,
-            &label,
-            &description,
-            own_cancel.clone(),
-        )
+        .register_receipt(Arc::clone(&receipt), &description, own_cancel.clone())
         .map_err(|msg| anyhow!("run_program: {msg}"))?;
+    super::provenance_store::record_attempt(&run_dir, &receipt);
+    let journal = Arc::new(Journal::open_run(run_dir, "journal.jsonl"));
     let parent_inbox = ctx.cfg.inbox.clone();
     let background_executions = ctx.cfg.background_executions.clone();
     let ui = ctx.ui.clone();
@@ -377,6 +434,7 @@ fn spawn_background_program(
     // turn's — the parent may end while the program is still going.
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
+    bg_ctx.enclosing_execution = Some(receipt.as_execution_ref());
     let bridge = Arc::new(CoreBridge::new(
         bg_ctx,
         limits,
@@ -399,10 +457,10 @@ fn spawn_background_program(
 
         kloop_codemode::run_program(&source, &names, bridge, worker_cancel, limits).await
     });
-    background_executions.attach_abort(&label, worker.abort_handle());
+    background_executions.attach_abort_registration(&registration, worker.abort_handle());
     let supervisor_run_id = run_id.clone();
     tokio::spawn({
-        let label = label.clone();
+        let label = registration.id().to_string();
         let ui = ui.clone();
         let description = description.clone();
         async move {
@@ -416,22 +474,27 @@ fn spawn_background_program(
                     )),
                 ),
             };
-            let terminal = background_executions.finish(&label, status, |actual, deliver| {
-                if deliver {
-                    if let Some(summary) = reinject {
-                        parent_inbox.push(InboxItem::ProgramResult {
-                            label: label.clone(),
-                            run_id: supervisor_run_id.clone(),
-                            summary,
-                        });
+            let terminal = background_executions.finish_registration(
+                &registration,
+                status,
+                |registered_receipt, actual, deliver| {
+                    debug_assert_eq!(registered_receipt.execution().as_str(), label);
+                    if deliver {
+                        if let Some(summary) = reinject {
+                            parent_inbox.push(InboxItem::ProgramResult {
+                                label: label.clone(),
+                                run_id: supervisor_run_id.clone(),
+                                summary,
+                            });
+                        } else {
+                            parent_inbox.notify_activity();
+                        }
                     } else {
+                        debug_assert_eq!(actual, ExecutionStatus::Aborted);
                         parent_inbox.notify_activity();
                     }
-                } else {
-                    debug_assert_eq!(actual, ExecutionStatus::Aborted);
-                    parent_inbox.notify_activity();
-                }
-            });
+                },
+            );
             if let Some(terminal) = terminal {
                 super::subagent::emit_background_task(
                     &ui,
@@ -646,15 +709,16 @@ impl HostBridge for CoreBridge {
                 }
             }
             let workspace = ctx.cfg.effective_workspace();
-            let result = super::subagent::run_agent_tool(&agent_input, &ctx, &workspace)
-                .await
-                .map(Value::String)
-                .map_err(|e| format!("{e:#}"));
-            // Record only a successful live call so a resume can skip it.
-            if let (Ok(out), Some(journal)) = (&result, &journal) {
-                journal.record(call_id, prompt, opts, out.clone());
+            match super::subagent::run_agent_admitted(&agent_input, &ctx, &workspace).await {
+                Ok(admitted) => {
+                    let output = Value::String(admitted.value);
+                    if let Some(journal) = &journal {
+                        journal.record(call_id, prompt, opts, output.clone(), &admitted.receipt);
+                    }
+                    Ok(output)
+                }
+                Err(error) => Err(format!("{error:#}")),
             }
-            result
         })
     }
 
@@ -767,9 +831,10 @@ later message. Call `wait_for_activity` once only when you truly need to block f
 never use it as a status/output polling loop. Stop only the program-N ID with `stop_program`. Use \
 this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
 If a program fails after successful agent calls, call run_program again with the byte-identical \
-source and its run-* `resume_from_run_id`. Journal v2 reuses only calls whose stable topology ID \
-and complete structured input match. This is best-effort model-call memoization, not deterministic \
-agent text, workspace-state validation, or exactly-once external side effects.\n\n\
+source and its run-* `resume_from_run_id`. Journal v3 reuses only calls whose stable topology ID \
+and complete structured input match; v1, v2, and future-version entries are safe cache misses. \
+This is best-effort model-call memoization, not deterministic agent text, workspace-state validation, \
+or exactly-once external side effects.\n\n\
 Available API (TypeScript):\n```ts\n{decls}```"
     );
 
@@ -799,7 +864,7 @@ the program:\n",
                 "description": {"type": "string", "minLength": 1, "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
                 "source": {"type": "string", "description": "The JavaScript program to run"},
                 "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
-                "resume_from_run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9_-]+$", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v2 agent calls are reused."}
+                "resume_from_run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9_-]+$", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v3 agent calls are reused. Journal v1/v2/future entries are safe cache misses."}
             },
             "required": ["source"],
             "additionalProperties": false

@@ -293,49 +293,88 @@ impl RunDir {
     }
 
     pub(super) fn read(&self, name: &'static str) -> Result<Vec<u8>> {
+        self.read_bounded(name, MAX_FILE_BYTES)
+    }
+
+    pub(super) fn read_bounded(&self, name: &'static str, max_bytes: usize) -> Result<Vec<u8>> {
+        self.read_optional_bounded(name, max_bytes)?
+            .ok_or_else(|| anyhow!("run artifact {name} is missing"))
+    }
+
+    pub(super) fn read_optional_bounded(
+        &self,
+        name: &'static str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
         validate_file_name(name)?;
+        if max_bytes == 0 || max_bytes > MAX_FILE_BYTES {
+            return Err(anyhow!("run read limit must be 1..={MAX_FILE_BYTES} bytes"));
+        }
         self.verify()?;
         #[cfg(unix)]
         {
             use rustix::fs::Mode;
             use rustix::fs::OFlags;
-            let fd = rustix::fs::openat(
+            let fd = match rustix::fs::openat(
                 &*self.dir,
                 name,
                 OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
                 Mode::empty(),
-            )
-            .with_context(|| format!("cannot open run file {}", self.path.join(name).display()))?;
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot open run file {}", self.path.join(name).display())
+                    });
+                }
+            };
             let file = std::fs::File::from(fd);
             let metadata = file.metadata().context("cannot stat run file")?;
             if !metadata.is_file() {
                 return Err(anyhow!("run artifact {name} is not a regular file"));
             }
-            if metadata.len() > MAX_FILE_BYTES as u64 {
-                return Err(anyhow!("run file exceeds the {MAX_FILE_BYTES}-byte limit"));
+            if metadata.len() > max_bytes as u64 {
+                return Err(anyhow!("run file exceeds the {max_bytes}-byte limit"));
             }
             use std::io::Read as _;
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            file.take((MAX_FILE_BYTES + 1) as u64)
+            file.take((max_bytes + 1) as u64)
                 .read_to_end(&mut bytes)
                 .context("cannot read run file")?;
-            if bytes.len() > MAX_FILE_BYTES {
-                return Err(anyhow!("run file exceeds the {MAX_FILE_BYTES}-byte limit"));
+            if bytes.len() > max_bytes {
+                return Err(anyhow!("run file exceeds the {max_bytes}-byte limit"));
             }
-            Ok(bytes)
+            Ok(Some(bytes))
         }
         #[cfg(not(unix))]
         {
             let path = self.file_path(name)?;
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("cannot stat run file {}", path.display()))?;
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot stat run file {}", path.display()));
+                }
+            };
             if !metadata.is_file() {
                 return Err(anyhow!("run artifact {name} is not a regular file"));
             }
-            if metadata.len() > MAX_FILE_BYTES as u64 {
-                return Err(anyhow!("run file exceeds the {MAX_FILE_BYTES}-byte limit"));
+            if metadata.len() > max_bytes as u64 {
+                return Err(anyhow!("run file exceeds the {max_bytes}-byte limit"));
             }
-            std::fs::read(&path).with_context(|| format!("cannot read run file {}", path.display()))
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("cannot read run file {}", path.display()))?;
+            use std::io::Read as _;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take((max_bytes + 1) as u64)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("cannot read run file {}", path.display()))?;
+            if bytes.len() > max_bytes {
+                return Err(anyhow!("run file exceeds the {max_bytes}-byte limit"));
+            }
+            Ok(Some(bytes))
         }
     }
 

@@ -1448,9 +1448,9 @@ mod tests {
     async fn clear_changes_only_the_task_registry() {
         let ctx = test_ctx(0, "task-clear-scope");
         let executions = [
-            (ExecutionKind::Agent, "agent-task-clear"),
-            (ExecutionKind::Program, "program-task-clear"),
-            (ExecutionKind::Workflow, "workflow-task-clear"),
+            (ExecutionKind::Agent, "agent-201"),
+            (ExecutionKind::Program, "program-201"),
+            (ExecutionKind::Workflow, "workflow-201"),
         ];
         for (kind, id) in executions {
             ctx.cfg

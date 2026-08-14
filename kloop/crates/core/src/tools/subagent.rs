@@ -11,13 +11,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
-use super::background_executions::ExecutionKind;
 use super::background_executions::ExecutionStatus;
 use super::str_arg;
 use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
-use crate::agent::run_structured_turn;
-use crate::agent::run_turn;
+use crate::agent::run_structured_turn_in_execution;
+use crate::agent::run_turn_in_execution;
 use crate::agent_type::AgentType;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
@@ -27,6 +26,18 @@ use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
+use crate::execution_provenance::AdmissionAuthority;
+use crate::execution_provenance::AdmissionOrigin;
+use crate::execution_provenance::AgentExecutionId;
+use crate::execution_provenance::DeliveryRoute;
+use crate::execution_provenance::ExecutionProvenanceReceipt;
+use crate::execution_provenance::MailboxRoute;
+use crate::execution_provenance::ResolvedExecutionAdmission;
+use crate::execution_provenance::TerminalOwner;
+use crate::execution_provenance::TerminalRoute;
+use crate::execution_provenance::TransientExecutionId;
+use crate::execution_provenance::WorkspaceDisposition;
+use crate::execution_provenance::WorkspaceProvenance;
 use crate::history::History;
 use crate::inbox::InboxItem;
 use crate::rollout::Rollout;
@@ -43,6 +54,11 @@ const MAX_REINJECT_ERROR_CHARS: usize = 3600;
 /// Process-global so parallel run_agent calls (and any future spawner) never hand
 /// out the same label — same reasoning as the offload counter (lesson 2).
 static AGENT_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+pub(crate) struct Admitted<T> {
+    pub(crate) value: T,
+    pub(crate) receipt: Arc<ExecutionProvenanceReceipt>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +81,14 @@ pub(super) async fn run_agent_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
+    Ok(run_agent_admitted(input, ctx, workspace).await?.value)
+}
+
+pub(crate) async fn run_agent_admitted(
+    input: &Value,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<Admitted<String>> {
     if ctx.depth >= 1 {
         bail!("run_agent: sub-agents cannot spawn further sub-agents");
     }
@@ -126,6 +150,32 @@ pub(super) async fn run_agent_tool(
     } else {
         None
     };
+    let receipt_workspace = if isolate {
+        WorkspaceProvenance::capture(
+            &sub.effective_workspace(),
+            WorkspaceDisposition::IsolatedChild,
+        )
+    } else {
+        WorkspaceProvenance::capture_current(workspace)
+    };
+    let receipt = mint_agent_receipt(
+        ctx,
+        &sub,
+        &agent,
+        receipt_workspace,
+        AdmissionOrigin::RunAgent,
+        if background {
+            TerminalRoute::new(
+                TerminalOwner::BackgroundExecutions,
+                DeliveryRoute::ParentInboxBody,
+            )
+        } else {
+            TerminalRoute::new(
+                TerminalOwner::ForegroundCaller,
+                DeliveryRoute::DirectToolResult,
+            )
+        },
+    )?;
     let sub_cfg = Arc::new(sub);
 
     if background {
@@ -139,6 +189,7 @@ pub(super) async fn run_agent_tool(
             depth,
             ui,
             worktree,
+            receipt,
         )
         .await;
     }
@@ -153,11 +204,16 @@ pub(super) async fn run_agent_tool(
         depth,
         "run_agent",
         worktree,
+        receipt,
     )
     .await
 }
 
-pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx) -> Result<Value> {
+pub(crate) async fn structured_agent_admitted(
+    input: &Value,
+    schema: Value,
+    ctx: &ToolCtx,
+) -> Result<Admitted<Value>> {
     if ctx.depth >= 1 {
         bail!("workflow agent: nested sub-agents are unavailable");
     }
@@ -203,6 +259,25 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
     } else {
         None
     };
+    let receipt_workspace = if isolate {
+        WorkspaceProvenance::capture(
+            &sub.effective_workspace(),
+            WorkspaceDisposition::IsolatedChild,
+        )
+    } else {
+        WorkspaceProvenance::capture_current(&workspace)
+    };
+    let receipt = mint_agent_receipt(
+        ctx,
+        &sub,
+        &agent,
+        receipt_workspace,
+        AdmissionOrigin::StructuredAgent,
+        TerminalRoute::new(
+            TerminalOwner::ForegroundCaller,
+            DeliveryRoute::DirectToolResult,
+        ),
+    )?;
     let sub_cfg = Arc::new(sub);
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
@@ -219,6 +294,7 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
     )
     .await?;
     emit_agent_start(&ui, &agent, &preview);
+    let execution = receipt.as_execution_ref();
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -227,7 +303,16 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
 
-            run_structured_turn(&sub_cfg, &mut history, &ui, &cancel, depth, schema).await
+            run_structured_turn_in_execution(
+                &sub_cfg,
+                &mut history,
+                &ui,
+                &cancel,
+                depth,
+                schema,
+                execution,
+            )
+            .await
         }
     });
     let outcome = match handle.await {
@@ -269,7 +354,7 @@ pub(super) async fn structured_agent(input: &Value, schema: Value, ctx: &ToolCtx
         }
     }
     emit_agent_end(&ui, &agent, result.is_ok());
-    result
+    result.map(|value| Admitted { value, receipt })
 }
 
 /// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
@@ -352,6 +437,41 @@ fn next_agent_label() -> String {
     format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+fn mint_agent_receipt(
+    ctx: &ToolCtx,
+    sub: &Config,
+    agent: &str,
+    workspace: WorkspaceProvenance,
+    origin: AdmissionOrigin,
+    terminal: TerminalRoute,
+) -> Result<Arc<ExecutionProvenanceReceipt>> {
+    let execution = AgentExecutionId::parse(agent)?;
+    let parent = sub
+        .parent_agent_id()
+        .cloned()
+        .ok_or_else(|| anyhow!("Agent execution has no mailbox parent"))?;
+    ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
+        session_id: &ctx.cfg.session_id,
+        parent: ctx.enclosing_execution.clone(),
+        execution: TransientExecutionId::Agent(execution),
+        durable: None,
+        mailbox: MailboxRoute::Agent {
+            context_id: sub.local_agent.context_id(),
+            parent,
+            child: sub.agent_id().clone(),
+        },
+        authority: AdmissionAuthority::new(
+            ctx.cfg.local_agent.context_id(),
+            ctx.cfg.agent_id().clone(),
+            ctx.depth,
+        ),
+        parent_rollout_id: ctx.parent_rollout_id.as_deref(),
+        workspace,
+        origin,
+        terminal,
+    })
+}
+
 /// A sub-agent began working on a description; its item id is its label. Shared
 /// with the code-mode program runner, whose background agent has the same lifecycle.
 pub(super) fn emit_agent_start(ui: &Arc<dyn crate::agent::Ui>, label: &str, description: &str) {
@@ -425,7 +545,8 @@ async fn run_sub_agent_sync(
     depth: u8,
     who: &str,
     worktree: Option<worktree::Worktree>,
-) -> Result<String> {
+    receipt: Arc<ExecutionProvenanceReceipt>,
+) -> Result<Admitted<String>> {
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
@@ -440,6 +561,7 @@ async fn run_sub_agent_sync(
     )
     .await?;
     emit_agent_start(&ui, &agent, &preview);
+    let execution = receipt.as_execution_ref();
     let handle = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -448,7 +570,7 @@ async fn run_sub_agent_sync(
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
 
-            run_turn(&sub_cfg, &mut history, &ui, &cancel, depth).await
+            run_turn_in_execution(&sub_cfg, &mut history, &ui, &cancel, depth, execution).await
         }
     });
     let outcome = match handle.await {
@@ -494,7 +616,7 @@ async fn run_sub_agent_sync(
         }
     }
     emit_agent_end(&ui, &agent, result.is_ok());
-    result
+    result.map(|value| Admitted { value, receipt })
 }
 
 /// Run a `context: fork` skill (plan 28 slice 2) as an isolated sub-agent: the
@@ -523,8 +645,19 @@ pub(crate) async fn fork_skill(
     if let Some(tools) = &skill.allowed_tools {
         sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
     }
+    let receipt = mint_agent_receipt(
+        ctx,
+        &sub,
+        &agent,
+        WorkspaceProvenance::capture_current(workspace),
+        AdmissionOrigin::SkillFork,
+        TerminalRoute::new(
+            TerminalOwner::ForegroundCaller,
+            DeliveryRoute::DirectToolResult,
+        ),
+    )?;
     let preview = format!("[skill:{}] {}", skill.name, agent_preview(&body));
-    run_sub_agent_sync(
+    Ok(run_sub_agent_sync(
         ctx,
         Arc::new(sub),
         agent,
@@ -534,8 +667,10 @@ pub(crate) async fn fork_skill(
         ctx.depth + 1,
         "skill",
         None,
+        receipt,
     )
-    .await
+    .await?
+    .value)
 }
 
 /// Fire-and-forget spawn (plan 26): register the agent, launch a DETACHED tokio
@@ -555,7 +690,8 @@ async fn spawn_background(
     depth: u8,
     ui: Arc<dyn crate::agent::Ui>,
     worktree: Option<worktree::Worktree>,
-) -> Result<String> {
+    receipt: Arc<ExecutionProvenanceReceipt>,
+) -> Result<Admitted<String>> {
     let lease = match sub_cfg.local_agent.register_child(
         Arc::clone(&sub_cfg.inbox),
         agent_type.as_deref(),
@@ -575,21 +711,23 @@ async fn spawn_background(
         }
     };
     let own_cancel = CancellationToken::new();
-    if let Err(msg) = ctx.cfg.background_executions.register(
-        ExecutionKind::Agent,
-        &agent,
+    let registration = match ctx.cfg.background_executions.register_receipt(
+        Arc::clone(&receipt),
         preview,
         own_cancel.clone(),
     ) {
-        // The slot couldn't be reserved: nothing will run, so undo the worktree
-        // now instead of leaking an empty tree.
-        if let Some(wt) = worktree {
-            worktree::finish(wt)
-                .await
-                .map_err(|error| anyhow!("run_agent: {msg}; worktree cleanup failed: {error:#}"))?;
+        Ok(registration) => registration,
+        Err(msg) => {
+            // The slot couldn't be reserved: nothing will run, so undo the worktree
+            // now instead of leaking an empty tree.
+            if let Some(wt) = worktree {
+                worktree::finish(wt).await.map_err(|error| {
+                    anyhow!("run_agent: {msg}; worktree cleanup failed: {error:#}")
+                })?;
+            }
+            return Err(anyhow!("run_agent: {msg}"));
         }
-        return Err(anyhow!("run_agent: {msg}"));
-    }
+    };
     let parent_inbox = ctx.cfg.inbox.clone();
     let background_executions = ctx.cfg.background_executions.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
@@ -608,6 +746,7 @@ async fn spawn_background(
     // The worker owns only the model turn. A supervisor awaits its JoinHandle so
     // panic/forced abort still reaches worktree cleanup, one terminal registry
     // transition, one inbox publication, and one frontend event.
+    let execution = receipt.as_execution_ref();
     let worker = tokio::spawn({
         let ui = ui.clone();
         let label = agent.clone();
@@ -616,12 +755,12 @@ async fn spawn_background(
             let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
             history.record(Message::user_text(prompt));
 
-            run_turn(&sub_cfg, &mut history, &ui, &own_cancel, depth).await
+            run_turn_in_execution(&sub_cfg, &mut history, &ui, &own_cancel, depth, execution).await
         }
     });
-    background_executions.attach_abort(&agent, worker.abort_handle());
+    background_executions.attach_abort_registration(&registration, worker.abort_handle());
     tokio::spawn({
-        let label = agent.clone();
+        let label = registration.id().to_string();
         let ui = ui.clone();
         let description = description.clone();
         async move {
@@ -663,21 +802,26 @@ async fn spawn_background(
                     }
                 }
             }
-            let terminal = background_executions.finish(&label, status, |actual, deliver| {
-                if deliver {
-                    if let Some(summary) = reinject {
-                        parent_inbox.push(InboxItem::SubAgentResult {
-                            label: label.clone(),
-                            summary,
-                        });
+            let terminal = background_executions.finish_registration(
+                &registration,
+                status,
+                |registered_receipt, actual, deliver| {
+                    debug_assert_eq!(registered_receipt.execution().as_str(), label);
+                    if deliver {
+                        if let Some(summary) = reinject {
+                            parent_inbox.push(InboxItem::SubAgentResult {
+                                label: label.clone(),
+                                summary,
+                            });
+                        } else {
+                            parent_inbox.notify_activity();
+                        }
                     } else {
+                        debug_assert_eq!(actual, ExecutionStatus::Aborted);
                         parent_inbox.notify_activity();
                     }
-                } else {
-                    debug_assert_eq!(actual, ExecutionStatus::Aborted);
-                    parent_inbox.notify_activity();
-                }
-            });
+                },
+            );
             if let Some(terminal) = terminal {
                 emit_background_task(
                     &ui,
@@ -691,9 +835,12 @@ async fn spawn_background(
             }
         }
     });
-    Ok(format!(
-        "Agent({description}) started in the background.{session_note}\nAgent ID: {agent}\nKeep working; its result will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_agent {{\"agent_id\": \"{agent}\"}}."
-    ))
+    Ok(Admitted {
+        value: format!(
+            "Agent({description}) started in the background.{session_note}\nAgent ID: {agent}\nKeep working; its result will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, or stop it with stop_agent {{\"agent_id\": \"{agent}\"}}."
+        ),
+        receipt,
+    })
 }
 
 /// Build the sub-agent's History, persisting to its own session file when the
@@ -852,6 +999,7 @@ mod tests {
     use crate::tools::testutil::*;
     use kloop_protocol::AssistantBlock;
     use kloop_protocol::ContentBlock;
+    use kloop_protocol::LocalAgentId;
     use kloop_provider::Provider;
     use serde_json::json;
 
@@ -912,6 +1060,46 @@ mod tests {
                     if content.as_text().contains("\"id\":\"main\""))
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn foreground_agent_receipt_separates_execution_and_mailbox_route() {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "done".into(),
+        }]]);
+        let ctx = with_provider(test_ctx(0, "agent-provenance"), provider);
+        let workspace = ctx.cfg.effective_workspace();
+        let admitted = run_agent_admitted(&json!({"prompt": "work"}), &ctx, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(admitted.value, "done");
+        let TransientExecutionId::Agent(execution) = admitted.receipt.execution() else {
+            panic!("foreground child did not mint an Agent execution");
+        };
+        let MailboxRoute::Agent {
+            context_id,
+            parent,
+            child,
+        } = admitted.receipt.mailbox()
+        else {
+            panic!("foreground child did not retain its mailbox route");
+        };
+        assert_eq!(execution.as_str(), child.as_str());
+        assert_eq!(context_id, &ctx.cfg.local_agent.context_id());
+        assert_eq!(parent, &LocalAgentId::Main);
+        assert_eq!(admitted.receipt.authority().caller(), &LocalAgentId::Main);
+        assert_eq!(
+            admitted.receipt.workspace().disposition(),
+            WorkspaceDisposition::Base
+        );
+        assert!(admitted.receipt.parent().is_none());
+        assert_eq!(
+            admitted.receipt.terminal(),
+            TerminalRoute::new(
+                TerminalOwner::ForegroundCaller,
+                DeliveryRoute::DirectToolResult
+            )
+        );
     }
 
     #[tokio::test]
