@@ -993,6 +993,18 @@ mod tests {
                 ExecutionStatus::Completed,
                 |registered, status, deliver| {
                     assert!(std::ptr::eq(registered, receipt.as_ref()));
+                    assert_eq!(
+                        registered.execution().kind(),
+                        ProvenanceExecutionKind::Agent
+                    );
+                    assert_eq!(
+                        registered.terminal().owner(),
+                        TerminalOwner::BackgroundExecutions
+                    );
+                    assert_eq!(
+                        registered.terminal().delivery(),
+                        DeliveryRoute::ParentInboxBody
+                    );
                     assert_eq!(status, ExecutionStatus::Completed);
                     assert!(deliver);
                     published.fetch_add(1, Ordering::SeqCst);

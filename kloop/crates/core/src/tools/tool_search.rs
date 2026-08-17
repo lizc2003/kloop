@@ -457,11 +457,18 @@ fn render(found: &[ToolDef], notes: &[String], total_deferred: usize) -> String 
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::history::History;
     use crate::tools::ToolSource;
     use crate::tools::testutil::*;
+    use kloop_protocol::AssistantBlock;
+    use kloop_protocol::ContentBlock;
+    use kloop_protocol::Message;
+    use kloop_provider::MockTurn;
+    use kloop_provider::Provider;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     /// Two deferred-able tools with distinct names/descriptions so keyword
     /// scoring is observable. Calls echo the tool name.
@@ -825,6 +832,8 @@ mod tests {
     struct WireRaceSrv {
         definition: ToolDef,
         generation: std::sync::atomic::AtomicU64,
+        readiness_revision: std::sync::atomic::AtomicU64,
+        calls: std::sync::atomic::AtomicUsize,
         barrier: Arc<tokio::sync::Barrier>,
     }
 
@@ -842,6 +851,11 @@ mod tests {
                 .then(|| (self.definition.clone(), self.definition_generation(tool)))
         }
 
+        fn readiness_revision(&self, _tool: &str) -> u64 {
+            self.readiness_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
         fn is_readonly(&self, _tool: &str) -> bool {
             false
         }
@@ -851,22 +865,33 @@ mod tests {
             tool: &'a str,
             input: &'a Value,
         ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
-            self.call_at_generation(tool, input, None)
+            self.call_at_version(tool, input, None)
         }
 
-        fn call_at_generation<'a>(
+        fn call_at_version<'a>(
             &'a self,
             tool: &'a str,
             _input: &'a Value,
-            generation: Option<u64>,
+            version: Option<crate::tools::SourceVersion>,
         ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
             Box::pin(async move {
                 self.barrier.wait().await;
                 self.barrier.wait().await;
-                let current = self.definition_generation(tool);
-                if generation != Some(current) {
+                let current = crate::tools::SourceVersion {
+                    definition_generation: self.definition_generation(tool),
+                    readiness_revision: self.readiness_revision(tool),
+                };
+                let Some(expected) = version else {
+                    bail!("wire call is missing a source version for {tool}");
+                };
+                if expected.definition_generation != current.definition_generation {
                     bail!("wire rejected stale generation for {tool}");
                 }
+                if expected.readiness_revision != current.readiness_revision {
+                    bail!("wire rejected stale readiness for {tool}");
+                }
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(crate::tools::SourceOutput::text("wire call".into()))
             })
         }
@@ -932,12 +957,41 @@ mod tests {
         output
     }
 
+    #[derive(Clone, Copy)]
     enum WireRacePath {
         Discovered,
         Program,
     }
 
-    async fn assert_wire_refresh_race(tag: &str, name: &str, path: WireRacePath) {
+    #[derive(Clone, Copy)]
+    enum WireRaceAxis {
+        Definition,
+        Readiness,
+    }
+
+    impl WireRaceAxis {
+        fn advance(self, source: &WireRaceSrv) {
+            match self {
+                Self::Definition => &source.generation,
+                Self::Readiness => &source.readiness_revision,
+            }
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+
+        fn error_fragment(self) -> &'static str {
+            match self {
+                Self::Definition => "wire rejected stale generation",
+                Self::Readiness => "wire rejected stale readiness",
+            }
+        }
+    }
+
+    async fn assert_wire_refresh_race(
+        tag: &str,
+        name: &str,
+        path: WireRacePath,
+        axis: WireRaceAxis,
+    ) {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let source = Arc::new(WireRaceSrv {
             definition: ToolDef {
@@ -946,6 +1000,8 @@ mod tests {
                 schema: json!({"type": "object"}),
             },
             generation: std::sync::atomic::AtomicU64::new(0),
+            readiness_revision: std::sync::atomic::AtomicU64::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
             barrier: Arc::clone(&barrier),
         });
         let mut ctx = deferred_ctx_with_source(tag, source.clone());
@@ -955,6 +1011,8 @@ mod tests {
             }
             WireRacePath::Program => ctx.from_program = true,
         }
+        let receipts_before =
+            matches!(path, WireRacePath::Discovered).then(|| ctx.cfg.unlocked_tools.receipts());
 
         let call = tokio::spawn({
             let ctx = ctx.clone();
@@ -962,16 +1020,32 @@ mod tests {
             async move { run_tool(&name, json!({}), &ctx).await }
         });
         barrier.wait().await;
-        source
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        axis.advance(&source);
         barrier.wait().await;
         let (output, is_error) = call.await.unwrap();
         assert!(is_error, "{output}");
-        assert!(
-            output.contains("wire rejected stale generation"),
-            "{output}"
-        );
+        assert!(output.contains(axis.error_fragment()), "{output}");
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        if let Some(receipts_before) = receipts_before {
+            assert_eq!(
+                ctx.cfg.unlocked_tools.receipts(),
+                receipts_before,
+                "a failed wire call must not mint a replacement receipt"
+            );
+        }
+    }
+
+    fn tool_surface(ctx: &crate::tools::ToolCtx) -> (Vec<ToolDef>, Option<String>) {
+        (
+            crate::tools::all_tool_defs(
+                ctx.depth,
+                &ctx.cfg.tool_sources,
+                ctx.cfg.defer_threshold,
+                ctx.cfg.surface,
+                &ctx.cfg.shell_programs,
+            ),
+            deferred_notice(&ctx.cfg),
+        )
     }
 
     fn unlocked(cfg: &Config) -> Vec<String> {
@@ -1293,7 +1367,24 @@ mod tests {
 
     #[tokio::test]
     async fn wire_call_rejects_refresh_after_dispatch_validation() {
-        assert_wire_refresh_race("wire-race", "srv__wire_race", WireRacePath::Discovered).await;
+        assert_wire_refresh_race(
+            "wire-race",
+            "srv__wire_race",
+            WireRacePath::Discovered,
+            WireRaceAxis::Definition,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wire_call_rejects_readiness_refresh_after_dispatch_validation() {
+        assert_wire_refresh_race(
+            "readiness-wire-race",
+            "srv__readiness_wire_race",
+            WireRacePath::Discovered,
+            WireRaceAxis::Readiness,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1316,6 +1407,7 @@ mod tests {
             "program-wire-race",
             "srv__program_race",
             WireRacePath::Program,
+            WireRaceAxis::Definition,
         )
         .await;
     }
@@ -1559,20 +1651,14 @@ mod tests {
     #[test]
     fn notice_lists_every_deferred_name_and_stays_static_across_unlocks() {
         let ctx = deferred_ctx("notice");
-        let notice = deferred_notice(&ctx.cfg).expect("regime active");
+        let (tools_before, notice_before) = tool_surface(&ctx);
+        let notice = notice_before.clone().expect("regime active");
         assert!(notice.starts_with("<system-reminder>"), "{notice}");
         assert!(
             notice.contains("srv__web_search\nsrv__page_fetch"),
             "{notice}"
         );
         assert!(notice.contains("tool_search"), "{notice}");
-        let tools_before = crate::tools::all_tool_defs(
-            ctx.depth,
-            &ctx.cfg.tool_sources,
-            ctx.cfg.defer_threshold,
-            ctx.cfg.surface,
-            &ctx.cfg.shell_programs,
-        );
         // Unlocking must not change the injected text (prompt-cache stability).
         let workspace = ctx.cfg.effective_workspace();
         let source = current_source_binding("srv__web_search", &ctx.cfg).unwrap();
@@ -1582,17 +1668,10 @@ mod tests {
             source,
             &capability,
         ));
-        assert_eq!(deferred_notice(&ctx.cfg), Some(notice));
         assert_eq!(
-            crate::tools::all_tool_defs(
-                ctx.depth,
-                &ctx.cfg.tool_sources,
-                ctx.cfg.defer_threshold,
-                ctx.cfg.surface,
-                &ctx.cfg.shell_programs,
-            ),
-            tools_before,
-            "receipt churn must not alter the provider tool array"
+            tool_surface(&ctx),
+            (tools_before, notice_before),
+            "receipt churn must not alter the provider tool surface"
         );
     }
 
@@ -1609,6 +1688,57 @@ mod tests {
             &ctx.cfg.powershell_execution_gate,
             &sub.powershell_execution_gate
         ));
+    }
+
+    #[tokio::test]
+    async fn same_session_compaction_preserves_deferred_unlock() {
+        let source = Arc::new(OwnedSrv::new("srv__mutate", "mutated"));
+        let ctx = with_provider(
+            deferred_ctx_with_source("compaction-preserves-unlock", source.clone()),
+            Provider::mock_scripted(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary".into(),
+            }])]),
+        );
+        search_select(&ctx, "srv__mutate").await;
+        let receipts_before = ctx.cfg.unlocked_tools.receipts();
+        let surface_before = tool_surface(&ctx);
+
+        let mut history = History::new(ctx.cfg.offload_dir.clone());
+        history.record(Message::user_text("old"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "old answer".into(),
+        }]));
+        history.record(Message::user_text("current"));
+        let stats = crate::compact::run_compaction(
+            &ctx.cfg,
+            "mock",
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.summarized, 1);
+        assert_eq!(stats.kept, 2);
+        assert_eq!(
+            history.messages()[0],
+            Message::user_text(format!("{}summary", crate::compact::SUMMARY_PREFIX))
+        );
+        assert_eq!(
+            ctx.cfg.unlocked_tools.receipts(),
+            receipts_before,
+            "same-session compaction must preserve the exact live receipt"
+        );
+        assert_eq!(
+            tool_surface(&ctx),
+            surface_before,
+            "same-session compaction must not perturb the provider tool surface"
+        );
+        assert_eq!(
+            run_tool("srv__mutate", json!({}), &ctx).await,
+            ("mutated".into(), false)
+        );
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -41,6 +41,8 @@ Plan 81（2026-08-12）已销账当前 transcript 的 durable provider-reported 
 
 Plan 85（2026-08-14）补齐 session persistence 的 correctness seam：只读 snapshot/list/read/spawn seed 不修盘，显式 resume/fork 才 truncate torn tail 或追加 pairing `repaired` marker；repair stats、terminal boundary remap、invalid UTF-8 tail、sequence exhaustion 和 client session-id traversal rejection 均有 core/server 回归。该维护切片不新增 public protocol/event journal、跨进程 recovery lock、fsync/exactly-once 或 provider/billing 能力。
 
+Plan 91 的 Plan 87–90 先行验收只增加 conformance evidence，不新增能力；完整矩阵见 `docs/plan/91-agent-boundary-acceptance.md`。显式 provider route transition、lossy request view、route-aware usage 与 public route revision 仍按 `docs/plan/92-session-provider-switching.md` 挂账，Plan 91 因此未标完成。
+
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | 压缩后重注入最近读过的 ≤5 文件 | cc 单家 | 未立 | dogfood 出现"压缩后失忆"痛感 |

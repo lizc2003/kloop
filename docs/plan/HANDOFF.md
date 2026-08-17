@@ -34,6 +34,10 @@
 >
 > **Plan 90 教训**：catalog continuity 与 live readiness 是两条独立版本轴；last-known-good schema 可以为恢复保留，却不能继续充当 Ready。等待 notification 的 detached task 若又经 source→client 强持 notification sender，会把 Drop/Closed 变成不可达的自保活环；长期 transport 必须由外层 supervisor 持 cancel/task/client ownership，并用独立 health signal把 EOF 与 pending failure送出。configured-but-failed 的准确错误也不要求全局 registry：让原 source 保留 bounded prefix claim，即可在 exact route 上区分 unavailable 与 missing；generic keyword discovery仍不能凭空发明未知 schema。HTTP wire session重建只证明 transport恢复，不证明 capability/catalog连续，必须另做 catalog revalidation。
 >
+> **Plan 91 先行验收（2026-08-17；完整收口等待 Plan 92）**：Plan 87–90 的 owner-by-owner deterministic matrix 已实施；补齐 same-session compaction 保留 exact unlock receipt，以及普通 direct call 在 final wire gate 的 readiness revision race，并把 background winner callback 锁定到 canonical typed receipt。其余 cell 复用既有 owner-local typed/bytes/lineage/terminal/secret-negative witness；完整矩阵、测试名、数量与实际命令见 `91-agent-boundary-acceptance.md`。Plan 92 的 provider route/switch 全部保持 `pending(plan92)`，Plan 91 不标 ✅；真实 provider、第三方 MCP/OAuth、Linux/Windows/Desktop/物理 terminal 本轮未执行。
+>
+> **Plan 91 先行验收教训**：acceptance 应先按事实 owner 建矩阵，只给跨生命周期真实缺口新增 witness。session-memory receipt 在 compaction 内应整对象保留，resume/fork则由 fresh Config边界保证不持久化；不能为了测试把 receipt 塞进 rollout。测试 filter必须先以 `--list` 证明命中，再用完整 test path `--exact`，否则 `0 passed` 的成功退出码是假绿。
+>
 > **Plan 83 已完成（2026-08-13）**：TUI bracketed paste ingress 统一将 CRLF 与孤立 CR 规范化为 LF，再交给 Composer 或 question editor；不 trim，不删除前后空格和尾随换行。这样复制 `abc`/`def` 两行时，CR 不再作为终端控制字符覆盖前一行，Composer、paste atom、history、steering 与 provider payload 都共享 canonical LF 文本。普通未包裹 raw CR burst 仍按 Enter/提交语义处理，Plan 38 的 PasteBurst 范围不变。
 >
 > App unit 覆盖 LF/CRLF/CR、空格/尾随 LF 和 submit payload；question notes 粘贴覆盖 canonical LF；Unix PTY 真实发送 bracketed `abc\\r\\ndef` 后提交，mock provider 收到 `abc\\ndef`。本次未执行物理终端手工场景；提交 SHA 以本条所在提交为准。
