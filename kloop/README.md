@@ -592,8 +592,11 @@ resolved default model (not a fabricated provider catalog); `config/read
 `skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without
 bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}`
 returns the immutable startup discovery snapshot (transport, connected /
-unavailable state, sanitized message, and model-visible tool names). Config,
-skill, plugin, and MCP mutation methods are deliberately absent in this slice.
+unavailable state, sanitized message, and model-visible tool names). MCP runtime
+readiness is consumed internally by tool/resource discovery and dispatch; it does
+not reinterpret this legacy snapshot or add a process-global event stream.
+Config, skill, plugin, and MCP mutation methods are deliberately absent in this
+slice.
 Read methods reject unknown parameters, accept at most one scope selector, and
 canonicalize cwd before invoking their reader.
 
@@ -793,9 +796,11 @@ variable that kloop reads at connect time into `Authorization: Bearer <token>`
 Over HTTP, one POST carries each request, the reply comes back as
 `application/json` or a short-lived `text/event-stream`, and the server's
 `Mcp-Session-Id` header rides every subsequent request; a `404` for a
-session-bearing request re-runs the handshake once, and 408/429/5xx and
-transient network errors retry (250ms, 1s, then a final try) while 401/403 are
-terminal.
+session-bearing request re-runs the handshake once but does **not** transparently
+replay the original operation. The adapter first revalidates capabilities and the
+tool catalog under its lifecycle gate; only a later freshly discovered call may
+retry. 408/429/5xx and transient network errors retry (250ms, 1s, then a final
+try), while 401/403 are terminal.
 
 **OAuth (plan 34b).** A remote server with no `bearer_token_env_var` takes the
 OAuth 2.1 authorization-code path — the way the hosted MCP servers (GitHub,
@@ -818,28 +823,62 @@ warning pointing at `kloop mcp login <name>`. Keyring storage, cross-process
 refresh locks, the legacy SSE transport, and the manual-paste (no-browser)
 fallback are out of scope (see the plan).
 
-Servers are spawned/connected once at startup (stdio children killed on exit);
-the handshake is `initialize` → `notifications/initialized` → `tools/list`
-(with bounded `nextCursor` pagination), and each advertised tool joins the model's tool
-list as `{server}__{tool}` with its inputSchema passed through verbatim. A stdio
-server advertising `tools.listChanged` drives an atomic catalog refresh: burst
-notifications coalesce, receiver lag still marks the catalog dirty, transient list
-failures retry, and a final failure leaves the old catalog intact. Streamable HTTP
-currently has no long-lived server-notification stream; if an HTTP server advertises
-listChanged, kloop reports that the startup catalog remains fixed instead of silently
-claiming dynamic refresh. A failing server degrades to a startup warning — MCP never
-blocks kloop. Name sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so
-persisted allow rules round-trip through the permission-rule grammar); collisions
-warn at startup and the colliding later definitions are skipped.
+Servers are planned and connected once at startup; the handshake remains
+`initialize` → `notifications/initialized` → `tools/list` (with bounded
+`nextCursor` pagination). A process-owned lifecycle supervisor then owns every
+stdio child, transport-health monitor, and refresh worker, performs explicit
+shutdown/reap on every frontend exit, and uses Drop only as an error-path abort
+fallback. Stdio EOF/read/write failure and request timeout publish a bounded
+health transition, fail all pending requests, and close the matching refresh
+worker; dropping a cancelled request also removes its pending route immediately.
 
-Calls go out with the raw server-side tool name. Text content is flattened;
-supported image blocks are lifted into canonical model image blocks, while
-unsupported binary/audio content degrades to explicit text tags. `isError: true`
-surfaces as an is_error tool_result — the same shape as a failing built-in. MCP
-tools run serially unless listed in `readonly`, and always ask for permission
-unless covered by the current project's durable whole-tool rule or the
-WorkspaceId-scoped session cache — the `a`/`p` answers remember ordinary MCP
-tools at workspace-session/project granularity. Resource reads are the exception below.
+Each configured server has one source-owned, in-memory readiness receipt. It
+binds the server identity and a secret-free endpoint digest to auth availability,
+capability summary, catalog generation, monotonic readiness revision, refresh
+state, last health result, and a fixed failure class. The HTTP binding hashes
+only scheme/host/port (not userinfo, path, query, headers, or credentials); the
+stdio binding hashes only executable identity and environment names (not argv or
+environment values). Its lifecycle distinguishes planned / starting / ready /
+stale / degraded / failed / closed. It never stores or projects raw
+command/URL/header/token/error-body data and is neither a permission grant nor a
+second registry. A startup-failed server retains an empty source route, so an
+exact `{server}__{tool}` request and all three resource helpers report that the
+configured server is unavailable—not `unknown tool`, `no deferred tool`, or
+`Server not found`—before hooks or approval.
+
+Each advertised tool joins the model catalog as `{server}__{tool}` with its
+inputSchema passed through verbatim. A stdio server advertising
+`tools.listChanged` drives an atomic catalog refresh: burst notifications
+coalesce, receiver lag still marks the catalog dirty, and list failures retry
+within a fixed bound. Refresh first marks the source stale; success publishes the
+complete replacement catalog and increments both catalog generation and
+readiness revision. Exhausted retries retain the last-known catalog internally
+but mark it degraded and hide it from discovery/call until a later successful
+refresh; recovery therefore requires fresh tool discovery even when a tool name
+is unchanged. Streamable HTTP still has no long-lived server-notification stream,
+so its catalog is explicitly startup-fixed. A recovered HTTP 404 session emits a
+lifecycle event and revalidates the catalog once rather than treating a new wire
+session as proof that the old catalog is current; OAuth refresh/relogin state is
+likewise reflected in readiness. MCP startup failure never blocks kloop.
+Name sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
+allow rules round-trip through the permission-rule grammar); collisions warn at
+startup and the colliding later definitions are skipped.
+
+Calls go out with the raw server-side tool name only after core has frozen both
+the source's catalog generation and readiness revision. Deferred discovery and a
+Program manifest bind the same pair; core checks availability before hooks and
+permission, checks the binding again after a pre-tool hook, and the adapter
+rechecks under its call/refresh gate immediately before wire I/O. Availability
+therefore never authorizes a call: ordinary permission, hooks, sandbox and
+concurrency rules remain unchanged once the server is ready. Text content is
+flattened; supported image blocks are lifted into canonical model image blocks,
+while unsupported binary/audio content degrades to explicit text tags.
+`isError: true` surfaces as an is_error tool_result — the same shape as a failing
+built-in. MCP tools run serially unless listed in `readonly`, and always ask for
+permission unless covered by the current project's durable whole-tool rule or
+the WorkspaceId-scoped session cache — the `a`/`p` answers remember ordinary MCP
+tools at workspace-session/project granularity. Resource reads are the exception
+below.
 
 Layering: core only knows the `ToolSource` trait (`tools/mod.rs`); the wire
 client is the `kloop-mcp` crate (protocol layer transport-agnostic behind a
@@ -852,9 +891,11 @@ leaks into the wire crate).
 
 ### MCP resources
 
-A server whose initialize result advertises `resources` contributes three global
-resource helpers. They are always deferred behind `tool_search`, even when the
-ordinary tool count is below the threshold:
+Whenever MCP is configured, kloop exposes three global resource helpers. Each
+helper routes through the same per-server readiness receipt; a ready server must
+also advertise `resources`, while a failed/degraded/stale server reports its
+availability state before URI lookup or approval. The helpers are always deferred
+behind `tool_search`, even when the ordinary tool count is below the threshold:
 
 - **list_mcp_resources** `{server?}` lists one server or aggregates all
   resources-capable servers concurrently. It is catalog-only and auto-allowed.

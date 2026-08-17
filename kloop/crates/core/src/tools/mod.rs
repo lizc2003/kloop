@@ -68,6 +68,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -131,10 +132,40 @@ impl SourceOutput {
     }
 }
 
+/// Definition/catalog and live-readiness version captured as one source-owned
+/// snapshot. Both axes must still match at the wire boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SourceVersion {
+    pub definition_generation: u64,
+    pub readiness_revision: u64,
+}
+
+/// A source's verdict for one exact route. Dynamic adapters override this to
+/// atomically pair a definition with live readiness; static sources use the
+/// default implementation.
+#[derive(Clone, Debug)]
+pub enum SourceDefinitionState {
+    Missing,
+    Available {
+        definition: ToolDef,
+        version: SourceVersion,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceRouteState {
+    Missing,
+    Available(SourceCallBinding),
+    Unavailable(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SourceCallBinding {
     source_slot: usize,
-    generation: u64,
+    version: SourceVersion,
 }
 
 struct SourceDefinitionSnapshot {
@@ -190,6 +221,39 @@ pub trait ToolSource: Send + Sync {
             .cloned()
             .map(|def| (def, self.definition_generation(tool)))
     }
+    /// Monotonic live-readiness revision. Static sources remain at zero.
+    fn readiness_revision(&self, _tool: &str) -> u64 {
+        0
+    }
+    /// Source-wide version used to prove that a provider request's generated
+    /// Program API and callable manifest came from the same lifecycle snapshot.
+    fn catalog_version(&self) -> SourceVersion {
+        SourceVersion {
+            definition_generation: self.definition_generation(""),
+            readiness_revision: self.readiness_revision(""),
+        }
+    }
+    /// Atomically classify one exact source route. An unavailable verdict is
+    /// distinct from Missing so configured-but-failed sources cannot degrade to
+    /// an unknown-tool error.
+    fn definition_state(&self, tool: &str) -> SourceDefinitionState {
+        match self.definition_snapshot(tool) {
+            Some((definition, definition_generation)) => SourceDefinitionState::Available {
+                definition,
+                version: SourceVersion {
+                    definition_generation,
+                    readiness_revision: self.readiness_revision(tool),
+                },
+            },
+            None => SourceDefinitionState::Missing,
+        }
+    }
+    /// Source-specific fail-fast validation performed before pre-tool hooks and
+    /// permission. It must be side-effect free; the source still revalidates at
+    /// the wire boundary after any approval wait.
+    fn preflight(&self, _tool: &str, _input: &Value) -> Result<()> {
+        Ok(())
+    }
     /// Whether this tool was explicitly marked read-only in config, making
     /// it eligible for concurrent dispatch. External tools default to NOT
     /// read-only — serial. (The permission gate is independent: external
@@ -213,6 +277,37 @@ pub trait ToolSource: Send + Sync {
         _generation: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
         self.call(tool, input)
+    }
+    /// Execute against both catalog generation and live-readiness revision.
+    /// Dynamic sources override this so the final check and wire request share
+    /// their lifecycle gate; static sources delegate to the generation seam.
+    fn call_at_version<'a>(
+        &'a self,
+        tool: &'a str,
+        input: &'a Value,
+        version: Option<SourceVersion>,
+    ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.definition_state(tool) {
+                SourceDefinitionState::Missing => bail!("unknown source tool: {tool}"),
+                SourceDefinitionState::Unavailable { reason } => bail!(reason),
+                SourceDefinitionState::Available {
+                    version: current, ..
+                } if version.is_some_and(|expected| expected != current) => {
+                    bail!(
+                        "tool '{tool}' source readiness or definition changed after discovery; rediscover it before retrying"
+                    )
+                }
+                SourceDefinitionState::Available { .. } => {
+                    self.call_at_generation(
+                        tool,
+                        input,
+                        version.map(|version| version.definition_generation),
+                    )
+                    .await
+                }
+            }
+        })
     }
 }
 
@@ -493,27 +588,85 @@ fn find_source<'a>(
     find_source_slot(sources, name).map(|(_, source)| source)
 }
 
+enum SourceResolution {
+    Missing,
+    Unavailable(String),
+    Available {
+        source_slot: usize,
+        definition: ToolDef,
+        version: SourceVersion,
+    },
+}
+
+fn resolve_source(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceResolution {
+    let mut reserved = reserved_builtin_names();
+    reserve_surface_names(&mut reserved);
+    if reserved.contains(name) {
+        return SourceResolution::Missing;
+    }
+    let mut unavailable = None;
+    for (source_slot, source) in sources.iter().enumerate() {
+        match source.definition_state(name) {
+            SourceDefinitionState::Missing => {}
+            SourceDefinitionState::Unavailable { reason } => {
+                unavailable.get_or_insert(reason);
+            }
+            SourceDefinitionState::Available {
+                definition,
+                version,
+            } => {
+                return SourceResolution::Available {
+                    source_slot,
+                    definition,
+                    version,
+                };
+            }
+        }
+    }
+    unavailable.map_or(SourceResolution::Missing, SourceResolution::Unavailable)
+}
+
+fn source_definition_result(
+    sources: &[Arc<dyn ToolSource>],
+    name: &str,
+) -> std::result::Result<Option<SourceDefinitionSnapshot>, String> {
+    match resolve_source(sources, name) {
+        SourceResolution::Available {
+            source_slot,
+            definition,
+            version,
+        } => Ok(Some(SourceDefinitionSnapshot {
+            definition,
+            binding: SourceCallBinding {
+                source_slot,
+                version,
+            },
+        })),
+        SourceResolution::Missing => Ok(None),
+        SourceResolution::Unavailable(reason) => Err(reason),
+    }
+}
+
 fn source_definition_snapshot(
     sources: &[Arc<dyn ToolSource>],
     name: &str,
 ) -> Option<SourceDefinitionSnapshot> {
-    let (source_slot, source) = find_source_slot(sources, name)?;
-    let (definition, generation) = source.definition_snapshot(name)?;
-    Some(SourceDefinitionSnapshot {
-        definition,
-        binding: SourceCallBinding {
-            source_slot,
-            generation,
-        },
-    })
+    source_definition_result(sources, name).ok().flatten()
 }
 
-fn source_call_binding(sources: &[Arc<dyn ToolSource>], name: &str) -> Option<SourceCallBinding> {
-    let (source_slot, source) = find_source_slot(sources, name)?;
-    Some(SourceCallBinding {
-        source_slot,
-        generation: source.definition_generation(name),
-    })
+fn source_route_state(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceRouteState {
+    match resolve_source(sources, name) {
+        SourceResolution::Missing => SourceRouteState::Missing,
+        SourceResolution::Unavailable(reason) => SourceRouteState::Unavailable(reason),
+        SourceResolution::Available {
+            source_slot,
+            version,
+            ..
+        } => SourceRouteState::Available(SourceCallBinding {
+            source_slot,
+            version,
+        }),
+    }
 }
 
 /// The built-in tool defs (bash, file, search, and — at depth 0 — tasks plus
@@ -995,14 +1148,19 @@ async fn run_one(
                 "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
             );
         }
+        let route_before = tool_search::current_source_route(&name, &ctx.cfg);
+        let source_before = match &route_before {
+            SourceRouteState::Missing => None,
+            SourceRouteState::Available(binding) => Some(*binding),
+            SourceRouteState::Unavailable(reason) => bail!(reason.clone()),
+        };
         // Freeze the workspace before validating a deferred capability. A stale
         // call is a discovery error, so neither hooks nor the human permission
         // gate should observe it. The same workspace snapshot is then used for
         // prepare, permission, sandbox and execution.
         let workspace = ctx.cfg.effective_workspace();
         let (discovery_gated, expected_source) = if ctx.from_program {
-            let current_source = tool_search::current_source_binding(&name, &ctx.cfg);
-            if current_source != expected_program_source {
+            if source_before != expected_program_source {
                 bail!(
                     "tool '{name}' source changed after this Program API was generated; run the Program again from a fresh sampling round"
                 );
@@ -1010,18 +1168,22 @@ async fn run_one(
             (false, expected_program_source)
         } else {
             let deferred_before = tool_search::is_deferred(&name, &ctx.cfg);
-            let source_before = tool_search::current_source_binding(&name, &ctx.cfg);
             let deferred_after = tool_search::is_deferred(&name, &ctx.cfg);
             let discovery_gated = deferred_before || deferred_after;
             let expected_source = if discovery_gated {
-                let source =
-                    tool_search::unlocked_source_for_dispatch(&name, &ctx, &workspace).ok_or_else(
-                        || {
-                            anyhow!(
+                let source = match tool_search::unlocked_source_for_dispatch(
+                    &name, &ctx, &workspace,
+                ) {
+                    Some(source) => source,
+                    None => match tool_search::current_source_route(&name, &ctx.cfg) {
+                        SourceRouteState::Unavailable(reason) => bail!(reason),
+                        SourceRouteState::Missing | SourceRouteState::Available(_) => {
+                            bail!(
                                 "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
                             )
-                        },
-                    )?;
+                        }
+                    },
+                };
                 if Some(source) != source_before {
                     bail!(
                         "tool '{name}' source changed while its deferred capability was classified; call tool_search with query \"select:{name}\" to load its definition again, then retry"
@@ -1032,6 +1194,14 @@ async fn run_one(
                 source_before
             };
             (discovery_gated, expected_source)
+        };
+        if let Some(binding) = expected_source {
+            let source = ctx
+                .cfg
+                .tool_sources
+                .get(binding.source_slot)
+                .context("source preflight binding is no longer registered")?;
+            source.preflight(&name, &input)?;
         };
         // pre_tool hooks run BEFORE the permission gate: hooks are automation
         // policy, permissions are the human's last word — a hook block means
@@ -1050,12 +1220,37 @@ async fn run_one(
                 ctx.hook_context.lock().unwrap().extend(context);
             }
         }
+        let source_after = match tool_search::current_source_route(&name, &ctx.cfg) {
+            SourceRouteState::Missing => None,
+            SourceRouteState::Available(binding) => Some(binding),
+            SourceRouteState::Unavailable(reason) => bail!(reason),
+        };
+        if source_after != source_before {
+            let guidance = if discovery_gated {
+                format!(
+                    "call tool_search with query \"select:{name}\" to load its definition again, then retry"
+                )
+            } else if ctx.from_program {
+                "run the Program again from a fresh sampling round".to_string()
+            } else {
+                "retry from a fresh sampling round".to_string()
+            };
+            bail!("tool '{name}' source changed while its pre-tool hook ran; {guidance}");
+        }
         if discovery_gated
             && tool_search::unlocked_source_for_dispatch(&name, &ctx, &workspace) != expected_source
         {
             bail!(
                 "tool '{name}' capability changed while its pre-tool hook ran; call tool_search with query \"select:{name}\" to load its definition again, then retry"
             );
+        }
+        if let Some(binding) = expected_source {
+            let source = ctx
+                .cfg
+                .tool_sources
+                .get(binding.source_slot)
+                .context("source preflight binding is no longer registered")?;
+            source.preflight(&name, &input)?;
         }
         // Prepare mutations after pre-hooks but before permission. The gate sees
         // the canonical effective target, while the executor retains an open
@@ -1297,7 +1492,7 @@ fn execute_tool<'a>(
                 )));
             };
             return match source
-                .call_at_generation(name, input, Some(binding.generation))
+                .call_at_version(name, input, Some(binding.version))
                 .await
             {
                 Ok(out) => {
@@ -1734,6 +1929,85 @@ mod tests {
                     "echoed {}",
                     input["text"].as_str().unwrap_or("?")
                 )))
+            })
+        }
+    }
+
+    struct PanicApprover;
+
+    impl crate::permissions::Approver for PanicApprover {
+        fn confirm(
+            &self,
+            _request: crate::permissions::ConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::permissions::Decision> + Send + '_>> {
+            panic!("unavailable source reached the permission approver")
+        }
+    }
+
+    struct UnavailableSource {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolSource for UnavailableSource {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(Vec::<ToolDef>::new())
+        }
+
+        fn definition_state(&self, tool: &str) -> SourceDefinitionState {
+            if tool.starts_with("offline__") {
+                SourceDefinitionState::Unavailable {
+                    reason: "MCP server \"offline\" is failed: configured tools are unavailable, not missing".into(),
+                }
+            } else {
+                SourceDefinitionState::Missing
+            }
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(SourceOutput::text("unexpected call".into()))
+            })
+        }
+    }
+
+    struct PreflightSource {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolSource for PreflightSource {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![ToolDef {
+                name: "external__preflight".into(),
+                description: "preflight fixture".into(),
+                schema: json!({"type": "object"}),
+            }])
+        }
+
+        fn preflight(&self, _tool: &str, _input: &Value) -> Result<()> {
+            bail!("source unavailable during preflight")
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(SourceOutput::text("unexpected call".into()))
             })
         }
     }
@@ -2512,6 +2786,79 @@ mod tests {
         let (out, is_error) = run_tool("other__tool", json!({}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_source_route_fails_before_call_and_is_not_unknown() {
+        let source = Arc::new(UnavailableSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base = test_ctx_with_sources(0, "unavailable-source", vec![source.clone()]);
+        let permissions = crate::permissions::Permissions::new(
+            crate::permissions::Mode::Manual,
+            &crate::permissions::PermissionRules::default(),
+            std::env::temp_dir(),
+            Some(Arc::new(PanicApprover)),
+        )
+        .unwrap();
+        let mut cfg = base.cfg.test_clone();
+        cfg.permissions = Arc::new(permissions);
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (output, is_error) = run_tool("offline__echo", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert!(output.contains("unavailable, not missing"), "{output}");
+        assert!(!output.contains("unknown tool"), "{output}");
+        assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+
+        let (search, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "select:offline__echo"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{search}");
+        assert!(search.contains("unavailable, not missing"), "{search}");
+        assert!(!search.contains("no deferred tool named"), "{search}");
+
+        let ready_ctx = test_ctx_with_sources(
+            0,
+            "unavailable-shadow",
+            vec![source, StubSource::new("offline")],
+        );
+        let (output, is_error) =
+            run_tool("offline__echo", json!({"text": "ready"}), &ready_ctx).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "echoed ready");
+    }
+
+    #[tokio::test]
+    async fn source_preflight_fails_before_hooks_permission_and_call() {
+        let source = Arc::new(PreflightSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base = test_ctx_with_sources(0, "source-preflight", vec![source.clone()]);
+        let permissions = crate::permissions::Permissions::new(
+            crate::permissions::Mode::Manual,
+            &crate::permissions::PermissionRules::default(),
+            std::env::temp_dir(),
+            Some(Arc::new(PanicApprover)),
+        )
+        .unwrap();
+        let mut cfg = base.cfg.test_clone();
+        cfg.permissions = Arc::new(permissions);
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (output, is_error) = run_tool("external__preflight", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert!(output.contains("unavailable during preflight"), "{output}");
+        assert_eq!(source.calls.load(Ordering::Relaxed), 0);
     }
 
     /// An external (MCP) tool that returns an image lands a Blocks tool_result,

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -32,7 +33,9 @@ use reqwest::header::HeaderValue;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::McpAuthenticationError;
 use crate::McpRpcError;
+use crate::McpSessionReinitialized;
 use crate::Transport;
 use crate::oauth::OAuthSession;
 use crate::sse::SseParser;
@@ -61,6 +64,11 @@ pub(crate) struct HttpTransport {
     protocol_version: Mutex<Option<String>>,
     /// The last `initialize` params, replayed to recover an expired session.
     init_params: Mutex<Option<Value>>,
+    /// Capabilities returned by the most recent recovery initialize, shared with
+    /// concurrent callers that observe the already-replaced session.
+    reinit_capabilities: Mutex<Option<crate::McpServerCapabilities>>,
+    /// Blocks request publication while a recovered session is being installed.
+    session_gate: tokio::sync::RwLock<()>,
     /// Serializes session recovery so a burst of concurrent 404s re-handshakes
     /// once, not once per caller.
     reinit_lock: tokio::sync::Mutex<()>,
@@ -68,6 +76,14 @@ pub(crate) struct HttpTransport {
     /// request from here instead of being a fixed `base_headers` entry. Absent
     /// for no-auth and static-bearer servers.
     oauth: Option<Arc<OAuthSession>>,
+    /// Bounded lifecycle events (session reinitialize and OAuth refresh) for the
+    /// adapter readiness owner. No URL, token, header or response body enters it.
+    health: tokio::sync::watch::Sender<crate::McpTransportHealth>,
+    health_publish_lock: Mutex<()>,
+    session_revision: AtomicU64,
+    authentication_revision: AtomicU64,
+    revalidation_required: AtomicBool,
+    catalog_revalidation_allowed: AtomicBool,
     retry_delays: Vec<Duration>,
 }
 
@@ -94,6 +110,7 @@ impl HttpTransport {
                 .with_context(|| format!("invalid value for mcp http header '{name}'"))?;
             base_headers.insert(name, value);
         }
+        let (health, _) = tokio::sync::watch::channel(crate::McpTransportHealth::healthy());
         Ok(HttpTransport {
             client: reqwest::Client::new(),
             url,
@@ -102,10 +119,77 @@ impl HttpTransport {
             session_id: Mutex::new(None),
             protocol_version: Mutex::new(None),
             init_params: Mutex::new(None),
+            reinit_capabilities: Mutex::new(None),
+            session_gate: tokio::sync::RwLock::new(()),
             reinit_lock: tokio::sync::Mutex::new(()),
             oauth,
+            health,
+            health_publish_lock: Mutex::new(()),
+            session_revision: AtomicU64::new(0),
+            authentication_revision: AtomicU64::new(0),
+            revalidation_required: AtomicBool::new(false),
+            catalog_revalidation_allowed: AtomicBool::new(false),
             retry_delays,
         })
+    }
+
+    fn advance_revision(revision: &AtomicU64, label: &str) -> u64 {
+        revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("MCP HTTP {label} revision exhausted"))
+            + 1
+    }
+
+    fn publish_session_reinitialized(&self) {
+        let _publication = self.health_publish_lock.lock().unwrap();
+        let session_revision = Self::advance_revision(&self.session_revision, "session");
+        let current = *self.health.borrow();
+        self.health.send_replace(crate::McpTransportHealth {
+            session_revision,
+            ..current
+        });
+    }
+
+    fn mark_session_revalidation_required(&self) {
+        self.revalidation_required.store(true, Ordering::Release);
+        self.publish_session_reinitialized();
+    }
+
+    fn clear_recovered_session(&self) {
+        *self.session_id.lock().unwrap() = None;
+        *self.reinit_capabilities.lock().unwrap() = None;
+        self.catalog_revalidation_allowed
+            .store(false, Ordering::Release);
+    }
+
+    fn revalidation_error(&self, method: &str) -> Option<anyhow::Error> {
+        if !self.revalidation_required.load(Ordering::Acquire) {
+            return None;
+        }
+        if method == "tools/list" && self.catalog_revalidation_allowed.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.reinit_capabilities.lock().unwrap().clone() {
+            Some(capabilities) => {
+                Some(anyhow::Error::new(McpSessionReinitialized { capabilities }))
+            }
+            None => Some(anyhow!(
+                "MCP session recovery did not complete; restart the server before retrying"
+            )),
+        }
+    }
+
+    fn publish_authentication_refreshed(&self) {
+        let _publication = self.health_publish_lock.lock().unwrap();
+        let authentication_revision =
+            Self::advance_revision(&self.authentication_revision, "authentication");
+        let current = *self.health.borrow();
+        self.health.send_replace(crate::McpTransportHealth {
+            authentication_revision,
+            ..current
+        });
     }
 
     /// POST one JSON-RPC message. `expect_id` is the request id whose response
@@ -212,6 +296,9 @@ impl HttpTransport {
             {
                 return Err(Attempt::Unauthorized(bearer));
             }
+            if code == 401 {
+                return Err(Attempt::Fatal(anyhow::Error::new(McpAuthenticationError)));
+            }
             let bytes = read_body_bounded(resp).await?;
             let text = String::from_utf8_lossy(&bytes);
             let msg = anyhow!("mcp http {status}: {text}");
@@ -271,11 +358,24 @@ impl HttpTransport {
     /// Serialized so a burst of 404s re-handshakes once: if another caller
     /// already refreshed the session (it differs from the one that failed),
     /// this is a no-op.
-    async fn reinitialize(&self, failed_session: &Option<String>) -> Result<()> {
+    async fn reinitialize(
+        &self,
+        failed_session: &Option<String>,
+    ) -> Result<crate::McpServerCapabilities> {
+        let _session = self.session_gate.write().await;
         let _guard = self.reinit_lock.lock().await;
         if *self.session_id.lock().unwrap() != *failed_session {
-            return Ok(());
+            return self
+                .reinit_capabilities
+                .lock()
+                .unwrap()
+                .clone()
+                .context("MCP session changed without recovered capabilities");
         }
+        self.revalidation_required.store(true, Ordering::Release);
+        self.catalog_revalidation_allowed
+            .store(false, Ordering::Release);
+        *self.reinit_capabilities.lock().unwrap() = None;
         let params = self
             .init_params
             .lock()
@@ -285,15 +385,23 @@ impl HttpTransport {
         *self.session_id.lock().unwrap() = None;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let init = json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": params});
-        self.post_with_retry(&init, Some(id), crate::HANDSHAKE_TIMEOUT)
+        let result = self
+            .post_with_retry(&init, Some(id), crate::HANDSHAKE_TIMEOUT)
             .await
             .map_err(PostError::into_anyhow)
-            .context("mcp re-initialize failed")?;
+            .context("mcp re-initialize failed")?
+            .context("mcp re-initialize produced no response")?;
+        let capabilities = crate::McpServerCapabilities::from_initialize(&result);
         let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        self.post_with_retry(&notif, None, NOTIFY_TIMEOUT)
-            .await
-            .map_err(PostError::into_anyhow)?;
-        Ok(())
+        if let Err(error) = self.post_with_retry(&notif, None, NOTIFY_TIMEOUT).await {
+            self.clear_recovered_session();
+            return Err(error.into_anyhow());
+        }
+        *self.reinit_capabilities.lock().unwrap() = Some(capabilities.clone());
+        self.catalog_revalidation_allowed
+            .store(true, Ordering::Release);
+        self.mark_session_revalidation_required();
+        Ok(capabilities)
     }
 }
 
@@ -309,15 +417,31 @@ impl Transport for HttpTransport {
             if method == "initialize" {
                 *self.init_params.lock().unwrap() = Some(params.clone());
             }
+            if let Some(error) = self.revalidation_error(method) {
+                return Err(error);
+            }
             let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            let session_revision = self.session_revision.load(Ordering::Acquire);
+            let session_guard = self.session_gate.read().await;
+            if let Some(error) = self.revalidation_error(method) {
+                return Err(error);
+            }
+            if self.session_revision.load(Ordering::Acquire) != session_revision {
+                let capabilities = self
+                    .reinit_capabilities
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("MCP session changed without recovered capabilities")?;
+                return Err(anyhow::Error::new(McpSessionReinitialized { capabilities }));
+            }
             let session_before = self.session_id.lock().unwrap().clone();
             let result = match self.post_with_retry(&body, Some(id), timeout).await {
                 Ok(v) => v,
                 Err(PostError::SessionExpired) => {
-                    self.reinitialize(&session_before).await?;
-                    self.post_with_retry(&body, Some(id), timeout)
-                        .await
-                        .map_err(PostError::into_anyhow)?
+                    drop(session_guard);
+                    let capabilities = self.reinitialize(&session_before).await?;
+                    return Err(anyhow::Error::new(McpSessionReinitialized { capabilities }));
                 }
                 Err(PostError::Unauthorized(used_bearer)) => {
                     // `Unauthorized` is only produced when oauth is set.
@@ -327,20 +451,37 @@ impl Transport for HttpTransport {
                         .expect("Unauthorized requires an OAuth session");
                     oauth.refresh_after_401(&used_bearer).await?;
                     match self.post_with_retry(&body, Some(id), timeout).await {
-                        Ok(v) => v,
+                        Ok(value) => {
+                            self.publish_authentication_refreshed();
+                            value
+                        }
+                        Err(PostError::SessionExpired) => {
+                            drop(session_guard);
+                            let capabilities = self.reinitialize(&session_before).await?;
+                            return Err(anyhow::Error::new(McpSessionReinitialized {
+                                capabilities,
+                            }));
+                        }
                         Err(PostError::Unauthorized(_)) => {
-                            return Err(anyhow!(
-                                "mcp http: still unauthorized after refreshing the OAuth token; \
-                                 re-run `kloop mcp login`"
-                            ));
+                            oauth.mark_relogin_required();
+                            return Err(anyhow::Error::new(McpAuthenticationError));
                         }
                         Err(other) => return Err(other.into_anyhow()),
                     }
                 }
                 Err(other) => return Err(other.into_anyhow()),
             };
+            if method == "tools/list" && result.is_some() {
+                self.revalidation_required.store(false, Ordering::Release);
+                self.catalog_revalidation_allowed
+                    .store(false, Ordering::Release);
+            }
             result.context("mcp http: request produced no response")
         })
+    }
+
+    fn subscribe_health(&self) -> Option<tokio::sync::watch::Receiver<crate::McpTransportHealth>> {
+        Some(self.health.subscribe())
     }
 
     fn notify<'a>(
@@ -374,7 +515,7 @@ impl PostError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             PostError::SessionExpired => anyhow!("mcp session expired"),
-            PostError::Unauthorized(_) => anyhow!("mcp http: unauthorized (401)"),
+            PostError::Unauthorized(_) => anyhow::Error::new(McpAuthenticationError),
             PostError::Other(e) => e,
         }
     }
@@ -698,12 +839,49 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
 
         let client = client(server.uri(), BTreeMap::new());
         let err = client.list_tools().await.unwrap_err();
-        assert!(err.to_string().contains("401"), "got: {err}");
+        assert!(err.downcast_ref::<McpAuthenticationError>().is_some());
         server.verify().await;
     }
 
-    /// A session-bearing request that 404s triggers exactly one re-handshake,
-    /// after which the retried call carries the fresh session id.
+    #[tokio::test]
+    async fn coalesced_health_snapshot_preserves_concurrent_session_and_auth_revisions() {
+        let transport = Arc::new(
+            HttpTransport::with_retry(
+                "https://example.com/mcp".into(),
+                BTreeMap::new(),
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let mut health = transport.subscribe_health().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let transport = transport.clone();
+            let barrier = barrier.clone();
+            tasks.push(std::thread::spawn(move || {
+                barrier.wait();
+                if index % 2 == 0 {
+                    transport.publish_session_reinitialized();
+                } else {
+                    transport.publish_authentication_refreshed();
+                }
+            }));
+        }
+        barrier.wait();
+        for task in tasks {
+            task.join().unwrap();
+        }
+        health.changed().await.unwrap();
+        let current = *health.borrow_and_update();
+        assert_eq!(current.session_revision, 16);
+        assert_eq!(current.authentication_revision, 16);
+        assert_eq!(current.state, crate::McpTransportState::Healthy);
+    }
+
+    /// A session-bearing request that 404s triggers exactly one re-handshake and
+    /// returns a typed revalidation outcome without replaying the operation.
     #[tokio::test]
     async fn session_expiry_reinitializes_once() {
         let server = MockServer::start().await;
@@ -717,7 +895,19 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
             .await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "initialize"})))
-            .respond_with(RpcResult::with_session(init_result(), "sess-2"))
+            .respond_with(RpcResult::with_session(
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {
+                        "resources": {},
+                        "extensions": {
+                            "io.modelcontextprotocol/skills": {"directoryRead": true}
+                        }
+                    },
+                    "serverInfo": {"name": "mock", "version": "1"}
+                }),
+                "sess-2",
+            ))
             .with_priority(2)
             .mount(&server)
             .await;
@@ -745,13 +935,97 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
             .with_priority(2)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .and(header("mcp-session-id", "sess-2"))
+            .respond_with(RpcResult::new(json!({"tools": []})))
+            .mount(&server)
+            .await;
 
         let client = client(server.uri(), BTreeMap::new());
+        let mut health = client.subscribe_health().unwrap();
         client.initialize().await.unwrap();
+        let error = client.call_tool("echo", &json!({})).await.unwrap_err();
+        let recovered = error
+            .downcast_ref::<McpSessionReinitialized>()
+            .unwrap_or_else(|| panic!("got: {error:#}"));
+        assert!(recovered.capabilities.resources);
+        assert!(recovered.capabilities.directory_read);
+        health.changed().await.unwrap();
+        let current = *health.borrow_and_update();
+        assert_eq!(current.session_revision, 1);
+        assert_eq!(current.authentication_revision, 0);
+        assert_eq!(current.state, crate::McpTransportState::Healthy);
+
+        let blocked = client.call_tool("echo", &json!({})).await.unwrap_err();
+        assert!(blocked.downcast_ref::<McpSessionReinitialized>().is_some());
+        assert!(client.list_tools().await.unwrap().is_empty());
         let out = client.call_tool("echo", &json!({})).await.unwrap();
         assert_eq!(out, "recovered");
     }
 
+    #[tokio::test]
+    async fn failed_initialized_notification_keeps_recovered_session_blocked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("mcp-session-id", "sess-2")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": init_result()
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let transport =
+            HttpTransport::with_retry(server.uri(), BTreeMap::new(), None, vec![Duration::ZERO])
+                .unwrap();
+        *transport.session_id.lock().unwrap() = Some("sess-1".into());
+        *transport.init_params.lock().unwrap() = Some(json!({
+            "protocolVersion": crate::PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "kloop", "version": "test"}
+        }));
+        let mut health = transport.subscribe_health().unwrap();
+        let error = transport
+            .reinitialize(&Some("sess-1".into()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mcp http 500"), "{error:#}");
+        assert!(transport.revalidation_required.load(Ordering::Acquire));
+        assert!(
+            !transport
+                .catalog_revalidation_allowed
+                .load(Ordering::Acquire)
+        );
+        assert!(transport.session_id.lock().unwrap().is_none());
+        assert!(transport.reinit_capabilities.lock().unwrap().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), health.changed())
+                .await
+                .is_err(),
+            "failed initialized notification must not publish a session revision"
+        );
+        let blocked = transport
+            .request("tools/call", json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(blocked.to_string().contains("recovery did not complete"));
+        server.verify().await;
+    }
     /// An OAuth server: the stale bearer 401s, the transport refreshes it once
     /// (POST /token), and the replayed request carries the fresh bearer.
     #[tokio::test]
@@ -801,7 +1075,60 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
             Box::new(|_| {}),
         ));
         let client = client_with_oauth(format!("{base}/mcp"), BTreeMap::new(), Some(session));
+        let mut health = client.subscribe_health().unwrap();
         let out = client.call_tool("echo", &json!({})).await.unwrap();
         assert_eq!(out, "authed");
+        health.changed().await.unwrap();
+        let current = *health.borrow_and_update();
+        assert_eq!(current.session_revision, 0);
+        assert_eq!(current.authentication_revision, 1);
+        assert_eq!(current.state, crate::McpTransportState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn oauth_fresh_bearer_rejected_marks_relogin_without_success_event() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "at-new", "expires_in": 3600})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(OAuthSession::new(
+            format!("{base}/token"),
+            "client-1".into(),
+            format!("{base}/mcp"),
+            OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-1".into()),
+                expires_at: None,
+                scope: None,
+            },
+            Box::new(|_| {}),
+        ));
+        let client = client_with_oauth(
+            format!("{base}/mcp"),
+            BTreeMap::new(),
+            Some(session.clone()),
+        );
+        let mut health = client.subscribe_health().unwrap();
+        let error = client.call_tool("echo", &json!({})).await.unwrap_err();
+        assert!(error.downcast_ref::<McpAuthenticationError>().is_some());
+        assert!(session.needs_relogin());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), health.changed())
+                .await
+                .is_err(),
+            "failed replay must not publish a successful auth revision"
+        );
     }
 }

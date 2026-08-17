@@ -12,6 +12,7 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 
 use kloop_mcp::McpClient;
+use kloop_mcp::McpTransportFailure;
 use kloop_protocol::ToolDef;
 
 /// The server end of the pipe: reads one JSON message per line, writes
@@ -606,8 +607,9 @@ async fn rpc_error_maps_to_err_with_code_and_message() {
 /// EOF with a request in flight resolves that request with a definite error
 /// instead of hanging until the timeout.
 #[tokio::test]
-async fn server_closing_fails_pending_requests() {
+async fn server_closing_fails_pending_requests_and_publishes_health() {
     let (client, mut server) = pair();
+    let mut health = client.subscribe_health().unwrap();
     tokio::spawn(async move {
         let _ = server.recv().await; // read the request, then hang up
         drop(server);
@@ -618,6 +620,14 @@ async fn server_closing_fails_pending_requests() {
         err.to_string().contains("closed the connection"),
         "got: {err}"
     );
+    health.changed().await.unwrap();
+    let current = *health.borrow_and_update();
+    assert_eq!(
+        current.state,
+        kloop_mcp::McpTransportState::Closed(McpTransportFailure::ConnectionEof)
+    );
+    assert_eq!(current.session_revision, 0);
+    assert_eq!(current.authentication_revision, 0);
 }
 
 /// Server-initiated requests are refused with -32601 (we advertise no

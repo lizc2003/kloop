@@ -670,6 +670,10 @@ impl OAuthSession {
         self.needs_relogin.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn mark_relogin_required(&self) {
+        self.needs_relogin.store(true, Ordering::Relaxed);
+    }
+
     /// Refresh only if the live access token still equals `stale` — the dedup
     /// that turns a herd of concurrent 401s (all holding the same token) into a
     /// single refresh.

@@ -104,6 +104,47 @@ pub enum McpNotification {
     ResourceUpdated { uri: String },
 }
 
+/// A bounded, secret-free transport health snapshot. Persistent failures use the
+/// `state` axis; HTTP session/auth recovery increment independent revisions so
+/// coalesced watch updates cannot lose either edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpTransportHealth {
+    pub state: McpTransportState,
+    pub session_revision: u64,
+    pub authentication_revision: u64,
+}
+
+impl McpTransportHealth {
+    fn healthy() -> Self {
+        Self {
+            state: McpTransportState::Healthy,
+            session_revision: 0,
+            authentication_revision: 0,
+        }
+    }
+
+    fn is_closed(self) -> bool {
+        matches!(self.state, McpTransportState::Closed(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpTransportState {
+    Healthy,
+    Degraded(McpTransportFailure),
+    Closed(McpTransportFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpTransportFailure {
+    RequestTimeout,
+    WriteFailed,
+    ConnectionEof,
+    ReadFailed,
+    MessageTooLarge,
+    ExplicitShutdown,
+}
+
 impl McpNotification {
     fn from_message(message: &Value) -> Option<Self> {
         match message["method"].as_str()? {
@@ -198,6 +239,51 @@ impl std::fmt::Display for McpRpcError {
 
 impl std::error::Error for McpRpcError {}
 
+/// A successful `tools/call` response whose MCP `isError` flag is true. This is
+/// a tool-level failure, not evidence that the server transport is unhealthy.
+#[derive(Debug)]
+pub struct McpToolCallError {
+    pub message: String,
+}
+
+impl std::fmt::Display for McpToolCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for McpToolCallError {}
+
+/// The HTTP transport established a new MCP session. The original operation was
+/// not replayed because the new capability/catalog must be revalidated first.
+#[derive(Clone, Debug)]
+pub struct McpSessionReinitialized {
+    pub capabilities: McpServerCapabilities,
+}
+
+impl std::fmt::Display for McpSessionReinitialized {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "MCP HTTP session was reinitialized; revalidate the server catalog before retrying",
+        )
+    }
+}
+
+impl std::error::Error for McpSessionReinitialized {}
+
+/// A request was rejected for authentication. This contains no response body,
+/// endpoint, header or credential data.
+#[derive(Debug)]
+pub struct McpAuthenticationError;
+
+impl std::fmt::Display for McpAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MCP authentication was rejected; authenticate before retrying")
+    }
+}
+
+impl std::error::Error for McpAuthenticationError {}
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 
@@ -218,11 +304,21 @@ pub(crate) trait Transport: Send + Sync {
         None
     }
 
+    fn subscribe_health(&self) -> Option<tokio::sync::watch::Receiver<McpTransportHealth>> {
+        None
+    }
+
     fn notify<'a>(
         &'a self,
         method: &'a str,
         params: Option<Value>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    fn abort(&self) {}
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 /// One connected MCP server. All methods take `&self`; concurrent calls are
@@ -317,6 +413,22 @@ impl McpClient {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<McpNotification>> {
         self.transport.subscribe()
+    }
+
+    pub fn subscribe_health(&self) -> Option<tokio::sync::watch::Receiver<McpTransportHealth>> {
+        self.transport.subscribe_health()
+    }
+
+    /// Stop transport-owned tasks and child processes without waiting. The
+    /// lifecycle owner uses this as its synchronous Drop fallback.
+    pub fn abort(&self) {
+        self.transport.abort();
+    }
+
+    /// Explicit transport shutdown. Stdio closes its reader, fails pending
+    /// requests and reaps the child; request-scoped HTTP has nothing persistent.
+    pub async fn shutdown(&self) {
+        self.transport.shutdown().await;
     }
 
     /// Full tool list (follows `nextCursor` pagination). Names are the raw
@@ -459,7 +571,9 @@ impl McpClient {
             .await?;
         validate_call_tool_result(&result)?;
         if result["isError"].as_bool().unwrap_or(false) {
-            bail!("{}", render_result(&result));
+            return Err(anyhow::Error::new(McpToolCallError {
+                message: render_result(&result),
+            }));
         }
         Ok(result)
     }
@@ -500,6 +614,17 @@ fn validate_call_tool_result(result: &Value) -> Result<()> {
     Ok(())
 }
 
+struct PendingRequest {
+    id: u64,
+    pending: Pending,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// The stdio transport: newline-delimited JSON over a child process's (or, in
 /// tests, a duplex pipe's) byte streams. A background reader task routes
 /// responses to pending requests by id.
@@ -507,15 +632,15 @@ struct StdioTransport {
     writer: SharedWriter,
     pending: Pending,
     notifications: tokio::sync::broadcast::Sender<McpNotification>,
+    health: tokio::sync::watch::Sender<McpTransportHealth>,
     next_id: AtomicU64,
-    reader: tokio::task::JoinHandle<()>,
-    /// Held only so kill_on_drop fires when the transport is dropped.
-    _child: Option<tokio::process::Child>,
+    reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    child: Mutex<Option<tokio::process::Child>>,
 }
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        self.reader.abort();
+        self.abort();
     }
 }
 
@@ -550,20 +675,55 @@ impl StdioTransport {
         let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (notifications, _) = tokio::sync::broadcast::channel(32);
+        let (health, _) = tokio::sync::watch::channel(McpTransportHealth::healthy());
         let reader_task = tokio::spawn(read_loop(
             reader,
             writer.clone(),
             pending.clone(),
             notifications.clone(),
+            health.clone(),
         ));
         StdioTransport {
             writer,
             pending,
             notifications,
+            health,
             next_id: AtomicU64::new(1),
-            reader: reader_task,
-            _child: child,
+            reader: Mutex::new(Some(reader_task)),
+            child: Mutex::new(child),
         }
+    }
+
+    fn publish_health(&self, state: McpTransportState) {
+        publish_transport_state(&self.health, state);
+    }
+
+    fn close_local(&self, failure: McpTransportFailure) {
+        self.publish_health(McpTransportState::Closed(failure));
+        if let Some(reader) = self.reader.lock().unwrap().take() {
+            reader.abort();
+        }
+        fail_pending(&self.pending, "mcp transport closed");
+    }
+}
+
+fn publish_transport_state(
+    health: &tokio::sync::watch::Sender<McpTransportHealth>,
+    state: McpTransportState,
+) {
+    health.send_if_modified(|current| {
+        if current.is_closed() {
+            return false;
+        }
+        current.state = state;
+        true
+    });
+}
+
+fn fail_pending(pending: &Pending, reason: &str) {
+    let stranded: Vec<_> = pending.lock().unwrap().drain().collect();
+    for (_, tx) in stranded {
+        let _ = tx.send(Err(anyhow!(reason.to_string())));
     }
 }
 
@@ -575,19 +735,39 @@ impl Transport for StdioTransport {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
+            if self.health.borrow().is_closed() {
+                bail!("{method}: MCP transport is closed");
+            }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(id, tx);
+            let _pending = PendingRequest {
+                id,
+                pending: self.pending.clone(),
+            };
+            if self.health.borrow().is_closed() {
+                bail!("{method}: MCP transport closed while registering the request");
+            }
             let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-            if let Err(e) = write_line(&self.writer, &msg).await {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(e);
+            if let Err(error) = write_line(&self.writer, &msg).await {
+                self.close_local(McpTransportFailure::WriteFailed);
+                return Err(error);
             }
             match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(anyhow!("{method}: connection closed before response")),
+                Ok(Ok(result)) => {
+                    self.publish_health(McpTransportState::Healthy);
+                    result
+                }
+                Ok(Err(_)) => {
+                    self.publish_health(McpTransportState::Closed(
+                        McpTransportFailure::ConnectionEof,
+                    ));
+                    Err(anyhow!("{method}: connection closed before response"))
+                }
                 Err(_) => {
-                    self.pending.lock().unwrap().remove(&id);
+                    self.publish_health(McpTransportState::Degraded(
+                        McpTransportFailure::RequestTimeout,
+                    ));
                     Err(anyhow!("{method}: no response within {timeout:?}"))
                 }
             }
@@ -598,17 +778,46 @@ impl Transport for StdioTransport {
         Some(self.notifications.subscribe())
     }
 
+    fn subscribe_health(&self) -> Option<tokio::sync::watch::Receiver<McpTransportHealth>> {
+        Some(self.health.subscribe())
+    }
+
     fn notify<'a>(
         &'a self,
         method: &'a str,
         params: Option<Value>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            if self.health.borrow().is_closed() {
+                bail!("{method}: MCP transport is closed");
+            }
             let msg = match params {
                 Some(params) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
                 None => json!({"jsonrpc": "2.0", "method": method}),
             };
-            write_line(&self.writer, &msg).await
+            if let Err(error) = write_line(&self.writer, &msg).await {
+                self.close_local(McpTransportFailure::WriteFailed);
+                return Err(error);
+            }
+            self.publish_health(McpTransportState::Healthy);
+            Ok(())
+        })
+    }
+
+    fn abort(&self) {
+        self.close_local(McpTransportFailure::ExplicitShutdown);
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.close_local(McpTransportFailure::ExplicitShutdown);
+            let child = self.child.lock().unwrap().take();
+            if let Some(mut child) = child {
+                let _ = child.kill().await;
+            }
         })
     }
 }
@@ -681,13 +890,26 @@ async fn read_loop(
     writer: SharedWriter,
     pending: Pending,
     notifications: tokio::sync::broadcast::Sender<McpNotification>,
+    health: tokio::sync::watch::Sender<McpTransportHealth>,
 ) {
     let mut reader = BufReader::new(reader);
-    let terminal_error = loop {
+    let (terminal_failure, terminal_error) = loop {
         let line = match read_bounded_line(&mut reader, MAX_WIRE_MESSAGE_BYTES).await {
             Ok(Some(line)) => line,
-            Ok(None) => break "mcp server closed the connection".to_string(),
-            Err(error) => break format!("mcp read failed: {error}"),
+            Ok(None) => {
+                break (
+                    McpTransportFailure::ConnectionEof,
+                    "mcp server closed the connection".to_string(),
+                );
+            }
+            Err(error) => {
+                let failure = if error.kind() == io::ErrorKind::InvalidData {
+                    McpTransportFailure::MessageTooLarge
+                } else {
+                    McpTransportFailure::ReadFailed
+                };
+                break (failure, format!("mcp read failed: {error}"));
+            }
         };
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -702,7 +924,12 @@ async fn read_loop(
                     "id": id,
                     "error": {"code": -32601, "message": "method not supported by this client"},
                 });
-                let _ = write_line(&writer, &refusal).await;
+                if let Err(error) = write_line(&writer, &refusal).await {
+                    break (
+                        McpTransportFailure::WriteFailed,
+                        format!("mcp write failed: {error}"),
+                    );
+                }
             } else if let Some(notification) = McpNotification::from_message(&msg) {
                 let _ = notifications.send(notification);
             }
@@ -723,12 +950,10 @@ async fn read_loop(
         };
         let _ = tx.send(outcome);
     };
-    // EOF, read failure, or an oversized frame: every in-flight request gets a
-    // definite answer and the untrusted stream is not parsed further.
-    let stranded: Vec<_> = pending.lock().unwrap().drain().collect();
-    for (_, tx) in stranded {
-        let _ = tx.send(Err(anyhow!(terminal_error.clone())));
-    }
+    // EOF, read failure, or an oversized frame: publish one bounded health
+    // transition before failing every in-flight request.
+    publish_transport_state(&health, McpTransportState::Closed(terminal_failure));
+    fail_pending(&pending, &terminal_error);
 }
 
 /// Flatten a `CallToolResult`'s content array into the plain text a tool_result
@@ -856,5 +1081,83 @@ mod wire_tests {
         let error = read_bounded_line(&mut reader, 4).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("wire limit"));
+    }
+
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture write failure",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_server_request_refusal_closes_transport_health() {
+        use super::McpTransportFailure;
+        use super::McpTransportState;
+        use super::StdioTransport;
+        use super::Transport;
+
+        let (mut server_writer, client_reader) = tokio::io::duplex(4096);
+        let transport = StdioTransport::over(client_reader, FailingWriter, None);
+        let mut health = transport.subscribe_health().unwrap();
+        server_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"roots/list\"}\n")
+            .await
+            .unwrap();
+        health.changed().await.unwrap();
+        assert_eq!(
+            health.borrow_and_update().state,
+            McpTransportState::Closed(McpTransportFailure::WriteFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_request_future_removes_pending_entry() {
+        use super::StdioTransport;
+        use super::Transport;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client_io);
+        let (server_reader, _server_writer) = tokio::io::split(server_io);
+        let transport = Arc::new(StdioTransport::over(reader, writer, None));
+        let request_transport = transport.clone();
+        let request = tokio::spawn(async move {
+            request_transport
+                .request("tools/call", json!({}), Duration::from_secs(60))
+                .await
+        });
+        let mut lines = BufReader::new(server_reader).lines();
+        let _ = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(transport.pending.lock().unwrap().len(), 1);
+        request.abort();
+        let _ = request.await;
+        tokio::task::yield_now().await;
+        assert!(transport.pending.lock().unwrap().is_empty());
     }
 }

@@ -15,6 +15,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use super::SourceCallBinding;
+use super::SourceRouteState;
 use super::ToolCtx;
 use super::deferred_tool_defs;
 use super::str_arg;
@@ -214,8 +215,22 @@ fn receipt_for_capability(
     }
 }
 
+pub(super) fn current_source_route(name: &str, cfg: &Config) -> SourceRouteState {
+    super::source_route_state(&cfg.tool_sources, name)
+}
+
 pub(super) fn current_source_binding(name: &str, cfg: &Config) -> Option<SourceCallBinding> {
-    super::source_call_binding(&cfg.tool_sources, name)
+    match current_source_route(name, cfg) {
+        SourceRouteState::Available(binding) => Some(binding),
+        SourceRouteState::Missing | SourceRouteState::Unavailable(_) => None,
+    }
+}
+
+pub(super) fn unavailable_source_reason(name: &str, cfg: &Config) -> Option<String> {
+    match current_source_route(name, cfg) {
+        SourceRouteState::Unavailable(reason) => Some(reason),
+        SourceRouteState::Missing | SourceRouteState::Available(_) => None,
+    }
 }
 
 /// Return the exact source owner/generation unlocked for this capability scope.
@@ -291,6 +306,8 @@ pub(super) async fn tool_search_tool(
                 }
             } else if loaded.iter().any(|def| def.name.eq_ignore_ascii_case(name)) {
                 notes.push(format!("'{name}' is already loaded; call it directly"));
+            } else if let Some(reason) = unavailable_source_reason(name, &ctx.cfg) {
+                notes.push(reason);
             } else {
                 notes.push(format!("no deferred tool named '{name}'"));
             }
@@ -303,6 +320,8 @@ pub(super) async fn tool_search_tool(
         .find(|def| def.name.eq_ignore_ascii_case(&query))
     {
         found.push(def.clone());
+    } else if let Some(reason) = unavailable_source_reason(&query, &ctx.cfg) {
+        notes.push(reason);
     } else {
         let query_lower = query.to_lowercase();
         let prefix_matches: Vec<ToolDef> = deferred
@@ -334,21 +353,25 @@ pub(super) async fn tool_search_tool(
     }
 
     let capability = CapabilityBinding::capture(ctx, workspace);
-    let found: Vec<ToolDef> = found
-        .into_iter()
-        .filter_map(|definition| {
-            super::source_definition_snapshot(&ctx.cfg.tool_sources, &definition.name)
-        })
-        .map(|snapshot| {
-            ctx.cfg.unlocked_tools.record(receipt_for_capability(
-                &snapshot.definition.name,
-                snapshot.binding,
-                &capability,
-            ));
-            snapshot.definition
-        })
-        .collect();
-    Ok(render(&found, &notes, deferred.len()))
+    let mut published = Vec::new();
+    for definition in found {
+        match super::source_definition_result(&ctx.cfg.tool_sources, &definition.name) {
+            Ok(Some(snapshot)) => {
+                ctx.cfg.unlocked_tools.record(receipt_for_capability(
+                    &snapshot.definition.name,
+                    snapshot.binding,
+                    &capability,
+                ));
+                published.push(snapshot.definition);
+            }
+            Ok(None) => notes.push(format!(
+                "tool '{}' changed while search results were being published; search again",
+                definition.name
+            )),
+            Err(reason) => notes.push(reason),
+        }
+    }
+    Ok(render(&published, &notes, deferred.len()))
 }
 
 #[derive(Debug)]
@@ -529,6 +552,75 @@ mod tests {
             _input: &'a Value,
         ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
             Box::pin(async move { Ok(crate::tools::SourceOutput::text(format!("ran {tool}"))) })
+        }
+    }
+
+    struct ReadinessSrv {
+        revision: std::sync::atomic::AtomicU64,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolSource for ReadinessSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![ToolDef {
+                name: "srv__readiness".into(),
+                description: "A tool whose readiness revision changes".into(),
+                schema: json!({"type": "object"}),
+            }])
+        }
+
+        fn readiness_revision(&self, _tool: &str) -> u64 {
+            self.revision.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(crate::tools::SourceOutput::text("ready call".into()))
+            })
+        }
+    }
+
+    struct UnavailableDuringPublishSrv;
+
+    impl ToolSource for UnavailableDuringPublishSrv {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![ToolDef {
+                name: "srv__publish_race".into(),
+                description: "becomes unavailable while publishing".into(),
+                schema: json!({"type": "object"}),
+            }])
+        }
+
+        fn definition_state(&self, tool: &str) -> crate::tools::SourceDefinitionState {
+            if tool == "srv__publish_race" {
+                crate::tools::SourceDefinitionState::Unavailable {
+                    reason: "MCP server is stale: unavailable, not missing".into(),
+                }
+            } else {
+                crate::tools::SourceDefinitionState::Missing
+            }
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::tools::SourceOutput>> + Send + 'a>> {
+            Box::pin(async { unreachable!("unavailable source must not be called") })
         }
     }
 
@@ -917,7 +1009,48 @@ mod tests {
         let receipts = ctx.cfg.unlocked_tools.receipts();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].tool_name, "srv__racing");
-        assert_eq!(receipts[0].source.generation, 1);
+        assert_eq!(receipts[0].source.version.definition_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_revision_invalidates_discovery_without_calling_source() {
+        let source = Arc::new(ReadinessSrv {
+            revision: std::sync::atomic::AtomicU64::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ctx = deferred_ctx_with_source("readiness-revision", source.clone());
+        search_select(&ctx, "srv__readiness").await;
+        let receipts = ctx.cfg.unlocked_tools.receipts();
+        assert_eq!(receipts[0].source.version.readiness_revision, 0);
+
+        source
+            .revision
+            .store(1, std::sync::atomic::Ordering::Release);
+        let (output, is_error) = run_tool("srv__readiness", json!({}), &ctx).await;
+        assert!(is_error, "{output}");
+        assert!(output.contains("deferred and not loaded yet"), "{output}");
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        search_select(&ctx, "srv__readiness").await;
+        let (output, is_error) = run_tool("srv__readiness", json!({}), &ctx).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "ready call");
+    }
+
+    #[tokio::test]
+    async fn unavailable_during_publication_is_not_rendered_as_no_match() {
+        let ctx = deferred_ctx_with_source(
+            "unavailable-publication",
+            Arc::new(UnavailableDuringPublishSrv),
+        );
+        for query in ["select:srv__publish_race", "srv__publish_race"] {
+            let (output, is_error) = run_tool("tool_search", json!({"query": query}), &ctx).await;
+            assert!(!is_error, "{output}");
+            assert!(output.contains("unavailable, not missing"), "{output}");
+            assert!(!output.contains("No matching deferred tools"), "{output}");
+            assert!(!output.contains("no deferred tool named"), "{output}");
+        }
+        assert!(ctx.cfg.unlocked_tools.receipts().is_empty());
     }
 
     #[tokio::test]
@@ -1346,7 +1479,7 @@ mod tests {
         changed.source.source_slot += 1;
         mutations.push(changed);
         let mut changed = receipt.clone();
-        changed.source.generation += 1;
+        changed.source.version.definition_generation += 1;
         mutations.push(changed);
         let mut changed = receipt.clone();
         changed.capability.workspace_id = other_workspace.workspace_id().clone();

@@ -124,6 +124,8 @@ pub(crate) struct ProgramToolEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgramToolManifest {
     entries: Vec<ProgramToolEntry>,
+    source_versions_before: Vec<super::SourceVersion>,
+    source_versions_after: Vec<super::SourceVersion>,
 }
 
 impl ProgramToolManifest {
@@ -137,6 +139,10 @@ impl ProgramToolManifest {
     fn get(&self, name: &str) -> Option<&ProgramToolEntry> {
         self.entries.iter().find(|entry| entry.name == name)
     }
+
+    pub(crate) fn is_consistent(&self) -> bool {
+        self.source_versions_before == self.source_versions_after
+    }
 }
 
 /// Capture the exact callable source owner/generation and readonly verdict that
@@ -147,6 +153,10 @@ pub(crate) fn capture_program_tool_manifest(
     sources: &[Arc<dyn super::ToolSource>],
     shell_programs: &crate::shell_programs::ShellPrograms,
 ) -> ProgramToolManifest {
+    let source_versions_before = sources
+        .iter()
+        .map(|source| source.catalog_version())
+        .collect();
     let mut entries: Vec<ProgramToolEntry> = super::builtin_defs(0, shell_programs)
         .into_iter()
         .filter(|definition| is_program_callable(&definition.name))
@@ -170,7 +180,15 @@ pub(crate) fn capture_program_tool_manifest(
                 })
             }),
     );
-    ProgramToolManifest { entries }
+    let source_versions_after = sources
+        .iter()
+        .map(|source| source.catalog_version())
+        .collect();
+    ProgramToolManifest {
+        entries,
+        source_versions_before,
+        source_versions_after,
+    }
 }
 
 #[cfg(test)]

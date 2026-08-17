@@ -314,7 +314,7 @@ async fn turn_rounds(
                 &cfg.tool_sources,
                 &cfg.shell_programs,
             );
-            if before != after {
+            if !before.is_consistent() || !after.is_consistent() || before != after {
                 continue;
             }
             // The `skill` tool exists only at depth 0 (like `task`) and only when a

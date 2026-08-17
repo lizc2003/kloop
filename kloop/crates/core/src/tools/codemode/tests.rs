@@ -1332,6 +1332,7 @@ impl ToolSource for Srv {
 struct MutableSrvState {
     definition: Option<ToolDef>,
     generation: u64,
+    readiness_revision: u64,
 }
 
 struct MutableSrv {
@@ -1351,6 +1352,7 @@ impl MutableSrv {
                     schema: json!({"type": "object"}),
                 }),
                 generation: 0,
+                readiness_revision: 0,
             }),
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -1364,6 +1366,10 @@ impl MutableSrv {
             description: format!("{} refreshed schema", self.label),
             schema: json!({"type": "object"}),
         });
+    }
+
+    fn bump_readiness(&self) {
+        self.state.lock().unwrap().readiness_revision += 1;
     }
 
     fn calls(&self) -> usize {
@@ -1386,6 +1392,10 @@ impl ToolSource for MutableSrv {
 
     fn definition_generation(&self, _tool: &str) -> u64 {
         self.state.lock().unwrap().generation
+    }
+
+    fn readiness_revision(&self, _tool: &str) -> u64 {
+        self.state.lock().unwrap().readiness_revision
     }
 
     fn definition_snapshot(&self, tool: &str) -> Option<(ToolDef, u64)> {
@@ -1444,6 +1454,59 @@ impl ToolSource for MutableSrv {
     }
 }
 
+struct ManifestCaptureRaceSource {
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl ToolSource for ManifestCaptureRaceSource {
+    fn defs(&self) -> Arc<[ToolDef]> {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Arc::from(vec![ToolDef {
+            name: "srv__manifest_race".into(),
+            description: "manifest race".into(),
+            schema: json!({"type": "object"}),
+        }])
+    }
+
+    fn catalog_version(&self) -> crate::tools::SourceVersion {
+        crate::tools::SourceVersion {
+            definition_generation: 0,
+            readiness_revision: self.revision.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    fn is_readonly(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        _tool: &'a str,
+        _input: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<crate::tools::SourceOutput>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { unreachable!("capture-only fixture") })
+    }
+}
+
+#[test]
+fn program_manifest_detects_lifecycle_change_during_capture() {
+    let source: Arc<dyn ToolSource> = Arc::new(ManifestCaptureRaceSource {
+        revision: std::sync::atomic::AtomicU64::new(0),
+    });
+    let manifest = capture_program_tool_manifest(
+        &[source],
+        &crate::shell_programs::ShellPrograms::native_posix(),
+    );
+    assert!(!manifest.is_consistent());
+}
+
 #[tokio::test]
 async fn program_manifest_rejects_same_name_source_owner_hop() {
     let first = MutableSrv::new("first");
@@ -1467,6 +1530,36 @@ async fn program_manifest_rejects_same_name_source_owner_hop() {
     );
     assert_eq!(first.calls(), 0);
     assert_eq!(second.calls(), 0);
+}
+
+#[tokio::test]
+async fn program_manifest_rejects_readiness_revision_change() {
+    let source = MutableSrv::new("source");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tag = format!("program-readiness-{}-{unique}", std::process::id());
+    let mut ctx = test_ctx_with_sources(0, &tag, vec![source.clone()]);
+    let mut cfg = ctx.cfg.test_clone();
+    cfg.offload_dir = std::env::temp_dir()
+        .join(format!("kloop-program-readiness-{tag}"))
+        .join("offload");
+    ctx.cfg = Arc::new(cfg);
+    ctx.program_tool_manifest = Some(Arc::new(capture_program_tool_manifest(
+        &ctx.cfg.tool_sources,
+        &ctx.cfg.shell_programs,
+    )));
+
+    source.bump_readiness();
+    let (output, is_error) = run("return await tools.srv__same({});", &ctx).await;
+
+    assert!(is_error, "{output}");
+    assert!(
+        output.contains("source changed after this Program API was generated"),
+        "{output}"
+    );
+    assert_eq!(source.calls(), 0);
 }
 
 /// Slice 1: below the defer threshold, an external source tool is callable from

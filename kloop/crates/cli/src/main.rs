@@ -132,8 +132,8 @@ async fn main() -> Result<ExitCode> {
     // MCP servers connect once per process (before any UI owns the terminal)
     // and are shared into every Config — including all server-mode threads.
     // --mock stays hermetic: no child processes or web-key reads.
-    let (tool_sources, mcp_statuses) = if args.mock {
-        (Vec::new(), Vec::new())
+    let (tool_sources, mcp_statuses, mcp_lifecycle) = if args.mock {
+        (Vec::new(), Vec::new(), mcp::McpLifecycleOwner::default())
     } else {
         let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
         // Web tools ride the same ToolSource seam, registered before MCP so
@@ -142,8 +142,12 @@ async fn main() -> Result<ExitCode> {
         let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
         sources.extend(web::build_web_source(&web_cfg, &warn));
         let servers = mcp::load_mcp_servers(user_config.table())?;
-        let mcp = mcp::connect_servers(servers, &warn).await?;
-        sources.extend(mcp.sources);
+        let mcp::McpConnections {
+            sources: mcp_sources,
+            statuses,
+            lifecycle,
+        } = mcp::connect_servers(servers, &warn).await?;
+        sources.extend(mcp_sources);
         for warning in tool_merge_warnings(
             &sources,
             runtime.defer_threshold(),
@@ -151,7 +155,7 @@ async fn main() -> Result<ExitCode> {
         ) {
             warn(&warning);
         }
-        (sources, mcp.statuses)
+        (sources, statuses, lifecycle)
     };
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     if args.serve {
@@ -222,7 +226,9 @@ async fn main() -> Result<ExitCode> {
             server_config_snapshot(&read_args, cwd, &config_provider, &config_runtime)
         });
         server.skills_reader = server_skills_reader(&args);
-        kloop_server::serve_stdio(server).await?;
+        let server_result = kloop_server::serve_stdio(server).await;
+        mcp_lifecycle.shutdown().await;
+        server_result?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -302,6 +308,7 @@ async fn main() -> Result<ExitCode> {
             && let Err(e) = kloop_core::worktree::enter(&cfg, name).await
         {
             eprintln!("worktree: {e:#}");
+            mcp_lifecycle.shutdown().await;
             return Ok(ExitCode::FAILURE);
         }
         let cancel = CancellationToken::new();
@@ -326,13 +333,14 @@ async fn main() -> Result<ExitCode> {
         if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
             eprintln!("{}", note.trim());
         }
+        mcp_lifecycle.shutdown().await;
         return Ok(ExitCode::from(result.code as u8));
     }
 
     // The TUI is the default entry point; --plain keeps the line-based REPL,
     // and --mock's scripted demo stays on plain output where it is readable.
     if args.mock || args.plain {
-        plain_main(
+        let plain_result = plain_main(
             args,
             provider,
             runtime,
@@ -344,12 +352,14 @@ async fn main() -> Result<ExitCode> {
             skills,
             pending_images,
         )
-        .await?;
+        .await;
+        mcp_lifecycle.shutdown().await;
+        plain_result?;
         return Ok(ExitCode::SUCCESS);
     }
     let factory_session_id = session_id.clone();
     let worktree = args.worktree.clone();
-    kloop_tui::run(
+    let tui_result = kloop_tui::run(
         move |approver, questioner, notify| {
             let mut cfg = config_from_settings(
                 &args,
@@ -372,7 +382,9 @@ async fn main() -> Result<ExitCode> {
         pending_images,
         worktree,
     )
-    .await?;
+    .await;
+    mcp_lifecycle.shutdown().await;
+    tui_result?;
     Ok(ExitCode::SUCCESS)
 }
 
