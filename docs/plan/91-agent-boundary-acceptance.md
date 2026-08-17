@@ -1,6 +1,6 @@
 # Plan 91 — CodeWhale 借鉴：agent boundary acceptance/conformance
 
-> 状态：✅ 已完成（2026-08-18；Plan 87–90 deterministic acceptance 与 Plan 92 provider route/switch 跨面验收已实施；提交 `02650ee`）
+> 状态：✅ 已完成（2026-08-18；Plan 87–90 deterministic acceptance 与 Plan 92 provider route/switch 跨面验收已实施；提交 `da6f7f3`）
 >
 > 依赖：Plan 87、Plan 88、Plan 89、Plan 90、Plan 92；复用 Plan 54、Plan 63、Plan 68、Plan 77、Plan 81、Plan 85、Plan 86；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 

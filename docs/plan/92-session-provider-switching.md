@@ -1,6 +1,6 @@
 # Plan 92 — CodeWhale 借鉴：会话内 provider/model 热切换
 
-> 状态：✅ 已完成（2026-08-18；提交 `02650ee`）
+> 状态：✅ 已完成（2026-08-18；提交 `da6f7f3`）
 >
 > 依赖：Plan 39、Plan 40、Plan 77、Plan 81、Plan 85、Plan 86、Plan 89；完成后纳入 Plan 91 跨面验收；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 >
