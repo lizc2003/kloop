@@ -461,7 +461,7 @@ async fn background_agent_scheduler_report() -> Value {
     config.inbox = Arc::clone(&inbox);
     config.scheduler = Arc::clone(&scheduler);
     config.session_id = "plan59-owner".into();
-    config.provider = Arc::new(provider);
+    config.set_test_provider(provider);
     config.surface.scheduler = true;
     context.cfg = Arc::new(config);
 
@@ -909,7 +909,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let mut config = context.cfg.test_clone();
     config.cwd = root.path().to_path_buf();
     config.offload_dir = root.path().join("offload");
-    config.provider = Arc::new(workflow_provider);
+    config.set_test_provider(workflow_provider);
     config.questioner = Some(questioner);
     config.permissions = Arc::new(permissions);
     config.surface = SurfaceCapabilities {

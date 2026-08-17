@@ -36,9 +36,13 @@ fn mock_assistant(content: Vec<ContentBlock>, model: &str) -> Message {
     Message::assistant_from_provider(
         content,
         ProviderResponseProvenance {
-            provider: "mock".into(),
+            route_revision: 1,
+            origin_boundary: 2,
+            provider_id: "test".into(),
             api_family: ProviderApiFamily::Mock,
+            endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
             model: model.into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
         },
     )
 }
@@ -145,7 +149,7 @@ fn structured_config(
     let (provider, seen) = Provider::mock_recording(turns);
     let ctx = crate::tools::testutil::test_ctx(1, "structured-agent");
     let mut cfg = ctx.cfg.test_clone();
-    cfg.provider = Arc::new(provider);
+    cfg.set_test_provider(provider);
     cfg.max_rounds = Some(10);
     cfg.local_agent = cfg.local_agent.child("agent-99".parse().unwrap());
     (Arc::new(cfg), seen)
@@ -517,10 +521,18 @@ async fn mock_end_to_end_three_rounds() {
             text: "all done".into(),
         }],
     ]);
+    let (provider_catalog, provider_route) = crate::provider_route::ProviderCatalog::from_provider(
+        "test",
+        provider,
+        "mock",
+        vec!["mock".into()],
+        None,
+    )
+    .unwrap();
     let inbox = Arc::new(crate::inbox::Inbox::default());
     let cfg = Arc::new(Config {
-        provider: Arc::new(provider),
-        model: "mock".into(),
+        provider_catalog,
+        provider_route,
         system: "test".into(),
         project_instructions: None,
         max_rounds: Some(10),
@@ -528,7 +540,6 @@ async fn mock_end_to_end_three_rounds() {
         offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
         sessions_dir: std::env::temp_dir().join("kloop-test-e2e-sessions"),
         context_window: None,
-        fallback_model: None,
         permissions: Arc::new(crate::permissions::Permissions::allow_all()),
         questioner: None,
         file_state: Default::default(),
@@ -663,7 +674,10 @@ async fn subagent_turn_routes_to_subagent_hooks() {
     // Give the sub-agent a session file so the stop payload has a transcript.
     let session = dir.join("agent-7.jsonl");
     let mut history = History::new(cfg.offload_dir.clone());
-    history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
     history.record(Message::user_text("do sub work"));
 
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -697,10 +711,18 @@ async fn subagent_turn_routes_to_subagent_hooks() {
 }
 
 fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
+    let (provider_catalog, provider_route) = crate::provider_route::ProviderCatalog::from_provider(
+        "test",
+        provider,
+        "mock",
+        vec!["mock".into()],
+        None,
+    )
+    .unwrap();
     let inbox = Arc::new(crate::inbox::Inbox::default());
     Arc::new(Config {
-        provider: Arc::new(provider),
-        model: "mock".into(),
+        provider_catalog,
+        provider_route,
         system: "test".into(),
         project_instructions: None,
         max_rounds: Some(10),
@@ -708,7 +730,6 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
         offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
         sessions_dir: std::env::temp_dir().join(format!("kloop-test-{tag}-sessions")),
         context_window: Some(window),
-        fallback_model: None,
         permissions: Arc::new(crate::permissions::Permissions::allow_all()),
         questioner: None,
         file_state: Default::default(),
@@ -905,7 +926,7 @@ async fn reactive_compaction_uses_the_active_fallback_model() {
         MockTurn::Blocks(text("fallback answer")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "reactive-fallback").test_clone();
-    cfg.fallback_model = Some("mock-fallback".into());
+    cfg.set_test_route_models("mock", Some("mock-fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1043,7 +1064,10 @@ async fn validated_terminal_usage_is_recorded_before_assistant_message() {
     let cfg = compaction_cfg(provider, 200_000, "usage-order");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
-    history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
     history.record(Message::user_text("question"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -1051,11 +1075,11 @@ async fn validated_terminal_usage_is_recorded_before_assistant_message() {
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(
         history.provider_usage().records(),
-        &[ProviderUsageRecord {
-            model: "mock".into(),
-            operation: UsageOperation::Sampling,
-            usage: usage(10),
-        }]
+        &[ProviderUsageRecord::from_attempt(
+            cfg.provider_route.primary_attempt().identity(),
+            UsageOperation::Sampling,
+            usage(10),
+        )]
     );
     let lines: Vec<serde_json::Value> = std::fs::read_to_string(&session)
         .unwrap()
@@ -1064,10 +1088,15 @@ async fn validated_terminal_usage_is_recorded_before_assistant_message() {
         .collect();
     assert_eq!(
         lines.iter().map(|line| &line["type"]).collect::<Vec<_>>(),
-        vec!["message", "provider_usage", "message"]
+        vec![
+            "provider_route_initial",
+            "message",
+            "provider_usage",
+            "message",
+        ]
     );
-    assert_eq!(lines[1]["parent"], lines[0]["id"]);
     assert_eq!(lines[2]["parent"], lines[1]["id"]);
+    assert_eq!(lines[3]["parent"], lines[2]["id"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1104,11 +1133,11 @@ async fn every_valid_terminal_outcome_keeps_reported_usage() {
 
         assert_eq!(
             history.provider_usage().records(),
-            &[ProviderUsageRecord {
-                model: "mock".into(),
-                operation: UsageOperation::Sampling,
-                usage: usage(index as u64 + 1),
-            }],
+            &[ProviderUsageRecord::from_attempt(
+                cfg.provider_route.primary_attempt().identity(),
+                UsageOperation::Sampling,
+                usage(index as u64 + 1),
+            )],
             "terminal case {index}"
         );
     }
@@ -1124,10 +1153,7 @@ async fn failures_and_missing_usage_do_not_create_records() {
     ];
     for (index, turns) in cases.into_iter().enumerate() {
         let provider = Provider::mock_scripted(turns);
-        let mut cfg =
-            compaction_cfg(provider, 200_000, &format!("usage-none-{index}")).test_clone();
-        cfg.fallback_model = None;
-        let cfg = Arc::new(cfg);
+        let cfg = compaction_cfg(provider, 200_000, &format!("usage-none-{index}"));
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("request"));
@@ -1154,8 +1180,7 @@ async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() 
         },
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "usage-fallback").test_clone();
-    cfg.model = "primary".into();
-    cfg.fallback_model = Some("fallback".into());
+    cfg.set_test_route_models("primary", Some("fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1166,19 +1191,15 @@ async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(
         history.messages()[1].provider_provenance,
-        Some(ProviderResponseProvenance {
-            provider: "mock".into(),
-            api_family: ProviderApiFamily::Mock,
-            model: "fallback".into(),
-        })
+        Some(cfg.provider_route.fallback_attempt().unwrap().provenance(2),)
     );
     assert_eq!(
         history.provider_usage().records(),
-        &[ProviderUsageRecord {
-            model: "fallback".into(),
-            operation: UsageOperation::Sampling,
-            usage: usage(7),
-        }]
+        &[ProviderUsageRecord::from_attempt(
+            cfg.provider_route.fallback_attempt().unwrap().identity(),
+            UsageOperation::Sampling,
+            usage(7),
+        )]
     );
 }
 
@@ -1191,19 +1212,18 @@ async fn fallback_fails_closed_on_incompatible_reasoning_history() {
         MockTurn::Blocks(text("must not run on fallback")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "reasoning-fallback-seal").test_clone();
-    cfg.model = "primary".into();
-    cfg.fallback_model = Some("fallback".into());
+    cfg.set_test_route_models("primary", Some("fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
     history.record(Message::user_text("old request"));
-    history.record(mock_assistant(
+    history.record_provider_assistant(
         vec![ContentBlock::Thinking {
             thinking: "summary".into(),
             signature: "opaque".into(),
         }],
-        "primary",
-    ));
+        &cfg.provider_route.primary_attempt(),
+    );
     history.record(Message::user_text("new request"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -1215,7 +1235,7 @@ async fn fallback_fails_closed_on_incompatible_reasoning_history() {
         failure.kind(),
         &kloop_provider::ProviderFailureKind::Protocol
     );
-    assert!(failure.to_string().contains("reasoning replay requires"));
+    assert!(failure.to_string().contains("not authorized"));
     assert_eq!(seen.lock().unwrap().len(), 3);
     assert_eq!(history.messages().len(), 3);
     assert!(history.provider_usage().records().is_empty());
@@ -1253,7 +1273,7 @@ async fn empty_end_turn_completes_without_recording_empty_assistant() {
         outcome: AssistantOutcome::EndTurn,
     }]);
     let mut cfg = compaction_cfg(provider, 200_000, "empty-end-turn").test_clone();
-    cfg.fallback_model = Some("must-not-fallback".into());
+    cfg.set_test_route_models("mock", Some("must-not-fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1292,7 +1312,7 @@ async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
             MockTurn::Blocks(text("must not retry")),
         ]);
         let mut cfg = compaction_cfg(provider, 200_000, &format!("semantic-{index}")).test_clone();
-        cfg.fallback_model = Some("must-not-fallback".into());
+        cfg.set_test_route_models("mock", Some("must-not-fallback"));
         let cfg = Arc::new(cfg);
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
@@ -1452,7 +1472,7 @@ async fn fallback_model_takes_over_after_retries() {
         MockTurn::Blocks(text("answer from fallback")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "fallback").test_clone();
-    cfg.fallback_model = Some("mock-fallback".into());
+    cfg.set_test_route_models("mock", Some("mock-fallback"));
     let cfg = Arc::new(cfg);
     let note_ui = Arc::new(NoteUi(std::sync::Mutex::new(Vec::new())));
     let ui: Arc<dyn Ui> = note_ui.clone();
@@ -1512,7 +1532,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "partial-stream").test_clone();
-    cfg.fallback_model = Some("must-not-run-after-visible-output".into());
+    cfg.set_test_route_models("mock", Some("must-not-run-after-visible-output"));
     let cfg = Arc::new(cfg);
     let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
     let ui: Arc<dyn Ui> = event_ui.clone();
@@ -1520,7 +1540,10 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         .offload_dir
         .join(format!("partial-session-{}.jsonl", std::process::id()));
     let mut history = History::new(cfg.offload_dir.clone());
-    history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
     history.record(Message::user_text("hello"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -1544,11 +1567,11 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         history.messages(),
         &[
             Message::user_text("hello"),
-            mock_assistant(
+            Message::assistant_from_provider(
                 vec![ContentBlock::Text {
                     text: "half answer".into(),
                 }],
-                "mock",
+                cfg.provider_route.primary_attempt().provenance(3),
             ),
         ],
         "the completed UI item must be recoverable after restart"
@@ -1629,7 +1652,7 @@ async fn complete_tool_block_seals_retry_without_dispatching_it() {
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "tool-seals-retry").test_clone();
-    cfg.fallback_model = Some("must-not-fallback".into());
+    cfg.set_test_route_models("mock", Some("must-not-fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1655,7 +1678,7 @@ async fn subagent_internal_delta_also_seals_retry() {
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "subagent-seals-retry").test_clone();
-    cfg.fallback_model = Some("must-not-fallback".into());
+    cfg.set_test_route_models("mock", Some("must-not-fallback"));
     cfg.local_agent = cfg.local_agent.child("agent-98".parse().unwrap());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -1690,7 +1713,7 @@ async fn non_retryable_failure_does_not_retry_or_fallback() {
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "terminal-failure").test_clone();
-    cfg.fallback_model = Some("must-not-fallback".into());
+    cfg.set_test_route_models("mock", Some("must-not-fallback"));
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());

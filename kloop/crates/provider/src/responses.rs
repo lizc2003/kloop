@@ -91,13 +91,6 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                             thinking,
                             signature,
                         } => {
-                            // Without the encrypted blob the item cannot be
-                            // verified server-side (e.g. blocks recorded on
-                            // another rail), so it is dropped rather than
-                            // rejected.
-                            if signature.is_empty() {
-                                continue;
-                            }
                             let summary: Vec<Value> = if thinking.is_empty() {
                                 Vec::new()
                             } else {
@@ -1203,6 +1196,11 @@ mod tests {
                     "type": "reasoning",
                     "summary": [{"type": "summary_text", "text": "planning"}],
                     "encrypted_content": "enc-blob",
+                }),
+                json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "from another rail"}],
+                    "encrypted_content": "",
                 }),
                 json!({
                     "type": "message",

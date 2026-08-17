@@ -20,6 +20,8 @@ use crate::event::Delta;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
+use crate::history::History;
+use crate::provider_route::FrozenProviderAttempt;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -70,8 +72,8 @@ const MAX_ATTEMPTS: u32 = 3;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn sample_with_retry(
     cfg: &Arc<Config>,
-    model: &str,
-    messages: &[Message],
+    provider_attempt: &FrozenProviderAttempt,
+    history: &History,
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
@@ -80,6 +82,11 @@ pub(super) async fn sample_with_retry(
     workspace: &EffectiveWorkspace,
     item_seq: &mut u64,
 ) -> Sampled {
+    let projected = match history.provider_request_view(provider_attempt) {
+        Ok(projected) => projected,
+        Err(error) => return Sampled::Terminal(error),
+    };
+    let messages = projected.as_slice();
     // Project instructions, the (depth-0) skills catalog, and the deferred-tools
     // notice ride every request as a synthetic first user message. Never
     // recorded: resume rereads fresh files, and compaction cannot swallow it.
@@ -100,7 +107,7 @@ pub(super) async fn sample_with_retry(
         // gets a fresh id.
         match sample_once(
             cfg,
-            model,
+            provider_attempt,
             messages,
             tools,
             ui,
@@ -153,8 +160,8 @@ pub(super) async fn sample_with_retry(
 
 #[allow(clippy::too_many_arguments)]
 async fn sample_once(
-    cfg: &Arc<Config>,
-    model: &str,
+    _cfg: &Arc<Config>,
+    provider_attempt: &FrozenProviderAttempt,
     messages: &[Message],
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
@@ -164,7 +171,12 @@ async fn sample_once(
     item_seq: &mut u64,
 ) -> Result<SampleOk, SampleError> {
     let system = &workspace.system;
-    let mut rx = cfg.provider.stream(model, system, messages, tools);
+    let mut rx = provider_attempt.provider().stream_attempt(
+        provider_attempt.identity(),
+        system,
+        messages,
+        tools,
+    );
     let mut blocks: Vec<AssistantBlock> = Vec::new();
     // Open assistant/reasoning items, one of each at a time: a delta opens the
     // item (front-ends see `ItemStarted`), later deltas stream into it, and its

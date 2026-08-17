@@ -539,7 +539,7 @@ fn structured_config(
     let (provider, seen) = Provider::mock_recording(turns);
     let context = test_ctx(1, "plan53-structured");
     let mut config = context.cfg.test_clone();
-    config.provider = Arc::new(provider);
+    config.set_test_provider(provider);
     config.max_rounds = Some(10);
     config.offload_dir = root.join("offload");
     config.local_agent = config.local_agent.child("agent-53".parse().unwrap());

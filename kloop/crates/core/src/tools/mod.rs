@@ -1677,11 +1677,20 @@ pub(crate) mod testutil {
         tag: &str,
         sources: Vec<Arc<dyn ToolSource>>,
     ) -> ToolCtx {
+        let (provider_catalog, provider_route) =
+            crate::provider_route::ProviderCatalog::from_provider(
+                "test",
+                Provider::mock(vec![]),
+                "mock",
+                vec!["mock".into()],
+                None,
+            )
+            .unwrap();
         let inbox = Arc::new(crate::inbox::Inbox::default());
         ToolCtx {
             cfg: Arc::new(Config {
-                provider: Arc::new(Provider::mock(vec![])),
-                model: "mock".into(),
+                provider_catalog,
+                provider_route,
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: Some(5),
@@ -1689,7 +1698,6 @@ pub(crate) mod testutil {
                 offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
                 sessions_dir: std::env::temp_dir().join(format!("kloop-tools-sessions-{tag}")),
                 context_window: None,
-                fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 questioner: None,
                 file_state: Default::default(),
@@ -1754,7 +1762,7 @@ pub(crate) mod testutil {
     /// sub-agents that sample.
     pub(crate) fn with_provider(mut ctx: ToolCtx, provider: Provider) -> ToolCtx {
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(provider);
+        cfg.set_test_provider(provider);
         ctx.cfg = Arc::new(cfg);
         ctx
     }
@@ -3390,13 +3398,22 @@ mod tests {
             fn emit(&self, _: &Event) {}
         }
 
+        let (provider_catalog, provider_route) =
+            crate::provider_route::ProviderCatalog::from_provider(
+                "test",
+                Provider::mock(vec![]),
+                "mock",
+                vec!["mock".into()],
+                None,
+            )
+            .unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
         let inbox = Arc::new(crate::inbox::Inbox::default());
         let ctx = ToolCtx {
             cfg: Arc::new(Config {
-                provider: Arc::new(Provider::mock(vec![])),
-                model: "mock".into(),
+                provider_catalog,
+                provider_route,
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: Some(5),
@@ -3404,7 +3421,6 @@ mod tests {
                 offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
                 sessions_dir: std::env::temp_dir().join("kloop-test-cancel-sessions"),
                 context_window: None,
-                fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 questioner: None,
                 file_state: Default::default(),

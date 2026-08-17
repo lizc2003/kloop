@@ -128,7 +128,7 @@ pub(crate) async fn run_agent_admitted(
     };
     let agent = next_agent_label();
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
-    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type);
+    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type)?;
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
     // A custom label improves human-facing lifecycle rows without changing the
@@ -243,9 +243,12 @@ pub(crate) async fn structured_agent_admitted(
     };
     let agent = next_agent_label();
     let workspace = ctx.cfg.effective_workspace();
-    let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type);
+    let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type)?;
     if let Some(model) = input["model"].as_str() {
-        sub.model = model.to_string();
+        sub.provider_route = sub
+            .provider_route
+            .child_route(Some(model))
+            .map_err(|error| anyhow!("workflow agent: {error}"))?;
     }
     let preview = match agent_type {
         Some(agent_type) => format!("[{}] {}", agent_type.name, agent_preview(&prompt)),
@@ -300,7 +303,19 @@ pub(crate) async fn structured_agent_admitted(
         let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
+            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+                Ok(history) => history,
+                Err(error) => {
+                    return crate::agent::TurnOutcome {
+                        reason: crate::agent::EndReason::Error(
+                            format!("sub-agent route initialization failed: {error:#}").into(),
+                        ),
+                        final_text: String::new(),
+                        rounds: 0,
+                        structured_output: None,
+                    };
+                }
+            };
             history.record(Message::user_text(prompt));
 
             run_structured_turn_in_execution(
@@ -567,7 +582,19 @@ async fn run_sub_agent_sync(
         let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
+            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+                Ok(history) => history,
+                Err(error) => {
+                    return crate::agent::TurnOutcome {
+                        reason: crate::agent::EndReason::Error(
+                            format!("sub-agent route initialization failed: {error:#}").into(),
+                        ),
+                        final_text: String::new(),
+                        rounds: 0,
+                        structured_output: None,
+                    };
+                }
+            };
             history.record(Message::user_text(prompt));
 
             run_turn_in_execution(&sub_cfg, &mut history, &ui, &cancel, depth, execution).await
@@ -637,7 +664,10 @@ pub(crate) async fn fork_skill(
     let agent = next_agent_label();
     let mut sub = clone_for_subagent(ctx, workspace, None, agent.clone());
     if let Some(model) = &skill.model {
-        sub.model = model.clone();
+        sub.provider_route = sub
+            .provider_route
+            .child_route(Some(model))
+            .map_err(|error| anyhow!("skill fork: {error}"))?;
     }
     // `allowed-tools` restricts the sub-agent's tool set (like an agent_type's
     // tools) — a capability limit, not a permission grant; read_offloaded stays
@@ -752,7 +782,19 @@ async fn spawn_background(
         let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = sub_history(&sub_cfg, &label, subagent_of.as_deref());
+            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+                Ok(history) => history,
+                Err(error) => {
+                    return crate::agent::TurnOutcome {
+                        reason: crate::agent::EndReason::Error(
+                            format!("sub-agent route initialization failed: {error:#}").into(),
+                        ),
+                        final_text: String::new(),
+                        rounds: 0,
+                        structured_output: None,
+                    };
+                }
+            };
             history.record(Message::user_text(prompt));
 
             run_turn_in_execution(&sub_cfg, &mut history, &ui, &own_cancel, depth, execution).await
@@ -850,15 +892,21 @@ async fn spawn_background(
 /// transcript is auditable and separately resumable, yet kept out of the
 /// default resume picker. A parent with no session (mock, tests) or with a
 /// dropped rollout leaves the sub-agent in-memory, exactly as before.
-fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> History {
+fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> Result<History> {
     let mut history = History::new(cfg.offload_dir.clone());
     if let Some(parent_line) = subagent_of
         && !cfg.session_id.is_empty()
     {
         let path = session_path(&cfg.sessions_dir, &child_session_id(cfg, agent));
-        history.attach_rollout(Rollout::new_subagent(path, parent_line.to_string()));
+        history.attach_rollout(Rollout::new_subagent_with_route(
+            path,
+            parent_line.to_string(),
+            &cfg.provider_route,
+        )?);
+    } else {
+        history.ensure_initial_provider_route(&cfg.provider_route)?;
     }
-    history
+    Ok(history)
 }
 
 /// The sub-agent's session id: parent id + its label, so the file name itself
@@ -955,29 +1003,29 @@ fn clone_for_subagent(
     )
 }
 
-/// Build the `run_agent` sub-agent's Config: the shared clone plus any agent_type
-/// overrides (system prompt, model, tool allowlist). Returned unwrapped so the
-/// caller can still rewire it (worktree isolation) before sharing the Arc.
 fn build_sub_config(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
     max_rounds: Option<usize>,
     agent: String,
     agent_type: Option<&AgentType>,
-) -> Config {
+) -> Result<Config> {
     let mut sub = clone_for_subagent(ctx, workspace, max_rounds, agent);
     if let Some(at) = agent_type {
         if let Some(system) = &at.system {
             sub.system = system.clone();
         }
         if let Some(model) = &at.model {
-            sub.model = model.clone();
+            sub.provider_route = sub
+                .provider_route
+                .child_route(Some(model))
+                .map_err(|error| anyhow!("child route override rejected: {error}"))?;
         }
         if let Some(tools) = &at.tools {
             sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
         }
     }
-    sub
+    Ok(sub)
 }
 
 /// First line of the prompt, truncated — the label a UI shows next to the
@@ -1358,7 +1406,7 @@ mod tests {
         let ctx = ctx_in(test_ctx(0, "register-close"), &repo);
         let workspace = ctx.cfg.effective_workspace();
         let agent = "agent-9000".to_string();
-        let mut sub = build_sub_config(&ctx, &workspace, None, agent.clone(), None);
+        let mut sub = build_sub_config(&ctx, &workspace, None, agent.clone(), None).unwrap();
         let worktree = worktree::create(&workspace.cwd, &agent).await.unwrap();
         let worktree = bind_subagent_worktree(&mut sub, worktree, "test")
             .await
@@ -1692,6 +1740,7 @@ mod tests {
         }];
         let base = with_provider(test_ctx(0, "atype"), provider);
         let mut cfg = base.cfg.test_clone();
+        cfg.set_test_route_models("mock", Some("cheap-model"));
         cfg.agent_types = Arc::new(types);
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
@@ -2247,9 +2296,13 @@ mod tests {
                         text: "sub result".into()
                     }],
                     kloop_protocol::ProviderResponseProvenance {
-                        provider: "mock".into(),
+                        route_revision: 1,
+                        origin_boundary: 3,
+                        provider_id: "test".into(),
                         api_family: kloop_protocol::ProviderApiFamily::Mock,
+                        endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                         model: "mock".into(),
+                        attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
                     },
                 ),
             ],

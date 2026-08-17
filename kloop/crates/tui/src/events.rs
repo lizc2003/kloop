@@ -32,7 +32,8 @@ pub enum AgentEvent {
     /// Output of a slash command (`/help`, `/cost`, …). Rendered as a wrapped
     /// system block, not a one-line note — emitted by the worker directly.
     System(String),
-    /// `/clear` emptied History; the loop resets its transcript view to match.
+    ProviderChanged(kloop_protocol::ActiveProviderRoute),
+    ProviderPicker(Vec<kloop_protocol::ProviderDescriptor>),
     ClearTranscript,
     /// `/exit` ran on the worker; the UI loop quits (same clean teardown as a
     /// two-tap Ctrl+C).

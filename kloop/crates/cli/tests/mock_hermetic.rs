@@ -57,7 +57,7 @@ fn mock_ignores_home_config_and_runtime_environment() {
         .unwrap()
         .write_all(
             concat!(
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1.0\",\"capabilities\":{}}}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2.0\",\"capabilities\":{}}}\n",
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"config/read\",\"params\":{}}\n",
                 "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"thread/start\",\"params\":{}}\n",
             )

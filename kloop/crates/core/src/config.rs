@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kloop_provider::Provider;
+use crate::provider_route::FrozenProviderRoute;
+use crate::provider_route::ProviderCatalog;
 
 use crate::agent_mailbox::LocalAgentContext;
 use crate::file_state::FileState;
@@ -257,8 +258,11 @@ pub struct EffectiveWorkspace {
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
 pub struct Config {
-    pub provider: Arc<Provider>,
-    pub model: String,
+    /// Immutable catalog shared by session supervisors and child admission.
+    pub provider_catalog: Arc<ProviderCatalog>,
+    /// Operation-owned provider route. Frontends freeze a session route before
+    /// constructing the Config used by a turn or manual compaction.
+    pub provider_route: FrozenProviderRoute,
     pub system: String,
     /// Working-directory anchor for THIS agent's tool calls: bash runs here,
     /// relative file/search paths resolve against it, and the permission gate
@@ -289,8 +293,6 @@ pub struct Config {
     pub sessions_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
     pub context_window: Option<u64>,
-    /// Model to switch to (once per turn) after retries are exhausted.
-    pub fallback_model: Option<String>,
     /// Tool-execution gate; the Arc is shared into sub-agent configs so the
     /// session approval cache is inherited.
     pub permissions: Arc<Permissions>,
@@ -463,8 +465,11 @@ impl Config {
         agent_id: kloop_protocol::LocalAgentId,
     ) -> Self {
         Self {
-            provider: Arc::clone(&self.provider),
-            model: self.model.clone(),
+            provider_catalog: Arc::clone(&self.provider_catalog),
+            provider_route: self
+                .provider_route
+                .child_route(None)
+                .expect("inherited provider model remains allowlisted"),
             system: workspace.system.clone(),
             cwd: workspace.cwd.clone(),
             project_instructions: self.project_instructions.clone(),
@@ -472,7 +477,6 @@ impl Config {
             offload_dir: self.offload_dir.clone(),
             sessions_dir: self.sessions_dir.clone(),
             context_window: self.context_window,
-            fallback_model: self.fallback_model.clone(),
             permissions: Arc::clone(&workspace.permissions),
             questioner: None,
             file_state: Arc::new(FileState::default()),
@@ -499,11 +503,10 @@ impl Config {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_clone(&self) -> Self {
+    pub fn clone_with_provider_route(&self, provider_route: FrozenProviderRoute) -> Self {
         Self {
-            provider: Arc::clone(&self.provider),
-            model: self.model.clone(),
+            provider_catalog: Arc::clone(&self.provider_catalog),
+            provider_route,
             system: self.system.clone(),
             cwd: self.cwd.clone(),
             project_instructions: self.project_instructions.clone(),
@@ -511,7 +514,6 @@ impl Config {
             offload_dir: self.offload_dir.clone(),
             sessions_dir: self.sessions_dir.clone(),
             context_window: self.context_window,
-            fallback_model: self.fallback_model.clone(),
             permissions: Arc::clone(&self.permissions),
             questioner: self.questioner.clone(),
             file_state: Arc::clone(&self.file_state),
@@ -538,8 +540,27 @@ impl Config {
         }
     }
 
-    pub fn set_model(&mut self, model: String) {
-        self.model = model;
+    #[cfg(test)]
+    pub(crate) fn test_clone(&self) -> Self {
+        self.clone_with_provider_route(self.provider_route.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_provider(&mut self, provider: kloop_provider::Provider) {
+        let model = self.provider_route.primary_model().to_string();
+        let models = self.provider_route.allowed_models().to_vec();
+        let fallback = self.provider_route.fallback_model().map(str::to_string);
+        let (catalog, route) = crate::provider_route::ProviderCatalog::from_provider(
+            "test", provider, model, models, fallback,
+        )
+        .expect("test provider route is valid");
+        self.provider_catalog = catalog;
+        self.provider_route = route;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_route_models(&mut self, primary: &str, fallback: Option<&str>) {
+        self.provider_route = self.provider_route.with_test_models(primary, fallback);
     }
 
     pub fn set_max_rounds(&mut self, max_rounds: Option<usize>) {

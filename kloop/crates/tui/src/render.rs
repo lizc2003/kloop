@@ -77,6 +77,7 @@ fn task_panel_allowed(app: &App) -> bool {
     app.show_task_graph
         && app.interactions.is_empty()
         && app.fork_picker.is_none()
+        && app.provider_picker.is_none()
         && app.popup.is_none()
         && app
             .task_graph
@@ -899,6 +900,8 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
         Some(PendingInteraction::Question(_))
     ) {
         draw_question(f, app, full);
+    } else if app.provider_picker.is_some() {
+        draw_provider_picker(f, app, full);
     } else if app.fork_picker.is_some() {
         draw_fork_picker(f, app, full);
     } else {
@@ -991,7 +994,79 @@ fn pad(text: &str, width: usize) -> String {
     s
 }
 
-/// The rewind picker popup (plan 18): one row per fork point, the cursor row
+fn draw_provider_picker(f: &mut Frame, app: &App, area: Rect) {
+    let picker = app.provider_picker.as_ref().expect("checked some");
+    let popup_w = area.width.saturating_sub(4).clamp(24, 76);
+    let inner_w = usize::from(popup_w - 2);
+    let (rows, cursor, title): (Vec<Line>, usize, &str) = match picker.model_cursor {
+        Some(cursor) => {
+            let provider = &picker.providers[picker.provider_cursor];
+            (
+                provider
+                    .models
+                    .iter()
+                    .enumerate()
+                    .map(|(index, model)| {
+                        let marker = if model == &provider.default_model {
+                            " (default)"
+                        } else {
+                            ""
+                        };
+                        let text = pad(&format!("{model}{marker}"), inner_w);
+                        let style = if index == cursor {
+                            Style::new().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        };
+                        Line::from(Span::styled(text, style))
+                    })
+                    .collect(),
+                cursor,
+                "provider model — ↑↓ enter esc",
+            )
+        }
+        None => (
+            picker
+                .providers
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| {
+                    let text = pad(
+                        &format!(
+                            "{}  {}  {:?}",
+                            provider.id, provider.default_model, provider.availability
+                        ),
+                        inner_w,
+                    );
+                    let style = if index == picker.provider_cursor {
+                        Style::new().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(text, style))
+                })
+                .collect(),
+            picker.provider_cursor,
+            "provider — ↑↓ enter esc",
+        ),
+    };
+    let avail = usize::from(area.height);
+    let popup_h = (rows.len() + 2).min(avail).max(3);
+    let content_h = popup_h - 2;
+    let scroll = cursor.saturating_sub(content_h - 1);
+    let end = (scroll + content_h).min(rows.len());
+    let visible = rows[scroll..end].to_vec();
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
+        width: popup_w,
+        height: popup_h as u16,
+    };
+    let block = Block::bordered().title(title);
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(visible).block(block), popup);
+}
+
 /// reversed, windowed so the cursor stays visible in a tall list. The bottom
 /// border shows the cursor's position in the list.
 fn draw_fork_picker(f: &mut Frame, app: &App, area: Rect) {

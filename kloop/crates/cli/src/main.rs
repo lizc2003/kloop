@@ -204,8 +204,15 @@ async fn main() -> Result<ExitCode> {
                     skills,
                     &options.cwd,
                 )?;
-                if let Some(model) = options.model {
-                    cfg.set_model(model);
+                if options.provider_id.is_some() || options.model.is_some() {
+                    let provider_id = options
+                        .provider_id
+                        .as_deref()
+                        .unwrap_or_else(|| provider.initial_provider());
+                    cfg.provider_route = provider
+                        .catalog()
+                        .initial_route(provider_id, options.model.as_deref())
+                        .map_err(anyhow::Error::new)?;
                 }
                 Ok(cfg)
             })
@@ -218,7 +225,7 @@ async fn main() -> Result<ExitCode> {
                 offload_dir: PathBuf::from(".kloop/offload"),
             },
         );
-        server.models = vec![provider.model_info()];
+        server.providers = provider.catalog().descriptors();
         server.mcp_servers = mcp_statuses;
         let config_provider = provider.clone();
         let config_runtime = runtime.clone();
@@ -258,7 +265,17 @@ async fn main() -> Result<ExitCode> {
         PathBuf::from(".kloop/offload"),
         &args.session,
         &sessions_dir,
+        &provider.initial_route(),
     )?;
+    let session_route = provider
+        .catalog()
+        .restore_route(
+            history
+                .provider_routes()
+                .last()
+                .context("session provider route timeline is missing")?,
+        )
+        .map_err(anyhow::Error::new)?;
 
     // `--image` files are read + validated once, up front, so a bad path fails
     // fast before any UI owns the terminal. They attach to the first user turn.
@@ -296,6 +313,13 @@ async fn main() -> Result<ExitCode> {
             skills,
             &cwd,
         )?;
+        cfg.provider_route = if args.mock {
+            cfg.provider_route
+                .at_revision(session_route.revision())
+                .map_err(anyhow::Error::new)?
+        } else {
+            session_route.clone()
+        };
         cfg.bind_session(session_id.clone())?;
         // An explicit headless runaway guardrail enables the otherwise-absent cap.
         if let Some(max_rounds) = args.max_rounds {
@@ -343,6 +367,7 @@ async fn main() -> Result<ExitCode> {
         let plain_result = plain_main(
             args,
             provider,
+            session_route.clone(),
             runtime,
             history,
             session_id,
@@ -358,6 +383,7 @@ async fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let factory_session_id = session_id.clone();
+    let tui_session_route = session_route.clone();
     let worktree = args.worktree.clone();
     let tui_result = kloop_tui::run(
         move |approver, questioner, notify| {
@@ -374,6 +400,7 @@ async fn main() -> Result<ExitCode> {
                 skills.clone(),
                 &cwd,
             )?;
+            cfg.provider_route = tui_session_route.clone();
             cfg.bind_session(factory_session_id.clone())?;
             Ok(cfg)
         },
@@ -562,6 +589,7 @@ where
 async fn plain_main(
     args: CliArgs,
     provider: Arc<ResolvedProviderSettings>,
+    session_route: kloop_core::provider_route::FrozenProviderRoute,
     runtime: Arc<RuntimeSettings>,
     mut history: History,
     session_id: String,
@@ -587,8 +615,20 @@ async fn plain_main(
         skills,
         &cwd,
     )?;
+    cfg.provider_route = if args.mock {
+        cfg.provider_route
+            .at_revision(session_route.revision())
+            .map_err(anyhow::Error::new)?
+    } else {
+        session_route
+    };
     cfg.bind_session(session_id.clone())?;
-    let cfg = Arc::new(cfg);
+    let mut cfg = Arc::new(cfg);
+    let provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
+        Arc::clone(&cfg.provider_catalog),
+        history.provider_routes(),
+    )
+    .map_err(anyhow::Error::new)?;
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi::default());
 
     if args.mock {
@@ -680,13 +720,22 @@ async fn plain_main(
         if kloop_core::commands::is_command(&line) {
             let cancel = CancellationToken::new();
             let (result, exit_requested) = run_plain_operation(
-                kloop_core::commands::run(&line, &mut history, &cfg, &cancel),
+                kloop_core::commands::run_with_provider_state(
+                    &line,
+                    &mut history,
+                    &cfg,
+                    &provider_state,
+                    &cancel,
+                ),
                 &cancel,
                 &mut ctrl_c,
             )
             .await;
             if !result.output.is_empty() {
                 println!("{}", result.output);
+            }
+            if result.provider_changed {
+                cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
             }
             // `/exit` quits the REPL, like the bare `exit` word above.
             if result.quit || exit_requested {

@@ -195,7 +195,12 @@ pub struct ForkPicker {
     pub cursor: usize,
 }
 
-/// What the event loop must do after a key was handled; the side-effectful
+pub struct ProviderPicker {
+    pub providers: Vec<kloop_protocol::ProviderDescriptor>,
+    pub provider_cursor: usize,
+    pub model_cursor: Option<usize>,
+}
+
 /// counterpart to the pure state change already applied.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -284,6 +289,7 @@ pub struct App {
     /// The rewind picker while it is open (Ctrl+R when idle); None otherwise.
     /// While open it captures the keyboard, like a confirm prompt.
     pub fork_picker: Option<ForkPicker>,
+    pub provider_picker: Option<ProviderPicker>,
     /// The current permission mode, shown in the status bar. A display mirror of
     /// the shared gate: shift+Tab updates it here and via `Command::SetMode`; an
     /// `exit_plan_mode` approval refreshes it via `Event::ModeChanged`. The
@@ -336,6 +342,7 @@ impl App {
             agent_message_cells: HashMap::new(),
             frozen_agent_messages: HashSet::new(),
             fork_picker: None,
+            provider_picker: None,
             mode: Mode::default(),
             ctrl_c_exit_armed: false,
             popup: None,
@@ -377,6 +384,25 @@ impl App {
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.cells.push(Cell::System(text));
+            }
+            AgentEvent::ProviderChanged(route) => {
+                self.model = route.model.clone();
+                self.cells.push(Cell::System(format!(
+                    "provider: {} {} (revision {})",
+                    route.provider_id, route.model, route.revision
+                )));
+            }
+            AgentEvent::ProviderPicker(providers) => {
+                if providers.is_empty() {
+                    self.cells
+                        .push(Cell::System("no configured providers".into()));
+                } else {
+                    self.provider_picker = Some(ProviderPicker {
+                        providers,
+                        provider_cursor: 0,
+                        model_cursor: None,
+                    });
+                }
             }
             AgentEvent::ClearTranscript => {
                 // /clear emptied History on the worker; drop the uncommitted
@@ -937,6 +963,9 @@ impl App {
         if !self.interactions.is_empty() {
             return self.on_interaction_key(key);
         }
+        if self.provider_picker.is_some() {
+            return self.on_provider_key(key);
+        }
         // So does an open rewind picker.
         if self.fork_picker.is_some() {
             return self.on_fork_key(key);
@@ -1369,6 +1398,52 @@ impl App {
         self.confirm_scroll = 0;
         let _ = question.reply.send(outcome);
     }
+    fn on_provider_key(&mut self, key: KeyEvent) -> Command {
+        let picker = self.provider_picker.as_mut().expect("checked some");
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Command::None;
+        }
+        let selecting_model = picker.model_cursor.is_some();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(cursor) = picker.model_cursor.as_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                } else {
+                    picker.provider_cursor = picker.provider_cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(cursor) = picker.model_cursor.as_mut() {
+                    let models = &picker.providers[picker.provider_cursor].models;
+                    *cursor = (*cursor + 1).min(models.len() - 1);
+                } else {
+                    picker.provider_cursor =
+                        (picker.provider_cursor + 1).min(picker.providers.len() - 1);
+                }
+            }
+            KeyCode::Enter if selecting_model => {
+                let provider = &picker.providers[picker.provider_cursor];
+                let model = &provider.models[picker.model_cursor.unwrap_or(0)];
+                let command = format!("/provider {} {}", provider.id, model);
+                self.provider_picker = None;
+                return Command::Slash(command);
+            }
+            KeyCode::Enter => {
+                let provider = &picker.providers[picker.provider_cursor];
+                let cursor = provider
+                    .models
+                    .iter()
+                    .position(|model| model == &provider.default_model)
+                    .unwrap_or(0);
+                picker.model_cursor = Some(cursor);
+            }
+            KeyCode::Esc if selecting_model => picker.model_cursor = None,
+            KeyCode::Esc => self.provider_picker = None,
+            _ => {}
+        }
+        Command::None
+    }
+
     /// at the selected point, Esc backs out without touching History (Ctrl+C is
     /// the two-tap quit, intercepted before routing here).
     fn on_fork_key(&mut self, key: KeyEvent) -> Command {
@@ -2281,6 +2356,39 @@ mod tests {
                 if task.id == "program-8"
                     && task.status == BackgroundTaskStatus::Cancelled
         ));
+    }
+
+    #[test]
+    fn provider_picker_selects_provider_then_model_and_updates_status() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ProviderPicker(vec![
+            kloop_protocol::ProviderDescriptor {
+                id: "a".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                default_model: "a1".into(),
+                models: vec!["a1".into(), "a2".into()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+            },
+        ]));
+        assert!(app.provider_picker.is_some());
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Down)), Command::None);
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash("/provider a a2".into())
+        );
+        assert!(app.provider_picker.is_none());
+
+        app.apply(AgentEvent::ProviderChanged(
+            kloop_protocol::ActiveProviderRoute {
+                revision: 2,
+                provider_id: "a".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                model: "a2".into(),
+            },
+        ));
+        assert_eq!(app.model, "a2");
     }
 
     fn fp(seq: u64, preview: &str) -> ForkPoint {

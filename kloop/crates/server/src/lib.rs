@@ -66,8 +66,10 @@ use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::rollout::TurnTerminal;
+use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::ProviderDescriptor;
 
 use events::EventsSyncParams;
 use events::RecoverySource;
@@ -85,6 +87,7 @@ pub type NoteFn = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadStartOptions {
     pub cwd: PathBuf,
+    pub provider_id: Option<String>,
     pub model: Option<String>,
 }
 
@@ -102,18 +105,6 @@ pub type ConfigFactory = Arc<
         + Sync,
 >;
 
-/// One model the engine can start a new thread with. Slice 4 deliberately
-/// reports only models the process can name locally; it never fabricates a
-/// provider-wide remote catalog.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelInfo {
-    pub id: String,
-    pub display_name: String,
-    pub provider: String,
-    pub is_default: bool,
-}
-
 /// Non-sensitive effective configuration shown to a local protocol client.
 /// Provider credentials, MCP headers/env, hook commands, and permission-rule
 /// bodies are intentionally absent from this allowlist DTO.
@@ -121,7 +112,7 @@ pub struct ModelInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSnapshot {
     pub cwd: String,
-    pub model: Option<String>,
+    pub route: Option<ActiveProviderRoute>,
     pub permission_mode: String,
     pub context_window: Option<u64>,
     pub defer_threshold: usize,
@@ -220,7 +211,7 @@ pub struct ServerPaths {
 pub struct ServerConfig {
     pub factory: ConfigFactory,
     pub paths: ServerPaths,
-    pub models: Vec<ModelInfo>,
+    pub providers: Vec<ProviderDescriptor>,
     pub mcp_servers: Vec<McpServerStatus>,
     pub config_reader: ConfigReader,
     pub skills_reader: SkillsReader,
@@ -231,12 +222,12 @@ impl ServerConfig {
         Self {
             factory,
             paths,
-            models: Vec::new(),
+            providers: Vec::new(),
             mcp_servers: Vec::new(),
             config_reader: Arc::new(|cwd| {
                 Ok(ConfigSnapshot {
                     cwd: cwd.to_string_lossy().to_string(),
-                    model: None,
+                    route: None,
                     permission_mode: "manual".into(),
                     context_window: None,
                     defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
@@ -274,7 +265,7 @@ where
     let ServerConfig {
         factory,
         paths,
-        models,
+        providers,
         mcp_servers,
         config_reader,
         skills_reader,
@@ -292,7 +283,7 @@ where
         reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
-        models,
+        providers,
         mcp_servers,
         config_reader,
         skills_reader,
@@ -349,15 +340,26 @@ struct Turn {
     delivery_only: bool,
 }
 
+enum ThreadWorkerMsg {
+    Turn(Turn),
+    SwitchProvider {
+        provider_id: String,
+        model: Option<String>,
+        expected_revision: u64,
+        request_id: RequestId,
+    },
+}
+
 struct ThreadWorkerState {
     running: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     turn_seq: Arc<AtomicU64>,
     inbox: Arc<Inbox>,
+    active_route: Arc<Mutex<ActiveProviderRoute>>,
 }
 
 struct ThreadHandle {
-    turn_tx: mpsc::UnboundedSender<Turn>,
+    turn_tx: mpsc::UnboundedSender<ThreadWorkerMsg>,
     running: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// The thread's step-boundary injection queue (a clone of `Config.inbox`,
@@ -373,7 +375,7 @@ struct ThreadHandle {
     /// Canonical base cwd and pinned model for read-only config/skills queries.
     /// These are the persisted thread runtime, not a transient active worktree.
     cwd: PathBuf,
-    model: String,
+    active_route: Arc<Mutex<ActiveProviderRoute>>,
     /// Generation-scoped public display projection, shared with ThreadUi and
     /// thread/events/sync.
     projection: Arc<ThreadProjection>,
@@ -408,7 +410,7 @@ struct Server {
     factory: ConfigFactory,
     paths: ServerPaths,
     /// Immutable process-level catalogs/snapshots assembled by the CLI.
-    models: Vec<ModelInfo>,
+    providers: Vec<ProviderDescriptor>,
     mcp_servers: Vec<McpServerStatus>,
     /// Safe process-config projection and fresh cwd-scoped skill discovery.
     /// Both callbacks return allowlist DTOs only.
@@ -464,6 +466,16 @@ impl Server {
                 message: "not initialized; send `initialize` first".into(),
             });
         }
+        if method == "thread/provider/switch" {
+            if let Err((code, message)) = self.queue_thread_provider_switch(id.clone(), &params) {
+                self.send(Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                });
+            }
+            return;
+        }
         let result = match method {
             "initialize" => self.initialize(&params),
             "thread/start" => self.thread_start(&params),
@@ -472,7 +484,7 @@ impl Server {
             "thread/list" => self.thread_list(&params),
             "thread/read" => self.thread_read(&params),
             "thread/events/sync" => self.thread_events_sync(&params),
-            "model/list" => self.model_list(&params),
+            "provider/catalog/read" => self.provider_catalog_read(&params),
             "config/read" => self.config_read(&params),
             "skills/list" => self.skills_list(&params),
             "mcpServerStatus/list" => self.mcp_server_status_list(&params),
@@ -523,7 +535,7 @@ impl Server {
                     "scopes": ["once", "workspaceSession", "project"]
                 },
                 "questions": true,
-                "models": {"list": true},
+                "providers": {"catalog": true, "switch": true},
                 "config": {"read": true},
                 "skills": {"list": true},
                 "mcpServers": {"status": true},
@@ -600,7 +612,7 @@ impl Server {
             .open(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot claim session: {e}")))?;
         let runtime = runtime_from_options(&options);
-        let rollout = match Rollout::new_with_runtime(path.clone(), runtime.clone()) {
+        let rollout = match Rollout::new_with_runtime_pending_route(path.clone(), runtime.clone()) {
             Ok(rollout) => rollout,
             Err(error) => {
                 let _ = std::fs::remove_file(&path);
@@ -616,6 +628,7 @@ impl Server {
             messages: Vec::new(),
             runtime: Some(runtime),
             terminals: Vec::new(),
+            provider_routes: history.provider_routes().to_vec(),
         };
         if let Err(error) = self.spawn_thread(
             thread_id.clone(),
@@ -627,7 +640,15 @@ impl Server {
             let _ = std::fs::remove_file(&path);
             return Err(error);
         }
-        Ok(json!({"thread": {"id": thread_id}}))
+        let route = self
+            .threads
+            .get(&thread_id)
+            .expect("spawned thread is registered")
+            .active_route
+            .lock()
+            .unwrap()
+            .clone();
+        Ok(json!({"thread": {"id": thread_id, "route": route}}))
     }
 
     fn thread_resume(&mut self, params: &Value) -> MethodResult {
@@ -645,18 +666,10 @@ impl Server {
         }
         let inspected = rollout::inspect_session(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
-        let (options, migrate) = resume_options(&inspected.snapshot(), params, &self.default_cwd)?;
-        let mut resumed = inspected
+        let options = resume_options(&inspected.snapshot(), params, &self.default_cwd)?;
+        let resumed = inspected
             .recover()
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
-        if migrate {
-            let runtime = runtime_from_options(&options);
-            resumed
-                .rollout
-                .append_runtime(&runtime)
-                .map_err(|e| (wire::SERVER_ERROR, format!("cannot migrate session: {e}")))?;
-            resumed.snapshot.runtime = Some(runtime);
-        }
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
         let history = History::resume(self.paths.offload_dir.clone(), resumed);
@@ -667,8 +680,16 @@ impl Server {
             RecoverySource::Resumed,
             seed,
         )?;
+        let route = self
+            .threads
+            .get(thread_id)
+            .expect("spawned thread is registered")
+            .active_route
+            .lock()
+            .unwrap()
+            .clone();
         Ok(json!({
-            "thread": thread_runtime_json(thread_id, &options),
+            "thread": thread_runtime_json(thread_id, &options, &route),
             "messageCount": count,
         }))
     }
@@ -701,32 +722,19 @@ impl Server {
         if !src.exists() {
             return Err((wire::SERVER_ERROR, format!("no session '{src_id}'")));
         }
-        let source = rollout::inspect_session(&src)
+        rollout::inspect_session(&src)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read source: {e}")))?;
-        let (options, _) = resume_options(&source.snapshot(), params, &self.default_cwd)?;
         let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
-        let mut resumed = match rollout::inspect_session(&new_path).and_then(|read| read.recover())
-        {
+        let resumed = match rollout::inspect_session(&new_path).and_then(|read| read.recover()) {
             Ok(resumed) => resumed,
             Err(error) => {
                 let _ = std::fs::remove_file(&new_path);
                 return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
             }
         };
-        // The requested cut may precede the source's runtime line. Always stamp
-        // the effective canonical runtime onto the fork so it remains resumable
-        // after this server process exits.
-        let runtime = runtime_from_options(&options);
-        if let Err(error) = resumed.rollout.append_runtime(&runtime) {
-            let _ = std::fs::remove_file(&new_path);
-            return Err((
-                wire::SERVER_ERROR,
-                format!("cannot persist fork runtime: {error}"),
-            ));
-        }
-        resumed.snapshot.runtime = Some(runtime);
+        let options = resume_options(&resumed.snapshot, params, &self.default_cwd)?;
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
         let history = History::resume(self.paths.offload_dir.clone(), resumed);
@@ -740,8 +748,16 @@ impl Server {
             let _ = std::fs::remove_file(&new_path);
             return Err(error);
         }
+        let route = self
+            .threads
+            .get(&new_id)
+            .expect("spawned fork is registered")
+            .active_route
+            .lock()
+            .unwrap()
+            .clone();
         Ok(json!({
-            "thread": thread_runtime_json(&new_id, &options),
+            "thread": thread_runtime_json(&new_id, &options, &route),
             "messageCount": count,
         }))
     }
@@ -799,12 +815,21 @@ impl Server {
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
+            let route = snapshot
+                .provider_routes
+                .last()
+                .map(|route| ActiveProviderRoute {
+                    revision: route.revision,
+                    provider_id: route.provider_id.clone(),
+                    api_family: route.api_family,
+                    model: route.primary_model.clone(),
+                });
             threads.push(json!({
                 "id": thread_id,
                 "messages": snapshot.messages.len(),
                 "snippet": rollout::first_user_snippet(&snapshot.messages),
                 "cwd": runtime.map(|runtime| runtime.cwd.as_str()),
-                "model": runtime.and_then(|runtime| runtime.model.as_deref()),
+                "route": route,
                 "resumable": runtime.is_some(),
                 "inProgress": in_progress,
                 "forkedFrom": fork_origin_json(path),
@@ -827,11 +852,20 @@ impl Server {
             rollout::load_session_snapshot(&path)
                 .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?,
         );
+        let route = snapshot
+            .provider_routes
+            .last()
+            .map(|route| ActiveProviderRoute {
+                revision: route.revision,
+                provider_id: route.provider_id.clone(),
+                api_family: route.api_family,
+                model: route.primary_model.clone(),
+            });
         Ok(json!({
             "thread": {
                 "id": thread_id,
                 "cwd": snapshot.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
-                "model": snapshot.runtime.as_ref().and_then(|runtime| runtime.model.as_deref()),
+                "route": route,
                 "resumable": snapshot.runtime.is_some(),
                 "forkedFrom": fork_origin_json(&path),
                 "messages": snapshot.messages,
@@ -864,21 +898,82 @@ impl Server {
         })
     }
 
-    fn model_list(&self, params: &Value) -> MethodResult {
-        ensure_empty_params(params, "model/list")?;
-        Ok(json!({"models": &self.models}))
+    fn provider_catalog_read(&self, params: &Value) -> MethodResult {
+        ensure_empty_params(params, "provider/catalog/read")?;
+        Ok(json!({"providers": &self.providers}))
     }
 
+    fn queue_thread_provider_switch(
+        &self,
+        request_id: RequestId,
+        params: &Value,
+    ) -> Result<(), (i64, String)> {
+        ensure_known_params(
+            params,
+            "thread/provider/switch",
+            &["threadId", "providerId", "model", "expectedRouteRevision"],
+        )?;
+        let thread_id = str_param(params, "threadId")?;
+        let provider_id = str_param(params, "providerId")?.to_string();
+        let model = match params.get("model") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
+            Some(Value::String(_)) => {
+                return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()));
+            }
+            Some(_) => {
+                return Err((wire::INVALID_PARAMS, "'model' must be a string".into()));
+            }
+        };
+        let expected_revision = params["expectedRouteRevision"].as_u64().ok_or((
+            wire::INVALID_PARAMS,
+            "'expectedRouteRevision' must be a positive integer".to_string(),
+        ))?;
+        if expected_revision == 0 {
+            return Err((
+                wire::INVALID_PARAMS,
+                "'expectedRouteRevision' must be a positive integer".into(),
+            ));
+        }
+        let handle = self.threads.get(thread_id).ok_or_else(|| {
+            (
+                wire::INVALID_PARAMS,
+                format!("unknown or inactive thread '{thread_id}'"),
+            )
+        })?;
+        if handle
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err((
+                wire::SERVER_ERROR,
+                format!("thread '{thread_id}' already has an active operation"),
+            ));
+        }
+        if handle
+            .turn_tx
+            .send(ThreadWorkerMsg::SwitchProvider {
+                provider_id,
+                model,
+                expected_revision,
+                request_id,
+            })
+            .is_err()
+        {
+            handle.running.store(false, Ordering::SeqCst);
+            return Err((wire::SERVER_ERROR, "thread worker is unavailable".into()));
+        }
+        Ok(())
+    }
     fn config_read(&self, params: &Value) -> MethodResult {
         ensure_known_params(params, "config/read", &["threadId", "cwd"])?;
-        let (cwd, pinned_model) = self.read_scope(params)?;
+        let (cwd, pinned_route) = self.read_scope(params)?;
         let mut snapshot = (self.config_reader)(&cwd)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read config: {e:#}")))?;
-        // The callback reports the process default; a thread-scoped query must
-        // reflect that thread's model pinned in its rollout/runtime instead.
         snapshot.cwd = cwd.to_string_lossy().to_string();
-        if let Some(model) = pinned_model {
-            snapshot.model = Some(model);
+        if let Some(route) = pinned_route {
+            snapshot.route = Some(route);
         }
         Ok(json!({"config": snapshot}))
     }
@@ -911,7 +1006,10 @@ impl Server {
     /// Resolve the cwd selected by `{threadId? | cwd?}`. With no selector, use
     /// the server's canonical startup cwd. A dormant thread reads its persisted
     /// runtime; legacy sessions without runtime metadata fail closed.
-    fn read_scope(&self, params: &Value) -> Result<(PathBuf, Option<String>), (i64, String)> {
+    fn read_scope(
+        &self,
+        params: &Value,
+    ) -> Result<(PathBuf, Option<ActiveProviderRoute>), (i64, String)> {
         object_params(params, "read method")?;
         let thread_id = params.get("threadId").filter(|value| !value.is_null());
         let cwd = params.get("cwd").filter(|value| !value.is_null());
@@ -930,7 +1028,10 @@ impl Server {
                 return Err((wire::INVALID_PARAMS, "'threadId' must not be empty".into()));
             }
             if let Some(handle) = self.threads.get(thread_id) {
-                return Ok((handle.cwd.clone(), Some(handle.model.clone())));
+                return Ok((
+                    handle.cwd.clone(),
+                    Some(handle.active_route.lock().unwrap().clone()),
+                ));
             }
             let path = rollout::checked_session_path(&self.paths.sessions_dir, thread_id)
                 .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
@@ -939,12 +1040,22 @@ impl Server {
             }
             let snapshot = rollout::load_session_snapshot(&path)
                 .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
+            let route = snapshot.provider_routes.last().ok_or((
+                wire::SERVER_ERROR,
+                format!("session '{thread_id}' has no provider route timeline"),
+            ))?;
+            let public_route = ActiveProviderRoute {
+                revision: route.revision,
+                provider_id: route.provider_id.clone(),
+                api_family: route.api_family,
+                model: route.primary_model.clone(),
+            };
             let runtime = snapshot.runtime.ok_or((
                 wire::SERVER_ERROR,
                 format!("session '{thread_id}' has no runtime metadata"),
             ))?;
             let options = options_from_runtime(&runtime)?;
-            return Ok((options.cwd, options.model));
+            return Ok((options.cwd, Some(public_route)));
         }
         Ok((resolve_cwd(cwd, &self.default_cwd)?, None))
     }
@@ -974,13 +1085,13 @@ impl Server {
             .record_input(Some(turn_id), &params["input"]);
         if handle
             .turn_tx
-            .send(Turn {
+            .send(ThreadWorkerMsg::Turn(Turn {
                 text,
                 images,
                 id: turn_id,
                 cancel,
                 delivery_only: false,
-            })
+            }))
             .is_err()
         {
             handle.running.store(false, Ordering::SeqCst);
@@ -1042,11 +1153,17 @@ impl Server {
             ThreadProjection::new(
                 thread_id.clone(),
                 options.cwd.to_string_lossy().to_string(),
-                options.model.clone().unwrap_or_default(),
+                ActiveProviderRoute {
+                    revision: 0,
+                    provider_id: "pending".into(),
+                    api_family: kloop_protocol::ProviderApiFamily::Mock,
+                    model: options.model.clone().unwrap_or_default(),
+                },
                 SessionSnapshot {
                     messages: Vec::new(),
                     runtime: None,
                     terminals: Vec::new(),
+                    provider_routes: Vec::new(),
                 },
                 recovery_source,
             )
@@ -1072,8 +1189,6 @@ impl Server {
         let questioner: Option<Arc<dyn Questioner>> = self
             .client_questions
             .then(|| ui.clone() as Arc<dyn Questioner>);
-        let runtime_cwd = options.cwd.to_string_lossy().to_string();
-        let pin_default_model = options.model.is_none();
         let mut cfg = (self.factory)(
             options,
             ui.clone(),
@@ -1081,27 +1196,26 @@ impl Server {
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
         )
         .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
-        if pin_default_model {
-            let runtime = SessionRuntime {
-                cwd: runtime_cwd,
-                model: Some(cfg.model.clone()),
-            };
-            history
-                .append_runtime(runtime.clone())
-                .map_err(|e| (wire::SERVER_ERROR, format!("cannot pin session model: {e}")))?;
-            seed.runtime = Some(runtime);
-        }
+        history
+            .ensure_initial_provider_route(&cfg.provider_route)
+            .map_err(|error| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot persist initial provider route: {error}"),
+                )
+            })?;
+        seed.provider_routes = history.provider_routes().to_vec();
         // The factory cannot know which thread it is building for; the hook
         // events' session id is stamped here.
         cfg.bind_session(thread_id.clone())
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot bind session: {e:#}")))?;
         projection.refresh_seed(
             cfg.cwd.to_string_lossy().to_string(),
-            cfg.model.clone(),
+            cfg.provider_route.public_route(),
             seed,
         );
         let handle_cwd = cfg.cwd.clone();
-        let handle_model = cfg.model.clone();
+        let active_route = Arc::new(Mutex::new(cfg.provider_route.public_route()));
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         let current_cancel = Arc::new(Mutex::new(None));
@@ -1114,6 +1228,7 @@ impl Server {
             current_cancel: current_cancel.clone(),
             turn_seq: turn_seq.clone(),
             inbox: inbox.clone(),
+            active_route: active_route.clone(),
         };
         tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
         self.threads.insert(
@@ -1126,7 +1241,7 @@ impl Server {
                 turn_seq,
                 turn,
                 cwd: handle_cwd,
-                model: handle_model,
+                active_route,
                 projection,
             },
         );
@@ -1209,7 +1324,6 @@ fn resolve_cwd(value: Option<&Value>, default_cwd: &Path) -> Result<PathBuf, (i6
 fn runtime_from_options(options: &ThreadStartOptions) -> SessionRuntime {
     SessionRuntime {
         cwd: options.cwd.to_string_lossy().to_string(),
-        model: options.model.clone(),
     }
 }
 
@@ -1228,33 +1342,39 @@ fn options_from_runtime(runtime: &SessionRuntime) -> Result<ThreadStartOptions, 
     }
     Ok(ThreadStartOptions {
         cwd,
-        model: runtime.model.clone(),
+        provider_id: None,
+        model: None,
     })
 }
 
 fn resume_options(
     snapshot: &SessionSnapshot,
-    params: &Value,
-    default_cwd: &Path,
-) -> Result<(ThreadStartOptions, bool), (i64, String)> {
-    if let Some(runtime) = &snapshot.runtime {
-        return Ok((options_from_runtime(runtime)?, false));
-    }
-    if params.get("cwd").is_none_or(Value::is_null) {
-        return Err((
-            wire::SERVER_ERROR,
-            "session predates runtime metadata; supply its original 'cwd' to migrate it safely"
-                .into(),
-        ));
-    }
-    Ok((parse_thread_start_options(params, default_cwd)?, true))
+    _params: &Value,
+    _default_cwd: &Path,
+) -> Result<ThreadStartOptions, (i64, String)> {
+    let runtime = snapshot.runtime.as_ref().ok_or((
+        wire::SERVER_ERROR,
+        "session is missing runtime metadata".into(),
+    ))?;
+    let route = snapshot.provider_routes.last().ok_or((
+        wire::SERVER_ERROR,
+        "session is missing its provider route timeline".into(),
+    ))?;
+    let mut options = options_from_runtime(runtime)?;
+    options.provider_id = Some(route.provider_id.clone());
+    options.model = Some(route.primary_model.clone());
+    Ok(options)
 }
 
-fn thread_runtime_json(thread_id: &str, options: &ThreadStartOptions) -> Value {
+fn thread_runtime_json(
+    thread_id: &str,
+    options: &ThreadStartOptions,
+    route: &ActiveProviderRoute,
+) -> Value {
     json!({
         "id": thread_id,
         "cwd": options.cwd.to_string_lossy(),
-        "model": options.model,
+        "route": route,
         "resumable": true,
     })
 }
@@ -1287,7 +1407,23 @@ fn parse_thread_start_options(
         Some(_) => return Err((wire::INVALID_PARAMS, "'model' must be a string".into())),
     };
 
-    Ok(ThreadStartOptions { cwd, model })
+    let provider_id = match params.get("providerId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
+        Some(Value::String(_)) => {
+            return Err((
+                wire::INVALID_PARAMS,
+                "'providerId' must not be empty".into(),
+            ));
+        }
+        Some(_) => return Err((wire::INVALID_PARAMS, "'providerId' must be a string".into())),
+    };
+
+    Ok(ThreadStartOptions {
+        cwd,
+        provider_id,
+        model,
+    })
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
@@ -1333,10 +1469,10 @@ fn parse_input(params: &Value) -> Result<(String, Vec<ContentBlock>), (i64, Stri
 /// scheduler deliveries share one single-flight bracket and one monotonic id
 /// allocator; a scheduled prompt never borrows the id of the turn that created it.
 async fn thread_worker(
-    cfg: Arc<Config>,
+    mut cfg: Arc<Config>,
     mut history: History,
     ui: Arc<ThreadUi>,
-    mut turns: mpsc::UnboundedReceiver<Turn>,
+    mut turns: mpsc::UnboundedReceiver<ThreadWorkerMsg>,
     state: ThreadWorkerState,
 ) {
     let ThreadWorkerState {
@@ -1344,10 +1480,16 @@ async fn thread_worker(
         current_cancel,
         turn_seq,
         inbox,
+        active_route,
     } = state;
+    let provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
+        Arc::clone(&cfg.provider_catalog),
+        history.provider_routes(),
+    )
+    .expect("server history route timeline was validated before worker start");
     let mut inbox_activity = inbox.subscribe_activity();
     loop {
-        let turn = tokio::select! {
+        let message = tokio::select! {
             turn = turns.recv() => {
                 let Some(turn) = turn else { break };
                 turn
@@ -1367,17 +1509,80 @@ async fn thread_worker(
                 *ui.turn.lock().unwrap() = Some(id);
                 let cancel = CancellationToken::new();
                 *current_cancel.lock().unwrap() = Some(cancel.clone());
-                Turn {
+                ThreadWorkerMsg::Turn(Turn {
                     text: String::new(),
                     images: Vec::new(),
                     id,
                     cancel,
                     delivery_only: true,
-                }
+                })
+            }
+        };
+        let turn = match message {
+            ThreadWorkerMsg::Turn(turn) => turn,
+            ThreadWorkerMsg::SwitchProvider {
+                provider_id,
+                model,
+                expected_revision,
+                request_id,
+            } => {
+                let result = history
+                    .switch_provider(
+                        &provider_state,
+                        expected_revision,
+                        &provider_id,
+                        model.as_deref(),
+                    )
+                    .map(|outcome| {
+                        let route = match outcome {
+                            kloop_core::provider_route::SwitchOutcome::NoOp(route) => route,
+                            kloop_core::provider_route::SwitchOutcome::Changed {
+                                route,
+                                continuity,
+                            } => {
+                                ui.projection.update_provider_route(route.public_route());
+                                ui.notify(
+                                    "thread/provider/changed",
+                                    json!({
+                                        "route": route.public_route(),
+                                        "continuity": continuity,
+                                    }),
+                                );
+                                route
+                            }
+                        };
+                        cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
+                        let public_route = route.public_route();
+                        *active_route.lock().unwrap() = public_route.clone();
+                        public_route
+                    })
+                    .map_err(|error| error.to_string());
+                let outgoing = match result {
+                    Ok(route) => Outgoing::Response {
+                        id: request_id,
+                        result: json!({"route": route}),
+                    },
+                    Err(message) => Outgoing::Error {
+                        id: Some(request_id),
+                        code: wire::SERVER_ERROR,
+                        message,
+                    },
+                };
+                running.store(false, Ordering::SeqCst);
+                let _ = ui.out.send(outgoing.to_json());
+                continue;
             }
         };
         ui.notify("turn/started", wire::turn_started_params(turn.id));
-        let reason = run_turn_or_command(&cfg, &mut history, &ui, &turn).await;
+        let reason = run_turn_or_command(
+            &mut cfg,
+            &provider_state,
+            &active_route,
+            &mut history,
+            &ui,
+            &turn,
+        )
+        .await;
         history.record_turn_terminal(turn_terminal(&reason));
         ui.emit(&Event::Usage(history.estimated_tokens()));
         ui.notify(
@@ -1416,7 +1621,9 @@ fn turn_terminal(reason: &EndReason) -> TurnTerminal {
 /// also emits `thread/cleared` so the client resets its transcript. Images (or
 /// any non-command text) take the model path.
 async fn run_turn_or_command(
-    cfg: &Arc<Config>,
+    cfg: &mut Arc<Config>,
+    provider_state: &kloop_core::provider_route::SessionProviderState,
+    active_route: &Arc<Mutex<ActiveProviderRoute>>,
     history: &mut History,
     ui: &Arc<ThreadUi>,
     turn: &Turn,
@@ -1428,7 +1635,20 @@ async fn run_turn_or_command(
             .reason;
     }
     if turn.images.is_empty() && commands::is_command(&turn.text) {
-        let result = commands::run(&turn.text, history, cfg, &turn.cancel).await;
+        let result = commands::run_with_provider_state(
+            &turn.text,
+            history,
+            cfg,
+            provider_state,
+            &turn.cancel,
+        )
+        .await;
+        if result.provider_changed {
+            let route = provider_state.active_route();
+            *cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
+            *active_route.lock().unwrap() = route.clone();
+            ui.projection.update_provider_route(route);
+        }
         // `/exit` is a client-side concept: quitting one thread must never stop
         // a multi-session server. Relay a note instead of acting on it.
         if result.quit {

@@ -29,7 +29,7 @@ use kloop_core::event::ItemStatus;
 /// The protocol version kloop's engine speaks. Bumped only on a breaking wire
 /// change; the handshake rejects a client asking for anything else rather than
 /// silently downgrading.
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "2.0";
 
 /// JSON-RPC request ids may be integers or strings; both are preserved
 /// verbatim so responses match whatever the client sent. The server's own

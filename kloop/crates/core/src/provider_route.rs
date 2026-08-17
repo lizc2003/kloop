@@ -1,0 +1,766 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use kloop_protocol::ActiveProviderRoute;
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderAttemptIdentity;
+use kloop_protocol::ProviderAttemptKind;
+use kloop_protocol::ProviderAvailabilityCode;
+use kloop_protocol::ProviderDescriptor;
+use kloop_protocol::ProviderResponseProvenance;
+use kloop_protocol::ReasoningContinuity;
+use kloop_provider::Provider;
+
+pub type ProviderFactory =
+    Arc<dyn Fn() -> Result<Provider, ProviderAvailabilityCode> + Send + Sync + 'static>;
+
+pub struct ProviderCatalogEntry {
+    pub id: String,
+    pub api_family: ProviderApiFamily,
+    pub endpoint_fingerprint: String,
+    pub default_model: String,
+    pub models: Vec<String>,
+    pub fallback_model: Option<String>,
+    pub availability: ProviderAvailabilityCode,
+    pub factory: ProviderFactory,
+}
+
+struct CatalogEntry {
+    descriptor: ProviderDescriptor,
+    endpoint_fingerprint: String,
+    factory: ProviderFactory,
+    provider: OnceLock<Result<Arc<Provider>, ProviderAvailabilityCode>>,
+}
+
+pub struct ProviderCatalog {
+    entries: BTreeMap<String, CatalogEntry>,
+}
+
+impl fmt::Debug for ProviderCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderCatalog")
+            .field("descriptors", &self.descriptors())
+            .finish()
+    }
+}
+
+impl ProviderCatalog {
+    pub fn new(entries: Vec<ProviderCatalogEntry>) -> Result<Self, String> {
+        if entries.is_empty() {
+            return Err("provider catalog must contain at least one provider".into());
+        }
+        let mut catalog = BTreeMap::new();
+        for entry in entries {
+            let id = checked_nonempty(&entry.id, "provider id")?;
+            let default_model = checked_nonempty(&entry.default_model, "default model")?;
+            let endpoint_fingerprint =
+                checked_nonempty(&entry.endpoint_fingerprint, "endpoint fingerprint")?;
+            let mut models = Vec::new();
+            for model in entry.models {
+                let model = checked_nonempty(&model, "provider model")?;
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+            if models.is_empty() {
+                return Err(format!("provider '{id}' must declare at least one model"));
+            }
+            if !models.contains(&default_model) {
+                return Err(format!(
+                    "provider '{id}' default model '{default_model}' is not in its models allowlist"
+                ));
+            }
+            if let Some(fallback) = entry.fallback_model.as_ref()
+                && !models.contains(fallback)
+            {
+                return Err(format!(
+                    "provider '{id}' fallback model '{fallback}' is not in its models allowlist"
+                ));
+            }
+            let descriptor = ProviderDescriptor {
+                id: id.clone(),
+                api_family: entry.api_family,
+                default_model,
+                models,
+                fallback_model: entry.fallback_model,
+                availability: entry.availability,
+            };
+            if catalog
+                .insert(
+                    id.clone(),
+                    CatalogEntry {
+                        descriptor,
+                        endpoint_fingerprint,
+                        factory: entry.factory,
+                        provider: OnceLock::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!("duplicate provider id '{id}'"));
+            }
+        }
+        Ok(Self { entries: catalog })
+    }
+
+    pub fn from_provider(
+        id: impl Into<String>,
+        provider: Provider,
+        default_model: impl Into<String>,
+        models: Vec<String>,
+        fallback_model: Option<String>,
+    ) -> Result<(Arc<Self>, FrozenProviderRoute), String> {
+        let id = id.into();
+        let default_model = default_model.into();
+        let api_family = provider.api_family();
+        let endpoint_fingerprint = provider.endpoint_fingerprint();
+        let provider = Mutex::new(Some(provider));
+        let entry = ProviderCatalogEntry {
+            id: id.clone(),
+            api_family,
+            endpoint_fingerprint,
+            default_model: default_model.clone(),
+            models,
+            fallback_model,
+            availability: ProviderAvailabilityCode::Ready,
+            factory: Arc::new(move || {
+                provider
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or(ProviderAvailabilityCode::InvalidConfiguration)
+            }),
+        };
+        let catalog = Arc::new(Self::new(vec![entry])?);
+        let route = catalog
+            .initial_route(&id, Some(&default_model))
+            .map_err(|error| error.to_string())?;
+        Ok((catalog, route))
+    }
+
+    fn validate_receipt(
+        &self,
+        receipt: &kloop_protocol::ProviderRouteReceipt,
+    ) -> Result<(), SwitchError> {
+        let entry = self
+            .entries
+            .get(&receipt.provider_id)
+            .ok_or_else(|| SwitchError::UnknownProvider(receipt.provider_id.clone()))?;
+        if entry.descriptor.api_family != receipt.api_family
+            || entry.endpoint_fingerprint != receipt.endpoint_fingerprint
+            || entry.descriptor.fallback_model != receipt.fallback_model
+            || !entry
+                .descriptor
+                .models
+                .iter()
+                .any(|model| model == &receipt.primary_model)
+        {
+            return Err(SwitchError::RouteDrift(receipt.provider_id.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn restore_route(
+        self: &Arc<Self>,
+        receipt: &kloop_protocol::ProviderRouteReceipt,
+    ) -> Result<FrozenProviderRoute, SwitchError> {
+        if receipt.revision == 0 {
+            return Err(SwitchError::InvalidRevision);
+        }
+        self.validate_receipt(receipt)?;
+        let resolved = self.resolve(&receipt.provider_id, &receipt.primary_model)?;
+        Ok(FrozenProviderRoute::new(receipt.revision, resolved))
+    }
+    pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        self.entries
+            .values()
+            .map(|entry| entry.descriptor.clone())
+            .collect()
+    }
+
+    pub fn descriptor(&self, id: &str) -> Option<ProviderDescriptor> {
+        self.entries.get(id).map(|entry| entry.descriptor.clone())
+    }
+
+    fn resolve(&self, provider_id: &str, model: &str) -> Result<ResolvedRoute, SwitchError> {
+        let entry = self
+            .entries
+            .get(provider_id)
+            .ok_or_else(|| SwitchError::UnknownProvider(provider_id.to_string()))?;
+        if !entry
+            .descriptor
+            .models
+            .iter()
+            .any(|allowed| allowed == model)
+        {
+            return Err(SwitchError::UnknownModel {
+                provider_id: provider_id.to_string(),
+                model: model.to_string(),
+            });
+        }
+        if entry.descriptor.availability != ProviderAvailabilityCode::Ready {
+            return Err(SwitchError::Unavailable {
+                provider_id: provider_id.to_string(),
+                code: entry.descriptor.availability,
+            });
+        }
+        let provider = entry
+            .provider
+            .get_or_init(|| (entry.factory)().map(Arc::new))
+            .clone()
+            .map_err(|code| SwitchError::Unavailable {
+                provider_id: provider_id.to_string(),
+                code,
+            })?;
+        Ok(ResolvedRoute {
+            provider_id: provider_id.to_string(),
+            api_family: entry.descriptor.api_family,
+            endpoint_fingerprint: entry.endpoint_fingerprint.clone(),
+            primary_model: model.to_string(),
+            allowed_models: entry.descriptor.models.clone(),
+            fallback_model: entry.descriptor.fallback_model.clone(),
+            provider,
+        })
+    }
+
+    pub fn initial_route(
+        self: &Arc<Self>,
+        provider_id: &str,
+        model: Option<&str>,
+    ) -> Result<FrozenProviderRoute, SwitchError> {
+        let descriptor = self
+            .descriptor(provider_id)
+            .ok_or_else(|| SwitchError::UnknownProvider(provider_id.to_string()))?;
+        let model = model.unwrap_or(&descriptor.default_model);
+        Ok(FrozenProviderRoute::new(
+            1,
+            self.resolve(provider_id, model)?,
+        ))
+    }
+}
+
+fn checked_nonempty(value: &str, field: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(value.to_string())
+}
+
+#[derive(Clone)]
+struct ResolvedRoute {
+    provider_id: String,
+    api_family: ProviderApiFamily,
+    endpoint_fingerprint: String,
+    primary_model: String,
+    allowed_models: Vec<String>,
+    fallback_model: Option<String>,
+    provider: Arc<Provider>,
+}
+
+struct SessionState {
+    revision: u64,
+    active: ResolvedRoute,
+    remembered_models: BTreeMap<String, String>,
+}
+
+pub struct SessionProviderState {
+    catalog: Arc<ProviderCatalog>,
+    state: Mutex<SessionState>,
+}
+
+impl fmt::Debug for SessionProviderState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionProviderState")
+            .field("active", &self.active_route())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionProviderState {
+    pub fn new(
+        catalog: Arc<ProviderCatalog>,
+        provider_id: &str,
+        model: Option<&str>,
+    ) -> Result<Self, SwitchError> {
+        let route = catalog.initial_route(provider_id, model)?;
+        Ok(Self::from_route(catalog, route))
+    }
+
+    pub fn from_timeline(
+        catalog: Arc<ProviderCatalog>,
+        timeline: &[kloop_protocol::ProviderRouteReceipt],
+    ) -> Result<Self, SwitchError> {
+        let latest = timeline.last().ok_or(SwitchError::InvalidRevision)?;
+        for receipt in timeline {
+            catalog.validate_receipt(receipt)?;
+        }
+        let route = catalog.restore_route(latest)?;
+        let remembered_models = timeline
+            .iter()
+            .map(|receipt| (receipt.provider_id.clone(), receipt.primary_model.clone()))
+            .collect();
+        Ok(Self {
+            catalog,
+            state: Mutex::new(SessionState {
+                revision: route.revision,
+                active: route.route,
+                remembered_models,
+            }),
+        })
+    }
+    pub fn from_route(catalog: Arc<ProviderCatalog>, route: FrozenProviderRoute) -> Self {
+        let remembered_models = BTreeMap::from([(
+            route.provider_id().to_string(),
+            route.primary_model().to_string(),
+        )]);
+        Self {
+            catalog,
+            state: Mutex::new(SessionState {
+                revision: route.revision,
+                active: route.route,
+                remembered_models,
+            }),
+        }
+    }
+
+    pub fn catalog(&self) -> &Arc<ProviderCatalog> {
+        &self.catalog
+    }
+
+    pub fn freeze(&self) -> FrozenProviderRoute {
+        let state = self.state.lock().unwrap();
+        FrozenProviderRoute::new(state.revision, state.active.clone())
+    }
+
+    pub fn active_route(&self) -> ActiveProviderRoute {
+        self.freeze().public_route()
+    }
+
+    pub fn remembered_models(&self) -> BTreeMap<String, String> {
+        self.state.lock().unwrap().remembered_models.clone()
+    }
+
+    pub fn switch_with<E>(
+        &self,
+        expected_revision: u64,
+        provider_id: &str,
+        model: Option<&str>,
+        commit: impl FnOnce(
+            &FrozenProviderRoute,
+            &FrozenProviderRoute,
+        ) -> Result<ReasoningContinuity, E>,
+    ) -> Result<SwitchOutcome, SwitchCommitError<E>> {
+        let target_model = {
+            let state = self.state.lock().unwrap();
+            let descriptor = self.catalog.descriptor(provider_id).ok_or_else(|| {
+                SwitchCommitError::Switch(SwitchError::UnknownProvider(provider_id.to_string()))
+            })?;
+            model
+                .map(str::to_string)
+                .or_else(|| state.remembered_models.get(provider_id).cloned())
+                .unwrap_or(descriptor.default_model)
+        };
+        let target = self
+            .catalog
+            .resolve(provider_id, &target_model)
+            .map_err(SwitchCommitError::Switch)?;
+
+        let mut state = self.state.lock().unwrap();
+        if state.revision != expected_revision {
+            return Err(SwitchCommitError::Switch(SwitchError::StaleRevision {
+                expected: expected_revision,
+                actual: state.revision,
+            }));
+        }
+        if state.active.provider_id == target.provider_id
+            && state.active.primary_model == target.primary_model
+            && state.active.api_family == target.api_family
+            && state.active.endpoint_fingerprint == target.endpoint_fingerprint
+        {
+            return Ok(SwitchOutcome::NoOp(FrozenProviderRoute::new(
+                state.revision,
+                state.active.clone(),
+            )));
+        }
+        let next_revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| SwitchCommitError::Switch(SwitchError::RevisionExhausted))?;
+        let previous = FrozenProviderRoute::new(state.revision, state.active.clone());
+        let next = FrozenProviderRoute::new(next_revision, target.clone());
+        let continuity = commit(&previous, &next).map_err(SwitchCommitError::Commit)?;
+        state.revision = next_revision;
+        state.active = target;
+        state
+            .remembered_models
+            .insert(provider_id.to_string(), target_model);
+        Ok(SwitchOutcome::Changed {
+            route: next,
+            continuity,
+        })
+    }
+
+    pub fn restore(
+        catalog: Arc<ProviderCatalog>,
+        revision: u64,
+        provider_id: &str,
+        model: &str,
+        remembered_models: BTreeMap<String, String>,
+    ) -> Result<Self, SwitchError> {
+        if revision == 0 {
+            return Err(SwitchError::InvalidRevision);
+        }
+        let active = catalog.resolve(provider_id, model)?;
+        Ok(Self {
+            catalog,
+            state: Mutex::new(SessionState {
+                revision,
+                active,
+                remembered_models,
+            }),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct FrozenProviderRoute {
+    revision: u64,
+    route: ResolvedRoute,
+}
+
+impl fmt::Debug for FrozenProviderRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrozenProviderRoute")
+            .field("revision", &self.revision)
+            .field("provider_id", &self.route.provider_id)
+            .field("api_family", &self.route.api_family)
+            .field("primary_model", &self.route.primary_model)
+            .field("fallback_model", &self.route.fallback_model)
+            .finish()
+    }
+}
+
+impl FrozenProviderRoute {
+    fn new(revision: u64, route: ResolvedRoute) -> Self {
+        Self { revision, route }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn at_revision(&self, revision: u64) -> Result<Self, SwitchError> {
+        if revision == 0 {
+            return Err(SwitchError::InvalidRevision);
+        }
+        Ok(Self::new(revision, self.route.clone()))
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.route.provider_id
+    }
+
+    pub fn api_family(&self) -> ProviderApiFamily {
+        self.route.api_family
+    }
+
+    pub fn endpoint_fingerprint(&self) -> &str {
+        &self.route.endpoint_fingerprint
+    }
+
+    pub fn primary_model(&self) -> &str {
+        &self.route.primary_model
+    }
+
+    pub fn allowed_models(&self) -> &[String] {
+        &self.route.allowed_models
+    }
+
+    pub fn fallback_model(&self) -> Option<&str> {
+        self.route.fallback_model.as_deref()
+    }
+
+    pub fn primary_attempt(&self) -> FrozenProviderAttempt {
+        self.attempt(
+            self.route.primary_model.clone(),
+            ProviderAttemptKind::Primary,
+        )
+    }
+
+    pub fn fallback_attempt(&self) -> Option<FrozenProviderAttempt> {
+        self.route
+            .fallback_model
+            .as_ref()
+            .filter(|model| **model != self.route.primary_model)
+            .map(|model| self.attempt(model.clone(), ProviderAttemptKind::Fallback))
+    }
+
+    fn attempt(&self, model: String, attempt_kind: ProviderAttemptKind) -> FrozenProviderAttempt {
+        FrozenProviderAttempt {
+            identity: ProviderAttemptIdentity {
+                route_revision: self.revision,
+                provider_id: self.route.provider_id.clone(),
+                api_family: self.route.api_family,
+                endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
+                model,
+                attempt_kind,
+            },
+            provider: Arc::clone(&self.route.provider),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_models(&self, primary: &str, fallback: Option<&str>) -> Self {
+        let mut route = self.route.clone();
+        route.primary_model = primary.to_string();
+        route.allowed_models = vec![primary.to_string()];
+        route.fallback_model = fallback.map(str::to_string);
+        if let Some(fallback) = fallback
+            && !route.allowed_models.iter().any(|model| model == fallback)
+        {
+            route.allowed_models.push(fallback.to_string());
+        }
+        Self::new(self.revision, route)
+    }
+
+    pub fn child_route(&self, model: Option<&str>) -> Result<Self, SwitchError> {
+        let model = model.unwrap_or(&self.route.primary_model);
+        if !self
+            .route
+            .allowed_models
+            .iter()
+            .any(|allowed| allowed == model)
+        {
+            return Err(SwitchError::UnknownModel {
+                provider_id: self.route.provider_id.clone(),
+                model: model.to_string(),
+            });
+        }
+        let mut route = self.route.clone();
+        route.primary_model = model.to_string();
+        Ok(Self::new(1, route))
+    }
+
+    pub fn receipt(
+        &self,
+        boundary: u64,
+        source: kloop_protocol::ProviderRouteSource,
+        continuity: ReasoningContinuity,
+    ) -> kloop_protocol::ProviderRouteReceipt {
+        kloop_protocol::ProviderRouteReceipt {
+            revision: self.revision,
+            boundary,
+            source,
+            provider_id: self.route.provider_id.clone(),
+            api_family: self.route.api_family,
+            endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
+            primary_model: self.route.primary_model.clone(),
+            fallback_model: self.route.fallback_model.clone(),
+            continuity,
+        }
+    }
+
+    pub fn public_route(&self) -> ActiveProviderRoute {
+        ActiveProviderRoute {
+            revision: self.revision,
+            provider_id: self.route.provider_id.clone(),
+            api_family: self.route.api_family,
+            model: self.route.primary_model.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct FrozenProviderAttempt {
+    identity: ProviderAttemptIdentity,
+    provider: Arc<Provider>,
+}
+
+impl fmt::Debug for FrozenProviderAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrozenProviderAttempt")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrozenProviderAttempt {
+    pub fn identity(&self) -> &ProviderAttemptIdentity {
+        &self.identity
+    }
+
+    pub fn provider(&self) -> &Arc<Provider> {
+        &self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.identity.model
+    }
+
+    pub fn provenance(&self, origin_boundary: u64) -> ProviderResponseProvenance {
+        ProviderResponseProvenance {
+            route_revision: self.identity.route_revision,
+            origin_boundary,
+            provider_id: self.identity.provider_id.clone(),
+            api_family: self.identity.api_family,
+            endpoint_fingerprint: self.identity.endpoint_fingerprint.clone(),
+            model: self.identity.model.clone(),
+            attempt_kind: self.identity.attempt_kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum SwitchOutcome {
+    NoOp(FrozenProviderRoute),
+    Changed {
+        route: FrozenProviderRoute,
+        continuity: ReasoningContinuity,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SwitchError {
+    UnknownProvider(String),
+    UnknownModel {
+        provider_id: String,
+        model: String,
+    },
+    Unavailable {
+        provider_id: String,
+        code: ProviderAvailabilityCode,
+    },
+    RouteDrift(String),
+    StaleRevision {
+        expected: u64,
+        actual: u64,
+    },
+    RevisionExhausted,
+    InvalidRevision,
+}
+
+impl fmt::Display for SwitchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownProvider(provider) => write!(formatter, "unknown provider '{provider}'"),
+            Self::UnknownModel { provider_id, model } => {
+                write!(
+                    formatter,
+                    "unknown model '{model}' for provider '{provider_id}'"
+                )
+            }
+            Self::Unavailable { provider_id, code } => {
+                write!(
+                    formatter,
+                    "provider '{provider_id}' is unavailable ({code:?})"
+                )
+            }
+            Self::RouteDrift(provider_id) => write!(
+                formatter,
+                "provider '{provider_id}' no longer matches the persisted route identity"
+            ),
+            Self::StaleRevision { expected, actual } => write!(
+                formatter,
+                "provider route revision changed: expected {expected}, active {actual}"
+            ),
+            Self::RevisionExhausted => formatter.write_str("provider route revision exhausted"),
+            Self::InvalidRevision => {
+                formatter.write_str("provider route revision must be positive")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SwitchError {}
+
+#[derive(Debug)]
+pub enum SwitchCommitError<E> {
+    Switch(SwitchError),
+    Commit(E),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mock_entry(id: &str, default_model: &str, models: &[&str]) -> ProviderCatalogEntry {
+        ProviderCatalogEntry {
+            id: id.into(),
+            api_family: ProviderApiFamily::Mock,
+            endpoint_fingerprint: format!("mock:{id}"),
+            default_model: default_model.into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            fallback_model: None,
+            availability: ProviderAvailabilityCode::Ready,
+            factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+        }
+    }
+
+    #[test]
+    fn catalog_deduplicates_models_and_validates_defaults() {
+        let catalog =
+            ProviderCatalog::new(vec![mock_entry("a", "m1", &["m1", "m2", "m1"])]).unwrap();
+        assert_eq!(catalog.descriptors()[0].models, ["m1", "m2"]);
+
+        let error = ProviderCatalog::new(vec![mock_entry("a", "missing", &["m1"])]).unwrap_err();
+        assert!(error.contains("default model"));
+    }
+
+    #[test]
+    fn successful_switch_updates_only_after_commit_and_remembers_model() {
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                mock_entry("a", "a1", &["a1"]),
+                mock_entry("b", "b1", &["b1", "b2"]),
+            ])
+            .unwrap(),
+        );
+        let state = SessionProviderState::new(catalog, "a", None).unwrap();
+        let outcome = state
+            .switch_with(1, "b", Some("b2"), |previous, next| {
+                assert_eq!(previous.primary_model(), "a1");
+                assert_eq!(next.revision(), 2);
+                Ok::<_, ()>(ReasoningContinuity::Filtered)
+            })
+            .unwrap();
+        assert!(matches!(outcome, SwitchOutcome::Changed { .. }));
+        assert_eq!(state.active_route().model, "b2");
+        assert_eq!(state.remembered_models()["b"], "b2");
+    }
+
+    #[test]
+    fn failed_commit_and_noop_are_zero_mutation() {
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                mock_entry("a", "a1", &["a1"]),
+                mock_entry("b", "b1", &["b1"]),
+            ])
+            .unwrap(),
+        );
+        let state = SessionProviderState::new(catalog, "a", None).unwrap();
+        let result = state.switch_with(1, "b", None, |_, _| {
+            Err::<ReasoningContinuity, _>("persist")
+        });
+        assert!(matches!(result, Err(SwitchCommitError::Commit("persist"))));
+        assert_eq!(state.active_route().revision, 1);
+        assert_eq!(state.active_route().provider_id, "a");
+
+        let mut called = false;
+        let outcome = state
+            .switch_with(1, "a", None, |_, _| {
+                called = true;
+                Ok::<_, ()>(ReasoningContinuity::Preserved)
+            })
+            .unwrap();
+        assert!(!called);
+        assert!(matches!(outcome, SwitchOutcome::NoOp(_)));
+    }
+}

@@ -925,7 +925,7 @@ mod tests {
         let mut ctx = enabled_ctx("workflow-concurrency-limit");
         let mut cfg = ctx.cfg.test_clone();
         cfg.program_limits.max_concurrency = 1;
-        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+        cfg.set_test_provider(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: first_started_tx,
                 release: first_release_rx,
@@ -990,7 +990,7 @@ mod tests {
         let mut ctx = enabled_ctx("workflow-concurrency-cancel");
         let mut cfg = ctx.cfg.test_clone();
         cfg.program_limits.max_concurrency = 1;
-        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+        cfg.set_test_provider(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: first_started_tx,
                 release: first_release_rx,
@@ -1055,7 +1055,7 @@ mod tests {
         let mut ctx = enabled_ctx("workflow-stop");
         let ui = Arc::new(RecordingUi::default());
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+        cfg.set_test_provider(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
                 release: release_rx,
@@ -1118,7 +1118,7 @@ mod tests {
         let mut ctx = enabled_ctx("workflow-shutdown");
         let ui = Arc::new(RecordingUi::default());
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(kloop_provider::Provider::mock_scripted(vec![
+        cfg.set_test_provider(kloop_provider::Provider::mock_scripted(vec![
             kloop_provider::MockTurn::Gate {
                 started: started_tx,
                 release: release_rx,
@@ -1183,7 +1183,7 @@ mod tests {
             }]),
         ]);
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(provider);
+        cfg.set_test_provider(provider);
         ctx.cfg = Arc::new(cfg);
         let launched = workflow_tool(&json!({"script": script}), &ctx)
             .await
@@ -1216,7 +1216,7 @@ mod tests {
 
         let (provider, hit_seen) = kloop_provider::Provider::mock_recording(Vec::new());
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(provider);
+        cfg.set_test_provider(provider);
         ctx.cfg = Arc::new(cfg);
         workflow_tool(
             &json!({
@@ -1270,7 +1270,7 @@ mod tests {
             }]),
         ]);
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(provider);
+        cfg.set_test_provider(provider);
         ctx.cfg = Arc::new(cfg);
         workflow_tool(
             &json!({
@@ -1303,7 +1303,7 @@ mod tests {
     async fn workflow_structured_agent_returns_object_and_journals_value() {
         let mut ctx = enabled_ctx("workflow-structured");
         let mut cfg = ctx.cfg.test_clone();
-        cfg.provider = Arc::new(kloop_provider::Provider::mock(vec![vec![
+        cfg.set_test_provider(kloop_provider::Provider::mock(vec![vec![
             kloop_protocol::AssistantBlock::ToolUse {
                 id: "structured-1".into(),
                 name: "structured_output".into(),

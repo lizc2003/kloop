@@ -163,7 +163,7 @@ pub async fn run(
         .with_commands(slash_catalog(&cfg))
         .with_working_directory(display_cwd(&effective_cwd), effective_branch.clone())
         .with_context(
-            cfg.model.clone(),
+            cfg.provider_route.primary_model().to_string(),
             cfg.context_window,
             history.estimated_tokens(),
         );
@@ -174,7 +174,7 @@ pub async fn run(
     app.cells.insert(
         0,
         Cell::SessionHeader {
-            model: cfg.model.clone(),
+            model: cfg.provider_route.primary_model().to_string(),
             cwd: display_cwd(&effective_cwd),
             branch: effective_branch,
             mode: permissions.mode().label().to_string(),
@@ -329,7 +329,7 @@ fn send_command_result_events(
 /// Owns History for its whole lifetime and runs turns strictly one at a time;
 /// the UI loop enforces single-flight by ignoring Enter while running.
 async fn agent_worker(
-    cfg: Arc<Config>,
+    mut cfg: Arc<Config>,
     mut history: History,
     ui: Arc<dyn Ui>,
     mut msgs: mpsc::UnboundedReceiver<WorkerMsg>,
@@ -337,6 +337,11 @@ async fn agent_worker(
     // `--image` blocks ride the first user turn; taken once, then empty.
     mut pending_images: Vec<ContentBlock>,
 ) {
+    let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
+        Arc::clone(&cfg.provider_catalog),
+        history.provider_routes(),
+    )
+    .expect("TUI history route timeline was validated before worker start");
     loop {
         let next = msgs.recv().await;
         let Some(msg) = next else {
@@ -390,10 +395,31 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Command { line, cancel } => {
-                let result = kloop_core::commands::run(&line, &mut history, &cfg, &cancel).await;
+                let result = kloop_core::commands::run_with_provider_state(
+                    &line,
+                    &mut history,
+                    &cfg,
+                    &provider_state,
+                    &cancel,
+                )
+                .await;
+                if result.provider_changed {
+                    let route = provider_state.active_route();
+                    cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
+                    let _ = events.send(AgentEvent::ProviderChanged(route));
+                }
                 // Clear first (drops the old cells), then apply the exact empty
                 // graph fence, then show the result on the now-blank transcript.
                 if !send_command_result_events(&events, &result) {
+                    return;
+                }
+                if result.open_provider_picker
+                    && events
+                        .send(AgentEvent::ProviderPicker(
+                            cfg.provider_catalog.descriptors(),
+                        ))
+                        .is_err()
+                {
                     return;
                 }
                 // `/exit`: tell the loop to quit (it tears the terminal down
@@ -440,11 +466,40 @@ async fn agent_worker(
                 let event = match fork_here(&history, seq) {
                     Ok((session_id, resumed)) => {
                         let messages = resumed.messages.clone();
-                        history.rebase(resumed);
-                        cfg.reset_deferred_tool_capabilities();
-                        AgentEvent::Forked {
-                            session_id,
-                            messages,
+                        let route = resumed
+                            .snapshot
+                            .provider_routes
+                            .last()
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "rewound session provider route timeline is missing",
+                                )
+                            })
+                            .and_then(|receipt| {
+                                cfg.provider_catalog
+                                    .restore_route(receipt)
+                                    .map_err(std::io::Error::other)
+                            });
+                        match route {
+                            Ok(route) => {
+                                history.rebase(resumed);
+                                cfg.reset_deferred_tool_capabilities();
+                                cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
+                                provider_state =
+                                    kloop_core::provider_route::SessionProviderState::from_timeline(
+                                        Arc::clone(&cfg.provider_catalog),
+                                        history.provider_routes(),
+                                    )
+                                    .expect("rewound provider timeline was validated on recovery");
+                                AgentEvent::Forked {
+                                    session_id,
+                                    messages,
+                                }
+                            }
+                            Err(error) => AgentEvent::System(format!(
+                                "rewind failed: cannot restore provider route: {error}"
+                            )),
                         }
                     }
                     // A failed rewind leaves History untouched; report and carry
@@ -1305,8 +1360,8 @@ mod tests {
             text: "bye".into(),
         }]));
 
-        // Cut at #2 keeps the first turn only; the branch gets a fresh id.
-        let (id, resumed) = fork_here(&history, 2).unwrap();
+        // Route receipt + two messages keeps the first turn only.
+        let (id, resumed) = fork_here(&history, 3).unwrap();
         assert_ne!(id, "session");
         assert_eq!(
             resumed.messages,
@@ -1426,6 +1481,8 @@ mod tests {
             run_turn: None,
             task_graph: Some(snapshot(7, 0)),
             quit: false,
+            provider_changed: false,
+            open_provider_picker: false,
         };
         assert!(send_command_result_events(&tx, &result));
         assert!(matches!(

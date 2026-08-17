@@ -1609,6 +1609,7 @@ dependencies = [
  "kloop-protocol",
  "reqwest",
  "serde_json",
+ "sha2",
  "tokio",
  "wiremock",
 ]

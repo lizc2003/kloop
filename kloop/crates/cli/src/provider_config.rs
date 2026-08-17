@@ -1,10 +1,11 @@
-//! Process-global provider resolution from the parsed user config.
+//! Immutable process-wide provider catalog resolution.
 //!
-//! [`crate::user_config`] owns the one `~/.kloop/config.toml` read and root
-//! schema. This module validates the provider/model subset and applies the
-//! established environment override precedence.
+//! The user config declares every logical provider and its ordered model
+//! allowlist. Environment variables may select a new session's initial route,
+//! but never add an undeclared provider or model.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -13,103 +14,99 @@ use anyhow::bail;
 use toml::Value;
 use url::Url;
 
+use kloop_core::provider_route::FrozenProviderRoute;
+use kloop_core::provider_route::ProviderCatalog;
+use kloop_core::provider_route::ProviderCatalogEntry;
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderAvailabilityCode;
 use kloop_provider::Provider;
 use kloop_provider::ThinkingMode;
-use kloop_server::ModelInfo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rail {
-    Mock,
     Anthropic,
     OpenAiChat,
     OpenAiResponses,
 }
 
-/// Fully resolved process-wide provider state. Deliberately no Debug/Serialize:
-/// both would make accidental credential projection too easy.
+impl Rail {
+    fn api_family(self) -> ProviderApiFamily {
+        match self {
+            Self::Anthropic => ProviderApiFamily::AnthropicMessages,
+            Self::OpenAiChat => ProviderApiFamily::OpenAiChatCompletions,
+            Self::OpenAiResponses => ProviderApiFamily::OpenAiResponses,
+        }
+    }
+
+    fn default_base(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::OpenAiChat | Self::OpenAiResponses => "https://api.openai.com/v1",
+        }
+    }
+}
+
+/// Secret-free catalog plus one validated initial route. Deliberately no
+/// Debug/Serialize: its catalog owns lazy factories that capture credentials.
 pub(crate) struct ResolvedProviderSettings {
-    rail: Rail,
-    key: String,
-    base: String,
-    model: String,
-    cache: bool,
-    thinking: ThinkingMode,
-    effort: Option<String>,
+    catalog: Arc<ProviderCatalog>,
+    initial_provider: String,
+    initial_route: FrozenProviderRoute,
 }
 
 impl ResolvedProviderSettings {
     pub(crate) fn mock() -> Self {
+        let (catalog, initial_route) = ProviderCatalog::from_provider(
+            "mock",
+            Provider::mock(Vec::new()),
+            "mock",
+            vec!["mock".into()],
+            None,
+        )
+        .expect("built-in mock catalog is valid");
         Self {
-            rail: Rail::Mock,
-            key: String::new(),
-            base: String::new(),
-            model: "mock".into(),
-            cache: false,
-            thinking: ThinkingMode::Unset,
-            effort: None,
+            catalog,
+            initial_provider: "mock".into(),
+            initial_route,
         }
     }
 
-    pub(crate) fn provider(&self) -> Provider {
-        match self.rail {
-            Rail::Mock => Provider::mock(Vec::new()),
-            Rail::Anthropic => Provider::Anthropic {
-                key: self.key.clone(),
-                base: self.base.clone(),
-                cache: self.cache,
-                thinking: self.thinking,
-            },
-            Rail::OpenAiChat => Provider::OpenAiCompat {
-                key: self.key.clone(),
-                base: self.base.clone(),
-            },
-            Rail::OpenAiResponses => Provider::OpenAiResponses {
-                key: self.key.clone(),
-                base: self.base.clone(),
-                effort: self.effort.clone(),
-            },
-        }
+    pub(crate) fn catalog(&self) -> Arc<ProviderCatalog> {
+        Arc::clone(&self.catalog)
     }
 
+    pub(crate) fn initial_route(&self) -> FrozenProviderRoute {
+        self.initial_route.clone()
+    }
+
+    pub(crate) fn initial_provider(&self) -> &str {
+        &self.initial_provider
+    }
+
+    #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub(crate) fn model_info(&self) -> ModelInfo {
-        let provider = match self.rail {
-            Rail::Mock => "mock",
-            Rail::Anthropic => "anthropic",
-            Rail::OpenAiChat => "openai",
-            Rail::OpenAiResponses => "openaiResponses",
-        };
-        ModelInfo {
-            id: self.model.clone(),
-            display_name: self.model.clone(),
-            provider: provider.into(),
-            is_default: true,
-        }
+        self.initial_route.primary_model()
     }
 }
 
 struct Profile {
     wire: Rail,
-    base_url: Option<String>,
+    base_url: String,
     headers: BTreeMap<String, String>,
-    model: Option<String>,
-    cache: Option<bool>,
-    thinking: Option<ThinkingMode>,
+    default_model: String,
+    models: Vec<String>,
+    fallback_model: Option<String>,
+    cache: bool,
+    thinking: ThinkingMode,
     effort: Option<String>,
 }
 
 struct GlobalFile {
-    model: Option<String>,
-    model_provider: Option<String>,
-    effort: Option<String>,
+    initial_model: Option<String>,
+    initial_provider: String,
     profiles: BTreeMap<String, Profile>,
 }
 
-/// Resolve the process-global provider from the already parsed user config.
-/// `--mock` remains hermetic: no provider environment variables are read.
 pub(crate) fn load(mock: bool, table: &toml::Table) -> Result<ResolvedProviderSettings> {
     if mock {
         return Ok(ResolvedProviderSettings::mock());
@@ -136,146 +133,207 @@ fn resolve_table(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedProviderSettings> {
     let file = match table {
-        Some(table) => parse_global_file(table)?,
-        None => GlobalFile {
-            model: None,
-            model_provider: None,
-            effort: None,
-            profiles: BTreeMap::new(),
-        },
+        Some(table) if !table.is_empty() => parse_global_file(table)?,
+        _ => env_only_file(env)?,
     };
-
-    let env_provider = nonempty_env(env, "KLOOP_PROVIDER")?;
-    let selected = env_provider.as_deref().or(file.model_provider.as_deref());
-    let (rail, profile) = match selected {
-        Some(name) => match file.profiles.get(name) {
-            Some(profile) => (profile.wire, Some(profile)),
-            None => (
-                infer_builtin_rail(name).with_context(|| {
-                    format!("provider profile '{name}' is not defined in ~/.kloop/config.toml")
-                })?,
-                None,
-            ),
-        },
-        None if env("ANTHROPIC_API_KEY").is_some() => {
-            (Rail::Anthropic, file.profiles.get("anthropic"))
-        }
-        None if env("OPENAI_API_KEY").is_some() => (Rail::OpenAiChat, file.profiles.get("openai")),
-        None => {
-            bail!(
-                "no provider configured: set model_provider in ~/.kloop/config.toml, \
-                 set KLOOP_PROVIDER with provider credentials, or run with --mock"
-            )
-        }
-    };
-
-    let specific_model = match rail {
+    let initial_provider =
+        nonempty_env(env, "KLOOP_PROVIDER")?.unwrap_or_else(|| file.initial_provider.clone());
+    let profile = file.profiles.get(&initial_provider).with_context(|| {
+        format!("provider profile '{initial_provider}' is not defined in ~/.kloop/config.toml")
+    })?;
+    let rail_model = match profile.wire {
         Rail::Anthropic => nonempty_env(env, "ANTHROPIC_MODEL")?,
         Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_MODEL")?,
-        Rail::Mock => None,
     };
-    let model = specific_model
+    let initial_model = rail_model
         .or(nonempty_env(env, "KLOOP_MODEL")?)
-        .or_else(|| profile.and_then(|profile| profile.model.clone()))
-        .or_else(|| file.model.clone())
-        .or_else(|| (rail == Rail::Anthropic).then(|| "claude-sonnet-5".into()))
-        .context(
-            "openai providers need model in ~/.kloop/config.toml or OPENAI_MODEL/KLOOP_MODEL",
-        )?;
+        .or(file.initial_model)
+        .unwrap_or_else(|| profile.default_model.clone());
+    if !profile.models.iter().any(|model| model == &initial_model) {
+        bail!(
+            "initial model '{initial_model}' is not in provider '{initial_provider}' models allowlist"
+        );
+    }
 
-    match rail {
-        Rail::Anthropic => {
-            let key = nonempty_env(env, "ANTHROPIC_API_KEY")?
-                .or_else(|| profile.and_then(|profile| profile.headers.get("x-api-key").cloned()))
-                .context("anthropic credentials missing: set x-api-key in ~/.kloop/config.toml or ANTHROPIC_API_KEY")?;
-            let base = resolve_base(
-                nonempty_env(env, "ANTHROPIC_BASE_URL")?,
-                profile.and_then(|profile| profile.base_url.clone()),
-                "https://api.anthropic.com",
-                "model_providers.<selected>.base_url",
-            )?;
-            let cache = match nonempty_env(env, "KLOOP_CACHE")? {
-                Some(raw) => parse_bool_switch(&raw, "KLOOP_CACHE")?,
-                None => profile.and_then(|profile| profile.cache).unwrap_or(true),
-            };
-            let thinking = match nonempty_env(env, "KLOOP_THINKING")? {
-                Some(raw) => parse_thinking_string(&raw, "KLOOP_THINKING")?,
-                None => profile
-                    .and_then(|profile| profile.thinking)
-                    .unwrap_or(ThinkingMode::Unset),
-            };
-            Ok(ResolvedProviderSettings {
-                rail,
-                key,
-                base,
-                model,
-                cache,
-                thinking,
-                effort: None,
+    let mut entries = Vec::with_capacity(file.profiles.len());
+    for (id, profile) in file.profiles {
+        let selected = id == initial_provider;
+        let base = selected_base(&profile, selected, env)?;
+        let credential = selected_credential(&profile, selected, env)?;
+        let availability = if credential.is_some() {
+            ProviderAvailabilityCode::Ready
+        } else {
+            ProviderAvailabilityCode::MissingCredential
+        };
+        let api_family = profile.wire.api_family();
+        let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
+        let wire = profile.wire;
+        let cache = profile.cache;
+        let thinking = profile.thinking;
+        let effort = profile.effort.clone();
+        let factory = Arc::new(move || {
+            let key = credential
+                .clone()
+                .ok_or(ProviderAvailabilityCode::MissingCredential)?;
+            Ok(match wire {
+                Rail::Anthropic => Provider::Anthropic {
+                    key,
+                    base: base.clone(),
+                    cache,
+                    thinking,
+                },
+                Rail::OpenAiChat => Provider::OpenAiCompat {
+                    key,
+                    base: base.clone(),
+                },
+                Rail::OpenAiResponses => Provider::OpenAiResponses {
+                    key,
+                    base: base.clone(),
+                    effort: effort.clone(),
+                },
             })
+        });
+        entries.push(ProviderCatalogEntry {
+            id,
+            api_family,
+            endpoint_fingerprint,
+            default_model: profile.default_model,
+            models: profile.models,
+            fallback_model: profile.fallback_model,
+            availability,
+            factory,
+        });
+    }
+    let catalog = Arc::new(ProviderCatalog::new(entries).map_err(anyhow::Error::msg)?);
+    let initial_route = catalog
+        .initial_route(&initial_provider, Some(&initial_model))
+        .map_err(anyhow::Error::new)?;
+    Ok(ResolvedProviderSettings {
+        catalog,
+        initial_provider,
+        initial_route,
+    })
+}
+
+fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
+    let id = nonempty_env(env, "KLOOP_PROVIDER")?
+        .context("no provider configured: set KLOOP_PROVIDER or declare model_provider in ~/.kloop/config.toml")?;
+    let wire = match id.as_str() {
+        "anthropic" => Rail::Anthropic,
+        "openai" | "openai-compat" => Rail::OpenAiChat,
+        "openai-responses" => Rail::OpenAiResponses,
+        _ => bail!("provider '{id}' requires a declared model_providers profile"),
+    };
+    let model = match wire {
+        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_MODEL")?,
+        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_MODEL")?,
+    }
+    .or(nonempty_env(env, "KLOOP_MODEL")?)
+    .unwrap_or_else(|| {
+        if wire == Rail::Anthropic {
+            "claude-sonnet-5".into()
+        } else {
+            "gpt-5.6-sol".into()
+        }
+    });
+    let key = match wire {
+        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_API_KEY")?,
+        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_API_KEY")?,
+    }
+    .context("provider credentials missing; set the provider API key environment variable")?;
+    let base = match wire {
+        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_BASE_URL")?,
+        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_BASE_URL")?,
+    }
+    .unwrap_or_else(|| wire.default_base().into());
+    let base_url = validate_base_url(&base, "provider base URL")?;
+    let mut headers = BTreeMap::new();
+    match wire {
+        Rail::Anthropic => {
+            headers.insert("x-api-key".into(), key);
         }
         Rail::OpenAiChat | Rail::OpenAiResponses => {
-            let key = nonempty_env(env, "OPENAI_API_KEY")?
-                .or_else(|| profile.and_then(|profile| bearer_key(&profile.headers)))
-                .context("openai credentials missing: set Bearer Authorization in ~/.kloop/config.toml or OPENAI_API_KEY")?;
-            let base = resolve_base(
-                nonempty_env(env, "OPENAI_BASE_URL")?,
-                profile.and_then(|profile| profile.base_url.clone()),
-                "https://api.openai.com/v1",
-                "model_providers.<selected>.base_url",
-            )?;
-            let effort = if rail == Rail::OpenAiResponses {
-                nonempty_env(env, "KLOOP_EFFORT")?
-                    .or_else(|| profile.and_then(|profile| profile.effort.clone()))
-                    .or_else(|| file.effort.clone())
-            } else {
-                None
-            };
-            Ok(ResolvedProviderSettings {
-                rail,
-                key,
-                base,
-                model,
-                cache: false,
-                thinking: ThinkingMode::Unset,
-                effort,
-            })
+            headers.insert("authorization".into(), format!("Bearer {key}"));
         }
-        Rail::Mock => unreachable!("mock returns before resolver"),
     }
+    let profile = Profile {
+        wire,
+        base_url,
+        headers,
+        default_model: model.clone(),
+        models: vec![model.clone()],
+        fallback_model: None,
+        cache: wire == Rail::Anthropic,
+        thinking: ThinkingMode::Unset,
+        effort: nonempty_env(env, "KLOOP_EFFORT")?,
+    };
+    Ok(GlobalFile {
+        initial_model: Some(model),
+        initial_provider: id.clone(),
+        profiles: BTreeMap::from([(id, profile)]),
+    })
+}
+
+fn selected_base(
+    profile: &Profile,
+    selected: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let override_name = match profile.wire {
+        Rail::Anthropic => "ANTHROPIC_BASE_URL",
+        Rail::OpenAiChat | Rail::OpenAiResponses => "OPENAI_BASE_URL",
+    };
+    if selected && let Some(base) = nonempty_env(env, override_name)? {
+        return validate_base_url(&base, override_name);
+    }
+    Ok(profile.base_url.clone())
+}
+
+fn selected_credential(
+    profile: &Profile,
+    selected: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let from_env = if selected {
+        match profile.wire {
+            Rail::Anthropic => nonempty_env(env, "ANTHROPIC_API_KEY")?,
+            Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_API_KEY")?,
+        }
+    } else {
+        None
+    };
+    Ok(from_env.or_else(|| match profile.wire {
+        Rail::Anthropic => profile.headers.get("x-api-key").cloned(),
+        Rail::OpenAiChat | Rail::OpenAiResponses => bearer_key(&profile.headers),
+    }))
 }
 
 fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
-    let model = optional_string(table, "model", "model")?;
-    let model_provider = optional_string(table, "model_provider", "model_provider")?;
-    let effort = optional_string(table, "model_reasoning_effort", "model_reasoning_effort")?;
+    let initial_model = optional_string(table, "model", "model")?;
+    let initial_provider = optional_string(table, "model_provider", "model_provider")?
+        .context("model_provider is required")?;
+    let providers = table
+        .get("model_providers")
+        .and_then(Value::as_table)
+        .context("model_providers must be a table")?;
     let mut profiles = BTreeMap::new();
-    if let Some(value) = table.get("model_providers") {
-        let providers = value
+    for (id, value) in providers {
+        let spec = value
             .as_table()
-            .context("model_providers must be a table")?;
-        for (name, value) in providers {
-            let spec = value
-                .as_table()
-                .with_context(|| format!("model_providers.{name} must be a table"))?;
-            profiles.insert(name.clone(), parse_profile(name, spec)?);
-        }
+            .with_context(|| format!("model_providers.{id} must be a table"))?;
+        profiles.insert(id.clone(), parse_profile(id, spec)?);
     }
-    if let Some(selected) = &model_provider
-        && !profiles.contains_key(selected)
-        && infer_builtin_rail(selected).is_none()
-    {
-        bail!("model_provider '{selected}' has no matching model_providers profile");
+    if !profiles.contains_key(&initial_provider) {
+        bail!("model_provider '{initial_provider}' has no matching model_providers profile");
     }
     Ok(GlobalFile {
-        model,
-        model_provider,
-        effort,
+        initial_model,
+        initial_provider,
         profiles,
     })
 }
 
-fn parse_profile(name: &str, spec: &toml::Table) -> Result<Profile> {
+fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     for key in spec.keys() {
         if !matches!(
             key.as_str(),
@@ -283,137 +341,151 @@ fn parse_profile(name: &str, spec: &toml::Table) -> Result<Profile> {
                 | "wire_api"
                 | "base_url"
                 | "http_headers"
-                | "model"
+                | "default_model"
+                | "models"
+                | "fallback_model"
                 | "cache"
                 | "thinking"
                 | "effort"
         ) {
-            bail!("model_providers.{name} has unknown key '{key}'");
+            bail!("model_providers.{id} has unknown key '{key}'");
         }
     }
-    let _display_name = optional_string(spec, "name", &format!("model_providers.{name}.name"))?;
-    let wire = match optional_string(
+    let _display_name = optional_string(spec, "name", &format!("model_providers.{id}.name"))?;
+    let wire = parse_wire(
+        &required_string(spec, "wire_api", &format!("model_providers.{id}.wire_api"))?,
+        id,
+    )?;
+    let default_model = required_string(
         spec,
-        "wire_api",
-        &format!("model_providers.{name}.wire_api"),
-    )? {
-        Some(raw) => parse_wire(&raw, name)?,
-        None => infer_builtin_rail(name).with_context(|| {
-            format!("model_providers.{name}.wire_api is required for a custom provider")
-        })?,
-    };
-    let base_url = optional_string(
+        "default_model",
+        &format!("model_providers.{id}.default_model"),
+    )?;
+    let models = required_string_array(spec, "models", &format!("model_providers.{id}.models"))?;
+    if !models.iter().any(|model| model == &default_model) {
+        bail!("model_providers.{id}.default_model '{default_model}' is not in models allowlist");
+    }
+    let fallback_model = optional_string(
         spec,
-        "base_url",
-        &format!("model_providers.{name}.base_url"),
-    )?
-    .map(|base| validate_base_url(&base, &format!("model_providers.{name}.base_url")))
-    .transpose()?;
-    let model = optional_string(spec, "model", &format!("model_providers.{name}.model"))?;
-    let cache = optional_bool(spec, "cache", &format!("model_providers.{name}.cache"))?;
-    let effort = optional_string(spec, "effort", &format!("model_providers.{name}.effort"))?;
+        "fallback_model",
+        &format!("model_providers.{id}.fallback_model"),
+    )?;
+    if let Some(fallback) = fallback_model.as_ref()
+        && !models.iter().any(|model| model == fallback)
+    {
+        bail!("model_providers.{id}.fallback_model '{fallback}' is not in models allowlist");
+    }
+    let base_url = optional_string(spec, "base_url", &format!("model_providers.{id}.base_url"))?
+        .unwrap_or_else(|| wire.default_base().to_string());
+    let base_url = validate_base_url(&base_url, &format!("model_providers.{id}.base_url"))?;
+    let cache = optional_bool(spec, "cache", &format!("model_providers.{id}.cache"))?
+        .unwrap_or(wire == Rail::Anthropic);
+    let effort = optional_string(spec, "effort", &format!("model_providers.{id}.effort"))?;
     let thinking = match spec.get("thinking") {
-        None => None,
-        Some(Value::String(raw)) => Some(parse_thinking_string(
-            raw,
-            &format!("model_providers.{name}.thinking"),
-        )?),
-        Some(Value::Integer(raw)) if *raw > 0 => Some(ThinkingMode::Budget(*raw as u64)),
-        Some(_) => bail!(
-            "model_providers.{name}.thinking must be 'off', 'adaptive', or a positive integer"
-        ),
+        None => ThinkingMode::Unset,
+        Some(Value::String(raw)) => {
+            parse_thinking_string(raw, &format!("model_providers.{id}.thinking"))?
+        }
+        Some(Value::Integer(raw)) if *raw > 0 => ThinkingMode::Budget(*raw as u64),
+        Some(_) => {
+            bail!("model_providers.{id}.thinking must be 'off', 'adaptive', or a positive integer")
+        }
     };
-    if wire != Rail::Anthropic && (cache.is_some() || thinking.is_some()) {
-        bail!("model_providers.{name}: cache/thinking are only valid for anthropic wire_api");
+    if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
+        bail!("model_providers.{id}: cache/thinking are only valid for anthropic wire_api");
     }
     if wire != Rail::OpenAiResponses && effort.is_some() {
-        bail!("model_providers.{name}.effort is only valid for responses wire_api");
+        bail!("model_providers.{id}.effort is only valid for responses wire_api");
     }
-    let headers = parse_headers(name, spec.get("http_headers"), wire)?;
+    let headers = parse_headers(id, spec.get("http_headers"), wire)?;
     Ok(Profile {
         wire,
         base_url,
         headers,
-        model,
+        default_model,
+        models,
+        fallback_model,
         cache,
         thinking,
         effort,
     })
 }
 
-fn parse_headers(
-    name: &str,
-    value: Option<&Value>,
-    wire: Rail,
-) -> Result<BTreeMap<String, String>> {
+fn required_string(table: &toml::Table, key: &str, field: &str) -> Result<String> {
+    optional_string(table, key, field)?.with_context(|| format!("{field} is required"))
+}
+
+fn required_string_array(table: &toml::Table, key: &str, field: &str) -> Result<Vec<String>> {
+    let values = table
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{field} must be an array of strings"))?;
+    let mut models = Vec::new();
+    for value in values {
+        let model = value
+            .as_str()
+            .with_context(|| format!("{field} must contain only strings"))?;
+        let model = nonempty(model, field)?;
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if models.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    Ok(models)
+}
+
+fn parse_headers(id: &str, value: Option<&Value>, wire: Rail) -> Result<BTreeMap<String, String>> {
     let mut headers = BTreeMap::new();
     let Some(value) = value else {
         return Ok(headers);
     };
     let table = value
         .as_table()
-        .with_context(|| format!("model_providers.{name}.http_headers must be a table"))?;
+        .with_context(|| format!("model_providers.{id}.http_headers must be a table"))?;
     for (header, value) in table {
         let folded = header.to_ascii_lowercase();
         let allowed = match wire {
             Rail::Anthropic => folded == "x-api-key",
             Rail::OpenAiChat | Rail::OpenAiResponses => folded == "authorization",
-            Rail::Mock => false,
         };
         if !allowed {
-            bail!("model_providers.{name}.http_headers contains unsupported header '{header}'");
+            bail!("model_providers.{id}.http_headers contains unsupported header '{header}'");
         }
         let value = value.as_str().with_context(|| {
-            format!("model_providers.{name}.http_headers.{header} must be a string")
+            format!("model_providers.{id}.http_headers.{header} must be a string")
         })?;
         let value = nonempty(
             value,
-            &format!("model_providers.{name}.http_headers.{header}"),
+            &format!("model_providers.{id}.http_headers.{header}"),
         )?;
         if headers.insert(folded, value).is_some() {
-            bail!("model_providers.{name}.http_headers contains a duplicate header");
+            bail!("model_providers.{id}.http_headers contains a duplicate header");
         }
     }
     if wire != Rail::Anthropic
         && let Some(value) = headers.get("authorization")
         && bearer_from_header(value).is_none()
     {
-        bail!("model_providers.{name}.http_headers.Authorization must use Bearer authentication");
+        bail!("model_providers.{id}.http_headers.Authorization must use Bearer authentication");
     }
     Ok(headers)
 }
 
-fn parse_wire(raw: &str, name: &str) -> Result<Rail> {
+fn parse_wire(raw: &str, id: &str) -> Result<Rail> {
     match raw {
         "anthropic" => Ok(Rail::Anthropic),
         "chat" => Ok(Rail::OpenAiChat),
         "responses" => Ok(Rail::OpenAiResponses),
-        _ => bail!("model_providers.{name}.wire_api must be anthropic | chat | responses"),
+        _ => bail!("model_providers.{id}.wire_api must be anthropic | chat | responses"),
     }
-}
-
-fn infer_builtin_rail(name: &str) -> Option<Rail> {
-    match name {
-        "anthropic" => Some(Rail::Anthropic),
-        "openai" | "openai-compat" => Some(Rail::OpenAiChat),
-        "openai-responses" => Some(Rail::OpenAiResponses),
-        _ => None,
-    }
-}
-
-fn resolve_base(
-    env_base: Option<String>,
-    profile_base: Option<String>,
-    default: &str,
-    field: &str,
-) -> Result<String> {
-    validate_base_url(
-        env_base.or(profile_base).as_deref().unwrap_or(default),
-        field,
-    )
 }
 
 fn validate_base_url(raw: &str, field: &str) -> Result<String> {
+    if raw == "mock" {
+        return Ok(raw.into());
+    }
     let parsed = Url::parse(raw).map_err(|_| anyhow!("{field} must be an absolute http(s) URL"))?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -471,14 +543,6 @@ fn nonempty_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<Opti
     env(name).map(|value| nonempty(&value, name)).transpose()
 }
 
-fn parse_bool_switch(raw: &str, field: &str) -> Result<bool> {
-    match raw {
-        "off" | "0" | "false" => Ok(false),
-        "on" | "1" | "true" => Ok(true),
-        _ => bail!("{field} must be on | off | true | false | 1 | 0"),
-    }
-}
-
 fn parse_thinking_string(raw: &str, field: &str) -> Result<ThinkingMode> {
     match raw {
         "off" => Ok(ThinkingMode::Off),
@@ -515,154 +579,125 @@ mod tests {
         }
     }
 
-    #[test]
-    fn codex_style_custom_responses_profile_resolves() {
-        let raw = r#"
-model = "gpt-5.6-sol"
-model_provider = "gw_router"
-model_reasoning_effort = "xhigh"
+    const CATALOG: &str = r#"
+model_provider = "anthropic-a"
 
-[model_providers.gw_router]
-name = "gateway"
-wire_api = "responses"
-base_url = "https://router.example/v1/"
-http_headers = { Authorization = "Bearer sentinel-key" }
-"#;
-        let settings = resolve(Some(raw), &env(&[])).unwrap();
-        assert_eq!(settings.rail, Rail::OpenAiResponses);
-        assert_eq!(settings.model(), "gpt-5.6-sol");
-        assert_eq!(settings.base, "https://router.example/v1");
-        assert_eq!(settings.effort.as_deref(), Some("xhigh"));
-        assert_eq!(settings.model_info().provider, "openaiResponses");
-    }
-
-    #[test]
-    fn all_three_rails_and_profile_models_resolve() {
-        let anthropic = r#"
-model_provider = "anthropic"
-[model_providers.anthropic]
-base_url = "https://anthropic.example"
+[model_providers.anthropic-a]
+wire_api = "anthropic"
+base_url = "https://anthropic-a.example"
 http_headers = { x-api-key = "a-key" }
-model = "claude-test"
+default_model = "claude-a"
+models = ["claude-a", "claude-b", "claude-a"]
+fallback_model = "claude-b"
 cache = false
 thinking = "adaptive"
-"#;
-        let settings = resolve(Some(anthropic), &env(&[])).unwrap();
-        assert_eq!(settings.rail, Rail::Anthropic);
-        assert_eq!(settings.model(), "claude-test");
-        assert!(!settings.cache);
-        assert_eq!(settings.thinking, ThinkingMode::Adaptive);
 
-        let chat = r#"
-model_provider = "openai"
-[model_providers.openai]
-http_headers = { Authorization = "Bearer chat-key" }
-model = "chat-test"
+[model_providers.responses-b]
+wire_api = "responses"
+base_url = "https://responses-b.example/v1"
+http_headers = { Authorization = "Bearer b-key" }
+default_model = "gpt-a"
+models = ["gpt-a", "gpt-b"]
+effort = "high"
+
+[model_providers.chat-c]
+wire_api = "chat"
+base_url = "https://chat-c.example/v1"
+default_model = "chat-a"
+models = ["chat-a", "shared"]
 "#;
-        let settings = resolve(Some(chat), &env(&[])).unwrap();
-        assert_eq!(settings.rail, Rail::OpenAiChat);
-        assert_eq!(settings.model(), "chat-test");
+
+    #[test]
+    fn canonical_catalog_preserves_ordered_allowlists_and_availability() {
+        let settings = resolve(Some(CATALOG), &env(&[])).unwrap();
+        assert_eq!(settings.initial_provider(), "anthropic-a");
+        assert_eq!(settings.model(), "claude-a");
+        let descriptors = settings.catalog().descriptors();
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].models, ["claude-a", "claude-b"]);
+        assert_eq!(descriptors[0].fallback_model.as_deref(), Some("claude-b"));
+        assert_eq!(
+            descriptors[1].availability,
+            ProviderAvailabilityCode::MissingCredential
+        );
     }
 
     #[test]
-    fn environment_overrides_profile_without_cross_provider_fallback() {
-        let raw = r#"
-model = "file-model"
-model_provider = "sky"
-[model_providers.sky]
-wire_api = "responses"
-base_url = "https://file.example/v1"
-http_headers = { Authorization = "Bearer file-key" }
-"#;
+    fn environment_selects_only_declared_initial_routes() {
         let settings = resolve(
-            Some(raw),
-            &env(&[
-                ("OPENAI_API_KEY", "env-key"),
-                ("OPENAI_BASE_URL", "https://env.example/v1"),
-                ("OPENAI_MODEL", "env-model"),
-                ("KLOOP_EFFORT", "high"),
-            ]),
+            Some(CATALOG),
+            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_MODEL", "gpt-b")]),
         )
         .unwrap();
-        assert_eq!(settings.key, "env-key");
-        assert_eq!(settings.base, "https://env.example/v1");
-        assert_eq!(settings.model(), "env-model");
-        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.initial_provider(), "responses-b");
+        assert_eq!(settings.model(), "gpt-b");
 
         let error = resolve(
-            Some(raw),
-            &env(&[
-                ("KLOOP_PROVIDER", "anthropic"),
-                ("OPENAI_API_KEY", "wrong-rail"),
-            ]),
+            Some(CATALOG),
+            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_MODEL", "raw")]),
         )
         .err()
         .unwrap()
         .to_string();
-        assert!(error.contains("anthropic credentials missing"), "{error}");
-        assert!(!error.contains("wrong-rail"));
+        assert!(error.contains("allowlist"));
     }
 
     #[test]
-    fn pure_environment_compatibility_keeps_existing_precedence() {
+    fn selected_environment_credentials_do_not_make_other_profiles_ready() {
+        let raw = CATALOG.replace("http_headers = { Authorization = \"Bearer b-key\" }", "");
         let settings = resolve(
-            None,
+            Some(&raw),
             &env(&[
-                ("OPENAI_API_KEY", "key"),
-                ("OPENAI_MODEL", "specific"),
-                ("KLOOP_MODEL", "shared"),
+                ("KLOOP_PROVIDER", "responses-b"),
+                ("OPENAI_API_KEY", "selected-key"),
             ]),
         )
         .unwrap();
-        assert_eq!(settings.rail, Rail::OpenAiChat);
-        assert_eq!(settings.model(), "specific");
-
-        let settings = resolve(
-            None,
-            &env(&[("ANTHROPIC_API_KEY", "key"), ("KLOOP_MODEL", "shared")]),
-        )
-        .unwrap();
-        assert_eq!(settings.rail, Rail::Anthropic);
-        assert_eq!(settings.model(), "shared");
+        let descriptors = settings.catalog().descriptors();
+        assert_eq!(descriptors[2].availability, ProviderAvailabilityCode::Ready);
+        assert_eq!(
+            descriptors[1].availability,
+            ProviderAvailabilityCode::MissingCredential
+        );
     }
 
     #[test]
-    fn strict_schema_and_errors_do_not_echo_secrets() {
-        for raw in [
-            "secret = \"SENTINEL\"\n",
-            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"bad\"\nhttp_headers = { Authorization = \"Bearer SENTINEL\" }\n",
-            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nhttp_headers = { X-Secret = \"SENTINEL\" }\n",
-            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nhttp_headers = { Authorization = \"Bearer key\" }\n",
+    fn rejects_legacy_profile_model_and_invalid_membership() {
+        let legacy = r#"
+model_provider = "x"
+[model_providers.x]
+wire_api = "responses"
+model = "old"
+http_headers = { Authorization = "Bearer key" }
+"#;
+        assert!(
+            resolve(Some(legacy), &env(&[]))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unknown key 'model'")
+        );
+
+        for field in [
+            "default_model = \"missing\"\nmodels = [\"a\"]",
+            "default_model = \"a\"\nmodels = [\"a\"]\nfallback_model = \"missing\"",
         ] {
-            let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
-            assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
+            let raw = format!(
+                "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nhttp_headers = {{ Authorization = \"Bearer key\" }}\n{field}\n"
+            );
+            assert!(resolve(Some(&raw), &env(&[])).is_err());
         }
     }
 
     #[test]
-    fn rejects_endpoint_urls_and_custom_profiles_without_wire() {
-        let no_wire = r#"
-model_provider = "custom"
-[model_providers.custom]
-http_headers = { Authorization = "Bearer key" }
-"#;
-        assert!(
-            resolve(Some(no_wire), &env(&[]))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("wire_api")
-        );
-
-        for base in [
-            "https://example.test/v1/responses",
-            "https://example.test/v1?token=x",
-            "file:///tmp/api",
+    fn errors_never_echo_credentials() {
+        for raw in [
+            "secret = \"SENTINEL\"\n",
+            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"bad\"\nhttp_headers = { Authorization = \"Bearer SENTINEL\" }\ndefault_model = \"m\"\nmodels = [\"m\"]\n",
+            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nhttp_headers = { Authorization = \"Bearer key\" }\ndefault_model = \"m\"\nmodels = [\"m\"]\n",
         ] {
-            let raw = format!(
-                "model = \"m\"\nmodel_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nbase_url = \"{base}\"\nhttp_headers = {{ Authorization = \"Bearer key\" }}\n"
-            );
-            assert!(resolve(Some(&raw), &env(&[])).is_err(), "accepted {base}");
+            let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
+            assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
         }
     }
 }

@@ -1,6 +1,10 @@
+use std::fmt;
+
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderAttemptIdentity;
+use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::Usage;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,16 +14,47 @@ pub enum UsageOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderUsageRecord {
+    pub provider_id: String,
+    pub api_family: ProviderApiFamily,
+    pub route_revision: u64,
     pub model: String,
+    pub attempt_kind: ProviderAttemptKind,
     pub operation: UsageOperation,
     pub usage: Usage,
+}
+
+impl ProviderUsageRecord {
+    pub fn from_attempt(
+        attempt: &ProviderAttemptIdentity,
+        operation: UsageOperation,
+        usage: Usage,
+    ) -> Self {
+        Self {
+            provider_id: attempt.provider_id.clone(),
+            api_family: attempt.api_family,
+            route_revision: attempt.route_revision,
+            model: attempt.model.clone(),
+            attempt_kind: attempt.attempt_kind,
+            operation,
+            usage,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsageAggregate {
     pub usage: Usage,
     pub reported_responses: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageGroup {
+    pub provider_id: String,
+    pub api_family: ProviderApiFamily,
+    pub model: String,
+    pub aggregate: UsageAggregate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +95,30 @@ impl UsageLedger {
     pub fn aggregate(&self) -> Result<Option<UsageAggregate>, UsageOverflow> {
         self.aggregate.transpose()
     }
+
+    pub fn grouped(&self) -> Result<Vec<UsageGroup>, UsageOverflow> {
+        let mut groups: Vec<UsageGroup> = Vec::new();
+        for record in &self.records {
+            if let Some(group) = groups.iter_mut().find(|group| {
+                group.provider_id == record.provider_id
+                    && group.api_family == record.api_family
+                    && group.model == record.model
+            }) {
+                group.aggregate = add_usage(group.aggregate, record.usage)?;
+            } else {
+                groups.push(UsageGroup {
+                    provider_id: record.provider_id.clone(),
+                    api_family: record.api_family,
+                    model: record.model.clone(),
+                    aggregate: UsageAggregate {
+                        usage: record.usage,
+                        reported_responses: 1,
+                    },
+                });
+            }
+        }
+        Ok(groups)
+    }
 }
 
 fn add_usage(current: UsageAggregate, added: Usage) -> Result<UsageAggregate, UsageOverflow> {
@@ -97,20 +156,24 @@ fn add_usage(current: UsageAggregate, added: Usage) -> Result<UsageAggregate, Us
 mod tests {
     use super::*;
 
-    fn record(model: &str, operation: UsageOperation, usage: Usage) -> ProviderUsageRecord {
+    fn record(provider: &str, model: &str, usage: Usage) -> ProviderUsageRecord {
         ProviderUsageRecord {
+            provider_id: provider.into(),
+            api_family: ProviderApiFamily::Mock,
+            route_revision: 1,
             model: model.into(),
-            operation,
+            attempt_kind: ProviderAttemptKind::Primary,
+            operation: UsageOperation::Sampling,
             usage,
         }
     }
 
     #[test]
-    fn aggregate_preserves_all_categories_and_response_count() {
+    fn aggregate_preserves_categories_and_groups_provider_model() {
         let mut ledger = UsageLedger::default();
         ledger.push(record(
-            "primary",
-            UsageOperation::Sampling,
+            "a",
+            "shared",
             Usage {
                 input_tokens: 10,
                 output_tokens: 20,
@@ -119,8 +182,8 @@ mod tests {
             },
         ));
         ledger.push(record(
-            "fallback",
-            UsageOperation::Compaction,
+            "b",
+            "shared",
             Usage {
                 input_tokens: 1,
                 output_tokens: 2,
@@ -141,16 +204,17 @@ mod tests {
                 reported_responses: 2,
             })
         );
-        assert_eq!(ledger.records()[1].model, "fallback");
-        assert_eq!(ledger.records()[1].operation, UsageOperation::Compaction);
+        let groups = ledger.grouped().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].provider_id, "a");
+        assert_eq!(groups[1].provider_id, "b");
     }
 
     #[test]
     fn empty_and_reported_zero_are_distinct() {
         let mut ledger = UsageLedger::default();
         assert_eq!(ledger.aggregate().unwrap(), None);
-
-        ledger.push(record("model", UsageOperation::Sampling, Usage::default()));
+        ledger.push(record("a", "model", Usage::default()));
         assert_eq!(
             ledger.aggregate().unwrap(),
             Some(UsageAggregate {
@@ -164,22 +228,22 @@ mod tests {
     fn aggregate_overflow_fails_closed() {
         let mut ledger = UsageLedger::default();
         ledger.push(record(
+            "a",
             "model",
-            UsageOperation::Sampling,
             Usage {
                 input_tokens: u64::MAX,
                 ..Usage::default()
             },
         ));
         ledger.push(record(
+            "a",
             "model",
-            UsageOperation::Sampling,
             Usage {
                 input_tokens: 1,
                 ..Usage::default()
             },
         ));
-
         assert_eq!(ledger.aggregate(), Err(UsageOverflow));
+        assert_eq!(ledger.records().len(), 2);
     }
 }

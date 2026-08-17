@@ -12,6 +12,7 @@ use serde_json::json;
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::rollout::SnapshotTerminal;
+use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::Message;
 
 const MAX_RETAINED_EVENTS: usize = 4_096;
@@ -131,7 +132,7 @@ pub(crate) struct PublicSnapshot {
 struct SnapshotThread {
     id: String,
     cwd: String,
-    model: String,
+    route: ActiveProviderRoute,
     resumable: bool,
 }
 
@@ -289,7 +290,7 @@ impl ThreadProjection {
     pub fn new(
         thread_id: String,
         cwd: String,
-        model: String,
+        route: ActiveProviderRoute,
         seed: SessionSnapshot,
         source: RecoverySource,
     ) -> Result<Self, getrandom::Error> {
@@ -298,7 +299,7 @@ impl ThreadProjection {
             thread_id,
             generation,
             cwd,
-            model,
+            route,
             seed,
             source,
             MAX_RETAINED_EVENTS,
@@ -311,7 +312,7 @@ impl ThreadProjection {
         thread_id: String,
         generation: String,
         cwd: String,
-        model: String,
+        route: ActiveProviderRoute,
         seed: SessionSnapshot,
         source: RecoverySource,
         max_events: usize,
@@ -328,7 +329,7 @@ impl ThreadProjection {
             thread: SnapshotThread {
                 id: thread_id.clone(),
                 cwd: cwd.clone(),
-                model,
+                route,
                 resumable,
             },
             history: SnapshotHistory {
@@ -424,11 +425,15 @@ impl ThreadProjection {
         Ok(())
     }
 
-    pub fn refresh_seed(&self, cwd: String, model: String, seed: SessionSnapshot) {
+    pub fn update_provider_route(&self, route: ActiveProviderRoute) {
+        self.state.lock().unwrap().snapshot.thread.route = route;
+    }
+
+    pub fn refresh_seed(&self, cwd: String, route: ActiveProviderRoute, seed: SessionSnapshot) {
         let seed = into_public_session_snapshot(seed);
         let mut state = self.state.lock().unwrap();
         state.snapshot.thread.cwd = cwd.clone();
-        state.snapshot.thread.model = model;
+        state.snapshot.thread.route = route;
         state.snapshot.thread.resumable = seed.runtime.is_some();
         state.snapshot.history = SnapshotHistory {
             messages: seed.messages,
@@ -735,14 +740,23 @@ mod tests {
     use super::*;
     use kloop_core::rollout::SessionRuntime;
 
+    fn route(model: &str) -> ActiveProviderRoute {
+        ActiveProviderRoute {
+            revision: 1,
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: model.into(),
+        }
+    }
+
     fn seed() -> SessionSnapshot {
         SessionSnapshot {
             messages: vec![Message::user_text("persisted")],
             runtime: Some(SessionRuntime {
                 cwd: "/tmp/project".into(),
-                model: Some("model-a".into()),
             }),
             terminals: Vec::new(),
+            provider_routes: Vec::new(),
         }
     }
 
@@ -751,7 +765,7 @@ mod tests {
             "thread-a".into(),
             "generation-a".into(),
             "/tmp/project".into(),
-            "model-a".into(),
+            route("model-a"),
             seed(),
             RecoverySource::Fresh,
             max_events,
@@ -780,9 +794,13 @@ mod tests {
                 },
             ],
             kloop_protocol::ProviderResponseProvenance {
-                provider: "anthropic:https://api.example.test".into(),
+                route_revision: 1,
+                origin_boundary: 2,
+                provider_id: "anthropic".into(),
                 api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
+                endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "wire-model".into(),
+                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         );
         let mut seeded = seed();
@@ -791,7 +809,7 @@ mod tests {
             "thread-a".into(),
             "generation-a".into(),
             "/tmp/project".into(),
-            "model-a".into(),
+            route("model-a"),
             seeded,
             RecoverySource::Fresh,
             8,
@@ -811,7 +829,7 @@ mod tests {
 
         let mut refreshed = seed();
         refreshed.messages.push(reasoning);
-        projection.refresh_seed("/tmp/project".into(), "model-a".into(), refreshed);
+        projection.refresh_seed("/tmp/project".into(), route("model-a"), refreshed);
         let refreshed = serde_json::to_string(&projection.sync(None).unwrap()).unwrap();
         assert!(!refreshed.contains("opaque-signature"));
         assert!(!refreshed.contains("opaque-redacted"));
@@ -1111,9 +1129,8 @@ mod tests {
         let mut refreshed = seed();
         refreshed.runtime = Some(SessionRuntime {
             cwd: "/tmp/new-project".into(),
-            model: Some("model-b".into()),
         });
-        projection.refresh_seed("/tmp/new-project".into(), "model-b".into(), refreshed);
+        projection.refresh_seed("/tmp/new-project".into(), route("model-b"), refreshed);
 
         let snapshot = serde_json::to_value(projection.sync(None).unwrap()).unwrap();
         assert_eq!(
@@ -1121,7 +1138,12 @@ mod tests {
             json!({
                 "id": "thread-a",
                 "cwd": "/tmp/new-project",
-                "model": "model-b",
+                "route": {
+                    "revision": 1,
+                    "providerId": "test",
+                    "apiFamily": "mock",
+                    "model": "model-b",
+                },
                 "resumable": true,
             })
         );
@@ -1137,7 +1159,7 @@ mod tests {
             "thread-a".into(),
             "generation-b".into(),
             "/tmp/project".into(),
-            "model-a".into(),
+            route("model-a"),
             seed(),
             RecoverySource::Resumed,
             8,

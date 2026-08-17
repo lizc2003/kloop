@@ -13,6 +13,7 @@ use anyhow::bail;
 
 use kloop_core::history::History;
 use kloop_core::permissions::Mode;
+use kloop_core::provider_route::FrozenProviderRoute;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionOrigin;
 use kloop_core::rollout::checked_session_path;
@@ -342,12 +343,16 @@ pub(crate) fn open_history(
     offload_dir: PathBuf,
     choice: &SessionChoice,
     sessions_dir: &Path,
+    initial_route: &FrozenProviderRoute,
 ) -> Result<(History, String)> {
     let resume_path = match choice {
         SessionChoice::New => {
             let id = new_session_id(sessions_dir);
             let mut history = History::new(offload_dir);
-            history.attach_rollout(Rollout::new(session_path(sessions_dir, &id)));
+            history.attach_rollout(Rollout::new_with_initial_route(
+                session_path(sessions_dir, &id),
+                initial_route,
+            )?);
             return Ok((history, id));
         }
         SessionChoice::Resume(id) => {

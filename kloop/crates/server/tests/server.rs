@@ -34,7 +34,6 @@ use kloop_server::McpServerState;
 use kloop_server::McpServerStatus;
 use kloop_server::McpToolInfo;
 use kloop_server::McpTransportKind;
-use kloop_server::ModelInfo;
 use kloop_server::PROTOCOL_VERSION;
 use kloop_server::SandboxConfigInfo;
 use kloop_server::ServerConfig;
@@ -192,7 +191,18 @@ fn text(t: &str) -> AssistantBlock {
     AssistantBlock::Text { text: t.into() }
 }
 
-/// Factory over a scripted Mock provider; every thread gets its own copy of
+fn mock_route() -> kloop_core::provider_route::FrozenProviderRoute {
+    kloop_core::provider_route::ProviderCatalog::from_provider(
+        "mock",
+        Provider::mock(Vec::new()),
+        "mock",
+        vec!["mock".into(), "model-a".into(), "model-b".into()],
+        None,
+    )
+    .unwrap()
+    .1
+}
+
 /// the script. `gated` = a real Manual-mode permission gate wired to the
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
@@ -208,11 +218,21 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
         } else {
             Permissions::allow_all()
         };
+        let model = options.model.unwrap_or_else(|| "mock".into());
+        let (provider_catalog, provider_route) =
+            kloop_core::provider_route::ProviderCatalog::from_provider(
+                "mock",
+                Provider::mock(turns.clone()),
+                model.clone(),
+                vec![model],
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
         let questions = questioner.is_some();
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Ok(Config {
-            provider: Arc::new(Provider::mock(turns.clone())),
-            model: options.model.unwrap_or_else(|| "mock".into()),
+            provider_catalog,
+            provider_route,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),
@@ -222,7 +242,6 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             // ServerPaths the server lists/creates threads from.
             sessions_dir: offload.with_file_name("sessions"),
             context_window: None,
-            fallback_model: None,
             permissions: Arc::new(permissions),
             questioner,
             file_state: Default::default(),
@@ -288,10 +307,20 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
     let inner = factory(Vec::new(), offload, false);
     Arc::new(move |options, approver, questioner, notify| {
         let mut cfg = inner(options, approver, questioner, notify)?;
-        cfg.provider = Arc::new(Provider::mock_scripted(vec![MockTurn::PartialError(
-            vec![text("half answer")],
-            "stream dropped".into(),
-        )]));
+        let (provider_catalog, provider_route) =
+            kloop_core::provider_route::ProviderCatalog::from_provider(
+                "mock",
+                Provider::mock_scripted(vec![MockTurn::PartialError(
+                    vec![text("half answer")],
+                    "stream dropped".into(),
+                )]),
+                cfg.provider_route.primary_model(),
+                cfg.provider_route.allowed_models().to_vec(),
+                cfg.provider_route.fallback_model().map(str::to_string),
+            )
+            .map_err(anyhow::Error::msg)?;
+        cfg.provider_catalog = provider_catalog;
+        cfg.provider_route = provider_route;
         Ok(cfg)
     })
 }
@@ -305,6 +334,59 @@ fn recording_factory(
     Arc::new(move |options, approver, questioner, notify| {
         seen.lock().unwrap().push(options.clone());
         inner(options, approver, questioner, notify)
+    })
+}
+
+fn switch_factory(
+    offload: PathBuf,
+    seen_a: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
+    seen_b: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
+) -> ConfigFactory {
+    let inner = factory(Vec::new(), offload, false);
+    Arc::new(move |options, approver, questioner, notify| {
+        let selected_provider = options.provider_id.clone().unwrap_or_else(|| "a".into());
+        let selected_model = options.model.clone().unwrap_or_else(|| "shared".into());
+        let mut cfg = inner(options, approver, questioner, notify)?;
+        let provider_a = Provider::Mock {
+            turns: Mutex::new(vec![kloop_provider::MockTurn::Blocks(vec![text("from a")])].into()),
+            seen: Arc::clone(&seen_a),
+        };
+        let provider_b = Provider::Mock {
+            turns: Mutex::new(vec![kloop_provider::MockTurn::Blocks(vec![text("from b")])].into()),
+            seen: Arc::clone(&seen_b),
+        };
+        let entry = |id: &str, provider: Provider| {
+            let provider = Arc::new(Mutex::new(Some(provider)));
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: id.into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                default_model: "shared".into(),
+                models: vec!["shared".into(), format!("{id}-other")],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(move || {
+                    provider
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or(kloop_protocol::ProviderAvailabilityCode::InvalidConfiguration)
+                }),
+            }
+        };
+        let catalog = Arc::new(
+            kloop_core::provider_route::ProviderCatalog::new(vec![
+                entry("a", provider_a),
+                entry("b", provider_b),
+            ])
+            .map_err(anyhow::Error::msg)?,
+        );
+        let route = catalog
+            .initial_route(&selected_provider, Some(&selected_model))
+            .map_err(anyhow::Error::new)?;
+        cfg.provider_catalog = catalog;
+        cfg.provider_route = route;
+        Ok(cfg)
     })
 }
 
@@ -349,11 +431,20 @@ fn worktree_factory(
     cwd: PathBuf,
 ) -> ConfigFactory {
     Arc::new(move |_options, _approver, questioner, _notify| {
+        let (provider_catalog, provider_route) =
+            kloop_core::provider_route::ProviderCatalog::from_provider(
+                "mock",
+                Provider::mock(turns.clone()),
+                "mock",
+                vec!["mock".into()],
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
         let questions = questioner.is_some();
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Ok(Config {
-            provider: Arc::new(Provider::mock(turns.clone())),
-            model: "mock".into(),
+            provider_catalog,
+            provider_route,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),
@@ -361,7 +452,6 @@ fn worktree_factory(
             offload_dir: offload.clone(),
             sessions_dir: offload.with_file_name("sessions"),
             context_window: None,
-            fallback_model: None,
             permissions: Arc::new(Permissions::new(
                 Mode::Bypass,
                 &PermissionRules::default(),
@@ -435,7 +525,7 @@ async fn handshake_gates_and_negotiates() {
     client
         .request(
             "initialize",
-            json!({"protocolVersion": "2.0", "capabilities": {}}),
+            json!({"protocolVersion": "1.0", "capabilities": {}}),
         )
         .await;
     let err = client.recv().await;
@@ -454,7 +544,7 @@ async fn handshake_gates_and_negotiates() {
         caps["approvals"],
         json!({"scopes": ["once", "workspaceSession", "project"]})
     );
-    assert_eq!(caps["models"], json!({"list": true}));
+    assert_eq!(caps["providers"], json!({"catalog": true, "switch": true}));
     assert_eq!(caps["config"], json!({"read": true}));
     assert_eq!(caps["skills"], json!({"list": true}));
     assert_eq!(caps["mcpServers"], json!({"status": true}));
@@ -493,11 +583,13 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
         paths,
     );
-    server.models = vec![ModelInfo {
-        id: "model-default".into(),
-        display_name: "Model Default".into(),
-        provider: "test".into(),
-        is_default: true,
+    server.providers = vec![kloop_protocol::ProviderDescriptor {
+        id: "mock".into(),
+        api_family: kloop_protocol::ProviderApiFamily::Mock,
+        default_model: "model-default".into(),
+        models: vec!["model-default".into()],
+        fallback_model: None,
+        availability: kloop_protocol::ProviderAvailabilityCode::Ready,
     }];
     server.mcp_servers = vec![
         McpServerStatus {
@@ -526,7 +618,12 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             .push(cwd.to_path_buf());
         Ok(ConfigSnapshot {
             cwd: cwd.to_string_lossy().to_string(),
-            model: Some("model-default".into()),
+            route: Some(kloop_protocol::ActiveProviderRoute {
+                revision: 1,
+                provider_id: "mock".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                model: "model-default".into(),
+            }),
             permission_mode: "manual".into(),
             context_window: Some(200_000),
             defer_threshold: 30,
@@ -571,7 +668,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             "images": true,
             "mcp": true,
             "mcpServers": {"status": true},
-            "models": {"list": true},
+            "providers": {"catalog": true, "switch": true},
             "questions": true,
             "skills": {"list": true},
             "streaming": true,
@@ -580,17 +677,18 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         })
     );
 
-    let id = client.request("model/list", json!({})).await;
+    let id = client.request("provider/catalog/read", json!({})).await;
     assert_eq!(
         client.recv().await,
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {"models": [{
-                "id": "model-default",
-                "displayName": "Model Default",
-                "provider": "test",
-                "isDefault": true,
+            "result": {"providers": [{
+                "id": "mock",
+                "apiFamily": "mock",
+                "defaultModel": "model-default",
+                "models": ["model-default"],
+                "availability": "ready",
             }]},
         })
     );
@@ -605,7 +703,12 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             "id": id,
             "result": {"config": {
                 "cwd": project_text,
-                "model": "model-default",
+                "route": {
+                    "revision": 1,
+                    "providerId": "mock",
+                    "apiFamily": "mock",
+                    "model": "model-default",
+                },
                 "permissionMode": "manual",
                 "contextWindow": 200_000,
                 "deferThreshold": 30,
@@ -689,7 +792,10 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
     let response = client.recv().await;
     assert_eq!(response["id"], id);
     assert_eq!(response["result"]["config"]["cwd"], project_text);
-    assert_eq!(response["result"]["config"]["model"], "thread-model");
+    assert_eq!(
+        response["result"]["config"]["route"]["model"],
+        "thread-model"
+    );
 
     // Slice 4 is deliberately read-only. No capability advertises mutation and
     // the stale plan-table mention of config/write stays METHOD_NOT_FOUND.
@@ -715,7 +821,7 @@ async fn read_surface_params_fail_closed() {
     client.initialize().await;
 
     for (method, params) in [
-        ("model/list", json!({"unexpected": true})),
+        ("provider/catalog/read", json!({"unexpected": true})),
         ("mcpServerStatus/list", json!([])),
         ("config/read", json!({"threadId": "x", "cwd": "."})),
         ("config/read", json!({"threadID": "x"})),
@@ -762,10 +868,12 @@ async fn thread_start_resolves_per_thread_cwd_and_model() {
         vec![
             ThreadStartOptions {
                 cwd: project_a,
+                provider_id: None,
                 model: Some("model-a".into()),
             },
             ThreadStartOptions {
                 cwd: project_b,
+                provider_id: None,
                 model: Some("model-b".into()),
             },
         ]
@@ -794,6 +902,108 @@ async fn thread_start_resolves_per_thread_cwd_and_model() {
     }
     assert_eq!(seen.lock().unwrap().len(), 2);
 
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
+    let dirs = test_dirs("provider-switch");
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let mut server = ServerConfig::new(
+        switch_factory(
+            dirs.offload.clone(),
+            Arc::clone(&seen_a),
+            Arc::clone(&seen_b),
+        ),
+        ServerPaths {
+            sessions_dir: dirs.sessions.clone(),
+            offload_dir: dirs.offload.clone(),
+        },
+    );
+    server.providers = vec![
+        kloop_protocol::ProviderDescriptor {
+            id: "a".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            default_model: "shared".into(),
+            models: vec!["shared".into(), "a-other".into()],
+            fallback_model: None,
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+        },
+        kloop_protocol::ProviderDescriptor {
+            id: "b".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            default_model: "shared".into(),
+            models: vec!["shared".into(), "b-other".into()],
+            fallback_model: None,
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+        },
+    ];
+    let mut client = start_server_with_config(server);
+    client.initialize().await;
+    let start_id = client
+        .request(
+            "thread/start",
+            json!({"providerId": "a", "model": "shared"}),
+        )
+        .await;
+    let started = client.recv().await;
+    assert_eq!(started["id"], start_id);
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(started["result"]["thread"]["route"]["providerId"], "a");
+
+    let switch_id = client
+        .request(
+            "thread/provider/switch",
+            json!({
+                "threadId": thread_id,
+                "providerId": "b",
+                "model": "shared",
+                "expectedRouteRevision": 1,
+            }),
+        )
+        .await;
+    let switch_messages = client
+        .recv_until(|message| message["id"] == switch_id)
+        .await;
+    assert!(
+        switch_messages.iter().any(|message| {
+            message["method"] == "thread/provider/changed"
+                && message["params"]["route"]["providerId"] == "b"
+                && message["params"]["route"]["revision"] == 2
+        }),
+        "{switch_messages:?}"
+    );
+    let switched = switch_messages
+        .iter()
+        .find(|message| message["id"] == switch_id)
+        .unwrap();
+    assert_eq!(switched["result"]["route"]["revision"], 2);
+    assert!(seen_a.lock().unwrap().is_empty());
+    assert!(seen_b.lock().unwrap().is_empty());
+
+    client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": "after switch"}),
+        )
+        .await;
+    let turn_messages = client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    assert!(seen_a.lock().unwrap().is_empty());
+    assert_eq!(seen_b.lock().unwrap().len(), 1, "{turn_messages:?}");
+
+    client
+        .request("thread/read", json!({"threadId": thread_id}))
+        .await;
+    let read = client.recv().await;
+    assert_eq!(read["result"]["thread"]["route"]["providerId"], "b");
+    assert_eq!(read["result"]["thread"]["route"]["revision"], 2);
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
@@ -837,7 +1047,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         .await;
     let read = client.recv().await;
     assert_eq!(read["result"]["thread"]["cwd"], project_text.as_str());
-    assert_eq!(read["result"]["thread"]["model"], "model-a");
+    assert_eq!(read["result"]["thread"]["route"]["model"], "model-a");
     assert_eq!(read["result"]["thread"]["resumable"], true);
     assert_eq!(
         read["result"]["thread"]["messages"]
@@ -855,7 +1065,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
     let list = client.recv().await;
     assert_eq!(list["result"]["threads"][0]["id"], thread_id);
     assert_eq!(list["result"]["threads"][0]["cwd"], project_text.as_str());
-    assert_eq!(list["result"]["threads"][0]["model"], "model-a");
+    assert_eq!(list["result"]["threads"][0]["route"]["model"], "model-a");
     assert_eq!(list["result"]["threads"][0]["messages"], 2);
     client.shutdown().await;
 
@@ -874,11 +1084,12 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         .await;
     let resumed = client.recv().await;
     assert_eq!(resumed["result"]["thread"]["cwd"], project_text.as_str());
-    assert_eq!(resumed["result"]["thread"]["model"], "model-a");
+    assert_eq!(resumed["result"]["thread"]["route"]["model"], "model-a");
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         &[ThreadStartOptions {
             cwd: project.clone(),
+            provider_id: Some("mock".into()),
             model: Some("model-a".into()),
         }]
     );
@@ -892,7 +1103,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         .unwrap()
         .to_string();
     assert_eq!(forked["result"]["thread"]["cwd"], project_text.as_str());
-    assert_eq!(forked["result"]["thread"]["model"], "model-a");
+    assert_eq!(forked["result"]["thread"]["route"]["model"], "model-a");
     client
         .request("thread/read", json!({"threadId": fork_id}))
         .await;
@@ -928,9 +1139,13 @@ async fn thread_read_strips_reasoning_replay_secrets() {
                 },
             ],
             kloop_protocol::ProviderResponseProvenance {
-                provider: "anthropic:https://api.example.test".into(),
-                api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
-                model: "wire-model".into(),
+                route_revision: 1,
+                origin_boundary: 3,
+                provider_id: "test".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                model: "mock".into(),
+                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         ))
         .unwrap();
@@ -960,62 +1175,44 @@ async fn thread_read_strips_reasoning_replay_secrets() {
 }
 
 #[tokio::test]
-async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
+async fn legacy_session_without_route_timeline_is_rejected_without_migration() {
     let dirs = test_dirs("legacy-history");
     std::fs::create_dir_all(&dirs.sessions).unwrap();
     let thread_id = "legacy";
     let path = dirs.sessions.join("legacy.jsonl");
-    let mut rollout = Rollout::new(path);
+    let mut rollout = Rollout::new(path.clone());
     rollout
         .append_message(&Message::user_text("old question"))
         .unwrap();
     drop(rollout);
+    let legacy = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    std::fs::write(&path, legacy).unwrap();
 
     let mut client = start_server(
         factory(vec![vec![text("answer")]], dirs.offload.clone(), false),
         &dirs,
     );
     client.initialize().await;
-    client
-        .request("thread/read", json!({"threadId": thread_id}))
-        .await;
-    let read = client.recv().await;
-    assert_eq!(read["result"]["thread"]["resumable"], false);
-    assert_eq!(
-        read["result"]["thread"]["messages"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-
-    client
-        .request("thread/resume", json!({"threadId": thread_id}))
-        .await;
-    let error = client.recv().await;
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("supply its original 'cwd'")
-    );
-
-    client
-        .request(
-            "thread/resume",
-            json!({"threadId": thread_id, "cwd": dirs.root}),
-        )
-        .await;
-    let resumed = client.recv().await;
-    assert_eq!(resumed["result"]["thread"]["resumable"], true);
+    for request in [
+        json!({"threadId": thread_id}),
+        json!({"threadId": thread_id, "cwd": dirs.root}),
+    ] {
+        client.request("thread/resume", request).await;
+        let error = client.recv().await;
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("provider route timeline"),
+            "{error}"
+        );
+    }
     client.shutdown().await;
-
-    let snapshot =
-        kloop_core::rollout::load_session_snapshot(&dirs.sessions.join("legacy.jsonl")).unwrap();
-    assert_eq!(
-        snapshot.runtime.unwrap().cwd,
-        std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
-    );
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
@@ -1025,12 +1222,12 @@ async fn read_methods_do_not_repair_torn_tail() {
     std::fs::create_dir_all(&dirs.sessions).unwrap();
     let path = dirs.sessions.join("torn.jsonl");
     let cwd = std::fs::canonicalize(&dirs.root).unwrap();
-    let mut rollout = Rollout::new_with_runtime(
+    let mut rollout = Rollout::new_with_runtime_and_route(
         path.clone(),
         SessionRuntime {
             cwd: cwd.to_string_lossy().into_owned(),
-            model: Some("model".into()),
         },
+        &mock_route(),
     )
     .unwrap();
     rollout
@@ -1097,12 +1294,12 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
     std::fs::create_dir_all(&dirs.sessions).unwrap();
     let path = dirs.sessions.join("repair.jsonl");
     let cwd = std::fs::canonicalize(&dirs.root).unwrap();
-    let mut rollout = Rollout::new_with_runtime(
+    let mut rollout = Rollout::new_with_runtime_and_route(
         path.clone(),
         SessionRuntime {
             cwd: cwd.to_string_lossy().into_owned(),
-            model: Some("model".into()),
         },
+        &mock_route(),
     )
     .unwrap();
     rollout
@@ -1152,12 +1349,20 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
 }
 
 #[tokio::test]
-async fn early_prefix_fork_keeps_runtime_written_after_the_cut() {
+async fn early_prefix_fork_restores_route_and_runtime_at_the_cut() {
     let dirs = test_dirs("fork-runtime-prefix");
     std::fs::create_dir_all(&dirs.sessions).unwrap();
     let source_id = "legacy-two-turns";
     let source_path = dirs.sessions.join(format!("{source_id}.jsonl"));
-    let mut rollout = Rollout::new(source_path.clone());
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    let mut rollout = Rollout::new_with_runtime_and_route(
+        source_path.clone(),
+        SessionRuntime {
+            cwd: cwd.to_string_lossy().into_owned(),
+        },
+        &mock_route(),
+    )
+    .unwrap();
     for message in [
         Message::user_text("q1"),
         Message::assistant(vec![ContentBlock::Text { text: "a1".into() }]),
@@ -1168,22 +1373,9 @@ async fn early_prefix_fork_keeps_runtime_written_after_the_cut() {
     }
     drop(rollout);
 
-    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
-    client.initialize().await;
-    client
-        .request(
-            "thread/resume",
-            json!({"threadId": source_id, "cwd": dirs.root}),
-        )
-        .await;
-    assert!(client.recv().await.get("error").is_none());
-    client.shutdown().await;
-
     let source = kloop_core::rollout::load_session_snapshot(&source_path).unwrap();
-    assert!(
-        source.runtime.is_some(),
-        "resume did not migrate source runtime"
-    );
+    assert_eq!(source.runtime.as_ref().unwrap().cwd, cwd.to_string_lossy());
+    assert_eq!(source.provider_routes.last().unwrap().provider_id, "mock");
     let cut = kloop_core::rollout::fork_points(&source_path)
         .unwrap()
         .first()

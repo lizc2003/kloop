@@ -28,6 +28,7 @@ mod exit;
 mod help;
 #[path = "loop.rs"]
 mod loop_command;
+mod provider;
 
 /// What a command produced. `output` is shown to the user as-is; `cleared`
 /// tells the front-end to reset its own transcript view — only `/clear` sets
@@ -44,6 +45,8 @@ pub struct SlashResult {
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
+    pub provider_changed: bool,
+    pub open_provider_picker: bool,
 }
 
 impl SlashResult {
@@ -57,6 +60,8 @@ impl SlashResult {
             run_turn: None,
             task_graph: None,
             quit: false,
+            provider_changed: false,
+            open_provider_picker: false,
         }
     }
 
@@ -68,6 +73,8 @@ impl SlashResult {
             run_turn: None,
             task_graph: Some(task_graph),
             quit: false,
+            provider_changed: false,
+            open_provider_picker: false,
         }
     }
 
@@ -79,6 +86,20 @@ impl SlashResult {
             run_turn: Some(prompt),
             task_graph: None,
             quit: false,
+            provider_changed: false,
+            open_provider_picker: false,
+        }
+    }
+
+    fn provider(output: impl Into<String>, changed: bool, open_picker: bool) -> Self {
+        Self {
+            output: output.into(),
+            cleared: false,
+            run_turn: None,
+            task_graph: None,
+            quit: false,
+            provider_changed: changed,
+            open_provider_picker: open_picker,
         }
     }
 
@@ -90,6 +111,8 @@ impl SlashResult {
             run_turn: None,
             task_graph: None,
             quit: true,
+            provider_changed: false,
+            open_provider_picker: false,
         }
     }
 }
@@ -106,6 +129,10 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "help",
         summary: help::SUMMARY,
+    },
+    Builtin {
+        name: "provider",
+        summary: provider::SUMMARY,
     },
     Builtin {
         name: "cost",
@@ -144,6 +171,20 @@ pub async fn run(
     cfg: &Arc<Config>,
     cancel: &CancellationToken,
 ) -> SlashResult {
+    let state = crate::provider_route::SessionProviderState::from_route(
+        Arc::clone(&cfg.provider_catalog),
+        cfg.provider_route.clone(),
+    );
+    run_with_provider_state(line, history, cfg, &state, cancel).await
+}
+
+pub async fn run_with_provider_state(
+    line: &str,
+    history: &mut History,
+    cfg: &Arc<Config>,
+    provider_state: &crate::provider_route::SessionProviderState,
+    cancel: &CancellationToken,
+) -> SlashResult {
     let rest = line.strip_prefix('/').unwrap_or(line);
     let (name, args) = match rest.split_once(char::is_whitespace) {
         Some((name, args)) => (name, args.trim()),
@@ -151,6 +192,7 @@ pub async fn run(
     };
     match name {
         "help" => help::run(),
+        "provider" => provider::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
@@ -194,12 +236,21 @@ mod tests {
     use kloop_protocol::Message;
 
     /// A Config wired to the given provider; only the fields the commands read
-    /// (provider/model/context_window/tasks/inbox) matter here.
+    /// (provider route/context_window/tasks/inbox) matter here.
     fn test_cfg(provider: kloop_provider::Provider, window: Option<u64>) -> Arc<Config> {
+        let (provider_catalog, provider_route) =
+            crate::provider_route::ProviderCatalog::from_provider(
+                "test",
+                provider,
+                "test-model",
+                vec!["test-model".into()],
+                None,
+            )
+            .unwrap();
         let inbox = Arc::new(crate::inbox::Inbox::default());
         Arc::new(Config {
-            provider: Arc::new(provider),
-            model: "test-model".into(),
+            provider_catalog,
+            provider_route,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(5),
@@ -207,7 +258,6 @@ mod tests {
             offload_dir: std::env::temp_dir().join("kloop-cmd-test"),
             sessions_dir: std::env::temp_dir().join("kloop-cmd-test-sessions"),
             context_window: window,
-            fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             questioner: None,
             file_state: Default::default(),
@@ -274,7 +324,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "model: test-model\ncontext: ~20000 / 200000 tokens (10%)\nprovider-reported usage across all models: unavailable"
+                "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~20000 / 200000 tokens (10%)\nprovider-reported usage by provider/model: unavailable"
             )
         );
     }
@@ -298,11 +348,15 @@ mod tests {
             run("/cost", &mut history, &cfg, &CancellationToken::new())
                 .await
                 .output
-                .ends_with("provider-reported usage across all models: unavailable")
+                .ends_with("provider-reported usage by provider/model: unavailable")
         );
 
         history.record_provider_usage(ProviderUsageRecord {
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            route_revision: 1,
             model: "primary".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: UsageOperation::Sampling,
             usage: Usage::default(),
         });
@@ -310,10 +364,14 @@ mod tests {
             run("/cost", &mut history, &cfg, &CancellationToken::new())
                 .await
                 .output,
-            "model: test-model\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage across all models: \n  input tokens: 0\n  output tokens: 0\n  cache read input tokens: 0\n  cache creation input tokens: 0\n  1 reported responses"
+            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1"
         );
         history.record_provider_usage(ProviderUsageRecord {
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            route_revision: 1,
             model: "fallback".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Fallback,
             operation: UsageOperation::Compaction,
             usage: Usage {
                 input_tokens: 10,
@@ -327,7 +385,7 @@ mod tests {
             .output;
         assert_eq!(
             output,
-            "model: test-model\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage across all models: \n  input tokens: 10\n  output tokens: 20\n  cache read input tokens: 30\n  cache creation input tokens: 40\n  2 reported responses"
+            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\n  test/fallback [Mock]: input=10 output=20 cache-read=30 cache-create=40 responses=1"
         );
         for forbidden in [
             "$", "currency", "price", "quota", "budget", "coverage", "total",
@@ -348,7 +406,11 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("some earlier work"));
         history.record_provider_usage(ProviderUsageRecord {
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            route_revision: 1,
             model: "model".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: UsageOperation::Sampling,
             usage: Usage {
                 input_tokens: 1,
@@ -360,12 +422,8 @@ mod tests {
         let cost = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
 
         assert!(history.messages().is_empty());
-        assert!(cost.output.contains("input tokens: 1"), "{}", cost.output);
-        assert!(
-            cost.output.contains("1 reported responses"),
-            "{}",
-            cost.output
-        );
+        assert!(cost.output.contains("input=1"), "{}", cost.output);
+        assert!(cost.output.contains("responses=1"), "{}", cost.output);
     }
 
     #[tokio::test]
@@ -479,7 +537,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /cost, /compact, /clear, /loop, /exit)"
+                "unknown command '/frobnicate' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit)"
             )
         );
     }
@@ -517,7 +575,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /loop, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit, /greet)"
             )
         );
     }
@@ -554,7 +612,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /cost, /compact, /clear, /loop, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit, /deploy)"
             )
         );
     }

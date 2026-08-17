@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::history::History;
 use crate::history::estimate_message_tokens;
+use crate::provider_route::FrozenProviderAttempt;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -206,11 +207,12 @@ fn build_replacement(plan: &CompactionPlan, summary: &str) -> Vec<Message> {
 /// after the provider response has been validated and the replacement changed.
 pub(crate) async fn compact_once(
     cfg: &Arc<Config>,
-    model: &str,
+    provider_attempt: &FrozenProviderAttempt,
     trigger: CompactionTrigger,
     history: &mut History,
     cancel: &CancellationToken,
 ) -> Result<CompactionOutcome> {
+    history.ensure_initial_provider_route(&cfg.provider_route)?;
     let messages = history.messages().to_vec();
     let mut request_plan = match plan_compaction(&messages) {
         Ok(plan) => plan,
@@ -220,7 +222,10 @@ pub(crate) async fn compact_once(
         .request
         .push(Message::user_text(COMPACT_INSTRUCTION));
 
-    let (summary, usage) = sample_summary(cfg, model, &request_plan.request, cancel).await?;
+    let projected_request = history
+        .provider_request_view_for(&request_plan.request, provider_attempt)
+        .map_err(anyhow::Error::new)?;
+    let (summary, usage) = sample_summary(provider_attempt, &projected_request, cancel).await?;
     let summary = canonicalize_summary(&summary)?;
     let items = build_replacement(&request_plan, &summary);
     if items == messages {
@@ -228,17 +233,17 @@ pub(crate) async fn compact_once(
     }
 
     if let Some(usage) = usage {
-        history.record_provider_usage(ProviderUsageRecord {
-            model: model.to_string(),
-            operation: UsageOperation::Compaction,
+        history.record_provider_usage(ProviderUsageRecord::from_attempt(
+            provider_attempt.identity(),
+            UsageOperation::Compaction,
             usage,
-        });
+        ));
     }
     history.replace_all(items);
     Ok(CompactionOutcome::Applied(CompactionReceipt {
         summarized: request_plan.summarized,
         kept: request_plan.kept,
-        model: model.to_string(),
+        model: provider_attempt.model().to_string(),
         trigger,
     }))
 }
@@ -251,7 +256,21 @@ pub async fn run_compaction(
     history: &mut History,
     cancel: &CancellationToken,
 ) -> Result<CompactionStats> {
-    match compact_once(cfg, model, CompactionTrigger::Manual, history, cancel).await? {
+    history.ensure_initial_provider_route(&cfg.provider_route)?;
+    let provider_route = cfg
+        .provider_route
+        .child_route(Some(model))
+        .map_err(anyhow::Error::msg)?;
+    let provider_attempt = provider_route.primary_attempt();
+    match compact_once(
+        cfg,
+        &provider_attempt,
+        CompactionTrigger::Manual,
+        history,
+        cancel,
+    )
+    .await?
+    {
         CompactionOutcome::Applied(receipt) => Ok(CompactionStats {
             summarized: receipt.summarized,
             kept: receipt.kept,
@@ -273,12 +292,16 @@ pub async fn run_compaction(
 
 /// One summarization request: no tools, text collected from BlockDone.
 async fn sample_summary(
-    cfg: &Arc<Config>,
-    model: &str,
+    provider_attempt: &FrozenProviderAttempt,
     request: &[Message],
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Usage>)> {
-    let mut rx = cfg.provider.stream(model, COMPACT_SYSTEM, request, &[]);
+    let mut rx = provider_attempt.provider().stream_attempt(
+        provider_attempt.identity(),
+        COMPACT_SYSTEM,
+        request,
+        &[],
+    );
     let mut summary = String::new();
     loop {
         tokio::select! {
@@ -313,10 +336,23 @@ mod tests {
     use serde_json::json;
 
     fn compact_test_cfg(provider: kloop_provider::Provider, tag: &str) -> Arc<Config> {
+        let (provider_catalog, provider_route) =
+            crate::provider_route::ProviderCatalog::from_provider(
+                "test",
+                provider,
+                "mock",
+                vec![
+                    "mock".into(),
+                    "actual-model".into(),
+                    "fallback-model".into(),
+                ],
+                None,
+            )
+            .unwrap();
         let inbox = Arc::new(crate::inbox::Inbox::default());
         Arc::new(Config {
-            provider: Arc::new(provider),
-            model: "mock".into(),
+            provider_catalog,
+            provider_route,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(5),
@@ -324,7 +360,6 @@ mod tests {
             offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
             sessions_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}-sessions")),
             context_window: Some(200_000),
-            fallback_model: None,
             permissions: Arc::new(crate::permissions::Permissions::allow_all()),
             questioner: None,
             file_state: Default::default(),
@@ -380,9 +415,14 @@ mod tests {
         let cfg = compact_test_cfg(provider, "rebuild");
         let mut history = seeded_history(cfg.offload_dir.clone());
 
-        let stats = run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
-            .await
-            .expect("compaction should succeed");
+        let stats = run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("compaction should succeed");
         // [user, assistant(fat), user] → summarize the first two, keep the last.
         assert_eq!(
             stats,
@@ -412,14 +452,12 @@ mod tests {
         ]);
         let cfg = compact_test_cfg(provider, "reasoning-tail");
         let mut history = seeded_history(cfg.offload_dir.clone());
-        let reasoning = Message::assistant_from_provider(
-            vec![ContentBlock::Thinking {
-                thinking: "display summary".into(),
-                signature: "opaque".into(),
-            }],
-            cfg.provider.response_provenance("mock"),
-        );
-        history.record(reasoning.clone());
+        let reasoning_content = vec![ContentBlock::Thinking {
+            thinking: "display summary".into(),
+            signature: "opaque".into(),
+        }];
+        history.record_provider_assistant(reasoning_content, &cfg.provider_route.primary_attempt());
+        let reasoning = history.messages().last().unwrap().clone();
 
         run_compaction(&cfg, "mock", &mut history, &CancellationToken::new())
             .await
@@ -455,22 +493,17 @@ mod tests {
         let mut history = seeded_history(cfg.offload_dir.clone());
         history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
 
-        run_compaction(
-            &cfg,
-            "actual-model",
-            &mut history,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        run_compaction(&cfg, "mock", &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
 
         assert_eq!(
             history.provider_usage().records(),
-            &[ProviderUsageRecord {
-                model: "actual-model".into(),
-                operation: UsageOperation::Compaction,
-                usage: usage(10),
-            }]
+            &[ProviderUsageRecord::from_attempt(
+                cfg.provider_route.primary_attempt().identity(),
+                UsageOperation::Compaction,
+                usage(10),
+            )]
         );
         let lines: Vec<serde_json::Value> = std::fs::read_to_string(&session)
             .unwrap()
@@ -479,7 +512,7 @@ mod tests {
             .collect();
         assert_eq!(
             lines.iter().map(|line| &line["type"]).collect::<Vec<_>>(),
-            vec!["provider_usage", "compacted"]
+            vec!["provider_route_initial", "provider_usage", "compacted"]
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -492,9 +525,14 @@ mod tests {
         let cfg = compact_test_cfg(provider, "no-usage");
         let mut history = seeded_history(cfg.offload_dir.clone());
 
-        run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
-            .await
-            .unwrap();
+        run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(history.provider_usage().records().is_empty());
         assert_eq!(
@@ -528,9 +566,14 @@ mod tests {
             let before = history.messages().to_vec();
 
             assert!(
-                run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
-                    .await
-                    .is_err()
+                run_compaction(
+                    &cfg,
+                    cfg.provider_route.primary_model(),
+                    &mut history,
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err()
             );
             assert_eq!(history.messages(), before);
             assert!(history.provider_usage().records().is_empty());
@@ -548,7 +591,7 @@ mod tests {
             }]),
         ]);
         let cfg = compact_test_cfg(provider, "model-arg");
-        assert_eq!(cfg.model, "mock");
+        assert_eq!(cfg.provider_route.primary_model(), "mock");
         let mut history = seeded_history(cfg.offload_dir.clone());
 
         run_compaction(
@@ -577,8 +620,13 @@ mod tests {
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
 
-        let result =
-            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
+        let result = run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..], "history must be untouched");
@@ -592,8 +640,13 @@ mod tests {
         let mut history = seeded_history(cfg.offload_dir.clone());
         let before = history.messages().to_vec();
 
-        let result =
-            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
+        let result = run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(history.messages(), &before[..]);
@@ -662,9 +715,14 @@ mod tests {
             text: "recent tail".into(),
         }]));
 
-        let stats = run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new())
-            .await
-            .expect("compaction should preserve the tool pair");
+        let stats = run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("compaction should preserve the tool pair");
         assert_eq!(stats.summarized, 1);
         assert_eq!(stats.kept, 3);
         assert!(matches!(
@@ -687,8 +745,13 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("only message"));
 
-        let result =
-            run_compaction(&cfg, &cfg.model, &mut history, &CancellationToken::new()).await;
+        let result = run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(history.messages().len(), 1);
@@ -704,7 +767,7 @@ mod tests {
 
         let result = compact_once(
             &cfg,
-            &cfg.model,
+            &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
             &mut history,
             &CancellationToken::new(),
@@ -767,9 +830,13 @@ mod tests {
         }]));
         history.record(Message::user_text("current request"));
 
+        let fallback_route = cfg
+            .provider_route
+            .child_route(Some("fallback-model"))
+            .unwrap();
         let result = compact_once(
             &cfg,
-            "fallback-model",
+            &fallback_route.primary_attempt(),
             CompactionTrigger::Predictive,
             &mut history,
             &CancellationToken::new(),
@@ -817,7 +884,7 @@ mod tests {
 
         let first = compact_once(
             &cfg,
-            &cfg.model,
+            &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
             &mut history,
             &CancellationToken::new(),
@@ -830,7 +897,7 @@ mod tests {
 
         let second = compact_once(
             &cfg,
-            &cfg.model,
+            &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
             &mut history,
             &CancellationToken::new(),

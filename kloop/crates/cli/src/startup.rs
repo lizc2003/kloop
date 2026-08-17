@@ -61,7 +61,6 @@ pub(crate) struct RuntimeSettings {
     agent_types: Arc<Vec<AgentType>>,
     program_limits: kloop_core::ProgramLimits,
     context_window: Option<u64>,
-    fallback_model: Option<String>,
     defer_threshold: usize,
     shell_programs: Arc<ShellPrograms>,
     shell_warnings: Vec<String>,
@@ -82,7 +81,6 @@ impl RuntimeSettings {
                 agent_types: Arc::new(Vec::new()),
                 program_limits: kloop_core::ProgramLimits::default(),
                 context_window: Some(200_000),
-                fallback_model: None,
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
                 shell_programs: Arc::new(shell_programs),
                 shell_warnings,
@@ -113,7 +111,6 @@ impl RuntimeSettings {
             agent_types: Arc::new(load_agent_types(table)?),
             program_limits: load_program_limits(table)?,
             context_window: context_window_from_env()?,
-            fallback_model: std::env::var("KLOOP_FALLBACK_MODEL").ok(),
             defer_threshold: defer_threshold_from_env()?,
             shell_programs: Arc::new(shell_programs),
             shell_warnings,
@@ -824,7 +821,7 @@ pub(crate) fn server_config_snapshot(
         && kloop_core::sandbox::availability().is_ok();
     Ok(ConfigSnapshot {
         cwd: cwd.to_string_lossy().to_string(),
-        model: Some(provider.model().to_string()),
+        route: Some(provider.initial_route().public_route()),
         permission_mode: if args.mock {
             "mock".into()
         } else {
@@ -920,14 +917,21 @@ pub(crate) fn config_from_settings(
     let cwd = cwd.to_path_buf();
     let questions_enabled = questioner.is_some();
     scheduler.set_missed_confirmation_available(questions_enabled);
-    let (provider_transport, model) = if args.mock {
-        (Provider::mock(mock_demo_turns()), "mock".to_string())
+    let (provider_catalog, provider_route) = if args.mock {
+        kloop_core::provider_route::ProviderCatalog::from_provider(
+            "mock",
+            Provider::mock(mock_demo_turns()),
+            "mock",
+            vec!["mock".into()],
+            None,
+        )
+        .map_err(anyhow::Error::msg)?
     } else {
-        (provider.provider(), provider.model().to_string())
+        (provider.catalog(), provider.initial_route())
     };
     Ok(Config {
-        provider: Arc::new(provider_transport),
-        model,
+        provider_catalog,
+        provider_route,
         system: project.system.clone(),
         project_instructions: project.instructions.clone(),
         max_rounds: None,
@@ -935,7 +939,6 @@ pub(crate) fn config_from_settings(
         offload_dir,
         sessions_dir,
         context_window: runtime.context_window,
-        fallback_model: runtime.fallback_model.clone(),
         permissions,
         questioner,
         file_state: Default::default(),

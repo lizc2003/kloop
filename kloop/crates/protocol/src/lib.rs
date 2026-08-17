@@ -365,15 +365,112 @@ impl ProviderApiFamily {
     }
 }
 
-/// Provider identity required to replay reasoning blocks. It records the wire
-/// family and the exact model that produced one assistant message; adapters
-/// must not infer either fact from the model name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAvailabilityCode {
+    Ready,
+    MissingCredential,
+    InvalidConfiguration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDescriptor {
+    pub id: String,
+    pub api_family: ProviderApiFamily,
+    pub default_model: String,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    pub availability: ProviderAvailabilityCode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptKind {
+    Primary,
+    Fallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttemptIdentity {
+    pub route_revision: u64,
+    pub provider_id: String,
+    pub api_family: ProviderApiFamily,
+    pub endpoint_fingerprint: String,
+    pub model: String,
+    pub attempt_kind: ProviderAttemptKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRouteSource {
+    Initial,
+    ExplicitSwitch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContinuity {
+    Preserved,
+    Filtered,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouteReceipt {
+    pub revision: u64,
+    pub boundary: u64,
+    pub source: ProviderRouteSource,
+    pub provider_id: String,
+    pub api_family: ProviderApiFamily,
+    pub endpoint_fingerprint: String,
+    pub primary_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    pub continuity: ReasoningContinuity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveProviderRoute {
+    pub revision: u64,
+    pub provider_id: String,
+    pub api_family: ProviderApiFamily,
+    pub model: String,
+}
+
+/// Private replay identity bound by the History owner when a provider-produced
+/// assistant message is appended. It is never part of a public projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderResponseProvenance {
-    pub provider: String,
+    pub route_revision: u64,
+    pub origin_boundary: u64,
+    pub provider_id: String,
     pub api_family: ProviderApiFamily,
+    pub endpoint_fingerprint: String,
     pub model: String,
+    pub attempt_kind: ProviderAttemptKind,
+}
+
+impl ProviderResponseProvenance {
+    pub fn matches_attempt(&self, attempt: &ProviderAttemptIdentity) -> bool {
+        self.route_revision == attempt.route_revision
+            && self.provider_id == attempt.provider_id
+            && self.api_family == attempt.api_family
+            && self.endpoint_fingerprint == attempt.endpoint_fingerprint
+            && self.model == attempt.model
+            && self.attempt_kind == attempt.attempt_kind
+    }
+
+    pub fn exact_replay_compatible(&self, attempt: &ProviderAttemptIdentity) -> bool {
+        self.provider_id == attempt.provider_id
+            && self.api_family == attempt.api_family
+            && self.endpoint_fingerprint == attempt.endpoint_fingerprint
+            && self.model == attempt.model
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -797,9 +894,13 @@ mod tests {
                 },
             ],
             provider_provenance: Some(ProviderResponseProvenance {
-                provider: "anthropic:https://api.anthropic.com".into(),
+                route_revision: 1,
+                origin_boundary: 2,
+                provider_id: "anthropic".into(),
                 api_family: ProviderApiFamily::AnthropicMessages,
+                endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "model-a".into(),
+                attempt_kind: ProviderAttemptKind::Primary,
             }),
         };
         let wire = serde_json::to_string(&msg).unwrap();
@@ -830,9 +931,13 @@ mod tests {
                 },
             ],
             ProviderResponseProvenance {
-                provider: "anthropic:https://api.anthropic.com".into(),
+                route_revision: 1,
+                origin_boundary: 2,
+                provider_id: "anthropic".into(),
                 api_family: ProviderApiFamily::AnthropicMessages,
+                endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "model-a".into(),
+                attempt_kind: ProviderAttemptKind::Primary,
             },
         );
 

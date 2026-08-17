@@ -10,6 +10,7 @@ use crate::event::Event;
 use crate::execution_provenance::ExecutionRef;
 use crate::history::History;
 use crate::inbox::Inbox;
+use crate::provider_route::FrozenProviderAttempt;
 use crate::tools::ToolCtx;
 use crate::tools::dispatch_tools;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
@@ -187,6 +188,16 @@ async fn run_turn_with_options(
     options: TurnOptions,
     enclosing_execution: Option<ExecutionRef>,
 ) -> TurnOutcome {
+    if let Err(error) = history.ensure_initial_provider_route(&cfg.provider_route) {
+        return TurnOutcome {
+            reason: EndReason::Error(
+                format!("provider route initialization failed: {error}").into(),
+            ),
+            final_text: String::new(),
+            rounds: 0,
+            structured_output: None,
+        };
+    }
     // A sub-agent (typed local identity set) fires subagent_start/subagent_stop instead
     // of pre_turn/post_turn — the split both cc and codex converge on (a
     // sub-agent's turn boundary is its own event, carrying its transcript and
@@ -371,9 +382,10 @@ async fn turn_rounds(
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;
-    // The model can be swapped once per turn: after retries are exhausted on
-    // the primary, the rest of the turn runs on the fallback.
-    let mut active_model = cfg.model.clone();
+    // Freeze the complete route once. Every round, compaction and child
+    // admission in this operation derives attempts from this same snapshot.
+    let frozen_route = cfg.provider_route.clone();
+    let mut active_attempt = frozen_route.primary_attempt();
     let mut truncation_recoveries = 0u32;
     // Cut-off text from truncated rounds, prepended to the final answer so a
     // truncated-then-continued turn returns the whole deliverable.
@@ -440,7 +452,7 @@ async fn turn_rounds(
             ));
             let compaction = compact::compact_once(
                 cfg,
-                &active_model,
+                &active_attempt,
                 compact::CompactionTrigger::Predictive,
                 history,
                 cancel,
@@ -474,8 +486,8 @@ async fn turn_rounds(
             outcome,
         } = match sample_with_retry(
             cfg,
-            &active_model,
-            history.messages(),
+            &active_attempt,
+            history,
             &tools,
             ui,
             cancel,
@@ -505,7 +517,7 @@ async fn turn_rounds(
                 ));
                 let compaction = compact::compact_once(
                     cfg,
-                    &active_model,
+                    &active_attempt,
                     compact::CompactionTrigger::Reactive,
                     history,
                     cancel,
@@ -545,7 +557,7 @@ async fn turn_rounds(
             }
             Sampled::Cancelled { partial } => {
                 let final_text = text_content(&partial);
-                record_provider_assistant(history, cfg, &active_model, partial);
+                record_provider_assistant(history, &active_attempt, partial);
                 return TurnOutcome {
                     reason: EndReason::Aborted,
                     final_text,
@@ -555,7 +567,7 @@ async fn turn_rounds(
             }
             Sampled::Partial { error, blocks } => {
                 let final_text = text_content(&blocks);
-                record_provider_assistant(history, cfg, &active_model, blocks);
+                record_provider_assistant(history, &active_attempt, blocks);
                 return TurnOutcome {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
                     final_text,
@@ -572,15 +584,16 @@ async fn turn_rounds(
                 };
             }
             Sampled::Failed(error) => {
-                // Retries exhausted on the primary model: switch to the
-                // fallback (once) instead of surfacing the error.
-                if let Some(fallback) = &cfg.fallback_model
-                    && *fallback != active_model
+                if active_attempt.identity().attempt_kind
+                    == kloop_protocol::ProviderAttemptKind::Primary
+                    && let Some(fallback) = frozen_route.fallback_attempt()
                 {
                     ui.emit(&Event::Note(format!(
-                            "sampling failed on {active_model}; switching to fallback model {fallback}: {error}"
-                        )));
-                    active_model = fallback.clone();
+                        "sampling failed on {}; switching to fallback model {}: {error}",
+                        active_attempt.model(),
+                        fallback.model()
+                    )));
+                    active_attempt = fallback;
                     continue;
                 }
                 return TurnOutcome {
@@ -600,13 +613,13 @@ async fn turn_rounds(
             };
         }
         if let Some(usage) = usage {
-            history.record_provider_usage(ProviderUsageRecord {
-                model: active_model.clone(),
-                operation: UsageOperation::Sampling,
+            history.record_provider_usage(ProviderUsageRecord::from_attempt(
+                active_attempt.identity(),
+                UsageOperation::Sampling,
                 usage,
-            });
+            ));
         }
-        record_provider_assistant(history, cfg, &active_model, blocks.clone());
+        record_provider_assistant(history, &active_attempt, blocks.clone());
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
@@ -870,17 +883,13 @@ fn validate_assistant_result(
 
 fn record_provider_assistant(
     history: &mut History,
-    cfg: &Config,
-    model: &str,
+    attempt: &FrozenProviderAttempt,
     blocks: Vec<ContentBlock>,
 ) {
     if blocks.is_empty() {
         return;
     }
-    history.record(Message::assistant_from_provider(
-        blocks,
-        cfg.provider.response_provenance(model),
-    ));
+    history.record_provider_assistant(blocks, attempt);
 }
 
 /// All text blocks of a sampled response, in provider order. Used both to end

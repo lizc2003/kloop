@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use crate::provider_route::FrozenProviderAttempt;
 use crate::rollout::ResumedSession;
 use crate::rollout::Rollout;
 use crate::rollout::SessionRuntime;
@@ -10,6 +11,11 @@ use crate::rollout::TurnTerminal;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderAttemptKind;
+use kloop_protocol::ProviderRouteReceipt;
+use kloop_protocol::ProviderRouteSource;
+use kloop_protocol::ReasoningContinuity;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
 
@@ -31,9 +37,11 @@ pub struct History {
     /// reported for the request covering them). Anchors the estimate.
     usage_anchor: Option<(usize, u64)>,
     provider_usage: UsageLedger,
+    provider_routes: Vec<ProviderRouteReceipt>,
     /// Session file written through on every record/replace_all; None for
     /// in-memory-only histories (sub-agents, tests).
     rollout: Option<Rollout>,
+    next_memory_boundary: u64,
 }
 
 impl History {
@@ -44,11 +52,14 @@ impl History {
             cap: 8000,
             usage_anchor: None,
             provider_usage: UsageLedger::default(),
+            provider_routes: Vec::new(),
             rollout: None,
+            next_memory_boundary: 1,
         }
     }
 
     pub fn attach_rollout(&mut self, rollout: Rollout) {
+        self.provider_routes = rollout.route_timeline().to_vec();
         self.rollout = Some(rollout);
     }
 
@@ -58,12 +69,15 @@ impl History {
     /// re-anchors on the first sampled response.
     pub fn resume(offload_dir: PathBuf, resumed: ResumedSession) -> Self {
         sync_offload_counter(&offload_dir);
+        let provider_routes = resumed.snapshot.provider_routes.clone();
         Self {
             items: resumed.messages,
             offload_dir,
             cap: 8000,
             usage_anchor: None,
             provider_usage: resumed.provider_usage,
+            provider_routes,
+            next_memory_boundary: resumed.rollout.next_boundary(),
             rollout: Some(resumed.rollout),
         }
     }
@@ -76,11 +90,17 @@ impl History {
     pub fn rebase(&mut self, resumed: ResumedSession) {
         self.items = resumed.messages;
         self.provider_usage = resumed.provider_usage;
+        self.provider_routes = resumed.snapshot.provider_routes.clone();
+        self.next_memory_boundary = resumed.rollout.next_boundary();
         self.rollout = Some(resumed.rollout);
         self.usage_anchor = None;
     }
 
     pub fn record(&mut self, mut msg: Message) {
+        assert!(
+            msg.provider_provenance.is_none(),
+            "provider assistant messages must use History::record_provider_assistant"
+        );
         for block in &mut msg.content {
             // Only text tool results spill to disk. Image blocks must reach the
             // model as-is (base64 inlines into the rollout) — cc likewise skips
@@ -94,8 +114,163 @@ impl History {
                 *text = self.offload_text(content);
             }
         }
+        let boundary = self
+            .rollout
+            .as_ref()
+            .map(Rollout::next_boundary)
+            .unwrap_or(self.next_memory_boundary);
         self.persist(|rollout| rollout.append_message(&msg));
         self.items.push(msg);
+        self.next_memory_boundary = boundary.saturating_add(1);
+    }
+
+    pub fn record_provider_assistant(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        attempt: &FrozenProviderAttempt,
+    ) {
+        let origin_boundary = self
+            .rollout
+            .as_ref()
+            .map(Rollout::next_boundary)
+            .unwrap_or(self.next_memory_boundary);
+        let message = Message::assistant_from_provider(blocks, attempt.provenance(origin_boundary));
+        self.persist(|rollout| rollout.append_message(&message));
+        self.items.push(message);
+        self.next_memory_boundary = origin_boundary.saturating_add(1);
+    }
+
+    pub fn ensure_initial_provider_route(
+        &mut self,
+        route: &crate::provider_route::FrozenProviderRoute,
+    ) -> std::io::Result<()> {
+        if let Some(existing) = self.provider_routes.last() {
+            if existing.revision != route.revision()
+                || existing.provider_id != route.provider_id()
+                || existing.api_family != route.api_family()
+                || existing.endpoint_fingerprint != route.endpoint_fingerprint()
+                || existing.primary_model != route.primary_model()
+                || existing.fallback_model.as_deref() != route.fallback_model()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "history provider route does not match the frozen operation route",
+                ));
+            }
+            return Ok(());
+        }
+        let receipt = if let Some(rollout) = self.rollout.as_mut() {
+            rollout.append_initial_route(route)?
+        } else {
+            route.receipt(
+                0,
+                ProviderRouteSource::Initial,
+                ReasoningContinuity::Preserved,
+            )
+        };
+        self.provider_routes.push(receipt);
+        Ok(())
+    }
+
+    pub fn append_provider_route_changed(
+        &mut self,
+        route: &crate::provider_route::FrozenProviderRoute,
+        continuity: ReasoningContinuity,
+    ) -> std::io::Result<ProviderRouteReceipt> {
+        let previous = self.provider_routes.last().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "history provider route timeline is missing",
+            )
+        })?;
+        if route.revision() != previous.revision.saturating_add(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "provider route revision must advance by exactly one",
+            ));
+        }
+        let receipt = if let Some(rollout) = self.rollout.as_mut() {
+            rollout.append_provider_route_changed(route, continuity)?
+        } else {
+            let receipt = route.receipt(
+                self.next_memory_boundary,
+                ProviderRouteSource::ExplicitSwitch,
+                continuity,
+            );
+            self.next_memory_boundary = self.next_memory_boundary.saturating_add(1);
+            receipt
+        };
+        self.provider_routes.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub fn provider_routes(&self) -> &[ProviderRouteReceipt] {
+        &self.provider_routes
+    }
+
+    pub fn provider_request_view(
+        &self,
+        attempt: &FrozenProviderAttempt,
+    ) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
+        provider_request_view(&self.items, &self.provider_routes, attempt)
+    }
+
+    pub(crate) fn provider_request_view_for(
+        &self,
+        messages: &[Message],
+        attempt: &FrozenProviderAttempt,
+    ) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
+        provider_request_view(messages, &self.provider_routes, attempt)
+    }
+
+    pub fn switch_provider(
+        &mut self,
+        state: &crate::provider_route::SessionProviderState,
+        expected_revision: u64,
+        provider_id: &str,
+        model: Option<&str>,
+    ) -> Result<crate::provider_route::SwitchOutcome, ProviderSwitchError> {
+        state
+            .switch_with(expected_revision, provider_id, model, |_previous, next| {
+                let boundary = self
+                    .rollout
+                    .as_ref()
+                    .map(Rollout::next_boundary)
+                    .unwrap_or(self.next_memory_boundary);
+                let mut hypothetical_routes = self.provider_routes.clone();
+                hypothetical_routes.push(next.receipt(
+                    boundary,
+                    ProviderRouteSource::ExplicitSwitch,
+                    ReasoningContinuity::Preserved,
+                ));
+                let projected = provider_request_view(
+                    &self.items,
+                    &hypothetical_routes,
+                    &next.primary_attempt(),
+                )
+                .map_err(ProviderSwitchCommitError::History)?;
+                let continuity = if projected == self.items {
+                    ReasoningContinuity::Preserved
+                } else {
+                    ReasoningContinuity::Filtered
+                };
+                self.append_provider_route_changed(next, continuity)
+                    .map_err(ProviderSwitchCommitError::Persistence)?;
+                Ok(continuity)
+            })
+            .map_err(|error| match error {
+                crate::provider_route::SwitchCommitError::Switch(error) => {
+                    ProviderSwitchError::Route(error)
+                }
+                crate::provider_route::SwitchCommitError::Commit(error) => match error {
+                    ProviderSwitchCommitError::History(error) => {
+                        ProviderSwitchError::History(error)
+                    }
+                    ProviderSwitchCommitError::Persistence(error) => {
+                        ProviderSwitchError::Persistence(error)
+                    }
+                },
+            })
     }
 
     /// Bound machine-produced text before injecting it as a non-tool user
@@ -207,6 +382,194 @@ impl History {
             Err(e) => format!("[offload to disk failed ({e}); output truncated]"),
         };
         format!("{head}\n…[truncated]…\n{tail}\n{pointer}")
+    }
+}
+
+#[derive(Debug)]
+enum ProviderSwitchCommitError {
+    History(kloop_provider::ProviderFailure),
+    Persistence(std::io::Error),
+}
+
+#[derive(Debug)]
+pub enum ProviderSwitchError {
+    Route(crate::provider_route::SwitchError),
+    History(kloop_provider::ProviderFailure),
+    Persistence(std::io::Error),
+}
+
+impl std::fmt::Display for ProviderSwitchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Route(error) => write!(formatter, "{error}"),
+            Self::History(error) => write!(formatter, "{error}"),
+            Self::Persistence(error) => {
+                write!(formatter, "provider route persistence failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderSwitchError {}
+
+fn provider_request_view(
+    messages: &[Message],
+    routes: &[ProviderRouteReceipt],
+    attempt: &FrozenProviderAttempt,
+) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
+    let active = routes.last().ok_or_else(|| {
+        kloop_provider::ProviderFailure::protocol("provider route timeline is missing")
+    })?;
+    if active.revision != attempt.identity().route_revision
+        || active.provider_id != attempt.identity().provider_id
+        || active.api_family != attempt.identity().api_family
+        || active.endpoint_fingerprint != attempt.identity().endpoint_fingerprint
+    {
+        return Err(kloop_provider::ProviderFailure::protocol(
+            "frozen provider attempt does not match the active durable route",
+        ));
+    }
+
+    let mut projected = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !message_has_reasoning(message) {
+            projected.push(message.clone());
+            continue;
+        }
+        let source = message.provider_provenance.as_ref().ok_or_else(|| {
+            kloop_provider::ProviderFailure::protocol(
+                "reasoning history is missing provider route provenance",
+            )
+        })?;
+        let source_index = routes
+            .iter()
+            .position(|route| route.revision == source.route_revision)
+            .ok_or_else(|| {
+                kloop_provider::ProviderFailure::protocol(
+                    "reasoning history references an unknown provider route revision",
+                )
+            })?;
+        let source_route = &routes[source_index];
+        let interval_end = routes
+            .get(source_index + 1)
+            .map_or(u64::MAX, |next| next.boundary);
+        if source.origin_boundary <= source_route.boundary || source.origin_boundary >= interval_end
+        {
+            return Err(kloop_provider::ProviderFailure::protocol(
+                "reasoning history origin lies outside its provider route interval",
+            ));
+        }
+        let source_model_valid = match source.attempt_kind {
+            ProviderAttemptKind::Primary => source.model == source_route.primary_model,
+            ProviderAttemptKind::Fallback => {
+                source_route.fallback_model.as_deref() == Some(source.model.as_str())
+            }
+        };
+        if source.provider_id != source_route.provider_id
+            || source.api_family != source_route.api_family
+            || source.endpoint_fingerprint != source_route.endpoint_fingerprint
+            || !source_model_valid
+        {
+            return Err(kloop_provider::ProviderFailure::protocol(
+                "reasoning history provenance does not match its producing route",
+            ));
+        }
+
+        if source.api_family == ProviderApiFamily::OpenAiChatCompletions
+            || (source.api_family == ProviderApiFamily::OpenAiResponses
+                && message.content.iter().any(block_has_redacted_reasoning))
+        {
+            return Err(kloop_provider::ProviderFailure::protocol(
+                "reasoning history block shape does not match its producing API family",
+            ));
+        }
+
+        if source.exact_replay_compatible(attempt.identity()) {
+            projected.push(message.clone());
+            continue;
+        }
+        let chat_target = attempt.identity().api_family == ProviderApiFamily::OpenAiChatCompletions;
+        let sanctioned_switch = attempt.identity().attempt_kind == ProviderAttemptKind::Primary
+            && source.route_revision < active.revision
+            && routes[source_index + 1..]
+                .iter()
+                .any(|route| route.source == ProviderRouteSource::ExplicitSwitch);
+        if !chat_target && !sanctioned_switch {
+            return Err(kloop_provider::ProviderFailure::protocol(
+                "reasoning mismatch is not authorized by a durable explicit provider switch",
+            ));
+        }
+        let mut message = message.clone();
+        message.content = message
+            .content
+            .into_iter()
+            .filter_map(strip_reasoning_block)
+            .collect();
+        message.provider_provenance = None;
+        if message.role != Role::Assistant || !message.content.is_empty() {
+            projected.push(message);
+        }
+    }
+    Ok(projected)
+}
+
+fn message_has_reasoning(message: &Message) -> bool {
+    message.content.iter().any(block_has_reasoning)
+}
+
+fn block_has_reasoning(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => true,
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().any(block_has_reasoning),
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult {
+            content: ToolResultContent::Text(_),
+            ..
+        } => false,
+    }
+}
+
+fn block_has_redacted_reasoning(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::RedactedThinking { .. } => true,
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().any(block_has_redacted_reasoning),
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::Thinking { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult {
+            content: ToolResultContent::Text(_),
+            ..
+        } => false,
+    }
+}
+
+fn strip_reasoning_block(block: ContentBlock) -> Option<ContentBlock> {
+    match block {
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content: ToolResultContent::Blocks(blocks),
+            is_error,
+        } => Some(ContentBlock::ToolResult {
+            tool_use_id,
+            content: ToolResultContent::Blocks(
+                blocks
+                    .into_iter()
+                    .filter_map(strip_reasoning_block)
+                    .collect(),
+            ),
+            is_error,
+        }),
+        other => Some(other),
     }
 }
 
@@ -347,9 +710,13 @@ mod tests {
         let bound = Message::assistant_from_provider(
             content,
             kloop_protocol::ProviderResponseProvenance {
-                provider: "openai_responses:https://api.example.test".into(),
+                route_revision: 1,
+                origin_boundary: 2,
+                provider_id: "responses".into(),
                 api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "wire-model".into(),
+                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         );
 
@@ -431,7 +798,11 @@ mod tests {
         let mut history = History::new(dir.clone());
         history.attach_rollout(Rollout::new(session.clone()));
         let record = ProviderUsageRecord {
-            model: "model".into(),
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            route_revision: 1,
+            model: "mock".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: crate::usage::UsageOperation::Sampling,
             usage: kloop_protocol::Usage {
                 input_tokens: 1,
@@ -495,9 +866,9 @@ mod tests {
             text: "bye".into(),
         }]));
 
-        // Fork before the "two" turn (cut at #2) and rewind the live history
-        // onto that branch.
-        let fork_path = fork_session(&session, Some(2), &dir).unwrap();
+        // Fork before the "two" turn (route receipt + two message lines) and
+        // rewind the live history onto that branch.
+        let fork_path = fork_session(&session, Some(3), &dir).unwrap();
         let resumed = crate::rollout::resume_session(&fork_path).unwrap();
         h.rebase(resumed);
         assert_eq!(
@@ -540,6 +911,124 @@ mod tests {
             "the resumed session's spill file must survive new spills"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_switch_filters_request_view_and_switching_back_restores_reasoning() {
+        use std::sync::Arc;
+
+        use crate::provider_route::ProviderCatalog;
+        use crate::provider_route::ProviderCatalogEntry;
+        use crate::provider_route::SessionProviderState;
+        use crate::provider_route::SwitchOutcome;
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::Provider;
+
+        let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
+        let entry = |id: &str, fallback: Option<&str>| ProviderCatalogEntry {
+            id: id.into(),
+            api_family: ProviderApiFamily::Mock,
+            endpoint_fingerprint: fingerprint.clone(),
+            default_model: format!("{id}-model"),
+            models: fallback.map_or_else(
+                || vec![format!("{id}-model")],
+                |fallback| vec![format!("{id}-model"), fallback.to_string()],
+            ),
+            fallback_model: fallback.map(str::to_string),
+            availability: ProviderAvailabilityCode::Ready,
+            factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+        };
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![entry("a", None), entry("b", Some("b-fallback"))]).unwrap(),
+        );
+        let initial = catalog.initial_route("a", None).unwrap();
+        let state = SessionProviderState::from_route(Arc::clone(&catalog), initial.clone());
+        let mut history = History::new(temp_dir("provider-switch-view"));
+        history.ensure_initial_provider_route(&initial).unwrap();
+        history.record(Message::user_text("question"));
+        history.record_provider_assistant(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "readable reasoning".into(),
+                    signature: "opaque".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            &initial.primary_attempt(),
+        );
+        let canonical = history.messages().to_vec();
+
+        let changed = history.switch_provider(&state, 1, "b", None).unwrap();
+        assert!(matches!(
+            changed,
+            SwitchOutcome::Changed {
+                continuity: ReasoningContinuity::Filtered,
+                ..
+            }
+        ));
+        let route_b = state.freeze();
+        let view_b = history
+            .provider_request_view(&route_b.primary_attempt())
+            .unwrap();
+        assert_eq!(
+            view_b[1].content,
+            vec![ContentBlock::Text {
+                text: "answer".into()
+            }]
+        );
+        assert_eq!(history.messages(), canonical.as_slice());
+        let fallback_error = history
+            .provider_request_view(&route_b.fallback_attempt().unwrap())
+            .unwrap_err();
+        assert!(fallback_error.to_string().contains("not authorized"));
+
+        history.switch_provider(&state, 2, "a", None).unwrap();
+        let view_a = history
+            .provider_request_view(&state.freeze().primary_attempt())
+            .unwrap();
+        assert_eq!(view_a, canonical);
+    }
+
+    #[test]
+    fn route_append_failure_keeps_memory_state_and_remembered_model() {
+        use std::sync::Arc;
+
+        use crate::provider_route::ProviderCatalog;
+        use crate::provider_route::ProviderCatalogEntry;
+        use crate::provider_route::SessionProviderState;
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::Provider;
+
+        let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
+        let entry = |id: &str| ProviderCatalogEntry {
+            id: id.into(),
+            api_family: ProviderApiFamily::Mock,
+            endpoint_fingerprint: fingerprint.clone(),
+            default_model: format!("{id}-model"),
+            models: vec![format!("{id}-model")],
+            fallback_model: None,
+            availability: ProviderAvailabilityCode::Ready,
+            factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+        };
+        let catalog = Arc::new(ProviderCatalog::new(vec![entry("a"), entry("b")]).unwrap());
+        let initial = catalog.initial_route("a", None).unwrap();
+        let state = SessionProviderState::from_route(catalog, initial.clone());
+        let root = temp_dir("route-persist-failure");
+        let session = root.join("session.jsonl");
+        let mut history = History::new(root.join("offload"));
+        history.attach_rollout(Rollout::new_with_initial_route(session, &initial).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::write(&root, b"blocks parent directory creation").unwrap();
+
+        let error = history.switch_provider(&state, 1, "b", None).unwrap_err();
+        assert!(matches!(error, ProviderSwitchError::Persistence(_)));
+        assert_eq!(state.active_route().revision, 1);
+        assert_eq!(state.active_route().provider_id, "a");
+        assert_eq!(state.remembered_models().get("b"), None);
+        assert_eq!(history.provider_routes().len(), 1);
+        let _ = std::fs::remove_file(root);
     }
 
     #[test]

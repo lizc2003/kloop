@@ -19,17 +19,30 @@ pub async fn run(
     cfg: &Arc<Config>,
     cancel: &CancellationToken,
 ) -> SlashResult {
-    let output =
-        match compact_once(cfg, &cfg.model, CompactionTrigger::Manual, history, cancel).await {
-            Ok(CompactionOutcome::Applied(receipt)) => format!(
-                "history compacted: {} summarized, {} kept verbatim",
-                receipt.summarized, receipt.kept
-            ),
-            Ok(CompactionOutcome::NoOp(_)) => {
-                "history already compacted: nothing new to summarize".into()
-            }
-            // A failed summary request leaves History untouched; just report why.
-            Err(e) => format!("compaction failed: {e:#}"),
-        };
+    if let Err(error) = history.ensure_initial_provider_route(&cfg.provider_route) {
+        return SlashResult::message(format!(
+            "compaction failed: provider route initialization failed: {error}"
+        ));
+    }
+    let provider_attempt = cfg.provider_route.primary_attempt();
+    let output = match compact_once(
+        cfg,
+        &provider_attempt,
+        CompactionTrigger::Manual,
+        history,
+        cancel,
+    )
+    .await
+    {
+        Ok(CompactionOutcome::Applied(receipt)) => format!(
+            "history compacted: {} summarized, {} kept verbatim",
+            receipt.summarized, receipt.kept
+        ),
+        Ok(CompactionOutcome::NoOp(_)) => {
+            "history already compacted: nothing new to summarize".into()
+        }
+        // A failed summary request leaves History untouched; just report why.
+        Err(e) => format!("compaction failed: {e:#}"),
+    };
     SlashResult::message(output)
 }

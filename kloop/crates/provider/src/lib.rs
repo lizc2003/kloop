@@ -29,11 +29,16 @@ pub(crate) use stream::StreamSink;
 pub(crate) use stream::send_checked;
 use stream::spawn_stream;
 
+use sha2::Digest as _;
+use sha2::Sha256;
+
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderAttemptIdentity;
+use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
@@ -226,42 +231,93 @@ pub(crate) fn parse_tool_input(
 }
 
 impl Provider {
-    pub fn response_provenance(&self, model: &str) -> ProviderResponseProvenance {
-        let (provider, api_family) = match self {
-            Provider::Anthropic { base, .. } => (
-                format!("anthropic:{base}"),
-                ProviderApiFamily::AnthropicMessages,
-            ),
-            Provider::OpenAiCompat { base, .. } => (
-                format!("openai_compat:{base}"),
-                ProviderApiFamily::OpenAiChatCompletions,
-            ),
-            Provider::OpenAiResponses { base, .. } => (
-                format!("openai_responses:{base}"),
-                ProviderApiFamily::OpenAiResponses,
-            ),
-            Provider::Mock { .. } => ("mock".to_string(), ProviderApiFamily::Mock),
-        };
-        ProviderResponseProvenance {
-            provider,
-            api_family,
-            model: model.to_string(),
+    pub fn api_family(&self) -> ProviderApiFamily {
+        match self {
+            Self::Anthropic { .. } => ProviderApiFamily::AnthropicMessages,
+            Self::OpenAiCompat { .. } => ProviderApiFamily::OpenAiChatCompletions,
+            Self::OpenAiResponses { .. } => ProviderApiFamily::OpenAiResponses,
+            Self::Mock { .. } => ProviderApiFamily::Mock,
         }
+    }
+
+    pub fn endpoint_fingerprint_for(api_family: ProviderApiFamily, endpoint: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{api_family:?}\n{endpoint}"));
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn endpoint_fingerprint(&self) -> String {
+        let endpoint = match self {
+            Self::Anthropic { base, .. }
+            | Self::OpenAiCompat { base, .. }
+            | Self::OpenAiResponses { base, .. } => base.as_str(),
+            Self::Mock { .. } => "mock",
+        };
+        Self::endpoint_fingerprint_for(self.api_family(), endpoint)
+    }
+
+    pub fn attempt_identity(
+        &self,
+        provider_id: impl Into<String>,
+        route_revision: u64,
+        model: impl Into<String>,
+        attempt_kind: ProviderAttemptKind,
+    ) -> ProviderAttemptIdentity {
+        ProviderAttemptIdentity {
+            route_revision,
+            provider_id: provider_id.into(),
+            api_family: self.api_family(),
+            endpoint_fingerprint: self.endpoint_fingerprint(),
+            model: model.into(),
+            attempt_kind,
+        }
+    }
+
+    /// Fixture helper for constructing a provider-produced message without a
+    /// rollout. Production messages are bound by `History` from a frozen attempt.
+    pub fn response_provenance(&self, model: &str) -> ProviderResponseProvenance {
+        let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
+        ProviderResponseProvenance {
+            route_revision: attempt.route_revision,
+            origin_boundary: 1,
+            provider_id: attempt.provider_id,
+            api_family: attempt.api_family,
+            endpoint_fingerprint: attempt.endpoint_fingerprint,
+            model: attempt.model,
+            attempt_kind: attempt.attempt_kind,
+        }
+    }
+
+    fn validate_attempt(&self, attempt: &ProviderAttemptIdentity) -> Result<(), ProviderFailure> {
+        if attempt.api_family != self.api_family()
+            || attempt.endpoint_fingerprint != self.endpoint_fingerprint()
+        {
+            return Err(ProviderFailure::protocol(
+                "frozen provider attempt does not match the selected provider client",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_reasoning_replay(
         &self,
-        model: &str,
+        attempt: &ProviderAttemptIdentity,
         messages: &[Message],
     ) -> Result<(), ProviderFailure> {
-        let expected = self.response_provenance(model);
-        if !expected.api_family.requires_exact_reasoning_replay() {
-            return Ok(());
-        }
+        self.validate_attempt(attempt)?;
         for message in messages {
-            if message.has_reasoning() && message.provider_provenance.as_ref() != Some(&expected) {
+            if message.has_reasoning()
+                && !message
+                    .provider_provenance
+                    .as_ref()
+                    .is_some_and(|source| source.exact_replay_compatible(attempt))
+            {
                 return Err(ProviderFailure::protocol(
-                    "reasoning replay requires the same provider API family and exact model",
+                    "reasoning replay requires the same provider route and exact model",
                 ));
             }
         }
@@ -289,8 +345,8 @@ impl Provider {
         (provider, seen)
     }
 
-    /// Start one streaming sampling request. The returned receiver owns the
-    /// producer task; dropping it aborts an in-flight open/body read.
+    /// Compatibility test seam. Production callers use `stream_attempt` with a
+    /// route receipt minted by the session provider owner.
     pub fn stream(
         self: &Arc<Self>,
         model: &str,
@@ -298,9 +354,23 @@ impl Provider {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> ProviderStream {
-        if let Err(error) = self.validate_reasoning_replay(model, messages) {
+        let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
+        self.stream_attempt(&attempt, system, messages, tools)
+    }
+
+    /// Start one streaming request from an immutable provider attempt. The final
+    /// route/reasoning guard executes before any adapter can construct HTTP I/O.
+    pub fn stream_attempt(
+        self: &Arc<Self>,
+        attempt: &ProviderAttemptIdentity,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> ProviderStream {
+        if let Err(error) = self.validate_reasoning_replay(attempt, messages) {
             return spawn_stream(move |_sink| async move { Err(error) });
         }
+        let model = attempt.model.as_str();
         match self.as_ref() {
             Provider::Mock { turns, seen } => {
                 seen.lock().unwrap().push(MockRequest {
@@ -527,10 +597,11 @@ mod tests {
             provider_provenance: provenance,
         };
         let provider = Provider::mock(Vec::new());
+        let attempt = provider.attempt_identity("test", 1, "model-a", ProviderAttemptKind::Primary);
         let exact = provider.response_provenance("model-a");
         assert!(
             provider
-                .validate_reasoning_replay("model-a", &[reasoning(Some(exact.clone()))])
+                .validate_reasoning_replay(&attempt, &[reasoning(Some(exact.clone()))])
                 .is_ok()
         );
 
@@ -541,7 +612,7 @@ mod tests {
                 ..exact.clone()
             }),
             Some(ProviderResponseProvenance {
-                provider: "another-provider".into(),
+                provider_id: "another-provider".into(),
                 ..exact.clone()
             }),
             Some(ProviderResponseProvenance {
@@ -550,7 +621,7 @@ mod tests {
             }),
         ] {
             let error = provider
-                .validate_reasoning_replay("model-a", &[reasoning(provenance)])
+                .validate_reasoning_replay(&attempt, &[reasoning(provenance)])
                 .unwrap_err();
             assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
             assert!(!error.is_retryable());
@@ -559,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_replay_keeps_its_reasoning_strip_boundary() {
+    fn chat_replay_still_requires_validated_source() {
         let chat = Provider::OpenAiCompat {
             key: "unused".into(),
             base: "https://chat.invalid".into(),
@@ -570,16 +641,21 @@ mod tests {
                 signature: "opaque".into(),
             }],
             ProviderResponseProvenance {
-                provider: "openai_responses:https://responses.invalid".into(),
+                route_revision: 1,
+                origin_boundary: 2,
+                provider_id: "responses".into(),
                 api_family: ProviderApiFamily::OpenAiResponses,
+                endpoint_fingerprint: "responses-fingerprint".into(),
                 model: "model-a".into(),
+                attempt_kind: ProviderAttemptKind::Primary,
             },
         );
+        let attempt = chat.attempt_identity("chat", 2, "chat-model", ProviderAttemptKind::Primary);
 
         assert!(
-            chat.validate_reasoning_replay("chat-model", &[foreign])
-                .is_ok(),
-            "chat intentionally strips reasoning instead of replaying it"
+            chat.validate_reasoning_replay(&attempt, &[foreign])
+                .is_err(),
+            "chat strips reasoning only after the core request view validates its source"
         );
     }
 

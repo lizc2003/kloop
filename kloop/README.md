@@ -28,7 +28,7 @@ frame (1 MiB) guards apply on all three wires. Transport/open/read failures,
 HTTP 408/429/5xx, and incomplete EOF retry up to 3 total attempts only before
 any text, reasoning, or complete tool call arrives; `Retry-After` is honored up
 to 60s. Core retains provider outcomes and failures inside typed turn errors;
-string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
+string rendering happens only at CLI/TUI/native protocol 2.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.
 
@@ -117,7 +117,7 @@ The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display `turn_terminal`
 records (completed/maxRounds/aborted/error, positioned after a message index).
 Error terminals add an internal typed provider outcome/failure while preserving
-the protocol 1.0 status/error projection; terminals never enter provider replay
+the protocol 2.0 status/error projection; terminals never enter provider replay
 or token accounting. If a stream fails or is cancelled after visible text, that
 partial assistant block and its provider provenance are recorded before the
 terminal, so restart/fork keeps the replay boundary without generating a second
@@ -551,75 +551,38 @@ tool status rows re-derived from the recorded tool_use/tool_result pairs); a
 long history scrolls straight into native scrollback, so a resumed session
 starts with its recent conversation visible instead of a blank screen.
 
-## Native agent protocol (plan 39)
+`kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
 
-`kloop app-server` (alias `kloop --serve`) speaks kloop's native agent protocol
-over stdio — **standard JSON-RPC 2.0** (every envelope carries `"jsonrpc":"2.0"`,
-one object per line) — so IDEs and automation can drive multiple sessions
-concurrently. The core emits a single [`Event`](crates/core/src/event.rs)
-stream that every front-end projects; the server (and the headless `--json`
-stream) project it onto the wire below via one shared `project_event`, so both
-speak one item vocabulary by construction.
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. A switch creates no turn, message, terminal, or usage record; stale CAS, unavailable targets, busy threads, and persistence failures leave the old route untouched.
+
 
 **Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
-`{serverInfo, protocolVersion, capabilities}` accepts exactly protocol `"1.0"`
+`{serverInfo, protocolVersion, capabilities}` accepts exactly protocol `"2.0"`
 and gates every other method until it succeeds. Plan 63 changes the scoped
 approval schema in place because the native protocol had no external users; it
 does not add a compatibility adapter, fallback, alias, or silent downgrade.
 Capabilities are structured: `{streaming, subagents, mcp,
 images, approvals:{scopes:["once","workspaceSession","project"]}, questions,
 events:{sequence:true,sync:true,snapshot:true}, threads:{list,
-read,resume,fork}, models:{list}, config:{read}, skills:{list},
+read,resume,fork}, providers:{catalog:true,switch:true}, config:{read}, skills:{list},
 mcpServers:{status}}`. Event recovery is part of the only current protocol contract,
 not an opt-in compatibility switch; the Desktop adapter rejects a server that does
 not advertise all three event capabilities.
 
-**Methods:** `thread/start {cwd?, model?}` → `{thread:{id}}`;
+**Methods:** `thread/start {cwd?, providerId?, model?}` → `{thread:{id,route}}`;
 `thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
 sub-agent sidechains hidden, `limit` capped at 500); `thread/read {threadId}` →
-`{thread:{id,cwd,model,resumable,forkedFrom,messages,terminals}}`;
-`thread/resume {threadId, cwd?}` and `thread/fork {threadId, cut?, cwd?}` →
-`{thread:{id,cwd,model,resumable}, messageCount}`; `turn/start {threadId,
+`{thread:{id,cwd,route,resumable,forkedFrom,messages,terminals}}`;
+`thread/resume {threadId}` and `thread/fork {threadId, cut?}` →
+`{thread:{id,cwd,route,resumable}, messageCount}`; `turn/start {threadId,
 input}` → `{turn:{id}}`, `turn/steer {threadId, input}` → `{turnId}`,
-`turn/interrupt {threadId}`. The optional `cwd` on resume/fork is only the
-one-time migration input for pre-runtime-metadata rollouts; it cannot override
-a pinned session runtime. `input` is a string or an array of content parts
+`turn/interrupt {threadId}`. Old rollouts without route timelines are rejected,
+not migrated. `input` is a string or an array of content parts
 (`{type:"text",text}` / `{type:"image",source:{…}}`).
 
-**Read-only discovery:** `model/list {}` returns only the process's locally
-resolved default model (not a fabricated provider catalog); `config/read
-{cwd? | threadId?}` returns an explicit non-sensitive allowlist;
-`skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without
-bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}`
-returns the immutable startup discovery snapshot (transport, connected /
-unavailable state, sanitized message, and model-visible tool names). MCP runtime
-readiness is consumed internally by tool/resource discovery and dispatch; it does
-not reinterpret this legacy snapshot or add a process-global event stream.
-Config, skill, plugin, and MCP mutation methods are deliberately absent in this
-slice.
-Read methods reject unknown parameters, accept at most one scope selector, and
-canonicalize cwd before invoking their reader.
+**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | threadId?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
-Every thread is its own tokio task owning a History (persisted to the same
-`.kloop/sessions/` files the interactive frontends use — sessions are
-interchangeable) and a fresh `PermissionSession`: mode, WorkspaceId-partitioned
-cache, approver, and background registries never leak across threads. Threads
-with the same `ProjectId` obtain one live `ProjectPermissionPolicy` from the
-process registry, so a successfully persisted project grant is immediately
-visible to sibling threads; different projects remain isolated. A missing
-`thread/start.cwd` defaults to the app-server launch directory; an explicit
-relative path is resolved from that directory, canonicalized, and rejected
-unless it is an accessible directory. The CLI builds project instructions,
-skills, permissions, sandbox,
-hooks, agent types, and program limits from that thread cwd without ever
-changing the process cwd. `thread/start.model`, when present, overrides the
-provider/env default only for that thread; otherwise the factory-resolved
-default is pinned before `thread/start` returns, so a later server restart or
-environment change cannot silently switch the resumed thread's model. Provider
-state and already-connected MCP tool sources remain process-shared;
-session/offload roots remain the app-server's `ServerPaths`, not the thread
-project directory.
-
+Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable explicit switch may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
 **Events** stream per active thread. Every public notification carries
 `threadId`, one opaque `eventGeneration`, and a decimal-string `seq`; `seq`
 starts at `"1"`, increases strictly across turns in that generation, and never
@@ -704,12 +667,12 @@ dropped replies fail closed and pending reverse requests are removed when their
 turn is interrupted.
 
 ```jsonc
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true}}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"1.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"approvals":{"scopes":["once","workspaceSession","project"]},"questions":true,"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"models":{"list":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
-→ {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}
-← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146"}}}
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true},"providers":{"catalog":true,"switch":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"2.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"providers":{"catalog":true,"switch":true},"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
+→ {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"providerId":"anthropic","model":"claude-sonnet-5"}}
+← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146","route":{"revision":1,"providerId":"anthropic","apiFamily":"anthropic_messages","model":"claude-sonnet-5"}}}}
 → {"jsonrpc":"2.0","id":3,"method":"thread/events/sync","params":{"threadId":"20260721-135146"}}
-← {"jsonrpc":"2.0","id":3,"result":{"mode":"snapshot","reason":"initial","generation":"g","highWaterSeq":"0","snapshot":{"schemaVersion":1,"thread":{"id":"20260721-135146","cwd":"…","model":"…","resumable":true},"history":{"messages":[],"runtime":{"cwd":"…","model":"…"},"terminals":[]},"tail":{"turns":[],"notices":[],"backgroundTasks":[],"agentMessages":[],"scheduledTasks":[],"tokenUsage":null,"cwd":{"path":"…","branch":null}},"recovery":{"source":"fresh","volatileState":"live"}},"eventCursor":{"threadId":"20260721-135146","generation":"g","seq":"0"}}}
+← {"jsonrpc":"2.0","id":3,"result":{"mode":"snapshot","reason":"initial","generation":"g","highWaterSeq":"0","snapshot":{"schemaVersion":1,"thread":{"id":"20260721-135146","cwd":"…","route":{"revision":1,"providerId":"anthropic","apiFamily":"anthropic_messages","model":"claude-sonnet-5"},"resumable":true},"history":{"messages":[],"runtime":{"cwd":"…"},"terminals":[]},"tail":{"turns":[],"notices":[],"backgroundTasks":[],"agentMessages":[],"scheduledTasks":[],"tokenUsage":null,"cwd":{"path":"…","branch":null}},"recovery":{"source":"fresh","volatileState":"live"}},"eventCursor":{"threadId":"20260721-135146","generation":"g","seq":"0"}}}
 → {"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
 ← {"jsonrpc":"2.0","id":4,"result":{"turn":{"id":1}}}
 ← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","eventGeneration":"g","seq":"1","turn":{"id":1}}}
@@ -722,7 +685,7 @@ turn is interrupted.
 ### Codex Desktop adapter (plan 39 slices 2–4)
 
 The `桌面前端仓库` repository's dedicated `kloop` branch launches this
-server through `ENGINE_BIN` and consumes native protocol 1.0 directly (it
+server through `ENGINE_BIN` and consumes native protocol 2.0 directly (it
 does not emulate the old Codex app-server wire). Its initialize request declares
 the mandatory event recovery shape and hard-rejects a server missing any of
 `events.sequence`, `events.sync`, or `events.snapshot`. The Tauri reader also
@@ -2572,54 +2535,39 @@ cargo run -- --mock
 # remains the workspace anchor for project instructions, skills, tools,
 # permissions, and sandbox paths.
 #
-# Daily provider/model configuration lives in that process-global file. The
+# Daily provider route configuration lives in that process-global file. The
 # directory must have no group/other access (kloop creates it as 0700), and the
 # file must be mode 0600:
 #
-#   model = "gpt-5.6-sol"
-#   model_provider = "gw_router"
-#   model_reasoning_effort = "xhigh"
+#   model = "gpt-5.6-sol"             # initial model, must be allowlisted
+#   model_provider = "gw_router"     # initial provider profile
 #
 #   [model_providers.gw_router]
-#   name = "gateway"             # optional display name
-#   wire_api = "responses"         # responses | chat | anthropic
+#   wire_api = "responses"             # responses | chat | anthropic
 #   base_url = "https://example/v1"
 #   http_headers = { Authorization = "Bearer ..." }
-#   model = "gpt-5.6-sol"          # optional profile-specific default
+#   default_model = "gpt-5.6-sol"
+#   models = ["gpt-5.6-sol", "gpt-5.6-mini"]
+#   fallback_model = "gpt-5.6-mini"     # optional, in models only
 #
-# Custom profile names require wire_api. Built-in names anthropic, openai /
-# openai-compat, and openai-responses infer it. Anthropic profiles use exactly
-# one x-api-key header; chat/responses profiles use Bearer Authorization.
-# kloop appends /v1/messages, /chat/completions, or /responses to the base.
-#
-# Native Windows shell overrides are optional. Each value is one absolute
-# executable path with no arguments; startup validates/canonicalizes it and
-# freezes one ShellPrograms snapshot for every thread/agent/worktree/code-mode
-# child. Git Bash must be the complete Git for Windows bin/bash.exe layout.
-# PowerShell discovery prefers the highest trusted v7 pwsh.exe across MSI and
-# official Microsoft MSIX package roots, then falls back to 5.1:
-#
-#   [shells]
-#   bash = 'C:\Program Files\Git\bin\bash.exe'
-#   powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
-#
-# --mock ignores [shells], HOME, and PATH discovery and injects a deterministic
-# test snapshot. On ordinary startup, a missing shell family is omitted from the
-# model catalog and warned once; PowerShell remains usable when Git Bash is absent.
-chmod 700 ~/.kloop
-chmod 600 ~/.kloop/config.toml
-cargo run
+# Every configured profile declares a stable id, API family, default model, and
+# ordered model allowlist. Unselected profiles may be unavailable because their
+# credential is absent; they remain visible with a bounded availability code and
+# are checked only when selected. No model discovery or credential editing occurs
+# at runtime. kloop appends /v1/messages, /chat/completions, or /responses.
 
-# Environment variables remain compatibility/CI overrides rather than the
-# daily source of truth. Provider selection: KLOOP_PROVIDER > model_provider >
-# key auto-detection. Key/base env wins over the selected profile. Model order:
-# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > profile model > top-level model.
-# Explicitly selected, incomplete profiles fail; kloop never switches rails.
+# Environment variables only select a new session's initial catalog route; they
+# cannot inject an undeclared provider or model. Provider selection:
+# KLOOP_PROVIDER > model_provider. Model order:
+# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > top-level model > profile default,
+# but every result must occur in that profile's models allowlist. Credentials and
+# base URL env overrides apply to the selected profile only; unselected profiles
+# remain bounded-unavailable when their configured credential is absent.
 #
-# ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL (base excludes /v1) select Messages;
-# OPENAI_API_KEY / OPENAI_BASE_URL (base normally includes /v1) select either
-# chat or Responses according to KLOOP_PROVIDER. KLOOP_CACHE and KLOOP_THINKING
-# override Anthropic cache/thinking; KLOOP_EFFORT overrides Responses effort.
+# ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
+# OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
+# selected profile. KLOOP_CACHE, KLOOP_THINKING, and KLOOP_EFFORT remain provider-
+# local request settings. KLOOP_FALLBACK_MODEL is not a runtime selector.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
 # Stream guards are fixed provider-internal safety defaults, not user config:
@@ -2645,7 +2593,7 @@ cargo run
 # tool. ToolUse must agree bidirectionally with unique, valid tool blocks. A
 # valid empty EndTurn creates no assistant history placeholder. Display items
 # with partial text close as failed on stream error, while completed blocks stay
-# completed; native protocol 1.0 keeps the existing item/completed method and
+# completed; native protocol 2.0 keeps the existing item/completed method and
 # carries that distinction in the item's status field. Core turn errors retain
 # AssistantOutcome or ProviderFailure rather than recovering either from text.
 # Assistant history binds reasoning to provider endpoint identity + API family +
@@ -2793,7 +2741,7 @@ Every session is saved and resumable — see Session persistence above.
   scrollback; it does not prove real terminal input or native scrollback retention.
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
-  plus duplex-driven exact native protocol 1.0 tests against the real serve loop:
+  plus duplex-driven exact native protocol 2.0 tests against the real serve loop:
   structured approval scopes, `acceptForProject`, protocol 2.0/`acceptAlways` rejection,
   delta streaming and completion, approval deny/allow
   round-trips (file provably not/created, the change `preview` reaching the
@@ -2853,7 +2801,7 @@ Every session is saved and resumable — see Session persistence above.
 
 Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
 rounds. Plan 63 acceptance also runs the real stdio binary for an exact native
-protocol 1.0 handshake and protocol 2.0 refusal, plus the Desktop companion's Bun,
+protocol 2.0 handshake and protocol 1.0 refusal, plus the Desktop companion's Bun,
 production-build, Rust test/clippy/fmt gates. Those deterministic gates cover
 Once/WorkspaceSession/Project wire decisions and persistence-failure behavior;
 they do not claim a manual GUI click-through or native Windows runtime where it

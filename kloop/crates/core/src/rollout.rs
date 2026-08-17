@@ -28,12 +28,16 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::inbox::STEERING_PREFIX;
+use crate::provider_route::FrozenProviderRoute;
 use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
+use kloop_protocol::ProviderRouteReceipt;
+use kloop_protocol::ProviderRouteSource;
+use kloop_protocol::ReasoningContinuity;
 use kloop_protocol::Role;
 use kloop_provider::ProviderFailure;
 use kloop_provider::ProviderFailureKind;
@@ -43,8 +47,6 @@ use kloop_provider::TimeoutStage;
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntime {
     pub cwd: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,6 +275,8 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub runtime: Option<SessionRuntime>,
     pub terminals: Vec<SnapshotTerminal>,
+    #[serde(skip_serializing)]
+    pub provider_routes: Vec<ProviderRouteReceipt>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +324,18 @@ enum RolloutLine {
         meta: LineMeta,
         runtime: SessionRuntime,
     },
+    ProviderRouteInitial {
+        #[serde(flatten)]
+        meta: LineMeta,
+        #[serde(flatten)]
+        receipt: ProviderRouteReceipt,
+    },
+    ProviderRouteChanged {
+        #[serde(flatten)]
+        meta: LineMeta,
+        #[serde(flatten)]
+        receipt: ProviderRouteReceipt,
+    },
     Message {
         #[serde(flatten)]
         meta: LineMeta,
@@ -358,6 +374,8 @@ impl RolloutLine {
     fn meta(&self) -> &LineMeta {
         match self {
             RolloutLine::Session { meta, .. }
+            | RolloutLine::ProviderRouteInitial { meta, .. }
+            | RolloutLine::ProviderRouteChanged { meta, .. }
             | RolloutLine::Message { meta, .. }
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
@@ -370,6 +388,8 @@ impl RolloutLine {
     fn into_meta(self) -> LineMeta {
         match self {
             RolloutLine::Session { meta, .. }
+            | RolloutLine::ProviderRouteInitial { meta, .. }
+            | RolloutLine::ProviderRouteChanged { meta, .. }
             | RolloutLine::Message { meta, .. }
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
@@ -391,26 +411,72 @@ pub struct Rollout {
     /// Set only for a sub-agent's rollout: stamped onto the FIRST appended
     /// line's envelope (`subagent_of`) and ignored thereafter.
     subagent_of: Option<String>,
+    route_timeline: Vec<ProviderRouteReceipt>,
 }
 
 impl Rollout {
-    /// A fresh session: the id chain starts at `#1` with no parent.
+    /// A fresh fixture session with a complete mock route timeline. Production
+    /// session owners use `new_with_initial_route` once their catalog route is resolved.
     pub fn new(path: PathBuf) -> Self {
-        Self::with_origin(path, None)
+        let mut rollout = Self::with_origin(path, None);
+        rollout
+            .append_fixture_initial_route()
+            .expect("fixture rollout initial route must be writable");
+        rollout
     }
 
-    /// A fresh session whose runtime choices must survive process restarts.
-    /// The metadata is written before the thread id is returned to a client.
-    pub fn new_with_runtime(path: PathBuf, runtime: SessionRuntime) -> io::Result<Self> {
-        let mut rollout = Self::new(path);
+    pub fn new_with_initial_route(path: PathBuf, route: &FrozenProviderRoute) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(path, None);
+        rollout.append_initial_route(route)?;
+        Ok(rollout)
+    }
+
+    pub fn new_with_runtime_pending_route(
+        path: PathBuf,
+        runtime: SessionRuntime,
+    ) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(path, None);
         rollout.append_runtime(&runtime)?;
+        Ok(rollout)
+    }
+
+    /// A fresh fixture session whose runtime choices must survive process restarts.
+    pub fn new_with_runtime(path: PathBuf, runtime: SessionRuntime) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(path, None);
+        rollout.append_runtime(&runtime)?;
+        rollout.append_fixture_initial_route()?;
+        Ok(rollout)
+    }
+
+    pub fn new_with_runtime_and_route(
+        path: PathBuf,
+        runtime: SessionRuntime,
+        route: &FrozenProviderRoute,
+    ) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(path, None);
+        rollout.append_runtime(&runtime)?;
+        rollout.append_initial_route(route)?;
         Ok(rollout)
     }
 
     /// A sub-agent's rollout: like [`Rollout::new`], but the first appended
     /// line records the parent turn (`{parent stem}#{seq}`) that spawned it.
     pub fn new_subagent(path: PathBuf, subagent_of: String) -> Self {
-        Self::with_origin(path, Some(subagent_of))
+        let mut rollout = Self::with_origin(path, Some(subagent_of));
+        rollout
+            .append_fixture_initial_route()
+            .expect("fixture sub-agent initial route must be writable");
+        rollout
+    }
+
+    pub fn new_subagent_with_route(
+        path: PathBuf,
+        subagent_of: String,
+        route: &FrozenProviderRoute,
+    ) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(path, Some(subagent_of));
+        rollout.append_initial_route(route)?;
+        Ok(rollout)
     }
 
     fn with_origin(path: PathBuf, subagent_of: Option<String>) -> Self {
@@ -421,6 +487,7 @@ impl Rollout {
             next_seq: 1,
             last_id: None,
             subagent_of,
+            route_timeline: Vec::new(),
         }
     }
 
@@ -429,6 +496,10 @@ impl Rollout {
     /// `subagent_of` back-pointer for the sub-agent it launches.
     pub fn last_id(&self) -> Option<&str> {
         self.last_id.as_deref()
+    }
+
+    pub fn next_boundary(&self) -> u64 {
+        self.next_seq
     }
 
     /// The session file this rollout writes to — surfaced in the subagent_stop
@@ -442,6 +513,86 @@ impl Rollout {
             meta: self.next_meta(),
             runtime: runtime.clone(),
         })
+    }
+
+    fn append_fixture_initial_route(&mut self) -> io::Result<ProviderRouteReceipt> {
+        let receipt = ProviderRouteReceipt {
+            revision: 1,
+            boundary: self.next_seq,
+            source: ProviderRouteSource::Initial,
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
+                kloop_protocol::ProviderApiFamily::Mock,
+                "mock",
+            ),
+            primary_model: "mock".into(),
+            fallback_model: None,
+            continuity: ReasoningContinuity::Preserved,
+        };
+        self.append_line(RolloutLine::ProviderRouteInitial {
+            meta: self.next_meta(),
+            receipt: receipt.clone(),
+        })?;
+        self.route_timeline.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub fn append_initial_route(
+        &mut self,
+        route: &FrozenProviderRoute,
+    ) -> io::Result<ProviderRouteReceipt> {
+        if !self.route_timeline.is_empty() || route.revision() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "initial provider route must be the unique revision 1 receipt",
+            ));
+        }
+        let receipt = route.receipt(
+            self.next_seq,
+            ProviderRouteSource::Initial,
+            ReasoningContinuity::Preserved,
+        );
+        self.append_line(RolloutLine::ProviderRouteInitial {
+            meta: self.next_meta(),
+            receipt: receipt.clone(),
+        })?;
+        self.route_timeline.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub fn append_provider_route_changed(
+        &mut self,
+        route: &FrozenProviderRoute,
+        continuity: ReasoningContinuity,
+    ) -> io::Result<ProviderRouteReceipt> {
+        let previous = self.route_timeline.last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider route timeline is missing",
+            )
+        })?;
+        if route.revision() != previous.revision.saturating_add(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider route revision must advance by exactly one",
+            ));
+        }
+        let receipt = route.receipt(
+            self.next_seq,
+            ProviderRouteSource::ExplicitSwitch,
+            continuity,
+        );
+        self.append_line(RolloutLine::ProviderRouteChanged {
+            meta: self.next_meta(),
+            receipt: receipt.clone(),
+        })?;
+        self.route_timeline.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub fn route_timeline(&self) -> &[ProviderRouteReceipt] {
+        &self.route_timeline
     }
 
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
@@ -538,6 +689,7 @@ struct ParsedSession {
     provider_usage: UsageLedger,
     runtime: Option<SessionRuntime>,
     terminals: Vec<SnapshotTerminal>,
+    route_timeline: Vec<ProviderRouteReceipt>,
     last_id: Option<String>,
     max_seq: u64,
     /// Byte offset just past the last intact line; anything after is a
@@ -547,11 +699,10 @@ struct ParsedSession {
 
 /// Every intact line in file order, plus the byte offset just past the last
 /// one; anything after that offset is a malformed or unterminated tail.
-fn intact_lines(raw: &[u8]) -> (Vec<RolloutLine>, usize) {
+fn intact_lines(raw: &[u8]) -> io::Result<(Vec<RolloutLine>, usize)> {
     let mut lines = Vec::new();
     let mut intact_end = 0;
     for line in raw.split_inclusive(|byte| *byte == b'\n') {
-        // An unterminated final line is a torn write, never trustworthy.
         if !line.ends_with(b"\n") {
             break;
         }
@@ -560,14 +711,21 @@ fn intact_lines(raw: &[u8]) -> (Vec<RolloutLine>, usize) {
         };
         let content = line.trim();
         if !content.is_empty() {
-            match serde_json::from_str(content) {
-                Ok(parsed) => lines.push(parsed),
+            let value: serde_json::Value = match serde_json::from_str(content) {
+                Ok(value) => value,
                 Err(_) => break,
-            }
+            };
+            let parsed = serde_json::from_value(value).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid complete session line: {error}"),
+                )
+            })?;
+            lines.push(parsed);
         }
         intact_end += line.len();
     }
-    (lines, intact_end)
+    Ok((lines, intact_end))
 }
 
 fn checked_seq_of(meta: &LineMeta) -> io::Result<u64> {
@@ -586,13 +744,239 @@ fn seq_of(meta: &LineMeta) -> u64 {
     checked_seq_of(meta).unwrap_or(0)
 }
 
+fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut routes: Vec<ProviderRouteReceipt> = Vec::new();
+    for line in lines {
+        let (meta, receipt, expected_source) = match line {
+            RolloutLine::ProviderRouteInitial { meta, receipt } => {
+                (meta, receipt, ProviderRouteSource::Initial)
+            }
+            RolloutLine::ProviderRouteChanged { meta, receipt } => {
+                (meta, receipt, ProviderRouteSource::ExplicitSwitch)
+            }
+            _ => continue,
+        };
+        let boundary = checked_seq_of(meta)?;
+        if receipt.boundary != boundary || receipt.source != expected_source {
+            return Err(invalid(
+                "provider route receipt boundary/source does not match its line".into(),
+            ));
+        }
+        match routes.last() {
+            None if receipt.revision == 1 && receipt.source == ProviderRouteSource::Initial => {}
+            None => {
+                return Err(invalid(
+                    "provider route timeline must start with initial revision 1".into(),
+                ));
+            }
+            Some(previous)
+                if receipt.source == ProviderRouteSource::ExplicitSwitch
+                    && previous
+                        .revision
+                        .checked_add(1)
+                        .is_some_and(|next| next == receipt.revision) => {}
+            Some(_) => {
+                return Err(invalid(
+                    "provider route revisions must be unique and advance by one".into(),
+                ));
+            }
+        }
+        if receipt.provider_id.trim().is_empty()
+            || receipt.endpoint_fingerprint.trim().is_empty()
+            || receipt.primary_model.trim().is_empty()
+            || receipt.fallback_model.as_deref() == Some("")
+        {
+            return Err(invalid(
+                "provider route receipt contains an empty identity".into(),
+            ));
+        }
+        routes.push(receipt.clone());
+    }
+    if routes.is_empty() {
+        return Err(invalid(
+            "session is missing its provider route timeline".into(),
+        ));
+    }
+
+    let first_message = lines.iter().find_map(|line| match line {
+        RolloutLine::Message { meta, .. } => Some(seq_of(meta)),
+        _ => None,
+    });
+    if first_message.is_some_and(|boundary| routes[0].boundary >= boundary) {
+        return Err(invalid(
+            "initial provider route must precede the first history message".into(),
+        ));
+    }
+
+    for line in lines {
+        if let RolloutLine::ProviderUsage { meta, record } = line {
+            let boundary = checked_seq_of(meta)?;
+            let route = routes
+                .iter()
+                .rev()
+                .find(|route| route.boundary < boundary)
+                .ok_or_else(|| invalid("provider usage precedes the initial route".into()))?;
+            let model_matches = match record.attempt_kind {
+                kloop_protocol::ProviderAttemptKind::Primary => record.model == route.primary_model,
+                kloop_protocol::ProviderAttemptKind::Fallback => {
+                    route.fallback_model.as_deref() == Some(record.model.as_str())
+                }
+            };
+            if record.route_revision != route.revision
+                || record.provider_id != route.provider_id
+                || record.api_family != route.api_family
+                || !model_matches
+            {
+                return Err(invalid(
+                    "provider usage identity does not match the active route".into(),
+                ));
+            }
+        }
+    }
+
+    let mut original_origins = HashSet::new();
+    for line in lines {
+        if let RolloutLine::Message { meta, message } = line {
+            let boundary = checked_seq_of(meta)?;
+            validate_provider_message(message, boundary, &routes, true)?;
+            if let Some(source) = &message.provider_provenance {
+                original_origins.insert((source.origin_boundary, source.route_revision));
+            }
+        }
+    }
+    for line in lines {
+        let replacement = match line {
+            RolloutLine::Compacted { replacement, .. }
+            | RolloutLine::Repaired { replacement, .. } => replacement,
+            _ => continue,
+        };
+        for message in replacement {
+            validate_provider_message(message, 0, &routes, false)?;
+            if let Some(source) = &message.provider_provenance
+                && !original_origins.contains(&(source.origin_boundary, source.route_revision))
+            {
+                return Err(invalid(
+                    "replacement history contains provider provenance with no original message"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_message(
+    message: &Message,
+    line_boundary: u64,
+    routes: &[ProviderRouteReceipt],
+    original_line: bool,
+) -> io::Result<()> {
+    let invalid = |message: &'static str| io::Error::new(io::ErrorKind::InvalidData, message);
+    let has_reasoning = message.content.iter().any(rollout_block_has_reasoning);
+    let Some(source) = message.provider_provenance.as_ref() else {
+        return if has_reasoning {
+            Err(invalid(
+                "reasoning history is missing provider route provenance",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    if message.role != Role::Assistant {
+        return Err(invalid(
+            "only provider assistant messages may carry provider provenance",
+        ));
+    }
+    let index = routes
+        .iter()
+        .position(|route| route.revision == source.route_revision)
+        .ok_or_else(|| invalid("provider provenance references an unknown route revision"))?;
+    let route = &routes[index];
+    let interval_end = routes.get(index + 1).map_or(u64::MAX, |next| next.boundary);
+    if source.origin_boundary <= route.boundary || source.origin_boundary >= interval_end {
+        return Err(invalid(
+            "provider provenance origin lies outside its route interval",
+        ));
+    }
+    if original_line && source.origin_boundary != line_boundary {
+        return Err(invalid(
+            "provider provenance origin does not match its message line boundary",
+        ));
+    }
+    let model_matches = match source.attempt_kind {
+        kloop_protocol::ProviderAttemptKind::Primary => source.model == route.primary_model,
+        kloop_protocol::ProviderAttemptKind::Fallback => {
+            route.fallback_model.as_deref() == Some(source.model.as_str())
+        }
+    };
+    if source.provider_id != route.provider_id
+        || source.api_family != route.api_family
+        || source.endpoint_fingerprint != route.endpoint_fingerprint
+        || !model_matches
+    {
+        return Err(invalid(
+            "provider provenance identity does not match its producing route",
+        ));
+    }
+    if source.api_family == kloop_protocol::ProviderApiFamily::OpenAiChatCompletions
+        || (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiResponses
+            && message
+                .content
+                .iter()
+                .any(rollout_block_has_redacted_reasoning))
+    {
+        return Err(invalid(
+            "provider reasoning block shape does not match its producing API family",
+        ));
+    }
+    Ok(())
+}
+
+fn rollout_block_has_reasoning(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => true,
+        ContentBlock::ToolResult {
+            content: kloop_protocol::ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().any(rollout_block_has_reasoning),
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult {
+            content: kloop_protocol::ToolResultContent::Text(_),
+            ..
+        } => false,
+    }
+}
+
+fn rollout_block_has_redacted_reasoning(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::RedactedThinking { .. } => true,
+        ContentBlock::ToolResult {
+            content: kloop_protocol::ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().any(rollout_block_has_redacted_reasoning),
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::Thinking { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult {
+            content: kloop_protocol::ToolResultContent::Text(_),
+            ..
+        } => false,
+    }
+}
+
 fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
-    let (lines, intact_end) = intact_lines(raw);
+    let (lines, intact_end) = intact_lines(raw)?;
+    validate_provider_routes(&lines)?;
     let mut parsed = ParsedSession {
         items: Vec::new(),
         provider_usage: UsageLedger::default(),
         runtime: None,
         terminals: Vec::new(),
+        route_timeline: Vec::new(),
         last_id: None,
         max_seq: 0,
         intact_end,
@@ -601,6 +985,14 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
         let meta = match line {
             RolloutLine::Session { meta, runtime } => {
                 parsed.runtime = Some(runtime);
+                meta
+            }
+            RolloutLine::ProviderRouteInitial { meta, receipt } => {
+                parsed.route_timeline.push(receipt);
+                meta
+            }
+            RolloutLine::ProviderRouteChanged { meta, receipt } => {
+                parsed.route_timeline.push(receipt);
                 meta
             }
             RolloutLine::Message { meta, message } => {
@@ -687,6 +1079,7 @@ impl SessionRead {
             next_seq,
             last_id: self.last_id,
             subagent_of: None,
+            route_timeline: self.snapshot.provider_routes.clone(),
         };
         if self.intact_end < self.raw_len {
             std::fs::OpenOptions::new()
@@ -715,6 +1108,7 @@ pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
         messages: repair.messages.clone(),
         runtime: parsed.runtime,
         terminals: repair.terminals.clone(),
+        provider_routes: parsed.route_timeline,
     };
     Ok(SessionRead {
         snapshot,
@@ -771,7 +1165,7 @@ pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
 pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Result<PathBuf> {
     let illegal = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
     let raw = std::fs::read(src)?;
-    let (lines, _) = intact_lines(&raw);
+    let (lines, _) = intact_lines(&raw)?;
     let legal = legal_cut_seqs(&lines);
     let Some(&last) = legal.last() else {
         return Err(illegal("session has no lines to fork".into()));
@@ -817,6 +1211,18 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 meta: remeta(meta),
                 runtime,
             },
+            RolloutLine::ProviderRouteInitial { meta, receipt } => {
+                RolloutLine::ProviderRouteInitial {
+                    meta: remeta(meta),
+                    receipt,
+                }
+            }
+            RolloutLine::ProviderRouteChanged { meta, receipt } => {
+                RolloutLine::ProviderRouteChanged {
+                    meta: remeta(meta),
+                    receipt,
+                }
+            }
             RolloutLine::Message { meta, message } => RolloutLine::Message {
                 meta: remeta(meta),
                 message,
@@ -875,6 +1281,8 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         }
         RolloutLine::Session { .. }
+        | RolloutLine::ProviderRouteInitial { .. }
+        | RolloutLine::ProviderRouteChanged { .. }
         | RolloutLine::ProviderUsage { .. }
         | RolloutLine::Compacted { .. }
         | RolloutLine::TurnTerminal { .. }
@@ -919,7 +1327,7 @@ pub struct ForkPoint {
 /// of them. Reads the whole file.
 pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
     let raw = std::fs::read(path)?;
-    let (lines, _) = intact_lines(&raw);
+    let (lines, _) = intact_lines(&raw)?;
     let mut points = Vec::new();
     let mut seen_user_turn = false;
     for (i, line) in lines.iter().enumerate() {
@@ -1331,9 +1739,13 @@ mod tests {
         }
     }
 
-    fn usage_record(model: &str, input_tokens: u64) -> ProviderUsageRecord {
+    fn usage_record(_model: &str, input_tokens: u64) -> ProviderUsageRecord {
         ProviderUsageRecord {
-            model: model.into(),
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            route_revision: 1,
+            model: "mock".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: crate::usage::UsageOperation::Sampling,
             usage: kloop_protocol::Usage {
                 input_tokens,
@@ -1341,6 +1753,23 @@ mod tests {
                 cache_read_input_tokens: 3,
                 cache_creation_input_tokens: 4,
             },
+        }
+    }
+
+    fn fixture_route(boundary: u64) -> ProviderRouteReceipt {
+        ProviderRouteReceipt {
+            revision: 1,
+            boundary,
+            source: ProviderRouteSource::Initial,
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
+                kloop_protocol::ProviderApiFamily::Mock,
+                "mock",
+            ),
+            primary_model: "mock".into(),
+            fallback_model: None,
+            continuity: ReasoningContinuity::Preserved,
         }
     }
 
@@ -1364,14 +1793,28 @@ mod tests {
             Message::user_text("hello"),
             // Thinking must round-trip byte-exact (the signature is a replay
             // credential), empty text included.
-            Message::assistant(vec![
-                ContentBlock::Thinking {
-                    thinking: String::new(),
-                    signature: "sig".into(),
+            Message::assistant_from_provider(
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: "sig".into(),
+                    },
+                    ContentBlock::RedactedThinking { data: "d".into() },
+                    tool_use("t1"),
+                ],
+                kloop_protocol::ProviderResponseProvenance {
+                    route_revision: 1,
+                    origin_boundary: 3,
+                    provider_id: "test".into(),
+                    api_family: kloop_protocol::ProviderApiFamily::Mock,
+                    endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
+                        kloop_protocol::ProviderApiFamily::Mock,
+                        "mock",
+                    ),
+                    model: "mock".into(),
+                    attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
                 },
-                ContentBlock::RedactedThinking { data: "d".into() },
-                tool_use("t1"),
-            ]),
+            ),
             Message::tool_results(vec![tool_result("t1")]),
             Message::assistant(vec![ContentBlock::Text {
                 text: "done".into(),
@@ -1400,13 +1843,17 @@ mod tests {
 
         let lines = raw_lines(&path);
         assert_eq!(
-            lines[1],
+            lines[2],
             json!({
                 "type": "provider_usage",
-                "id": "session#2",
-                "parent": "session#1",
-                "ts": lines[1]["ts"],
-                "model": "actual-model",
+                "id": "session#3",
+                "parent": "session#2",
+                "ts": lines[2]["ts"],
+                "providerId": "test",
+                "apiFamily": "mock",
+                "routeRevision": 1,
+                "model": "mock",
+                "attemptKind": "primary",
                 "operation": "sampling",
                 "usage": {
                     "input_tokens": 120,
@@ -1454,15 +1901,17 @@ mod tests {
             .unwrap();
 
         let lines = raw_lines(&path);
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert_eq!(lines[0]["id"], "session#1");
         assert_eq!(lines[0].get("parent"), None, "first line has no parent");
+        assert_eq!(lines[0]["type"], "provider_route_initial");
         assert_eq!(lines[1]["id"], "session#2");
         assert_eq!(lines[1]["parent"], "session#1");
-        // The compacted marker participates in the same chain.
         assert_eq!(lines[2]["id"], "session#3");
         assert_eq!(lines[2]["parent"], "session#2");
-        assert_eq!(lines[2]["type"], "compacted");
+        assert_eq!(lines[3]["id"], "session#4");
+        assert_eq!(lines[3]["parent"], "session#3");
+        assert_eq!(lines[3]["type"], "compacted");
         for line in &lines {
             assert!(line["ts"].as_u64().unwrap() > 0, "ts must be stamped");
         }
@@ -1687,10 +2136,19 @@ mod tests {
             fn emit(&self, _: &crate::event::Event) {}
         }
         let cfg_with = |provider: Provider, dir: &Path| {
+            let (provider_catalog, provider_route) =
+                crate::provider_route::ProviderCatalog::from_provider(
+                    "test",
+                    provider,
+                    "mock",
+                    vec!["mock".into()],
+                    None,
+                )
+                .unwrap();
             let inbox = Arc::new(crate::inbox::Inbox::default());
             Arc::new(Config {
-                provider: Arc::new(provider),
-                model: "mock".into(),
+                provider_catalog,
+                provider_route,
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: Some(5),
@@ -1698,7 +2156,6 @@ mod tests {
                 offload_dir: dir.to_path_buf(),
                 sessions_dir: dir.to_path_buf(),
                 context_window: None,
-                fallback_model: None,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 questioner: None,
                 file_state: Default::default(),
@@ -1793,20 +2250,20 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         let messages = seed_forkable(&path);
 
-        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        let fork_path = fork_session(&path, Some(5), &dir).unwrap();
         let fork_stem = session_id_of(&fork_path);
         assert_ne!(fork_stem, "session");
         assert_eq!(load_session(&fork_path).unwrap(), messages[..4].to_vec());
-        assert_eq!(fork_origin(&fork_path).unwrap(), "session#4");
+        assert_eq!(fork_origin(&fork_path).unwrap(), "session#5");
         assert_eq!(fork_origin(&path), None, "fresh session has no origin");
 
         // Re-enveloped chain: new stem, seq from 1, first parent crosses
         // files, timestamps preserved from the source lines.
         let src_lines = raw_lines(&path);
         let lines = raw_lines(&fork_path);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert_eq!(lines[0]["id"], format!("{fork_stem}#1"));
-        assert_eq!(lines[0]["parent"], "session#4");
+        assert_eq!(lines[0]["parent"], "session#5");
         assert_eq!(lines[1]["id"], format!("{fork_stem}#2"));
         assert_eq!(lines[1]["parent"], format!("{fork_stem}#1"));
         for (line, src) in lines.iter().zip(&src_lines) {
@@ -1829,8 +2286,8 @@ mod tests {
         src_expected.push(Message::user_text("main branch"));
         assert_eq!(load_session(&path).unwrap(), src_expected);
         let appended = raw_lines(&fork_path);
-        assert_eq!(appended[4]["id"], format!("{fork_stem}#5"));
-        assert_eq!(appended[4]["parent"], format!("{fork_stem}#4"));
+        assert_eq!(appended[5]["id"], format!("{fork_stem}#6"));
+        assert_eq!(appended[5]["parent"], format!("{fork_stem}#5"));
         cleanup(&path);
     }
 
@@ -1858,7 +2315,7 @@ mod tests {
             }]))
             .unwrap();
 
-        let fork_path = fork_session(&path, Some(3), &dir).unwrap();
+        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
         let forked = resume_session(&fork_path).unwrap();
         assert_eq!(
             forked.provider_usage.records(),
@@ -1886,7 +2343,7 @@ mod tests {
         let messages = seed_forkable(&path);
         let fork_path = fork_session(&path, None, &dir).unwrap();
         assert_eq!(load_session(&fork_path).unwrap(), messages);
-        assert_eq!(fork_origin(&fork_path).unwrap(), "session#6");
+        assert_eq!(fork_origin(&fork_path).unwrap(), "session#7");
         cleanup(&path);
     }
 
@@ -1896,10 +2353,10 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         seed_forkable(&path);
         // #2 would split the t1 tool exchange.
-        let err = fork_session(&path, Some(2), &dir).unwrap_err();
+        let err = fork_session(&path, Some(3), &dir).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let msg = err.to_string();
-        assert!(msg.contains("#4") && msg.contains("end = #6"), "{msg}");
+        assert!(msg.contains("#5") && msg.contains("end = #7"), "{msg}");
         // Past the end of the file.
         assert!(fork_session(&path, Some(99), &dir).is_err());
         // Nothing to fork at all.
@@ -1927,15 +2384,15 @@ mod tests {
         rollout.append_message(&Message::user_text("e")).unwrap();
 
         // Cutting at the marker keeps it: the fork replays the replacement.
-        let at_marker = fork_session(&path, Some(5), &dir).unwrap();
+        let at_marker = fork_session(&path, Some(6), &dir).unwrap();
         assert_eq!(load_session(&at_marker).unwrap(), replacement);
         // Cutting before compaction forks the raw history the marker later
         // superseded — those lines never left the file.
-        let before = fork_session(&path, Some(2), &dir).unwrap();
+        let before = fork_session(&path, Some(3), &dir).unwrap();
         assert_eq!(load_session(&before).unwrap(), pre);
         // The line just before the marker is not a legal cut (its successor
         // is the marker, not a user turn).
-        assert!(fork_session(&path, Some(4), &dir).is_err());
+        assert!(fork_session(&path, Some(5), &dir).is_err());
         cleanup(&path);
     }
 
@@ -1944,10 +2401,10 @@ mod tests {
         let path = temp_file("forkfork");
         let dir = path.parent().unwrap().to_path_buf();
         seed_forkable(&path);
-        let first = fork_session(&path, Some(4), &dir).unwrap();
+        let first = fork_session(&path, Some(5), &dir).unwrap();
         let second = fork_session(&first, None, &dir).unwrap();
         let first_stem = session_id_of(&first);
-        assert_eq!(fork_origin(&second).unwrap(), format!("{first_stem}#4"));
+        assert_eq!(fork_origin(&second).unwrap(), format!("{first_stem}#5"));
         assert_eq!(
             load_session(&second).unwrap(),
             load_session(&first).unwrap()
@@ -1964,7 +2421,7 @@ mod tests {
         assert_eq!(
             fork_points(&path).unwrap(),
             vec![ForkPoint {
-                seq: 4,
+                seq: 5,
                 preview: "two".into(),
             }]
         );
@@ -1994,7 +2451,7 @@ mod tests {
         assert_eq!(
             fork_points(&path).unwrap(),
             vec![ForkPoint {
-                seq: 3,
+                seq: 4,
                 preview: "mid-turn nudge".into(),
             }]
         );
@@ -2021,7 +2478,7 @@ mod tests {
         let path = temp_file("forkoffload");
         let dir = path.parent().unwrap().to_path_buf();
         seed_forkable(&path);
-        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        let fork_path = fork_session(&path, Some(5), &dir).unwrap();
 
         // Resume both branches against the shared offload dir and spill from
         // each: the ids must never collide (counter is dir-global).
@@ -2102,10 +2559,10 @@ mod tests {
         assert!(!is_subagent_session(&path));
 
         // A fork: cross-file parent, no subagent_of → Fork.
-        let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        let fork_path = fork_session(&path, Some(5), &dir).unwrap();
         assert_eq!(
             session_origin(&fork_path),
-            Some(SessionOrigin::Fork("session#4".into()))
+            Some(SessionOrigin::Fork("session#5".into()))
         );
         assert!(!is_subagent_session(&fork_path));
         cleanup(&path);
@@ -2157,7 +2614,6 @@ mod tests {
         let path = temp_file("snapshot");
         let runtime = SessionRuntime {
             cwd: "/tmp/project".into(),
-            model: Some("test-model".into()),
         };
         let mut rollout = Rollout::new_with_runtime(path.clone(), runtime.clone()).unwrap();
         rollout
@@ -2201,6 +2657,7 @@ mod tests {
                     status: "error".into(),
                     error: Some("stream dropped".into()),
                 }],
+                provider_routes: vec![fixture_route(2)],
             }
         );
         cleanup(&path);
@@ -2212,7 +2669,6 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         let runtime = SessionRuntime {
             cwd: "/tmp/fork-project".into(),
-            model: None,
         };
         let mut rollout = Rollout::new_with_runtime(path.clone(), runtime.clone()).unwrap();
         rollout.append_message(&Message::user_text("q")).unwrap();
@@ -2240,7 +2696,7 @@ mod tests {
                 error: None,
             }]
         );
-        assert_eq!(fork_origin(&fork), Some("session#4".into()));
+        assert_eq!(fork_origin(&fork), Some("session#5".into()));
         cleanup(&path);
     }
 
@@ -2249,9 +2705,16 @@ mod tests {
         let path = temp_file("reasoning-continuity");
         let dir = path.parent().unwrap().to_path_buf();
         let provenance = kloop_protocol::ProviderResponseProvenance {
-            provider: "openai_responses:https://api.example.test".into(),
-            api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
-            model: "wire-model".into(),
+            route_revision: 1,
+            origin_boundary: 3,
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
+                kloop_protocol::ProviderApiFamily::Mock,
+                "mock",
+            ),
+            model: "mock".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
         };
         let assistant = Message::assistant_from_provider(
             vec![ContentBlock::Thinking {
@@ -2281,8 +2744,8 @@ mod tests {
             Some(provenance.clone())
         );
         let raw = raw_lines(&path);
-        assert_eq!(raw[2]["typedError"]["kind"], "provider_outcome");
-        assert_eq!(raw[2]["typedError"]["value"]["type"], "incomplete");
+        assert_eq!(raw[3]["typedError"]["kind"], "provider_outcome");
+        assert_eq!(raw[3]["typedError"]["value"]["type"], "incomplete");
         let failure = ProviderFailure::transport("stream dropped").with_semantic_output(true);
         let encoded = serde_json::to_value(TurnError::ProviderFailure(failure.clone())).unwrap();
         assert_eq!(
@@ -2294,7 +2757,7 @@ mod tests {
         assert_eq!(resumed.messages[1].provider_provenance, Some(provenance));
         let fork = fork_session(&path, None, &dir).unwrap();
         assert_eq!(load_session_snapshot(&fork).unwrap().messages[1], assistant);
-        assert_eq!(raw_lines(&fork)[2]["typedError"], raw[2]["typedError"]);
+        assert_eq!(raw_lines(&fork)[3]["typedError"], raw[3]["typedError"]);
         cleanup(&path);
     }
 
@@ -2509,6 +2972,83 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_and_semantically_invalid_route_lines_fail_without_repair() {
+        let legacy_path = temp_file("legacy-no-route");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy_path,
+            b"{\"type\":\"message\",\"id\":\"session#1\",\"ts\":1,\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}\n",
+        )
+        .unwrap();
+        let legacy_before = std::fs::read(&legacy_path).unwrap();
+        assert!(inspect_session(&legacy_path).is_err());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+
+        let invalid_path = temp_file("invalid-route-line");
+        let mut rollout = Rollout::new(invalid_path.clone());
+        rollout.append_message(&Message::user_text("new")).unwrap();
+        drop(rollout);
+        let mut lines = raw_lines(&invalid_path);
+        let mut duplicate = lines[0].clone();
+        duplicate["type"] = json!("provider_route_changed");
+        duplicate["id"] = json!("session#2");
+        duplicate["parent"] = json!("session#1");
+        duplicate["boundary"] = json!(2);
+        duplicate["source"] = json!("explicit_switch");
+        lines.insert(1, duplicate);
+        let raw = lines
+            .iter()
+            .map(|line| format!("{}\n", serde_json::to_string(line).unwrap()))
+            .collect::<String>();
+        std::fs::write(&invalid_path, raw.as_bytes()).unwrap();
+        let before = std::fs::read(&invalid_path).unwrap();
+        assert!(inspect_session(&invalid_path).is_err());
+        assert_eq!(std::fs::read(&invalid_path).unwrap(), before);
+        cleanup(&legacy_path);
+        cleanup(&invalid_path);
+    }
+
+    #[test]
+    fn future_provider_revision_in_message_provenance_fails_closed() {
+        let path = temp_file("future-route-provenance");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::user_text("question"))
+            .unwrap();
+        let mut provenance = kloop_protocol::ProviderResponseProvenance {
+            route_revision: 2,
+            origin_boundary: 3,
+            provider_id: "test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
+                kloop_protocol::ProviderApiFamily::Mock,
+                "mock",
+            ),
+            model: "mock".into(),
+            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
+        };
+        rollout
+            .append_message(&Message::assistant_from_provider(
+                vec![ContentBlock::Thinking {
+                    thinking: "summary".into(),
+                    signature: "opaque".into(),
+                }],
+                provenance.clone(),
+            ))
+            .unwrap();
+        assert!(inspect_session(&path).is_err());
+        provenance.route_revision = 1;
+        provenance.origin_boundary = 99;
+        let raw = std::fs::read_to_string(&path).unwrap().replace(
+            "\"routeRevision\":2,\"originBoundary\":3",
+            "\"routeRevision\":1,\"originBoundary\":99",
+        );
+        std::fs::write(&path, raw).unwrap();
+        assert!(inspect_session(&path).is_err());
         cleanup(&path);
     }
 

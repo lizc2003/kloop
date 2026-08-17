@@ -420,7 +420,7 @@ async fn delivery_report() -> Value {
         .unwrap();
 
     let mut config = context.cfg.test_clone();
-    config.provider = Arc::new(Provider::mock(vec![vec![AssistantBlock::Text {
+    config.set_test_provider(Provider::mock(vec![vec![AssistantBlock::Text {
         text: "timer answer".into(),
     }]]));
     context.cfg = Arc::new(config);

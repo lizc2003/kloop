@@ -311,10 +311,19 @@ mod tests {
     }
 
     fn mock_provider_config(provider: Provider) -> Config {
+        let (provider_catalog, provider_route) =
+            kloop_core::provider_route::ProviderCatalog::from_provider(
+                "mock",
+                provider,
+                "mock",
+                vec!["mock".into()],
+                None,
+            )
+            .unwrap();
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         Config {
-            provider: Arc::new(provider),
-            model: "mock".into(),
+            provider_catalog,
+            provider_route,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),
@@ -322,7 +331,6 @@ mod tests {
             offload_dir: std::env::temp_dir().join("kloop-headless-offload"),
             sessions_dir: std::env::temp_dir().join("kloop-headless-sessions"),
             context_window: None,
-            fallback_model: None,
             permissions: Arc::new(Permissions::allow_all()),
             questioner: None,
             file_state: Default::default(),
