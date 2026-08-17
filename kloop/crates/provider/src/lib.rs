@@ -33,6 +33,8 @@ use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
 
@@ -224,6 +226,48 @@ pub(crate) fn parse_tool_input(
 }
 
 impl Provider {
+    pub fn response_provenance(&self, model: &str) -> ProviderResponseProvenance {
+        let (provider, api_family) = match self {
+            Provider::Anthropic { base, .. } => (
+                format!("anthropic:{base}"),
+                ProviderApiFamily::AnthropicMessages,
+            ),
+            Provider::OpenAiCompat { base, .. } => (
+                format!("openai_compat:{base}"),
+                ProviderApiFamily::OpenAiChatCompletions,
+            ),
+            Provider::OpenAiResponses { base, .. } => (
+                format!("openai_responses:{base}"),
+                ProviderApiFamily::OpenAiResponses,
+            ),
+            Provider::Mock { .. } => ("mock".to_string(), ProviderApiFamily::Mock),
+        };
+        ProviderResponseProvenance {
+            provider,
+            api_family,
+            model: model.to_string(),
+        }
+    }
+
+    fn validate_reasoning_replay(
+        &self,
+        model: &str,
+        messages: &[Message],
+    ) -> Result<(), ProviderFailure> {
+        let expected = self.response_provenance(model);
+        if !expected.api_family.requires_exact_reasoning_replay() {
+            return Ok(());
+        }
+        for message in messages {
+            if message.has_reasoning() && message.provider_provenance.as_ref() != Some(&expected) {
+                return Err(ProviderFailure::protocol(
+                    "reasoning replay requires the same provider API family and exact model",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn mock(turns: Vec<Vec<AssistantBlock>>) -> Self {
         Self::mock_scripted(turns.into_iter().map(MockTurn::Blocks).collect())
     }
@@ -254,6 +298,9 @@ impl Provider {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> ProviderStream {
+        if let Err(error) = self.validate_reasoning_replay(model, messages) {
+            return spawn_stream(move |_sink| async move { Err(error) });
+        }
         match self.as_ref() {
             Provider::Mock { turns, seen } => {
                 seen.lock().unwrap().push(MockRequest {
@@ -467,6 +514,73 @@ mod tests {
         assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
         assert!(!error.is_retryable());
         assert!(error.to_string().contains("invalid JSON input"));
+    }
+
+    #[test]
+    fn reasoning_replay_requires_exact_provider_family_and_model() {
+        let reasoning = |provenance: Option<ProviderResponseProvenance>| Message {
+            role: kloop_protocol::Role::Assistant,
+            content: vec![kloop_protocol::ContentBlock::Thinking {
+                thinking: "summary".into(),
+                signature: "opaque".into(),
+            }],
+            provider_provenance: provenance,
+        };
+        let provider = Provider::mock(Vec::new());
+        let exact = provider.response_provenance("model-a");
+        assert!(
+            provider
+                .validate_reasoning_replay("model-a", &[reasoning(Some(exact.clone()))])
+                .is_ok()
+        );
+
+        for provenance in [
+            None,
+            Some(ProviderResponseProvenance {
+                model: "model-b".into(),
+                ..exact.clone()
+            }),
+            Some(ProviderResponseProvenance {
+                provider: "another-provider".into(),
+                ..exact.clone()
+            }),
+            Some(ProviderResponseProvenance {
+                api_family: ProviderApiFamily::OpenAiResponses,
+                ..exact.clone()
+            }),
+        ] {
+            let error = provider
+                .validate_reasoning_replay("model-a", &[reasoning(provenance)])
+                .unwrap_err();
+            assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+            assert!(!error.is_retryable());
+            assert!(!error.after_semantic_output());
+        }
+    }
+
+    #[test]
+    fn chat_replay_keeps_its_reasoning_strip_boundary() {
+        let chat = Provider::OpenAiCompat {
+            key: "unused".into(),
+            base: "https://chat.invalid".into(),
+        };
+        let foreign = Message::assistant_from_provider(
+            vec![kloop_protocol::ContentBlock::Thinking {
+                thinking: "must not cross rails".into(),
+                signature: "opaque".into(),
+            }],
+            ProviderResponseProvenance {
+                provider: "openai_responses:https://responses.invalid".into(),
+                api_family: ProviderApiFamily::OpenAiResponses,
+                model: "model-a".into(),
+            },
+        );
+
+        assert!(
+            chat.validate_reasoning_replay("chat-model", &[foreign])
+                .is_ok(),
+            "chat intentionally strips reasoning instead of replaying it"
+        );
     }
 
     #[tokio::test]

@@ -1188,6 +1188,7 @@ mod tests {
                         text: "and hurry".into(),
                     },
                 ],
+                provider_provenance: None,
             },
         ];
         assert_eq!(
@@ -1245,6 +1246,7 @@ mod tests {
                     },
                 },
             ],
+            provider_provenance: None,
         }];
         assert_eq!(
             to_input_items(&messages),

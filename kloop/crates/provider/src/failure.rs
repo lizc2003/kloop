@@ -22,8 +22,8 @@ pub enum ProviderFailureKind {
 /// A typed failure from one provider sampling attempt.
 ///
 /// Retry eligibility belongs to the producer-side classification, not to error
-/// string matching in core. The string remains bounded and credential-safe for
-/// the existing `EndReason::Error` and native protocol 1.0 surfaces.
+/// string matching in core. Display remains bounded and credential-safe for
+/// lossy CLI/TUI/native projections, while core retains this typed value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderFailure {
     kind: ProviderFailureKind,
@@ -36,6 +36,29 @@ pub struct ProviderFailure {
 impl ProviderFailure {
     pub fn kind(&self) -> &ProviderFailureKind {
         &self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Rebuild durable terminal evidence. The restored value is display/audit
+    /// data only; retry admission is never resumed from a turn terminal.
+    #[doc(hidden)]
+    pub fn from_recorded_terminal(
+        kind: ProviderFailureKind,
+        message: String,
+        retryable: bool,
+        retry_after: Option<Duration>,
+        semantic_output: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            retryable,
+            retry_after,
+            semantic_output,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -52,7 +75,7 @@ impl ProviderFailure {
         self.semantic_output
     }
 
-    pub(crate) fn with_semantic_output(mut self, semantic_output: bool) -> Self {
+    pub fn with_semantic_output(mut self, semantic_output: bool) -> Self {
         self.semantic_output |= semantic_output;
         self
     }

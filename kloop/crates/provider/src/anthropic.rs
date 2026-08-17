@@ -63,7 +63,17 @@ pub(super) fn system_value(system: &str, cache: bool) -> Value {
 /// cache_control stays out of the protocol types: it is a transport detail
 /// injected here, never persisted.
 pub(super) fn messages_value(messages: &[Message], cache: bool) -> Value {
-    let mut value = serde_json::to_value(messages).unwrap_or_default();
+    let mut value = Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message.role,
+                    "content": message.content,
+                })
+            })
+            .collect(),
+    );
     if cache {
         // The API rejects cache_control on thinking blocks, so the marker
         // goes on the last cacheable block instead.
@@ -464,6 +474,7 @@ mod tests {
                     },
                 },
             ],
+            provider_provenance: None,
         }];
         assert_eq!(
             messages_value(&messages, true),

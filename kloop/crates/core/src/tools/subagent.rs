@@ -897,7 +897,7 @@ fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>
             ExecutionStatus::Failed,
             Some(format!(
                 "[sub-agent failed] {}\nYou may re-dispatch it or try another approach.",
-                truncate_error(&e)
+                truncate_error(&e.to_string())
             )),
         ),
         EndReason::Aborted => (ExecutionStatus::Aborted, None),
@@ -2242,9 +2242,16 @@ mod tests {
             load_session(path).unwrap(),
             vec![
                 Message::user_text("do the sub thing"),
-                Message::assistant(vec![ContentBlock::Text {
-                    text: "sub result".into()
-                }]),
+                Message::assistant_from_provider(
+                    vec![ContentBlock::Text {
+                        text: "sub result".into()
+                    }],
+                    kloop_protocol::ProviderResponseProvenance {
+                        provider: "mock".into(),
+                        api_family: kloop_protocol::ProviderApiFamily::Mock,
+                        model: "mock".into(),
+                    },
+                ),
             ],
             "replays to the sub-agent's own transcript"
         );

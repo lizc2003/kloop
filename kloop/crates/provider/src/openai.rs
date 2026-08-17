@@ -574,6 +574,7 @@ mod tests {
                         input: json!({"command": "ls"}),
                     },
                 ],
+                provider_provenance: None,
             },
             Message {
                 role: Role::User,
@@ -587,6 +588,7 @@ mod tests {
                         text: "and hurry".into(),
                     },
                 ],
+                provider_provenance: None,
             },
             Message {
                 role: Role::User,
@@ -595,6 +597,7 @@ mod tests {
                     content: "boom".into(),
                     is_error: true,
                 }],
+                provider_provenance: None,
             },
         ];
         assert_eq!(
@@ -633,6 +636,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::RedactedThinking { data: "d".into() }],
+                provider_provenance: None,
             },
         ];
         assert_eq!(
@@ -676,6 +680,7 @@ mod tests {
                     },
                 },
             ],
+            provider_provenance: None,
         }];
         assert_eq!(
             to_openai_messages("s", &messages),

@@ -8,6 +8,8 @@ use crate::tools::ToolSource;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::IncompleteReason;
+use kloop_protocol::ProviderApiFamily;
+use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
@@ -28,6 +30,17 @@ fn usage(input_tokens: u64) -> Usage {
         cache_read_input_tokens: input_tokens + 2,
         cache_creation_input_tokens: input_tokens + 3,
     }
+}
+
+fn mock_assistant(content: Vec<ContentBlock>, model: &str) -> Message {
+    Message::assistant_from_provider(
+        content,
+        ProviderResponseProvenance {
+            provider: "mock".into(),
+            api_family: ProviderApiFamily::Mock,
+            model: model.into(),
+        },
+    )
 }
 
 #[test]
@@ -977,7 +990,9 @@ async fn truncation_recovery_is_bounded() {
 
     assert_eq!(
         outcome.reason,
-        EndReason::Error("response remained truncated after 3 continuation attempts".into())
+        EndReason::Error(TurnError::ProviderOutcome(AssistantOutcome::OutputLimit(
+            kloop_protocol::OutputLimitKind::MaxOutputTokens,
+        )))
     );
     // 3 nudges (the limit), so the 4th truncated response returns the error.
     // Every cut-off segment is accumulated into the final deliverable.
@@ -989,6 +1004,30 @@ async fn truncation_recovery_is_bounded() {
         .filter(|m| *m == &Message::user_text(super::TRUNCATION_CONTINUE_MSG))
         .count();
     assert_eq!(nudges, 3);
+}
+
+#[tokio::test]
+async fn model_context_output_limit_keeps_its_typed_kind() {
+    let truncated = || MockTurn::Outcome {
+        blocks: text("cut"),
+        outcome: AssistantOutcome::OutputLimit(kloop_protocol::OutputLimitKind::ModelContextWindow),
+    };
+    let provider =
+        Provider::mock_scripted(vec![truncated(), truncated(), truncated(), truncated()]);
+    let cfg = compaction_cfg(provider, 200_000, "context-limit-kind");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("long answer"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error(TurnError::ProviderOutcome(AssistantOutcome::OutputLimit(
+            kloop_protocol::OutputLimitKind::ModelContextWindow,
+        )))
+    );
+    assert_eq!(outcome.final_text, "cutcutcutcut");
 }
 
 #[tokio::test]
@@ -1126,6 +1165,14 @@ async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() 
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(
+        history.messages()[1].provider_provenance,
+        Some(ProviderResponseProvenance {
+            provider: "mock".into(),
+            api_family: ProviderApiFamily::Mock,
+            model: "fallback".into(),
+        })
+    );
+    assert_eq!(
         history.provider_usage().records(),
         &[ProviderUsageRecord {
             model: "fallback".into(),
@@ -1133,6 +1180,45 @@ async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() 
             usage: usage(7),
         }]
     );
+}
+
+#[tokio::test]
+async fn fallback_fails_closed_on_incompatible_reasoning_history() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Error("primary one".into()),
+        MockTurn::Error("primary two".into()),
+        MockTurn::Error("primary three".into()),
+        MockTurn::Blocks(text("must not run on fallback")),
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "reasoning-fallback-seal").test_clone();
+    cfg.model = "primary".into();
+    cfg.fallback_model = Some("fallback".into());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("old request"));
+    history.record(mock_assistant(
+        vec![ContentBlock::Thinking {
+            thinking: "summary".into(),
+            signature: "opaque".into(),
+        }],
+        "primary",
+    ));
+    history.record(Message::user_text("new request"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    let EndReason::Error(TurnError::ProviderFailure(failure)) = outcome.reason else {
+        panic!("expected typed replay failure")
+    };
+    assert_eq!(
+        failure.kind(),
+        &kloop_provider::ProviderFailureKind::Protocol
+    );
+    assert!(failure.to_string().contains("reasoning replay requires"));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_eq!(history.messages().len(), 3);
+    assert!(history.provider_usage().records().is_empty());
 }
 
 #[tokio::test]
@@ -1201,7 +1287,7 @@ async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
         let (provider, seen) = Provider::mock_recording(vec![
             MockTurn::Outcome {
                 blocks: text("partial semantic content"),
-                outcome: semantic,
+                outcome: semantic.clone(),
             },
             MockTurn::Blocks(text("must not retry")),
         ]);
@@ -1214,14 +1300,24 @@ async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
 
         let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
-        assert_eq!(outcome.reason, EndReason::Error(expected));
+        assert_eq!(
+            outcome.reason,
+            EndReason::Error(TurnError::ProviderOutcome(semantic))
+        );
+        let EndReason::Error(error) = &outcome.reason else {
+            unreachable!("typed provider outcome asserted above")
+        };
+        assert_eq!(error.to_string(), expected);
         assert_eq!(outcome.final_text, "partial semantic content");
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(
             history.messages()[1],
-            Message::assistant(vec![ContentBlock::Text {
-                text: "partial semantic content".into(),
-            }])
+            mock_assistant(
+                vec![ContentBlock::Text {
+                    text: "partial semantic content".into(),
+                }],
+                "mock",
+            )
         );
     }
 }
@@ -1325,10 +1421,13 @@ async fn signed_empty_thinking_is_semantic_history_without_display_item() {
     assert!(event_ui.0.lock().unwrap().is_empty());
     assert_eq!(
         history.messages()[1],
-        Message::assistant(vec![ContentBlock::Thinking {
-            thinking: String::new(),
-            signature: "signed".into(),
-        }])
+        mock_assistant(
+            vec![ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: "signed".into(),
+            }],
+            "mock",
+        )
     );
 }
 
@@ -1426,11 +1525,15 @@ async fn partial_stream_error_completes_open_item_without_retry() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
-    assert!(
-        matches!(&outcome.reason, EndReason::Error(e) if e.contains("stream dropped")),
-        "expected the visible stream error, got {:?}",
-        outcome.reason
+    let EndReason::Error(TurnError::ProviderFailure(failure)) = &outcome.reason else {
+        panic!("expected typed provider failure, got {:?}", outcome.reason)
+    };
+    assert_eq!(
+        failure.kind(),
+        &kloop_provider::ProviderFailureKind::Transport
     );
+    assert!(failure.after_semantic_output());
+    assert!(failure.to_string().contains("stream dropped"));
     assert_eq!(outcome.final_text, "half answer");
     assert_eq!(
         seen.lock().unwrap().len(),
@@ -1441,9 +1544,12 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         history.messages(),
         &[
             Message::user_text("hello"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "half answer".into(),
-            }]),
+            mock_assistant(
+                vec![ContentBlock::Text {
+                    text: "half answer".into(),
+                }],
+                "mock",
+            ),
         ],
         "the completed UI item must be recoverable after restart"
     );
@@ -1478,6 +1584,39 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         ]
     );
     let _ = std::fs::remove_file(session);
+}
+
+#[tokio::test]
+async fn semantic_partial_preserves_signed_reasoning_provenance() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::BlocksThenError(
+        vec![AssistantBlock::Thinking {
+            thinking: "summary".into(),
+            signature: "opaque".into(),
+        }],
+        ProviderFailure::transport("reasoning stream dropped"),
+    )]);
+    let cfg = compaction_cfg(provider, 200_000, "partial-reasoning");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("think"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    let EndReason::Error(TurnError::ProviderFailure(failure)) = outcome.reason else {
+        panic!("expected typed provider failure")
+    };
+    assert!(failure.after_semantic_output());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        history.messages()[1],
+        mock_assistant(
+            vec![ContentBlock::Thinking {
+                thinking: "summary".into(),
+                signature: "opaque".into(),
+            }],
+            "mock",
+        )
+    );
 }
 
 #[tokio::test]
@@ -1533,9 +1672,12 @@ async fn subagent_internal_delta_also_seals_retry() {
         history.messages(),
         &[
             Message::user_text("child work"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "private partial".into(),
-            }]),
+            mock_assistant(
+                vec![ContentBlock::Text {
+                    text: "private partial".into(),
+                }],
+                "mock",
+            ),
         ],
         "the child records replay-safe partial text in its own history without retrying"
     );
@@ -1556,9 +1698,15 @@ async fn non_retryable_failure_does_not_retry_or_fallback() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
-    assert!(
-        matches!(&outcome.reason, EndReason::Error(error) if error.contains("malformed provider frame"))
+    let EndReason::Error(TurnError::ProviderFailure(failure)) = &outcome.reason else {
+        panic!("expected typed provider failure, got {:?}", outcome.reason)
+    };
+    assert_eq!(
+        failure.kind(),
+        &kloop_provider::ProviderFailureKind::Protocol
     );
+    assert!(!failure.after_semantic_output());
+    assert!(failure.to_string().contains("malformed provider frame"));
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
@@ -2554,11 +2702,12 @@ async fn thinking_blocks_recorded_and_streamed_separately() {
     assert_eq!(outcome.final_text, "answer");
     assert_eq!(
         history.messages()[1],
-        Message::assistant(
+        mock_assistant(
             blocks
                 .into_iter()
                 .map(AssistantBlock::into_content_block)
-                .collect()
+                .collect(),
+            "mock",
         )
     );
     assert_eq!(*split.thinking.lock().unwrap(), "pondering");

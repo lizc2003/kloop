@@ -43,11 +43,11 @@ pub(super) enum Sampled {
     },
     /// A retryable failure exhausted the primary model's attempt budget and may
     /// proceed to the configured fallback model.
-    Failed(String),
+    Failed(ProviderFailure),
     /// A non-retryable failure ends the turn without replay or model fallback.
-    Terminal(String),
+    Terminal(ProviderFailure),
     Partial {
-        error: String,
+        error: ProviderFailure,
         blocks: Vec<ContentBlock>,
     },
 }
@@ -60,7 +60,7 @@ enum SampleError {
     Provider(ProviderFailure),
     /// Retrying or falling back after semantic content would replay output.
     AfterOutput {
-        error: String,
+        error: ProviderFailure,
         partial: Vec<ContentBlock>,
     },
 }
@@ -124,10 +124,10 @@ pub(super) async fn sample_with_retry(
             }
             Err(SampleError::Provider(error)) => {
                 if !error.is_retryable() {
-                    return Sampled::Terminal(error.to_string());
+                    return Sampled::Terminal(error);
                 }
                 if attempt + 1 == MAX_ATTEMPTS {
-                    return Sampled::Failed(error.to_string());
+                    return Sampled::Failed(error);
                 }
                 // Exponential backoff with sub-ms jitter from the clock's
                 // nanoseconds. A bounded provider Retry-After takes precedence.
@@ -196,7 +196,6 @@ async fn sample_once(
                     "ProviderStream materializes premature producer close as a typed failure"
                 ),
                 Some(Err(error)) => {
-                    let message = error.to_string();
                     finish_open_items(
                         ui,
                         &mut text_item,
@@ -207,7 +206,7 @@ async fn sample_once(
                     );
                     return Err(if error.after_semantic_output() {
                         SampleError::AfterOutput {
-                            error: message,
+                            error,
                             partial: replayable_partial(blocks, &text_accum),
                         }
                     } else if error.is_context_overflow() {
@@ -307,7 +306,10 @@ async fn sample_once(
                             ItemStatus::Failed,
                         );
                         return Err(SampleError::AfterOutput {
-                            error: "provider terminal arrived before display output closed".into(),
+                            error: ProviderFailure::protocol(
+                                "provider terminal arrived before display output closed",
+                            )
+                            .with_semantic_output(true),
                             partial: replayable_partial(blocks, &text_accum),
                         });
                     }

@@ -286,15 +286,9 @@ pub fn turn_started_params(turn_id: u64) -> Value {
 /// The `turn/completed` params for a turn's end reason: `{turn:{id, status,
 /// error?}}`. `error` is present only on the error status.
 pub fn turn_completed_params(turn_id: u64, reason: &EndReason) -> Value {
-    let status = match reason {
-        EndReason::Completed => "completed",
-        EndReason::MaxRounds => "maxRounds",
-        EndReason::Aborted => "aborted",
-        EndReason::Error(_) => "error",
-    };
-    let mut turn = json!({"id": turn_id, "status": status});
-    if let EndReason::Error(e) = reason {
-        turn["error"] = Value::String(e.clone());
+    let mut turn = json!({"id": turn_id, "status": reason.terminal_status()});
+    if let Some(error) = reason.terminal_error() {
+        turn["error"] = Value::String(error.to_string());
     }
     json!({"turn": turn})
 }

@@ -143,6 +143,15 @@ struct SnapshotHistory {
     terminals: Vec<SnapshotTerminal>,
 }
 
+pub(crate) fn into_public_session_snapshot(mut snapshot: SessionSnapshot) -> SessionSnapshot {
+    snapshot.messages = snapshot
+        .messages
+        .into_iter()
+        .map(Message::into_public_projection)
+        .collect();
+    snapshot
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotTail {
@@ -312,6 +321,7 @@ impl ThreadProjection {
             RecoverySource::Fresh => VolatileState::Live,
             RecoverySource::Resumed => VolatileState::Reset,
         };
+        let seed = into_public_session_snapshot(seed);
         let resumable = seed.runtime.is_some();
         let snapshot = PublicSnapshot {
             schema_version: 1,
@@ -415,6 +425,7 @@ impl ThreadProjection {
     }
 
     pub fn refresh_seed(&self, cwd: String, model: String, seed: SessionSnapshot) {
+        let seed = into_public_session_snapshot(seed);
         let mut state = self.state.lock().unwrap();
         state.snapshot.thread.cwd = cwd.clone();
         state.snapshot.thread.model = model;
@@ -754,6 +765,56 @@ mod tests {
             .publish(method, params, |params| sent = Some(params))
             .unwrap();
         sent.unwrap()
+    }
+
+    #[test]
+    fn snapshots_project_reasoning_without_replay_secrets() {
+        let reasoning = Message::assistant_from_provider(
+            vec![
+                kloop_protocol::ContentBlock::Thinking {
+                    thinking: "display summary".into(),
+                    signature: "opaque-signature".into(),
+                },
+                kloop_protocol::ContentBlock::RedactedThinking {
+                    data: "opaque-redacted".into(),
+                },
+            ],
+            kloop_protocol::ProviderResponseProvenance {
+                provider: "anthropic:https://api.example.test".into(),
+                api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
+                model: "wire-model".into(),
+            },
+        );
+        let mut seeded = seed();
+        seeded.messages.push(reasoning.clone());
+        let projection = ThreadProjection::with_generation_and_limits(
+            "thread-a".into(),
+            "generation-a".into(),
+            "/tmp/project".into(),
+            "model-a".into(),
+            seeded,
+            RecoverySource::Fresh,
+            8,
+            usize::MAX,
+        );
+
+        let value = serde_json::to_value(projection.sync(None).unwrap()).unwrap();
+        let assistant = &value["snapshot"]["history"]["messages"][1];
+        assert!(assistant.get("provider_provenance").is_none());
+        assert_eq!(
+            assistant["content"],
+            json!([{"type": "thinking", "thinking": "display summary"}])
+        );
+        let wire = serde_json::to_string(&value).unwrap();
+        assert!(!wire.contains("opaque-signature"));
+        assert!(!wire.contains("opaque-redacted"));
+
+        let mut refreshed = seed();
+        refreshed.messages.push(reasoning);
+        projection.refresh_seed("/tmp/project".into(), "model-a".into(), refreshed);
+        let refreshed = serde_json::to_string(&projection.sync(None).unwrap()).unwrap();
+        assert!(!refreshed.contains("opaque-signature"));
+        assert!(!refreshed.contains("opaque-redacted"));
     }
 
     #[test]

@@ -91,17 +91,20 @@ async fn request_body_is_stateless_with_reasoning_include() {
     let provider = Arc::new(responses(&server));
     let messages = vec![
         Message::user_text("hi"),
-        Message::assistant(vec![
-            ContentBlock::Thinking {
-                thinking: String::new(),
-                signature: "enc-blob".into(),
-            },
-            ContentBlock::ToolUse {
-                id: "call_1".into(),
-                name: "bash".into(),
-                input: json!({"command": "ls"}),
-            },
-        ]),
+        Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "enc-blob".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+            ],
+            provider.response_provenance("test-model"),
+        ),
         Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "call_1".into(),
             content: "ok".into(),

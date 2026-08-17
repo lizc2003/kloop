@@ -823,8 +823,10 @@ impl Server {
         if !path.exists() {
             return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
         }
-        let snapshot = rollout::load_session_snapshot(&path)
-            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
+        let snapshot = events::into_public_session_snapshot(
+            rollout::load_session_snapshot(&path)
+                .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?,
+        );
         Ok(json!({
             "thread": {
                 "id": thread_id,
@@ -1041,7 +1043,11 @@ impl Server {
                 thread_id.clone(),
                 options.cwd.to_string_lossy().to_string(),
                 options.model.clone().unwrap_or_default(),
-                seed.clone(),
+                SessionSnapshot {
+                    messages: Vec::new(),
+                    runtime: None,
+                    terminals: Vec::new(),
+                },
                 recovery_source,
             )
             .map_err(|e| {
@@ -1396,23 +1402,10 @@ async fn thread_worker(
 }
 
 fn turn_terminal(reason: &EndReason) -> TurnTerminal {
-    match reason {
-        EndReason::Completed => TurnTerminal {
-            status: "completed".into(),
-            error: None,
-        },
-        EndReason::MaxRounds => TurnTerminal {
-            status: "maxRounds".into(),
-            error: None,
-        },
-        EndReason::Aborted => TurnTerminal {
-            status: "aborted".into(),
-            error: None,
-        },
-        EndReason::Error(error) => TurnTerminal {
-            status: "error".into(),
-            error: Some(error.clone()),
-        },
+    TurnTerminal {
+        status: reason.terminal_status().into(),
+        error: reason.terminal_error().map(ToString::to_string),
+        typed_error: reason.terminal_error().cloned(),
     }
 }
 

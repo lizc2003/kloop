@@ -256,6 +256,7 @@ pub enum ContentBlock {
     /// encrypted_content).
     Thinking {
         thinking: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         signature: String,
     },
     /// Reasoning the API withheld; an opaque blob replayed verbatim.
@@ -349,10 +350,40 @@ pub enum ImageSource {
     Base64 { media_type: String, data: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApiFamily {
+    AnthropicMessages,
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    Mock,
+}
+
+impl ProviderApiFamily {
+    pub fn requires_exact_reasoning_replay(self) -> bool {
+        self != Self::OpenAiChatCompletions
+    }
+}
+
+/// Provider identity required to replay reasoning blocks. It records the wire
+/// family and the exact model that produced one assistant message; adapters
+/// must not infer either fact from the model name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderResponseProvenance {
+    pub provider: String,
+    pub api_family: ProviderApiFamily,
+    pub model: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    /// Internal replay identity. Provider adapters remove it from request wire,
+    /// and public history projections remove it together with opaque reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_provenance: Option<ProviderResponseProvenance>,
 }
 
 impl Message {
@@ -360,6 +391,7 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+            provider_provenance: None,
         }
     }
 
@@ -377,6 +409,7 @@ impl Message {
         Self {
             role: Role::User,
             content,
+            provider_provenance: None,
         }
     }
 
@@ -384,6 +417,18 @@ impl Message {
         Self {
             role: Role::Assistant,
             content,
+            provider_provenance: None,
+        }
+    }
+
+    pub fn assistant_from_provider(
+        content: Vec<ContentBlock>,
+        provenance: ProviderResponseProvenance,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content,
+            provider_provenance: Some(provenance),
         }
     }
 
@@ -391,7 +436,48 @@ impl Message {
         Self {
             role: Role::User,
             content: results,
+            provider_provenance: None,
         }
+    }
+
+    pub fn has_reasoning(&self) -> bool {
+        self.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        })
+    }
+
+    /// Display-safe history: provider identity and opaque payloads stay
+    /// internal. Display reasoning text remains visible, matching live
+    /// `reasoning` item events, but its replay signature is removed.
+    pub fn into_public_projection(mut self) -> Self {
+        fn project_block(block: ContentBlock) -> Option<ContentBlock> {
+            match block {
+                ContentBlock::Thinking { thinking, .. } => Some(ContentBlock::Thinking {
+                    thinking,
+                    signature: String::new(),
+                }),
+                ContentBlock::RedactedThinking { .. } => None,
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Blocks(blocks),
+                    is_error,
+                } => Some(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Blocks(
+                        blocks.into_iter().filter_map(project_block).collect(),
+                    ),
+                    is_error,
+                }),
+                other => Some(other),
+            }
+        }
+
+        self.content = self.content.into_iter().filter_map(project_block).collect();
+        self.provider_provenance = None;
+        self
     }
 }
 
@@ -479,13 +565,15 @@ impl AssistantBlock {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputLimitKind {
     MaxOutputTokens,
     ModelContextWindow,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IncompleteReason {
     PauseTurn,
     Provider(String),
@@ -493,7 +581,8 @@ pub enum IncompleteReason {
 
 /// Why a syntactically complete provider message ended. This is an internal
 /// agent contract, not the public native protocol terminal shape.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "reason", rename_all = "snake_case")]
 pub enum AssistantOutcome {
     EndTurn,
     ToolUse,
@@ -707,12 +796,69 @@ mod tests {
                     input: json!({"command": "pwd"}),
                 },
             ],
+            provider_provenance: Some(ProviderResponseProvenance {
+                provider: "anthropic:https://api.anthropic.com".into(),
+                api_family: ProviderApiFamily::AnthropicMessages,
+                model: "model-a".into(),
+            }),
         };
         let wire = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, msg);
         // Roles serialize lowercase.
         assert!(wire.contains("\"role\":\"assistant\""));
+    }
+
+    #[test]
+    fn public_projection_strips_provider_and_opaque_reasoning() {
+        let message = Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "display summary".into(),
+                    signature: "opaque-signature".into(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque-redacted".into(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: ToolResultContent::Blocks(vec![ContentBlock::Thinking {
+                        thinking: "nested summary".into(),
+                        signature: "nested-opaque".into(),
+                    }]),
+                    is_error: false,
+                },
+            ],
+            ProviderResponseProvenance {
+                provider: "anthropic:https://api.anthropic.com".into(),
+                api_family: ProviderApiFamily::AnthropicMessages,
+                model: "model-a".into(),
+            },
+        );
+
+        let public = message.into_public_projection();
+        assert_eq!(public.provider_provenance, None);
+        assert_eq!(
+            public.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "display summary".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: ToolResultContent::Blocks(vec![ContentBlock::Thinking {
+                        thinking: "nested summary".into(),
+                        signature: String::new(),
+                    }]),
+                    is_error: false,
+                },
+            ]
+        );
+        let wire = serde_json::to_string(&public).unwrap();
+        assert!(!wire.contains("provider_provenance"));
+        assert!(!wire.contains("signature"));
+        assert!(!wire.contains("opaque"));
     }
 
     #[test]
@@ -741,6 +887,7 @@ mod tests {
                     },
                 },
             ],
+            provider_provenance: None,
         };
         let wire = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), msg);
@@ -772,6 +919,7 @@ mod tests {
                     },
                     img.clone()
                 ],
+                provider_provenance: None,
             }
         );
         // Empty text contributes no text block: an image-only message.
@@ -780,6 +928,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![img],
+                provider_provenance: None,
             }
         );
     }

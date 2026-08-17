@@ -144,6 +144,7 @@ fn is_existing_summary(message: &Message) -> bool {
         Message {
             role: Role::User,
             content,
+            ..
         } if content.len() == 1
             && matches!(&content[0], ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX))
     )
@@ -403,6 +404,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_keeps_reasoning_provenance_on_the_verbatim_tail() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "reasoning-tail");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        let reasoning = Message::assistant_from_provider(
+            vec![ContentBlock::Thinking {
+                thinking: "display summary".into(),
+                signature: "opaque".into(),
+            }],
+            cfg.provider.response_provenance("mock"),
+        );
+        history.record(reasoning.clone());
+
+        run_compaction(&cfg, "mock", &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(history.messages().last(), Some(&reasoning));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].messages.last(),
+            Some(&Message::user_text(COMPACT_INSTRUCTION))
+        );
+        assert!(
+            seen[0].messages.iter().all(|message| message != &reasoning),
+            "the verbatim tail must not be folded into the summary request"
+        );
+    }
+
+    #[tokio::test]
     async fn accepted_summary_records_usage_before_compacted_marker() {
         let dir = std::env::temp_dir().join(format!("kloop-compact-usage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -634,10 +670,10 @@ mod tests {
         assert!(matches!(
             history.messages(),
             [
-                Message { role: kloop_protocol::Role::User, content },
-                Message { role: kloop_protocol::Role::Assistant, content: tool_use },
-                Message { role: kloop_protocol::Role::User, content: tool_result },
-                Message { role: kloop_protocol::Role::Assistant, content: tail },
+                Message { role: kloop_protocol::Role::User, content, .. },
+                Message { role: kloop_protocol::Role::Assistant, content: tool_use, .. },
+                Message { role: kloop_protocol::Role::User, content: tool_result, .. },
+                Message { role: kloop_protocol::Role::Assistant, content: tail, .. },
             ] if content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)))
                 && tool_use.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "t1"))
                 && tool_result.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"))

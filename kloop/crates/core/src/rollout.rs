@@ -20,6 +20,7 @@ use std::io;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -29,9 +30,14 @@ use serde::Serialize;
 use crate::inbox::STEERING_PREFIX;
 use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
+use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
+use kloop_provider::ProviderFailure;
+use kloop_provider::ProviderFailureKind;
+use kloop_provider::TimeoutStage;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,12 +47,215 @@ pub struct SessionRuntime {
     pub model: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnError {
+    Core(String),
+    ProviderOutcome(AssistantOutcome),
+    ProviderFailure(ProviderFailure),
+}
+
+mod provider_failure_serde {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum RecordedKind {
+        ContextOverflow,
+        Http { status: u16 },
+        Transport,
+        Timeout { stage: RecordedTimeoutStage },
+        Protocol,
+        ResponseTooLarge,
+        Cancelled,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RecordedTimeoutStage {
+        Open,
+        Idle,
+        Wall,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RecordedFailure {
+        kind: RecordedKind,
+        message: String,
+        retryable: bool,
+        retry_after: Option<Duration>,
+        semantic_output: bool,
+    }
+
+    impl RecordedKind {
+        fn capture(kind: &ProviderFailureKind) -> Self {
+            match kind {
+                ProviderFailureKind::ContextOverflow => Self::ContextOverflow,
+                ProviderFailureKind::Http { status } => Self::Http { status: *status },
+                ProviderFailureKind::Transport => Self::Transport,
+                ProviderFailureKind::Timeout { stage } => Self::Timeout {
+                    stage: match stage {
+                        TimeoutStage::Open => RecordedTimeoutStage::Open,
+                        TimeoutStage::Idle => RecordedTimeoutStage::Idle,
+                        TimeoutStage::Wall => RecordedTimeoutStage::Wall,
+                    },
+                },
+                ProviderFailureKind::Protocol => Self::Protocol,
+                ProviderFailureKind::ResponseTooLarge => Self::ResponseTooLarge,
+                ProviderFailureKind::Cancelled => Self::Cancelled,
+            }
+        }
+
+        fn restore(self) -> ProviderFailureKind {
+            match self {
+                Self::ContextOverflow => ProviderFailureKind::ContextOverflow,
+                Self::Http { status } => ProviderFailureKind::Http { status },
+                Self::Transport => ProviderFailureKind::Transport,
+                Self::Timeout { stage } => ProviderFailureKind::Timeout {
+                    stage: match stage {
+                        RecordedTimeoutStage::Open => TimeoutStage::Open,
+                        RecordedTimeoutStage::Idle => TimeoutStage::Idle,
+                        RecordedTimeoutStage::Wall => TimeoutStage::Wall,
+                    },
+                },
+                Self::Protocol => ProviderFailureKind::Protocol,
+                Self::ResponseTooLarge => ProviderFailureKind::ResponseTooLarge,
+                Self::Cancelled => ProviderFailureKind::Cancelled,
+            }
+        }
+    }
+
+    pub fn serialize<S>(failure: &ProviderFailure, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        RecordedFailure {
+            kind: RecordedKind::capture(failure.kind()),
+            message: failure.message().to_string(),
+            retryable: failure.is_retryable(),
+            retry_after: failure.retry_after(),
+            semantic_output: failure.after_semantic_output(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ProviderFailure, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let failure = RecordedFailure::deserialize(deserializer)?;
+        Ok(ProviderFailure::from_recorded_terminal(
+            failure.kind.restore(),
+            failure.message,
+            failure.retryable,
+            failure.retry_after,
+            failure.semantic_output,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RecordedProviderFailure(#[serde(with = "provider_failure_serde")] ProviderFailure);
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum RecordedTurnError {
+    Core(String),
+    ProviderOutcome(AssistantOutcome),
+    ProviderFailure(RecordedProviderFailure),
+}
+
+impl Serialize for TurnError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Core(error) => RecordedTurnError::Core(error.clone()),
+            Self::ProviderOutcome(outcome) => RecordedTurnError::ProviderOutcome(outcome.clone()),
+            Self::ProviderFailure(failure) => {
+                RecordedTurnError::ProviderFailure(RecordedProviderFailure(failure.clone()))
+            }
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match RecordedTurnError::deserialize(deserializer)? {
+            RecordedTurnError::Core(error) => Self::Core(error),
+            RecordedTurnError::ProviderOutcome(outcome) => Self::ProviderOutcome(outcome),
+            RecordedTurnError::ProviderFailure(RecordedProviderFailure(failure)) => {
+                Self::ProviderFailure(failure)
+            }
+        })
+    }
+}
+
+impl TurnError {
+    pub fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl From<String> for TurnError {
+    fn from(error: String) -> Self {
+        Self::Core(error)
+    }
+}
+
+impl From<&str> for TurnError {
+    fn from(error: &str) -> Self {
+        Self::Core(error.to_string())
+    }
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(error) => formatter.write_str(error),
+            Self::ProviderFailure(error) => write!(formatter, "{error}"),
+            Self::ProviderOutcome(AssistantOutcome::Refused) => {
+                formatter.write_str("model refused the request")
+            }
+            Self::ProviderOutcome(AssistantOutcome::Filtered) => {
+                formatter.write_str("provider filtered the response")
+            }
+            Self::ProviderOutcome(AssistantOutcome::Incomplete(reason)) => {
+                let reason = match reason {
+                    IncompleteReason::PauseTurn => "pause_turn",
+                    IncompleteReason::Provider(reason) => reason,
+                };
+                write!(
+                    formatter,
+                    "provider returned an incomplete response: {reason}"
+                )
+            }
+            Self::ProviderOutcome(AssistantOutcome::OutputLimit(_)) => {
+                formatter.write_str("response remained truncated after 3 continuation attempts")
+            }
+            Self::ProviderOutcome(AssistantOutcome::EndTurn) => {
+                formatter.write_str("provider end_turn was misclassified as an error")
+            }
+            Self::ProviderOutcome(AssistantOutcome::ToolUse) => {
+                formatter.write_str("provider tool_use was misclassified as an error")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnTerminal {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_error: Option<TurnError>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1963,6 +2172,7 @@ mod tests {
             .append_turn_terminal(&TurnTerminal {
                 status: "error".into(),
                 error: Some("stream dropped".into()),
+                typed_error: None,
             })
             .unwrap();
 
@@ -2015,6 +2225,7 @@ mod tests {
             .append_turn_terminal(&TurnTerminal {
                 status: "completed".into(),
                 error: None,
+                typed_error: None,
             })
             .unwrap();
 
@@ -2030,6 +2241,60 @@ mod tests {
             }]
         );
         assert_eq!(fork_origin(&fork), Some("session#4".into()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reasoning_provenance_and_typed_terminal_survive_resume_and_fork() {
+        let path = temp_file("reasoning-continuity");
+        let dir = path.parent().unwrap().to_path_buf();
+        let provenance = kloop_protocol::ProviderResponseProvenance {
+            provider: "openai_responses:https://api.example.test".into(),
+            api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+            model: "wire-model".into(),
+        };
+        let assistant = Message::assistant_from_provider(
+            vec![ContentBlock::Thinking {
+                thinking: "summary".into(),
+                signature: "encrypted".into(),
+            }],
+            provenance.clone(),
+        );
+        let typed_error = TurnError::ProviderOutcome(AssistantOutcome::Incomplete(
+            IncompleteReason::Provider("provider_status".into()),
+        ));
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("q")).unwrap();
+        rollout.append_message(&assistant).unwrap();
+        rollout
+            .append_turn_terminal(&TurnTerminal {
+                status: "error".into(),
+                error: Some(typed_error.to_string()),
+                typed_error: Some(typed_error.clone()),
+            })
+            .unwrap();
+
+        let snapshot = load_session_snapshot(&path).unwrap();
+        assert_eq!(snapshot.messages[1], assistant);
+        assert_eq!(
+            snapshot.messages[1].provider_provenance,
+            Some(provenance.clone())
+        );
+        let raw = raw_lines(&path);
+        assert_eq!(raw[2]["typedError"]["kind"], "provider_outcome");
+        assert_eq!(raw[2]["typedError"]["value"]["type"], "incomplete");
+        let failure = ProviderFailure::transport("stream dropped").with_semantic_output(true);
+        let encoded = serde_json::to_value(TurnError::ProviderFailure(failure.clone())).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TurnError>(encoded).unwrap(),
+            TurnError::ProviderFailure(failure)
+        );
+
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages[1].provider_provenance, Some(provenance));
+        let fork = fork_session(&path, None, &dir).unwrap();
+        assert_eq!(load_session_snapshot(&fork).unwrap().messages[1], assistant);
+        assert_eq!(raw_lines(&fork)[2]["typedError"], raw[2]["typedError"]);
         cleanup(&path);
     }
 
@@ -2162,6 +2427,7 @@ mod tests {
             .append_turn_terminal(&TurnTerminal {
                 status: "error".into(),
                 error: None,
+                typed_error: None,
             })
             .unwrap();
 

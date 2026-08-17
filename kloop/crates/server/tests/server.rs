@@ -908,6 +908,58 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
 }
 
 #[tokio::test]
+async fn thread_read_strips_reasoning_replay_secrets() {
+    let dirs = test_dirs("reasoning-public-projection");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let path = dirs.sessions.join("reasoning.jsonl");
+    let mut rollout = Rollout::new(path);
+    rollout
+        .append_message(&Message::user_text("question"))
+        .unwrap();
+    rollout
+        .append_message(&Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "display summary".into(),
+                    signature: "opaque-signature".into(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque-redacted".into(),
+                },
+            ],
+            kloop_protocol::ProviderResponseProvenance {
+                provider: "anthropic:https://api.example.test".into(),
+                api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
+                model: "wire-model".into(),
+            },
+        ))
+        .unwrap();
+    drop(rollout);
+
+    let mut client = start_server(
+        factory(vec![vec![text("unused")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client.initialize().await;
+    client
+        .request("thread/read", json!({"threadId": "reasoning"}))
+        .await;
+    let read = client.recv().await;
+    let assistant = &read["result"]["thread"]["messages"][1];
+    assert!(assistant.get("provider_provenance").is_none());
+    assert_eq!(
+        assistant["content"],
+        json!([{"type": "thinking", "thinking": "display summary"}])
+    );
+    let wire = serde_json::to_string(&read).unwrap();
+    assert!(!wire.contains("opaque-signature"));
+    assert!(!wire.contains("opaque-redacted"));
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
 async fn legacy_session_is_readable_but_resume_requires_explicit_cwd() {
     let dirs = test_dirs("legacy-history");
     std::fs::create_dir_all(&dirs.sessions).unwrap();

@@ -27,8 +27,22 @@ open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE
 frame (1 MiB) guards apply on all three wires. Transport/open/read failures,
 HTTP 408/429/5xx, and incomplete EOF retry up to 3 total attempts only before
 any text, reasoning, or complete tool call arrives; `Retry-After` is honored up
-to 60s. Cancellation aborts the producer task, and orphan patching still keeps
-history legal after interruption.
+to 60s. Core retains provider outcomes and failures inside typed turn errors;
+string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
+Cancellation remains a distinct core terminal, aborts the producer task, and
+orphan patching still keeps history legal after interruption.
+
+Every provider-produced assistant message also carries private replay
+provenance: provider endpoint identity, API family, and exact final wire model.
+Anthropic Messages and OpenAI Responses replay reasoning text plus
+signature/encrypted/redacted payloads only on an exact match; legacy reasoning
+without provenance, a provider/family switch, or a model switch fails closed
+before network I/O and cannot silently fall back. OpenAI Chat keeps its existing
+intentional boundary and strips reasoning instead of replaying it. Compaction
+keeps the recent tail verbatim, while resume and fork preserve this provenance
+with the complete message. Public `thread/read` and event snapshots remove the
+private provenance, signatures, encrypted content, and redacted blobs; only the
+same display reasoning text already emitted by live `reasoning` items remains.
 
 ## Claude Code 2.1.220 parity baseline
 
@@ -100,12 +114,14 @@ provider-reported categories (input, output, cache-read input, cache-creation
 input). It is historical transcript data, separate from the resettable context
 estimate and never enters provider replay, public display events, or snapshots.
 The same append-only chain also carries recovery-only `session`
-records (the canonical cwd and resolved model) and display-only `turn_terminal`
-records (completed/maxRounds/aborted/error, positioned after a message index);
-neither enters provider replay or token accounting. If a stream fails or is
-cancelled after visible text, that partial assistant block is recorded before
-the terminal, so `thread/read` can reconstruct exactly what the user already
-saw after a restart. Compaction appends a `compacted` marker line carrying the
+records (the canonical cwd and resolved model) and display `turn_terminal`
+records (completed/maxRounds/aborted/error, positioned after a message index).
+Error terminals add an internal typed provider outcome/failure while preserving
+the protocol 1.0 status/error projection; terminals never enter provider replay
+or token accounting. If a stream fails or is cancelled after visible text, that
+partial assistant block and its provider provenance are recorded before the
+terminal, so restart/fork keeps the replay boundary without generating a second
+answer. Compaction appends a `compacted` marker line carrying the
 full replacement history (the codex rollout pattern): the file stays
 append-only and auditable, replay swaps in the replacement and keeps reading,
 and superseded terminal indices are discarded with the replaced history.
@@ -2589,7 +2605,12 @@ cargo run
 # valid empty EndTurn creates no assistant history placeholder. Display items
 # with partial text close as failed on stream error, while completed blocks stay
 # completed; native protocol 1.0 keeps the existing item/completed method and
-# carries that distinction in the item's status field.
+# carries that distinction in the item's status field. Core turn errors retain
+# AssistantOutcome or ProviderFailure rather than recovering either from text.
+# Assistant history binds reasoning to provider endpoint identity + API family +
+# exact final wire model. Messages/Responses replay only an exact match; legacy,
+# cross-provider/family/model reasoning fails before I/O, while Chat strips it.
+# Native thread/read and event snapshots omit replay provenance and opaque bytes.
 #
 # The ignored native primitive evaluator accepts all three rails. Responses must
 # be selected explicitly and needs KLOOP_EFFORT so it actually produces and

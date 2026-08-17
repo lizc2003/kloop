@@ -10,6 +10,7 @@ use crate::rollout::TurnTerminal;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
 
 /// Offload ids are process-global so a sub-agent's spills never clobber the
@@ -230,12 +231,19 @@ pub fn sync_offload_counter(offload_dir: &Path) {
     NEXT_OFFLOAD_ID.fetch_max(max_seen + 1, Ordering::Relaxed);
 }
 
-/// ~4 chars/token heuristic over the serialized wire form, ceiling division.
+/// ~4 chars/token heuristic over the provider-visible message form, ceiling
+/// division. Internal replay provenance is persisted with history but never
+/// enters the provider prompt, so it must not inflate context estimates.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
+    #[derive(serde::Serialize)]
+    struct ProviderMessage<'a> {
+        role: Role,
+        content: &'a [ContentBlock],
+    }
+
     // Count the serialized bytes without materializing the string — this runs
     // per message on every predictive-overflow check and every compaction
-    // candidate, and only the length feeds the heuristic. Byte-identical to
-    // `to_string().len()` (both serialize through the same writer path).
+    // candidate, and only the length feeds the heuristic.
     struct ByteCounter(u64);
     impl std::io::Write for ByteCounter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -246,8 +254,12 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             Ok(())
         }
     }
+    let provider_message = ProviderMessage {
+        role: message.role,
+        content: &message.content,
+    };
     let mut counter = ByteCounter(0);
-    let bytes = serde_json::to_writer(&mut counter, message).map_or(0, |()| counter.0);
+    let bytes = serde_json::to_writer(&mut counter, &provider_message).map_or(0, |()| counter.0);
     bytes.div_ceil(4)
 }
 
@@ -323,6 +335,28 @@ mod tests {
         // Compaction (replace_all) invalidates the anchor: pure estimate again.
         h.replace_all(vec![tail.clone()]);
         assert_eq!(h.estimated_tokens(), tail_estimate);
+    }
+
+    #[test]
+    fn replay_provenance_does_not_count_toward_context_estimates() {
+        let content = vec![ContentBlock::Thinking {
+            thinking: "summary".into(),
+            signature: "opaque".into(),
+        }];
+        let plain = Message::assistant(content.clone());
+        let bound = Message::assistant_from_provider(
+            content,
+            kloop_protocol::ProviderResponseProvenance {
+                provider: "openai_responses:https://api.example.test".into(),
+                api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                model: "wire-model".into(),
+            },
+        );
+
+        assert_eq!(
+            estimate_message_tokens(&bound),
+            estimate_message_tokens(&plain)
+        );
     }
 
     #[test]
@@ -521,6 +555,7 @@ mod tests {
                     content: "hello".into(),
                     is_error: false,
                 }],
+                provider_provenance: None,
             }
         );
     }

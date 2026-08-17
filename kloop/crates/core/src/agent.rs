@@ -15,12 +15,12 @@ use crate::tools::dispatch_tools;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
-use kloop_protocol::IncompleteReason;
 use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
 
 mod sampling;
 
+pub use crate::rollout::TurnError;
 use sampling::SampleOk;
 use sampling::Sampled;
 use sampling::sample_with_retry;
@@ -41,7 +41,25 @@ pub enum EndReason {
     Completed,
     MaxRounds,
     Aborted,
-    Error(String),
+    Error(TurnError),
+}
+
+impl EndReason {
+    pub fn terminal_status(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::MaxRounds => "maxRounds",
+            Self::Aborted => "aborted",
+            Self::Error(_) => "error",
+        }
+    }
+
+    pub fn terminal_error(&self) -> Option<&TurnError> {
+        match self {
+            Self::Error(error) => Some(error),
+            Self::Completed | Self::MaxRounds | Self::Aborted => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,7 +113,7 @@ async fn run_structured_turn_in_context(
 ) -> TurnOutcome {
     if let Err(error) = crate::structured_output::validate_schema(&schema) {
         return TurnOutcome {
-            reason: EndReason::Error(format!("{error:#}")),
+            reason: EndReason::Error(format!("{error:#}").into()),
             final_text: String::new(),
             rounds: 0,
             structured_output: None,
@@ -189,7 +207,7 @@ async fn run_turn_with_options(
                 "subagent_start"
             };
             return TurnOutcome {
-                reason: EndReason::Error(format!("turn blocked by {which} hook: {reason}")),
+                reason: EndReason::Error(format!("turn blocked by {which} hook: {reason}").into()),
                 final_text: String::new(),
                 rounds: 0,
                 structured_output: None,
@@ -339,7 +357,7 @@ async fn turn_rounds(
         Ok(built) => built,
         Err(error) => {
             return TurnOutcome {
-                reason: EndReason::Error(error),
+                reason: EndReason::Error(error.into()),
                 final_text: String::new(),
                 rounds: 0,
                 structured_output: None,
@@ -385,7 +403,7 @@ async fn turn_rounds(
                 }
                 Err(error) => {
                     return TurnOutcome {
-                        reason: EndReason::Error(error),
+                        reason: EndReason::Error(error.into()),
                         final_text: String::new(),
                         rounds,
                         structured_output: None,
@@ -514,7 +532,9 @@ async fn turn_rounds(
                             reason: if cancel.is_cancelled() {
                                 EndReason::Aborted
                             } else {
-                                EndReason::Error(format!("reactive compaction failed: {e:#}"))
+                                EndReason::Error(
+                                    format!("reactive compaction failed: {e:#}").into(),
+                                )
                             },
                             final_text: String::new(),
                             rounds: round,
@@ -525,9 +545,7 @@ async fn turn_rounds(
             }
             Sampled::Cancelled { partial } => {
                 let final_text = text_content(&partial);
-                if !partial.is_empty() {
-                    history.record(Message::assistant(partial));
-                }
+                record_provider_assistant(history, cfg, &active_model, partial);
                 return TurnOutcome {
                     reason: EndReason::Aborted,
                     final_text,
@@ -537,11 +555,9 @@ async fn turn_rounds(
             }
             Sampled::Partial { error, blocks } => {
                 let final_text = text_content(&blocks);
-                if !blocks.is_empty() {
-                    history.record(Message::assistant(blocks));
-                }
+                record_provider_assistant(history, cfg, &active_model, blocks);
                 return TurnOutcome {
-                    reason: EndReason::Error(error),
+                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
                     final_text,
                     rounds: round,
                     structured_output: None,
@@ -549,26 +565,26 @@ async fn turn_rounds(
             }
             Sampled::Terminal(error) => {
                 return TurnOutcome {
-                    reason: EndReason::Error(error),
+                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
                     final_text: String::new(),
                     rounds: round,
                     structured_output: None,
                 };
             }
-            Sampled::Failed(e) => {
+            Sampled::Failed(error) => {
                 // Retries exhausted on the primary model: switch to the
                 // fallback (once) instead of surfacing the error.
                 if let Some(fallback) = &cfg.fallback_model
                     && *fallback != active_model
                 {
                     ui.emit(&Event::Note(format!(
-                            "sampling failed on {active_model}; switching to fallback model {fallback}: {e}"
+                            "sampling failed on {active_model}; switching to fallback model {fallback}: {error}"
                         )));
                     active_model = fallback.clone();
                     continue;
                 }
                 return TurnOutcome {
-                    reason: EndReason::Error(e),
+                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
                     final_text: String::new(),
                     rounds: round,
                     structured_output: None,
@@ -577,7 +593,7 @@ async fn turn_rounds(
         };
         if let Err(error) = validate_assistant_result(&outcome, &blocks) {
             return TurnOutcome {
-                reason: EndReason::Error(error),
+                reason: EndReason::Error(error.into()),
                 final_text: String::new(),
                 rounds: round + 1,
                 structured_output: None,
@@ -590,9 +606,7 @@ async fn turn_rounds(
                 usage,
             });
         }
-        if !blocks.is_empty() {
-            history.record(Message::assistant(blocks.clone()));
-        }
+        record_provider_assistant(history, cfg, &active_model, blocks.clone());
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
@@ -615,31 +629,11 @@ async fn turn_rounds(
             .collect();
 
         match &outcome {
-            AssistantOutcome::Refused => {
+            AssistantOutcome::Refused
+            | AssistantOutcome::Filtered
+            | AssistantOutcome::Incomplete(_) => {
                 return TurnOutcome {
-                    reason: EndReason::Error("model refused the request".into()),
-                    final_text: text_content(&blocks),
-                    rounds: round + 1,
-                    structured_output: None,
-                };
-            }
-            AssistantOutcome::Filtered => {
-                return TurnOutcome {
-                    reason: EndReason::Error("provider filtered the response".into()),
-                    final_text: text_content(&blocks),
-                    rounds: round + 1,
-                    structured_output: None,
-                };
-            }
-            AssistantOutcome::Incomplete(reason) => {
-                let reason = match reason {
-                    IncompleteReason::PauseTurn => "pause_turn",
-                    IncompleteReason::Provider(reason) => reason,
-                };
-                return TurnOutcome {
-                    reason: EndReason::Error(format!(
-                        "provider returned an incomplete response: {reason}"
-                    )),
+                    reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
                     final_text: text_content(&blocks),
                     rounds: round + 1,
                     structured_output: None,
@@ -658,9 +652,7 @@ async fn turn_rounds(
                 }
                 let final_text = format!("{truncated_prefix}{round_text}");
                 return TurnOutcome {
-                    reason: EndReason::Error(format!(
-                        "response remained truncated after {TRUNCATION_RECOVERY_LIMIT} continuation attempts"
-                    )),
+                    reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
                     final_text,
                     rounds: round + 1,
                     structured_output: None,
@@ -874,6 +866,21 @@ fn validate_assistant_result(
         (false, true) => Err("provider returned a tool call for a non-tool outcome".into()),
         _ => Ok(()),
     }
+}
+
+fn record_provider_assistant(
+    history: &mut History,
+    cfg: &Config,
+    model: &str,
+    blocks: Vec<ContentBlock>,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    history.record(Message::assistant_from_provider(
+        blocks,
+        cfg.provider.response_provenance(model),
+    ));
 }
 
 /// All text blocks of a sampled response, in provider order. Used both to end

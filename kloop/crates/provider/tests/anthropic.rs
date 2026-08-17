@@ -165,6 +165,7 @@ async fn request_body_carries_cache_breakpoints() {
                     text: "continue".into(),
                 },
             ],
+            provider_provenance: None,
         },
     ];
     let mut rx = provider.stream("test-model", "be brief", &messages, &tools);
@@ -537,14 +538,17 @@ async fn thinking_replay_and_request_modes() {
     // breakpoint-skips-thinking rule.
     let messages = vec![
         Message::user_text("hi"),
-        Message::assistant(vec![
-            ContentBlock::Thinking {
-                thinking: String::new(),
-                signature: "sig".into(),
-            },
-            ContentBlock::Text { text: "so".into() },
-            ContentBlock::RedactedThinking { data: "d".into() },
-        ]),
+        Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Text { text: "so".into() },
+                ContentBlock::RedactedThinking { data: "d".into() },
+            ],
+            provider.response_provenance("test-model"),
+        ),
     ];
     let mut rx = provider.stream("test-model", "s", &messages, &[]);
     while rx.recv().await.is_some() {}
