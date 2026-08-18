@@ -2583,6 +2583,9 @@ cargo run -- --mock
 # Optional Agent/Program/Workflow string controls likewise expose the same
 # non-empty ID/metadata constraints enforced by their strict runtime parsers;
 # nullable options use null for omission, while an empty identity remains invalid.
+# run_agent/run_program description likewise accepts omission/null or a bounded,
+# single-line string containing at least one non-whitespace character; empty or
+# whitespace-only labels still fail before any Agent/Program side effect.
 # run_agent advertises agent_type only when custom types exist, as null or an
 # enum of the configured names, and does not invent a general-purpose alias.
 #
@@ -2601,9 +2604,15 @@ cargo run -- --mock
 # cross-provider/family/model reasoning fails before I/O, while Chat strips it.
 # Native thread/read and event snapshots omit replay provenance and opaque bytes.
 #
-# The ignored native primitive evaluator accepts all three rails. Responses must
-# be selected explicitly and needs KLOOP_EFFORT so it actually produces and
-# validates reasoning items; provide the normal private OPENAI_* compatibility
+# The ignored native primitive evaluator accepts all three rails. Its Program
+# contract uses two explicit client turns: the first returns a Durable Run ID,
+# the second supplies that exact ID and byte-identical source. It still requires
+# two outer run_program calls and only one journaled child Agent spawn; runtime
+# never auto-resumes or promises exactly-once ordinary tool side effects.
+# Responses must be selected explicitly and needs KLOOP_EFFORT so it actually
+# produces and validates reasoning items. Its real-test watchdog defaults to 900s
+# (300s on other rails) and can be overridden with
+# KLOOP_REAL_EVALUATOR_TIMEOUT_SECS=60..3600. Provide private OPENAI_* compatibility
 # env without printing or committing it:
 # KLOOP_PROVIDER=openai-responses KLOOP_EFFORT=high \
 #   cargo test -p kloop --test real_agent_program_workflow \

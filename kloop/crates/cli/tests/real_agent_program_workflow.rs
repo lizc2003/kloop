@@ -87,6 +87,31 @@ struct NativeClient {
     next_id: u64,
 }
 
+fn real_evaluator_timeout() -> Duration {
+    if let Ok(raw) = std::env::var("KLOOP_REAL_EVALUATOR_TIMEOUT_SECS") {
+        let seconds = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (60..=3_600).contains(seconds))
+            .expect("KLOOP_REAL_EVALUATOR_TIMEOUT_SECS must be an integer from 60 to 3600");
+        return Duration::from_secs(seconds);
+    }
+    if std::env::var("KLOOP_PROVIDER").as_deref() == Ok("openai-responses") {
+        Duration::from_secs(900)
+    } else {
+        Duration::from_secs(300)
+    }
+}
+
+impl Drop for NativeClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl NativeClient {
     fn spawn(root: &TestRoot) -> Self {
         Self::spawn_with_permission_mode(root, "accept-edits")
@@ -172,14 +197,27 @@ impl NativeClient {
         id
     }
 
-    fn receive(&self, deadline: Instant) -> Value {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .expect("real primitive evaluator timed out");
+    fn receive(&mut self, deadline: Instant, stage: &str) -> Value {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            self.fail_receive(stage, true);
+        };
         match self.messages.recv_timeout(remaining) {
             Ok(Ok(message)) => message,
-            Ok(Err(reason)) => panic!("app-server protocol failure: {reason}"),
-            Err(_) => panic!("app-server stopped or timed out"),
+            Ok(Err(reason)) => panic!("app-server protocol failure during {stage}: {reason}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.fail_receive(stage, true),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.fail_receive(stage, false),
+        }
+    }
+
+    fn fail_receive(&mut self, stage: &str, timed_out: bool) -> ! {
+        match self.child.try_wait() {
+            Ok(Some(status)) => panic!("app-server exited with {status} during {stage}"),
+            Ok(None) if timed_out => panic!(
+                "real primitive evaluator timed out during {stage} after {} seconds",
+                real_evaluator_timeout().as_secs()
+            ),
+            Ok(None) => panic!("app-server output channel closed during {stage}"),
+            Err(error) => panic!("cannot inspect app-server during {stage}: {error}"),
         }
     }
 
@@ -187,7 +225,7 @@ impl NativeClient {
         let id = self.send(method, params);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let message = self.receive(deadline);
+            let message = self.receive(deadline, method);
             if message["id"] == id {
                 assert!(message.get("error").is_none(), "app-server request failed");
                 return message["result"].clone();
@@ -200,12 +238,12 @@ impl NativeClient {
             "turn/start",
             json!({"threadId": thread_id, "input": prompt}),
         );
-        let deadline = Instant::now() + Duration::from_secs(300);
+        let deadline = Instant::now() + real_evaluator_timeout();
         let mut messages = Vec::new();
         let mut turn_id = None;
         let mut completed = Vec::new();
         loop {
-            let message = self.receive(deadline);
+            let message = self.receive(deadline, "foreground turn");
             if message["id"] == request_id {
                 assert!(message.get("error").is_none(), "turn/start failed");
                 turn_id = message["result"]["turn"]["id"].as_u64();
@@ -223,8 +261,8 @@ impl NativeClient {
         }
     }
 
-    fn collect_background_delivery(&self, mut messages: Vec<Value>, kind: &str) -> Vec<Value> {
-        let deadline = Instant::now() + Duration::from_secs(300);
+    fn collect_background_delivery(&mut self, mut messages: Vec<Value>, kind: &str) -> Vec<Value> {
+        let deadline = Instant::now() + real_evaluator_timeout();
         loop {
             let terminal_index = messages.iter().position(|message| {
                 message["method"] == "thread/backgroundTask/updated"
@@ -241,7 +279,7 @@ impl NativeClient {
             }) {
                 return messages;
             }
-            messages.push(self.receive(deadline));
+            messages.push(self.receive(deadline, "background delivery"));
         }
     }
 
@@ -261,6 +299,51 @@ fn tool_items<'a>(messages: &'a [Value], method: &str, name: &str) -> Vec<&'a Va
                 && message["params"]["item"]["name"] == name
         })
         .collect()
+}
+
+fn assert_turn_completed(messages: &[Value], stage: &str) {
+    let turn = messages
+        .iter()
+        .rev()
+        .find(|message| message["method"] == "turn/completed")
+        .and_then(|message| message["params"]["turn"].as_object())
+        .unwrap_or_else(|| panic!("{stage} omitted turn/completed"));
+    assert_eq!(
+        turn.get("status").and_then(Value::as_str),
+        Some("completed"),
+        "{stage} ended with status {:?}",
+        turn.get("status")
+    );
+}
+
+fn assert_optional_description(input: &Value) {
+    match input.get("description") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(description)) => {
+            assert!(!description.trim().is_empty(), "description was blank");
+            assert!(
+                description.chars().count() <= 200,
+                "description was too long"
+            );
+            assert!(
+                !description.chars().any(char::is_control),
+                "description contained control characters"
+            );
+        }
+        value => panic!("description had an invalid type: {value:?}"),
+    }
+}
+
+fn assert_logically_omitted(input: &Value, key: &str, default: Option<Value>) {
+    let value = input.get(key);
+    assert!(
+        value.is_none()
+            || value == Some(&Value::Null)
+            || default
+                .as_ref()
+                .is_some_and(|default| value == Some(default)),
+        "optional field '{key}' was not omitted/defaulted: {value:?}"
+    );
 }
 
 fn assert_tool_pairs(messages: &[Value], name: &str, expected: usize) -> Vec<String> {
@@ -438,43 +521,122 @@ fn real_agent_program_workflow_contract() {
     let agent_messages = client.run_turn(
         &thread_id,
         &format!(
-            "Acceptance case Agent. Call run_agent exactly once in foreground with prompt `Reply exactly {AGENT_SENTINEL}`. Omit agent_type, isolation, max_rounds, background, and description. Do not use Program or Workflow. After its successful tool result, answer `AGENT_CASE_DONE_68`."
+            "Acceptance case Agent. Call run_agent exactly once in foreground with prompt `Reply exactly {AGENT_SENTINEL}`. Use description:null to represent omission; omit agent_type, and use background:false, max_rounds:null, isolation:\"shared\". Do not use Program or Workflow. After its successful tool result, answer `AGENT_CASE_DONE_68`."
         ),
     );
+    assert_turn_completed(&agent_messages, "foreground Agent case");
     let agent_outputs = assert_tool_pairs(&agent_messages, "run_agent", 1);
     let agent_input =
         &tool_items(&agent_messages, "item/started", "run_agent")[0]["params"]["item"]["input"];
+    assert_optional_description(agent_input);
+    assert_logically_omitted(agent_input, "agent_type", None);
+    assert_logically_omitted(agent_input, "background", Some(json!(false)));
+    assert_logically_omitted(agent_input, "max_rounds", None);
+    assert_logically_omitted(agent_input, "isolation", Some(json!("shared")));
+    assert!(
+        agent_input
+            .as_object()
+            .is_some_and(|input| input.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "prompt"
+                        | "description"
+                        | "agent_type"
+                        | "background"
+                        | "max_rounds"
+                        | "isolation"
+                )
+            })),
+        "run_agent input contained an unknown optional control: {agent_input}"
+    );
     assert!(
         agent_outputs[0].contains(AGENT_SENTINEL),
         "direct Agent sentinel missing; input={agent_input}; output={}",
         agent_outputs[0]
     );
 
-    let program_prompt = format!(
-        "Acceptance case Program. Call run_program exactly twice and do not call run_agent or Workflow directly. First call it in foreground with the exact JavaScript source below and omit description, background, and resume_from_run_id. It is expected to fail after one child Agent. Read the reported durable run-* id, then call run_program a second time with the byte-identical source and that resume_from_run_id, again omitting description and background. The second failure is expected; do not retry again. Finish with `PROGRAM_CASE_DONE_68`.\n\n```js\n{PROGRAM_SOURCE}\n```"
+    let first_program_prompt = format!(
+        "Acceptance case Program stage one. Call run_program exactly once in foreground with the exact JavaScript source below. Set description:null, background:false, and resume_from_run_id:null to represent omitted optional controls. Do not replace null with an empty, whitespace, or placeholder value. It is expected to fail after one child Agent. Do not call run_program again in this turn and do not call run_agent or Workflow directly. Finish after reporting the expected failure.\n\n```js\n{PROGRAM_SOURCE}\n```"
     );
-    let program_messages = client.run_turn(&thread_id, &program_prompt);
-    let program_outputs = assert_tool_pairs(&program_messages, "run_program", 2);
+    let first_program_messages = client.run_turn(&thread_id, &first_program_prompt);
+    assert_turn_completed(&first_program_messages, "Program stage one");
+    let first_program_outputs = assert_tool_pairs(&first_program_messages, "run_program", 1);
+    let first_program_input = &tool_items(&first_program_messages, "item/started", "run_program")
+        [0]["params"]["item"]["input"];
+    assert_optional_description(first_program_input);
+    assert_logically_omitted(first_program_input, "background", Some(json!(false)));
+    assert_logically_omitted(first_program_input, "resume_from_run_id", None);
     assert!(
-        program_outputs
-            .iter()
-            .all(|output| output.contains(PROGRAM_FAILURE_SENTINEL)),
-        "Program expected failure sentinel missing; inputs={:?}; outputs={program_outputs:?}",
-        tool_items(&program_messages, "item/started", "run_program")
-            .iter()
-            .map(|message| &message["params"]["item"]["input"])
-            .collect::<Vec<_>>()
+        first_program_input
+            .as_object()
+            .is_some_and(|input| input.keys().all(|key| matches!(
+                key.as_str(),
+                "source" | "description" | "background" | "resume_from_run_id"
+            ))),
+        "first run_program input contained an unknown control: {first_program_input}"
     );
-    let run_id = program_outputs
-        .iter()
-        .find_map(|output| extract_run_id(output))
-        .expect("Program did not report a resumable run id");
     assert!(
-        program_outputs
-            .iter()
-            .all(|output| output.contains(&run_id)),
-        "Program resume did not use one durable run id"
+        first_program_outputs[0].contains(PROGRAM_FAILURE_SENTINEL),
+        "first Program expected failure sentinel missing; input={first_program_input}; output={}",
+        first_program_outputs[0]
     );
+    let run_id = extract_run_id(&first_program_outputs[0])
+        .expect("first Program did not report a resumable run id");
+    assert!(
+        first_program_outputs[0].contains(&format!("Durable Run ID: {run_id}")),
+        "first Program did not expose the stable durable id marker"
+    );
+    let first_program_source = first_program_input["source"]
+        .as_str()
+        .expect("first run_program omitted source")
+        .to_string();
+    assert_eq!(
+        first_program_source.trim_end_matches(['\r', '\n']),
+        PROGRAM_SOURCE,
+        "model changed the requested Program source"
+    );
+
+    let resume_program_prompt = format!(
+        "Acceptance case Program stage two. Call run_program exactly once in foreground with description:null, background:false, resume_from_run_id `{run_id}`, and the byte-identical JavaScript source below. Do not use an empty, whitespace, placeholder, or different run id. The second failure is expected because the source deliberately throws. Do not call any other tool. Finish with `PROGRAM_CASE_DONE_68`.\n\n```js\n{first_program_source}\n```"
+    );
+    let second_program_messages = client.run_turn(&thread_id, &resume_program_prompt);
+    assert_turn_completed(&second_program_messages, "Program stage two");
+    let second_program_outputs = assert_tool_pairs(&second_program_messages, "run_program", 1);
+    let second_program_input = &tool_items(&second_program_messages, "item/started", "run_program")
+        [0]["params"]["item"]["input"];
+    assert_optional_description(second_program_input);
+    assert_logically_omitted(second_program_input, "background", Some(json!(false)));
+    assert_eq!(
+        second_program_input["resume_from_run_id"].as_str(),
+        Some(run_id.as_str()),
+        "resume used a different durable run id"
+    );
+    assert!(
+        second_program_input
+            .as_object()
+            .is_some_and(|input| input.keys().all(|key| matches!(
+                key.as_str(),
+                "source" | "description" | "background" | "resume_from_run_id"
+            ))),
+        "resume run_program input contained an unknown control: {second_program_input}"
+    );
+    assert!(
+        second_program_outputs[0].contains(PROGRAM_FAILURE_SENTINEL),
+        "resumed Program expected failure sentinel missing; input={second_program_input}; output={}",
+        second_program_outputs[0]
+    );
+    assert!(
+        second_program_outputs[0].contains(&run_id),
+        "Program resume did not retain one durable run id"
+    );
+
+    let second_program_source = second_program_input["source"]
+        .as_str()
+        .expect("resume run_program omitted source")
+        .to_string();
+
+    let mut program_messages = first_program_messages;
+    program_messages.extend(second_program_messages);
     let program_child_starts = program_messages
         .iter()
         .filter(|message| {
@@ -494,24 +656,13 @@ fn real_agent_program_workflow_contract() {
         .join(".kloop/program-runs")
         .join(&run_id)
         .join("source.js");
-    let invoked_program_sources: Vec<&str> =
-        tool_items(&program_messages, "item/started", "run_program")
-            .into_iter()
-            .map(|message| {
-                message["params"]["item"]["input"]["source"]
-                    .as_str()
-                    .expect("run_program omitted source")
-            })
-            .collect();
-    assert_eq!(invoked_program_sources.len(), 2);
+    let invoked_program_sources = [
+        first_program_source.as_str(),
+        second_program_source.as_str(),
+    ];
     assert_eq!(
         invoked_program_sources[0], invoked_program_sources[1],
         "resume source was not byte-identical"
-    );
-    assert_eq!(
-        invoked_program_sources[0].trim_end_matches(['\r', '\n']),
-        PROGRAM_SOURCE,
-        "model changed the requested Program source"
     );
     assert_eq!(
         std::fs::read_to_string(stored_source).expect("missing Program source artifact"),
@@ -774,7 +925,7 @@ fn real_local_agent_mailbox_contract() {
         if terminal_agents == 2 && delivered == 3 && completion_after_terminals {
             break;
         }
-        messages.push(client.receive(deadline));
+        messages.push(client.receive(deadline, "mailbox delivery"));
     }
 
     assert_tool_pairs(&messages, "run_agent", 2);

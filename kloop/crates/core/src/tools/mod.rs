@@ -876,7 +876,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string", "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes the prompt or result."},
+                    "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes the prompt or result."},
                     "prompt": {"type": "string", "description": "Complete standalone work description"},
                     "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
                     "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
@@ -1583,6 +1583,9 @@ pub(crate) fn optional_display_description(input: &Value, tool: &str) -> Result<
     let Some(value) = input.get("description") else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let description = value
         .as_str()
         .ok_or_else(|| anyhow!("{tool}: description must be a string when provided"))?;
@@ -2076,8 +2079,11 @@ mod tests {
                 .as_deref(),
             Some("审查后台生命周期")
         );
+        assert_eq!(
+            optional_display_description(&json!({"description": null}), "run_agent").unwrap(),
+            None
+        );
         for (value, message) in [
-            (Value::Null, "must be a string"),
             (json!(42), "must be a string"),
             (json!("   "), "must not be empty"),
             (json!("two\nlines"), "single line"),
@@ -2108,9 +2114,10 @@ mod tests {
             assert_eq!(
                 definition.schema["properties"]["description"],
                 json!({
-                    "type": "string",
+                    "type": ["string", "null"],
                     "minLength": 1,
                     "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS,
+                    "pattern": ".*\\S.*",
                     "description": if name == "run_agent" {
                         "Optional short, single-line display label. It never changes the prompt or result."
                     } else {

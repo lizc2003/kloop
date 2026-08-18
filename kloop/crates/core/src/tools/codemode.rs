@@ -389,7 +389,7 @@ fn new_run_id() -> String {
 fn resume_hint(e: anyhow::Error, journal: &Journal, run_id: &str) -> anyhow::Error {
     if journal.is_active() {
         anyhow!(
-            "{e:#}\n[This program journaled its completed agent() calls. To resume without \
+            "{e:#}\nDurable Run ID: {run_id}\n[This program journaled its completed agent() calls. To resume without \
              re-running them, call run_program again with the same source and \
              resume_from_run_id: \"{run_id}\".]"
         )
@@ -848,8 +848,10 @@ display-only and falls back to a source preview. Its return value is delivered a
 later message. Call `wait_for_activity` once only when you truly need to block for any activity; \
 never use it as a status/output polling loop. Stop only the program-N ID with `stop_program`. Use \
 this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
-If a program fails after successful agent calls, call run_program again with the byte-identical \
-source and its run-* `resume_from_run_id`. Journal v3 reuses only calls whose stable topology ID \
+If a program fails after successful agent calls, its error names a `Durable Run ID: run-*`. The \
+next action is an explicit run_program call with the byte-identical source and that exact \
+`resume_from_run_id`; omit other optional controls, never invent or substitute an empty/placeholder \
+ID. Journal v3 reuses only calls whose stable topology ID \
 and complete structured input match; v1, v2, and future-version entries are safe cache misses. \
 This is best-effort model-call memoization, not deterministic agent text, workspace-state validation, \
 or exactly-once external side effects.\n\n\
@@ -879,7 +881,7 @@ the program:\n",
         schema: json!({
             "type": "object",
             "properties": {
-                "description": {"type": "string", "minLength": 1, "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
+                "description": {"type": ["string", "null"], "minLength": 1, "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
                 "source": {"type": "string", "description": "The JavaScript program to run"},
                 "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
                 "resume_from_run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9_-]+$", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v3 agent calls are reused. Journal v1/v2/future entries are safe cache misses."}

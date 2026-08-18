@@ -1832,7 +1832,6 @@ mod tests {
         let ui = std::sync::Arc::new(BackgroundTaskUi::default());
         ctx.ui = ui.clone();
         let cases = [
-            (Value::Null, "must be a string"),
             (json!(7), "invalid type"),
             (json!("  "), "must not be empty"),
             (json!("two\tparts"), "single line"),
@@ -1855,6 +1854,22 @@ mod tests {
         assert_eq!(ctx.cfg.background_executions.running_count(), 0);
         assert!(ui.0.lock().unwrap().is_empty());
         assert!(ctx.cfg.inbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_agent_null_description_uses_prompt_preview() {
+        let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "null description accepted".into(),
+        }]]);
+        let ctx = with_provider(test_ctx(0, "run-agent-description-null"), provider);
+        let (output, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "inspect the target", "description": null}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "null description accepted");
     }
 
     /// A foreground child may forge a Task tool call, but the depth gate rejects

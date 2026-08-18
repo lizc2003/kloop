@@ -150,6 +150,58 @@ async fn request_body_is_stateless_with_reasoning_include() {
     );
 }
 
+#[tokio::test]
+async fn error_tool_output_replays_program_resume_contract_verbatim() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[json!({"type": "response.completed", "response": {}})]),
+    )
+    .await;
+    let provider = Arc::new(responses(&server));
+    let error = "PROGRAM_EXPECTED_FAILURE_68\nDurable Run ID: run-live-7\nresume_from_run_id: \"run-live-7\"";
+    let messages = vec![
+        Message::user_text("run the program"),
+        Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "use Program".into(),
+                    signature: "enc-program".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_program".into(),
+                    name: "run_program".into(),
+                    input: json!({"source": "throw new Error('expected')"}),
+                },
+            ],
+            provider.response_provenance("test-model"),
+        ),
+        Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_program".into(),
+            content: error.into(),
+            is_error: true,
+        }]),
+    ];
+    let mut rx = provider.stream("test-model", "continue", &messages, &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "run the program"}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "use Program"}],
+             "encrypted_content": "enc-program"},
+            {"type": "function_call", "call_id": "call_program", "name": "run_program",
+             "arguments": "{\"source\":\"throw new Error('expected')\"}"},
+            {"type": "function_call_output", "call_id": "call_program",
+             "output": format!("[error] {error}")},
+        ])
+    );
+}
+
 /// KLOOP_EFFORT maps to the reasoning request field (with summary=auto for
 /// displayable text); absent effort sends no reasoning field at all.
 #[tokio::test]

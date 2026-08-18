@@ -705,7 +705,6 @@ async fn run_program_rejects_invalid_descriptions_before_creating_run_artifacts(
     assert!(!run_root.exists());
 
     let cases = [
-        (Value::Null, "must be a string"),
         (json!(false), "invalid type"),
         (json!(" \t"), "must not be empty"),
         (json!("two\nlines"), "single line"),
@@ -733,6 +732,19 @@ async fn run_program_rejects_invalid_descriptions_before_creating_run_artifacts(
     assert!(ui.0.lock().unwrap().is_empty());
     assert!(ctx.cfg.inbox.is_empty());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn run_program_null_description_uses_source_preview() {
+    let ctx = test_ctx(0, "run-program-description-null");
+    let (output, is_error) = run_tool(
+        "run_program",
+        json!({"source": "return 'null description accepted';", "description": null}),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(output, "null description accepted");
 }
 
 /// A background program cancelled via stop_program ends Aborted and reinjects
@@ -1030,7 +1042,9 @@ async fn failure_after_agent_reports_a_resumable_run_id() {
     assert!(is_error, "{out}");
     assert!(out.contains("boom after step one"), "{out}");
     assert!(
-        out.contains(&run_id) && out.contains("resume_from_run_id"),
+        out.contains(&format!("Durable Run ID: {run_id}"))
+            && out.contains(&run_id)
+            && out.contains("resume_from_run_id"),
         "reports how to resume: {out}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
