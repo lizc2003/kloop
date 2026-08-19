@@ -532,6 +532,7 @@ fn real_agent_program_workflow_contract() {
     assert_logically_omitted(agent_input, "agent_type", None);
     assert_logically_omitted(agent_input, "background", Some(json!(false)));
     assert_logically_omitted(agent_input, "max_rounds", None);
+    assert_logically_omitted(agent_input, "model", None);
     assert_logically_omitted(agent_input, "isolation", Some(json!("shared")));
     assert!(
         agent_input
@@ -544,6 +545,7 @@ fn real_agent_program_workflow_contract() {
                         | "agent_type"
                         | "background"
                         | "max_rounds"
+                        | "model"
                         | "isolation"
                 )
             })),

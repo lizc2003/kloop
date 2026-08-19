@@ -173,7 +173,11 @@ impl ProviderCatalog {
         }
         self.validate_receipt(receipt)?;
         let resolved = self.resolve(&receipt.provider_id, &receipt.primary_model)?;
-        Ok(FrozenProviderRoute::new(receipt.revision, resolved))
+        Ok(FrozenProviderRoute::with_continuity(
+            receipt.revision,
+            resolved,
+            receipt.continuity,
+        ))
     }
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.entries
@@ -243,12 +247,69 @@ impl ProviderCatalog {
     }
 }
 
+pub(crate) fn validate_timeline(
+    timeline: &[kloop_protocol::ProviderRouteReceipt],
+) -> Result<(), SwitchError> {
+    let mut previous: Option<&kloop_protocol::ProviderRouteReceipt> = None;
+    for receipt in timeline {
+        if receipt.revision == 0
+            || receipt.boundary == 0
+            || receipt.provider_id.trim().is_empty()
+            || receipt.endpoint_fingerprint.trim().is_empty()
+            || receipt.primary_model.trim().is_empty()
+            || receipt
+                .fallback_model
+                .as_deref()
+                .is_some_and(|fallback| fallback.trim().is_empty())
+        {
+            return Err(SwitchError::InvalidTimeline);
+        }
+        match previous {
+            None if receipt.revision == 1
+                && receipt.source == kloop_protocol::ProviderRouteSource::Initial => {}
+            Some(previous)
+                if receipt.source == kloop_protocol::ProviderRouteSource::ExplicitSwitch
+                    && previous
+                        .revision
+                        .checked_add(1)
+                        .is_some_and(|revision| revision == receipt.revision)
+                    && receipt.boundary > previous.boundary => {}
+            _ => return Err(SwitchError::InvalidTimeline),
+        }
+        previous = Some(receipt);
+    }
+    if previous.is_none() {
+        return Err(SwitchError::InvalidTimeline);
+    }
+    Ok(())
+}
+
 fn checked_nonempty(value: &str, field: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err(format!("{field} must not be empty"));
     }
     Ok(value.to_string())
+}
+
+/// A child may select only a model declared by the frozen parent's provider.
+/// The string form remains the configuration and frontmatter contract; this
+/// wrapper makes that inherited-provider constraint explicit after parsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InheritedProviderModelOverride(String);
+
+impl InheritedProviderModelOverride {
+    pub fn parse(value: &str) -> Result<Self, SwitchError> {
+        let model = value.trim();
+        if model.is_empty() {
+            return Err(SwitchError::InvalidInheritedProviderModel);
+        }
+        Ok(Self(model.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +326,7 @@ struct ResolvedRoute {
 struct SessionState {
     revision: u64,
     active: ResolvedRoute,
+    continuity: ReasoningContinuity,
     remembered_models: BTreeMap<String, String>,
 }
 
@@ -296,10 +358,11 @@ impl SessionProviderState {
         catalog: Arc<ProviderCatalog>,
         timeline: &[kloop_protocol::ProviderRouteReceipt],
     ) -> Result<Self, SwitchError> {
-        let latest = timeline.last().ok_or(SwitchError::InvalidRevision)?;
+        validate_timeline(timeline)?;
         for receipt in timeline {
             catalog.validate_receipt(receipt)?;
         }
+        let latest = timeline.last().ok_or(SwitchError::InvalidTimeline)?;
         let route = catalog.restore_route(latest)?;
         let remembered_models = timeline
             .iter()
@@ -310,6 +373,7 @@ impl SessionProviderState {
             state: Mutex::new(SessionState {
                 revision: route.revision,
                 active: route.route,
+                continuity: route.continuity,
                 remembered_models,
             }),
         })
@@ -324,6 +388,7 @@ impl SessionProviderState {
             state: Mutex::new(SessionState {
                 revision: route.revision,
                 active: route.route,
+                continuity: route.continuity,
                 remembered_models,
             }),
         }
@@ -335,7 +400,7 @@ impl SessionProviderState {
 
     pub fn freeze(&self) -> FrozenProviderRoute {
         let state = self.state.lock().unwrap();
-        FrozenProviderRoute::new(state.revision, state.active.clone())
+        FrozenProviderRoute::with_continuity(state.revision, state.active.clone(), state.continuity)
     }
 
     pub fn active_route(&self) -> ActiveProviderRoute {
@@ -344,6 +409,21 @@ impl SessionProviderState {
 
     pub fn remembered_models(&self) -> BTreeMap<String, String> {
         self.state.lock().unwrap().remembered_models.clone()
+    }
+
+    pub fn preflight(&self, provider_id: &str, model: Option<&str>) -> Result<(), SwitchError> {
+        let target_model = {
+            let state = self.state.lock().unwrap();
+            let descriptor = self
+                .catalog
+                .descriptor(provider_id)
+                .ok_or_else(|| SwitchError::UnknownProvider(provider_id.to_string()))?;
+            model
+                .map(str::to_string)
+                .or_else(|| state.remembered_models.get(provider_id).cloned())
+                .unwrap_or(descriptor.default_model)
+        };
+        self.catalog.resolve(provider_id, &target_model).map(|_| ())
     }
 
     pub fn switch_with<E>(
@@ -383,20 +463,27 @@ impl SessionProviderState {
             && state.active.api_family == target.api_family
             && state.active.endpoint_fingerprint == target.endpoint_fingerprint
         {
-            return Ok(SwitchOutcome::NoOp(FrozenProviderRoute::new(
+            return Ok(SwitchOutcome::NoOp(FrozenProviderRoute::with_continuity(
                 state.revision,
                 state.active.clone(),
+                state.continuity,
             )));
         }
         let next_revision = state
             .revision
             .checked_add(1)
             .ok_or_else(|| SwitchCommitError::Switch(SwitchError::RevisionExhausted))?;
-        let previous = FrozenProviderRoute::new(state.revision, state.active.clone());
-        let next = FrozenProviderRoute::new(next_revision, target.clone());
-        let continuity = commit(&previous, &next).map_err(SwitchCommitError::Commit)?;
+        let previous = FrozenProviderRoute::with_continuity(
+            state.revision,
+            state.active.clone(),
+            state.continuity,
+        );
+        let tentative = FrozenProviderRoute::new(next_revision, target.clone());
+        let continuity = commit(&previous, &tentative).map_err(SwitchCommitError::Commit)?;
+        let next = FrozenProviderRoute::with_continuity(next_revision, target.clone(), continuity);
         state.revision = next_revision;
         state.active = target;
+        state.continuity = continuity;
         state
             .remembered_models
             .insert(provider_id.to_string(), target_model);
@@ -422,6 +509,7 @@ impl SessionProviderState {
             state: Mutex::new(SessionState {
                 revision,
                 active,
+                continuity: ReasoningContinuity::Preserved,
                 remembered_models,
             }),
         })
@@ -432,6 +520,7 @@ impl SessionProviderState {
 pub struct FrozenProviderRoute {
     revision: u64,
     route: ResolvedRoute,
+    continuity: ReasoningContinuity,
 }
 
 impl fmt::Debug for FrozenProviderRoute {
@@ -449,7 +538,23 @@ impl fmt::Debug for FrozenProviderRoute {
 
 impl FrozenProviderRoute {
     fn new(revision: u64, route: ResolvedRoute) -> Self {
-        Self { revision, route }
+        Self {
+            revision,
+            route,
+            continuity: ReasoningContinuity::Preserved,
+        }
+    }
+
+    fn with_continuity(
+        revision: u64,
+        route: ResolvedRoute,
+        continuity: ReasoningContinuity,
+    ) -> Self {
+        Self {
+            revision,
+            route,
+            continuity,
+        }
     }
 
     pub fn revision(&self) -> u64 {
@@ -460,7 +565,11 @@ impl FrozenProviderRoute {
         if revision == 0 {
             return Err(SwitchError::InvalidRevision);
         }
-        Ok(Self::new(revision, self.route.clone()))
+        Ok(Self::with_continuity(
+            revision,
+            self.route.clone(),
+            self.continuity,
+        ))
     }
 
     pub fn provider_id(&self) -> &str {
@@ -530,8 +639,13 @@ impl FrozenProviderRoute {
         Self::new(self.revision, route)
     }
 
-    pub fn child_route(&self, model: Option<&str>) -> Result<Self, SwitchError> {
-        let model = model.unwrap_or(&self.route.primary_model);
+    pub fn child_route(
+        &self,
+        model: Option<&InheritedProviderModelOverride>,
+    ) -> Result<Self, SwitchError> {
+        let model = model
+            .map(InheritedProviderModelOverride::as_str)
+            .unwrap_or(&self.route.primary_model);
         if !self
             .route
             .allowed_models
@@ -545,7 +659,7 @@ impl FrozenProviderRoute {
         }
         let mut route = self.route.clone();
         route.primary_model = model.to_string();
-        Ok(Self::new(1, route))
+        Ok(Self::with_continuity(1, route, self.continuity))
     }
 
     pub fn receipt(
@@ -573,6 +687,7 @@ impl FrozenProviderRoute {
             provider_id: self.route.provider_id.clone(),
             api_family: self.route.api_family,
             model: self.route.primary_model.clone(),
+            continuity: self.continuity,
         }
     }
 }
@@ -645,6 +760,8 @@ pub enum SwitchError {
     },
     RevisionExhausted,
     InvalidRevision,
+    InvalidTimeline,
+    InvalidInheritedProviderModel,
 }
 
 impl fmt::Display for SwitchError {
@@ -675,6 +792,10 @@ impl fmt::Display for SwitchError {
             Self::InvalidRevision => {
                 formatter.write_str("provider route revision must be positive")
             }
+            Self::InvalidTimeline => formatter.write_str("provider route timeline is invalid"),
+            Self::InvalidInheritedProviderModel => {
+                formatter.write_str("inherited provider model override must be a non-blank string")
+            }
         }
     }
 }
@@ -704,6 +825,168 @@ mod tests {
         }
     }
 
+    fn receipt(
+        revision: u64,
+        boundary: u64,
+        source: kloop_protocol::ProviderRouteSource,
+        provider_id: &str,
+        model: &str,
+    ) -> kloop_protocol::ProviderRouteReceipt {
+        kloop_protocol::ProviderRouteReceipt {
+            revision,
+            boundary,
+            source,
+            provider_id: provider_id.into(),
+            api_family: ProviderApiFamily::Mock,
+            endpoint_fingerprint: format!("mock:{provider_id}"),
+            primary_model: model.into(),
+            fallback_model: None,
+            continuity: ReasoningContinuity::Preserved,
+        }
+    }
+
+    #[test]
+    fn from_timeline_restores_latest_route_and_remembered_models() {
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                mock_entry("a", "a1", &["a1", "a2"]),
+                mock_entry("b", "b1", &["b1"]),
+            ])
+            .unwrap(),
+        );
+        let timeline = [
+            receipt(
+                1,
+                1,
+                kloop_protocol::ProviderRouteSource::Initial,
+                "a",
+                "a1",
+            ),
+            receipt(
+                2,
+                3,
+                kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                "b",
+                "b1",
+            ),
+            receipt(
+                3,
+                5,
+                kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                "a",
+                "a2",
+            ),
+        ];
+
+        let state = SessionProviderState::from_timeline(catalog, &timeline).unwrap();
+        assert_eq!(state.active_route().revision, 3);
+        assert_eq!(state.active_route().provider_id, "a");
+        assert_eq!(state.active_route().model, "a2");
+        assert_eq!(
+            state.remembered_models(),
+            BTreeMap::from([("a".into(), "a2".into()), ("b".into(), "b1".into())])
+        );
+    }
+
+    #[test]
+    fn from_timeline_rejects_malformed_receipt_sequence_before_restore() {
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                mock_entry("a", "a1", &["a1"]),
+                mock_entry("b", "b1", &["b1"]),
+            ])
+            .unwrap(),
+        );
+        let initial = receipt(
+            1,
+            1,
+            kloop_protocol::ProviderRouteSource::Initial,
+            "a",
+            "a1",
+        );
+        let valid_switch = receipt(
+            2,
+            3,
+            kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+            "b",
+            "b1",
+        );
+        let cases = [
+            vec![],
+            vec![valid_switch.clone()],
+            vec![
+                initial.clone(),
+                receipt(
+                    2,
+                    1,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "b",
+                    "b1",
+                ),
+            ],
+            vec![
+                initial.clone(),
+                receipt(
+                    2,
+                    3,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "b",
+                    "b1",
+                ),
+                receipt(
+                    3,
+                    3,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "a",
+                    "a1",
+                ),
+            ],
+            vec![
+                initial.clone(),
+                receipt(
+                    2,
+                    3,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "b",
+                    "b1",
+                ),
+                receipt(
+                    3,
+                    2,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "a",
+                    "a1",
+                ),
+            ],
+            vec![
+                initial.clone(),
+                receipt(
+                    3,
+                    3,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                    "b",
+                    "b1",
+                ),
+            ],
+            vec![
+                initial,
+                receipt(
+                    2,
+                    3,
+                    kloop_protocol::ProviderRouteSource::Initial,
+                    "b",
+                    "b1",
+                ),
+            ],
+        ];
+        for timeline in cases {
+            assert!(matches!(
+                SessionProviderState::from_timeline(Arc::clone(&catalog), &timeline),
+                Err(SwitchError::InvalidTimeline)
+            ));
+        }
+    }
+
     #[test]
     fn catalog_deduplicates_models_and_validates_defaults() {
         let catalog =
@@ -712,6 +995,36 @@ mod tests {
 
         let error = ProviderCatalog::new(vec![mock_entry("a", "missing", &["m1"])]).unwrap_err();
         assert!(error.contains("default model"));
+    }
+
+    #[test]
+    fn child_route_freezes_parent_and_restarts_revision() {
+        let catalog =
+            Arc::new(ProviderCatalog::new(vec![mock_entry("a", "m1", &["m1", "m2"])]).unwrap());
+        let route = catalog.initial_route("a", None).unwrap();
+        let child = route
+            .child_route(Some(&InheritedProviderModelOverride::parse("m2").unwrap()))
+            .unwrap();
+        assert_eq!(child.revision(), 1);
+        assert_eq!(child.primary_model(), "m2");
+        assert_eq!(route.primary_model(), "m1");
+
+        let error = route
+            .child_route(Some(
+                &InheritedProviderModelOverride::parse("missing").unwrap(),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SwitchError::UnknownModel {
+                provider_id: "a".into(),
+                model: "missing".into(),
+            }
+        );
+        assert_eq!(
+            InheritedProviderModelOverride::parse(" \t "),
+            Err(SwitchError::InvalidInheritedProviderModel)
+        );
     }
 
     #[test]

@@ -553,7 +553,7 @@ starts with its recent conversation visible instead of a blank screen.
 
 `kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
 
-**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. A switch creates no turn, message, terminal, or usage record; stale CAS, unavailable targets, busy threads, and persistence failures leave the old route untouched.
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
 
 
 **Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
@@ -606,10 +606,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detai
 for owner-scoped scheduler lifecycle (**no `turnId`**),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`,
-`/compact`, `/clear`, and an inert `/exit`) runs the command instead of the
-model: its output comes back as a `system` notification, `/clear` also emits
-`thread/cleared`, and the turn bracket is unchanged.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event.
 
 **Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
@@ -2617,6 +2614,12 @@ cargo run -- --mock
 # KLOOP_PROVIDER=openai-responses KLOOP_EFFORT=high \
 #   cargo test -p kloop --test real_agent_program_workflow \
 #   real_agent_program_workflow_contract -- --exact --ignored --nocapture
+# The cross-rail evaluator keeps both credentials in process memory (it does not
+# write a temporary provider config) and runs Anthropic → Chat → Responses →
+# Anthropic in one native session while checking route receipts, provenance,
+# usage, Chat's no-reasoning history contract and public redaction:
+# KLOOP_EFFORT=high cargo test -p kloop-server --test server \
+#   real_three_rail_route_switch_contract -- --exact --ignored --nocapture
 
 # line-based REPL instead of the TUI
 cargo run -- --plain

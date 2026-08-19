@@ -309,8 +309,16 @@ pub struct App {
     pub cwd: String,
     /// Current worktree branch, or None in the original checkout.
     pub branch: Option<String>,
-    /// Model name shown in the footer's system status. Static per session.
+    /// Compatibility mirror for legacy callers. Route state below is authoritative.
     pub model: String,
+    /// The idle user selection. It is the only route projection changed by a
+    /// successful provider switch; in-flight work uses [`frozen_route`].
+    pub selected_route: Option<kloop_protocol::ActiveProviderRoute>,
+    /// Route snapshot for the currently running turn/operation, if any.
+    pub frozen_route: Option<kloop_protocol::ActiveProviderRoute>,
+    /// Last successful model choice per logical provider, used by the picker
+    /// when a provider is selected without an explicit model.
+    pub remembered_models: HashMap<String, String>,
     /// Estimated context tokens in use (footer gauge), refreshed by the worker's
     /// `Usage` events after each turn.
     pub context_used: u64,
@@ -350,6 +358,9 @@ impl App {
             cwd: String::new(),
             branch: None,
             model: String::new(),
+            selected_route: None,
+            frozen_route: None,
+            remembered_models: HashMap::new(),
             context_used: 0,
             context_window: None,
         }
@@ -376,6 +387,61 @@ impl App {
         self
     }
 
+    pub fn with_route(mut self, route: kloop_protocol::ActiveProviderRoute) -> Self {
+        self.model = route.model.clone();
+        self.selected_route = Some(route);
+        self
+    }
+
+    pub(crate) fn display_route(&self) -> Option<&kloop_protocol::ActiveProviderRoute> {
+        if self.running {
+            self.frozen_route.as_ref().or(self.selected_route.as_ref())
+        } else {
+            self.selected_route.as_ref()
+        }
+    }
+
+    pub fn freeze_selected_route(&mut self) {
+        self.freeze_selected_route_inner();
+    }
+
+    fn freeze_selected_route_inner(&mut self) {
+        if self.frozen_route.is_none() {
+            self.frozen_route = self.selected_route.clone();
+        }
+    }
+
+    fn clear_frozen_route(&mut self) {
+        self.frozen_route = None;
+    }
+
+    /// Remember the model only after a successful provider transition. A late
+    /// ProviderChanged for an older revision cannot overwrite newer selection.
+    fn accept_selected_route(&mut self, route: kloop_protocol::ActiveProviderRoute) {
+        if self
+            .selected_route
+            .as_ref()
+            .is_none_or(|current| route.revision >= current.revision)
+        {
+            self.remembered_models
+                .insert(route.provider_id.clone(), route.model.clone());
+            self.model = route.model.clone();
+            self.selected_route = Some(route);
+        }
+    }
+
+    fn remembered_or_default_model(&self, provider: &kloop_protocol::ProviderDescriptor) -> String {
+        self.remembered_models
+            .get(&provider.id)
+            .filter(|model| provider.models.contains(model))
+            .cloned()
+            .unwrap_or_else(|| provider.default_model.clone())
+    }
+
+    pub fn picker_model(&self, provider: &kloop_protocol::ProviderDescriptor) -> String {
+        self.remembered_or_default_model(provider)
+    }
+
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
             // Agent output — the single core Event stream (plan 39).
@@ -386,11 +452,16 @@ impl App {
                 self.cells.push(Cell::System(text));
             }
             AgentEvent::ProviderChanged(route) => {
-                self.model = route.model.clone();
+                self.accept_selected_route(route.clone());
                 self.cells.push(Cell::System(format!(
                     "provider: {} {} (revision {})",
                     route.provider_id, route.model, route.revision
                 )));
+            }
+            AgentEvent::RouteFrozen(route) => {
+                if self.running {
+                    self.frozen_route = Some(route);
+                }
             }
             AgentEvent::ProviderPicker(providers) => {
                 if providers.is_empty() {
@@ -439,10 +510,12 @@ impl App {
             AgentEvent::Forked {
                 session_id,
                 messages,
+                route,
             } => {
                 // History was swapped to the fork; rebuild the view to match its
                 // truncated content, exactly like resuming into a session.
                 self.session_id = session_id;
+                self.accept_selected_route(route);
                 self.cells = cells_from_history(&messages);
                 // cells_from_history tags the tail "resumed session"; relabel it
                 // so the transcript says a rewind happened, not a resume.
@@ -807,6 +880,7 @@ impl App {
             }
             Event::TurnEnded(reason) => {
                 self.running = false;
+                self.clear_frozen_route();
                 self.assistant_open = false;
                 self.thinking_open = false;
                 self.assistant_cells.clear();
@@ -1151,6 +1225,7 @@ impl App {
         if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
             let _ = self.composer.submit_text();
             self.running = true;
+            self.freeze_selected_route();
             return Command::Slash(display);
         }
         if self.running {
@@ -1184,6 +1259,7 @@ impl App {
             self.cells.push(Cell::User(format!("[image: {label}]")));
         }
         self.running = true;
+        self.freeze_selected_route();
         Command::Submit(sub.text)
     }
 
@@ -1399,6 +1475,7 @@ impl App {
         let _ = question.reply.send(outcome);
     }
     fn on_provider_key(&mut self, key: KeyEvent) -> Command {
+        let remembered_models = self.remembered_models.clone();
         let picker = self.provider_picker.as_mut().expect("checked some");
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
@@ -1430,10 +1507,14 @@ impl App {
             }
             KeyCode::Enter => {
                 let provider = &picker.providers[picker.provider_cursor];
+                let model = remembered_models
+                    .get(&provider.id)
+                    .filter(|model| provider.models.contains(model))
+                    .unwrap_or(&provider.default_model);
                 let cursor = provider
                     .models
                     .iter()
-                    .position(|model| model == &provider.default_model)
+                    .position(|candidate| candidate == model)
                     .unwrap_or(0);
                 picker.model_cursor = Some(cursor);
             }
@@ -2386,11 +2467,95 @@ mod tests {
                 provider_id: "a".into(),
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "a2".into(),
+                continuity: kloop_protocol::ReasoningContinuity::Preserved,
             },
         ));
         assert_eq!(app.model, "a2");
     }
 
+    #[test]
+    fn provider_picker_remembers_successful_model_selection() {
+        let mut app = App::new("s".into());
+        let provider = kloop_protocol::ProviderDescriptor {
+            id: "a".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            default_model: "a1".into(),
+            models: vec!["a1".into(), "a2".into()],
+            fallback_model: None,
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+        };
+        app.apply(AgentEvent::ProviderChanged(
+            kloop_protocol::ActiveProviderRoute {
+                revision: 2,
+                provider_id: "a".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                model: "a2".into(),
+                continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            },
+        ));
+        app.apply(AgentEvent::ProviderPicker(vec![provider]));
+
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.provider_picker.as_ref().unwrap().model_cursor, Some(1));
+    }
+
+    #[test]
+    fn selected_route_changes_while_running_without_rewriting_frozen_route() {
+        let old = kloop_protocol::ActiveProviderRoute {
+            revision: 1,
+            provider_id: "old".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "old-model".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let new = kloop_protocol::ActiveProviderRoute {
+            revision: 2,
+            provider_id: "new".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "new-model".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let mut app = App::new("s".into()).with_route(old.clone());
+        app.running = true;
+        app.freeze_selected_route();
+        app.apply(AgentEvent::ProviderChanged(new.clone()));
+
+        assert_eq!(app.selected_route, Some(new));
+        assert_eq!(app.frozen_route, Some(old.clone()));
+        assert_eq!(app.display_route(), Some(&old));
+
+        app.apply(turn_ended(EndReason::Completed));
+        assert_eq!(app.frozen_route, None);
+        assert_eq!(app.display_route(), app.selected_route.as_ref());
+    }
+
+    #[test]
+    fn frozen_route_event_beats_late_selected_route_change_until_terminal() {
+        let old = kloop_protocol::ActiveProviderRoute {
+            revision: 3,
+            provider_id: "a".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "a1".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let new = kloop_protocol::ActiveProviderRoute {
+            revision: 4,
+            provider_id: "b".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "b1".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let mut app = App::new("s".into()).with_route(old.clone());
+        app.running = true;
+        app.apply(AgentEvent::RouteFrozen(old.clone()));
+        app.apply(AgentEvent::ProviderChanged(new.clone()));
+        app.apply(usage(123));
+
+        assert_eq!(app.selected_route, Some(new));
+        assert_eq!(app.frozen_route, Some(old.clone()));
+        assert_eq!(app.display_route(), Some(&old));
+        assert_eq!(app.context_used, 123);
+    }
     fn fp(seq: u64, preview: &str) -> ForkPoint {
         ForkPoint {
             seq,
@@ -2466,6 +2631,13 @@ mod tests {
                     text: "done".into(),
                 }]),
             ],
+            route: kloop_protocol::ActiveProviderRoute {
+                revision: 1,
+                provider_id: "mock".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                model: "mock-model".into(),
+                continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            },
         });
         assert_eq!(app.session_id, "new");
         assert_eq!(

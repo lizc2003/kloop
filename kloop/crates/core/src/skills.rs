@@ -118,15 +118,18 @@ impl Frontmatter {
         body: String,
         dir: &str,
         source: SkillSource,
-    ) -> Skill {
+    ) -> Result<Skill, String> {
         let context = match self.context.as_deref().map(str::trim) {
             Some("fork") => SkillContext::Fork,
             _ => SkillContext::Inline,
         };
-        let model = self
-            .model
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
+        let model = match self.model {
+            Some(model) if model.trim().is_empty() => {
+                return Err("model must be a non-blank string".into());
+            }
+            Some(model) => Some(model),
+            None => None,
+        };
         let allowed_tools = self.allowed_tools.and_then(|at| {
             let raw = match at {
                 AllowedTools::List(v) => v,
@@ -142,7 +145,7 @@ impl Frontmatter {
                 .collect();
             (!mapped.is_empty()).then_some(mapped)
         });
-        Skill {
+        Ok(Skill {
             name,
             description,
             body,
@@ -151,7 +154,7 @@ impl Frontmatter {
             model,
             allowed_tools,
             source,
-        }
+        })
     }
 }
 
@@ -202,13 +205,13 @@ impl Skill {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .ok_or("missing 'description' (the field the model matches on)")?;
-        Ok(fm.into_skill(
+        fm.into_skill(
             name,
             description,
             body.trim().to_string(),
             dir,
             SkillSource::Skill,
-        ))
+        )
     }
 
     /// Parse one single-file user command (`.kloop/commands/*.md`, plan 36).
@@ -235,13 +238,13 @@ impl Skill {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| description_from_body(&body));
-        Ok(fm.into_skill(
+        fm.into_skill(
             name.to_string(),
             description,
             body,
             dir,
             SkillSource::Command,
-        ))
+        )
     }
 
     /// Resolve a skill by name among `candidates`, or an error naming what is
@@ -507,6 +510,19 @@ mod tests {
         let weird =
             Skill::parse("s", "/s", "---\ndescription: d\ncontext: sideways\n---\nb").unwrap();
         assert_eq!(weird.context, SkillContext::Inline);
+    }
+
+    #[test]
+    fn parse_rejects_blank_model_override() {
+        assert_eq!(
+            Skill::parse(
+                "s",
+                "/s",
+                "---\ndescription: d\ncontext: fork\nmodel: '  '\n---\nb"
+            )
+            .unwrap_err(),
+            "model must be a non-blank string"
+        );
     }
 
     #[test]

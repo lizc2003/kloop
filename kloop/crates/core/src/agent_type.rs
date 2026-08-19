@@ -114,6 +114,12 @@ mod tests {
     }
 
     #[test]
+    fn model_override_keeps_its_compatible_string_form() {
+        let types = types();
+        assert_eq!(types[0].model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
     fn allowlist_gates_tools_but_never_read_offloaded() {
         let allow: HashSet<String> = ["grep".to_string(), "read_file".to_string()]
             .into_iter()

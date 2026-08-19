@@ -1,6 +1,6 @@
 # Plan 92 — CodeWhale 借鉴：会话内 provider/model 热切换
 
-> 状态：✅ 已完成（2026-08-18；提交 `da6f7f3`）
+> 状态：🚧 核心实现完成；跨面/真实 rail 验收收口中（2026-08-19）
 >
 > 依赖：Plan 39、Plan 40、Plan 77、Plan 81、Plan 85、Plan 86、Plan 89；完成后纳入 Plan 91 跨面验收；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 >
@@ -157,6 +157,8 @@ CodeWhale 已提供目标 UX：`/provider` 打开 picker，`/provider <name>` �
 - 旧 provider/model runtime、旧 rollout/wire reader和兼容分支已删除；无新增 provider、依赖、自动跨 provider routing或 Desktop UI。
 - focused tests、`cargo fmt --all -- --check`、workspace Clippy `-D warnings`、workspace all-target/all-feature tests、mock interactive/headless/NDJSON、diff check全绿；真实 provider、未执行平台和 UI 环境逐项如实记录。
 
-## 实现验收记录（2026-08-18）
+## 实现验收记录（2026-08-19）
 
-已落地 immutable provider catalog、session route revision、frozen route/attempt、durable route receipts、origin-bound provenance、唯一 request-view seam、provider-aware usage、CLI/plain/TUI/native provider control surface 与 protocol 2.0。旧无 route timeline rollout 在 inspect/resume/fork 时 fail closed，不从 model/runtime/environment 猜路由。focused provider/protocol/core/server/CLI/TUI tests 与 mock smoke 已执行；真实 provider、Linux/Windows/Desktop/物理终端未执行。
+核心实现与本地 deterministic/mock 链路已收口：immutable provider catalog、session route revision、frozen route/attempt、durable route receipts、origin-bound provenance、唯一 request-view seam、递归 reasoning final guard、provider-aware usage、CLI/plain/TUI/native provider control surface 与 protocol 2.0 均已更新。native public route 统一携带 bounded continuity，server switch 错误带稳定 `data.kind`，旧无 route timeline rollout 在 inspect/resume/fork 时 fail closed，child model override 在 inherited frozen provider 上显式校验。
+
+已执行 focused protocol/provider/core/server/TUI/codemode 测试、workspace fmt/check、server/TUI 集成测试与 mock smoke。2026-08-19 首轮真实复测中，Anthropic `claude-sonnet-4-6` 同一 session 连续两轮 sampling 与 local Agent mailbox 合约通过；primitive evaluator 曾因模型违背提示主动调用 `wait_for_activity` 未通过。Responses `gpt-5.5` evaluator 曾推进至 Program resume 第二阶段，随后最小 sampling 连续三次收到上游 503 `all_channels_unavailable` / circuit-open；Chat 同期收到 502 transient unavailable。再次复测时，Anthropic primitive 完整合约 64.97 秒通过，Responses primitive 完整合约 116.68 秒通过，Chat primitive 完整合约 74.95 秒通过，Chat local Agent mailbox 56.93 秒通过。新增 credential 只驻内存的 ignored native-server evaluator，在同一 session 完成 Anthropic→Chat→Responses→Anthropic 四轮真实 sampling（11.21 秒），严格验证 route revision `1→2→3→4`、durable timeline、assistant provenance、四条 usage record、response/event/read 一致性、Chat history 无 reasoning 与 public secret-negative。实际 continuity 为 `preserved→preserved→preserved`，该次四轮样本无需过滤；Chat history 无 reasoning 的真实约束与跨 rail reasoning 过滤分别由该 evaluator 和 deterministic request-view 回归覆盖。三条 rail 的真实独立合约与同 session 热切换闭环均已完成；Linux/Windows/Desktop/物理终端及完整并发/child/compaction/fallback 矩阵仍未执行或未逐项 witness，继续如实标记。三 rail 验收还暴露并修复 rollout validator 将所有带 provenance 的 Chat 文本误判为 reasoning-shape 错误的问题，并增加无 reasoning Chat provenance read 回归。凭据、endpoint、raw provider response 与完整 transcript 均未打印、落盘到测试配置或提交。

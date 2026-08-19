@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::history::History;
 use crate::history::estimate_message_tokens;
 use crate::provider_route::FrozenProviderAttempt;
+use crate::provider_route::InheritedProviderModelOverride;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -257,9 +258,10 @@ pub async fn run_compaction(
     cancel: &CancellationToken,
 ) -> Result<CompactionStats> {
     history.ensure_initial_provider_route(&cfg.provider_route)?;
+    let model = InheritedProviderModelOverride::parse(model).map_err(anyhow::Error::msg)?;
     let provider_route = cfg
         .provider_route
-        .child_route(Some(model))
+        .child_route(Some(&model))
         .map_err(anyhow::Error::msg)?;
     let provider_attempt = provider_route.primary_attempt();
     match compact_once(
@@ -830,9 +832,10 @@ mod tests {
         }]));
         history.record(Message::user_text("current request"));
 
+        let fallback_model = InheritedProviderModelOverride::parse("fallback-model").unwrap();
         let fallback_route = cfg
             .provider_route
-            .child_route(Some("fallback-model"))
+            .child_route(Some(&fallback_model))
             .unwrap();
         let result = compact_once(
             &cfg,

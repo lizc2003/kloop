@@ -432,7 +432,7 @@ fn provider_request_view(
 
     let mut projected = Vec::with_capacity(messages.len());
     for message in messages {
-        if !message_has_reasoning(message) {
+        if !message.has_reasoning() {
             projected.push(message.clone());
             continue;
         }
@@ -477,18 +477,21 @@ fn provider_request_view(
 
         if source.api_family == ProviderApiFamily::OpenAiChatCompletions
             || (source.api_family == ProviderApiFamily::OpenAiResponses
-                && message.content.iter().any(block_has_redacted_reasoning))
+                && message
+                    .content
+                    .iter()
+                    .any(ContentBlock::has_redacted_reasoning))
         {
             return Err(kloop_provider::ProviderFailure::protocol(
                 "reasoning history block shape does not match its producing API family",
             ));
         }
 
-        if source.exact_replay_compatible(attempt.identity()) {
+        let chat_target = attempt.identity().api_family == ProviderApiFamily::OpenAiChatCompletions;
+        if !chat_target && source.exact_replay_compatible(attempt.identity()) {
             projected.push(message.clone());
             continue;
         }
-        let chat_target = attempt.identity().api_family == ProviderApiFamily::OpenAiChatCompletions;
         let sanctioned_switch = attempt.identity().attempt_kind == ProviderAttemptKind::Primary
             && source.route_revision < active.revision
             && routes[source_index + 1..]
@@ -503,7 +506,7 @@ fn provider_request_view(
         message.content = message
             .content
             .into_iter()
-            .filter_map(strip_reasoning_block)
+            .filter_map(ContentBlock::into_without_reasoning)
             .collect();
         message.provider_provenance = None;
         if message.role != Role::Assistant || !message.content.is_empty() {
@@ -511,66 +514,6 @@ fn provider_request_view(
         }
     }
     Ok(projected)
-}
-
-fn message_has_reasoning(message: &Message) -> bool {
-    message.content.iter().any(block_has_reasoning)
-}
-
-fn block_has_reasoning(block: &ContentBlock) -> bool {
-    match block {
-        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => true,
-        ContentBlock::ToolResult {
-            content: ToolResultContent::Blocks(blocks),
-            ..
-        } => blocks.iter().any(block_has_reasoning),
-        ContentBlock::Text { .. }
-        | ContentBlock::Image { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult {
-            content: ToolResultContent::Text(_),
-            ..
-        } => false,
-    }
-}
-
-fn block_has_redacted_reasoning(block: &ContentBlock) -> bool {
-    match block {
-        ContentBlock::RedactedThinking { .. } => true,
-        ContentBlock::ToolResult {
-            content: ToolResultContent::Blocks(blocks),
-            ..
-        } => blocks.iter().any(block_has_redacted_reasoning),
-        ContentBlock::Text { .. }
-        | ContentBlock::Image { .. }
-        | ContentBlock::Thinking { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult {
-            content: ToolResultContent::Text(_),
-            ..
-        } => false,
-    }
-}
-
-fn strip_reasoning_block(block: ContentBlock) -> Option<ContentBlock> {
-    match block {
-        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content: ToolResultContent::Blocks(blocks),
-            is_error,
-        } => Some(ContentBlock::ToolResult {
-            tool_use_id,
-            content: ToolResultContent::Blocks(
-                blocks
-                    .into_iter()
-                    .filter_map(strip_reasoning_block)
-                    .collect(),
-            ),
-            is_error,
-        }),
-        other => Some(other),
-    }
 }
 
 /// A resumed session shares the offload dir with the files its earlier run
@@ -952,6 +895,19 @@ mod tests {
                     thinking: "readable reasoning".into(),
                     signature: "opaque".into(),
                 },
+                ContentBlock::ToolResult {
+                    tool_use_id: "nested".into(),
+                    content: ToolResultContent::Blocks(vec![
+                        ContentBlock::Text {
+                            text: "keep nested text".into(),
+                        },
+                        ContentBlock::Thinking {
+                            thinking: "nested reasoning".into(),
+                            signature: "nested opaque".into(),
+                        },
+                    ]),
+                    is_error: false,
+                },
                 ContentBlock::Text {
                     text: "answer".into(),
                 },
@@ -974,9 +930,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             view_b[1].content,
-            vec![ContentBlock::Text {
-                text: "answer".into()
-            }]
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "nested".into(),
+                    content: ToolResultContent::Blocks(vec![ContentBlock::Text {
+                        text: "keep nested text".into(),
+                    }]),
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "answer".into()
+                },
+            ]
         );
         assert_eq!(history.messages(), canonical.as_slice());
         let fallback_error = history
@@ -989,6 +954,79 @@ mod tests {
             .provider_request_view(&state.freeze().primary_attempt())
             .unwrap();
         assert_eq!(view_a, canonical);
+    }
+
+    #[test]
+    fn chat_request_view_validates_source_then_removes_reasoning() {
+        use std::sync::Arc;
+
+        use crate::provider_route::ProviderCatalog;
+        use crate::provider_route::ProviderCatalogEntry;
+        use crate::provider_route::SessionProviderState;
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::Provider;
+
+        let source_provider = Provider::mock(Vec::new());
+        let source_fingerprint = source_provider.endpoint_fingerprint();
+        let chat_provider = || Provider::OpenAiCompat {
+            key: "unused".into(),
+            base: "https://chat.invalid".into(),
+        };
+        let chat_fingerprint = chat_provider().endpoint_fingerprint();
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                ProviderCatalogEntry {
+                    id: "source".into(),
+                    api_family: ProviderApiFamily::Mock,
+                    endpoint_fingerprint: source_fingerprint,
+                    default_model: "source-model".into(),
+                    models: vec!["source-model".into()],
+                    fallback_model: None,
+                    availability: ProviderAvailabilityCode::Ready,
+                    factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+                },
+                ProviderCatalogEntry {
+                    id: "chat".into(),
+                    api_family: ProviderApiFamily::OpenAiChatCompletions,
+                    endpoint_fingerprint: chat_fingerprint,
+                    default_model: "chat-model".into(),
+                    models: vec!["chat-model".into()],
+                    fallback_model: None,
+                    availability: ProviderAvailabilityCode::Ready,
+                    factory: Arc::new(move || Ok(chat_provider())),
+                },
+            ])
+            .unwrap(),
+        );
+        let initial = catalog.initial_route("source", None).unwrap();
+        let state = SessionProviderState::from_route(catalog, initial.clone());
+        let mut history = History::new(temp_dir("chat-request-view"));
+        history.ensure_initial_provider_route(&initial).unwrap();
+        history.record(Message::user_text("question"));
+        history.record_provider_assistant(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "private".into(),
+                    signature: "opaque".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            &initial.primary_attempt(),
+        );
+
+        history.switch_provider(&state, 1, "chat", None).unwrap();
+        let view = history
+            .provider_request_view(&state.freeze().primary_attempt())
+            .unwrap();
+        assert_eq!(
+            view[1].content,
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }]
+        );
+        assert_eq!(view[1].provider_provenance, None);
     }
 
     #[test]

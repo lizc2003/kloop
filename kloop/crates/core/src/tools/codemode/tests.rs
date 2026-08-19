@@ -1185,6 +1185,12 @@ fn run_program_def_renders_a_typescript_api() {
     // String enums render as a union.
     assert!(d.contains(r#"output_mode?: "content" | "count""#), "{d}");
     assert!(d.contains("declare function agent("), "{d}");
+    assert!(
+        d.contains(
+            "type AgentOptions = { agent_type?: string; max_rounds?: number; model?: string }"
+        ),
+        "{d}"
+    );
     assert!(d.contains("declare function parallel<T>"), "{d}");
     assert!(d.contains("declare function pipeline("), "{d}");
     // run_agent is not callable from a program (agent() replaces it); run_program

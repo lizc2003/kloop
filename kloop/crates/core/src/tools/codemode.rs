@@ -721,7 +721,7 @@ impl HostBridge for CoreBridge {
                 }
             };
             let mut agent_input = json!({ "prompt": prompt.clone() });
-            for k in ["agent_type", "max_rounds"] {
+            for k in ["agent_type", "max_rounds", "model"] {
                 if let Some(v) = opts.get(k) {
                     agent_input[k] = v.clone();
                 }
@@ -808,7 +808,7 @@ pub(super) fn run_program_def(
     }
     decls.push_str("};\n");
     decls.push_str(
-        "type AgentOptions = { agent_type?: string; max_rounds?: number };\n\
+        "type AgentOptions = { agent_type?: string; max_rounds?: number; model?: string };\n\
          type OrchestrationScope = {\n\
            agent(prompt: string, opts?: AgentOptions): Promise<string>;\n\
            parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;\n\

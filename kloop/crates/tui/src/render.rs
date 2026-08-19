@@ -800,19 +800,27 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     }
 }
 
-/// The footer's right-hand status: model name and the context gauge
-/// (`~used/window (pct%)`, or `~used tok` with the window off). Empty when no
-/// model is known (mock/tests).
+/// The footer's right-hand status: active provider/model/revision and the
+/// context gauge. During an operation it deliberately reads the frozen route;
+/// only after terminal settlement does it return to the idle selection.
 fn system_status(app: &App) -> String {
-    if app.model.is_empty() {
+    let route = app.display_route();
+    let identity = route.map(|route| {
+        format!(
+            "{} / {} · r{}",
+            route.provider_id, route.model, route.revision
+        )
+    });
+    if identity.is_none() && app.model.is_empty() {
         return String::new();
     }
+    let identity = identity.unwrap_or_else(|| app.model.clone());
     match app.context_window {
         Some(window) if window > 0 => {
             let pct = (app.context_used as f64 / window as f64 * 100.0).round() as u64;
-            format!("{} · {}% ctx", app.model, pct.min(100))
+            format!("{identity} · {}% ctx", pct.min(100))
         }
-        _ => format!("{} · ~{} tok", app.model, app.context_used),
+        _ => format!("{identity} · ~{} tok", app.context_used),
     }
 }
 
@@ -1031,10 +1039,11 @@ fn draw_provider_picker(f: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, provider)| {
+                    let selected_model = app.picker_model(provider);
                     let text = pad(
                         &format!(
                             "{}  {}  {:?}",
-                            provider.id, provider.default_model, provider.availability
+                            provider.id, selected_model, provider.availability
                         ),
                         inner_w,
                     );
@@ -2249,8 +2258,38 @@ mod tests {
         assert!(narrow.contains("["), "the mode badge still shows: {narrow}");
     }
 
-    /// The activity line while running: an animated spinner glyph, a shimmering
-    /// verb, and the elapsed + interrupt hint.
+    #[test]
+    fn footer_shows_selected_route_and_preserves_frozen_route_while_running() {
+        let old = kloop_protocol::ActiveProviderRoute {
+            revision: 4,
+            provider_id: "alpha".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "a-model".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let new = kloop_protocol::ActiveProviderRoute {
+            revision: 5,
+            provider_id: "beta".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "b-model".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+        };
+        let mut app = App::new("s".into())
+            .with_context("legacy-model".into(), Some(100), 25)
+            .with_route(old.clone());
+        assert!(system_status(&app).contains("alpha / a-model · r4"));
+
+        app.running = true;
+        app.freeze_selected_route();
+        app.apply(crate::events::AgentEvent::ProviderChanged(new));
+        assert!(system_status(&app).contains("alpha / a-model · r4"));
+
+        app.apply(crate::events::AgentEvent::Core(
+            kloop_core::event::Event::TurnEnded(kloop_core::agent::EndReason::Completed),
+        ));
+        assert!(system_status(&app).contains("beta / b-model · r5"));
+    }
+
     #[test]
     fn activity_line_shows_spinner_and_elapsed() {
         let mut app = App::new("s".into());

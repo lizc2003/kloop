@@ -29,6 +29,7 @@ use serde::Serialize;
 
 use crate::inbox::STEERING_PREFIX;
 use crate::provider_route::FrozenProviderRoute;
+use crate::provider_route::validate_timeline;
 use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::AssistantOutcome;
@@ -744,6 +745,44 @@ fn seq_of(meta: &LineMeta) -> u64 {
     checked_seq_of(meta).unwrap_or(0)
 }
 
+fn validate_envelope(lines: &[RolloutLine]) -> io::Result<()> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut previous: Option<(&str, u64)> = None;
+    for line in lines {
+        let meta = line.meta();
+        let seq = checked_seq_of(meta)?;
+        if let Some((previous_id, previous_seq)) = previous {
+            if previous_seq
+                .checked_add(1)
+                .is_none_or(|expected| seq != expected)
+            {
+                return Err(invalid(
+                    "session line id sequences must strictly increase by one".into(),
+                ));
+            }
+            if meta.parent.as_deref() != Some(previous_id) {
+                return Err(invalid(
+                    "session line parent must reference the preceding line".into(),
+                ));
+            }
+        } else if let Some(parent) = meta.parent.as_deref() {
+            let current_prefix = meta.id.rsplit_once('#').map(|(prefix, _)| prefix);
+            let valid_fork_parent = parent.rsplit_once('#').is_some_and(|(prefix, seq)| {
+                !prefix.is_empty()
+                    && prefix != current_prefix.unwrap_or_default()
+                    && seq.parse::<u64>().is_ok()
+            });
+            if meta.subagent_of.is_some() || !valid_fork_parent {
+                return Err(invalid(
+                    "the first session line parent must be a valid cross-file fork origin".into(),
+                ));
+            }
+        }
+        previous = Some((&meta.id, seq));
+    }
+    Ok(())
+}
+
 fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
     let mut routes: Vec<ProviderRouteReceipt> = Vec::new();
@@ -763,41 +802,9 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
                 "provider route receipt boundary/source does not match its line".into(),
             ));
         }
-        match routes.last() {
-            None if receipt.revision == 1 && receipt.source == ProviderRouteSource::Initial => {}
-            None => {
-                return Err(invalid(
-                    "provider route timeline must start with initial revision 1".into(),
-                ));
-            }
-            Some(previous)
-                if receipt.source == ProviderRouteSource::ExplicitSwitch
-                    && previous
-                        .revision
-                        .checked_add(1)
-                        .is_some_and(|next| next == receipt.revision) => {}
-            Some(_) => {
-                return Err(invalid(
-                    "provider route revisions must be unique and advance by one".into(),
-                ));
-            }
-        }
-        if receipt.provider_id.trim().is_empty()
-            || receipt.endpoint_fingerprint.trim().is_empty()
-            || receipt.primary_model.trim().is_empty()
-            || receipt.fallback_model.as_deref() == Some("")
-        {
-            return Err(invalid(
-                "provider route receipt contains an empty identity".into(),
-            ));
-        }
         routes.push(receipt.clone());
     }
-    if routes.is_empty() {
-        return Err(invalid(
-            "session is missing its provider route timeline".into(),
-        ));
-    }
+    validate_timeline(&routes).map_err(|_| invalid("provider route timeline is invalid".into()))?;
 
     let first_message = lines.iter().find_map(|line| match line {
         RolloutLine::Message { meta, .. } => Some(seq_of(meta)),
@@ -919,12 +926,13 @@ fn validate_provider_message(
             "provider provenance identity does not match its producing route",
         ));
     }
-    if source.api_family == kloop_protocol::ProviderApiFamily::OpenAiChatCompletions
-        || (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiResponses
-            && message
-                .content
-                .iter()
-                .any(rollout_block_has_redacted_reasoning))
+    if has_reasoning
+        && (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiChatCompletions
+            || (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiResponses
+                && message
+                    .content
+                    .iter()
+                    .any(rollout_block_has_redacted_reasoning)))
     {
         return Err(invalid(
             "provider reasoning block shape does not match its producing API family",
@@ -971,6 +979,7 @@ fn rollout_block_has_redacted_reasoning(block: &ContentBlock) -> bool {
 fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let (lines, intact_end) = intact_lines(raw)?;
     validate_provider_routes(&lines)?;
+    validate_envelope(&lines)?;
     let mut parsed = ParsedSession {
         items: Vec::new(),
         provider_usage: UsageLedger::default(),
@@ -1951,7 +1960,7 @@ mod tests {
             .unwrap();
         writeln!(
             file,
-            r#"{{"type":"message","id":"session#2","parent":"session#1","ts":1,"future_field":42,"role":"user","content":[{{"type":"text","text":"new"}}]}}"#
+            r#"{{"type":"message","id":"session#3","parent":"session#2","ts":1,"future_field":42,"role":"user","content":[{{"type":"text","text":"new"}}]}}"#
         )
         .unwrap();
 
@@ -2701,6 +2710,36 @@ mod tests {
     }
 
     #[test]
+    fn chat_text_provenance_survives_read_without_reasoning() {
+        let path = temp_file("chat-text-provenance");
+        let provider = kloop_provider::Provider::OpenAiCompat {
+            key: "test-key".into(),
+            base: "https://chat.invalid".into(),
+        };
+        let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(
+            "chat",
+            provider,
+            "chat-model",
+            vec!["chat-model".into()],
+            None,
+        )
+        .unwrap();
+        let route = catalog.initial_route("chat", Some("chat-model")).unwrap();
+        let mut rollout = Rollout::new_with_initial_route(path.clone(), &route).unwrap();
+        let assistant = Message::assistant_from_provider(
+            vec![ContentBlock::Text {
+                text: "chat answer".into(),
+            }],
+            route.primary_attempt().provenance(2),
+        );
+        rollout.append_message(&assistant).unwrap();
+        assert_eq!(
+            load_session_snapshot(&path).unwrap().messages,
+            vec![assistant]
+        );
+        cleanup(&path);
+    }
+    #[test]
     fn reasoning_provenance_and_typed_terminal_survive_resume_and_fork() {
         let path = temp_file("reasoning-continuity");
         let dir = path.parent().unwrap().to_path_buf();
@@ -3010,6 +3049,91 @@ mod tests {
         assert_eq!(std::fs::read(&invalid_path).unwrap(), before);
         cleanup(&legacy_path);
         cleanup(&invalid_path);
+    }
+
+    #[test]
+    fn malformed_envelopes_and_route_timelines_fail_closed_without_repair() {
+        let path = temp_file("malformed-envelope");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+        drop(rollout);
+
+        let original = raw_lines(&path);
+        let cases = [
+            ("duplicate-id", "id", json!("session#2")),
+            ("regressed-id", "id", json!("session#1")),
+            ("bad-parent", "parent", json!("other#1")),
+        ];
+        for (tag, field, value) in cases {
+            let case_path = temp_file(tag);
+            let mut lines = original.clone();
+            lines[2][field] = value;
+            let raw = lines
+                .iter()
+                .map(|line| format!("{}\n", serde_json::to_string(line).unwrap()))
+                .collect::<String>();
+            std::fs::create_dir_all(case_path.parent().unwrap()).unwrap();
+            std::fs::write(&case_path, raw).unwrap();
+            let before = std::fs::read(&case_path).unwrap();
+            assert!(inspect_session(&case_path).is_err(), "{tag}");
+            assert_eq!(std::fs::read(&case_path).unwrap(), before, "{tag}");
+            cleanup(&case_path);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn duplicate_or_regressed_boundary_and_revision_gap_fail_closed_without_repair() {
+        let path = temp_file("malformed-route-timeline");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        let mut first_switch = fixture_route(3);
+        first_switch.revision = 2;
+        first_switch.source = ProviderRouteSource::ExplicitSwitch;
+        rollout
+            .append_line(RolloutLine::ProviderRouteChanged {
+                meta: rollout.next_meta(),
+                receipt: first_switch,
+            })
+            .unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+        let mut second_switch = fixture_route(5);
+        second_switch.revision = 3;
+        second_switch.source = ProviderRouteSource::ExplicitSwitch;
+        rollout
+            .append_line(RolloutLine::ProviderRouteChanged {
+                meta: rollout.next_meta(),
+                receipt: second_switch,
+            })
+            .unwrap();
+        rollout
+            .append_message(&Message::user_text("three"))
+            .unwrap();
+        drop(rollout);
+
+        let original = raw_lines(&path);
+        let cases = [
+            ("duplicate-boundary", "boundary", json!(3)),
+            ("regressed-boundary", "boundary", json!(2)),
+            ("revision-gap", "revision", json!(4)),
+        ];
+        for (tag, field, value) in cases {
+            let case_path = temp_file(tag);
+            let mut lines = original.clone();
+            lines[4][field] = value;
+            let raw = lines
+                .iter()
+                .map(|line| format!("{}\n", serde_json::to_string(line).unwrap()))
+                .collect::<String>();
+            std::fs::create_dir_all(case_path.parent().unwrap()).unwrap();
+            std::fs::write(&case_path, raw).unwrap();
+            let before = std::fs::read(&case_path).unwrap();
+            assert!(inspect_session(&case_path).is_err(), "{tag}");
+            assert_eq!(std::fs::read(&case_path).unwrap(), before, "{tag}");
+            cleanup(&case_path);
+        }
+        cleanup(&path);
     }
 
     #[test]

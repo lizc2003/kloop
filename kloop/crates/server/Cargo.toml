@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 kloop-core = { workspace = true }
 kloop-protocol = { workspace = true }
+kloop-provider = { workspace = true }
 
 anyhow = { workspace = true }
 getrandom = { workspace = true }
@@ -16,4 +17,3 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-kloop-provider = { workspace = true }

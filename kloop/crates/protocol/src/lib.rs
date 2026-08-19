@@ -284,6 +284,64 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    pub fn has_reasoning(&self) -> bool {
+        match self {
+            Self::Thinking { .. } | Self::RedactedThinking { .. } => true,
+            Self::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } => blocks.iter().any(Self::has_reasoning),
+            Self::Text { .. }
+            | Self::Image { .. }
+            | Self::ToolUse { .. }
+            | Self::ToolResult {
+                content: ToolResultContent::Text(_),
+                ..
+            } => false,
+        }
+    }
+
+    pub fn has_redacted_reasoning(&self) -> bool {
+        match self {
+            Self::RedactedThinking { .. } => true,
+            Self::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } => blocks.iter().any(Self::has_redacted_reasoning),
+            Self::Text { .. }
+            | Self::Thinking { .. }
+            | Self::Image { .. }
+            | Self::ToolUse { .. }
+            | Self::ToolResult {
+                content: ToolResultContent::Text(_),
+                ..
+            } => false,
+        }
+    }
+
+    pub fn into_without_reasoning(self) -> Option<Self> {
+        match self {
+            Self::Thinking { .. } | Self::RedactedThinking { .. } => None,
+            Self::ToolResult {
+                tool_use_id,
+                content: ToolResultContent::Blocks(blocks),
+                is_error,
+            } => Some(Self::ToolResult {
+                tool_use_id,
+                content: ToolResultContent::Blocks(
+                    blocks
+                        .into_iter()
+                        .filter_map(Self::into_without_reasoning)
+                        .collect(),
+                ),
+                is_error,
+            }),
+            other => Some(other),
+        }
+    }
+}
+
 /// The content of a tool_result: plain text (the overwhelming common case —
 /// every tool that returns a string) or a block array (a tool that returns an
 /// image, e.g. `read_file` on an image file). Serializes **untagged**, exactly
@@ -439,6 +497,8 @@ pub struct ActiveProviderRoute {
     pub provider_id: String,
     pub api_family: ProviderApiFamily,
     pub model: String,
+    /// Bounded public receipt for reasoning continuity at this route boundary.
+    pub continuity: ReasoningContinuity,
 }
 
 /// Private replay identity bound by the History owner when a provider-produced
@@ -538,12 +598,7 @@ impl Message {
     }
 
     pub fn has_reasoning(&self) -> bool {
-        self.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-            )
-        })
+        self.content.iter().any(ContentBlock::has_reasoning)
     }
 
     /// Display-safe history: provider identity and opaque payloads stay
@@ -908,6 +963,63 @@ mod tests {
         assert_eq!(back, msg);
         // Roles serialize lowercase.
         assert!(wire.contains("\"role\":\"assistant\""));
+    }
+
+    #[test]
+    fn reasoning_helpers_recurse_through_tool_result_blocks() {
+        let nested = ContentBlock::ToolResult {
+            tool_use_id: "outer".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "keep".into(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "inner".into(),
+                    content: ToolResultContent::Blocks(vec![
+                        ContentBlock::Thinking {
+                            thinking: "secret".into(),
+                            signature: "opaque".into(),
+                        },
+                        ContentBlock::RedactedThinking {
+                            data: "encrypted".into(),
+                        },
+                        ContentBlock::Image {
+                            source: ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: "AA==".into(),
+                            },
+                        },
+                    ]),
+                    is_error: false,
+                },
+            ]),
+            is_error: false,
+        };
+        let message = Message::tool_results(vec![nested.clone()]);
+        assert!(message.has_reasoning());
+        assert!(nested.has_redacted_reasoning());
+        assert_eq!(
+            nested.into_without_reasoning(),
+            Some(ContentBlock::ToolResult {
+                tool_use_id: "outer".into(),
+                content: ToolResultContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "keep".into(),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "inner".into(),
+                        content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                            source: ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: "AA==".into(),
+                            },
+                        }]),
+                        is_error: false,
+                    },
+                ]),
+                is_error: false,
+            })
+        );
     }
 
     #[test]

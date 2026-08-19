@@ -879,6 +879,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
                     "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes the prompt or result."},
                     "prompt": {"type": "string", "description": "Complete standalone work description"},
                     "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
+                    "model": {"type": ["string", "null"], "minLength": 1, "pattern": ".*\\S.*", "description": "Optional model override on this sub-agent's inherited frozen provider; it must be in that provider's model allowlist"},
                     "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
                     "max_rounds": {"type": ["integer", "null"], "minimum": 1, "description": "Optional round cap; omitted means no round limit"},
                     "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}

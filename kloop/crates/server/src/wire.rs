@@ -64,6 +64,7 @@ pub enum Outgoing {
         id: Option<RequestId>,
         code: i64,
         message: String,
+        data: Option<Value>,
     },
     Notification {
         method: &'static str,
@@ -103,8 +104,17 @@ impl Outgoing {
             Outgoing::Response { id, result } => {
                 json!({"jsonrpc": "2.0", "id": id, "result": result})
             }
-            Outgoing::Error { id, code, message } => {
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+            Outgoing::Error {
+                id,
+                code,
+                message,
+                data,
+            } => {
+                let mut error = json!({"code": code, "message": message});
+                if let Some(data) = data {
+                    error["data"] = data.clone();
+                }
+                json!({"jsonrpc": "2.0", "id": id, "error": error})
             }
             Outgoing::Notification { method, params } => {
                 json!({"jsonrpc": "2.0", "method": method, "params": params})
@@ -346,6 +356,7 @@ mod tests {
                     id: None,
                     code: PARSE_ERROR,
                     message: "bad line".into(),
+                    data: None,
                 },
                 r#"{"error":{"code":-32700,"message":"bad line"},"id":null,"jsonrpc":"2.0"}"#,
             ),

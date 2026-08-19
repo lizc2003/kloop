@@ -746,6 +746,7 @@ mod tests {
             provider_id: "test".into(),
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: model.into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
         }
     }
 
@@ -1143,6 +1144,7 @@ mod tests {
                     "providerId": "test",
                     "apiFamily": "mock",
                     "model": "model-b",
+                    "continuity": "preserved",
                 },
                 "resumable": true,
             })

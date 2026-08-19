@@ -33,6 +33,10 @@ pub enum AgentEvent {
     /// system block, not a one-line note — emitted by the worker directly.
     System(String),
     ProviderChanged(kloop_protocol::ActiveProviderRoute),
+    /// The immutable route snapshot used by the current turn/operation.
+    /// ProviderChanged may arrive while this operation is still settling; it
+    /// updates the idle selection but must not rewrite this snapshot.
+    RouteFrozen(kloop_protocol::ActiveProviderRoute),
     ProviderPicker(Vec<kloop_protocol::ProviderDescriptor>),
     ClearTranscript,
     /// `/exit` ran on the worker; the UI loop quits (same clean teardown as a
@@ -47,6 +51,7 @@ pub enum AgentEvent {
     Forked {
         session_id: String,
         messages: Vec<Message>,
+        route: kloop_protocol::ActiveProviderRoute,
     },
     /// A permission prompt. The decision travels back over `reply`; dropping
     /// the sender answers Deny (the agent side treats a closed channel as no).

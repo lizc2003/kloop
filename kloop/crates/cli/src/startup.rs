@@ -428,11 +428,15 @@ pub(crate) fn load_agent_types(root: &toml::Table) -> Result<Vec<AgentType>> {
         let str_field = |key: &str| -> Result<Option<String>> {
             match def.get(key) {
                 None => Ok(None),
-                Some(v) => Ok(Some(
-                    v.as_str()
-                        .with_context(|| format!("[agents.{name}].{key} must be a string"))?
-                        .to_string(),
-                )),
+                Some(v) => {
+                    let value = v
+                        .as_str()
+                        .with_context(|| format!("[agents.{name}].{key} must be a string"))?;
+                    if key == "model" && value.trim().is_empty() {
+                        bail!("[agents.{name}].model must be a non-blank string");
+                    }
+                    Ok(Some(value.to_string()))
+                }
             }
         };
         let tools = match def.get("tools") {
@@ -1384,6 +1388,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             "[agents.x]\n",
             "[agents.x]\ndescription = 3\n",
             "[agents.x]\ndescription = \"d\"\nmodel = 5\n",
+            "[agents.x]\ndescription = \"d\"\nmodel = \"  \"\n",
             "[agents.x]\ndescription = \"d\"\ntools = \"grep\"\n",
             "[agents.x]\ndescription = \"d\"\ntools = [3]\n",
             "[agents.x]\ndescription = \"d\"\nprompt = \"p\"\n",

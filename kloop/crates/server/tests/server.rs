@@ -76,7 +76,11 @@ impl TestClient {
     }
 
     async fn recv(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(30), self.lines.next_line())
+        self.recv_with_timeout(Duration::from_secs(30)).await
+    }
+
+    async fn recv_with_timeout(&mut self, timeout: Duration) -> Value {
+        let line = tokio::time::timeout(timeout, self.lines.next_line())
             .await
             .expect("timed out waiting for a server line")
             .unwrap()
@@ -207,7 +211,7 @@ fn mock_route() -> kloop_core::provider_route::FrozenProviderRoute {
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
 fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
-    Arc::new(move |options, approver, questioner, _notify| {
+    Arc::new(move |options, _catalog, approver, questioner, _notify| {
         let permissions = if gated {
             Permissions::new(
                 Mode::Manual,
@@ -285,8 +289,8 @@ fn clocked_scheduler_factory(
     clock: Arc<kloop_core::scheduler::ManualClock>,
 ) -> ConfigFactory {
     let inner = factory(turns, offload, false);
-    Arc::new(move |options, approver, questioner, notify| {
-        let mut cfg = inner(options, approver, questioner, notify)?;
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let mut cfg = inner(options, catalog, approver, questioner, notify)?;
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());
         cfg.local_agent = kloop_core::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox));
         cfg.inbox = Arc::clone(&inbox);
@@ -305,8 +309,8 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
     use kloop_provider::MockTurn;
 
     let inner = factory(Vec::new(), offload, false);
-    Arc::new(move |options, approver, questioner, notify| {
-        let mut cfg = inner(options, approver, questioner, notify)?;
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let mut cfg = inner(options, catalog, approver, questioner, notify)?;
         let (provider_catalog, provider_route) =
             kloop_core::provider_route::ProviderCatalog::from_provider(
                 "mock",
@@ -331,9 +335,9 @@ fn recording_factory(
     seen: Arc<Mutex<Vec<ThreadStartOptions>>>,
 ) -> ConfigFactory {
     let inner = factory(turns, offload, false);
-    Arc::new(move |options, approver, questioner, notify| {
+    Arc::new(move |options, catalog, approver, questioner, notify| {
         seen.lock().unwrap().push(options.clone());
-        inner(options, approver, questioner, notify)
+        inner(options, catalog, approver, questioner, notify)
     })
 }
 
@@ -343,10 +347,10 @@ fn switch_factory(
     seen_b: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
 ) -> ConfigFactory {
     let inner = factory(Vec::new(), offload, false);
-    Arc::new(move |options, approver, questioner, notify| {
+    Arc::new(move |options, catalog, approver, questioner, notify| {
         let selected_provider = options.provider_id.clone().unwrap_or_else(|| "a".into());
         let selected_model = options.model.clone().unwrap_or_else(|| "shared".into());
-        let mut cfg = inner(options, approver, questioner, notify)?;
+        let mut cfg = inner(options, catalog, approver, questioner, notify)?;
         let provider_a = Provider::Mock {
             turns: Mutex::new(vec![kloop_provider::MockTurn::Blocks(vec![text("from a")])].into()),
             seen: Arc::clone(&seen_a),
@@ -390,6 +394,103 @@ fn switch_factory(
     })
 }
 
+fn real_switch_factory(offload: PathBuf) -> ConfigFactory {
+    let inner = factory(Vec::new(), offload, false);
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let provider_id = options
+            .provider_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("real route test requires an explicit provider"))?;
+        let model = options
+            .model
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("real route test requires an explicit model"))?;
+        let mut cfg = inner(options, Arc::clone(&catalog), approver, questioner, notify)?;
+        cfg.provider_route = catalog
+            .initial_route(&provider_id, Some(&model))
+            .map_err(anyhow::Error::new)?;
+        cfg.provider_catalog = catalog;
+        cfg.system = "Answer the requested sentinel directly. Do not call tools.".into();
+        cfg.max_rounds = Some(3);
+        Ok(cfg)
+    })
+}
+
+fn required_real_env(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| panic!("set {name} to run the ignored real route-switch contract"))
+}
+
+async fn run_real_provider_turn(client: &mut TestClient, thread_id: &str, prompt: &str) {
+    let request_id = client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": prompt}),
+        )
+        .await;
+    let mut accepted = false;
+    loop {
+        let message = client.recv_with_timeout(Duration::from_secs(600)).await;
+        if message["id"] == request_id {
+            assert!(
+                message.get("error").is_none(),
+                "real turn request was rejected"
+            );
+            accepted = true;
+        }
+        if message["method"] == "turn/completed" {
+            assert!(accepted, "turn completed before its request was accepted");
+            assert_eq!(
+                message["params"]["turn"]["status"], "completed",
+                "real provider turn did not complete"
+            );
+            return;
+        }
+    }
+}
+
+async fn switch_real_provider(
+    client: &mut TestClient,
+    thread_id: &str,
+    provider_id: &str,
+    model: &str,
+    expected_revision: u64,
+) -> Value {
+    let request_id = client
+        .request(
+            "thread/provider/switch",
+            json!({
+                "threadId": thread_id,
+                "providerId": provider_id,
+                "model": model,
+                "expectedRouteRevision": expected_revision,
+            }),
+        )
+        .await;
+    let mut changed = None;
+    loop {
+        let message = client.recv_with_timeout(Duration::from_secs(60)).await;
+        if message["method"] == "thread/provider/changed"
+            && message["params"]["route"]["providerId"] == provider_id
+        {
+            changed = Some(message["params"]["route"].clone());
+        }
+        if message["id"] == request_id {
+            assert!(
+                message.get("error").is_none(),
+                "real provider switch was rejected"
+            );
+            let route = message["result"]["route"].clone();
+            assert_eq!(route["providerId"], provider_id);
+            assert_eq!(route["revision"], expected_revision + 1);
+            assert_eq!(changed.as_ref(), Some(&route));
+            return route;
+        }
+    }
+}
+
 fn tool_use(id: &str, name: &str, input: Value) -> AssistantBlock {
     AssistantBlock::ToolUse {
         id: id.into(),
@@ -430,7 +531,7 @@ fn worktree_factory(
     offload: PathBuf,
     cwd: PathBuf,
 ) -> ConfigFactory {
-    Arc::new(move |_options, _approver, questioner, _notify| {
+    Arc::new(move |_options, _catalog, _approver, questioner, _notify| {
         let (provider_catalog, provider_route) =
             kloop_core::provider_route::ProviderCatalog::from_provider(
                 "mock",
@@ -583,14 +684,15 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
         paths,
     );
-    server.providers = vec![kloop_protocol::ProviderDescriptor {
-        id: "mock".into(),
-        api_family: kloop_protocol::ProviderApiFamily::Mock,
-        default_model: "model-default".into(),
-        models: vec!["model-default".into()],
-        fallback_model: None,
-        availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-    }];
+    server.provider_catalog = kloop_core::provider_route::ProviderCatalog::from_provider(
+        "mock",
+        Provider::mock(Vec::new()),
+        "model-default",
+        vec!["model-default".into(), "thread-model".into()],
+        None,
+    )
+    .unwrap()
+    .0;
     server.mcp_servers = vec![
         McpServerStatus {
             name: "memory".into(),
@@ -623,6 +725,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                 provider_id: "mock".into(),
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "model-default".into(),
+                continuity: kloop_protocol::ReasoningContinuity::Preserved,
             }),
             permission_mode: "manual".into(),
             context_window: Some(200_000),
@@ -687,7 +790,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                 "id": "mock",
                 "apiFamily": "mock",
                 "defaultModel": "model-default",
-                "models": ["model-default"],
+                "models": ["model-default", "thread-model"],
                 "availability": "ready",
             }]},
         })
@@ -708,6 +811,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                     "providerId": "mock",
                     "apiFamily": "mock",
                     "model": "model-default",
+                    "continuity": "preserved",
                 },
                 "permissionMode": "manual",
                 "contextWindow": 200_000,
@@ -922,24 +1026,31 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             offload_dir: dirs.offload.clone(),
         },
     );
-    server.providers = vec![
-        kloop_protocol::ProviderDescriptor {
-            id: "a".into(),
-            api_family: kloop_protocol::ProviderApiFamily::Mock,
-            default_model: "shared".into(),
-            models: vec!["shared".into(), "a-other".into()],
-            fallback_model: None,
-            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-        },
-        kloop_protocol::ProviderDescriptor {
-            id: "b".into(),
-            api_family: kloop_protocol::ProviderApiFamily::Mock,
-            default_model: "shared".into(),
-            models: vec!["shared".into(), "b-other".into()],
-            fallback_model: None,
-            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-        },
-    ];
+    server.provider_catalog = Arc::new(
+        kloop_core::provider_route::ProviderCatalog::new(vec![
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: "a".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                default_model: "shared".into(),
+                models: vec!["shared".into(), "a-other".into()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+            },
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: "b".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                default_model: "shared".into(),
+                models: vec!["shared".into(), "b-other".into()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+            },
+        ])
+        .unwrap(),
+    );
     let mut client = start_server_with_config(server);
     client.initialize().await;
     let start_id = client
@@ -955,6 +1066,10 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
         .unwrap()
         .to_string();
     assert_eq!(started["result"]["thread"]["route"]["providerId"], "a");
+    assert_eq!(
+        started["result"]["thread"]["route"]["continuity"],
+        "preserved"
+    );
 
     let switch_id = client
         .request(
@@ -975,6 +1090,8 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             message["method"] == "thread/provider/changed"
                 && message["params"]["route"]["providerId"] == "b"
                 && message["params"]["route"]["revision"] == 2
+                && message["params"]["continuity"] == "preserved"
+                && message["params"]["route"]["continuity"] == "preserved"
         }),
         "{switch_messages:?}"
     );
@@ -983,6 +1100,8 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
         .find(|message| message["id"] == switch_id)
         .unwrap();
     assert_eq!(switched["result"]["route"]["revision"], 2);
+    assert_eq!(switched["result"]["continuity"], "preserved");
+    assert_eq!(switched["result"]["route"]["continuity"], "preserved");
     assert!(seen_a.lock().unwrap().is_empty());
     assert!(seen_b.lock().unwrap().is_empty());
 
@@ -1004,6 +1123,372 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     let read = client.recv().await;
     assert_eq!(read["result"]["thread"]["route"]["providerId"], "b");
     assert_eq!(read["result"]["thread"]["route"]["revision"], 2);
+    assert_eq!(read["result"]["thread"]["route"]["continuity"], "preserved");
+
+    client
+        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .await;
+    let snapshot = client.recv().await;
+    assert_eq!(
+        snapshot["result"]["snapshot"]["thread"]["route"],
+        json!({
+            "revision": 2,
+            "providerId": "b",
+            "apiFamily": "mock",
+            "model": "shared",
+            "continuity": "preserved",
+        })
+    );
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires real Anthropic, OpenAI Chat, and OpenAI Responses credentials"]
+async fn real_three_rail_route_switch_contract() {
+    let anthropic_key = required_real_env("ANTHROPIC_API_KEY");
+    let anthropic_base = required_real_env("ANTHROPIC_BASE_URL")
+        .trim_end_matches('/')
+        .to_string();
+    let anthropic_model = required_real_env("ANTHROPIC_MODEL");
+    let responses_key = required_real_env("OPENAI_API_KEY");
+    let responses_base = required_real_env("OPENAI_BASE_URL")
+        .trim_end_matches('/')
+        .to_string();
+    let responses_model = required_real_env("OPENAI_MODEL");
+    let responses_effort = std::env::var("KLOOP_EFFORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "high".into());
+
+    let anthropic_factory_key = anthropic_key.clone();
+    let anthropic_factory_base = anthropic_base.clone();
+    let chat_factory_key = responses_key.clone();
+    let chat_factory_base = responses_base.clone();
+    let responses_factory_key = responses_key.clone();
+    let responses_factory_base = responses_base.clone();
+    let catalog = Arc::new(
+        kloop_core::provider_route::ProviderCatalog::new(vec![
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: "anthropic-real".into(),
+                api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
+                endpoint_fingerprint: Provider::endpoint_fingerprint_for(
+                    kloop_protocol::ProviderApiFamily::AnthropicMessages,
+                    &anthropic_base,
+                ),
+                default_model: anthropic_model.clone(),
+                models: vec![anthropic_model.clone()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(move || {
+                    Ok(Provider::Anthropic {
+                        key: anthropic_factory_key.clone(),
+                        base: anthropic_factory_base.clone(),
+                        cache: true,
+                        thinking: kloop_provider::ThinkingMode::Unset,
+                    })
+                }),
+            },
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: "chat-real".into(),
+                api_family: kloop_protocol::ProviderApiFamily::OpenAiChatCompletions,
+                endpoint_fingerprint: Provider::endpoint_fingerprint_for(
+                    kloop_protocol::ProviderApiFamily::OpenAiChatCompletions,
+                    &responses_base,
+                ),
+                default_model: responses_model.clone(),
+                models: vec![responses_model.clone()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(move || {
+                    Ok(Provider::OpenAiCompat {
+                        key: chat_factory_key.clone(),
+                        base: chat_factory_base.clone(),
+                    })
+                }),
+            },
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: "responses-real".into(),
+                api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                endpoint_fingerprint: Provider::endpoint_fingerprint_for(
+                    kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                    &responses_base,
+                ),
+                default_model: responses_model.clone(),
+                models: vec![responses_model.clone()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                factory: Arc::new(move || {
+                    Ok(Provider::OpenAiResponses {
+                        key: responses_factory_key.clone(),
+                        base: responses_factory_base.clone(),
+                        effort: Some(responses_effort.clone()),
+                    })
+                }),
+            },
+        ])
+        .unwrap(),
+    );
+
+    let dirs = test_dirs("real-provider-switch");
+    std::fs::create_dir_all(&dirs.root).unwrap();
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    let mut server = ServerConfig::new(
+        real_switch_factory(dirs.offload.clone()),
+        ServerPaths {
+            sessions_dir: dirs.sessions.clone(),
+            offload_dir: dirs.offload.clone(),
+        },
+    );
+    server.provider_catalog = Arc::clone(&catalog);
+    let mut client = start_server_with_config(server);
+    client.initialize().await;
+
+    let catalog_id = client.request("provider/catalog/read", json!({})).await;
+    let catalog_response = client.recv().await;
+    assert_eq!(catalog_response["id"], catalog_id);
+    let provider_ids = catalog_response["result"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|provider| provider["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        provider_ids,
+        ["anthropic-real", "chat-real", "responses-real"]
+    );
+
+    let start_id = client
+        .request(
+            "thread/start",
+            json!({
+                "cwd": cwd,
+                "providerId": "anthropic-real",
+                "model": anthropic_model,
+            }),
+        )
+        .await;
+    let started = client.recv_with_timeout(Duration::from_secs(60)).await;
+    assert_eq!(started["id"], start_id);
+    assert!(started.get("error").is_none(), "real thread start failed");
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        started["result"]["thread"]["route"]["providerId"],
+        "anthropic-real"
+    );
+    assert_eq!(started["result"]["thread"]["route"]["revision"], 1);
+
+    run_real_provider_turn(
+        &mut client,
+        &thread_id,
+        "Reply exactly ANTHROPIC_ROUTE_A_92 and nothing else.",
+    )
+    .await;
+    let route_chat =
+        switch_real_provider(&mut client, &thread_id, "chat-real", &responses_model, 1).await;
+    run_real_provider_turn(
+        &mut client,
+        &thread_id,
+        "Reply exactly CHAT_ROUTE_C_92 and nothing else.",
+    )
+    .await;
+    let route_responses = switch_real_provider(
+        &mut client,
+        &thread_id,
+        "responses-real",
+        &responses_model,
+        2,
+    )
+    .await;
+    run_real_provider_turn(
+        &mut client,
+        &thread_id,
+        "Reply exactly RESPONSES_ROUTE_B_92 and nothing else.",
+    )
+    .await;
+    let route_a = switch_real_provider(
+        &mut client,
+        &thread_id,
+        "anthropic-real",
+        &anthropic_model,
+        3,
+    )
+    .await;
+    run_real_provider_turn(
+        &mut client,
+        &thread_id,
+        "Reply exactly ANTHROPIC_ROUTE_A_RETURN_92 and nothing else.",
+    )
+    .await;
+
+    let read_id = client
+        .request("thread/read", json!({"threadId": thread_id}))
+        .await;
+    let read = loop {
+        let message = client.recv().await;
+        if message["id"] == read_id {
+            break message;
+        }
+    };
+    assert!(
+        read.get("error").is_none(),
+        "thread/read failed: code={} kind={} message={}",
+        read["error"]["code"],
+        read["error"]["data"]["kind"],
+        read["error"]["message"],
+    );
+    assert_eq!(read["result"]["thread"]["route"], route_a);
+    let public = serde_json::to_string(&read).unwrap();
+    for private in [
+        anthropic_key.as_str(),
+        anthropic_base.as_str(),
+        responses_key.as_str(),
+        responses_base.as_str(),
+        "providerProvenance",
+        "endpointFingerprint",
+    ] {
+        assert!(
+            !public.contains(private),
+            "public thread/read leaked private route data"
+        );
+    }
+    client.shutdown().await;
+
+    let session = dirs.sessions.join(format!("{thread_id}.jsonl"));
+    let inspected = kloop_core::rollout::inspect_session(&session).unwrap();
+    let snapshot = inspected.snapshot();
+    assert_eq!(
+        snapshot
+            .provider_routes
+            .iter()
+            .map(|route| (route.revision, route.provider_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "anthropic-real"),
+            (2, "chat-real"),
+            (3, "responses-real"),
+            (4, "anthropic-real"),
+        ]
+    );
+    let assistants = snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == kloop_protocol::Role::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(assistants.len(), 4);
+    assert_eq!(
+        assistants
+            .iter()
+            .map(|message| {
+                let provenance = message.provider_provenance.as_ref().unwrap();
+                (provenance.route_revision, provenance.provider_id.as_str())
+            })
+            .collect::<Vec<_>>(),
+        [
+            (1, "anthropic-real"),
+            (2, "chat-real"),
+            (3, "responses-real"),
+            (4, "anthropic-real"),
+        ]
+    );
+    let expected_chat_continuity = if assistants[0].has_reasoning() {
+        kloop_protocol::ReasoningContinuity::Filtered
+    } else {
+        kloop_protocol::ReasoningContinuity::Preserved
+    };
+    assert!(
+        !assistants[1].has_reasoning(),
+        "Chat assistant history must not contain reasoning"
+    );
+    let expected_responses_continuity = expected_chat_continuity;
+    let expected_a_continuity = if assistants[2].has_reasoning() {
+        kloop_protocol::ReasoningContinuity::Filtered
+    } else {
+        kloop_protocol::ReasoningContinuity::Preserved
+    };
+    assert_eq!(
+        snapshot.provider_routes[1].continuity,
+        expected_chat_continuity
+    );
+    assert_eq!(
+        snapshot.provider_routes[2].continuity,
+        expected_responses_continuity
+    );
+    assert_eq!(
+        snapshot.provider_routes[3].continuity,
+        expected_a_continuity
+    );
+    assert_eq!(
+        route_chat["continuity"],
+        serde_json::to_value(expected_chat_continuity).unwrap()
+    );
+    assert_eq!(
+        route_responses["continuity"],
+        serde_json::to_value(expected_responses_continuity).unwrap()
+    );
+    assert_eq!(
+        route_a["continuity"],
+        serde_json::to_value(expected_a_continuity).unwrap()
+    );
+    assert_eq!(
+        inspected
+            .provider_usage()
+            .records()
+            .iter()
+            .map(|record| (record.route_revision, record.provider_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "anthropic-real"),
+            (2, "chat-real"),
+            (3, "responses-real"),
+            (4, "anthropic-real"),
+        ]
+    );
+
+    println!(
+        "real route-switch acceptance passed: anthropic({anthropic_model}) -> chat({responses_model}) -> responses({responses_model}) -> anthropic({anthropic_model}); revisions=1,2,3,4; continuity={},{},{}; usage_records=4; public_redaction=pass",
+        route_chat["continuity"].as_str().unwrap(),
+        route_responses["continuity"].as_str().unwrap(),
+        route_a["continuity"].as_str().unwrap(),
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn provider_switch_errors_have_stable_kinds() {
+    let dirs = test_dirs("provider-switch-errors");
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let mut client = start_server(
+        switch_factory(
+            dirs.offload.clone(),
+            Arc::clone(&seen_a),
+            Arc::clone(&seen_b),
+        ),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+
+    let switch = client
+        .request(
+            "thread/provider/switch",
+            json!({
+                "threadId": thread_id,
+                "providerId": "not-configured",
+                "expectedRouteRevision": 1,
+            }),
+        )
+        .await;
+    let messages = client.recv_until(|message| message["id"] == switch).await;
+    let response = messages
+        .iter()
+        .find(|message| message["id"] == switch)
+        .unwrap();
+    assert_eq!(response["error"]["data"]["kind"], "unknown_provider");
+
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
@@ -1100,7 +1585,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
     let forked = client.recv().await;
     let fork_id = forked["result"]["thread"]["id"]
         .as_str()
-        .unwrap()
+        .unwrap_or_else(|| panic!("fork response: {forked}"))
         .to_string();
     assert_eq!(forked["result"]["thread"]["cwd"], project_text.as_str());
     assert_eq!(forked["result"]["thread"]["route"]["model"], "model-a");
@@ -2724,6 +3209,24 @@ async fn slash_commands_surface_as_system_notifications() {
         &dirs,
     );
     let tid = client.init_and_start().await;
+
+    // Provider control commands use the idle switch transaction directly: they
+    // emit one bounded system result, not a turn bracket or usage event.
+    client
+        .request("turn/start", json!({"threadId": tid, "input": "/provider"}))
+        .await;
+    let provider_log = client.recv_until(|m| m["method"] == "system").await;
+    assert_eq!(methods_for_thread(&provider_log, &tid), vec!["system"]);
+    let provider_message = provider_log
+        .iter()
+        .find(|message| message["method"] == "system")
+        .unwrap();
+    assert!(
+        provider_message["params"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("active:")
+    );
 
     // /help lists the builtins as a system note; no item events appear.
     client

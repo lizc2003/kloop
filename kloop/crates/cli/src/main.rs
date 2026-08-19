@@ -171,7 +171,7 @@ async fn main() -> Result<ExitCode> {
             let args = args.clone();
             let provider = provider.clone();
             let runtime = runtime.clone();
-            Arc::new(move |options, approver, questioner, notify| {
+            Arc::new(move |options, catalog, approver, questioner, notify| {
                 let project = if args.mock {
                     context::mock(&options.cwd)
                 } else {
@@ -204,14 +204,20 @@ async fn main() -> Result<ExitCode> {
                     skills,
                     &options.cwd,
                 )?;
+                let current_provider = cfg.provider_route.provider_id().to_string();
+                let current_model = cfg.provider_route.primary_model().to_string();
+                cfg.provider_catalog = Arc::clone(&catalog);
                 if options.provider_id.is_some() || options.model.is_some() {
                     let provider_id = options
                         .provider_id
                         .as_deref()
                         .unwrap_or_else(|| provider.initial_provider());
-                    cfg.provider_route = provider
-                        .catalog()
+                    cfg.provider_route = catalog
                         .initial_route(provider_id, options.model.as_deref())
+                        .map_err(anyhow::Error::new)?;
+                } else {
+                    cfg.provider_route = catalog
+                        .initial_route(&current_provider, Some(&current_model))
                         .map_err(anyhow::Error::new)?;
                 }
                 Ok(cfg)
@@ -225,7 +231,7 @@ async fn main() -> Result<ExitCode> {
                 offload_dir: PathBuf::from(".kloop/offload"),
             },
         );
-        server.providers = provider.catalog().descriptors();
+        server.provider_catalog = provider.catalog();
         server.mcp_servers = mcp_statuses;
         let config_provider = provider.clone();
         let config_runtime = runtime.clone();

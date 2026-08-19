@@ -51,6 +51,7 @@ use kloop_core::agent::run_turn;
 use kloop_core::commands;
 use kloop_core::event::Event;
 use kloop_core::history::History;
+use kloop_core::history::ProviderSwitchError;
 use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
 use kloop_core::interaction::QuestionAnswer;
@@ -61,6 +62,8 @@ use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+use kloop_core::provider_route::ProviderCatalog;
+use kloop_core::provider_route::SwitchError;
 use kloop_core::rollout;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
@@ -69,7 +72,6 @@ use kloop_core::rollout::TurnTerminal;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
-use kloop_protocol::ProviderDescriptor;
 
 use events::EventsSyncParams;
 use events::RecoverySource;
@@ -97,6 +99,7 @@ pub struct ThreadStartOptions {
 pub type ConfigFactory = Arc<
     dyn Fn(
             ThreadStartOptions,
+            Arc<ProviderCatalog>,
             Arc<dyn Approver>,
             Option<Arc<dyn Questioner>>,
             NoteFn,
@@ -206,12 +209,12 @@ pub struct ServerPaths {
 }
 
 /// Everything the protocol server needs. The CLI owns filesystem/env/network
-/// assembly and injects immutable metadata plus safe config/skills callbacks;
-/// the server stays a transport/validation layer and never depends on the CLI.
+/// assembly and injects one immutable provider catalog. Thread configs, catalog
+/// reads, and switch validation all consume that same instance.
 pub struct ServerConfig {
     pub factory: ConfigFactory,
     pub paths: ServerPaths,
-    pub providers: Vec<ProviderDescriptor>,
+    pub provider_catalog: Arc<ProviderCatalog>,
     pub mcp_servers: Vec<McpServerStatus>,
     pub config_reader: ConfigReader,
     pub skills_reader: SkillsReader,
@@ -219,10 +222,18 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn new(factory: ConfigFactory, paths: ServerPaths) -> Self {
+        let (provider_catalog, _) = ProviderCatalog::from_provider(
+            "mock",
+            kloop_provider::Provider::mock(Vec::new()),
+            "mock",
+            vec!["mock".into()],
+            None,
+        )
+        .expect("built-in server provider catalog is valid");
         Self {
             factory,
             paths,
-            providers: Vec::new(),
+            provider_catalog,
             mcp_servers: Vec::new(),
             config_reader: Arc::new(|cwd| {
                 Ok(ConfigSnapshot {
@@ -265,7 +276,7 @@ where
     let ServerConfig {
         factory,
         paths,
-        providers,
+        provider_catalog,
         mcp_servers,
         config_reader,
         skills_reader,
@@ -283,7 +294,7 @@ where
         reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
         paths,
-        providers,
+        provider_catalog,
         mcp_servers,
         config_reader,
         skills_reader,
@@ -356,6 +367,7 @@ struct ThreadWorkerState {
     turn_seq: Arc<AtomicU64>,
     inbox: Arc<Inbox>,
     active_route: Arc<Mutex<ActiveProviderRoute>>,
+    provider_state: Arc<kloop_core::provider_route::SessionProviderState>,
 }
 
 struct ThreadHandle {
@@ -376,6 +388,7 @@ struct ThreadHandle {
     /// These are the persisted thread runtime, not a transient active worktree.
     cwd: PathBuf,
     active_route: Arc<Mutex<ActiveProviderRoute>>,
+    provider_state: Arc<kloop_core::provider_route::SessionProviderState>,
     /// Generation-scoped public display projection, shared with ThreadUi and
     /// thread/events/sync.
     projection: Arc<ThreadProjection>,
@@ -409,8 +422,8 @@ struct Server {
     reverse_request_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
     paths: ServerPaths,
-    /// Immutable process-level catalogs/snapshots assembled by the CLI.
-    providers: Vec<ProviderDescriptor>,
+    /// The immutable provider control-plane authority shared with every Config.
+    provider_catalog: Arc<ProviderCatalog>,
     mcp_servers: Vec<McpServerStatus>,
     /// Safe process-config projection and fresh cwd-scoped skill discovery.
     /// Both callbacks return allowlist DTOs only.
@@ -439,6 +452,7 @@ impl Server {
                     id: None,
                     code: wire::PARSE_ERROR,
                     message: format!("unparseable line: {e}"),
+                    data: None,
                 });
             }
         };
@@ -452,6 +466,7 @@ impl Server {
                 id: None,
                 code: wire::PARSE_ERROR,
                 message: "line is neither a request nor a response".into(),
+                data: None,
             }),
         }
     }
@@ -464,14 +479,16 @@ impl Server {
                 id: Some(id),
                 code: wire::SERVER_ERROR,
                 message: "not initialized; send `initialize` first".into(),
+                data: None,
             });
         }
         if method == "thread/provider/switch" {
-            if let Err((code, message)) = self.queue_thread_provider_switch(id.clone(), &params) {
+            if let Err(error) = self.queue_thread_provider_switch(id.clone(), &params) {
                 self.send(Outgoing::Error {
                     id: Some(id),
-                    code,
-                    message,
+                    code: error.code(),
+                    message: error.to_string(),
+                    data: Some(json!({"kind": error.kind()})),
                 });
             }
             return;
@@ -499,6 +516,7 @@ impl Server {
                 id: Some(id),
                 code,
                 message,
+                data: None,
             }),
         }
     }
@@ -560,6 +578,7 @@ impl Server {
                 id: Some(id),
                 code: wire::SERVER_ERROR,
                 message: "no pending interaction with this id".into(),
+                data: None,
             });
         };
         match pending {
@@ -823,6 +842,7 @@ impl Server {
                     provider_id: route.provider_id.clone(),
                     api_family: route.api_family,
                     model: route.primary_model.clone(),
+                    continuity: route.continuity,
                 });
             threads.push(json!({
                 "id": thread_id,
@@ -860,6 +880,7 @@ impl Server {
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
                 model: route.primary_model.clone(),
+                continuity: route.continuity,
             });
         Ok(json!({
             "thread": {
@@ -900,56 +921,80 @@ impl Server {
 
     fn provider_catalog_read(&self, params: &Value) -> MethodResult {
         ensure_empty_params(params, "provider/catalog/read")?;
-        Ok(json!({"providers": &self.providers}))
+        Ok(json!({"providers": self.provider_catalog.descriptors()}))
     }
 
     fn queue_thread_provider_switch(
         &self,
         request_id: RequestId,
         params: &Value,
-    ) -> Result<(), (i64, String)> {
+    ) -> Result<(), SwitchRequestError> {
         ensure_known_params(
             params,
             "thread/provider/switch",
             &["threadId", "providerId", "model", "expectedRouteRevision"],
-        )?;
-        let thread_id = str_param(params, "threadId")?;
-        let provider_id = str_param(params, "providerId")?.to_string();
+        )
+        .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?;
+        let thread_id = str_param(params, "threadId")
+            .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?;
+        let provider_id = str_param(params, "providerId")
+            .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?
+            .to_string();
         let model = match params.get("model") {
             None | Some(Value::Null) => None,
             Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
             Some(Value::String(_)) => {
-                return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()));
+                return Err(SwitchRequestError::InvalidParams(
+                    "'model' must not be empty".into(),
+                ));
             }
             Some(_) => {
-                return Err((wire::INVALID_PARAMS, "'model' must be a string".into()));
+                return Err(SwitchRequestError::InvalidParams(
+                    "'model' must be a string".into(),
+                ));
             }
         };
-        let expected_revision = params["expectedRouteRevision"].as_u64().ok_or((
-            wire::INVALID_PARAMS,
-            "'expectedRouteRevision' must be a positive integer".to_string(),
-        ))?;
+        let expected_revision = params["expectedRouteRevision"].as_u64().ok_or_else(|| {
+            SwitchRequestError::InvalidParams(
+                "'expectedRouteRevision' must be a positive integer".into(),
+            )
+        })?;
         if expected_revision == 0 {
-            return Err((
-                wire::INVALID_PARAMS,
+            return Err(SwitchRequestError::InvalidParams(
                 "'expectedRouteRevision' must be a positive integer".into(),
             ));
         }
         let handle = self.threads.get(thread_id).ok_or_else(|| {
-            (
-                wire::INVALID_PARAMS,
-                format!("unknown or inactive thread '{thread_id}'"),
-            )
+            SwitchRequestError::UnknownThread(format!("unknown or inactive thread '{thread_id}'"))
         })?;
+        if let Err(error) = handle
+            .provider_state
+            .preflight(&provider_id, model.as_deref())
+        {
+            let kind = match &error {
+                SwitchError::UnknownProvider(_) => "unknown_provider",
+                SwitchError::UnknownModel { .. } => "unknown_model",
+                SwitchError::Unavailable { .. } => "provider_unavailable",
+                SwitchError::StaleRevision { .. } => "stale_revision",
+                SwitchError::RouteDrift(_)
+                | SwitchError::RevisionExhausted
+                | SwitchError::InvalidRevision
+                | SwitchError::InvalidTimeline
+                | SwitchError::InvalidInheritedProviderModel => "invalid_route",
+            };
+            return Err(SwitchRequestError::Target {
+                message: error.to_string(),
+                kind,
+            });
+        }
         if handle
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err((
-                wire::SERVER_ERROR,
-                format!("thread '{thread_id}' already has an active operation"),
-            ));
+            return Err(SwitchRequestError::Busy(format!(
+                "thread '{thread_id}' already has an active operation"
+            )));
         }
         if handle
             .turn_tx
@@ -962,7 +1007,7 @@ impl Server {
             .is_err()
         {
             handle.running.store(false, Ordering::SeqCst);
-            return Err((wire::SERVER_ERROR, "thread worker is unavailable".into()));
+            return Err(SwitchRequestError::WorkerUnavailable);
         }
         Ok(())
     }
@@ -1049,6 +1094,7 @@ impl Server {
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
                 model: route.primary_model.clone(),
+                continuity: route.continuity,
             };
             let runtime = snapshot.runtime.ok_or((
                 wire::SERVER_ERROR,
@@ -1158,6 +1204,7 @@ impl Server {
                     provider_id: "pending".into(),
                     api_family: kloop_protocol::ProviderApiFamily::Mock,
                     model: options.model.clone().unwrap_or_default(),
+                    continuity: kloop_protocol::ReasoningContinuity::Preserved,
                 },
                 SessionSnapshot {
                     messages: Vec::new(),
@@ -1191,6 +1238,7 @@ impl Server {
             .then(|| ui.clone() as Arc<dyn Questioner>);
         let mut cfg = (self.factory)(
             options,
+            Arc::clone(&self.provider_catalog),
             ui.clone(),
             questioner,
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
@@ -1216,6 +1264,18 @@ impl Server {
         );
         let handle_cwd = cfg.cwd.clone();
         let active_route = Arc::new(Mutex::new(cfg.provider_route.public_route()));
+        let provider_state = Arc::new(
+            kloop_core::provider_route::SessionProviderState::from_timeline(
+                Arc::clone(&cfg.provider_catalog),
+                history.provider_routes(),
+            )
+            .map_err(|error| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot restore provider route state: {error}"),
+                )
+            })?,
+        );
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         let current_cancel = Arc::new(Mutex::new(None));
@@ -1229,6 +1289,7 @@ impl Server {
             turn_seq: turn_seq.clone(),
             inbox: inbox.clone(),
             active_route: active_route.clone(),
+            provider_state: provider_state.clone(),
         };
         tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
         self.threads.insert(
@@ -1242,6 +1303,7 @@ impl Server {
                 turn,
                 cwd: handle_cwd,
                 active_route,
+                provider_state,
                 projection,
             },
         );
@@ -1250,6 +1312,66 @@ impl Server {
 }
 
 type MethodResult = Result<Value, (i64, String)>;
+
+#[derive(Debug)]
+enum SwitchRequestError {
+    InvalidParams(String),
+    UnknownThread(String),
+    Target { message: String, kind: &'static str },
+    Busy(String),
+    WorkerUnavailable,
+}
+
+impl SwitchRequestError {
+    fn code(&self) -> i64 {
+        match self {
+            Self::InvalidParams(_) | Self::UnknownThread(_) | Self::Target { .. } => {
+                wire::INVALID_PARAMS
+            }
+            Self::Busy(_) | Self::WorkerUnavailable => wire::SERVER_ERROR,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidParams(_) => "invalid_params",
+            Self::UnknownThread(_) => "unknown",
+            Self::Target { kind, .. } => kind,
+            Self::Busy(_) => "busy",
+            Self::WorkerUnavailable => "unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for SwitchRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParams(message) | Self::UnknownThread(message) | Self::Busy(message) => {
+                formatter.write_str(message)
+            }
+            Self::Target { message, .. } => formatter.write_str(message),
+            Self::WorkerUnavailable => formatter.write_str("thread worker is unavailable"),
+        }
+    }
+}
+
+fn switch_error_kind(error: &ProviderSwitchError) -> &'static str {
+    match error {
+        ProviderSwitchError::Route(SwitchError::UnknownProvider(_)) => "unknown_provider",
+        ProviderSwitchError::Route(SwitchError::UnknownModel { .. }) => "unknown_model",
+        ProviderSwitchError::Route(SwitchError::Unavailable { .. }) => "provider_unavailable",
+        ProviderSwitchError::Route(SwitchError::StaleRevision { .. }) => "stale_revision",
+        ProviderSwitchError::Persistence(_) => "route_persistence_failed",
+        ProviderSwitchError::History(_) => "history_projection_failed",
+        ProviderSwitchError::Route(
+            SwitchError::RouteDrift(_)
+            | SwitchError::RevisionExhausted
+            | SwitchError::InvalidRevision
+            | SwitchError::InvalidTimeline
+            | SwitchError::InvalidInheritedProviderModel,
+        ) => "invalid_route",
+    }
+}
 
 fn object_params(params: &Value, method: &str) -> Result<(), (i64, String)> {
     match params {
@@ -1481,12 +1603,8 @@ async fn thread_worker(
         turn_seq,
         inbox,
         active_route,
+        provider_state,
     } = state;
-    let provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
-        Arc::clone(&cfg.provider_catalog),
-        history.provider_routes(),
-    )
-    .expect("server history route timeline was validated before worker start");
     let mut inbox_activity = inbox.subscribe_activity();
     loop {
         let message = tokio::select! {
@@ -1534,8 +1652,11 @@ async fn thread_worker(
                         model.as_deref(),
                     )
                     .map(|outcome| {
-                        let route = match outcome {
-                            kloop_core::provider_route::SwitchOutcome::NoOp(route) => route,
+                        let (route, continuity) = match outcome {
+                            kloop_core::provider_route::SwitchOutcome::NoOp(route) => {
+                                let continuity = route.public_route().continuity;
+                                (route, continuity)
+                            }
                             kloop_core::provider_route::SwitchOutcome::Changed {
                                 route,
                                 continuity,
@@ -1548,24 +1669,24 @@ async fn thread_worker(
                                         "continuity": continuity,
                                     }),
                                 );
-                                route
+                                (route, continuity)
                             }
                         };
                         cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
                         let public_route = route.public_route();
                         *active_route.lock().unwrap() = public_route.clone();
-                        public_route
-                    })
-                    .map_err(|error| error.to_string());
+                        (public_route, continuity)
+                    });
                 let outgoing = match result {
-                    Ok(route) => Outgoing::Response {
+                    Ok((route, continuity)) => Outgoing::Response {
                         id: request_id,
-                        result: json!({"route": route}),
+                        result: json!({"route": route, "continuity": continuity}),
                     },
-                    Err(message) => Outgoing::Error {
+                    Err(error) => Outgoing::Error {
                         id: Some(request_id),
                         code: wire::SERVER_ERROR,
-                        message,
+                        message: error.to_string(),
+                        data: Some(json!({"kind": switch_error_kind(&error)})),
                     },
                 };
                 running.store(false, Ordering::SeqCst);
@@ -1573,6 +1694,23 @@ async fn thread_worker(
                 continue;
             }
         };
+        if turn.images.is_empty()
+            && let Some(args) = provider_command_args(&turn.text)
+        {
+            let output = run_provider_command(
+                &args,
+                &mut cfg,
+                &provider_state,
+                &active_route,
+                &mut history,
+                &ui,
+            );
+            ui.notify("system", json!({"text": output}));
+            *current_cancel.lock().unwrap() = None;
+            running.store(false, Ordering::SeqCst);
+            *ui.turn.lock().unwrap() = None;
+            continue;
+        }
         ui.notify("turn/started", wire::turn_started_params(turn.id));
         let reason = run_turn_or_command(
             &mut cfg,
@@ -1611,6 +1749,65 @@ fn turn_terminal(reason: &EndReason) -> TurnTerminal {
         status: reason.terminal_status().into(),
         error: reason.terminal_error().map(ToString::to_string),
         typed_error: reason.terminal_error().cloned(),
+    }
+}
+
+fn provider_command_args(text: &str) -> Option<Vec<&str>> {
+    let rest = text.strip_prefix("/provider")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    Some(rest.split_whitespace().collect())
+}
+
+fn run_provider_command(
+    args: &[&str],
+    cfg: &mut Arc<Config>,
+    provider_state: &kloop_core::provider_route::SessionProviderState,
+    active_route: &Arc<Mutex<ActiveProviderRoute>>,
+    history: &mut History,
+    ui: &Arc<ThreadUi>,
+) -> String {
+    let Some(provider_id) = args.first().copied() else {
+        let route = provider_state.active_route();
+        return format!(
+            "active: {} {} (revision {})",
+            route.provider_id, route.model, route.revision
+        );
+    };
+    if args.len() > 2 {
+        return "usage: /provider <provider> [model]".into();
+    }
+    let model = args.get(1).copied();
+    let expected_revision = provider_state.active_route().revision;
+    match history.switch_provider(provider_state, expected_revision, provider_id, model) {
+        Ok(kloop_core::provider_route::SwitchOutcome::NoOp(route)) => format!(
+            "provider unchanged: {} {} (revision {})",
+            route.provider_id(),
+            route.primary_model(),
+            route.revision()
+        ),
+        Ok(kloop_core::provider_route::SwitchOutcome::Changed { route, continuity }) => {
+            let public_route = route.public_route();
+            let provider_name = route.provider_id().to_string();
+            let model_name = route.primary_model().to_string();
+            let revision = route.revision();
+            *cfg = Arc::new(cfg.clone_with_provider_route(route));
+            *active_route.lock().unwrap() = public_route.clone();
+            ui.projection.update_provider_route(public_route.clone());
+            ui.notify(
+                "thread/provider/changed",
+                json!({"route": public_route, "continuity": continuity}),
+            );
+            format!(
+                "provider switched: {provider_name} {model_name} (revision {revision}, reasoning continuity: {continuity:?})",
+            )
+        }
+        Err(error) => format!("provider switch failed: {error}"),
     }
 }
 

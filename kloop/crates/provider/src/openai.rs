@@ -42,7 +42,7 @@ fn image_url_part(source: &ImageSource) -> Value {
 /// Split a tool_result's block array into (joined text, image_url parts): text
 /// blocks are concatenated for the `tool` message; images become parts for the
 /// relocated user message.
-fn split_blocks_for_chat(blocks: &[ContentBlock]) -> (String, Vec<Value>) {
+fn split_blocks_for_chat(blocks: &[ContentBlock]) -> Result<(String, Vec<Value>), ProviderFailure> {
     let mut text = String::new();
     let mut images = Vec::new();
     for block in blocks {
@@ -54,14 +54,22 @@ fn split_blocks_for_chat(blocks: &[ContentBlock]) -> (String, Vec<Value>) {
                 text.push_str(t);
             }
             ContentBlock::Image { source } => images.push(image_url_part(source)),
-            _ => {}
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                return Err(protocol(
+                    "received reasoning that was not removed by the authorized request view",
+                ));
+            }
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {}
         }
     }
-    (text, images)
+    Ok((text, images))
 }
 
 /// Translate canonical (Anthropic-shaped) history into chat/completions messages.
-pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+pub(super) fn to_openai_messages(
+    system: &str,
+    messages: &[Message],
+) -> Result<Vec<Value>, ProviderFailure> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for msg in messages {
         match msg.role {
@@ -79,11 +87,11 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
                             },
                         })),
-                        // Reasoning is stripped on the way out: chat/completions
-                        // has no standard replay field, and providers that
-                        // accept one (deepseek's reasoning_content) tolerate
-                        // its absence.
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                            return Err(protocol(
+                                "received reasoning that was not removed by the authorized request view",
+                            ));
+                        }
                         // Assistant messages never carry images (top-level
                         // images ride on user messages).
                         ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
@@ -119,7 +127,7 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                         } => {
                             let (mut tool_text, image_parts) = match content {
                                 ToolResultContent::Text(s) => (s.clone(), Vec::new()),
-                                ToolResultContent::Blocks(blocks) => split_blocks_for_chat(blocks),
+                                ToolResultContent::Blocks(blocks) => split_blocks_for_chat(blocks)?,
                             };
                             // The tool message keeps the text and points at the
                             // relocated image so the model connects the two.
@@ -153,9 +161,12 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
                         // detail=auto matches the OpenAI default (Anthropic has
                         // no detail; kloop does not expose it yet).
                         ContentBlock::Image { source } => images.push(image_url_part(source)),
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::ToolUse { .. } => {}
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                            return Err(protocol(
+                                "received reasoning that was not removed by the authorized request view",
+                            ));
+                        }
+                        ContentBlock::ToolUse { .. } => {}
                     }
                 }
                 // With images the content is an array of parts (text first,
@@ -179,7 +190,7 @@ pub(super) fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<Valu
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -601,7 +612,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            to_openai_messages("be brief", &messages),
+            to_openai_messages("be brief", &messages).unwrap(),
             vec![
                 json!({"role": "system", "content": "be brief"}),
                 json!({"role": "user", "content": "do the thing"}),
@@ -621,10 +632,10 @@ mod tests {
         );
     }
 
-    /// Thinking never goes back out on the chat wire: no standard field
-    /// exists, and stray reasoning text would corrupt the assistant content.
+    /// Chat translation is not a second reasoning projection owner. Any
+    /// reasoning left after the core request view fails closed.
     #[test]
-    fn thinking_blocks_are_stripped_from_outbound_history() {
+    fn thinking_blocks_are_rejected_by_outbound_translation() {
         let messages = vec![
             Message::assistant(vec![
                 ContentBlock::Thinking {
@@ -639,14 +650,9 @@ mod tests {
                 provider_provenance: None,
             },
         ];
-        assert_eq!(
-            to_openai_messages("s", &messages),
-            vec![
-                json!({"role": "system", "content": "s"}),
-                json!({"role": "assistant", "content": "hi"}),
-            ],
-            "thinking stripped; a message left empty by stripping sends nothing"
-        );
+        let error = to_openai_messages("s", &messages).unwrap_err();
+        assert_eq!(error.kind(), &super::super::ProviderFailureKind::Protocol);
+        assert!(error.to_string().contains("authorized request view"));
     }
 
     /// A tool-calls-only assistant message must serialize content as null,
@@ -658,7 +664,7 @@ mod tests {
             name: "bash".into(),
             input: json!({}),
         }])];
-        let out = to_openai_messages("s", &messages);
+        let out = to_openai_messages("s", &messages).unwrap();
         assert!(out[1]["content"].is_null());
     }
 
@@ -683,7 +689,7 @@ mod tests {
             provider_provenance: None,
         }];
         assert_eq!(
-            to_openai_messages("s", &messages),
+            to_openai_messages("s", &messages).unwrap(),
             vec![
                 json!({"role": "system", "content": "s"}),
                 json!({
@@ -727,7 +733,7 @@ mod tests {
             }]),
         ];
         assert_eq!(
-            to_openai_messages("s", &messages),
+            to_openai_messages("s", &messages).unwrap(),
             vec![
                 json!({"role": "system", "content": "s"}),
                 json!({

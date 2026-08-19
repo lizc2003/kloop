@@ -40,6 +40,7 @@ use crate::execution_provenance::WorkspaceDisposition;
 use crate::execution_provenance::WorkspaceProvenance;
 use crate::history::History;
 use crate::inbox::InboxItem;
+use crate::provider_route::InheritedProviderModelOverride;
 use crate::rollout::Rollout;
 use crate::rollout::session_path;
 use crate::skills::Skill;
@@ -68,6 +69,8 @@ struct RunAgentInput {
     prompt: String,
     #[serde(default)]
     agent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     background: bool,
     #[serde(default)]
@@ -107,14 +110,22 @@ pub(crate) async fn run_agent_admitted(
         }
     };
     let background = parsed.background;
+    let model = match parsed.model.as_deref() {
+        Some(model) => Some(
+            InheritedProviderModelOverride::parse(model)
+                .map_err(|error| anyhow!("run_agent: {error}"))?,
+        ),
+        None => None,
+    };
     // A custom agent type overrides the sub-agent's system prompt, model and
     // tool set; an unknown name is an is_error result naming the available
     // types. Omitting agent_type keeps the general-purpose inherit-everything
     // sub-agent.
     let agent_type = match parsed.agent_type.as_deref() {
-        Some(name) => Some(
+        Some(name) if !name.trim().is_empty() => Some(
             AgentType::lookup(&ctx.cfg.agent_types, name).map_err(|e| anyhow!("run_agent: {e}"))?,
         ),
+        Some(_) => bail!("run_agent: agent_type must be a non-blank string"),
         None => None,
     };
     // `isolation: "worktree"` gives the sub-agent its own git worktree so it
@@ -129,6 +140,12 @@ pub(crate) async fn run_agent_admitted(
     let agent = next_agent_label();
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
     let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type)?;
+    if let Some(model) = model.as_ref() {
+        sub.provider_route = sub
+            .provider_route
+            .child_route(Some(model))
+            .map_err(|error| anyhow!("run_agent: {error}"))?;
+    }
     let ui = ctx.ui.clone();
     let depth = ctx.depth + 1;
     // A custom label improves human-facing lifecycle rows without changing the
@@ -229,22 +246,31 @@ pub(crate) async fn structured_agent_admitted(
             Some(usize::try_from(rounds).unwrap_or(usize::MAX))
         }
     };
-    let agent_type = match input["agent_type"].as_str() {
-        Some(name) => Some(
+    let agent_type = match input.get("agent_type") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) if !name.trim().is_empty() => Some(
             AgentType::lookup(&ctx.cfg.agent_types, name)
                 .map_err(|error| anyhow!("workflow agent: {error}"))?,
         ),
-        None => None,
+        Some(_) => bail!("workflow agent: agent_type must be a non-blank string"),
     };
     let isolate = match input["isolation"].as_str() {
         None | Some("shared") => false,
         Some("worktree") => true,
         Some(other) => bail!("workflow agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
+    let model = match input.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(model)) => Some(
+            InheritedProviderModelOverride::parse(model)
+                .map_err(|error| anyhow!("workflow agent: {error}"))?,
+        ),
+        Some(_) => bail!("workflow agent: model must be a non-blank string"),
+    };
     let agent = next_agent_label();
     let workspace = ctx.cfg.effective_workspace();
     let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type)?;
-    if let Some(model) = input["model"].as_str() {
+    if let Some(model) = model.as_ref() {
         sub.provider_route = sub
             .provider_route
             .child_route(Some(model))
@@ -664,9 +690,11 @@ pub(crate) async fn fork_skill(
     let agent = next_agent_label();
     let mut sub = clone_for_subagent(ctx, workspace, None, agent.clone());
     if let Some(model) = &skill.model {
+        let model = InheritedProviderModelOverride::parse(model)
+            .map_err(|error| anyhow!("skill fork: {error}"))?;
         sub.provider_route = sub
             .provider_route
-            .child_route(Some(model))
+            .child_route(Some(&model))
             .map_err(|error| anyhow!("skill fork: {error}"))?;
     }
     // `allowed-tools` restricts the sub-agent's tool set (like an agent_type's
@@ -1016,9 +1044,11 @@ fn build_sub_config(
             sub.system = system.clone();
         }
         if let Some(model) = &at.model {
+            let model = InheritedProviderModelOverride::parse(model)
+                .map_err(|error| anyhow!("child route override rejected: {error}"))?;
             sub.provider_route = sub
                 .provider_route
-                .child_route(Some(model))
+                .child_route(Some(&model))
                 .map_err(|error| anyhow!("child route override rejected: {error}"))?;
         }
         if let Some(tools) = &at.tools {
@@ -1773,6 +1803,49 @@ mod tests {
         assert!(!names.contains(&"write_file"));
     }
 
+    #[tokio::test]
+    async fn run_agent_model_override_is_allowlisted_and_does_not_mutate_parent_route() {
+        use kloop_provider::MockTurn;
+
+        let (provider, seen) =
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "child result".into(),
+            }])]);
+        let base = with_provider(test_ctx(0, "run-agent-model-override"), provider);
+        let mut cfg = base.cfg.test_clone();
+        cfg.set_test_route_models("parent-model", Some("child-model"));
+        let ctx = ToolCtx {
+            cfg: Arc::new(cfg),
+            ..base
+        };
+
+        let (output, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "work", "model": "child-model"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "child result");
+        assert_eq!(ctx.cfg.provider_route.revision(), 1);
+        assert_eq!(ctx.cfg.provider_route.primary_model(), "parent-model");
+        assert_eq!(seen.lock().unwrap()[0].model, "child-model");
+
+        for model in [json!("unknown-model"), json!(" \t "), json!(7)] {
+            let (output, is_error) = run_tool(
+                "run_agent",
+                json!({"prompt": "must not sample", "model": model}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{output}");
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "invalid overrides never sample"
+        );
+    }
     #[tokio::test]
     async fn unknown_agent_type_errors_with_available_list() {
         let types = vec![AgentType {

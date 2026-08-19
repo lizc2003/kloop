@@ -166,7 +166,8 @@ pub async fn run(
             cfg.provider_route.primary_model().to_string(),
             cfg.context_window,
             history.estimated_tokens(),
-        );
+        )
+        .with_route(cfg.provider_route.public_route());
     app.cells = app::cells_from_history(history.messages());
     // The opening session banner (plan 38 slice 6): the first cell, so it leads
     // the transcript and scrolls into scrollback. Built here with the git/env
@@ -349,6 +350,7 @@ async fn agent_worker(
         };
         match msg {
             WorkerMsg::Turn(turn) => {
+                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
                 // `--image` blocks ride the first turn; the composer's attached
                 // images ride the turn they were sent with. Merge both.
                 let mut images = std::mem::take(&mut pending_images);
@@ -371,6 +373,7 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Wake { cancel } => {
+                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
                 // Raced: a still-running turn already drained the reinjection,
                 // or stop_agent left nothing. Nothing to sample — just clear the
                 // busy state the UI loop set when it dispatched the wake.
@@ -395,6 +398,7 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Command { line, cancel } => {
+                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
                 let result = kloop_core::commands::run_with_provider_state(
                     &line,
                     &mut history,
@@ -495,6 +499,7 @@ async fn agent_worker(
                                 AgentEvent::Forked {
                                     session_id,
                                     messages,
+                                    route: route.public_route(),
                                 }
                             }
                             Err(error) => AgentEvent::System(format!(
@@ -985,6 +990,7 @@ fn dispatch_autowake(
     })
     .ok()?;
     app.running = true;
+    app.freeze_selected_route();
     Some(cancel)
 }
 

@@ -310,11 +310,18 @@ impl Provider {
     ) -> Result<(), ProviderFailure> {
         self.validate_attempt(attempt)?;
         for message in messages {
-            if message.has_reasoning()
-                && !message
-                    .provider_provenance
-                    .as_ref()
-                    .is_some_and(|source| source.exact_replay_compatible(attempt))
+            if !message.has_reasoning() {
+                continue;
+            }
+            if attempt.api_family == ProviderApiFamily::OpenAiChatCompletions {
+                return Err(ProviderFailure::protocol(
+                    "chat provider request view must not contain reasoning",
+                ));
+            }
+            if !message
+                .provider_provenance
+                .as_ref()
+                .is_some_and(|source| source.exact_replay_compatible(attempt))
             {
                 return Err(ProviderFailure::protocol(
                     "reasoning replay requires the same provider route and exact model",
@@ -444,11 +451,17 @@ impl Provider {
             Provider::OpenAiCompat { key, base } => {
                 let url = format!("{base}/chat/completions");
                 let key = key.clone();
+                let messages = match openai::to_openai_messages(system, messages) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        return spawn_stream(move |_sink| async move { Err(error) });
+                    }
+                };
                 let body = json!({
                     "model": model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
                     "stream_options": {"include_usage": true},
-                    "messages": openai::to_openai_messages(system, messages),
+                    "messages": messages,
                     "tools": tools.iter().map(|t| json!({
                         "type": "function",
                         "function": {
@@ -627,6 +640,46 @@ mod tests {
             assert!(!error.is_retryable());
             assert!(!error.after_semantic_output());
         }
+    }
+
+    #[test]
+    fn final_reasoning_guard_rejects_nested_or_chat_reasoning() {
+        let mock = Provider::mock(Vec::new());
+        let mock_attempt =
+            mock.attempt_identity("test", 1, "model-a", ProviderAttemptKind::Primary);
+        let nested = Message::assistant(vec![kloop_protocol::ContentBlock::ToolResult {
+            tool_use_id: "nested".into(),
+            content: kloop_protocol::ToolResultContent::Blocks(vec![
+                kloop_protocol::ContentBlock::Thinking {
+                    thinking: "hidden".into(),
+                    signature: "opaque".into(),
+                },
+            ]),
+            is_error: false,
+        }]);
+        let error = mock
+            .validate_reasoning_replay(&mock_attempt, &[nested])
+            .unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+
+        let chat = Provider::OpenAiCompat {
+            key: "unused".into(),
+            base: "https://chat.invalid".into(),
+        };
+        let chat_attempt =
+            chat.attempt_identity("chat", 1, "chat-model", ProviderAttemptKind::Primary);
+        let chat_reasoning = Message::assistant_from_provider(
+            vec![kloop_protocol::ContentBlock::Thinking {
+                thinking: "must be removed by core".into(),
+                signature: "opaque".into(),
+            }],
+            chat.response_provenance("chat-model"),
+        );
+        let error = chat
+            .validate_reasoning_replay(&chat_attempt, &[chat_reasoning])
+            .unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(error.to_string().contains("must not contain reasoning"));
     }
 
     #[test]
