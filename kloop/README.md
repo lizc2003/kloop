@@ -990,10 +990,13 @@ the parent's hook set and session id. `--mock` runs without hooks (hermetic).
 
 At startup kloop assembles what the model knows about where it is:
 
-- **System prompt** = base instructions + an environment block (working
-  directory, platform, today's UTC date, whether cwd is a git repo) + a git
-  snapshot (current branch, `git status --short` capped at 1000 bytes,
-  last 5 commits) labeled as a start-of-session snapshot.
+- **System prompt** = base instructions (a provider-neutral, sectioned policy
+  prompt — identity plus `# System` / `# Doing tasks` / `# Acting with care` /
+  `# Using your tools` / `# Communication style`; tool usage lives in each
+  tool's own description, not here) + an environment block (working directory,
+  platform, today's UTC date, whether cwd is a git repo) + a git snapshot
+  (current branch, `git status --short` capped at 1000 bytes, last 5 commits)
+  labeled as a start-of-session snapshot.
 - **Instruction files**: per directory `AGENTS.md` wins, `CLAUDE.md` is the
   compatibility fallback. Layers, in order: `~/.kloop/` (global), then every
   directory from the git root down to cwd (closest to cwd last). Within each
