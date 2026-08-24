@@ -249,6 +249,21 @@ fn required_non_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, Prov
     Ok(value)
 }
 
+/// Two Responses argument encodings agree when they parse to the same JSON
+/// value. The proxy may stream compact deltas but send a pretty-printed
+/// `.done`/`output_item.done` for the same object, so byte-equality is too
+/// strict. If either side is not valid JSON (e.g. an empty "" for a no-arg
+/// call), fall back to byte-equality so genuine divergence still fails closed.
+fn arguments_agree(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<Value>(a),
+        serde_json::from_str::<Value>(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
     value
         .as_u64()
@@ -686,7 +701,7 @@ fn finish_function_call(
     if !arguments_started || !arguments_done {
         return Err(protocol("function arguments were not fully closed"));
     }
-    if arguments != final_arguments {
+    if !arguments_agree(&arguments, final_arguments) {
         return Err(protocol(
             "final function arguments did not match streamed arguments",
         ));
@@ -1075,7 +1090,10 @@ pub(super) async fn stream(
                         return Err(protocol("received duplicate arguments done"));
                     }
                     *arguments_started = true;
-                    if required_str(&value["arguments"], "final arguments")? != arguments.as_str() {
+                    if !arguments_agree(
+                        required_str(&value["arguments"], "final arguments")?,
+                        arguments.as_str(),
+                    ) {
                         return Err(protocol("arguments done did not match accumulated delta"));
                     }
                     *arguments_done = true;

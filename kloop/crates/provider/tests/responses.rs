@@ -614,6 +614,100 @@ async fn malformed_function_arguments_fail_closed() {
     assert!(error.to_string().contains("invalid JSON input"));
 }
 
+/// The proxy may stream compact argument deltas but echo a pretty-printed
+/// object in `function_call_arguments.done` and `output_item.done`. Both
+/// encodings parse to the same JSON value, so the round succeeds and the tool
+/// input is the parsed object — the exact bytes observed on a real gpt-5.6 run.
+#[tokio::test]
+async fn function_arguments_agree_across_pretty_and_compact() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_1", "status": "in_progress",
+                "call_id": "call_9", "name": "read", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_1", "delta": "{\"limit\":3,"}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_1", "delta": "\"offset\":1,"}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_1", "delta": "\"path\":\"README.md\"}"}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_1",
+                "arguments": "{\"limit\": 3, \"offset\": 1, \"path\": \"README.md\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_9", "name": "read",
+                "arguments": "{\"limit\": 3, \"offset\": 1, \"path\": \"README.md\"}",
+                "status": "completed"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
+            if id == "call_9" && name == "read"
+                && input == &json!({"limit": 3, "offset": 1, "path": "README.md"})
+    ));
+    assert!(matches!(
+        &events[1],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::ToolUse,
+            ..
+        }
+    ));
+    assert_eq!(events.len(), 2);
+}
+
+/// Only whitespace/format differences are tolerated: when the accumulated
+/// delta and the `.done` arguments parse to genuinely different JSON values,
+/// the round still fails closed at the first comparison site.
+#[tokio::test]
+async fn function_arguments_differing_values_still_fail_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_5", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_5", "status": "in_progress",
+                "call_id": "call_1", "name": "bash", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_5", "delta": "{\"a\":1}"}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_5", "arguments": "{\"a\":2}"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_5", "call_id": "call_1", "name": "bash",
+                "arguments": "{\"a\":2}", "status": "completed"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_5", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert_eq!(events.len(), 1, "value divergence must not yield a ToolUse");
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(
+        error
+            .to_string()
+            .contains("arguments done did not match accumulated delta")
+    );
+}
+
 #[tokio::test]
 async fn refusal_fields_stream_and_finish_as_refused() {
     let server = MockServer::start().await;

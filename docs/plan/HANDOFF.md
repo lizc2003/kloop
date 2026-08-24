@@ -40,6 +40,8 @@
 >
 > **Plan 95 教训**：厂商带外遥测(如 `codex.rate_limits`)与官方语义流水线是两层事实——它不进 `created→output_item.*→completed`,只捎带限流配额,解析层必须把它和真正的协议事件分开。放行要用**窄口**:只认已识别的 `codex.` 前缀当带外 no-op,其余未知事件仍 fail-closed,不能退化成"忽略所有未知事件"。带外豁免必须在**两处拒绝点一致**落地——terminal 后守卫与 match 兜底都要豁免,否则同一事件在流中被放行、在 terminal 后仍打断整轮;为此把 SSE 解析上移到 terminal 守卫之前(`[DONE]` 检查只看 `frame.data`,仍留原位)。跨 rail 已有正确先例时直接照抄:anthropic 的 `ping`(terminal 守卫 `event != "ping"` + `"ping" => {}` no-op)就是模板,Responses 只补齐这一层,不动 anthropic。
 >
+> **Plan 96 教训**：严格解析器对"结构化字段"应比**语义值**、只对"逐字文本"才比**字节**。Responses 函数参数是结构化 JSON:真实代理(gpt-5.6 经 gateway)会把增量 `delta` 发成 compact(`{"limit":3,...}`),却把 `function_call_arguments.done` 与 `output_item.done` 的 `arguments` 发成 pretty(`{"limit": 3, ...}`),两者解析成同一对象、仅空白不同,字节级相等断言据此间歇 fail-close(~4 真实轮命中 2)。窄口修法:两处参数比对改用 `arguments_agree`(解析成 `Value` 比相等;任一侧非合法 JSON 时回退字节相等,保证空参 `""=""` 通过、一侧空一侧非空/值真不同仍 fail-closed)。**不放宽** `output_text.done`/`reasoning_summary_text.done` 的逐字节校验——那些应逐字回传,无 pretty/compact 歧义。对照 codex-rs:它根本不做 delta 交叉校验,直接取 `output_item.done` 的完整 item 为权威(`sse/responses.rs`),delta 只用于流式显示;kloop 保留交叉校验但把"字节一致"降为"语义一致",既保 fail-closed 又容忍代理线格式。这与 Plan 95 同类——严格解析器的"逐字节一致"假设被真实代理线格式违反,根因不同(空白 vs 带外事件),都以"识别真实契约、窄口放宽"收口。
+>
 > **Plan 83 已完成（2026-08-13）**：TUI bracketed paste ingress 统一将 CRLF 与孤立 CR 规范化为 LF，再交给 Composer 或 question editor；不 trim，不删除前后空格和尾随换行。这样复制 `abc`/`def` 两行时，CR 不再作为终端控制字符覆盖前一行，Composer、paste atom、history、steering 与 provider payload 都共享 canonical LF 文本。普通未包裹 raw CR burst 仍按 Enter/提交语义处理，Plan 38 的 PasteBurst 范围不变。
 >
 > App unit 覆盖 LF/CRLF/CR、空格/尾随 LF 和 submit payload；question notes 粘贴覆盖 canonical LF；Unix PTY 真实发送 bracketed `abc\\r\\ndef` 后提交，mock provider 收到 `abc\\ndef`。本次未执行物理终端手工场景；提交 SHA 以本条所在提交为准。
