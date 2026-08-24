@@ -265,6 +265,13 @@ fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, Provide
     Ok(kind)
 }
 
+/// gateway/Codex 代理往 Responses 流里塞的厂商带外事件(如
+/// `codex.rate_limits`)只携带限流遥测、不属官方语义族——识别后跳过,
+/// 其余未知事件仍 fail-closed(见 match 兜底)。对齐 anthropic 的 `ping` 处理。
+fn is_out_of_band(event: &str) -> bool {
+    event.starts_with("codex.")
+}
+
 fn response_identity(response: &Value) -> Result<(&str, &str), ProviderFailure> {
     Ok((
         required_non_empty(&response["id"], "response id")?,
@@ -793,11 +800,11 @@ pub(super) async fn stream(
                 }
                 return Err(protocol("[DONE] arrived before a semantic terminal"));
             }
-            if completion.is_some() {
-                return Err(protocol("semantic event arrived after response terminal"));
-            }
             let value = crate::parse_sse_json("openai-responses", &frame.data)?;
             let event = event_type(&frame, &value)?;
+            if completion.is_some() && !is_out_of_band(event) {
+                return Err(protocol("semantic event arrived after response terminal"));
+            }
             match event {
                 "response.created" => {
                     if response_id.is_some() {
@@ -1127,6 +1134,7 @@ pub(super) async fn stream(
                     let code = value["code"].as_str().unwrap_or("unknown");
                     return Err(protocol(format!("stream error ({code})")));
                 }
+                _ if is_out_of_band(event) => {}
                 _ => return Err(protocol("returned an unknown semantic event")),
             }
         }

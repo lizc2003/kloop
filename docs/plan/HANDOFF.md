@@ -38,6 +38,8 @@
 >
 > **Plan 91 先行验收教训**：acceptance 应先按事实 owner 建矩阵，只给跨生命周期真实缺口新增 witness。session-memory receipt 在 compaction 内应整对象保留，resume/fork则由 fresh Config边界保证不持久化；不能为了测试把 receipt 塞进 rollout。测试 filter必须先以 `--list` 证明命中，再用完整 test path `--exact`，否则 `0 passed` 的成功退出码是假绿。
 >
+> **Plan 95 教训**：厂商带外遥测(如 `codex.rate_limits`)与官方语义流水线是两层事实——它不进 `created→output_item.*→completed`,只捎带限流配额,解析层必须把它和真正的协议事件分开。放行要用**窄口**:只认已识别的 `codex.` 前缀当带外 no-op,其余未知事件仍 fail-closed,不能退化成"忽略所有未知事件"。带外豁免必须在**两处拒绝点一致**落地——terminal 后守卫与 match 兜底都要豁免,否则同一事件在流中被放行、在 terminal 后仍打断整轮;为此把 SSE 解析上移到 terminal 守卫之前(`[DONE]` 检查只看 `frame.data`,仍留原位)。跨 rail 已有正确先例时直接照抄:anthropic 的 `ping`(terminal 守卫 `event != "ping"` + `"ping" => {}` no-op)就是模板,Responses 只补齐这一层,不动 anthropic。
+>
 > **Plan 83 已完成（2026-08-13）**：TUI bracketed paste ingress 统一将 CRLF 与孤立 CR 规范化为 LF，再交给 Composer 或 question editor；不 trim，不删除前后空格和尾随换行。这样复制 `abc`/`def` 两行时，CR 不再作为终端控制字符覆盖前一行，Composer、paste atom、history、steering 与 provider payload 都共享 canonical LF 文本。普通未包裹 raw CR burst 仍按 Enter/提交语义处理，Plan 38 的 PasteBurst 范围不变。
 >
 > App unit 覆盖 LF/CRLF/CR、空格/尾随 LF 和 submit payload；question notes 粘贴覆盖 canonical LF；Unix PTY 真实发送 bracketed `abc\\r\\ndef` 后提交，mock provider 收到 `abc\\ndef`。本次未执行物理终端手工场景；提交 SHA 以本条所在提交为准。

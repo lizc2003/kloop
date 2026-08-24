@@ -20,7 +20,10 @@ validate five architectural bets before committing to a larger agent design.
 5. **Provider seam.** Internals speak Anthropic Messages shape only; adapters
    translate Anthropic native SSE and OpenAI-compat `tool_calls` streaming
    into one `StreamEvent` enum. A Mock provider enables keyless end-to-end
-   runs.
+   runs. The Responses adapter passes gateway/Codex vendor out-of-band
+   telemetry (`codex.*`, e.g. `codex.rate_limits`) through as a no-op both
+   before and after the terminal — mirroring Anthropic's `ping` — while every
+   other unknown SSE event still fails closed.
 
 Provider sampling is bounded and typed: each attempt has one terminal outcome;
 open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE

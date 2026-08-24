@@ -933,6 +933,115 @@ async fn terminal_is_low_latency_but_later_complete_semantic_frames_fail_closed(
     assert!(!error.is_retryable());
 }
 
+/// A `codex.*` vendor out-of-band event (rate-limit telemetry) landing mid
+/// stream is skipped: it produces no StreamEvent and does not disturb the
+/// surrounding semantic sequence. Mirrors anthropic's `ping` handling.
+#[tokio::test]
+async fn out_of_band_codex_event_is_ignored_mid_stream() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "codex.rate_limits",
+                "plan_type": "pro",
+                "rate_limits": {
+                    "primary": {"used_percent": 12.5, "window_minutes": 300, "reset_at": "2026-08-24T12:00:00Z"},
+                    "secondary": {"used_percent": 3.0, "window_minutes": 10080, "reset_at": "2026-08-30T00:00:00Z"}
+                },
+                "credits": 42,
+                "metered_limit_name": "gpt-5"}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::TextDelta(t) if t == "hi"));
+    assert!(matches!(
+        &ok[1],
+        StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "hi"
+    ));
+    assert!(matches!(
+        &ok[2],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
+    ));
+    assert_eq!(ok.len(), 3);
+}
+
+/// A `codex.*` out-of-band event arriving after the semantic terminal is
+/// exempt from the terminal-after guard (same as anthropic's `ping`): it is
+/// skipped and the single Terminal still stands.
+#[tokio::test]
+async fn out_of_band_codex_event_after_terminal_is_ignored() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.completed", "response": {"id": "r", "status": "completed"}}),
+            json!({"type": "codex.rate_limits", "plan_type": "pro", "credits": 7}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        })]
+    ));
+}
+
+/// The out-of-band window is narrow: any non-`codex.` unknown event is still
+/// a fatal protocol error (fail-closed boundary preserved).
+#[tokio::test]
+async fn unknown_non_codex_event_still_fails_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "some.unknown.event"}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+}
+
 #[tokio::test]
 async fn malformed_sse_json_is_a_terminal_protocol_error() {
     let server = MockServer::start().await;
