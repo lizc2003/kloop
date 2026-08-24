@@ -163,6 +163,56 @@ pub(crate) fn parse_sse_json(rail: &str, data: &str) -> Result<Value, ProviderFa
         .map_err(|error| ProviderFailure::protocol(format!("{rail} malformed SSE JSON: {error}")))
 }
 
+/// Faithfully surface a stream-level error's identifier: prefer the machine
+/// `code`, then the `type`, then "unknown". Proxies send transient errors as a
+/// bare `{type}` with no code, so both are consulted.
+pub(crate) fn error_label(error: &Value) -> &str {
+    error["code"]
+        .as_str()
+        .or_else(|| error["type"].as_str())
+        .unwrap_or("unknown")
+}
+
+/// Classify a faithfully-surfaced stream-error `label` into a typed failure.
+/// Only client-side / permanent conditions are fatal; every other error —
+/// transient upstream, overload, rate limit, or an unrecognized label — defaults
+/// to retryable. This is the inverse of the HTTP-status retry whitelist in
+/// `failure.rs`: there a small set is admitted for retry, here a small set is
+/// denied it. Safe because core still gates the actual retry on
+/// `after_semantic_output` (see `stream.rs`), so a retryable stream error only
+/// ever replays before any semantic output. Context-window overflow is
+/// classified earlier by each rail and never reaches here.
+pub(crate) fn stream_error(rail: &str, label: &str) -> ProviderFailure {
+    let message = format!("{rail} stream error ({label})");
+    if is_fatal_stream_error(label) {
+        ProviderFailure::protocol(message)
+    } else {
+        ProviderFailure::incomplete_protocol(message)
+    }
+}
+
+/// Client-side / permanent stream-error identifiers that must not retry, unioned
+/// across the OpenAI-family (`code`/`type`) and Anthropic (`type`) vocabularies;
+/// the strings do not collide. Transient conditions (`upstream_error`,
+/// `server_error`, `overloaded_error`, `rate_limit_error`, `api_error`, …) are
+/// deliberately absent so they default to retryable.
+fn is_fatal_stream_error(label: &str) -> bool {
+    matches!(
+        label,
+        "insufficient_quota"
+            | "usage_not_included"
+            | "cyber_policy"
+            | "invalid_prompt"
+            | "bio_policy"
+            | "invalid_request_error"
+            | "authentication_error"
+            | "permission_error"
+            | "not_found_error"
+            | "request_too_large"
+            | "billing_error"
+    )
+}
+
 fn validate_assistant_blocks(
     rail: &str,
     blocks: &[AssistantBlock],

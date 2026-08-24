@@ -506,3 +506,100 @@ async fn http_status_and_retry_after_remain_typed() {
     assert!(!error.is_retryable());
     assert_eq!(error.retry_after(), None);
 }
+
+/// The real gateway frame: a proxy relays a transient upstream error as a
+/// named `event: error` frame. It must surface the true `type` and be retryable,
+/// not degrade into the misleading "unknown SSE event name".
+#[tokio::test]
+async fn named_error_event_surfaces_upstream_error_and_is_retryable() {
+    let server = MockServer::start().await;
+    let delta = json!({"choices": [{"index": 0, "delta": {"content": "par"}}]});
+    let error = json!({"error": {
+        "message": "Upstream service temporarily unavailable",
+        "type": "upstream_error",
+    }});
+    mount_sse(
+        &server,
+        format!("data: {delta}\n\nevent: error\ndata: {error}\n\n"),
+    )
+    .await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0].as_ref().unwrap(),
+        StreamEvent::TextDelta(t) if t == "par"
+    ));
+    let error = events.into_iter().nth(1).unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("upstream_error"));
+    assert!(!error.to_string().contains("unknown SSE event name"));
+}
+
+/// A named error frame whose type is a client-side/permanent class stays fatal.
+#[tokio::test]
+async fn named_error_event_with_fatal_type_stays_fatal() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {"message": "bad", "type": "invalid_request_error"}});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("invalid_request_error"));
+}
+
+/// Overflow still wins first, even when wrapped in a named error frame.
+#[tokio::test]
+async fn named_error_event_with_overflow_message_maps_to_overflow() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {
+        "message": "This model's maximum context length is 128000 tokens",
+        "type": "invalid_request_error",
+    }});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
+}
+
+/// The unnamed `data:{"error":...}` body classifies identically to the named
+/// frame — one shared surfacing/retry path.
+#[tokio::test]
+async fn unnamed_error_body_uses_same_classification() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[json!({"error": {"type": "upstream_error", "message": "temporarily unavailable"}})],
+            false,
+        ),
+    )
+    .await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("upstream_error"));
+}
+
+/// Any named event other than `error` is still rejected — the narrow gate holds.
+#[tokio::test]
+async fn unknown_non_error_named_event_still_fails_closed() {
+    let server = MockServer::start().await;
+    mount_sse(&server, "event: something\ndata: {}\n\n".into()).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("unknown SSE event name"));
+}

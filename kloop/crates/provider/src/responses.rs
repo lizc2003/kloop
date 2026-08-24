@@ -1142,15 +1142,19 @@ pub(super) async fn stream(
                     if is_overflow_message(&error.to_string()) {
                         return Err(ProviderFailure::context_overflow());
                     }
-                    let code = error["code"].as_str().unwrap_or("unknown");
-                    return Err(protocol(format!("response failed ({code})")));
+                    return Err(crate::stream_error(
+                        "openai-responses",
+                        crate::error_label(error),
+                    ));
                 }
                 "error" => {
                     if is_overflow_message(&value.to_string()) {
                         return Err(ProviderFailure::context_overflow());
                     }
-                    let code = value["code"].as_str().unwrap_or("unknown");
-                    return Err(protocol(format!("stream error ({code})")));
+                    // The `error` event's own `type` is the envelope ("error"),
+                    // so only its `code` names the failure here.
+                    let label = value["code"].as_str().unwrap_or("unknown");
+                    return Err(crate::stream_error("openai-responses", label));
                 }
                 _ if is_out_of_band(event) => {}
                 _ => return Err(protocol("returned an unknown semantic event")),

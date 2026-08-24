@@ -643,6 +643,8 @@ async fn http_overflow_maps_to_overflow_error() {
     assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
+/// Anthropic's `overloaded_error` (HTTP 529) is transient — surfaced faithfully
+/// and retryable (retry is still gated on no prior semantic output upstream).
 #[tokio::test]
 async fn stream_error_event_surfaces_as_error() {
     let server = MockServer::start().await;
@@ -658,7 +660,28 @@ async fn stream_error_event_surfaces_as_error() {
     assert_eq!(events.len(), 1);
     let error = events.into_iter().next().unwrap().unwrap_err();
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(error.is_retryable());
     assert!(error.to_string().contains("overloaded_error"));
+}
+
+/// A client-side/permanent error type stays fatal.
+#[tokio::test]
+async fn stream_error_event_with_fatal_type_stays_fatal() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "error", "error": {"type": "authentication_error", "message": "bad key"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("authentication_error"));
 }
 
 /// A stream that dies without message_stop emits one typed incomplete error;

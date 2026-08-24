@@ -33,7 +33,14 @@ open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE
 frame (1 MiB) guards apply on all three wires. Transport/open/read failures,
 HTTP 408/429/5xx, and incomplete EOF retry up to 3 total attempts only before
 any text, reasoning, or complete tool call arrives; `Retry-After` is honored up
-to 60s. Core retains provider outcomes and failures inside typed turn errors;
+to 60s. Stream-level errors on all three wires are surfaced faithfully by their
+real `code`/`type` and classified by a small fatal blacklist (auth, permission,
+quota, policy, invalid-request, request-too-large, billing); every other stream
+error — transient upstream, overload, and rate-limit conditions included —
+defaults to retryable, the inverse of the HTTP-status whitelist and gated by the
+same no-semantic-output rule. A named Chat `event: error` frame is recognized
+and read rather than rejected as an unknown event name. Core retains provider
+outcomes and failures inside typed turn errors;
 string rendering happens only at CLI/TUI/native protocol 2.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.

@@ -426,7 +426,10 @@ pub(super) async fn stream(
             if transport_done {
                 return Err(protocol("SSE frame arrived after [DONE]"));
             }
-            if !matches!(frame.event.as_deref(), None | Some("message")) {
+            if !matches!(
+                frame.event.as_deref(),
+                None | Some("message") | Some("error")
+            ) {
                 return Err(protocol("returned an unknown SSE event name"));
             }
             if frame.data.trim() == "[DONE]" {
@@ -438,8 +441,10 @@ pub(super) async fn stream(
                 if is_overflow_message(&value["error"].to_string()) {
                     return Err(ProviderFailure::context_overflow());
                 }
-                let code = value["error"]["code"].as_str().unwrap_or("unknown");
-                return Err(protocol(format!("stream error ({code})")));
+                return Err(crate::stream_error(
+                    "openai-compat",
+                    crate::error_label(&value["error"]),
+                ));
             }
 
             if let Some(raw_usage) = value.get("usage")

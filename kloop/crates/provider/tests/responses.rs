@@ -544,6 +544,46 @@ async fn failed_with_context_error_maps_to_overflow() {
     assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
+/// `response.failed` and the top-level `error` event share the unified
+/// classification: transient upstream conditions are retryable, client-side /
+/// permanent classes stay fatal.
+#[tokio::test]
+async fn failed_and_error_events_classify_transient_vs_fatal() {
+    let server = MockServer::start().await;
+
+    for (event, retryable, needle) in [
+        (
+            json!({"type": "response.failed", "response": {"error": {"code": "server_error"}}}),
+            true,
+            "server_error",
+        ),
+        (
+            json!({"type": "response.failed", "response": {"error": {"code": "invalid_request_error"}}}),
+            false,
+            "invalid_request_error",
+        ),
+        (
+            json!({"type": "error", "code": "upstream_error", "message": "temporarily unavailable"}),
+            true,
+            "upstream_error",
+        ),
+        (
+            json!({"type": "error", "code": "insufficient_quota", "message": "no credit"}),
+            false,
+            "insufficient_quota",
+        ),
+    ] {
+        mount_sse(&server, sse_body(&[event])).await;
+        let events = collect(responses(&server)).await;
+        assert_eq!(events.len(), 1, "{needle}");
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "{needle}");
+        assert_eq!(error.is_retryable(), retryable, "{needle}");
+        assert!(error.to_string().contains(needle), "{needle}");
+        server.reset().await;
+    }
+}
+
 /// A stream that dies without a terminal event yields an error, not a
 /// fabricated Done — the agent retries on it.
 #[tokio::test]

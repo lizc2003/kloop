@@ -433,8 +433,10 @@ pub(super) async fn stream(
                     if is_overflow_message(&value["error"].to_string()) {
                         return Err(ProviderFailure::context_overflow());
                     }
-                    let error_type = value["error"]["type"].as_str().unwrap_or("unknown");
-                    return Err(protocol(format!("stream error ({error_type})")));
+                    return Err(crate::stream_error(
+                        "anthropic",
+                        crate::error_label(&value["error"]),
+                    ));
                 }
                 _ => return Err(protocol("returned an unknown semantic event")),
             }
