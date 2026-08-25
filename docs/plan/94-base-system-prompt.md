@@ -212,3 +212,13 @@ task; prefer URLs the user or local files provide.
 - `BASE_SYSTEM` 仅两处消费（`gather` via `assemble_system`、`mock` 拼接），无测试断言其内容；`context.rs` 现有单测用字面量 `"Base."`,与常量解耦、无需改。
 - 验证:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings` 全绿;`cargo test`（workspace）1305 passed / 0 failed;`cargo run -p kloop -- --mock --headless --json "say hi"` 脚本化 mock 整轮跑完、退出 0,证明新常量装配无误。真实 key 主观回归本次未跑（可选项,如需再问用户要代理/key）。
 - README「Project context」的 base instructions 一句已升级为分节方针描述;HANDOFF 补教训 42（base prompt 内容按变化频率三分、provider 中立身份）。未新增依赖/工具/wire 变更;工具说明与 `<project-instructions>` 装配不变。
+
+## 真实回归补记（2026-08-25）
+
+「可选真实 key 回归」本次补齐,三 rail 全通(gateway Chat/Responses + gateway Anthropic 通道,`--headless --permission-mode bypass`;同一只读探针:让 agent 一句话说出 `context.rs` 里 `BASE_SYSTEM` 分了哪几节)。三 rail 喂的是**同一个 provider 中立 `BASE_SYSTEM` 常量**,分节方针一致生效(动手前先核查、终端式简短、镜像中文、不臆造):
+
+- **Chat rail**(Chat wire):`grep` → `read_file` → 一句话中文,分节准确(先查后答、用专用工具而非 `cat`、镜像语言)。
+- **Responses rail**(gpt-5.6-sol,responses wire):`read_file`×2 → 一句话中文「五节」,准确。
+- **Anthropic rail**(claude-sonnet-4-6):通道持续 429「Too many tokens」限流(隔天仍限),隔次重试才拿到干净一轮——模型先查文件再一句话答对分节;此前另有一轮「首次采样成功、先查后答」的正面片段。限流期间 kloop 分类/退避每次都正确(429→可重试→退避→如实终局),间接印证失败模型。
+
+如实小差异:Anthropic 那轮模型用 `bash grep` 而非专用 `grep` 工具(base 方针倾向专用工具);先查后答的关键行为在,属模型取舍、非 plan 94 缺陷。secrets/endpoints 未落任何文件。
