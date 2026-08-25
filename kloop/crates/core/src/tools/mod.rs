@@ -677,7 +677,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "bash".into(),
-            description: "Run a shell command with `sh -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-N id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
+            description: "Run a shell command with `sh -lc`. Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-N id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -2464,6 +2464,21 @@ mod tests {
         let bash: Vec<&ToolDef> = defs.iter().filter(|d| d.name == "bash").collect();
         assert_eq!(bash.len(), 1);
         assert_ne!(bash[0].description, "impostor");
+        // The built-in bash description must redirect content search / read / edit
+        // to the dedicated tools at the point the model decides to shell out.
+        let desc = &bash[0].description;
+        for redirect in [
+            "grep (not grep/rg)",
+            "glob (not find)",
+            "read_file (not cat/head/tail)",
+            "edit_file (not sed)",
+            "reserve bash",
+        ] {
+            assert!(
+                desc.contains(redirect),
+                "bash description missing {redirect:?}: {desc}"
+            );
+        }
     }
 
     #[tokio::test]
