@@ -471,9 +471,16 @@ geometry already differs from the completed frame, the loop redraws first;
 repeated resize churn skips commit for that frame. Once finalized cells must
 freeze, `insert_before` writes them to native scrollback, clear succeeds, the App
 drains that exact prefix, and the loop immediately repaints the tail while the
-size fence is still held. A resize that arrives during the transaction becomes
-visible only to the next frame, so commit and repaint cannot split across two
-geometries. Key handling receives the final repaint's viewport. Composer wrapping,
+size fence is still held. The commit only freezes a leading prefix that still
+leaves the live tail at least a viewport tall, so a tall final message (e.g. the
+last turn on `-c` resume, trailed by a one-line note) is never stranded behind a
+full-screen blank pad. Because the inline viewport is the full terminal height,
+`insert_before` runs Ratatui's default path (the `scrolling-regions` cargo
+feature is deliberately off): it scrolls committed lines into scrollback with
+plain line feeds (`append_lines`) at the bottom row, not the DECSTBM one-row
+scroll region that iTerm2 smears. A resize that arrives during the transaction
+becomes visible only to the next frame, so commit and repaint cannot split across
+two geometries. Key handling receives the final repaint's viewport. Composer wrapping,
 cursor projection, visible height, and ↑/↓ navigation likewise come from one
 canonical visual-row layout.
 Streaming deltas are drained in batches so a burst of tokens redraws once, not

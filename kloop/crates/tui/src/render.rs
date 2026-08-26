@@ -654,6 +654,13 @@ pub fn commit_count(
         if !is_committable(&cells[committed]) && remaining <= hard_cap {
             break;
         }
+        // Keep the live tail at least a viewport tall: never commit a cell when
+        // doing so would strand a short remainder (e.g. a tall final message
+        // trailed by a one-line note on resume) behind a full-screen blank pad
+        // (plan 99). The last cell is already excluded by the loop condition.
+        if remaining - heights[committed] < active_h {
+            break;
+        }
         remaining -= heights[committed];
         committed += 1;
     }
@@ -2432,6 +2439,40 @@ mod tests {
         assert!(
             commit_count(&over_cap, 40, 2, |_| false) > 0,
             "the hard cap must prevent an unbounded mutable tail"
+        );
+    }
+
+    /// Regression (plan 99): resuming a session builds short leading cells, a
+    /// tall final assistant message, then a one-line note. Committing the tall
+    /// message would leave only the note live behind a full-viewport blank pad —
+    /// the exact `kloop -c` blank-gap bug. The commit must stop early so the live
+    /// tail still fills the viewport.
+    #[test]
+    fn commit_keeps_a_tall_final_message_live_instead_of_a_blank_pad() {
+        let width = 40;
+        let active_h = 5;
+        // A System cell renders one row per source line, so this is 8 rows tall.
+        let tall = Cell::System(
+            (0..8)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let cells = vec![
+            Cell::Assistant("intro 0".into()),
+            Cell::Assistant("intro 1".into()),
+            tall,
+            Cell::Note("resumed session — 52 message(s)".into()),
+        ];
+        let n = commit_count(&cells, width, active_h, |_| false);
+        assert!(
+            n <= 2,
+            "must not freeze the tall final message: committed {n}"
+        );
+        let live_tail: usize = cells[n..].iter().map(|c| cell_lines(c, width).len()).sum();
+        assert!(
+            live_tail >= active_h,
+            "live tail {live_tail} must fill the {active_h}-row viewport",
         );
     }
 

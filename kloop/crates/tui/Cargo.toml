@@ -14,9 +14,13 @@ anyhow = { workspace = true }
 arboard = { workspace = true }
 crossterm = { workspace = true }
 png = { workspace = true }
-# scrolling-regions: `insert_before` into native scrollback for the inline
-# viewport (plan 38 slice 0); plan 43 resyncs and redraws after each batch.
-ratatui = { workspace = true, features = ["scrolling-regions"] }
+# `insert_before` freezes finalized cells into native scrollback for the inline
+# viewport (plan 38 slice 0); plan 43 resyncs and redraws after each batch. We
+# deliberately do NOT enable the `scrolling-regions` feature: its full-height
+# `insert_before` path scrolls one DECSTBM row at a time, which iTerm2 smears in
+# scrollback (plan 99). The default path scrolls with LF-at-bottom (append_lines)
+# and commits cleanly across terminals.
+ratatui = { workspace = true }
 # Markdown → styled lines for assistant messages (plan 38 slice 1).
 pulldown-cmark = { workspace = true }
 # Tool-input parsing to format human-readable tool rows (plan 38 slice 2).

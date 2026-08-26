@@ -144,7 +144,7 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_turn_overflow_emits_ordered_scroll_clear_and_repaint() -> Result<()> {
+async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Result<()> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let mut first = (0..36)
         .map(|index| format!("FIRST-OVERFLOW-{index:02}"))
@@ -171,14 +171,27 @@ async fn two_turn_overflow_emits_ordered_scroll_clear_and_repaint() -> Result<()
     assert_eq!(final_frame.count("[manual]"), 1);
 
     let raw = harness.raw_since(mark);
-    let region = find_bytes(&raw, b"\x1b[1;1r", 0).expect("scroll region set");
-    let scroll = find_bytes(&raw, b"\x1b[1S", region).expect("scroll up");
-    let reset = find_bytes(&raw, b"\x1b[r", scroll).expect("scroll region reset");
-    let clear = find_bytes(&raw, b"\x1b[J", reset).expect("inline clear");
-    let repaint = find_bytes(&raw, b"FIRST_OVERFLOW_TAIL", clear).expect("tail repaint");
-    let second = find_bytes(&raw, b"SECOND_TAIL", repaint).expect("second tail repaint");
+    // Bug #1 (plan 99): a full-height inline commit must NOT drive DECSTBM scroll
+    // regions — that per-row path smears committed lines in iTerm2. Overflow now
+    // scrolls into scrollback with plain line feeds (append_lines) instead, so
+    // none of the scroll-region control sequences may appear.
     assert!(
-        region < scroll && scroll < reset && reset < clear && clear < repaint && repaint < second
+        find_bytes(&raw, b"\x1b[1;1r", 0).is_none(),
+        "commit must not set a one-row scroll region"
+    );
+    assert!(
+        find_bytes(&raw, b"\x1b[1S", 0).is_none(),
+        "commit must not emit a scroll-region scroll-up"
+    );
+    // The overflow still commits, clears the inline viewport, then repaints the
+    // first turn's tail followed by the second turn's — in that order.
+    let clear = find_bytes(&raw, b"\x1b[J", 0).expect("inline clear");
+    let repaint =
+        find_bytes(&raw, b"FIRST_OVERFLOW_TAIL", clear).expect("first tail repaint after clear");
+    let second = find_bytes(&raw, b"SECOND_TAIL", repaint).expect("second tail after first");
+    assert!(
+        clear < repaint && repaint < second,
+        "commit ordering in raw output"
     );
 
     graceful_exit(&mut harness)?;

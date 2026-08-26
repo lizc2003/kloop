@@ -624,22 +624,6 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
     fn flush(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.flush()
     }
-
-    fn scroll_region_up(
-        &mut self,
-        region: std::ops::Range<u16>,
-        line_count: u16,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.scroll_region_up(region, line_count)
-    }
-
-    fn scroll_region_down(
-        &mut self,
-        region: std::ops::Range<u16>,
-        line_count: u16,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.scroll_region_down(region, line_count)
-    }
 }
 
 type Terminal =
@@ -817,9 +801,11 @@ fn spawn_input_thread(
 }
 
 /// Insert one overflow batch into native scrollback, then invalidate the inline
-/// viewport. Ratatui's full-height `insert_before` path uses a one-row scrolling
-/// region that some terminals treat as a whole-screen scroll; `clear` resets its
-/// diff buffer so the next draw restores the transcript tail and bottom chrome.
+/// viewport. With `scrolling-regions` off, Ratatui's full-height `insert_before`
+/// scrolls the batch off the bottom with `append_lines` (a real LF-at-bottom
+/// scroll every terminal handles), instead of the DECSTBM one-row scroll that
+/// iTerm2 smears (plan 99); `clear` resets its diff buffer so the next draw
+/// restores the transcript tail and bottom chrome.
 fn insert_scrollback_blocks<B>(
     terminal: &mut ratatui::Terminal<B>,
     blocks: Vec<Vec<Line<'static>>>,
@@ -1326,24 +1312,6 @@ mod tests {
         fn flush(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.flush()
         }
-
-        fn scroll_region_up(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> std::result::Result<(), Self::Error> {
-            self.record("scroll");
-            self.inner.scroll_region_up(region, line_count)
-        }
-
-        fn scroll_region_down(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> std::result::Result<(), Self::Error> {
-            self.record("scroll");
-            self.inner.scroll_region_down(region, line_count)
-        }
     }
 
     /// The worker's rewind primitive: fork the live session's file at a cut,
@@ -1530,8 +1498,9 @@ mod tests {
 
         let events = terminal.backend().inner.events.borrow();
         assert!(events.contains(&"draw"));
-        assert!(!events.contains(&"scroll"));
         assert_eq!((viewport.width, viewport.height), (80, 24));
+        // A stale small size must not freeze overflow: the confirmed geometry is
+        // the full height, so all twelve cells stay live (none committed).
         assert_eq!(app.cells.len(), 12);
     }
 
@@ -1558,16 +1527,10 @@ mod tests {
         let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
 
         let events = terminal.backend().inner.events.borrow();
-        let first_draw = events
-            .iter()
-            .position(|event| *event == "draw")
-            .expect("frame was drawn");
-        let first_scroll = events
-            .iter()
-            .position(|event| *event == "scroll")
-            .expect("overflow was committed");
-        assert!(first_draw < first_scroll, "events: {events:?}");
+        assert!(events.contains(&"draw"), "frame was drawn: {events:?}");
         assert_eq!((viewport.width, viewport.height), (80, 6));
+        // Confirmed small geometry freezes the overflowing prefix into
+        // scrollback, so the live tail drops below the original twelve cells.
         assert!(app.cells.len() < 12);
         drop(events);
 
