@@ -478,7 +478,12 @@ full-screen blank pad. Because the inline viewport is the full terminal height,
 `insert_before` runs Ratatui's default path (the `scrolling-regions` cargo
 feature is deliberately off): it scrolls committed lines into scrollback with
 plain line feeds (`append_lines`) at the bottom row, not the DECSTBM one-row
-scroll region that iTerm2 smears. A resize that arrives during the transaction
+scroll region that iTerm2 smears. Each `insert_before` on a full-height viewport
+costs one full-screen scroll + clear regardless of how tall the block is, so a
+`-c` resume that commits a long backlog coalesces it into a few tall batches
+(capped rows each) rather than one `insert_before` per cell — the difference
+between a resume that lands at once and one that visibly scrolls the whole
+history for seconds. A resize that arrives during the transaction
 becomes visible only to the next frame, so commit and repaint cannot split across
 two geometries. Key handling receives the final repaint's viewport. Composer wrapping,
 cursor projection, visible height, and ↑/↓ navigation likewise come from one
