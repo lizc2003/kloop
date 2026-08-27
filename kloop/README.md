@@ -583,7 +583,7 @@ starts with its recent conversation visible instead of a blank screen.
 
 `kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
 
-**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
 
 
 **Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
@@ -636,7 +636,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detai
 for owner-scoped scheduler lifecycle (**no `turnId`**),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` runs on the ordinary command path but likewise re-freezes the session route, so its new `effort` reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
@@ -1777,6 +1777,11 @@ the model. The set is small and lives one-file-per-command under
 `core/src/commands/` (the directory listing *is* the catalog):
 
 - `/help` — list the commands.
+- `/provider` — show the configured providers, or `/provider <provider>
+  [model]` to switch the session route (see **Provider catalog and session
+  route** above; the TUI opens a picker when called bare).
+- `/effort` — show the session reasoning effort, `/effort <level>` to set it,
+  `/effort off` to send no effort field at all (see **Reasoning effort** below).
 - `/cost` — the current model and context-window estimate (`~used / window
   tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
   durable provider-reported usage across all models in the current transcript:
@@ -1795,6 +1800,32 @@ the model. The set is small and lives one-file-per-command under
   teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
   it is inert — quitting one thread must not stop a multi-session process, so it
   just relays a note.
+
+**Reasoning effort.** `/effort` is a session-local knob over one bounded
+vocabulary — `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — that each rail
+renders into its own request field: Anthropic `output_config.effort`, Responses
+`reasoning.effort` (with `summary: "auto"`), Chat `reasoning_effort`. The rails
+do not admit the same levels, so each declares its accepted subset (Anthropic
+`low..max`; the OpenAI family `minimal..high`) and a level outside it is refused
+by the command, listing what the active provider accepts — never silently
+downgraded, never sent for the provider to reject. `off` means kloop sends no
+field and the provider's own default stands; that is also the default, so the
+chat rail's field (which only reasoning models accept) never appears unless
+asked for. The initial value comes from `KLOOP_EFFORT` > top-level
+`model_reasoning_effort` > the selected profile's `effort`, each validated at
+startup against the rail that would have to send it.
+
+A change applies from the next turn: the effort rides the frozen provider route,
+so child agents and compaction sample at the same value, and it appears in the
+TUI footer and in `ActiveProviderRoute.effort`. It is deliberately **not** part
+of the durable route timeline — route revision and receipts are route *identity*
+(what reasoning replay is matched against), and an effort change leaves recorded
+reasoning replayable. A resumed session therefore re-seeds effort from
+configuration. Across a `/provider` switch the value is sticky where the new
+rail accepts it and otherwise falls back to that provider's configured effort;
+a session that never ran `/effort` simply follows each provider's configuration.
+Changing effort mid-conversation invalidates the Anthropic prompt cache (the
+request prefix changes), so the next turn re-pays cache creation.
 
 An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). Commands run **only when idle** — they read or
@@ -2596,8 +2627,10 @@ cargo run -- --mock
 #
 # ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
-# selected profile. KLOOP_CACHE, KLOOP_THINKING, and KLOOP_EFFORT remain provider-
-# local request settings. KLOOP_FALLBACK_MODEL is not a runtime selector.
+# selected profile. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
+# settings. KLOOP_EFFORT (or top-level model_reasoning_effort, or a profile's
+# effort key — in that precedence, and now valid on every wire_api, not just
+# responses) seeds the session reasoning effort that /effort then owns. KLOOP_FALLBACK_MODEL is not a runtime selector.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
 # Stream guards are fixed provider-internal safety defaults, not user config:

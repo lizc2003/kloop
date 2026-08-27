@@ -421,7 +421,109 @@ impl ProviderApiFamily {
     pub fn requires_exact_reasoning_replay(self) -> bool {
         self != Self::OpenAiChatCompletions
     }
+
+    /// The effort levels this rail's wire accepts. The three rails spell the
+    /// parameter differently and admit different vocabularies, so the set is
+    /// per-family rather than global; a level outside it is rejected here
+    /// instead of being silently downgraded or sent for the provider to 400.
+    /// Recheck each row when upgrading a provider — upstream adds levels.
+    pub fn accepted_efforts(self) -> &'static [ReasoningEffort] {
+        use ReasoningEffort::*;
+        match self {
+            // `output_config: {"effort": …}` — GA, defaults to `high`.
+            Self::AnthropicMessages => &[Low, Medium, High, XHigh, Max],
+            // `reasoning: {"effort": …}` / `reasoning_effort: …` — the OpenAI
+            // family tops out at `high` and adds `minimal` below `low`.
+            Self::OpenAiResponses | Self::OpenAiChatCompletions => &[Minimal, Low, Medium, High],
+            Self::Mock => ReasoningEffort::ALL,
+        }
+    }
+
+    pub fn accepts_effort(self, effort: ReasoningEffort) -> bool {
+        self.accepted_efforts().contains(&effort)
+    }
 }
+
+/// How hard the model is asked to think, as a kloop-owned bounded vocabulary.
+/// Each rail renders it into its own request field and accepts its own subset
+/// ([`ProviderApiFamily::accepted_efforts`]). Absent (`None` at the call site)
+/// means kloop sends no field at all and the provider's own default stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const ALL: &'static [ReasoningEffort] = &[
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Render a set for an error or help line: `minimal, low, medium, high`.
+    pub fn join(levels: &[ReasoningEffort]) -> String {
+        levels
+            .iter()
+            .map(|level| level.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = UnknownReasoningEffort;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|level| level.as_str().eq_ignore_ascii_case(raw.trim()))
+            .ok_or_else(|| UnknownReasoningEffort(raw.trim().to_string()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownReasoningEffort(pub String);
+
+impl fmt::Display for UnknownReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unknown effort '{}' (known: {})",
+            self.0,
+            ReasoningEffort::join(ReasoningEffort::ALL)
+        )
+    }
+}
+
+impl std::error::Error for UnknownReasoningEffort {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -499,6 +601,11 @@ pub struct ActiveProviderRoute {
     pub model: String,
     /// Bounded public receipt for reasoning continuity at this route boundary.
     pub continuity: ReasoningContinuity,
+    /// The session's reasoning effort, or None when kloop sends no field.
+    /// Session-local: it rides the frozen route but is not part of the durable
+    /// route timeline, so a resumed session re-seeds it from configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
 }
 
 /// Private replay identity bound by the History owner when a provider-produced
@@ -1342,5 +1449,56 @@ mod tests {
         for (assistant, content) in cases {
             assert_eq!(assistant.into_content_block(), content);
         }
+    }
+
+    /// The effort vocabulary round-trips through the words the wire and the
+    /// `/effort` command use, case-insensitively, and rejects anything else.
+    #[test]
+    fn reasoning_effort_parses_its_own_words_and_rejects_others() {
+        let parsed: Vec<ReasoningEffort> = ["minimal", "LOW", " medium ", "High", "xhigh", "max"]
+            .iter()
+            .map(|raw| raw.parse().unwrap())
+            .collect();
+        assert_eq!(parsed, ReasoningEffort::ALL);
+        assert_eq!(
+            ReasoningEffort::ALL
+                .iter()
+                .map(|level| level.as_str())
+                .collect::<Vec<_>>(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            "x-high".parse::<ReasoningEffort>(),
+            Err(UnknownReasoningEffort("x-high".into()))
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::XHigh).unwrap(),
+            serde_json::json!("xhigh")
+        );
+    }
+
+    /// Each rail admits its own subset: the OpenAI family tops out at `high`
+    /// and adds `minimal`; Anthropic starts at `low` and goes past `high`.
+    #[test]
+    fn accepted_efforts_are_per_api_family() {
+        use ReasoningEffort::*;
+        assert_eq!(
+            ProviderApiFamily::AnthropicMessages.accepted_efforts(),
+            [Low, Medium, High, XHigh, Max]
+        );
+        assert_eq!(
+            ProviderApiFamily::OpenAiResponses.accepted_efforts(),
+            [Minimal, Low, Medium, High]
+        );
+        assert_eq!(
+            ProviderApiFamily::OpenAiChatCompletions.accepted_efforts(),
+            [Minimal, Low, Medium, High]
+        );
+        assert!(!ProviderApiFamily::AnthropicMessages.accepts_effort(Minimal));
+        assert!(!ProviderApiFamily::OpenAiResponses.accepts_effort(Max));
+        assert_eq!(
+            ReasoningEffort::join(ProviderApiFamily::OpenAiResponses.accepted_efforts()),
+            "minimal, low, medium, high"
+        );
     }
 }

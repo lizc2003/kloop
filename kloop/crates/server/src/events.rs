@@ -747,6 +747,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: model.into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         }
     }
 

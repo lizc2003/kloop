@@ -40,6 +40,7 @@ use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
 use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::ProviderResponseProvenance;
+use kloop_protocol::ReasoningEffort;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
 
@@ -59,6 +60,7 @@ pub struct MockRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
+    pub effort: Option<ReasoningEffort>,
 }
 
 /// One scripted Mock response: content blocks, a gate-delayed response, a
@@ -137,9 +139,6 @@ pub enum Provider {
     OpenAiResponses {
         key: String,
         base: String,
-        /// `reasoning: {effort, summary: "auto"}` request field; None sends
-        /// no reasoning field.
-        effort: Option<String>,
     },
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
     Mock {
@@ -412,14 +411,21 @@ impl Provider {
         tools: &[ToolDef],
     ) -> ProviderStream {
         let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
-        self.stream_attempt(&attempt, system, messages, tools)
+        self.stream_attempt(&attempt, None, system, messages, tools)
     }
 
     /// Start one streaming request from an immutable provider attempt. The final
     /// route/reasoning guard executes before any adapter can construct HTTP I/O.
+    ///
+    /// `effort` is the session's reasoning knob, passed per request rather than
+    /// baked into the `Provider` so `/effort` can change it mid-conversation
+    /// (the catalog hands out one cached `Provider` per configured id). `None`
+    /// sends no effort field on any rail. The caller has already validated it
+    /// against this rail's [`ProviderApiFamily::accepted_efforts`].
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
+        effort: Option<ReasoningEffort>,
         system: &str,
         messages: &[Message],
         tools: &[ToolDef],
@@ -435,6 +441,7 @@ impl Provider {
                     system: system.to_string(),
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
+                    effort,
                 });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                     MockTurn::Blocks(vec![AssistantBlock::Text {
@@ -459,6 +466,9 @@ impl Provider {
                     "tools": anthropic::tools_value(tools, *cache),
                     "stream": true,
                 });
+                if let Some(effort) = effort {
+                    body["output_config"] = json!({"effort": effort.as_str()});
+                }
                 match thinking {
                     ThinkingMode::Unset => {}
                     ThinkingMode::Off => body["thinking"] = json!({"type": "disabled"}),
@@ -472,7 +482,7 @@ impl Provider {
                     anthropic::stream(&url, &key, &body, &sink).await
                 })
             }
-            Provider::OpenAiResponses { key, base, effort } => {
+            Provider::OpenAiResponses { key, base } => {
                 let url = format!("{base}/responses");
                 let key = key.clone();
                 let mut body = json!({
@@ -492,7 +502,7 @@ impl Provider {
                     "stream": true,
                 });
                 if let Some(effort) = effort {
-                    body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+                    body["reasoning"] = json!({"effort": effort.as_str(), "summary": "auto"});
                 }
                 spawn_stream(move |sink| async move {
                     responses::stream(&url, &key, &body, &sink).await
@@ -507,7 +517,7 @@ impl Provider {
                         return spawn_stream(move |_sink| async move { Err(error) });
                     }
                 };
-                let body = json!({
+                let mut body = json!({
                     "model": model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
                     "stream_options": {"include_usage": true},
@@ -522,6 +532,12 @@ impl Provider {
                     })).collect::<Vec<_>>(),
                     "stream": true,
                 });
+                // Only reasoning models accept this; a non-reasoning model
+                // rejects it, which is why the field is absent unless the
+                // session explicitly set an effort.
+                if let Some(effort) = effort {
+                    body["reasoning_effort"] = json!(effort.as_str());
+                }
                 spawn_stream(
                     move |sink| async move { openai::stream(&url, &key, &body, &sink).await },
                 )

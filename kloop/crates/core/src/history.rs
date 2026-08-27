@@ -879,6 +879,7 @@ mod tests {
             ),
             fallback_model: fallback.map(str::to_string),
             availability: ProviderAvailabilityCode::Ready,
+            default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
         let catalog = Arc::new(
@@ -983,6 +984,7 @@ mod tests {
                     models: vec!["source-model".into()],
                     fallback_model: None,
                     availability: ProviderAvailabilityCode::Ready,
+                    default_effort: None,
                     factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
                 },
                 ProviderCatalogEntry {
@@ -993,6 +995,7 @@ mod tests {
                     models: vec!["chat-model".into()],
                     fallback_model: None,
                     availability: ProviderAvailabilityCode::Ready,
+                    default_effort: None,
                     factory: Arc::new(move || Ok(chat_provider())),
                 },
             ])
@@ -1048,6 +1051,7 @@ mod tests {
             models: vec![format!("{id}-model")],
             fallback_model: None,
             availability: ProviderAvailabilityCode::Ready,
+            default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
         let catalog = Arc::new(ProviderCatalog::new(vec![entry("a"), entry("b")]).unwrap());

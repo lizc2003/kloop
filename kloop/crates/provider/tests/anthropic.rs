@@ -10,6 +10,7 @@ use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
 use kloop_protocol::OutputLimitKind;
+use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
@@ -743,4 +744,34 @@ async fn message_stop_does_not_close_an_unfinished_block() {
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
     assert!(!error.is_retryable());
     assert!(error.to_string().contains("unfinished content blocks"));
+}
+
+/// The session effort renders into `output_config` on this rail (its own
+/// spelling — `reasoning`/`reasoning_effort` belong to the OpenAI rails), and
+/// no effort sends no field, leaving the provider's own default in force.
+#[tokio::test]
+async fn effort_maps_to_output_config() {
+    for (effort, expected) in [
+        (None, None),
+        (
+            Some(ReasoningEffort::XHigh),
+            Some(json!({"effort": "xhigh"})),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+        let provider = Arc::new(anthropic(&server));
+        let attempt = provider.attempt_identity(
+            "anthropic",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx =
+            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
+        while rx.recv().await.is_some() {}
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body.get("output_config").cloned(), expected, "{effort:?}");
+    }
 }

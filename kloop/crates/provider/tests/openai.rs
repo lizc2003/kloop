@@ -6,6 +6,7 @@ use std::sync::Arc;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::Message;
+use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Provider;
@@ -602,4 +603,35 @@ async fn unknown_non_error_named_event_still_fails_closed() {
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
     assert!(!error.is_retryable());
     assert!(error.to_string().contains("unknown SSE event name"));
+}
+
+/// The chat rail spells the knob `reasoning_effort` (a bare string, not the
+/// nested object the other two rails use). It is absent unless the session set
+/// an effort, because a non-reasoning model rejects the field.
+#[tokio::test]
+async fn effort_maps_to_reasoning_effort_field() {
+    for (effort, expected) in [
+        (None, None),
+        (Some(ReasoningEffort::Minimal), Some(json!("minimal"))),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[], /*done*/ true)).await;
+        let provider = Arc::new(openai(&server));
+        let attempt = provider.attempt_identity(
+            "chat",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx =
+            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
+        while rx.recv().await.is_some() {}
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("reasoning_effort").cloned(),
+            expected,
+            "{effort:?}"
+        );
+    }
 }

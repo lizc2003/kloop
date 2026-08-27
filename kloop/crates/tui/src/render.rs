@@ -813,8 +813,13 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
 fn system_status(app: &App) -> String {
     let route = app.display_route();
     let identity = route.map(|route| {
+        // Effort only earns footer width when it is actually being sent.
+        let effort = route
+            .effort
+            .map(|effort| format!(" · {effort}"))
+            .unwrap_or_default();
         format!(
-            "{} / {} · r{}",
+            "{} / {} · r{}{effort}",
             route.provider_id, route.model, route.revision
         )
     });
@@ -2273,6 +2278,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "a-model".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let new = kloop_protocol::ActiveProviderRoute {
             revision: 5,
@@ -2280,6 +2286,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "b-model".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let mut app = App::new("s".into())
             .with_context("legacy-model".into(), Some(100), 25)

@@ -24,6 +24,7 @@ use crate::tools::TaskGraphSnapshot;
 mod clear;
 mod compact;
 mod cost;
+mod effort;
 mod exit;
 mod help;
 #[path = "loop.rs"]
@@ -45,7 +46,10 @@ pub struct SlashResult {
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
-    pub provider_changed: bool,
+    /// The session route changed in a way sampling must see — a provider or
+    /// model switch, or a new reasoning effort. The front-ends answer it by
+    /// re-freezing `cfg` from the session provider state.
+    pub route_changed: bool,
     pub open_provider_picker: bool,
 }
 
@@ -60,7 +64,7 @@ impl SlashResult {
             run_turn: None,
             task_graph: None,
             quit: false,
-            provider_changed: false,
+            route_changed: false,
             open_provider_picker: false,
         }
     }
@@ -73,7 +77,7 @@ impl SlashResult {
             run_turn: None,
             task_graph: Some(task_graph),
             quit: false,
-            provider_changed: false,
+            route_changed: false,
             open_provider_picker: false,
         }
     }
@@ -86,19 +90,19 @@ impl SlashResult {
             run_turn: Some(prompt),
             task_graph: None,
             quit: false,
-            provider_changed: false,
+            route_changed: false,
             open_provider_picker: false,
         }
     }
 
-    fn provider(output: impl Into<String>, changed: bool, open_picker: bool) -> Self {
+    fn route(output: impl Into<String>, changed: bool, open_picker: bool) -> Self {
         Self {
             output: output.into(),
             cleared: false,
             run_turn: None,
             task_graph: None,
             quit: false,
-            provider_changed: changed,
+            route_changed: changed,
             open_provider_picker: open_picker,
         }
     }
@@ -111,7 +115,7 @@ impl SlashResult {
             run_turn: None,
             task_graph: None,
             quit: true,
-            provider_changed: false,
+            route_changed: false,
             open_provider_picker: false,
         }
     }
@@ -133,6 +137,10 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "provider",
         summary: provider::SUMMARY,
+    },
+    Builtin {
+        name: "effort",
+        summary: effort::SUMMARY,
     },
     Builtin {
         name: "cost",
@@ -193,6 +201,7 @@ pub async fn run_with_provider_state(
     match name {
         "help" => help::run(),
         "provider" => provider::run(args, history, cfg, provider_state),
+        "effort" => effort::run(args, provider_state),
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
@@ -537,7 +546,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit)"
+                "unknown command '/frobnicate' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit)"
             )
         );
     }
@@ -575,7 +584,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit, /greet)"
             )
         );
     }
@@ -612,7 +621,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /cost, /compact, /clear, /loop, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit, /deploy)"
             )
         );
     }
@@ -717,5 +726,86 @@ mod tests {
             "got: {}",
             result.output
         );
+    }
+
+    /// `/effort` reads and writes the session knob, and refuses a level the
+    /// active rail cannot send instead of storing it for the provider to 400 on.
+    #[tokio::test]
+    async fn effort_shows_sets_clears_and_refuses_levels_the_rail_cannot_send() {
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        let catalog = Arc::new(
+            crate::provider_route::ProviderCatalog::new(vec![
+                crate::provider_route::ProviderCatalogEntry {
+                    id: "responses".into(),
+                    api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                    endpoint_fingerprint: "responses:test".into(),
+                    default_model: "m1".into(),
+                    models: vec!["m1".into()],
+                    fallback_model: None,
+                    availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                    default_effort: None,
+                    factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
+                },
+            ])
+            .unwrap(),
+        );
+        let state =
+            crate::provider_route::SessionProviderState::new(catalog, "responses", None).unwrap();
+        let cancel = CancellationToken::new();
+        let run = async |line: &str, history: &mut History| {
+            run_with_provider_state(line, history, &cfg, &state, &cancel).await
+        };
+
+        let shown = run("/effort", &mut history).await;
+        assert_eq!(
+            shown,
+            SlashResult::message(
+                "effort: off — no effort field is sent, the provider's own default applies \
+                 (provider responses, accepted: minimal, low, medium, high)\n\
+                 usage: /effort <level> | /effort off"
+            )
+        );
+
+        let set = run("/effort Medium", &mut history).await;
+        assert_eq!(
+            set,
+            SlashResult::route(
+                "effort: medium (provider responses, accepted: minimal, low, medium, high)",
+                /*changed*/ true,
+                /*open_picker*/ false,
+            )
+        );
+        assert_eq!(
+            state.effort(),
+            Some(kloop_protocol::ReasoningEffort::Medium)
+        );
+
+        // Setting the level it already has is a read, not a route change.
+        assert!(!run("/effort medium", &mut history).await.route_changed);
+
+        let refused = run("/effort max", &mut history).await;
+        assert_eq!(
+            refused,
+            SlashResult::message(
+                "provider 'responses' does not accept effort 'max' \
+                 (accepted: minimal, low, medium, high)"
+            )
+        );
+        let unknown = run("/effort hgih", &mut history).await;
+        assert_eq!(
+            unknown,
+            SlashResult::message(
+                "unknown effort 'hgih' (known: minimal, low, medium, high, xhigh, max)\n\
+                 provider 'responses' accepts: minimal, low, medium, high (or 'off')"
+            )
+        );
+        assert_eq!(
+            state.effort(),
+            Some(kloop_protocol::ReasoningEffort::Medium)
+        );
+
+        assert!(run("/effort off", &mut history).await.route_changed);
+        assert_eq!(state.effort(), None);
     }
 }

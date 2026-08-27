@@ -740,7 +740,7 @@ async fn plain_main(
             if !result.output.is_empty() {
                 println!("{}", result.output);
             }
-            if result.provider_changed {
+            if result.route_changed {
                 cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
             }
             // `/exit` quits the REPL, like the bare `exit` word above.

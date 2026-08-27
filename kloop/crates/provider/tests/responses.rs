@@ -8,6 +8,7 @@ use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::OutputLimitKind;
+use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
@@ -63,7 +64,6 @@ fn responses(server: &MockServer) -> Provider {
     Provider::OpenAiResponses {
         key: "test-key".into(),
         base: server.uri(),
-        effort: None,
     }
 }
 
@@ -202,15 +202,19 @@ async fn error_tool_output_replays_program_resume_contract_verbatim() {
     );
 }
 
-/// KLOOP_EFFORT maps to the reasoning request field (with summary=auto for
-/// displayable text); absent effort sends no reasoning field at all.
+/// The session effort maps to the reasoning request field (with summary=auto
+/// for displayable text); absent effort sends no reasoning field at all.
 #[tokio::test]
 async fn effort_maps_to_reasoning_field() {
     for (effort, expected) in [
         (None, None),
         (
-            Some("high".to_string()),
+            Some(ReasoningEffort::High),
             Some(json!({"effort": "high", "summary": "auto"})),
+        ),
+        (
+            Some(ReasoningEffort::Minimal),
+            Some(json!({"effort": "minimal", "summary": "auto"})),
         ),
     ] {
         let server = MockServer::start().await;
@@ -222,9 +226,15 @@ async fn effort_maps_to_reasoning_field() {
         let provider = Arc::new(Provider::OpenAiResponses {
             key: "test-key".into(),
             base: server.uri(),
-            effort: effort.clone(),
         });
-        let mut rx = provider.stream("test-model", "s", &[Message::user_text("hi")], &[]);
+        let attempt = provider.attempt_identity(
+            "responses",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx =
+            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();

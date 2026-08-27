@@ -33,7 +33,7 @@ pub fn run(
             ));
         }
         lines.push("usage: /provider <provider> [model]".into());
-        return SlashResult::provider(lines.join("\n"), false, true);
+        return SlashResult::route(lines.join("\n"), false, true);
     };
     let model = parts.next();
     if parts.next().is_some() {
@@ -41,7 +41,7 @@ pub fn run(
     }
     let expected_revision = state.active_route().revision;
     match history.switch_provider(state, expected_revision, provider_id, model) {
-        Ok(SwitchOutcome::NoOp(route)) => SlashResult::provider(
+        Ok(SwitchOutcome::NoOp(route)) => SlashResult::route(
             format!(
                 "provider unchanged: {} {} (revision {})",
                 route.provider_id(),
@@ -51,18 +51,26 @@ pub fn run(
             false,
             false,
         ),
-        Ok(SwitchOutcome::Changed { route, continuity }) => SlashResult::provider(
+        // The effort is reported because a switch can change it: it is kept
+        // when the new rail accepts it, and otherwise falls back to the new
+        // provider's configured value.
+        Ok(SwitchOutcome::Changed { route, continuity }) => SlashResult::route(
             format!(
-                "provider switched: {} {} (revision {}, reasoning continuity: {continuity:?})",
+                "provider switched: {} {} (revision {}, reasoning continuity: {continuity:?}, effort: {})",
                 route.provider_id(),
                 route.primary_model(),
-                route.revision()
+                route.revision(),
+                effort_label(route.effort()),
             ),
             true,
             false,
         ),
         Err(error) => SlashResult::message(format!("provider switch failed: {error}")),
     }
+}
+
+fn effort_label(effort: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
+    effort.map_or("off", kloop_protocol::ReasoningEffort::as_str)
 }
 
 fn api_family_label(family: kloop_protocol::ProviderApiFamily) -> &'static str {

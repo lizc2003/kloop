@@ -19,6 +19,7 @@ use kloop_core::provider_route::ProviderCatalog;
 use kloop_core::provider_route::ProviderCatalogEntry;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAvailabilityCode;
+use kloop_protocol::ReasoningEffort;
 use kloop_provider::Provider;
 use kloop_provider::ThinkingMode;
 
@@ -35,6 +36,14 @@ impl Rail {
             Self::Anthropic => ProviderApiFamily::AnthropicMessages,
             Self::OpenAiChat => ProviderApiFamily::OpenAiChatCompletions,
             Self::OpenAiResponses => ProviderApiFamily::OpenAiResponses,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiChat => "chat",
+            Self::OpenAiResponses => "responses",
         }
     }
 
@@ -98,12 +107,15 @@ struct Profile {
     fallback_model: Option<String>,
     cache: bool,
     thinking: ThinkingMode,
-    effort: Option<String>,
+    effort: Option<ReasoningEffort>,
 }
 
 struct GlobalFile {
     initial_model: Option<String>,
     initial_provider: String,
+    /// Root `model_reasoning_effort`: the rail-agnostic effort a session starts
+    /// at, overriding the selected profile's own `effort`.
+    initial_effort: Option<ReasoningEffort>,
     profiles: BTreeMap<String, Profile>,
 }
 
@@ -155,6 +167,7 @@ fn resolve_table(
         );
     }
 
+    let root_effort = file.initial_effort;
     let mut entries = Vec::with_capacity(file.profiles.len());
     for (id, profile) in file.profiles {
         let selected = id == initial_provider;
@@ -170,7 +183,7 @@ fn resolve_table(
         let wire = profile.wire;
         let cache = profile.cache;
         let thinking = profile.thinking;
-        let effort = profile.effort.clone();
+        let default_effort = selected_effort(&profile, selected, root_effort, env)?;
         let factory = Arc::new(move || {
             let key = credential
                 .clone()
@@ -189,7 +202,6 @@ fn resolve_table(
                 Rail::OpenAiResponses => Provider::OpenAiResponses {
                     key,
                     base: base.clone(),
-                    effort: effort.clone(),
                 },
             })
         });
@@ -201,6 +213,7 @@ fn resolve_table(
             models: profile.models,
             fallback_model: profile.fallback_model,
             availability,
+            default_effort,
             factory,
         });
     }
@@ -265,11 +278,14 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         fallback_model: None,
         cache: wire == Rail::Anthropic,
         thinking: ThinkingMode::Unset,
-        effort: nonempty_env(env, "KLOOP_EFFORT")?,
+        // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
+        // provider — which, here, is the only one.
+        effort: None,
     };
     Ok(GlobalFile {
         initial_model: Some(model),
         initial_provider: id.clone(),
+        initial_effort: None,
         profiles: BTreeMap::from([(id, profile)]),
     })
 }
@@ -287,6 +303,52 @@ fn selected_base(
         return validate_base_url(&base, override_name);
     }
     Ok(profile.base_url.clone())
+}
+
+/// The effort this provider starts a session at: `KLOOP_EFFORT` beats the root
+/// `model_reasoning_effort`, which beats the profile's own `effort`. Like the
+/// base URL and credential overrides, the two global sources apply only to the
+/// selected provider — they must not silently retarget the others. Validated
+/// against this profile's rail so an unusable value fails at startup, not on
+/// the first request.
+fn selected_effort(
+    profile: &Profile,
+    selected: bool,
+    root: Option<ReasoningEffort>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<ReasoningEffort>> {
+    let effort = if selected {
+        parse_effort_env(env)?.or(root).or(profile.effort)
+    } else {
+        profile.effort
+    };
+    if let Some(effort) = effort {
+        check_effort(effort, profile.wire, "effort")?;
+    }
+    Ok(effort)
+}
+
+fn parse_effort_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<ReasoningEffort>> {
+    nonempty_env(env, "KLOOP_EFFORT")?
+        .map(|raw| {
+            raw.parse::<ReasoningEffort>()
+                .map_err(|e| anyhow!("KLOOP_EFFORT: {e}"))
+        })
+        .transpose()
+}
+
+/// Each rail admits its own effort vocabulary; reject a level it cannot send
+/// rather than let the provider answer with a 400 on the first request.
+fn check_effort(effort: ReasoningEffort, wire: Rail, field: &str) -> Result<()> {
+    let family = wire.api_family();
+    if !family.accepts_effort(effort) {
+        bail!(
+            "{field} '{effort}' is not accepted by {} wire_api (accepted: {})",
+            wire.label(),
+            ReasoningEffort::join(family.accepted_efforts())
+        );
+    }
+    Ok(())
 }
 
 fn selected_credential(
@@ -310,6 +372,13 @@ fn selected_credential(
 
 fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
     let initial_model = optional_string(table, "model", "model")?;
+    let initial_effort =
+        optional_string(table, "model_reasoning_effort", "model_reasoning_effort")?
+            .map(|raw| {
+                raw.parse::<ReasoningEffort>()
+                    .map_err(|e| anyhow!("model_reasoning_effort: {e}"))
+            })
+            .transpose()?;
     let initial_provider = optional_string(table, "model_provider", "model_provider")?
         .context("model_provider is required")?;
     let providers = table
@@ -329,6 +398,7 @@ fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
     Ok(GlobalFile {
         initial_model,
         initial_provider,
+        initial_effort,
         profiles,
     })
 }
@@ -380,7 +450,15 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     let base_url = validate_base_url(&base_url, &format!("model_providers.{id}.base_url"))?;
     let cache = optional_bool(spec, "cache", &format!("model_providers.{id}.cache"))?
         .unwrap_or(wire == Rail::Anthropic);
-    let effort = optional_string(spec, "effort", &format!("model_providers.{id}.effort"))?;
+    let effort = optional_string(spec, "effort", &format!("model_providers.{id}.effort"))?
+        .map(|raw| {
+            raw.parse::<ReasoningEffort>()
+                .map_err(|e| anyhow!("model_providers.{id}.effort: {e}"))
+        })
+        .transpose()?;
+    if let Some(effort) = effort {
+        check_effort(effort, wire, &format!("model_providers.{id}.effort"))?;
+    }
     let thinking = match spec.get("thinking") {
         None => ThinkingMode::Unset,
         Some(Value::String(raw)) => {
@@ -393,9 +471,6 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     };
     if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
         bail!("model_providers.{id}: cache/thinking are only valid for anthropic wire_api");
-    }
-    if wire != Rail::OpenAiResponses && effort.is_some() {
-        bail!("model_providers.{id}.effort is only valid for responses wire_api");
     }
     let headers = parse_headers(id, spec.get("http_headers"), wire)?;
     Ok(Profile {
@@ -699,5 +774,105 @@ http_headers = { Authorization = "Bearer key" }
             let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
             assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
         }
+    }
+
+    /// `effort` is a per-provider default on every rail now (not responses
+    /// only), the root `model_reasoning_effort` and `KLOOP_EFFORT` override it
+    /// for the *selected* provider only, and every source is checked against
+    /// the rail that would have to send it.
+    #[test]
+    fn effort_resolves_env_over_root_over_profile_for_the_selected_provider() {
+        const WITH_EFFORT: &str = r#"
+model_provider = "anthropic-a"
+model_reasoning_effort = "max"
+
+[model_providers.anthropic-a]
+wire_api = "anthropic"
+http_headers = { x-api-key = "a-key" }
+default_model = "claude-a"
+models = ["claude-a"]
+effort = "low"
+
+[model_providers.responses-b]
+wire_api = "responses"
+http_headers = { Authorization = "Bearer b-key" }
+default_model = "gpt-a"
+models = ["gpt-a"]
+effort = "minimal"
+"#;
+        // Root beats the selected profile; an unselected profile keeps its own.
+        let rooted = resolve(Some(WITH_EFFORT), &env(&[])).unwrap();
+        assert_eq!(
+            rooted.catalog().default_effort("anthropic-a"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            rooted.catalog().default_effort("responses-b"),
+            Some(ReasoningEffort::Minimal)
+        );
+
+        // The environment beats the root key, and follows the selection.
+        let from_env = resolve(
+            Some(WITH_EFFORT),
+            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_EFFORT", "high")]),
+        )
+        .unwrap();
+        assert_eq!(
+            from_env.catalog().default_effort("responses-b"),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            from_env.catalog().default_effort("anthropic-a"),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn effort_is_rejected_when_the_rail_cannot_send_it() {
+        const XHIGH_ON_RESPONSES: &str = r#"
+model_provider = "responses-b"
+
+[model_providers.responses-b]
+wire_api = "responses"
+http_headers = { Authorization = "Bearer b-key" }
+default_model = "gpt-a"
+models = ["gpt-a"]
+effort = "xhigh"
+"#;
+        assert_eq!(
+            resolve(Some(XHIGH_ON_RESPONSES), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "model_providers.responses-b.effort 'xhigh' is not accepted by responses wire_api \
+             (accepted: minimal, low, medium, high)"
+        );
+
+        const MINIMAL_ROOT: &str = r#"
+model_provider = "anthropic-a"
+model_reasoning_effort = "minimal"
+
+[model_providers.anthropic-a]
+wire_api = "anthropic"
+http_headers = { x-api-key = "a-key" }
+default_model = "claude-a"
+models = ["claude-a"]
+"#;
+        assert_eq!(
+            resolve(Some(MINIMAL_ROOT), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "effort 'minimal' is not accepted by anthropic wire_api \
+             (accepted: low, medium, high, xhigh, max)"
+        );
+        assert_eq!(
+            resolve(Some(MINIMAL_ROOT), &env(&[("KLOOP_EFFORT", "sky-high")]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "KLOOP_EFFORT: unknown effort 'sky-high' \
+             (known: minimal, low, medium, high, xhigh, max)"
+        );
     }
 }

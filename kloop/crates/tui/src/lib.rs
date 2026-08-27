@@ -408,7 +408,7 @@ async fn agent_worker(
                     &cancel,
                 )
                 .await;
-                if result.provider_changed {
+                if result.route_changed {
                     let route = provider_state.active_route();
                     cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
                     let _ = events.send(AgentEvent::ProviderChanged(route));
@@ -1269,7 +1269,7 @@ mod tests {
             run_turn: None,
             task_graph: Some(snapshot(7, 0)),
             quit: false,
-            provider_changed: false,
+            route_changed: false,
             open_provider_picker: false,
         };
         assert!(send_command_result_events(&tx, &result));

@@ -2468,6 +2468,7 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "a2".into(),
                 continuity: kloop_protocol::ReasoningContinuity::Preserved,
+                effort: None,
             },
         ));
         assert_eq!(app.model, "a2");
@@ -2491,6 +2492,7 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "a2".into(),
                 continuity: kloop_protocol::ReasoningContinuity::Preserved,
+                effort: None,
             },
         ));
         app.apply(AgentEvent::ProviderPicker(vec![provider]));
@@ -2507,6 +2509,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "old-model".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let new = kloop_protocol::ActiveProviderRoute {
             revision: 2,
@@ -2514,6 +2517,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "new-model".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let mut app = App::new("s".into()).with_route(old.clone());
         app.running = true;
@@ -2537,6 +2541,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "a1".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let new = kloop_protocol::ActiveProviderRoute {
             revision: 4,
@@ -2544,6 +2549,7 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             model: "b1".into(),
             continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
         };
         let mut app = App::new("s".into()).with_route(old.clone());
         app.running = true;
@@ -2637,6 +2643,7 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "mock-model".into(),
                 continuity: kloop_protocol::ReasoningContinuity::Preserved,
+                effort: None,
             },
         });
         assert_eq!(app.session_id, "new");

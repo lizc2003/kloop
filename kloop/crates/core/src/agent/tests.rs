@@ -891,6 +891,34 @@ async fn predictive_noop_continues_sampling_without_provider_compaction() {
     assert_eq!(seen[0].system, "test");
 }
 
+/// The main sampling path sends the session reasoning effort: it is minted onto
+/// the attempt from the frozen route, never threaded separately, so `/effort`
+/// governs the turn without touching the sampler.
+#[tokio::test]
+async fn turn_samples_at_the_session_effort() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("answer"))]);
+    let cfg = compaction_cfg(provider, 200_000, "turn-effort");
+    let state = crate::provider_route::SessionProviderState::from_route(
+        Arc::clone(&cfg.provider_catalog),
+        cfg.provider_route.clone(),
+    );
+    state
+        .set_effort(Some(kloop_protocol::ReasoningEffort::Low))
+        .unwrap();
+    let cfg = Arc::new(cfg.clone_with_provider_route(state.freeze()));
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hi"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        seen.lock().unwrap()[0].effort,
+        Some(kloop_protocol::ReasoningEffort::Low)
+    );
+}
+
 /// Reactive NoOp ends the turn instead of retrying an unchanged request.
 #[tokio::test]
 async fn reactive_noop_does_not_retry_after_overflow() {

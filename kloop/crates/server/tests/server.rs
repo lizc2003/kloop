@@ -369,6 +369,7 @@ fn switch_factory(
                 models: vec!["shared".into(), format!("{id}-other")],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
                 factory: Arc::new(move || {
                     provider
                         .lock()
@@ -726,6 +727,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 model: "model-default".into(),
                 continuity: kloop_protocol::ReasoningContinuity::Preserved,
+                effort: None,
             }),
             permission_mode: "manual".into(),
             context_window: Some(200_000),
@@ -1036,6 +1038,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 models: vec!["shared".into(), "a-other".into()],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
             },
             kloop_core::provider_route::ProviderCatalogEntry {
@@ -1046,6 +1049,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 models: vec!["shared".into(), "b-other".into()],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
             },
         ])
@@ -1156,10 +1160,13 @@ async fn real_three_rail_route_switch_contract() {
         .trim_end_matches('/')
         .to_string();
     let responses_model = required_real_env("OPENAI_MODEL");
-    let responses_effort = std::env::var("KLOOP_EFFORT")
+    let responses_effort: kloop_protocol::ReasoningEffort = std::env::var("KLOOP_EFFORT")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "high".into());
+        .map_or(Ok(kloop_protocol::ReasoningEffort::High), |value| {
+            value.parse()
+        })
+        .expect("KLOOP_EFFORT must name a known effort level");
 
     let anthropic_factory_key = anthropic_key.clone();
     let anthropic_factory_base = anthropic_base.clone();
@@ -1180,6 +1187,7 @@ async fn real_three_rail_route_switch_contract() {
                 models: vec![anthropic_model.clone()],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
                 factory: Arc::new(move || {
                     Ok(Provider::Anthropic {
                         key: anthropic_factory_key.clone(),
@@ -1200,6 +1208,7 @@ async fn real_three_rail_route_switch_contract() {
                 models: vec![responses_model.clone()],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiCompat {
                         key: chat_factory_key.clone(),
@@ -1218,11 +1227,11 @@ async fn real_three_rail_route_switch_contract() {
                 models: vec![responses_model.clone()],
                 fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: Some(responses_effort),
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiResponses {
                         key: responses_factory_key.clone(),
                         base: responses_factory_base.clone(),
-                        effort: Some(responses_effort.clone()),
                     })
                 }),
             },

@@ -300,6 +300,7 @@ async fn sample_summary(
 ) -> Result<(String, Option<Usage>)> {
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
+        provider_attempt.effort(),
         COMPACT_SYSTEM,
         request,
         &[],
@@ -609,6 +610,42 @@ mod tests {
         assert_eq!(
             seen[0].model, "fallback-model",
             "compaction must use the passed model, not cfg.model"
+        );
+    }
+
+    /// The session effort reaches the wire through the frozen route: compaction
+    /// (like every child sampler) mints its attempt from `cfg.provider_route`,
+    /// so `/effort` governs it without being threaded through separately.
+    #[tokio::test]
+    async fn compaction_samples_at_the_session_effort() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "effort");
+        let state = crate::provider_route::SessionProviderState::from_route(
+            Arc::clone(&cfg.provider_catalog),
+            cfg.provider_route.clone(),
+        );
+        state
+            .set_effort(Some(kloop_protocol::ReasoningEffort::XHigh))
+            .unwrap();
+        let cfg = Arc::new(cfg.clone_with_provider_route(state.freeze()));
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        run_compaction(
+            &cfg,
+            cfg.provider_route.primary_model(),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0].effort,
+            Some(kloop_protocol::ReasoningEffort::XHigh)
         );
     }
 

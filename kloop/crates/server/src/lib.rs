@@ -839,6 +839,7 @@ impl Server {
                 .last()
                 .map(|route| ActiveProviderRoute {
                     revision: route.revision,
+                    effort: self.provider_catalog.default_effort(&route.provider_id),
                     provider_id: route.provider_id.clone(),
                     api_family: route.api_family,
                     model: route.primary_model.clone(),
@@ -877,6 +878,9 @@ impl Server {
             .last()
             .map(|route| ActiveProviderRoute {
                 revision: route.revision,
+                // Effort never enters the durable timeline, so a route read off
+                // disk reports the effort a session there would start at.
+                effort: self.provider_catalog.default_effort(&route.provider_id),
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
                 model: route.primary_model.clone(),
@@ -976,6 +980,7 @@ impl Server {
                 SwitchError::UnknownModel { .. } => "unknown_model",
                 SwitchError::Unavailable { .. } => "provider_unavailable",
                 SwitchError::StaleRevision { .. } => "stale_revision",
+                SwitchError::EffortUnsupported { .. } => "unsupported_effort",
                 SwitchError::RouteDrift(_)
                 | SwitchError::RevisionExhausted
                 | SwitchError::InvalidRevision
@@ -1091,6 +1096,7 @@ impl Server {
             ))?;
             let public_route = ActiveProviderRoute {
                 revision: route.revision,
+                effort: self.provider_catalog.default_effort(&route.provider_id),
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
                 model: route.primary_model.clone(),
@@ -1205,6 +1211,7 @@ impl Server {
                     api_family: kloop_protocol::ProviderApiFamily::Mock,
                     model: options.model.clone().unwrap_or_default(),
                     continuity: kloop_protocol::ReasoningContinuity::Preserved,
+                    effort: None,
                 },
                 SessionSnapshot {
                     messages: Vec::new(),
@@ -1361,6 +1368,7 @@ fn switch_error_kind(error: &ProviderSwitchError) -> &'static str {
         ProviderSwitchError::Route(SwitchError::UnknownModel { .. }) => "unknown_model",
         ProviderSwitchError::Route(SwitchError::Unavailable { .. }) => "provider_unavailable",
         ProviderSwitchError::Route(SwitchError::StaleRevision { .. }) => "stale_revision",
+        ProviderSwitchError::Route(SwitchError::EffortUnsupported { .. }) => "unsupported_effort",
         ProviderSwitchError::Persistence(_) => "route_persistence_failed",
         ProviderSwitchError::History(_) => "history_projection_failed",
         ProviderSwitchError::Route(
@@ -1840,7 +1848,7 @@ async fn run_turn_or_command(
             &turn.cancel,
         )
         .await;
-        if result.provider_changed {
+        if result.route_changed {
             let route = provider_state.active_route();
             *cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
             *active_route.lock().unwrap() = route.clone();
