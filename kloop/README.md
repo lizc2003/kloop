@@ -483,7 +483,12 @@ costs one full-screen scroll + clear regardless of how tall the block is, so a
 `-c` resume that commits a long backlog coalesces it into a few tall batches
 (capped rows each) rather than one `insert_before` per cell — the difference
 between a resume that lands at once and one that visibly scrolls the whole
-history for seconds. A resize that arrives during the transaction
+history for seconds. That default path blits every buffer cell verbatim,
+including the `" "` placeholder each wide (CJK/emoji) grapheme reserves for its
+second column; `Terminal::draw`'s diff drops those but `insert_before` does not,
+so the backend wrapper mirrors that skip for every draw — otherwise
+committed-to-scrollback CJK reads `关 键 逻 辑` while the live tail reads `关键逻辑`.
+A resize that arrives during the transaction
 becomes visible only to the next frame, so commit and repaint cannot split across
 two geometries. Key handling receives the final repaint's viewport. Composer wrapping,
 cursor projection, visible height, and ↑/↓ navigation likewise come from one

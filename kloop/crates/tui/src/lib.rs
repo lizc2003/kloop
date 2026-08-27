@@ -570,7 +570,28 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        self.inner.draw(content)
+        // Drop the placeholder cells that trail a wide (CJK/emoji) grapheme.
+        // `Terminal::draw`'s diff already skips them, but ratatui-core's
+        // no-scrolling-regions `insert_before` (`draw_lines`) blits every cell of
+        // the block verbatim — including each wide char's " " continuation cell.
+        // crossterm advances the cursor by one per cell, so those extra spaces
+        // land as a visible gap after every wide glyph (committed-to-scrollback
+        // CJK read "关 键 逻 辑"). Mirror the diff's skip here, at the one backend
+        // all draws funnel through, so both paths agree. Non-contiguous cells
+        // reset the run, so this is a no-op for the already-skipped draw path.
+        let mut to_skip = 0usize;
+        let mut next_x: Option<(u16, u16)> = None;
+        let filtered = content.filter(move |&(x, y, cell)| {
+            let continues = next_x == Some((x, y));
+            next_x = Some((x + 1, y));
+            if to_skip > 0 && continues {
+                to_skip -= 1;
+                return false;
+            }
+            to_skip = unicode_width::UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
+            true
+        });
+        self.inner.draw(filtered)
     }
 
     fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
@@ -1630,6 +1651,134 @@ mod tests {
             "commit did {clears} clears for {cells} cells — expected batched, not per-cell"
         );
         assert!(clears <= 3, "expected a single batch, got {clears} clears");
+    }
+
+    /// Records the `(x, y, symbol)` cells handed to `Backend::draw`, so a test
+    /// can assert exactly what the terminal is asked to print.
+    struct RecordingBackend {
+        inner: TestBackend,
+        drawn: RefCell<Vec<(u16, u16, String)>>,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                drawn: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        type Error = <TestBackend as Backend>::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+        {
+            let cells: Vec<(u16, u16, BufferCell)> =
+                content.map(|(x, y, c)| (x, y, c.clone())).collect();
+            self.drawn.borrow_mut().extend(
+                cells
+                    .iter()
+                    .map(|(x, y, c)| (*x, *y, c.symbol().to_string())),
+            );
+            self.inner.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))
+        }
+
+        fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
+            self.inner.append_lines(lines)
+        }
+
+        fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> std::result::Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> std::result::Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> std::result::Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> std::result::Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    /// ratatui's no-scrolling-regions `insert_before` blits every cell of the
+    /// committed block, including the " " placeholder that trails each wide
+    /// grapheme. `PinnedBackend::draw` drops those continuation cells (mirroring
+    /// the live-draw diff), so committed CJK reads "关键" and not "关 键".
+    #[test]
+    fn scrollback_commit_drops_wide_char_continuation_cells() {
+        const WIDTH: u16 = 8;
+        const HEIGHT: u16 = 4;
+        let backend = PinnedBackend::new(RecordingBackend::new(WIDTH, HEIGHT));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(HEIGHT),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(vec![Line::from("live")]), frame.area());
+            })
+            .unwrap();
+
+        terminal.backend().inner.drawn.borrow_mut().clear();
+        insert_scrollback_blocks(&mut terminal, vec![vec![Line::from("关键Ab")]]).unwrap();
+
+        // The committed row: wide chars sit two columns apart with no interstitial
+        // placeholder (x=1 and x=3 are dropped); ASCII stays width-1; the tail is
+        // real padding, not a continuation cell.
+        let row: Vec<(u16, String)> = terminal
+            .backend()
+            .inner
+            .drawn
+            .borrow()
+            .iter()
+            .filter(|(_, y, _)| *y == 0)
+            .map(|(x, _, s)| (*x, s.clone()))
+            .collect();
+        assert_eq!(
+            row,
+            vec![
+                (0, "关".to_string()),
+                (2, "键".to_string()),
+                (4, "A".to_string()),
+                (5, "b".to_string()),
+                (6, " ".to_string()),
+                (7, " ".to_string()),
+            ],
+            "wide-char continuation cells must not reach the terminal"
+        );
     }
 
     fn snapshot(revision: u64, tasks: usize) -> kloop_core::tools::TaskGraphSnapshot {
