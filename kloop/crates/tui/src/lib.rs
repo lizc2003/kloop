@@ -17,7 +17,7 @@ mod events;
 mod markdown;
 mod menu;
 mod render;
-mod scrollback;
+mod terminal;
 mod text_layout;
 mod toolrow;
 
@@ -67,8 +67,8 @@ use crate::app::Cell;
 use crate::app::Command;
 use crate::events::AgentEvent;
 use crate::events::ChannelUi;
-use crate::scrollback::PinnedBackend;
-use crate::scrollback::insert_scrollback_blocks;
+use crate::terminal::PinnedBackend;
+use crate::terminal::insert_scrollback_blocks;
 
 /// Out-of-band notification sink (e.g. "saved rule to config.toml"); the
 /// CLI's plain mode prints these to stderr, the TUI routes them into the

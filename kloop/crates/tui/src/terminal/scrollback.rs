@@ -1,146 +1,10 @@
-//! Inline-viewport → native-scrollback commit machinery, and the ratatui-core
-//! quirks it compensates for. kloop's inline viewport freezes finalized cells
-//! into the terminal's native scrollback with `Terminal::insert_before`; every
-//! item below papers over a sharp edge of that path so callers get a correct,
-//! fast commit.
-//!
-//! All three compensations exist under one deliberate choice — the
-//! `scrolling-regions` cargo feature is OFF. That choice and these fixes are
-//! linked: turning the feature back on silently restores the two behaviours the
-//! last two items work around. **Re-check every item on any ratatui bump.**
-//!
-//! - **`scrolling-regions` OFF (plan 99).** The feature scrolls with DECSTBM
-//!   one-row region scrolls that iTerm2 smears; kloop leaves it off so
-//!   `insert_before` scrolls each batch off the bottom with a plain
-//!   LF-at-bottom `append_lines` every terminal handles.
-//! - **Wide-char continuation cells (plan 101).** `Terminal::draw`'s diff skips
-//!   the " " placeholder trailing each wide (CJK/emoji) grapheme, but the
-//!   no-scrolling-regions `insert_before` (`draw_lines`) blits every cell
-//!   verbatim. crossterm advances one column per cell, so those spaces land as a
-//!   visible gap ("关 键 逻 辑"). [`PinnedBackend::draw`] mirrors the diff's skip
-//!   at the one backend all draws funnel through, so both paths agree.
-//! - **Per-`insert_before` fixed cost (plan 100).** A full-height inline
-//!   viewport pays one full-screen scroll + `clear_region` + flush per call
-//!   regardless of block height. Committing a long `-c` backlog one cell at a
-//!   time is O(cells) full-screen repaints; [`coalesce_scrollback_batches`]
-//!   collapses it to O(batches).
-//!
-//! [`PinnedBackend`] also pins one physical size across a commit transaction so
-//! autoresize confirmation, insert/drain, and the repaint share one geometry
-//! even if a resize arrives mid-transaction (consumed by `draw_frame`).
+//! Committing the overflow backlog into native scrollback in O(batches), not
+//! O(cells) (plan 100). See the [module catalogue](super) for why the per-cell
+//! path was slow.
 
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget as _;
-
-pub(crate) struct PinnedBackend<B> {
-    pub(crate) inner: B,
-    pinned_size: Option<ratatui::layout::Size>,
-}
-
-impl<B> PinnedBackend<B> {
-    pub(crate) fn new(inner: B) -> Self {
-        Self {
-            inner,
-            pinned_size: None,
-        }
-    }
-}
-
-impl<B: ratatui::backend::Backend> PinnedBackend<B> {
-    pub(crate) fn pin_current_size(&mut self) -> std::result::Result<(), B::Error> {
-        self.pinned_size = Some(self.inner.size()?);
-        Ok(())
-    }
-
-    pub(crate) fn unpin_size(&mut self) {
-        self.pinned_size = None;
-    }
-}
-
-impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B> {
-    type Error = B::Error;
-
-    fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
-    where
-        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
-    {
-        // Drop the placeholder cells that trail a wide (CJK/emoji) grapheme.
-        // `Terminal::draw`'s diff already skips them, but ratatui-core's
-        // no-scrolling-regions `insert_before` (`draw_lines`) blits every cell of
-        // the block verbatim — including each wide char's " " continuation cell.
-        // crossterm advances the cursor by one per cell, so those extra spaces
-        // land as a visible gap after every wide glyph (committed-to-scrollback
-        // CJK read "关 键 逻 辑"). Mirror the diff's skip here, at the one backend
-        // all draws funnel through, so both paths agree. Non-contiguous cells
-        // reset the run, so this is a no-op for the already-skipped draw path.
-        let mut to_skip = 0usize;
-        let mut next_x: Option<(u16, u16)> = None;
-        let filtered = content.filter(move |&(x, y, cell)| {
-            let continues = next_x == Some((x, y));
-            next_x = Some((x + 1, y));
-            if to_skip > 0 && continues {
-                to_skip -= 1;
-                return false;
-            }
-            to_skip = unicode_width::UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
-            true
-        });
-        self.inner.draw(filtered)
-    }
-
-    fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
-        self.inner.append_lines(lines)
-    }
-
-    fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(
-        &mut self,
-    ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
-        self.inner.get_cursor_position()
-    }
-
-    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
-        &mut self,
-        position: P,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.set_cursor_position(position)
-    }
-
-    fn clear(&mut self) -> std::result::Result<(), Self::Error> {
-        self.inner.clear()
-    }
-
-    fn clear_region(
-        &mut self,
-        clear_type: ratatui::backend::ClearType,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
-        self.pinned_size.map_or_else(|| self.inner.size(), Ok)
-    }
-
-    fn window_size(&mut self) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
-        let mut size = self.inner.window_size()?;
-        if let Some(pinned) = self.pinned_size {
-            size.columns_rows = pinned;
-        }
-        Ok(size)
-    }
-
-    fn flush(&mut self) -> std::result::Result<(), Self::Error> {
-        self.inner.flush()
-    }
-}
 
 /// Per-`insert_before` cost is fixed regardless of the block's height: a
 /// full-height inline viewport pays one full-screen scroll + `clear_region` +
@@ -228,6 +92,7 @@ mod tests {
     use ratatui::layout::Size;
 
     use super::*;
+    use crate::terminal::PinnedBackend;
 
     #[test]
     fn scrollback_insert_clears_viewport_without_clearing_history() {

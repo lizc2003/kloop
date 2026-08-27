@@ -69,11 +69,12 @@ ratatui-core 0.1.2 `terminal/inline.rs`:kloop 关了 scrolling-regions,走 `inse
 
 ### 后续内聚(同会话,用户拍板"同意")
 
-修完后发现 plan 99/100/101 三处补丁都是"scrolling-regions 关掉后 ratatui inline `insert_before` 的坑",本就挤在 `lib.rs` 一小片,遂抽成专门模块 `crates/tui/src/scrollback.rs`,不改行为、纯搬 + 加模块 doc:
+修完后发现 plan 99/100/101 三处补丁都是"scrolling-regions 关掉后 ratatui inline `insert_before` 的坑",本就挤在 `lib.rs` 一小片,遂抽成独立目录 `crates/tui/src/terminal/`,不改行为、纯搬 + 加 doc:
 
-- 挪入:`PinnedBackend`(size pin + 宽字符续格 skip)、`SCROLLBACK_BATCH_ROWS`、`coalesce_scrollback_batches`、`insert_scrollback_blocks`,及其专属测试(`RecordingBackend`/`ClearCountingBackend` + 4 个断言)。
+- 目录结构:`terminal/mod.rs`(三条 ratatui 坑的总目录 doc + `pub(crate) use` 再导出)、`terminal/pinned_backend.rs`(`PinnedBackend`:size pin + 宽字符续格 skip)、`terminal/scrollback.rs`(`SCROLLBACK_BATCH_ROWS` + `coalesce_scrollback_batches` + `insert_scrollback_blocks`,及其专属测试 `RecordingBackend`/`ClearCountingBackend` + 4 断言)。
 - 留在 `lib.rs`:`overflow_commit_count`/`commit_overflow`/`draw_frame`(kloop 的提交策略,是本模块的消费者)与 `StagedSizeBackend` 那两个 `draw_frame` 测试。
-- 模块顶 doc 把三个 ratatui 坑一处编目、点明"这些补偿与 scrolling-regions 关的决策是绑定的,升级 ratatui 时逐条复核"。
-- 为什么现在只抽模块不抽 crate:kloop 既有原则(沙箱先例)——为痛点抽 crate,不为整洁;当前无第二消费者、无编译痛感、无上游意图。抽 crate 的触发条件写在模块判断里(上游修复 / 第二前端 / 编译痛 / 补偿量变大)。
-- 验证:`cargo fmt --all --check` 净;`cargo test -p kloop-tui` 178 全绿(测试数不变,只是归到 `scrollback::tests`);`cargo test --workspace` + `cargo clippy --workspace --all-targets` 全绿(0 failed / 0 error)。
-- 提交:见 `git log` 顶部 `refactor(plan101)`。
+- `mod.rs` 顶 doc 把三个 ratatui 坑一处编目、点明"这些补偿与 scrolling-regions 关的决策绑定,升级 ratatui 时逐条复核";各子文件再各自一段聚焦 doc。
+- **命名坑(教训)**:目录不能叫 `ratatui`——它是 extern crate 名,crate root `mod ratatui;` 会在 crate root 作用域遮蔽外部 crate,`lib.rs` 里那 22 处 `ratatui::…` 全解析错、须逐个 `::ratatui::` 消歧。改用 `terminal/`(backend/终端补偿层,不撞名)。
+- 为什么只抽目录不抽 crate:kloop 既有原则(沙箱先例)——为痛点抽 crate,不为整洁;当前无第二消费者、无编译痛感、无上游意图。抽 crate 的触发条件写在判断里(上游修复 / 第二前端 / 编译痛 / 补偿量变大)。
+- 验证:`cargo fmt --all --check` 净;`cargo test -p kloop-tui` 178 全绿(测试数不变,归到 `terminal::scrollback::tests`);`cargo test --workspace` + `cargo clippy --workspace --all-targets` 全绿(0 failed / 0 error);`cargo doc --document-private-items` 我新增的 intra-doc 链接零 warning(`toolrow.rs` 那条断链是既有、非本次引入)。
+- 提交:见 `git log` 顶部两条 `refactor(plan101)`。
