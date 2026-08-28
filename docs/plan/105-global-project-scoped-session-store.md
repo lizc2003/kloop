@@ -106,3 +106,17 @@ codex 是 `~/.codex/sessions/<日期>/`。kloop 是唯一把会话散在 cwd 里
 **如实边界**:未跑真实 provider、Linux sandbox、Windows;sandbox 对 `~/.kloop` 的
 deny-read 已有 `startup::tests::sandbox_denies_private_state_tree_reads_and_writes` 覆盖策略
 生成,但"被 sandbox 的 bash 读不到转录"未做端到端实跑。用户既有的旧会话未迁移(按拍板)。
+
+### 收尾追记（同一提交）
+
+用户追问"现在还会在 cwd 下创建 `.kloop` 吗"。核查结果:
+
+- **非 mock 模式:不再创建**。cwd 下 `.kloop` 的剩余消费者全是只读输入(`rules/`、
+  `skills/`、`commands/`),kloop 不会创建它们;`--worktree` 用的是 `.claude/worktrees`
+  (对齐 cc),不是 `.kloop`;scheduler 本来就在 `~/.kloop/scheduler/`。
+- **`--mock`:仍然创建**,`<cwd>/.kloop/{sessions,offload}`,这是 hermetic 的定义,故意的。
+- **`program-runs`/`workflow-runs` 自动跟着搬了**:`RunStore::new` 以
+  `offload_dir.parent()` 为 base,所以它们现在落在 `~/.kloop/projects/v1/{pid}/` 下,
+  与 sessions/offload 同桶。这是耦合的既有行为、方向也正确(同生命周期的会话态),
+  但原先没被任何测试锁住 —— 已在 `run_store` 既有测试里补一行断言
+  (namespace 目录必须是 `offload` 的同级),并写进 README 的 layout 块。

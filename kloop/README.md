@@ -129,6 +129,8 @@ directory (`crates/core/src/session_store.rs`):
     project.json          {"version":1,"projectId":…,"anchor":"/abs/path"}
     sessions/{id}.jsonl   transcripts, including `{parent}-{agent-N}` sub-agents
     offload/              off-NNNN.txt and background shell bg-N.out
+    program-runs/         run_program artifacts (RunStore anchors on offload's
+    workflow-runs/        parent, so run state follows the session store)
 ```
 
 `{project-id}` is the `ProjectId` the durable permission store already uses,
@@ -155,7 +157,9 @@ Consequences worth knowing:
   and carries only an id afterwards;
 - `--mock` is hermetic — it resolves neither HOME nor Git — so it keeps an
   unpartitioned store at `<cwd>/.kloop/{sessions,offload}` and never writes
-  into a real project's bucket.
+  into a real project's bucket. It is the only mode that still creates a
+  `.kloop` directory below the working directory; everything else kloop reads
+  from there (`rules/`, `skills/`, `commands/`) is input it never creates.
 
 Every session is persisted to `{project store}/sessions/{id}.jsonl`
 (`crates/core/src/rollout.rs`), one JSON line per recorded message or

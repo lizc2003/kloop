@@ -497,6 +497,12 @@ mod tests {
         let base = std::env::temp_dir().join(format!("kloop-run-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let store = RunStore::new(&base.join("offload"), RunNamespace::Workflow).unwrap();
+        // The namespace is a sibling of `offload`, so run artifacts follow the
+        // session store into its project partition rather than the cwd.
+        assert_eq!(
+            store.root,
+            std::fs::canonicalize(base.join("workflow-runs")).unwrap()
+        );
         let run = store.create(&RunId::parse("wf_1").unwrap()).unwrap();
         run.write_atomic("script.js", b"return 1").unwrap();
         assert_eq!(run.read("script.js").unwrap(), b"return 1");
