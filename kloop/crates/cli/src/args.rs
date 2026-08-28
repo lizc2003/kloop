@@ -6,6 +6,7 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -28,6 +29,9 @@ use kloop_core::rollout::session_id_of;
 use kloop_core::rollout::session_origin;
 use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
+use kloop_core::session_store::ProjectBucket;
+use kloop_core::session_store::SessionDirs;
+use kloop_core::session_store::SessionStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionChoice {
@@ -59,6 +63,10 @@ pub(crate) struct CliArgs {
     /// approved via exit_plan_mode). `--mock` ignores it (no gate at all).
     pub(crate) permission_mode: Mode,
     pub(crate) list_sessions: bool,
+    /// `--all` (`--list-sessions` only): list every project's sessions, not
+    /// just this working directory's. Sessions are stored per project, so this
+    /// is the machine-wide view.
+    pub(crate) all: bool,
     pub(crate) plain: bool,
     pub(crate) serve: bool,
     /// `--headless`: run one turn headless (no REPL, no TUI) and exit. The
@@ -93,6 +101,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         help: false,
         permission_mode: Mode::Manual,
         list_sessions: false,
+        all: false,
         plain: false,
         serve: false,
         headless: false,
@@ -127,6 +136,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                 };
             }
             "--list-sessions" => parsed.list_sessions = true,
+            "--all" => parsed.all = true,
             "--plain" => parsed.plain = true,
             "--serve" => parsed.serve = true,
             "--worktree" => parsed.worktree = Some("session".into()),
@@ -190,7 +200,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-h/--help | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions)"
+                "unknown argument '{other}' (-h/--help | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions [--all])"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -249,7 +259,8 @@ pub(crate) fn help_text() -> &'static str {
      \x20   -c, --continue        resume the most recent session\n\
      \x20   -r, --resume [id]     resume a session (no id = pick from a list)\n\
      \x20       --fork <id>[#<seq>]  branch a session at line <seq> (rewind)\n\
-     \x20       --list-sessions   list saved sessions and exit\n\
+     \x20       --list-sessions   list this project's saved sessions and exit\n\
+     \x20       --all             (with --list-sessions) list every project's sessions\n\
      \n\
      PERMISSIONS:\n\
      \x20       --permission-mode <mode>   manual (default) | accept-edits | bypass | plan\n\
@@ -284,14 +295,91 @@ fn session_line(path: &Path) -> String {
     }
 }
 
-pub(crate) fn list_sessions(sessions_dir: &Path) {
-    let sessions = sessions_by_recency(sessions_dir);
+pub(crate) fn list_sessions(store: &SessionStore, cwd: &Path, all: bool) {
+    if all {
+        list_every_project(store);
+        return;
+    }
+    let dirs = store.dirs(cwd);
+    let sessions = sessions_by_recency(&dirs.sessions);
     if sessions.is_empty() {
-        println!("no saved sessions in {}", sessions_dir.display());
+        println!("no saved sessions in {}", dirs.sessions.display());
         return;
     }
     for path in sessions {
         println!("{}", session_line(&path));
+    }
+}
+
+/// `--list-sessions --all`: every project partition on this machine, most
+/// recently used first, labelled with the directory the partition is named
+/// after (its digest is storage detail the user should never have to read).
+fn list_every_project(store: &SessionStore) {
+    let mut groups: Vec<(ProjectBucket, Vec<PathBuf>, SystemTime)> = store
+        .buckets()
+        .into_iter()
+        .filter_map(|bucket| {
+            let sessions = sessions_by_recency(&bucket.dirs.sessions);
+            let newest = newest_mtime(sessions.first()?)?;
+            Some((bucket, sessions, newest))
+        })
+        .collect();
+    if groups.is_empty() {
+        println!("no saved sessions under {}", store.root().display());
+        return;
+    }
+    groups.sort_by_key(|(_, _, newest)| std::cmp::Reverse(*newest));
+    for (index, (bucket, sessions, _)) in groups.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        match &bucket.anchor {
+            Some(anchor) => println!("{}", anchor.display()),
+            None => println!("(unlabelled project {})", bucket.project_id),
+        }
+        for path in sessions {
+            println!("  {}", session_line(path));
+        }
+    }
+}
+
+fn newest_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// The project a session id belongs to, when it is not this one — so a listing
+/// that spans projects can explain why an id here is not resumable rather than
+/// just reporting it missing.
+fn owning_project(store: &SessionStore, dirs: &SessionDirs, id: &str) -> Option<PathBuf> {
+    store
+        .buckets()
+        .into_iter()
+        .find(|bucket| {
+            bucket.dirs.sessions != dirs.sessions
+                && checked_session_path(&bucket.dirs.sessions, id).is_ok_and(|path| path.exists())
+        })
+        .map(|bucket| {
+            bucket
+                .anchor
+                .unwrap_or_else(|| bucket.dirs.sessions.clone())
+        })
+}
+
+/// A session id that exists, or an error naming the project that owns it.
+/// Sessions are resumed in the current working directory, so adopting another
+/// project's transcript would run the agent against the wrong repository.
+fn session_in_this_project(store: &SessionStore, dirs: &SessionDirs, id: &str) -> Result<PathBuf> {
+    let path = checked_session_path(&dirs.sessions, id)
+        .with_context(|| format!("invalid session id '{id}'"))?;
+    if path.exists() {
+        return Ok(path);
+    }
+    match owning_project(store, dirs, id) {
+        Some(project) => bail!(
+            "session '{id}' belongs to {}; run kloop there to resume it",
+            project.display()
+        ),
+        None => bail!("no session '{id}' (try --list-sessions)"),
     }
 }
 
@@ -340,11 +428,13 @@ fn pick_index(input: &str, len: usize) -> Result<usize> {
 /// Build the History for this run: a fresh persisted session by default, or
 /// one replayed from disk for `--resume`.
 pub(crate) fn open_history(
-    offload_dir: PathBuf,
+    store: &SessionStore,
+    dirs: &SessionDirs,
     choice: &SessionChoice,
-    sessions_dir: &Path,
     initial_route: &FrozenProviderRoute,
 ) -> Result<(History, String)> {
+    let sessions_dir = dirs.sessions.as_path();
+    let offload_dir = dirs.offload.clone();
     let resume_path = match choice {
         SessionChoice::New => {
             let id = new_session_id(sessions_dir);
@@ -355,25 +445,14 @@ pub(crate) fn open_history(
             )?);
             return Ok((history, id));
         }
-        SessionChoice::Resume(id) => {
-            let path = checked_session_path(sessions_dir, id)
-                .with_context(|| format!("invalid session id '{id}'"))?;
-            if !path.exists() {
-                bail!("no session '{id}' (try --list-sessions)");
-            }
-            path
-        }
+        SessionChoice::Resume(id) => session_in_this_project(store, dirs, id)?,
         SessionChoice::Continue => resumable_sessions(sessions_dir)
             .into_iter()
             .next()
             .context("no saved sessions to continue")?,
         SessionChoice::Pick => pick_session(sessions_dir)?,
         SessionChoice::Fork { id, cut } => {
-            let src = checked_session_path(sessions_dir, id)
-                .with_context(|| format!("invalid session id '{id}'"))?;
-            if !src.exists() {
-                bail!("no session '{id}' (try --list-sessions)");
-            }
+            let src = session_in_this_project(store, dirs, id)?;
             let path = fork_session(&src, *cut, sessions_dir)
                 .with_context(|| format!("cannot fork session '{id}'"))?;
             println!(
@@ -412,6 +491,7 @@ mod tests {
             help: false,
             permission_mode: Mode::Manual,
             list_sessions: false,
+            all: false,
             plain: false,
             serve: false,
             headless: false,
@@ -676,6 +756,59 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help missing {needle}");
         }
+    }
+
+    /// Two partitions under one root, each holding one transcript.
+    fn two_project_store(tag: &str) -> (SessionStore, SessionDirs, SessionDirs) {
+        let root = std::env::temp_dir().join(format!("kloop-args-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut dirs = Vec::new();
+        for (id, anchor, session) in [
+            ("p1_a", "/work/here", "20260101-000001"),
+            ("p1_b", "/work/there", "20260202-000002"),
+        ] {
+            let partition = root.join("projects/v1").join(id);
+            std::fs::create_dir_all(partition.join("sessions")).unwrap();
+            std::fs::write(
+                partition.join("project.json"),
+                format!("{{\"version\":1,\"projectId\":\"{id}\",\"anchor\":\"{anchor}\"}}"),
+            )
+            .unwrap();
+            std::fs::write(
+                partition.join("sessions").join(format!("{session}.jsonl")),
+                "",
+            )
+            .unwrap();
+            dirs.push(SessionDirs {
+                sessions: partition.join("sessions"),
+                offload: partition.join("offload"),
+            });
+        }
+        let second = dirs.pop().unwrap();
+        (SessionStore::global(root), dirs.pop().unwrap(), second)
+    }
+
+    /// A session listed by `--list-sessions --all` is not silently adopted into
+    /// the wrong repository: the error names the project that owns it.
+    #[test]
+    fn resuming_another_projects_session_names_that_project() {
+        let (store, here, _there) = two_project_store("owning");
+
+        assert!(session_in_this_project(&store, &here, "20260101-000001").is_ok());
+        let error = session_in_this_project(&store, &here, "20260202-000002")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "session '20260202-000002' belongs to /work/there; run kloop there to resume it"
+        );
+        let missing = session_in_this_project(&store, &here, "20260303-000003")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            missing,
+            "no session '20260303-000003' (try --list-sessions)"
+        );
     }
 
     #[test]

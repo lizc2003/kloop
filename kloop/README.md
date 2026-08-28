@@ -6,7 +6,7 @@ validate five architectural bets before committing to a larger agent design.
 ## The five bets
 
 1. **Append-only history + offload at record time.** History is only ever
-   appended. A tool result over 8000 chars is spilled to `.kloop/offload/`
+   appended. A tool result over 8000 chars is spilled to the session store
    when recorded; the history keeps a head/tail preview plus a pointer, and a
    `read_offloaded` tool fetches the full output on demand.
 2. **Continuation signal = presence of `tool_use` blocks.** Never
@@ -118,7 +118,46 @@ Compaction itself uses one internal seam for predictive admission, reactive over
 
 ## Session persistence (Phase 2, second slice)
 
-Every session is persisted to `.kloop/sessions/{id}.jsonl`
+### Where sessions live
+
+Sessions are global and partitioned by project, not stored below the working
+directory (`crates/core/src/session_store.rs`):
+
+```
+~/.kloop/projects/v1/{project-id}/
+    permissions.json      durable project approvals
+    project.json          {"version":1,"projectId":…,"anchor":"/abs/path"}
+    sessions/{id}.jsonl   transcripts, including `{parent}-{agent-N}` sub-agents
+    offload/              off-NNNN.txt and background shell bg-N.out
+```
+
+`{project-id}` is the `ProjectId` the durable permission store already uses,
+derived from the **Git common directory** — so every subdirectory and every
+linked worktree of one repository shares a single history, and
+`--list-sessions --all` can enumerate every project on the machine. A cwd-local
+layout cannot answer "show me all my sessions": a transcript is only findable
+from the exact directory that wrote it. `project.json` labels the partition
+with the path it was named after, so cross-project listings print real
+directories rather than digests.
+
+Consequences worth knowing:
+
+- the partition directory is shared with the permission store, which refuses to
+  open one that group or other can reach, so every level is created `0700`;
+- `~/.kloop` is denied read and write inside the sandbox, so a sandboxed `bash`
+  cannot read transcripts or offload files. In-process readers are unaffected
+  (`read_offloaded`, `read_file`, `bash_output`), and a background shell's
+  output file is opened by the parent and inherited as a descriptor;
+- `--resume`/`--fork` stay inside the current project. An id that belongs to
+  another one is refused by name (`session 'X' belongs to /path; run kloop
+  there`) rather than adopted into the wrong repository. `thread/resume` does
+  search every partition, because a thread pins its own cwd at `thread/start`
+  and carries only an id afterwards;
+- `--mock` is hermetic — it resolves neither HOME nor Git — so it keeps an
+  unpartitioned store at `<cwd>/.kloop/{sessions,offload}` and never writes
+  into a real project's bucket.
+
+Every session is persisted to `{project store}/sessions/{id}.jsonl`
 (`crates/core/src/rollout.rs`), one JSON line per recorded message or
 provider-usage record, written through as the history records — so a killed
 process loses at most the line being written. A `provider_usage` line preserves
@@ -175,7 +214,8 @@ operation, so a timestamp collision cannot truncate an existing transcript.
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
-<id>` a specific one, `--list-sessions` shows what's on disk. Native-protocol
+<id>` a specific one, `--list-sessions` shows this project's sessions and
+`--list-sessions --all` every project's. Native-protocol
 sessions additionally restore the exact canonical cwd and resolved model that
 were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is
@@ -1304,7 +1344,7 @@ batching: read-only calls may overlap, while opaque/redirection calls execute se
 
 `bash` takes `background`: the command starts in its own owned process
 tree (Unix process group or Windows Job), stdout/stderr interleave straight into
-a file under `.kloop/offload/`
+a file under the session store's `offload/`
 (`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
 returns immediately with the ID and the output path. Companions:
 
@@ -2600,7 +2640,7 @@ kloop --mock --headless --json
   refusal/filter/incomplete response or exhausted output-limit recovery still
   prints any usable assistant text once, reports the stable failure on stderr,
   and exits `1`; a valid empty EndTurn writes no placeholder line.
-- The session persists to `.kloop/sessions/` like every other mode, so a
+- The session persists to the same project store as every other mode, so a
   headless run is resumable (`--resume <id>`) and forkable afterward.
 - **Scheduler shutdown.** After the main headless turn, kloop stops the scheduler before
   background task/shell shutdown. Session-only scheduled jobs disappear; durable jobs remain
@@ -2747,7 +2787,8 @@ cargo run -- app-server            # alias: cargo run -- --serve
 cargo run -- app-server --mock     # keyless: scripted provider behind the protocol
 
 # sessions (-c = --continue, -r = --resume, mirroring cc)
-cargo run -- --list-sessions   # what's on disk, most recent first
+cargo run -- --list-sessions   # this project's sessions, most recent first
+cargo run -- --list-sessions --all   # every project on the machine
 cargo run -- -c                # continue the most recent session (--continue)
 cargo run -- -r                # pick a session from a numbered list (--resume)
 cargo run -- -r <id>           # continue a specific session
@@ -3024,6 +3065,8 @@ crates/core/        kloop-core — the agent, network-free
   src/rollout.rs    append-only session persistence: message/provider-usage/
                     compacted + runtime/turn-terminal records, snapshots,
                     resume/fork
+  src/session_store.rs where transcripts and offload live: global, partitioned
+                    by ProjectId, owner-only; hermetic cwd-local for --mock
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui
 
 crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
@@ -3056,7 +3099,8 @@ crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rq
 crates/cli/         kloop — the binary
   src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
                     app-server/--serve), StdoutUi, CliApprover, --mock demo,
-                    session selection (--continue, --resume, --list-sessions)
+                    session selection (--continue, --resume, --list-sessions
+                    [--all])
   src/user_config.rs one global TOML read and strict root schema
   src/private_store.rs descriptor/handle-relative private I/O, atomic replace,
                     directory durability, reparse/symlink rejection, file locks

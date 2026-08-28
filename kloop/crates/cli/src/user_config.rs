@@ -62,6 +62,16 @@ pub(crate) fn global_config_path() -> Result<PathBuf> {
     Ok(home.join(GLOBAL_CONFIG))
 }
 
+/// The private state root — `~/.kloop`, parent of the global config. Home
+/// resolution only, never a config read: `--list-sessions` has to keep working
+/// when `config.toml` itself is unparseable.
+pub(crate) fn private_state_root() -> Result<PathBuf> {
+    Ok(global_config_path()?
+        .parent()
+        .expect("global config always has a parent")
+        .to_path_buf())
+}
+
 pub(crate) fn oauth_store_path() -> Result<PathBuf> {
     Ok(global_config_path()?
         .parent()

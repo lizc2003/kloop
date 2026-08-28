@@ -69,6 +69,8 @@ use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::rollout::TurnTerminal;
+use kloop_core::session_store::SessionDirs;
+use kloop_core::session_store::SessionStore;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -204,8 +206,10 @@ pub type ConfigReader = Arc<dyn Fn(&Path) -> Result<ConfigSnapshot> + Send + Syn
 pub type SkillsReader = Arc<dyn Fn(&Path) -> Result<SkillsSnapshot> + Send + Sync>;
 
 pub struct ServerPaths {
-    pub sessions_dir: PathBuf,
-    pub offload_dir: PathBuf,
+    /// Sessions are partitioned by project, and each thread pins its own cwd,
+    /// so the server resolves storage per thread rather than holding one pair
+    /// of directories for the process.
+    pub store: SessionStore,
 }
 
 /// Everything the protocol server needs. The CLI owns filesystem/env/network
@@ -287,6 +291,10 @@ where
     let default_cwd =
         std::fs::canonicalize(std::env::current_dir().context("cannot determine server cwd")?)
             .context("cannot canonicalize server cwd")?;
+    let default_dirs = paths
+        .store
+        .ensure(&default_cwd)
+        .context("cannot create the session directory")?;
     let mut server = Server {
         out: out_tx,
         threads: HashMap::new(),
@@ -299,6 +307,7 @@ where
         config_reader,
         skills_reader,
         default_cwd,
+        default_dirs,
         initialized: false,
         client_questions: false,
     };
@@ -431,6 +440,9 @@ struct Server {
     skills_reader: SkillsReader,
     /// Canonical process cwd used when a read method or thread/start omits cwd.
     default_cwd: PathBuf,
+    /// `default_cwd`'s partition, resolved once: locating a thread by id alone
+    /// starts here before falling back to a scan.
+    default_dirs: SessionDirs,
     /// Set once the client's `initialize` handshake succeeds. Every other
     /// method is rejected until then, so a version mismatch surfaces
     /// immediately instead of as mysterious downstream failures.
@@ -440,6 +452,27 @@ struct Server {
 }
 
 impl Server {
+    /// Locate a thread's transcript and the partition holding it. A thread
+    /// pins its own cwd at `thread/start`, so it can live outside the process
+    /// cwd's project while `thread/resume` carries only an id: check this
+    /// process's partition first, then the rest.
+    fn locate_thread(&self, thread_id: &str) -> Result<(PathBuf, SessionDirs), (i64, String)> {
+        let path = rollout::checked_session_path(&self.default_dirs.sessions, thread_id)
+            .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
+        if path.exists() {
+            return Ok((path, self.default_dirs.clone()));
+        }
+        self.paths
+            .store
+            .buckets()
+            .into_iter()
+            .find_map(|bucket| {
+                let path = rollout::checked_session_path(&bucket.dirs.sessions, thread_id).ok()?;
+                path.exists().then_some((path, bucket.dirs))
+            })
+            .ok_or((wire::SERVER_ERROR, format!("no session '{thread_id}'")))
+    }
+
     fn send(&self, outgoing: Outgoing) {
         let _ = self.out.send(outgoing.to_json());
     }
@@ -613,8 +646,14 @@ impl Server {
 
     fn thread_start(&mut self, params: &Value) -> MethodResult {
         let options = parse_thread_start_options(params, &self.default_cwd)?;
-        let thread_id = rollout::new_session_id(&self.paths.sessions_dir);
-        let path = rollout::session_path(&self.paths.sessions_dir, &thread_id);
+        let dirs = self.paths.store.ensure(&options.cwd).map_err(|e| {
+            (
+                wire::SERVER_ERROR,
+                format!("cannot create session directory: {e}"),
+            )
+        })?;
+        let thread_id = rollout::new_session_id(&dirs.sessions);
+        let path = rollout::session_path(&dirs.sessions, &thread_id);
         // Claim the id atomically before writing the runtime. A timestamp
         // collision must never truncate another server's session.
         if let Some(parent) = path.parent() {
@@ -641,7 +680,7 @@ impl Server {
                 ));
             }
         };
-        let mut history = History::new(self.paths.offload_dir.clone());
+        let mut history = History::new(dirs.offload.clone());
         history.attach_rollout(rollout);
         let seed = SessionSnapshot {
             messages: Vec::new(),
@@ -678,11 +717,7 @@ impl Server {
                 format!("thread '{thread_id}' is already active"),
             ));
         }
-        let path = rollout::checked_session_path(&self.paths.sessions_dir, thread_id)
-            .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
-        if !path.exists() {
-            return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
-        }
+        let (path, dirs) = self.locate_thread(thread_id)?;
         let inspected = rollout::inspect_session(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
         let options = resume_options(&inspected.snapshot(), params, &self.default_cwd)?;
@@ -691,7 +726,7 @@ impl Server {
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
-        let history = History::resume(self.paths.offload_dir.clone(), resumed);
+        let history = History::resume(dirs.offload.clone(), resumed);
         self.spawn_thread(
             thread_id.to_string(),
             history,
@@ -736,14 +771,11 @@ impl Server {
                 "'cut' must be a non-negative integer".to_string(),
             ))?),
         };
-        let src = rollout::checked_session_path(&self.paths.sessions_dir, src_id)
-            .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
-        if !src.exists() {
-            return Err((wire::SERVER_ERROR, format!("no session '{src_id}'")));
-        }
+        // A fork stays in its source's project: same repository, new branch.
+        let (src, dirs) = self.locate_thread(src_id)?;
         rollout::inspect_session(&src)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read source: {e}")))?;
-        let new_path = rollout::fork_session(&src, cut, &self.paths.sessions_dir)
+        let new_path = rollout::fork_session(&src, cut, &dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
         let resumed = match rollout::inspect_session(&new_path).and_then(|read| read.recover()) {
@@ -756,7 +788,7 @@ impl Server {
         let options = resume_options(&resumed.snapshot, params, &self.default_cwd)?;
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
-        let history = History::resume(self.paths.offload_dir.clone(), resumed);
+        let history = History::resume(dirs.offload.clone(), resumed);
         if let Err(error) = self.spawn_thread(
             new_id.clone(),
             history,
@@ -808,7 +840,7 @@ impl Server {
                 ));
             }
         };
-        let paths: Vec<PathBuf> = rollout::sessions_by_recency(&self.paths.sessions_dir)
+        let paths: Vec<PathBuf> = rollout::sessions_by_recency(&self.default_dirs.sessions)
             .into_iter()
             // Sub-agent transcripts share the sessions dir but are internal;
             // like cc's sidechains and codex's source filter, keep them out
@@ -864,11 +896,7 @@ impl Server {
 
     fn thread_read(&self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "threadId")?;
-        let path = rollout::checked_session_path(&self.paths.sessions_dir, thread_id)
-            .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
-        if !path.exists() {
-            return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
-        }
+        let (path, _) = self.locate_thread(thread_id)?;
         let snapshot = events::into_public_session_snapshot(
             rollout::load_session_snapshot(&path)
                 .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?,
@@ -1082,11 +1110,7 @@ impl Server {
                     Some(handle.active_route.lock().unwrap().clone()),
                 ));
             }
-            let path = rollout::checked_session_path(&self.paths.sessions_dir, thread_id)
-                .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
-            if !path.exists() {
-                return Err((wire::SERVER_ERROR, format!("no session '{thread_id}'")));
-            }
+            let (path, _) = self.locate_thread(thread_id)?;
             let snapshot = rollout::load_session_snapshot(&path)
                 .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
             let route = snapshot.provider_routes.last().ok_or((

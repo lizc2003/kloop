@@ -270,8 +270,9 @@ pub struct Config {
     /// process cwd (so behavior is unchanged); a `run_agent {isolation: worktree}`
     /// sub-agent's is its private git worktree (plan 35), which is how parallel
     /// sub-agents write the same relative path without colliding. `offload_dir`
-    /// and `sessions_dir` deliberately do NOT follow — they stay in the main
-    /// repo so a sub-agent's offload/session files land alongside the parent's.
+    /// and `sessions_dir` deliberately do NOT follow, so a sub-agent's
+    /// offload/session files land alongside the parent's (a linked worktree
+    /// resolves to the parent's partition anyway — same Git common directory).
     pub cwd: PathBuf,
     /// Assembled project-instructions message (context::assemble_instructions).
     /// Injected as a synthetic first user message into every sampling request
@@ -283,13 +284,15 @@ pub struct Config {
     /// an error ends the turn. Headless `--max-rounds` and an explicit run_agent
     /// `max_rounds` set it for callers that need a runaway bound.
     pub max_rounds: Option<usize>,
+    /// Directory holding oversized tool results and background shell output,
+    /// `~/.kloop/projects/v1/{project-id}/offload` (see `session_store`).
     pub offload_dir: PathBuf,
-    /// Directory holding session rollout files (`.kloop/sessions`). A sub-agent
-    /// run_agent spawns a sub-agent that writes its own session file here, named
-    /// `{parent session_id}-{agent-N}`, so its transcript is auditable and
-    /// separately resumable. Sub-agents inherit the parent's dir with the
-    /// Config clone. Empty for ephemeral sessions (mock, tests) — a sub-agent
-    /// then stays in-memory like before.
+    /// Directory holding session rollout files, the `sessions` sibling of
+    /// `offload_dir`. A sub-agent spawned by run_agent writes its own session
+    /// file here, named `{parent session_id}-{agent-N}`, so its transcript is
+    /// auditable and separately resumable. Sub-agents inherit the parent's dir
+    /// with the Config clone. Empty for ephemeral sessions (tests) — a
+    /// sub-agent then stays in-memory like before.
     pub sessions_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
     pub context_window: Option<u64>,

@@ -27,6 +27,7 @@ use kloop_core::permissions::Permissions;
 use kloop_core::permissions::ProjectPermissionPolicy;
 use kloop_core::permissions::ProjectPolicyRegistry;
 use kloop_core::project::WorkspaceIdentity;
+use kloop_core::session_store::SessionDirs;
 use kloop_core::shell_programs::ShellOverrides;
 use kloop_core::shell_programs::ShellPrograms;
 use kloop_core::skills::Skill;
@@ -910,10 +911,9 @@ pub(crate) fn config_from_settings(
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     skills: Arc<Vec<Skill>>,
     cwd: &Path,
+    session_dirs: &SessionDirs,
 ) -> Result<Config> {
     let permissions = Arc::new(build_permissions(args, cwd, runtime, approver, notify)?);
-    let offload_dir = PathBuf::from(".kloop/offload");
-    let sessions_dir = PathBuf::from(".kloop/sessions");
     let inbox: Arc<kloop_core::inbox::Inbox> = Default::default();
     let scheduler = scheduler_for_session(args, runtime, cwd, Arc::clone(&inbox))?;
     // The main agent's cwd anchor is the process cwd (same value build_permissions
@@ -940,8 +940,8 @@ pub(crate) fn config_from_settings(
         project_instructions: project.instructions.clone(),
         max_rounds: None,
         cwd,
-        offload_dir,
-        sessions_dir,
+        offload_dir: session_dirs.offload.clone(),
+        sessions_dir: session_dirs.sessions.clone(),
         context_window: runtime.context_window,
         permissions,
         questioner,

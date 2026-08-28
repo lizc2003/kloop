@@ -24,6 +24,7 @@ use kloop_core::permissions::PermissionRules;
 use kloop_core::permissions::Permissions;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
+use kloop_core::session_store::SessionStore;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
@@ -157,8 +158,7 @@ impl TestClient {
 
 fn start_server(factory: ConfigFactory, dirs: &TestDirs) -> TestClient {
     let paths = ServerPaths {
-        sessions_dir: dirs.sessions.clone(),
-        offload_dir: dirs.offload.clone(),
+        store: dirs.store.clone(),
     };
     start_server_with_config(ServerConfig::new(factory, paths))
 }
@@ -177,6 +177,10 @@ fn start_server_with_config(config: ServerConfig) -> TestClient {
 
 struct TestDirs {
     root: PathBuf,
+    /// Hermetic store: one unpartitioned bucket under `<root>/.kloop`, so a
+    /// test can write transcripts straight into `sessions` and still hand the
+    /// server the same storage.
+    store: SessionStore,
     sessions: PathBuf,
     offload: PathBuf,
 }
@@ -184,9 +188,12 @@ struct TestDirs {
 fn test_dirs(tag: &str) -> TestDirs {
     let root = std::env::temp_dir().join(format!("kloop-server-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
+    let store = SessionStore::hermetic(&root);
+    let dirs = store.dirs(&root);
     TestDirs {
-        sessions: root.join("sessions"),
-        offload: root.join("offload"),
+        sessions: dirs.sessions,
+        offload: dirs.offload,
+        store,
         root,
     }
 }
@@ -775,8 +782,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
     let skill_reads = Arc::new(Mutex::new(Vec::new()));
 
     let paths = ServerPaths {
-        sessions_dir: dirs.sessions.clone(),
-        offload_dir: dirs.offload.clone(),
+        store: dirs.store.clone(),
     };
     let mut server = ServerConfig::new(
         factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
@@ -1121,8 +1127,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             Arc::clone(&seen_b),
         ),
         ServerPaths {
-            sessions_dir: dirs.sessions.clone(),
-            offload_dir: dirs.offload.clone(),
+            store: dirs.store.clone(),
         },
     );
     server.provider_catalog = Arc::new(
@@ -1342,8 +1347,7 @@ async fn real_three_rail_route_switch_contract() {
     let mut server = ServerConfig::new(
         real_switch_factory(dirs.offload.clone()),
         ServerPaths {
-            sessions_dir: dirs.sessions.clone(),
-            offload_dir: dirs.offload.clone(),
+            store: dirs.store.clone(),
         },
     );
     server.provider_catalog = Arc::clone(&catalog);
@@ -3532,8 +3536,7 @@ async fn real_effort_sweep_contract() {
     let mut server = ServerConfig::new(
         real_switch_factory(dirs.offload.clone()),
         ServerPaths {
-            sessions_dir: dirs.sessions.clone(),
-            offload_dir: dirs.offload.clone(),
+            store: dirs.store.clone(),
         },
     );
     server.provider_catalog = Arc::clone(&catalog);

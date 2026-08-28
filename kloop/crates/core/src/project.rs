@@ -306,6 +306,28 @@ impl WorkspaceIdentity {
         self.project_id.as_ref()
     }
 
+    /// Storage partition for session transcripts and offloaded tool output.
+    /// Project *policy* stays disabled when Git identity is unavailable —
+    /// repository content must never grant authority — but a transcript still
+    /// has to land somewhere, so a failed probe degrades to the directory
+    /// domain instead of losing the session.
+    pub fn session_partition(&self) -> ProjectId {
+        self.project_id.clone().unwrap_or_else(|| {
+            ProjectId(hash_id(
+                "p1_",
+                PROJECT_DIRECTORY_DOMAIN,
+                self.cwd.as_os_str(),
+            ))
+        })
+    }
+
+    /// The path [`Self::session_partition`] is named after: the Git common
+    /// directory when the probe succeeded, else the directory itself. Display
+    /// only — never an identity or authorization source.
+    pub fn partition_anchor(&self) -> &Path {
+        self.project_anchor.as_deref().unwrap_or(&self.cwd)
+    }
+
     pub fn workspace_id(&self) -> &WorkspaceId {
         &self.workspace_id
     }

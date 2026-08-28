@@ -19,7 +19,6 @@ mod user_config;
 mod web;
 
 use std::io::Write as _;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -57,6 +56,8 @@ use crate::startup::server_config_snapshot;
 use crate::startup::server_skills_snapshot;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
+use kloop_core::session_store::SessionDirs;
+use kloop_core::session_store::SessionStore;
 
 /// `kloop mcp <subcommand>`. Only `login <server-name>` exists today (interactive
 /// OAuth for a remote server); logout/list are noted as future work in the plan.
@@ -110,10 +111,21 @@ async fn main() -> Result<ExitCode> {
         print!("{}", args::help_text());
         return Ok(ExitCode::SUCCESS);
     }
-    let sessions_dir = PathBuf::from(".kloop/sessions");
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    // Session storage resolves before the user config is parsed: `--list-sessions`
+    // must keep working when `~/.kloop/config.toml` is broken, so the store needs
+    // the private-state root but never its contents.
+    let session_store = if args.mock {
+        SessionStore::hermetic(&cwd)
+    } else {
+        SessionStore::global(user_config::private_state_root()?)
+    };
     if args.list_sessions {
-        list_sessions(&sessions_dir);
+        list_sessions(&session_store, &cwd, args.all);
         return Ok(ExitCode::SUCCESS);
+    }
+    if args.all {
+        anyhow::bail!("--all only applies to --list-sessions");
     }
     // Worktree mode is the single-session feature (plan 35 slice 2): --serve has
     // per-thread configs and no client cwd-switch protocol, --mock has no git.
@@ -157,7 +169,6 @@ async fn main() -> Result<ExitCode> {
         }
         (sources, statuses, lifecycle)
     };
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
     if args.serve {
         if !args.images.is_empty() {
             eprintln!(
@@ -171,6 +182,7 @@ async fn main() -> Result<ExitCode> {
             let args = args.clone();
             let provider = provider.clone();
             let runtime = runtime.clone();
+            let factory_store = session_store.clone();
             Arc::new(move |options, catalog, approver, questioner, notify| {
                 let project = if args.mock {
                     context::mock(&options.cwd)
@@ -191,6 +203,9 @@ async fn main() -> Result<ExitCode> {
                     }
                     skills
                 });
+                // Each thread pins its own cwd, so each resolves its own
+                // project partition rather than inheriting the process one.
+                let session_dirs = factory_store.ensure(&options.cwd)?;
                 let mut cfg = config_from_settings(
                     &args,
                     &provider,
@@ -203,6 +218,7 @@ async fn main() -> Result<ExitCode> {
                     sandbox,
                     skills,
                     &options.cwd,
+                    &session_dirs,
                 )?;
                 let current_provider = cfg.provider_route.provider_id().to_string();
                 let current_model = cfg.provider_route.primary_model().to_string();
@@ -227,8 +243,7 @@ async fn main() -> Result<ExitCode> {
         let mut server = kloop_server::ServerConfig::new(
             factory,
             kloop_server::ServerPaths {
-                sessions_dir,
-                offload_dir: PathBuf::from(".kloop/offload"),
+                store: session_store,
             },
         );
         server.provider_catalog = provider.catalog();
@@ -267,10 +282,13 @@ async fn main() -> Result<ExitCode> {
         }
         skills
     });
+    let session_dirs = session_store
+        .ensure(&cwd)
+        .context("cannot create the session directory")?;
     let (history, session_id) = open_history(
-        PathBuf::from(".kloop/offload"),
+        &session_store,
+        &session_dirs,
         &args.session,
-        &sessions_dir,
         &provider.initial_route(),
     )?;
     let session_route = provider
@@ -318,6 +336,7 @@ async fn main() -> Result<ExitCode> {
             sandbox,
             skills,
             &cwd,
+            &session_dirs,
         )?;
         cfg.provider_route = if args.mock {
             cfg.provider_route
@@ -382,6 +401,7 @@ async fn main() -> Result<ExitCode> {
             sandbox,
             skills,
             pending_images,
+            session_dirs,
         )
         .await;
         mcp_lifecycle.shutdown().await;
@@ -390,6 +410,7 @@ async fn main() -> Result<ExitCode> {
     }
     let factory_session_id = session_id.clone();
     let tui_session_route = session_route.clone();
+    let tui_session_dirs = session_dirs.clone();
     let worktree = args.worktree.clone();
     let tui_result = kloop_tui::run(
         move |approver, questioner, notify| {
@@ -405,6 +426,7 @@ async fn main() -> Result<ExitCode> {
                 sandbox.clone(),
                 skills.clone(),
                 &cwd,
+                &tui_session_dirs,
             )?;
             cfg.provider_route = tui_session_route.clone();
             cfg.bind_session(factory_session_id.clone())?;
@@ -604,6 +626,7 @@ async fn plain_main(
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     skills: Arc<Vec<Skill>>,
     pending_images: Vec<ContentBlock>,
+    session_dirs: SessionDirs,
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
@@ -620,6 +643,7 @@ async fn plain_main(
         sandbox,
         skills,
         &cwd,
+        &session_dirs,
     )?;
     cfg.provider_route = if args.mock {
         cfg.provider_route
