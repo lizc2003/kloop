@@ -488,6 +488,18 @@ including the `" "` placeholder each wide (CJK/emoji) grapheme reserves for its
 second column; `Terminal::draw`'s diff drops those but `insert_before` does not,
 so the backend wrapper mirrors that skip for every draw — otherwise
 committed-to-scrollback CJK reads `关 键 逻 辑` while the live tail reads `关键逻辑`.
+That default path also ends by clearing the whole inline viewport, which is
+where the commit could go visibly wrong: ratatui-crossterm flushes each command
+on its own, so the clear used to reach the terminal by itself and the screen sat
+blank until the repaint arrived — and `Terminal::clear` opens by asking the
+terminal where the cursor is (`ESC[6n`), a reply that waits on crossterm's
+reader lock, held for up to one 200ms input poll. Measured through the PTY
+harness, that left the screen black for 205–335ms per commit. So kloop adds no
+clear of its own (`insert_before` already did it), answers cursor queries from
+the last position it sent while a commit is in flight, and buffers every byte of
+a frame into one write wrapped in synchronized output (DEC mode 2026, ignored by
+terminals without it) — clear and repaint are presented as one update instead of
+a blank screen followed by a repaint.
 A resize that arrives during the transaction
 becomes visible only to the next frame, so commit and repaint cannot split across
 two geometries. Key handling receives the final repaint's viewport. Composer wrapping,

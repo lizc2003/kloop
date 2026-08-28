@@ -67,6 +67,7 @@ use crate::app::Cell;
 use crate::app::Command;
 use crate::events::AgentEvent;
 use crate::events::ChannelUi;
+use crate::terminal::FrameWriter;
 use crate::terminal::PinnedBackend;
 use crate::terminal::insert_scrollback_blocks;
 
@@ -539,8 +540,9 @@ fn fork_here(
     Ok((session_id_of(&fork_path), resumed))
 }
 
-type Terminal =
-    ratatui::Terminal<PinnedBackend<ratatui::backend::CrosstermBackend<std::io::Stdout>>>;
+type Terminal = ratatui::Terminal<
+    PinnedBackend<ratatui::backend::CrosstermBackend<FrameWriter<std::io::Stdout>>>,
+>;
 
 #[cfg(unix)]
 struct KeyboardEnhancementGuard {
@@ -613,6 +615,9 @@ struct TerminalSession {
 
 impl TerminalSession {
     fn restore(&mut self) {
+        // Hand over anything the last frame left buffered before the direct
+        // stdout writes in `restore_terminal` reorder themselves ahead of it.
+        let _ = self.terminal.backend_mut().commit_frame();
         self.modes.restore();
     }
 }
@@ -643,7 +648,15 @@ fn setup_terminal() -> Result<TerminalSession> {
     // (cursor-position query) runs before the input thread starts, so nothing
     // races it for stdin.
     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-    let backend = PinnedBackend::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()));
+    // Every byte of a frame goes through one `FrameWriter` (plan 103): ratatui-
+    // crossterm flushes on each `execute!`, so without it a frame reaches the
+    // terminal in pieces — and a commit's viewport clear as a piece of its own,
+    // leaving the screen blank until the repaint lands.
+    let frames = FrameWriter::new(std::io::stdout());
+    let backend = PinnedBackend::with_frames(
+        ratatui::backend::CrosstermBackend::new(frames.clone()),
+        frames,
+    );
     match ratatui::Terminal::with_options(
         backend,
         TerminalOptions {
@@ -731,7 +744,7 @@ fn overflow_commit_count(app: &App, viewport: Rect) -> usize {
 /// pass the viewport from that draw; committing from a pre-draw size probe would
 /// race Ratatui's own autoresize and could irreversibly freeze the wrong prefix.
 fn commit_overflow<B>(
-    terminal: &mut ratatui::Terminal<B>,
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
     viewport: Rect,
 ) -> std::result::Result<bool, B::Error>
@@ -754,6 +767,23 @@ where
     Ok(true)
 }
 
+/// Draw one frame and hand it to the terminal as a single synchronized write.
+/// Every draw in the loop goes through here: bytes a draw leaves in the
+/// [`FrameWriter`] are not on screen until the handover, and a handover in the
+/// middle of a repaint is exactly the flicker plan 103 removed.
+fn draw_and_hand_over<B>(
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
+    app: &mut App,
+    hud: &render::Hud,
+) -> std::result::Result<Rect, B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    terminal.draw(|frame| render::draw(frame, app, hud))?;
+    terminal.backend_mut().commit_frame()?;
+    Ok(terminal.get_frame().area())
+}
+
 /// Draw once so Ratatui's internal autoresize establishes the authoritative
 /// viewport. Before an irreversible commit, the backend captures and pins one
 /// physical size: autoresize confirmation, insert/drain, and the required repaint
@@ -768,8 +798,7 @@ where
     B: ratatui::backend::Backend,
 {
     for retry in 0..=1 {
-        terminal.draw(|frame| render::draw(frame, app, hud))?;
-        let drawn_viewport = terminal.get_frame().area();
+        let drawn_viewport = draw_and_hand_over(terminal, app, hud)?;
         let overlay_open =
             !app.interactions.is_empty() || app.fork_picker.is_some() || app.popup.is_some();
         if overlay_open {
@@ -783,8 +812,10 @@ where
             if confirmed_viewport != drawn_viewport {
                 return Ok(None);
             }
+            // The commit tears the viewport down and the repaint puts it back
+            // inside one handover, so the screen never shows the gap (plan 103).
             if commit_overflow(terminal, app, confirmed_viewport)? {
-                terminal.draw(|frame| render::draw(frame, app, hud))?;
+                draw_and_hand_over(terminal, app, hud)?;
             }
             Ok(Some(terminal.get_frame().area()))
         })();
@@ -793,10 +824,7 @@ where
         match attempt? {
             Some(viewport) => return Ok(viewport),
             None if retry == 0 => continue,
-            None => {
-                terminal.draw(|frame| render::draw(frame, app, hud))?;
-                return Ok(terminal.get_frame().area());
-            }
+            None => return draw_and_hand_over(terminal, app, hud),
         }
     }
     unreachable!("bounded geometry retry loop always returns")

@@ -1,6 +1,6 @@
-//! `PinnedBackend`: the single backend wrapper every draw funnels through. Two
-//! jobs, both serving a correct scrollback commit (see the [module
-//! catalogue](super)):
+//! `PinnedBackend`: the single backend wrapper every draw funnels through. Four
+//! jobs, all serving a correct — and flicker-free — scrollback commit (see the
+//! [module catalogue](super)):
 //!
 //! - **Wide-char continuation skip (plan 101).** [`PinnedBackend`]'s `draw`
 //!   drops the " " placeholder that trails each wide grapheme, mirroring the skip
@@ -9,10 +9,27 @@
 //! - **Size pin.** [`PinnedBackend::pin_current_size`] freezes one physical size
 //!   across a commit transaction so autoresize confirmation, insert/drain, and
 //!   the repaint share one geometry even if a resize arrives mid-transaction.
+//! - **No cursor round trip inside a commit (plan 103).**
+//!   [`PinnedBackend::begin_commit`] answers `get_cursor_position` from the
+//!   position we last sent instead of an `ESC[6n` query, which would block on
+//!   crossterm's reader lock — held for up to one poll interval by the input
+//!   thread — while the viewport is already cleared.
+//! - **Frame handover (plan 103).** [`PinnedBackend::commit_frame`] releases the
+//!   [`FrameWriter`] so one frame's bytes reach the terminal in a single
+//!   synchronized write, clear and repaint together.
+
+use super::FrameWriter;
 
 pub(crate) struct PinnedBackend<B> {
     pub(crate) inner: B,
     pinned_size: Option<ratatui::layout::Size>,
+    /// Present for the real terminal, absent for test backends (which flush
+    /// straight through their own writer).
+    frames: Option<FrameWriter<std::io::Stdout>>,
+    /// The position we last told the terminal to move to; stands in for a
+    /// cursor query while a commit is in flight.
+    last_cursor: Option<ratatui::layout::Position>,
+    committing: bool,
 }
 
 impl<B> PinnedBackend<B> {
@@ -20,7 +37,32 @@ impl<B> PinnedBackend<B> {
         Self {
             inner,
             pinned_size: None,
+            frames: None,
+            last_cursor: None,
+            committing: false,
         }
+    }
+
+    /// The real terminal: `frames` is the same [`FrameWriter`] the inner
+    /// backend writes into, so [`Self::commit_frame`] can release a frame.
+    pub(crate) fn with_frames(inner: B, frames: FrameWriter<std::io::Stdout>) -> Self {
+        Self {
+            frames: Some(frames),
+            ..Self::new(inner)
+        }
+    }
+
+    /// Open the window where `Terminal::clear` — which `insert_before` runs at
+    /// the end of every committed batch — must not query the cursor: the
+    /// viewport is being torn down and repainted inside one frame, so the only
+    /// thing ratatui does with the answer is put the cursor back, which the
+    /// repaint does anyway.
+    pub(crate) fn begin_commit(&mut self) {
+        self.committing = true;
+    }
+
+    pub(crate) fn end_commit(&mut self) {
+        self.committing = false;
     }
 }
 
@@ -32,6 +74,15 @@ impl<B: ratatui::backend::Backend> PinnedBackend<B> {
 
     pub(crate) fn unpin_size(&mut self) {
         self.pinned_size = None;
+    }
+
+    /// Hand the terminal everything drawn since the last handover as one write.
+    /// Test backends have no [`FrameWriter`]; their flush is already immediate.
+    pub(crate) fn commit_frame(&mut self) -> std::result::Result<(), B::Error> {
+        if let Some(frames) = &self.frames {
+            frames.release();
+        }
+        self.inner.flush()
     }
 }
 
@@ -81,6 +132,20 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
     fn get_cursor_position(
         &mut self,
     ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
+        // Inside a commit the honest answer costs an `ESC[6n` round trip whose
+        // reply waits on crossterm's reader lock — held for up to one 200ms
+        // poll by the input thread — and `Terminal::clear` asks for it right
+        // after blanking the viewport. Measured: 205-335ms of black screen per
+        // overflow commit (plan 103). The position we last sent is what the
+        // terminal's cursor is at anyway, and the repaint sets it regardless.
+        if self.committing
+            && let Some(position) = self.last_cursor
+        {
+            return Ok(position);
+        }
+        // Outside a commit the query is real (viewport init, resize anchoring),
+        // so the terminal must first have seen everything already drawn.
+        self.commit_frame()?;
         self.inner.get_cursor_position()
     }
 
@@ -88,6 +153,8 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
         &mut self,
         position: P,
     ) -> std::result::Result<(), Self::Error> {
+        let position = position.into();
+        self.last_cursor = Some(position);
         self.inner.set_cursor_position(position)
     }
 

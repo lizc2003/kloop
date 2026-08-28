@@ -6,6 +6,8 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget as _;
 
+use super::PinnedBackend;
+
 /// Per-`insert_before` cost is fixed regardless of the block's height: a
 /// full-height inline viewport pays one full-screen scroll + `clear_region` +
 /// flush every call (ratatui-core `insert_before_no_scrolling_regions`). So a
@@ -45,16 +47,40 @@ fn coalesce_scrollback_batches(
     batches
 }
 
-/// Insert the overflow backlog into native scrollback, then invalidate the
-/// inline viewport. With `scrolling-regions` off, Ratatui's full-height
-/// `insert_before` scrolls each batch off the bottom with `append_lines` (a real
-/// LF-at-bottom scroll every terminal handles), instead of the DECSTBM one-row
-/// scroll that iTerm2 smears (plan 99). Blocks are coalesced into a few tall
-/// batches first so a long resume commits in O(batches) full-screen repaints,
-/// not one per cell (plan 100); `clear` then resets the diff buffer so the next
-/// draw restores the transcript tail and bottom chrome.
+/// Insert the overflow backlog into native scrollback. With `scrolling-regions`
+/// off, Ratatui's full-height `insert_before` scrolls each batch off the bottom
+/// with `append_lines` (a real LF-at-bottom scroll every terminal handles),
+/// instead of the DECSTBM one-row scroll that iTerm2 smears (plan 99). Blocks
+/// are coalesced into a few tall batches first so a long resume commits in
+/// O(batches) full-screen repaints, not one per cell (plan 100).
+///
+/// No clear of our own: `insert_before` already ends with `Terminal::clear`,
+/// which both blanks the inline viewport (committed scrollback stays intact —
+/// an inline clear starts at the viewport) and resets the diff buffer so the
+/// next draw repaints the tail and bottom chrome. The second clear this used to
+/// do was not free — `Terminal::clear` opens with an `ESC[6n` cursor query, and
+/// that one landed *after* the viewport had gone blank, so the screen stayed
+/// black for as long as the reply waited on crossterm's reader lock: 205-335ms,
+/// measured (plan 103). The clear ratatui does itself is free of that stall
+/// because this function brackets the whole commit in
+/// [`PinnedBackend::begin_commit`] — hence the [`PinnedBackend`] in the
+/// signature: opening that window is part of committing, not something a caller
+/// can forget.
 pub(crate) fn insert_scrollback_blocks<B>(
-    terminal: &mut ratatui::Terminal<B>,
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
+    blocks: Vec<Vec<Line<'static>>>,
+) -> std::result::Result<(), B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    terminal.backend_mut().begin_commit();
+    let result = insert_batches(terminal, blocks);
+    terminal.backend_mut().end_commit();
+    result
+}
+
+fn insert_batches<B>(
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     blocks: Vec<Vec<Line<'static>>>,
 ) -> std::result::Result<(), B::Error>
 where
@@ -70,9 +96,6 @@ where
             Paragraph::new(lines).render(area, buf);
         })?;
     }
-    // Inline clear starts at the viewport, so committed native scrollback stays
-    // intact while the next draw is forced to repaint every visible cell.
-    terminal.clear()?;
     Ok(())
 }
 
@@ -98,7 +121,7 @@ mod tests {
     fn scrollback_insert_clears_viewport_without_clearing_history() {
         const WIDTH: u16 = 24;
         const HEIGHT: u16 = 6;
-        let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
+        let backend = PinnedBackend::new(TestBackend::new(WIDTH, HEIGHT));
         let mut terminal = ratatui::Terminal::with_options(
             backend,
             TerminalOptions {
@@ -130,7 +153,7 @@ mod tests {
         )
         .unwrap();
 
-        terminal.backend().assert_scrollback_lines([
+        terminal.backend().inner.assert_scrollback_lines([
             "committed one           ",
             "committed two           ",
             "committed three         ",
@@ -141,6 +164,7 @@ mod tests {
         assert!(
             terminal
                 .backend()
+                .inner
                 .buffer()
                 .content
                 .iter()
@@ -154,7 +178,7 @@ mod tests {
                 frame.render_widget(Paragraph::new(initial), area);
             })
             .unwrap();
-        terminal.backend().assert_buffer_lines([
+        terminal.backend().inner.assert_buffer_lines([
             "live tail               ",
             "                        ",
             "────────────────────────",
@@ -216,13 +240,17 @@ mod tests {
         assert_eq!(batches[0].len(), 2);
     }
 
-    /// Wraps `TestBackend` and counts `clear`/`clear_region`. Each
-    /// `insert_before` on an inline viewport ends with exactly one
-    /// `clear_region`, so the count equals the number of `insert_before` calls —
-    /// the O(cells) → O(batches) regression signal (plan 100).
+    /// Wraps `TestBackend` and counts `clear`/`clear_region` plus cursor
+    /// queries. Each `insert_before` on an inline viewport ends with exactly one
+    /// `clear_region`, so the clear count equals the number of `insert_before`
+    /// calls — the O(cells) → O(batches) regression signal (plan 100). The
+    /// cursor-query count is the flicker signal (plan 103): on the real backend
+    /// every one of them is a blocking `ESC[6n` round trip, and ratatui asks for
+    /// it right after blanking the viewport.
     struct ClearCountingBackend {
         inner: TestBackend,
         clears: StateCell<usize>,
+        cursor_queries: StateCell<usize>,
     }
 
     impl ClearCountingBackend {
@@ -230,11 +258,16 @@ mod tests {
             Self {
                 inner: TestBackend::new(width, height),
                 clears: StateCell::new(0),
+                cursor_queries: StateCell::new(0),
             }
         }
 
         fn clear_calls(&self) -> usize {
             self.clears.get()
+        }
+
+        fn cursor_queries(&self) -> usize {
+            self.cursor_queries.get()
         }
     }
 
@@ -248,6 +281,11 @@ mod tests {
             self.inner.draw(content)
         }
 
+        fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
+            self.cursor_queries.set(self.cursor_queries.get() + 1);
+            self.inner.get_cursor_position()
+        }
+
         fn append_lines(&mut self, lines: u16) -> std::result::Result<(), Self::Error> {
             self.inner.append_lines(lines)
         }
@@ -258,10 +296,6 @@ mod tests {
 
         fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.show_cursor()
-        }
-
-        fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
-            self.inner.get_cursor_position()
         }
 
         fn set_cursor_position<P: Into<Position>>(
@@ -300,11 +334,16 @@ mod tests {
         // exact `-c` resume shape. Committing per cell would drive one
         // full-screen scroll + clear_region per cell (O(cells)); coalescing
         // makes it O(batches). 300 one-line cells fit one 512-row batch, so the
-        // whole commit is one insert_before (one clear_region) plus the trailing
-        // terminal.clear() — a handful of clears, not ~300.
+        // whole commit is one insert_before — one clear_region, not ~300.
+        //
+        // The same run pins the flicker fix (plan 103): the commit must ask the
+        // terminal for the cursor position zero times. Each query is a blocking
+        // `ESC[6n` on the real backend, and ratatui issues it right after the
+        // clear has blanked the viewport — measured at 205-335ms of black screen
+        // per commit before this was suppressed.
         const WIDTH: u16 = 40;
         const HEIGHT: u16 = 10;
-        let backend = ClearCountingBackend::new(WIDTH, HEIGHT);
+        let backend = PinnedBackend::new(ClearCountingBackend::new(WIDTH, HEIGHT));
         let mut terminal = ratatui::Terminal::with_options(
             backend,
             TerminalOptions {
@@ -323,17 +362,20 @@ mod tests {
         let blocks: Vec<Vec<Line<'static>>> = (0..cells)
             .map(|i| vec![Line::from(format!("committed {i}"))])
             .collect();
-        let before = terminal.backend().clear_calls();
+        let before = terminal.backend().inner.clear_calls();
+        let queries_before = terminal.backend().inner.cursor_queries();
         insert_scrollback_blocks(&mut terminal, blocks).unwrap();
-        let clears = terminal.backend().clear_calls() - before;
+        let clears = terminal.backend().inner.clear_calls() - before;
+        let queries = terminal.backend().inner.cursor_queries() - queries_before;
 
-        // One 512-row batch → one insert_before (one clear_region) + one
-        // trailing terminal.clear(). The point is it does NOT scale with cells.
+        // One 512-row batch → one insert_before → one clear_region. The point is
+        // it does NOT scale with cells.
         assert!(
             clears < cells / 10,
             "commit did {clears} clears for {cells} cells — expected batched, not per-cell"
         );
-        assert!(clears <= 3, "expected a single batch, got {clears} clears");
+        assert_eq!(clears, 1, "expected a single batch and no clear of our own");
+        assert_eq!(queries, 0, "a commit must not stall on a cursor query");
     }
 
     /// Records the `(x, y, symbol)` cells handed to `Backend::draw`, so a test

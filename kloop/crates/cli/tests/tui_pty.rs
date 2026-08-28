@@ -18,6 +18,9 @@ use tui_pty_support::sse_text;
 static PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 const CTRL_C: &[u8] = b"\x03";
+const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 const LEFT: &[u8] = b"\x1b[D";
 const RIGHT: &[u8] = b"\x1b[C";
 const BACKSPACE: &[u8] = b"\x7f";
@@ -69,6 +72,13 @@ fn graceful_exit(harness: &mut PtyHarness) -> Result<()> {
         bail!("kloop exited with {}", status.exit_code());
     }
     Ok(())
+}
+
+/// Last occurrence of `needle`, for asking "which frame was this byte in?".
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 fn assert_no_alternate_screen(raw: &[u8]) {
@@ -192,6 +202,27 @@ async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Res
     assert!(
         clear < repaint && repaint < second,
         "commit ordering in raw output"
+    );
+    // Plan 103 (the black flash): that clear blanks the whole inline viewport,
+    // so it must not reach the terminal on its own. Clear and repaint ride one
+    // synchronized-update frame, and nothing in the commit may stop to ask the
+    // terminal where the cursor is — that `ESC[6n` blocks on crossterm's reader
+    // lock (held for up to one 200ms input poll) with the screen already blank.
+    assert!(
+        !contains_bytes(&raw, CURSOR_POSITION_QUERY),
+        "a commit must not stall on a cursor-position query"
+    );
+    let frame_start =
+        rfind_bytes(&raw[..clear], BEGIN_SYNCHRONIZED_UPDATE).expect("clear inside a frame");
+    let frame_end =
+        find_bytes(&raw, END_SYNCHRONIZED_UPDATE, clear).expect("frame end after the clear");
+    assert!(
+        rfind_bytes(&raw[..clear], END_SYNCHRONIZED_UPDATE).is_none_or(|end| end < frame_start),
+        "the clear must sit inside an open synchronized frame, not between two"
+    );
+    assert!(
+        repaint < frame_end,
+        "the repaint must land in the same synchronized frame as the clear"
     );
 
     graceful_exit(&mut harness)?;

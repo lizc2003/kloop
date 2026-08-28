@@ -25,12 +25,25 @@
 //!   one cell at a time is O(cells) full-screen repaints;
 //!   [`scrollback::insert_scrollback_blocks`] coalesces it to O(batches).
 //!
+//! - **A commit's clear must not be its own write (plan 103)** →
+//!   [`frame_writer`], plus the cursor-query suppression in [`pinned_backend`].
+//!   `insert_before` ends with `Terminal::clear`, which ratatui-crossterm
+//!   flushes on its own (`execute!`) and which asks the terminal where the
+//!   cursor is (`ESC[6n`) — a round trip that waits on crossterm's reader lock,
+//!   held for up to one 200ms poll by the input thread. The screen therefore sat
+//!   blank between the clear and the repaint: 205-335ms of black, measured
+//!   through the PTY harness. [`FrameWriter`] holds mid-frame flushes so clear
+//!   and repaint land in one synchronized write, and the commit answers cursor
+//!   queries from the last position it sent.
+//!
 //! [`PinnedBackend`] also pins one physical size across a commit transaction so
 //! autoresize confirmation, insert/drain, and the repaint share one geometry
 //! even if a resize arrives mid-transaction (consumed by `draw_frame`).
 
+mod frame_writer;
 mod pinned_backend;
 mod scrollback;
 
+pub(crate) use frame_writer::FrameWriter;
 pub(crate) use pinned_backend::PinnedBackend;
 pub(crate) use scrollback::insert_scrollback_blocks;
