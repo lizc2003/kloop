@@ -105,8 +105,8 @@ struct Profile {
 struct GlobalFile {
     initial_model: Option<String>,
     initial_provider: String,
-    /// Root `model_reasoning_effort`: the rail-agnostic effort a session starts
-    /// at, overriding the selected profile's own `effort`.
+    /// Root `effort`: the rail-agnostic level a session starts at, overriding
+    /// the selected profile's own `effort` (same key, wider scope).
     initial_effort: Option<ReasoningEffort>,
     profiles: BTreeMap<String, Profile>,
 }
@@ -298,7 +298,7 @@ fn selected_base(
 }
 
 /// The effort this provider starts a session at: `KLOOP_EFFORT` beats the root
-/// `model_reasoning_effort`, which beats the profile's own `effort`. Like the
+/// root `effort`, which beats the profile's own `effort`. Like the
 /// base URL and credential overrides, the two global sources apply only to the
 /// selected provider — they must not silently retarget the others. Only the
 /// spelling is checked (at parse time): which levels are legal belongs to the
@@ -346,13 +346,12 @@ fn selected_credential(
 
 fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
     let initial_model = optional_string(table, "model", "model")?;
-    let initial_effort =
-        optional_string(table, "model_reasoning_effort", "model_reasoning_effort")?
-            .map(|raw| {
-                raw.parse::<ReasoningEffort>()
-                    .map_err(|e| anyhow!("model_reasoning_effort: {e}"))
-            })
-            .transpose()?;
+    let initial_effort = optional_string(table, "effort", "effort")?
+        .map(|raw| {
+            raw.parse::<ReasoningEffort>()
+                .map_err(|e| anyhow!("effort: {e}"))
+        })
+        .transpose()?;
     let initial_provider = optional_string(table, "model_provider", "model_provider")?
         .context("model_provider is required")?;
     let providers = table
@@ -748,14 +747,14 @@ http_headers = { Authorization = "Bearer key" }
     }
 
     /// `effort` is a per-provider default on every rail now (not responses
-    /// only), the root `model_reasoning_effort` and `KLOOP_EFFORT` override it
+    /// only), the root `effort` and `KLOOP_EFFORT` override it
     /// for the *selected* provider only, and every source is checked against
     /// the rail that would have to send it.
     #[test]
     fn effort_resolves_env_over_root_over_profile_for_the_selected_provider() {
         const WITH_EFFORT: &str = r#"
 model_provider = "anthropic-a"
-model_reasoning_effort = "max"
+effort = "max"
 
 [model_providers.anthropic-a]
 wire_api = "anthropic"

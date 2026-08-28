@@ -83,7 +83,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
             key.as_str(),
             "model"
                 | "model_provider"
-                | "model_reasoning_effort"
+                | "effort"
                 | "model_providers"
                 | "permissions"
                 | "mcp"

@@ -1826,7 +1826,7 @@ force; that is also the startup state, so the chat rail's field (which only
 reasoning models accept) never appears unless asked for. It is deliberately not
 spelled `off`, because `none` is a real level meaning "do no reasoning" and the
 two would read as synonyms. The initial value comes from `KLOOP_EFFORT` >
-top-level `model_reasoning_effort` > the selected profile's `effort`.
+the top-level `effort` key > the selected profile's own `effort`.
 
 A change applies from the next turn: the effort rides the frozen provider route,
 so child agents and compaction sample at the same value, and it appears in the
@@ -2641,9 +2641,9 @@ cargo run -- --mock
 # ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
 # selected profile. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
-# settings. KLOOP_EFFORT (or top-level model_reasoning_effort, or a profile's
-# effort key — in that precedence, and valid on every wire_api) seeds the session
-# reasoning effort that /effort then owns. Only the spelling is checked: which
+# settings. KLOOP_EFFORT (or the top-level effort key, or a profile's own effort
+# key — same word at three scopes, in that precedence, valid on every wire_api)
+# seeds the session reasoning effort that /effort then owns. Only the spelling is checked: which
 # levels a model takes is the model's own contract, stated in its own error. KLOOP_FALLBACK_MODEL is not a runtime selector.
 # Provider/search keys are stripped from model-controlled shell environments.
 #

@@ -14,7 +14,7 @@
 
 - `effort` 只存在于 responses 轨,且是**启动期烘焙**——`Profile.effort: Option<String>` 进 `Provider::OpenAiResponses { effort }`,由 catalog 的 factory + `OnceLock` 缓存住,会话中无法更改。
 - Anthropic 轨完全没有 effort(只有 `ThinkingMode`);chat 轨也没有。
-- `~/.kloop/config.toml` 根键 `model_reasoning_effort` 被 `validate_root` 接受但**从没读过**(codex 兼容遗留)。
+- `~/.kloop/config.toml` 根键 `model_reasoning_effort` 被 `validate_root` 接受但**从没读过**(codex 兼容遗留;本 plan 里先改成真读,后按用户意见改名为 `effort`)。
 - `model_providers.<id>.effort` 目前硬性只允许 responses wire。
 
 三条轨其实都有 effort 参数(2026-08 核对):
@@ -86,7 +86,7 @@ Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请
 
 ### 5. 配置优先级
 
-`KLOOP_EFFORT` > 根键 `model_reasoning_effort`(**从接受但忽略变成真读**)> `model_providers.<id>.effort` > 不发。根键/环境变量只作用于**被选中的** provider,与既有 `selected_base` / `selected_credential` 同形。`model_providers.<id>.effort` 解除「只允许 responses」的限制,改为按本 profile 的 wire 校验取值。
+`KLOOP_EFFORT` > 根键 `effort`(原 codex 名 `model_reasoning_effort`,既没被读过、名字又长,直接改名)> `model_providers.<id>.effort` > 不发。根键/环境变量只作用于**被选中的** provider,与既有 `selected_base` / `selected_credential` 同形。`model_providers.<id>.effort` 解除「只允许 responses」的限制,改为按本 profile 的 wire 校验取值。
 
 ## 关键文件
 
@@ -96,7 +96,7 @@ Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请
 - `crates/core/src/commands/effort.rs`(新)+ `commands/mod.rs`(注册 + `route_changed` 更名)。
 - `crates/core/src/agent/sampling.rs`、`crates/core/src/compact.rs` — `stream_attempt` 传 attempt 的 effort。
 - `crates/cli/src/provider_config.rs` — profile effort 解析成 `ReasoningEffort` 并按 wire 校验;`selected_effort`(env > 根键 > profile);`ResolvedProviderSettings` 透出。
-- `crates/cli/src/user_config.rs` — 根键 `model_reasoning_effort` 真读出来。
+- `crates/cli/src/user_config.rs` — 根键改名 `effort` 并真读出来。
 - `crates/tui/src/lib.rs` / `crates/server/src/lib.rs` / `crates/cli/src/main.rs` — `route_changed` 更名。
 - `crates/tui/src/render.rs` — 页脚 `provider / model · r1 · high · 12% ctx`(effort 为 None 时不加这一段)。
 - `kloop/README.md` — provider 配置段、slash 命令段、wire 段同步。
@@ -136,7 +136,7 @@ Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请
 - **provider**(`crates/provider/src/lib.rs`):`Provider::OpenAiResponses` 删掉烘焙的 `effort`;`stream_attempt` 增 `effort: Option<ReasoningEffort>` 参数,三轨分别渲染 `output_config.effort` / `reasoning.{effort,summary}` / `reasoning_effort`,`None` 一律不发字段;`MockRequest` 记录 effort。
 - **core**(`crates/core/src/provider_route.rs`):catalog 增 `default_effort`(构造时按本轨接受集校验);`SessionState` 增 `effort` + `effort_pinned`;新增 `effort()` / `accepted_efforts()` / `set_effort()`(按当前轨校验,新增 `SwitchError::EffortUnsupported`);`FrozenProviderRoute` / `FrozenProviderAttempt` 携带 effort,`child_route` 与 fallback attempt 继承;`switch_with` 按「pinned 粘、不被新轨接受则回落该 provider 配置」更新。`sampling.rs` / `compact.rs` 两处 `stream_attempt` 传 `provider_attempt.effort()`。
 - **命令**:新增 `crates/core/src/commands/effort.rs`(`/effort` 显示、`/effort <level>` 设置、`/effort off` 清空、非法档位列出本轨接受集),进 `BUILTINS`(`/help` 与 TUI `/` 菜单自动带上);`SlashResult.provider_changed` 更名 `route_changed`(effort 变化也要三个前端 re-freeze `cfg`),`/provider` 切换回执补报 effort。
-- **cli**(`provider_config.rs`):profile `effort` 解析为 `ReasoningEffort` 并按本 profile 的 wire 校验(**解除「只允许 responses」**);新增 `selected_effort`(`KLOOP_EFFORT` > 根键 `model_reasoning_effort` > profile,只作用于被选中的 provider,与 `selected_base`/`selected_credential` 同形);根键 `model_reasoning_effort` 从「接受但忽略」变成真读。
+- **cli**(`provider_config.rs`):profile `effort` 解析为 `ReasoningEffort` 并按本 profile 的 wire 校验(**解除「只允许 responses」**);新增 `selected_effort`(`KLOOP_EFFORT` > 根键 `effort` > profile `effort`,同一个词三个作用域;只作用于被选中的 provider,与 `selected_base`/`selected_credential` 同形);根键从 codex 遗留的 `model_reasoning_effort` 改名为 `effort`(从没被读过,不留别名)。
 - **server**:三处从 rollout 快照投影的路由用 catalog 默认 effort 填(effort 不进时间线,磁盘上的路由报的是「在那儿开会话会用什么」);`SwitchError::EffortUnsupported` 映射到 `unsupported_effort` kind。
 - **TUI**:页脚 `provider / model · r1 · high · 12% ctx`(effort 为 None 时不占宽度)。
 - **测试**:端到端两个(`compaction_samples_at_the_session_effort` / `turn_samples_at_the_session_effort` —— 会话态 `set_effort` → frozen route → attempt → mock 记录到的请求带该 effort,证两处 `stream_attempt` 调用点都传对);protocol 2 个(词表往返/拒绝、每轨接受集整对象);provider 3 个(三轨 body 渲染 + `None` 无字段);core 3 个(`set_effort` 被本轨拒绝且 frozen attempt/child 继承、catalog 拒绝本轨不接受的默认值、切 provider 的 pinned/回落/`off` 也粘);commands 1 个(`/effort` 显示/设置/幂等/拒绝/未知/清空 + `route_changed`);cli 2 个(env>根键>profile 且只作用于选中项、三种非法来源的报错文案)。
