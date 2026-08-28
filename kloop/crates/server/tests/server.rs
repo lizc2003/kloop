@@ -452,6 +452,42 @@ async fn run_real_provider_turn(client: &mut TestClient, thread_id: &str, prompt
     }
 }
 
+/// A sweep row's outcome. A rate-limited row is deliberately not `Refused`:
+/// measured on a throttled proxy, 429s land on alternating requests while the
+/// same levels succeed either side of them, so folding them into "the model
+/// refused this level" would invent a contract the endpoint never stated.
+#[derive(Debug, PartialEq, Eq)]
+enum EffortOutcome {
+    Accepted,
+    Refused(String),
+    RateLimited(String),
+}
+
+/// Sample one level, retrying through rate limits before giving up on the row.
+async fn probe_real_effort(
+    client: &mut TestClient,
+    thread_id: &str,
+    prompt: &str,
+) -> EffortOutcome {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        match try_real_provider_turn(client, thread_id, prompt).await {
+            Ok(()) => return EffortOutcome::Accepted,
+            Err(error) => {
+                // A 429 says "later", never "not that value".
+                if !error.contains("429") {
+                    return EffortOutcome::Refused(error);
+                }
+                last = error;
+            }
+        }
+    }
+    EffortOutcome::RateLimited(last)
+}
+
 /// Like [`run_real_provider_turn`] but reports the outcome instead of asserting
 /// it — the effort sweep needs to record which levels a live model refuses.
 async fn try_real_provider_turn(
@@ -3398,14 +3434,14 @@ async fn clear_command_empties_history_and_notifies() {
 /// Plan 102 against a live endpoint. The unit tests only lock the request body
 /// kloop builds; this is the one that learns which effort levels the model on
 /// the other end actually takes — and it is what proved the levels are a
-/// property of the **model**, not the rail (the same endpoint accepts `xhigh`
-/// and refuses `minimal` for gpt-5.6-sol, so kloop stopped gating them).
+/// property of the **model**, not the rail — and that produced the vocabulary
+/// itself: `minimal` was dropped after every model measured refused it.
 ///
 /// It sweeps kloop's whole vocabulary, prints the accepted/refused table, and
 /// asserts only what every reasoning model owes: `low`/`medium`/`high` sample
-/// successfully, `off` (no field at all) samples successfully, and a level kloop
-/// does not spell is refused by kloop before any request. A completed turn is
-/// the signal — the request body is not observable from here.
+/// successfully, `unset` (no field at all) samples successfully, and a level
+/// kloop does not spell is refused by kloop before any request. A completed turn
+/// is the signal — the request body is not observable from here.
 ///
 /// One rail per run, selected by KLOOP_PROVIDER (anthropic | openai |
 /// openai-responses) with that rail's usual credential/model variables:
@@ -3516,59 +3552,76 @@ async fn real_effort_sweep_contract() {
     // Nothing configured, so the route publishes no effort and sends no field.
     assert!(started["result"]["thread"]["route"]["effort"].is_null());
 
-    // `off` first: the no-field control. If this fails the endpoint is simply
-    // unavailable and every effort row below would be noise.
-    let cleared = run_real_command(&mut client, &thread_id, "/effort off").await;
+    // The no-field control first. If this fails the endpoint is simply
+    // unavailable and every effort row below would be noise — that control is
+    // what identified a throttled rail as throttled rather than effort-refusing.
+    let cleared = run_real_command(&mut client, &thread_id, "/effort unset").await;
     assert!(
-        cleared.starts_with("effort: off —"),
+        cleared.starts_with("effort: unset —"),
         "unexpected: {cleared}"
     );
-    try_real_provider_turn(
-        &mut client,
-        &thread_id,
-        "Reply exactly EFFORT_OFF and nothing else.",
-    )
-    .await
-    .unwrap_or_else(|error| panic!("no-field control turn failed, endpoint unusable: {error}"));
+    assert_eq!(
+        probe_real_effort(
+            &mut client,
+            &thread_id,
+            "Reply exactly EFFORT_UNSET and nothing else.",
+        )
+        .await,
+        EffortOutcome::Accepted,
+        "the no-field control must sample cleanly, or the rows below are noise"
+    );
 
     println!("== {rail} / {model} ==");
     println!("  (no field) ACCEPTED");
-    let mut accepted = Vec::new();
+    let mut outcomes = Vec::new();
     for effort in kloop_protocol::ReasoningEffort::ALL {
         let shown = run_real_command(&mut client, &thread_id, &format!("/effort {effort}")).await;
         assert!(
             shown.starts_with(&format!("effort: {effort} (provider {provider_id})")),
             "unexpected /effort output for {effort}: {shown}"
         );
-        match try_real_provider_turn(
+        let outcome = probe_real_effort(
             &mut client,
             &thread_id,
             &format!("Reply exactly EFFORT_{effort} and nothing else."),
         )
-        .await
-        {
-            Ok(()) => {
-                accepted.push(*effort);
-                println!("  {effort:<8} ACCEPTED");
-            }
-            Err(error) => {
+        .await;
+        match &outcome {
+            EffortOutcome::Accepted => println!("  {effort:<8} ACCEPTED"),
+            EffortOutcome::Refused(error) => {
                 let error = error.replace('\n', " ");
                 println!("  {effort:<8} REFUSED  {}", &error[..error.len().min(200)]);
             }
+            EffortOutcome::RateLimited(_) => {
+                println!("  {effort:<8} INCONCLUSIVE (endpoint rate-limited)")
+            }
         }
+        outcomes.push((*effort, outcome));
     }
 
     // The floor every reasoning model owes; the rest of the table is this
-    // model's own contract and is reported, not asserted.
+    // model's own contract and is reported, not asserted. A throttled row is
+    // called out as such — it is not evidence either way.
     for required in [
         kloop_protocol::ReasoningEffort::Low,
         kloop_protocol::ReasoningEffort::Medium,
         kloop_protocol::ReasoningEffort::High,
     ] {
-        assert!(
-            accepted.contains(&required),
-            "{model} refused '{required}', which every reasoning model is expected to take"
-        );
+        match outcomes
+            .iter()
+            .find(|(effort, _)| *effort == required)
+            .map(|(_, outcome)| outcome)
+        {
+            Some(EffortOutcome::Accepted) => {}
+            Some(EffortOutcome::RateLimited(error)) => panic!(
+                "endpoint stayed rate-limited on '{required}' after retries, \
+                 so this run proves nothing about it: {error}"
+            ),
+            other => panic!(
+                "{model} refused '{required}', which every reasoning model is \
+                 expected to take: {other:?}"
+            ),
+        }
     }
 
     // kloop enforces its own spelling and nothing else — no request is made.

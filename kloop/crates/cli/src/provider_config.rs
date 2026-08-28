@@ -769,7 +769,7 @@ wire_api = "responses"
 http_headers = { Authorization = "Bearer b-key" }
 default_model = "gpt-a"
 models = ["gpt-a"]
-effort = "minimal"
+effort = "none"
 "#;
         // Root beats the selected profile; an unselected profile keeps its own.
         let rooted = resolve(Some(WITH_EFFORT), &env(&[])).unwrap();
@@ -779,7 +779,7 @@ effort = "minimal"
         );
         assert_eq!(
             rooted.catalog().default_effort("responses-b"),
-            Some(ReasoningEffort::Minimal)
+            Some(ReasoningEffort::None)
         );
 
         // The environment beats the root key, and follows the selection.
@@ -799,8 +799,7 @@ effort = "minimal"
     }
 
     /// Only kloop's own spelling is enforced at load time. Which levels a model
-    /// takes is the model's contract (measured: one endpoint refuses `minimal`
-    /// and accepts `max` for the same model), so a wire never vetoes a level.
+    /// takes is the model's contract, so a wire never vetoes a level.
     #[test]
     fn effort_rejects_only_unknown_spellings() {
         const XHIGH_ON_RESPONSES: &str = r#"
@@ -837,7 +836,7 @@ effort = "sky-high"
                 .unwrap_err()
                 .to_string(),
             "model_providers.anthropic-a.effort: unknown effort 'sky-high' \
-             (known: none, minimal, low, medium, high, xhigh, max)"
+             (known: none, low, medium, high, xhigh, max)"
         );
         assert_eq!(
             resolve(Some(XHIGH_ON_RESPONSES), &env(&[("KLOOP_EFFORT", "hgih")]))
@@ -845,7 +844,7 @@ effort = "sky-high"
                 .unwrap_err()
                 .to_string(),
             "KLOOP_EFFORT: unknown effort 'hgih' \
-             (known: none, minimal, low, medium, high, xhigh, max)"
+             (known: none, low, medium, high, xhigh, max)"
         );
     }
 }

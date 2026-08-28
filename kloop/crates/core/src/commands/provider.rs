@@ -70,7 +70,7 @@ pub fn run(
 }
 
 fn effort_label(effort: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
-    effort.map_or("off", kloop_protocol::ReasoningEffort::as_str)
+    effort.map_or("unset", kloop_protocol::ReasoningEffort::as_str)
 }
 
 fn api_family_label(family: kloop_protocol::ProviderApiFamily) -> &'static str {

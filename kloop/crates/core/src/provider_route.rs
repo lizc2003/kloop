@@ -444,9 +444,8 @@ impl SessionProviderState {
     /// Set (or with `None`, clear) the session reasoning effort. Deliberately
     /// unvalidated beyond kloop's own vocabulary: which levels a model accepts
     /// is the model's contract, not the rail's, and the provider states it
-    /// precisely in its own error (measured — the same endpoint takes `xhigh`
-    /// and refuses `minimal` for one model). The next frozen route carries the
-    /// value to every attempt, children included.
+    /// precisely in its own error. The next frozen route carries the value to
+    /// every attempt, children included.
     pub fn set_effort(&self, effort: Option<ReasoningEffort>) {
         let mut state = self.state.lock().unwrap();
         state.effort = effort;
@@ -1204,9 +1203,8 @@ mod tests {
         );
         let state = SessionProviderState::new(catalog, "responses", None).unwrap();
         assert_eq!(state.effort(), None);
-        // Measured on a live endpoint: the same rail refuses `minimal` and takes
-        // `max` for one model, so the level is the model's contract, not ours —
-        // kloop stores what it is told.
+        // The level is the model's contract, not ours: kloop stores what it is
+        // told and lets the model object on the next turn.
         state.set_effort(Some(ReasoningEffort::Max));
         assert_eq!(state.effort(), Some(ReasoningEffort::Max));
         let route = state.freeze();

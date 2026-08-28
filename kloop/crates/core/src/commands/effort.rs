@@ -5,7 +5,7 @@ use crate::provider_route::SessionProviderState;
 
 pub const SUMMARY: &str = "show or set the session reasoning effort";
 
-const USAGE: &str = "usage: /effort <level> | /effort off (off sends no effort field at all)";
+const USAGE: &str = "usage: /effort <level> | /effort unset (send no effort field at all)";
 
 pub fn run(args: &str, state: &SessionProviderState) -> SlashResult {
     let mut parts = args.split_whitespace();
@@ -19,10 +19,11 @@ pub fn run(args: &str, state: &SessionProviderState) -> SlashResult {
     if parts.next().is_some() {
         return SlashResult::message(USAGE);
     }
-    // `off` is kloop's word for "send no effort field at all". It is not a wire
-    // value, so it is matched before the level vocabulary — and it is a
-    // different thing from the `none` level, which asks for no reasoning.
-    let target = if requested.eq_ignore_ascii_case("off") {
+    // `unset` is kloop's word for "send no effort field at all" — not a wire
+    // value, so it is matched before the level vocabulary. Deliberately not
+    // spelled `off`: `none` is a real level meaning "do no reasoning", and the
+    // two would read as synonyms.
+    let target = if requested.eq_ignore_ascii_case("unset") {
         None
     } else {
         match requested.parse::<ReasoningEffort>() {
@@ -51,16 +52,15 @@ fn status_line(state: &SessionProviderState) -> String {
     match state.effort() {
         Some(effort) => format!("effort: {effort} (provider {})", route.provider_id),
         None => format!(
-            "effort: off — no effort field is sent, the provider's own default applies (provider {})",
+            "effort: unset — no effort field is sent, the provider's own default applies (provider {})",
             route.provider_id
         ),
     }
 }
 
 /// Which levels a model actually takes is the model's own contract, not the
-/// rail's — the same endpoint accepts `xhigh` and refuses `minimal` depending on
-/// the model — so kloop lists its vocabulary and lets the provider's error
-/// (which names the supported values) settle the rest.
+/// rail's, so kloop lists its vocabulary and lets the provider's error (which
+/// names the supported values) settle the rest.
 fn levels_line() -> String {
     format!(
         "levels: {} — a model accepts its own subset and names it if you miss",

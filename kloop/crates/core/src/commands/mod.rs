@@ -761,11 +761,11 @@ mod tests {
         assert_eq!(
             shown,
             SlashResult::message(
-                "effort: off — no effort field is sent, the provider's own default applies \
+                "effort: unset — no effort field is sent, the provider's own default applies \
                  (provider responses)\n\
-                 levels: none, minimal, low, medium, high, xhigh, max — a model accepts its own \
-                 subset and names it if you miss\n\
-                 usage: /effort <level> | /effort off (off sends no effort field at all)"
+                 levels: none, low, medium, high, xhigh, max — a model accepts its own subset \
+                 and names it if you miss\n\
+                 usage: /effort <level> | /effort unset (send no effort field at all)"
             )
         );
 
@@ -796,16 +796,17 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown effort 'hgih' (known: none, minimal, low, medium, high, xhigh, max)\n\
-                 usage: /effort <level> | /effort off (off sends no effort field at all)"
+                "unknown effort 'hgih' (known: none, low, medium, high, xhigh, max)\n\
+                 usage: /effort <level> | /effort unset (send no effort field at all)"
             )
         );
         assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::XHigh));
 
-        // `off` (send no field) is a different thing from the `none` level.
+        // `unset` (send no field) is a different thing from the `none` level,
+        // which asks the model for no reasoning — hence not calling it `off`.
         assert!(run("/effort none", &mut history).await.route_changed);
         assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::None));
-        assert!(run("/effort off", &mut history).await.route_changed);
+        assert!(run("/effort unset", &mut history).await.route_changed);
         assert_eq!(state.effort(), None);
     }
 }

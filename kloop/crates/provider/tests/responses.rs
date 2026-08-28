@@ -213,8 +213,8 @@ async fn effort_maps_to_reasoning_field() {
             Some(json!({"effort": "high", "summary": "auto"})),
         ),
         (
-            Some(ReasoningEffort::Minimal),
-            Some(json!({"effort": "minimal", "summary": "auto"})),
+            Some(ReasoningEffort::None),
+            Some(json!({"effort": "none", "summary": "auto"})),
         ),
     ] {
         let server = MockServer::start().await;

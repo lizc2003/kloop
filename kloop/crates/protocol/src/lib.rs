@@ -424,21 +424,24 @@ impl ProviderApiFamily {
 }
 
 /// How hard the model is asked to think, as a kloop-owned bounded vocabulary.
-/// Each rail renders it into its own request field ([`crate::ProviderApiFamily`]),
-/// but **which levels are legal is a property of the model, not the rail** — the
-/// same endpoint accepts `xhigh` on one model and refuses `minimal` on another,
-/// and says so precisely in its own 400. So this enum only bounds kloop's own
-/// spelling (catching `/effort hgih`); the model's contract is enforced by the
-/// model. Absent (`None` at the call site) means kloop sends no field at all and
-/// the provider's default stands — distinct from [`ReasoningEffort::None`],
-/// which explicitly asks for no reasoning.
+/// Each rail renders it into its own request field ([`crate::ProviderApiFamily`]).
+///
+/// The six levels are the set live endpoints were measured to accept (2026-08-28,
+/// plan 102) — an OpenAI-family model enumerated exactly these on refusal, and an
+/// Anthropic model took every one of them from `low` up. **Which subset a given
+/// model accepts is the model's own contract, not the rail's**, so this enum only
+/// bounds kloop's spelling (catching `/effort hgih`); a level the model refuses
+/// comes back as the provider's own error, which names what it does support.
+///
+/// Absent (`None` at the call site) means kloop sends no field at all and the
+/// provider's default stands — a different thing from [`ReasoningEffort::None`],
+/// which explicitly asks the model for no reasoning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     /// `effort: "none"` — the model does no reasoning. Distinct from sending no
     /// field at all, which leaves the provider's own default in force.
     None,
-    Minimal,
     Low,
     Medium,
     High,
@@ -450,7 +453,6 @@ pub enum ReasoningEffort {
 impl ReasoningEffort {
     pub const ALL: &'static [ReasoningEffort] = &[
         Self::None,
-        Self::Minimal,
         Self::Low,
         Self::Medium,
         Self::High,
@@ -461,7 +463,6 @@ impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -470,7 +471,7 @@ impl ReasoningEffort {
         }
     }
 
-    /// Render a set for an error or help line: `minimal, low, medium, high`.
+    /// Render a set for an error or help line: `none, low, medium, high, …`.
     pub fn join(levels: &[ReasoningEffort]) -> String {
         levels
             .iter()
@@ -1444,18 +1445,17 @@ mod tests {
     /// `/effort` command use, case-insensitively, and rejects anything else.
     #[test]
     fn reasoning_effort_parses_its_own_words_and_rejects_others() {
-        let parsed: Vec<ReasoningEffort> =
-            ["none", "minimal", "LOW", " medium ", "High", "xhigh", "max"]
-                .iter()
-                .map(|raw| raw.parse().unwrap())
-                .collect();
+        let parsed: Vec<ReasoningEffort> = ["none", "LOW", " medium ", "High", "xhigh", "max"]
+            .iter()
+            .map(|raw| raw.parse().unwrap())
+            .collect();
         assert_eq!(parsed, ReasoningEffort::ALL);
         assert_eq!(
             ReasoningEffort::ALL
                 .iter()
                 .map(|level| level.as_str())
                 .collect::<Vec<_>>(),
-            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            ["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             "x-high".parse::<ReasoningEffort>(),

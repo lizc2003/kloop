@@ -612,7 +612,7 @@ async fn unknown_non_error_named_event_still_fails_closed() {
 async fn effort_maps_to_reasoning_effort_field() {
     for (effort, expected) in [
         (None, None),
-        (Some(ReasoningEffort::Minimal), Some(json!("minimal"))),
+        (Some(ReasoningEffort::None), Some(json!("none"))),
     ] {
         let server = MockServer::start().await;
         mount_sse(&server, sse_body(&[], /*done*/ true)).await;

@@ -1781,8 +1781,8 @@ the model. The set is small and lives one-file-per-command under
   [model]` to switch the session route (see **Provider catalog and session
   route** above; the TUI opens a picker when called bare).
 - `/effort` — show the session reasoning effort, `/effort <level>` to set it
-  (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`), `/effort off` to send
-  no effort field at all (see **Reasoning effort** below).
+  (`none`|`low`|`medium`|`high`|`xhigh`|`max`), `/effort unset` to send no
+  effort field at all (see **Reasoning effort** below).
 - `/cost` — the current model and context-window estimate (`~used / window
   tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
   durable provider-reported usage across all models in the current transcript:
@@ -1803,20 +1803,23 @@ the model. The set is small and lives one-file-per-command under
   just relays a note.
 
 **Reasoning effort.** `/effort` is a session-local knob over one bounded
-vocabulary — `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — that
-each rail renders into its own request field: Anthropic `output_config.effort`,
-Responses `reasoning.effort` (with `summary: "auto"`), Chat `reasoning_effort`.
-**Which levels are legal is a property of the model, not the rail**, so kloop
-enforces only its own spelling (`/effort hgih` is refused locally) and lets the
-model's own error settle the rest — those errors name the supported set, and the
-alternative was measured wrong: one live endpoint accepts `xhigh` and `max` on
-the Responses *and* Chat rails for `gpt-5.6-sol` while refusing `minimal`, which
-no per-rail table gets right. `off` means kloop sends no field and the
-provider's own default stands; that is the default, so the chat rail's field
-(which only reasoning models accept) never appears unless asked for. It is
-distinct from the `none` level, which explicitly asks for no reasoning. The
-initial value comes from `KLOOP_EFFORT` > top-level `model_reasoning_effort` >
-the selected profile's `effort`.
+vocabulary — `none`, `low`, `medium`, `high`, `xhigh`, `max` — that each rail
+renders into its own request field: Anthropic `output_config.effort`, Responses
+`reasoning.effort` (with `summary: "auto"`), Chat `reasoning_effort`. Those six
+are the levels live endpoints were measured to accept; a seventh, `minimal`, was
+carried in the first draft from a stale prior and removed once every model
+measured refused it.
+
+**Which subset a model accepts is the model's own contract, not the rail's**, so
+kloop enforces only its own spelling (`/effort hgih` is refused locally) and lets
+the model's error settle the rest — those errors name the supported set, and a
+per-rail table was measured wrong in both directions before it was deleted.
+`/effort unset` sends no field at all, leaving the provider's own default in
+force; that is also the startup state, so the chat rail's field (which only
+reasoning models accept) never appears unless asked for. It is deliberately not
+spelled `off`, because `none` is a real level meaning "do no reasoning" and the
+two would read as synonyms. The initial value comes from `KLOOP_EFFORT` >
+top-level `model_reasoning_effort` > the selected profile's `effort`.
 
 A change applies from the next turn: the effort rides the frozen provider route,
 so child agents and compaction sample at the same value, and it appears in the
@@ -1825,7 +1828,7 @@ of the durable route timeline — route revision and receipts are route *identit
 (what reasoning replay is matched against), and an effort change leaves recorded
 reasoning replayable. A resumed session therefore re-seeds effort from
 configuration. A `/provider` switch carries an explicitly set effort along
-(including an explicit `off`); a session that never ran `/effort` follows each
+(including an explicit `unset`); a session that never ran `/effort` follows each
 provider's configured value. Changing effort mid-conversation invalidates the
 Anthropic prompt cache (the request prefix changes), so the next turn re-pays
 cache creation.

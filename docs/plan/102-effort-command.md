@@ -27,29 +27,35 @@
 
 ## 已拍板设计
 
-### 1. 词表:kloop 自有 bounded 枚举,但**不**按轨门禁(2026-08-28 真实测量后修正)
+### 1. 词表:六档,来自真实测量;不按轨门禁(2026-08-28 测完定稿)
 
-`kloop-protocol` 新增 `ReasoningEffort { None, Minimal, Low, Medium, High, XHigh, Max }`(serde/`FromStr` 都是小写单词,`xhigh` 不带下划线)。
+`ReasoningEffort { None, Low, Medium, High, XHigh, Max }`(serde/`FromStr` 小写单词,`xhigh` 不带下划线)。
 
-**首版设计错了,已改**:原本按 `api_family` 硬编码「每轨接受子集」(Anthropic `low..max`、OpenAI 家族 `minimal..high`),并在命令层当场拒绝集外档位。真实跑一次就被推翻——同一个端点对 `gpt-5.6-sol`:
+**这六档是测出来的,不是查出来的。** 首版按训练期印象写了两条错误的东西,真实跑一次全被推翻:
 
-| 档位 | responses 轨 | chat 轨 |
-| --- | --- | --- |
-| `none` | ✅ | ✅ |
-| `minimal` | ❌ 400 | ❌ 400 |
-| `low` / `medium` / `high` | ✅ | ✅ |
-| `xhigh` / `max` | ✅ | ✅ |
+1. **按 `api_family` 硬编码「每轨接受子集」**(Anthropic `low..max`、OpenAI 家族 `minimal..high`)并在命令层当场拒绝集外档位。
+2. 词表里带了 `minimal`。
 
-Anthropic 轨(claude-sonnet-4-6,同代理):`low`/`medium`/`high`/`xhigh`/`max` 均 ✅;`none`/`minimal` 两轮都失败但回的是 429 限流文案而非 400,未定论。
+实测(同一代理,`real_effort_sweep_contract` 走完整会话:`/effort <level>` 后各跑一次真实 turn):
+
+| 档位 | responses / gpt-5.6-sol | chat / gpt-5.6-sol | anthropic / claude-sonnet-4-6 |
+| --- | --- | --- | --- |
+| (不发字段,对照) | ✅ | ✅ | ✅ |
+| `none` | ✅ | ✅ | ⚠️ 未定论 |
+| `minimal`(已删) | ❌ 400 | ❌ 400 | ⚠️ 未定论 |
+| `low` / `medium` / `high` | ✅ | ✅ | ✅ |
+| `xhigh` / `max` | ✅ | ✅ | ✅ |
 
 端点原话:`Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol' model. Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and 'max'.`
 
-即:**接受集是模型属性,不是轨属性**,而且 provider 自己的 400 报得比我这张表准得多(直接枚举了支持值)。硬编码表两个方向都错:多拒了 `xhigh`/`max`(假阴性,挡住合法配置),又漏放了 `none`。
+Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请求 429 一次,一轮里失败行呈 `none`✗ `low`✓ `medium`✗ `high`✓ `xhigh`✗ `max`✓ 的交替形态,而 `medium`/`xhigh` 在别的轮次里成功过。sweep 因此改成**把 429 与「档位被拒」分开**:429 自动重试三次(间隔 30s),仍 429 就记 `INCONCLUSIVE` 而非 `REFUSED`。加重试后该轨 `low..max` 全绿,只剩 `none` 仍被限流挡住,如实记未定论。
 
-修正后的分工:
-- **kloop 只管自己的拼写**——`/effort hgih` 当场报错并列出词表(这仍有价值:打错字不该等到下一轮才发现)。
-- **档位合法性交给模型**——原样发出,provider 的 400 原样透出(kloop 本来就如实透传 provider 错误)。
-- `off`(不发字段,provider 自己的默认生效)与 `none` 档位(显式要求不推理)是两回事,文档里点明。
+据此定稿:据此定稿:
+
+- **删掉 `minimal`**。我能测到的模型没有一个支持它(gpt-5.6-sol 明确拒绝并列出不含它的支持集;Anthropic 文档的集合也是 `low..max`),它是训练期旧印象的残留。用户拍板「不用考虑兼容性」,直接删。
+- **不按轨门禁**。那张表两个方向都错:多拒了 `xhigh`/`max`(假阴性,挡住 gpt-5.6-sol 上的合法配置),又漏了 `none`。而且**两条轨实测结论完全一致**——差异是我编出来的。接受集是模型属性,provider 的 400 直接枚举支持值,比任何本地表都准。
+- 分工:**kloop 只管自己的拼写**(`/effort hgih` 当场拒并列出词表,打错字不该等到下一轮),**档位合法性交给模型**,provider 的 400 原样透出。
+- **`off` 改名 `unset`**。设计 `off` 时 `none` 还不在词表里;测出 `none` 是真实档位后,「off(不发字段)」和「none(发 `effort:"none"`,要求不推理)」并排会被读成同义词。`unset` 精确指「不发这个字段」。
 
 ### 2. Seam:effort 从 Provider 构造挪到每次请求
 
@@ -134,11 +140,6 @@ Anthropic 轨(claude-sonnet-4-6,同代理):`low`/`medium`/`high`/`xhigh`/`max` �
 - **TUI**:页脚 `provider / model · r1 · high · 12% ctx`(effort 为 None 时不占宽度)。
 - **测试**:端到端两个(`compaction_samples_at_the_session_effort` / `turn_samples_at_the_session_effort` —— 会话态 `set_effort` → frozen route → attempt → mock 记录到的请求带该 effort,证两处 `stream_attempt` 调用点都传对);protocol 2 个(词表往返/拒绝、每轨接受集整对象);provider 3 个(三轨 body 渲染 + `None` 无字段);core 3 个(`set_effort` 被本轨拒绝且 frozen attempt/child 继承、catalog 拒绝本轨不接受的默认值、切 provider 的 pinned/回落/`off` 也粘);commands 1 个(`/effort` 显示/设置/幂等/拒绝/未知/清空 + `route_changed`);cli 2 个(env>根键>profile 且只作用于选中项、三种非法来源的报错文案)。
 - **验证**:`cargo fmt --all --check` 干净;`cargo clippy --workspace --all-targets` 零 warning;`cargo test --workspace` 1335 passed / 0 failed。**如实边界**:三条真实 rail 上「改完 effort 下一轮确实按新档位采样」须用户 dogfood 复验(自动化只锁到发给 provider 的请求体形状与会话态流转);未把 KLOOP_EFFORT 之外的任何 endpoint/credential 写进提交文件。
-- **真实 provider 验证**(2026-08-28,用户提供 key/代理后执行,凭据只从 gitignored 的 `.kloop/env.local` source,未落任何提交文件):
-  - **responses 轨 / gpt-5.6-sol**:`none`/`low`/`medium`/`high`/`xhigh`/`max` 全部真实 turn 成功;`minimal` 被端点 400 拒。
-  - **chat 轨 / gpt-5.6-sol**:结论与 responses 完全一致——`reasoning_effort` 在这个代理上确实生效。
-  - **anthropic 轨 / claude-sonnet-4-6**(用户更新凭据后重测):「不发字段」对照行通过,`low`/`medium`/`high`/`xhigh`/`max` 全部真实 turn 成功。`none` 与 `minimal` 两轮独立测试都失败,但端点回的是 **429 `Too many tokens`(限流文案)而非 400 参数拒绝**,所以「是这两个档位非法、还是恰好被限流」**无法区分,记为未定论**,不写成「该轨不接受」。(首轮测试时连对照行都 429,那批数据整体作废。)
-  - 这轮测量直接推翻了首版的「每轨接受子集」设计,见上文第 1 节。
-  - 工具:`crates/provider/tests/effort_probe.rs`(ignored 诊断,逐档位打 ACCEPTED/REJECTED,带「不发字段」对照行与 20s 间隔,专门用来把「谁接受什么」问出来而不是猜);`crates/server/tests/server.rs::real_effort_sweep_contract`(ignored 契约,跑全词表并打表,只断言 `low`/`medium`/`high` 与 `off` 必须成功、未知拼写被 kloop 当场拒)。
+- **真实 provider 验证**(2026-08-28,用户提供 key/代理后执行;凭据只从 gitignored 的 `.kloop/env.local` source,未落任何提交文件):三条轨的完整 sweep 结果见上文第 1 节表格。责任分工:`crates/provider/tests/effort_probe.rs`(ignored 诊断,直接打 provider 层,逐档位 ACCEPTED/REJECTED,带「不发字段」对照行——正是这行让 anthropic 轨的全行失败被认出是代理限流而非 effort 被拒);`crates/server/tests/server.rs::real_effort_sweep_contract`(ignored 契约,走完整 server 会话:`/effort <level>` → 真实 turn,跑全词表并打表,429 自动重试后仍失败记 INCONCLUSIVE,只断言 `low`/`medium`/`high` 与「不发字段」对照必须成功、未知拼写被 kloop 当场拒)。
 
 - **README**:built-in 命令表补 `/provider` 与 `/effort`;新增「Reasoning effort」段(词表、每轨字段与接受集、不静默降级、优先级、随 frozen route 到子 agent/compaction、不进时间线故 resume 回落、切 provider 的粘/回落、改 effort 会作废 Anthropic prompt cache);provider 配置注释块与 server `/provider` 例外那句同步。
