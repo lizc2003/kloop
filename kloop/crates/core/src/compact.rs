@@ -628,9 +628,7 @@ mod tests {
             Arc::clone(&cfg.provider_catalog),
             cfg.provider_route.clone(),
         );
-        state
-            .set_effort(Some(kloop_protocol::ReasoningEffort::XHigh))
-            .unwrap();
+        state.set_effort(Some(kloop_protocol::ReasoningEffort::XHigh));
         let cfg = Arc::new(cfg.clone_with_provider_route(state.freeze()));
         let mut history = seeded_history(cfg.offload_dir.clone());
 

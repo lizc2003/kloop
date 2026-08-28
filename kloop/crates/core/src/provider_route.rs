@@ -87,14 +87,6 @@ impl ProviderCatalog {
                     "provider '{id}' fallback model '{fallback}' is not in its models allowlist"
                 ));
             }
-            if let Some(effort) = entry.default_effort
-                && !entry.api_family.accepts_effort(effort)
-            {
-                return Err(format!(
-                    "provider '{id}' effort '{effort}' is not accepted by its api family (accepted: {})",
-                    ReasoningEffort::join(entry.api_family.accepted_efforts())
-                ));
-            }
             let descriptor = ProviderDescriptor {
                 id: id.clone(),
                 api_family: entry.api_family,
@@ -449,34 +441,16 @@ impl SessionProviderState {
         self.state.lock().unwrap().effort
     }
 
-    /// The effort levels the *active* rail accepts, for `/effort`'s help and
-    /// error lines.
-    pub fn accepted_efforts(&self) -> &'static [ReasoningEffort] {
-        self.state
-            .lock()
-            .unwrap()
-            .active
-            .api_family
-            .accepted_efforts()
-    }
-
-    /// Set (or with `None`, clear) the session reasoning effort. Validated
-    /// against the active rail so an unusable value can never be stored; the
-    /// next frozen route carries it to every attempt, including children.
-    pub fn set_effort(&self, effort: Option<ReasoningEffort>) -> Result<(), SwitchError> {
+    /// Set (or with `None`, clear) the session reasoning effort. Deliberately
+    /// unvalidated beyond kloop's own vocabulary: which levels a model accepts
+    /// is the model's contract, not the rail's, and the provider states it
+    /// precisely in its own error (measured — the same endpoint takes `xhigh`
+    /// and refuses `minimal` for one model). The next frozen route carries the
+    /// value to every attempt, children included.
+    pub fn set_effort(&self, effort: Option<ReasoningEffort>) {
         let mut state = self.state.lock().unwrap();
-        if let Some(effort) = effort
-            && !state.active.api_family.accepts_effort(effort)
-        {
-            return Err(SwitchError::EffortUnsupported {
-                provider_id: state.active.provider_id.clone(),
-                api_family: state.active.api_family,
-                effort,
-            });
-        }
         state.effort = effort;
         state.effort_pinned = true;
-        Ok(())
     }
 
     pub fn active_route(&self) -> ActiveProviderRoute {
@@ -556,16 +530,14 @@ impl SessionProviderState {
             state.continuity,
             state.effort,
         );
-        // An unpinned session follows the target's configured effort; a pinned
-        // one keeps the user's choice, falling back to that configuration only
-        // when the new rail does not accept it. Either way the stored effort is
-        // always one the active rail accepts.
-        let next_effort = match state.effort {
-            Some(effort) if state.effort_pinned && target.api_family.accepts_effort(effort) => {
-                Some(effort)
-            }
-            None if state.effort_pinned => None,
-            _ => self.catalog.default_effort(provider_id),
+        // An unpinned session follows the target's configured effort; once
+        // `/effort` has spoken, the user's choice travels with the session. A
+        // model that refuses the level says so on the next turn — kloop does not
+        // second-guess it here (see `set_effort`).
+        let next_effort = if state.effort_pinned {
+            state.effort
+        } else {
+            self.catalog.default_effort(provider_id)
         };
         let tentative = FrozenProviderRoute::new(next_revision, target.clone(), next_effort);
         let continuity = commit(&previous, &tentative).map_err(SwitchCommitError::Commit)?;
@@ -881,11 +853,6 @@ pub enum SwitchError {
         code: ProviderAvailabilityCode,
     },
     RouteDrift(String),
-    EffortUnsupported {
-        provider_id: String,
-        api_family: ProviderApiFamily,
-        effort: ReasoningEffort,
-    },
     StaleRevision {
         expected: u64,
         actual: u64,
@@ -915,15 +882,6 @@ impl fmt::Display for SwitchError {
             Self::RouteDrift(provider_id) => write!(
                 formatter,
                 "provider '{provider_id}' no longer matches the persisted route identity"
-            ),
-            Self::EffortUnsupported {
-                provider_id,
-                api_family,
-                effort,
-            } => write!(
-                formatter,
-                "provider '{provider_id}' does not accept effort '{effort}' (accepted: {})",
-                ReasoningEffort::join(api_family.accepted_efforts())
             ),
             Self::StaleRevision { expected, actual } => write!(
                 formatter,
@@ -1231,10 +1189,11 @@ mod tests {
         }
     }
 
-    /// A level the active rail cannot send is refused outright — the session
-    /// never holds an effort its own route would reject.
+    /// The session knob is set and read as given: kloop bounds the spelling, the
+    /// model bounds the levels. What matters here is that the value reaches every
+    /// attempt minted from the frozen route.
     #[test]
-    fn set_effort_is_validated_against_the_active_rail() {
+    fn set_effort_reaches_every_attempt_minted_from_the_route() {
         let catalog = Arc::new(
             ProviderCatalog::new(vec![rail_entry(
                 "responses",
@@ -1245,53 +1204,26 @@ mod tests {
         );
         let state = SessionProviderState::new(catalog, "responses", None).unwrap();
         assert_eq!(state.effort(), None);
-        assert_eq!(
-            state.set_effort(Some(ReasoningEffort::Max)),
-            Err(SwitchError::EffortUnsupported {
-                provider_id: "responses".into(),
-                api_family: ProviderApiFamily::OpenAiResponses,
-                effort: ReasoningEffort::Max,
-            })
-        );
-        assert_eq!(state.effort(), None);
-        assert_eq!(state.set_effort(Some(ReasoningEffort::Minimal)), Ok(()));
-        assert_eq!(state.effort(), Some(ReasoningEffort::Minimal));
-        // The frozen route carries it to every attempt minted from it, children
-        // (same rail) included.
+        // Measured on a live endpoint: the same rail refuses `minimal` and takes
+        // `max` for one model, so the level is the model's contract, not ours —
+        // kloop stores what it is told.
+        state.set_effort(Some(ReasoningEffort::Max));
+        assert_eq!(state.effort(), Some(ReasoningEffort::Max));
         let route = state.freeze();
-        assert_eq!(
-            route.primary_attempt().effort(),
-            Some(ReasoningEffort::Minimal)
-        );
+        assert_eq!(route.primary_attempt().effort(), Some(ReasoningEffort::Max));
         assert_eq!(
             route.child_route(None).unwrap().effort(),
-            Some(ReasoningEffort::Minimal)
+            Some(ReasoningEffort::Max)
         );
-        assert_eq!(state.set_effort(None), Ok(()));
+        state.set_effort(None);
         assert_eq!(state.freeze().primary_attempt().effort(), None);
     }
 
-    /// A catalog cannot even be built with an effort its own rail refuses.
-    #[test]
-    fn catalog_rejects_a_default_effort_its_rail_refuses() {
-        let error = ProviderCatalog::new(vec![rail_entry(
-            "chat",
-            ProviderApiFamily::OpenAiChatCompletions,
-            Some(ReasoningEffort::XHigh),
-        )])
-        .unwrap_err();
-        assert_eq!(
-            error,
-            "provider 'chat' effort 'xhigh' is not accepted by its api family \
-             (accepted: minimal, low, medium, high)"
-        );
-    }
-
     /// Across a switch: an untouched session follows each provider's configured
-    /// effort; once `/effort` pins one it survives wherever the new rail accepts
-    /// it, and falls back to that provider's configuration where it does not.
+    /// effort, while a session that has run `/effort` carries its choice along —
+    /// including an explicit `off`, which a switch must not quietly revive.
     #[test]
-    fn switching_provider_keeps_a_pinned_effort_only_where_the_rail_accepts_it() {
+    fn switching_provider_keeps_a_pinned_effort_and_otherwise_follows_configuration() {
         let catalog = || {
             Arc::new(
                 ProviderCatalog::new(vec![
@@ -1323,20 +1255,17 @@ mod tests {
         assert_eq!(unpinned.effort(), Some(ReasoningEffort::Low));
 
         let pinned = SessionProviderState::new(catalog(), "claude", None).unwrap();
-        pinned.set_effort(Some(ReasoningEffort::Medium)).unwrap();
-        // `medium` is in both vocabularies, so the switch keeps it.
+        pinned.set_effort(Some(ReasoningEffort::Medium));
         switch(&pinned, "responses", 1);
         assert_eq!(pinned.effort(), Some(ReasoningEffort::Medium));
-        // `minimal` is not, so switching back falls to claude's configured one.
-        pinned.set_effort(Some(ReasoningEffort::Minimal)).unwrap();
-        switch(&pinned, "claude", 2);
-        assert_eq!(pinned.effort(), Some(ReasoningEffort::XHigh));
-        assert_eq!(pinned.active_route().effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(
+            pinned.active_route().effort,
+            Some(ReasoningEffort::Medium),
+            "the published route reports what the next turn will sample at"
+        );
 
-        // An explicit `/effort off` is pinned too: a switch does not revive a
-        // provider's configured effort behind the user's back.
         let cleared = SessionProviderState::new(catalog(), "claude", None).unwrap();
-        cleared.set_effort(None).unwrap();
+        cleared.set_effort(None);
         switch(&cleared, "responses", 1);
         assert_eq!(cleared.effort(), None);
     }

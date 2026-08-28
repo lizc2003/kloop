@@ -902,9 +902,7 @@ async fn turn_samples_at_the_session_effort() {
         Arc::clone(&cfg.provider_catalog),
         cfg.provider_route.clone(),
     );
-    state
-        .set_effort(Some(kloop_protocol::ReasoningEffort::Low))
-        .unwrap();
+    state.set_effort(Some(kloop_protocol::ReasoningEffort::Low));
     let cfg = Arc::new(cfg.clone_with_provider_route(state.freeze()));
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());

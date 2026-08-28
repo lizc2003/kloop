@@ -1780,8 +1780,9 @@ the model. The set is small and lives one-file-per-command under
 - `/provider` — show the configured providers, or `/provider <provider>
   [model]` to switch the session route (see **Provider catalog and session
   route** above; the TUI opens a picker when called bare).
-- `/effort` — show the session reasoning effort, `/effort <level>` to set it,
-  `/effort off` to send no effort field at all (see **Reasoning effort** below).
+- `/effort` — show the session reasoning effort, `/effort <level>` to set it
+  (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`), `/effort off` to send
+  no effort field at all (see **Reasoning effort** below).
 - `/cost` — the current model and context-window estimate (`~used / window
   tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
   durable provider-reported usage across all models in the current transcript:
@@ -1802,18 +1803,20 @@ the model. The set is small and lives one-file-per-command under
   just relays a note.
 
 **Reasoning effort.** `/effort` is a session-local knob over one bounded
-vocabulary — `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — that each rail
-renders into its own request field: Anthropic `output_config.effort`, Responses
-`reasoning.effort` (with `summary: "auto"`), Chat `reasoning_effort`. The rails
-do not admit the same levels, so each declares its accepted subset (Anthropic
-`low..max`; the OpenAI family `minimal..high`) and a level outside it is refused
-by the command, listing what the active provider accepts — never silently
-downgraded, never sent for the provider to reject. `off` means kloop sends no
-field and the provider's own default stands; that is also the default, so the
-chat rail's field (which only reasoning models accept) never appears unless
-asked for. The initial value comes from `KLOOP_EFFORT` > top-level
-`model_reasoning_effort` > the selected profile's `effort`, each validated at
-startup against the rail that would have to send it.
+vocabulary — `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — that
+each rail renders into its own request field: Anthropic `output_config.effort`,
+Responses `reasoning.effort` (with `summary: "auto"`), Chat `reasoning_effort`.
+**Which levels are legal is a property of the model, not the rail**, so kloop
+enforces only its own spelling (`/effort hgih` is refused locally) and lets the
+model's own error settle the rest — those errors name the supported set, and the
+alternative was measured wrong: one live endpoint accepts `xhigh` and `max` on
+the Responses *and* Chat rails for `gpt-5.6-sol` while refusing `minimal`, which
+no per-rail table gets right. `off` means kloop sends no field and the
+provider's own default stands; that is the default, so the chat rail's field
+(which only reasoning models accept) never appears unless asked for. It is
+distinct from the `none` level, which explicitly asks for no reasoning. The
+initial value comes from `KLOOP_EFFORT` > top-level `model_reasoning_effort` >
+the selected profile's `effort`.
 
 A change applies from the next turn: the effort rides the frozen provider route,
 so child agents and compaction sample at the same value, and it appears in the
@@ -1821,11 +1824,11 @@ TUI footer and in `ActiveProviderRoute.effort`. It is deliberately **not** part
 of the durable route timeline — route revision and receipts are route *identity*
 (what reasoning replay is matched against), and an effort change leaves recorded
 reasoning replayable. A resumed session therefore re-seeds effort from
-configuration. Across a `/provider` switch the value is sticky where the new
-rail accepts it and otherwise falls back to that provider's configured effort;
-a session that never ran `/effort` simply follows each provider's configuration.
-Changing effort mid-conversation invalidates the Anthropic prompt cache (the
-request prefix changes), so the next turn re-pays cache creation.
+configuration. A `/provider` switch carries an explicitly set effort along
+(including an explicit `off`); a session that never ran `/effort` follows each
+provider's configured value. Changing effort mid-conversation invalidates the
+Anthropic prompt cache (the request prefix changes), so the next turn re-pays
+cache creation.
 
 An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). Commands run **only when idle** — they read or
@@ -2629,8 +2632,9 @@ cargo run -- --mock
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
 # selected profile. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
 # settings. KLOOP_EFFORT (or top-level model_reasoning_effort, or a profile's
-# effort key — in that precedence, and now valid on every wire_api, not just
-# responses) seeds the session reasoning effort that /effort then owns. KLOOP_FALLBACK_MODEL is not a runtime selector.
+# effort key — in that precedence, and valid on every wire_api) seeds the session
+# reasoning effort that /effort then owns. Only the spelling is checked: which
+# levels a model takes is the model's own contract, stated in its own error. KLOOP_FALLBACK_MODEL is not a runtime selector.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
 # Stream guards are fixed provider-internal safety defaults, not user config:

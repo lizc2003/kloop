@@ -421,36 +421,23 @@ impl ProviderApiFamily {
     pub fn requires_exact_reasoning_replay(self) -> bool {
         self != Self::OpenAiChatCompletions
     }
-
-    /// The effort levels this rail's wire accepts. The three rails spell the
-    /// parameter differently and admit different vocabularies, so the set is
-    /// per-family rather than global; a level outside it is rejected here
-    /// instead of being silently downgraded or sent for the provider to 400.
-    /// Recheck each row when upgrading a provider — upstream adds levels.
-    pub fn accepted_efforts(self) -> &'static [ReasoningEffort] {
-        use ReasoningEffort::*;
-        match self {
-            // `output_config: {"effort": …}` — GA, defaults to `high`.
-            Self::AnthropicMessages => &[Low, Medium, High, XHigh, Max],
-            // `reasoning: {"effort": …}` / `reasoning_effort: …` — the OpenAI
-            // family tops out at `high` and adds `minimal` below `low`.
-            Self::OpenAiResponses | Self::OpenAiChatCompletions => &[Minimal, Low, Medium, High],
-            Self::Mock => ReasoningEffort::ALL,
-        }
-    }
-
-    pub fn accepts_effort(self, effort: ReasoningEffort) -> bool {
-        self.accepted_efforts().contains(&effort)
-    }
 }
 
 /// How hard the model is asked to think, as a kloop-owned bounded vocabulary.
-/// Each rail renders it into its own request field and accepts its own subset
-/// ([`ProviderApiFamily::accepted_efforts`]). Absent (`None` at the call site)
-/// means kloop sends no field at all and the provider's own default stands.
+/// Each rail renders it into its own request field ([`crate::ProviderApiFamily`]),
+/// but **which levels are legal is a property of the model, not the rail** — the
+/// same endpoint accepts `xhigh` on one model and refuses `minimal` on another,
+/// and says so precisely in its own 400. So this enum only bounds kloop's own
+/// spelling (catching `/effort hgih`); the model's contract is enforced by the
+/// model. Absent (`None` at the call site) means kloop sends no field at all and
+/// the provider's default stands — distinct from [`ReasoningEffort::None`],
+/// which explicitly asks for no reasoning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// `effort: "none"` — the model does no reasoning. Distinct from sending no
+    /// field at all, which leaves the provider's own default in force.
+    None,
     Minimal,
     Low,
     Medium,
@@ -462,6 +449,7 @@ pub enum ReasoningEffort {
 
 impl ReasoningEffort {
     pub const ALL: &'static [ReasoningEffort] = &[
+        Self::None,
         Self::Minimal,
         Self::Low,
         Self::Medium,
@@ -472,6 +460,7 @@ impl ReasoningEffort {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -1455,17 +1444,18 @@ mod tests {
     /// `/effort` command use, case-insensitively, and rejects anything else.
     #[test]
     fn reasoning_effort_parses_its_own_words_and_rejects_others() {
-        let parsed: Vec<ReasoningEffort> = ["minimal", "LOW", " medium ", "High", "xhigh", "max"]
-            .iter()
-            .map(|raw| raw.parse().unwrap())
-            .collect();
+        let parsed: Vec<ReasoningEffort> =
+            ["none", "minimal", "LOW", " medium ", "High", "xhigh", "max"]
+                .iter()
+                .map(|raw| raw.parse().unwrap())
+                .collect();
         assert_eq!(parsed, ReasoningEffort::ALL);
         assert_eq!(
             ReasoningEffort::ALL
                 .iter()
                 .map(|level| level.as_str())
                 .collect::<Vec<_>>(),
-            ["minimal", "low", "medium", "high", "xhigh", "max"]
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             "x-high".parse::<ReasoningEffort>(),
@@ -1474,31 +1464,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ReasoningEffort::XHigh).unwrap(),
             serde_json::json!("xhigh")
-        );
-    }
-
-    /// Each rail admits its own subset: the OpenAI family tops out at `high`
-    /// and adds `minimal`; Anthropic starts at `low` and goes past `high`.
-    #[test]
-    fn accepted_efforts_are_per_api_family() {
-        use ReasoningEffort::*;
-        assert_eq!(
-            ProviderApiFamily::AnthropicMessages.accepted_efforts(),
-            [Low, Medium, High, XHigh, Max]
-        );
-        assert_eq!(
-            ProviderApiFamily::OpenAiResponses.accepted_efforts(),
-            [Minimal, Low, Medium, High]
-        );
-        assert_eq!(
-            ProviderApiFamily::OpenAiChatCompletions.accepted_efforts(),
-            [Minimal, Low, Medium, High]
-        );
-        assert!(!ProviderApiFamily::AnthropicMessages.accepts_effort(Minimal));
-        assert!(!ProviderApiFamily::OpenAiResponses.accepts_effort(Max));
-        assert_eq!(
-            ReasoningEffort::join(ProviderApiFamily::OpenAiResponses.accepted_efforts()),
-            "minimal, low, medium, high"
         );
     }
 }

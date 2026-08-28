@@ -980,7 +980,6 @@ impl Server {
                 SwitchError::UnknownModel { .. } => "unknown_model",
                 SwitchError::Unavailable { .. } => "provider_unavailable",
                 SwitchError::StaleRevision { .. } => "stale_revision",
-                SwitchError::EffortUnsupported { .. } => "unsupported_effort",
                 SwitchError::RouteDrift(_)
                 | SwitchError::RevisionExhausted
                 | SwitchError::InvalidRevision
@@ -1368,7 +1367,6 @@ fn switch_error_kind(error: &ProviderSwitchError) -> &'static str {
         ProviderSwitchError::Route(SwitchError::UnknownModel { .. }) => "unknown_model",
         ProviderSwitchError::Route(SwitchError::Unavailable { .. }) => "provider_unavailable",
         ProviderSwitchError::Route(SwitchError::StaleRevision { .. }) => "stale_revision",
-        ProviderSwitchError::Route(SwitchError::EffortUnsupported { .. }) => "unsupported_effort",
         ProviderSwitchError::Persistence(_) => "route_persistence_failed",
         ProviderSwitchError::History(_) => "history_projection_failed",
         ProviderSwitchError::Route(

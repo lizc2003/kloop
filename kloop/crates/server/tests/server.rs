@@ -452,6 +452,36 @@ async fn run_real_provider_turn(client: &mut TestClient, thread_id: &str, prompt
     }
 }
 
+/// Like [`run_real_provider_turn`] but reports the outcome instead of asserting
+/// it — the effort sweep needs to record which levels a live model refuses.
+async fn try_real_provider_turn(
+    client: &mut TestClient,
+    thread_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let request_id = client
+        .request(
+            "turn/start",
+            json!({"threadId": thread_id, "input": prompt}),
+        )
+        .await;
+    loop {
+        let message = client.recv_with_timeout(Duration::from_secs(600)).await;
+        if message["id"] == request_id {
+            assert!(message.get("error").is_none(), "real turn was rejected");
+        }
+        if message["method"] == "turn/completed" {
+            return match message["params"]["turn"]["status"].as_str() {
+                Some("completed") => Ok(()),
+                _ => Err(message["params"]["turn"]["error"]
+                    .as_str()
+                    .unwrap_or("unknown provider failure")
+                    .to_string()),
+            };
+        }
+    }
+}
+
 async fn switch_real_provider(
     client: &mut TestClient,
     thread_id: &str,
@@ -3365,12 +3395,17 @@ async fn clear_command_empties_history_and_notifies() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// Plan 102 against a live endpoint: every effort level a rail *claims* to
-/// accept is set mid-session with `/effort` and then actually sampled at, plus
-/// `off` for the no-field path. The unit tests only lock the request body kloop
-/// builds; this is the one that fails when a real endpoint rejects a level or
-/// the field itself (e.g. a proxy that does not know `reasoning_effort`).
-/// A completed turn is the signal — the request body is not observable here.
+/// Plan 102 against a live endpoint. The unit tests only lock the request body
+/// kloop builds; this is the one that learns which effort levels the model on
+/// the other end actually takes — and it is what proved the levels are a
+/// property of the **model**, not the rail (the same endpoint accepts `xhigh`
+/// and refuses `minimal` for gpt-5.6-sol, so kloop stopped gating them).
+///
+/// It sweeps kloop's whole vocabulary, prints the accepted/refused table, and
+/// asserts only what every reasoning model owes: `low`/`medium`/`high` sample
+/// successfully, `off` (no field at all) samples successfully, and a level kloop
+/// does not spell is refused by kloop before any request. A completed turn is
+/// the signal — the request body is not observable from here.
 ///
 /// One rail per run, selected by KLOOP_PROVIDER (anthropic | openai |
 /// openai-responses) with that rail's usual credential/model variables:
@@ -3401,7 +3436,9 @@ async fn real_effort_sweep_contract() {
             required_real_env("OPENAI_BASE_URL"),
             required_real_env("OPENAI_MODEL"),
         ),
-        other => panic!("KLOOP_PROVIDER '{other}' must be anthropic, openai, or openai-responses"),
+        other => {
+            panic!("KLOOP_PROVIDER '{other}' must be anthropic, openai, or openai-responses")
+        }
     };
     let base = base.trim_end_matches('/').to_string();
     let provider_id = format!("{rail}-real");
@@ -3439,7 +3476,9 @@ async fn real_effort_sweep_contract() {
                         kloop_protocol::ProviderApiFamily::OpenAiResponses => {
                             Provider::OpenAiResponses { key, base }
                         }
-                        kloop_protocol::ProviderApiFamily::Mock => unreachable!("real rail only"),
+                        kloop_protocol::ProviderApiFamily::Mock => {
+                            unreachable!("a real rail is selected above")
+                        }
                     })
                 }),
             },
@@ -3474,51 +3513,69 @@ async fn real_effort_sweep_contract() {
         .as_str()
         .unwrap()
         .to_string();
-    // No effort configured, so the route publishes none and no field is sent.
+    // Nothing configured, so the route publishes no effort and sends no field.
     assert!(started["result"]["thread"]["route"]["effort"].is_null());
 
-    let accepted = api_family.accepted_efforts();
-    assert!(!accepted.is_empty(), "every real rail accepts some effort");
-    for effort in accepted {
-        let shown = run_real_command(&mut client, &thread_id, &format!("/effort {effort}")).await;
-        assert!(
-            shown.starts_with(&format!("effort: {effort} (provider {provider_id},")),
-            "unexpected /effort output for {effort}: {shown}"
-        );
-        run_real_provider_turn(
-            &mut client,
-            &thread_id,
-            &format!("Reply exactly EFFORT_{effort} and nothing else."),
-        )
-        .await;
-    }
-
-    // `off` must also survive a real request: the rail sends no effort field and
-    // the provider's own default stands.
+    // `off` first: the no-field control. If this fails the endpoint is simply
+    // unavailable and every effort row below would be noise.
     let cleared = run_real_command(&mut client, &thread_id, "/effort off").await;
     assert!(
         cleared.starts_with("effort: off —"),
         "unexpected: {cleared}"
     );
-    run_real_provider_turn(
+    try_real_provider_turn(
         &mut client,
         &thread_id,
         "Reply exactly EFFORT_OFF and nothing else.",
     )
-    .await;
+    .await
+    .unwrap_or_else(|error| panic!("no-field control turn failed, endpoint unusable: {error}"));
 
-    // A level this rail does not accept is refused by kloop, never sent.
-    let refused_level = match api_family {
-        kloop_protocol::ProviderApiFamily::AnthropicMessages => "minimal",
-        _ => "max",
-    };
-    let refused =
-        run_real_command(&mut client, &thread_id, &format!("/effort {refused_level}")).await;
+    println!("== {rail} / {model} ==");
+    println!("  (no field) ACCEPTED");
+    let mut accepted = Vec::new();
+    for effort in kloop_protocol::ReasoningEffort::ALL {
+        let shown = run_real_command(&mut client, &thread_id, &format!("/effort {effort}")).await;
+        assert!(
+            shown.starts_with(&format!("effort: {effort} (provider {provider_id})")),
+            "unexpected /effort output for {effort}: {shown}"
+        );
+        match try_real_provider_turn(
+            &mut client,
+            &thread_id,
+            &format!("Reply exactly EFFORT_{effort} and nothing else."),
+        )
+        .await
+        {
+            Ok(()) => {
+                accepted.push(*effort);
+                println!("  {effort:<8} ACCEPTED");
+            }
+            Err(error) => {
+                let error = error.replace('\n', " ");
+                println!("  {effort:<8} REFUSED  {}", &error[..error.len().min(200)]);
+            }
+        }
+    }
+
+    // The floor every reasoning model owes; the rest of the table is this
+    // model's own contract and is reported, not asserted.
+    for required in [
+        kloop_protocol::ReasoningEffort::Low,
+        kloop_protocol::ReasoningEffort::Medium,
+        kloop_protocol::ReasoningEffort::High,
+    ] {
+        assert!(
+            accepted.contains(&required),
+            "{model} refused '{required}', which every reasoning model is expected to take"
+        );
+    }
+
+    // kloop enforces its own spelling and nothing else — no request is made.
+    let unknown = run_real_command(&mut client, &thread_id, "/effort hgih").await;
     assert!(
-        refused.starts_with(&format!(
-            "provider '{provider_id}' does not accept effort '{refused_level}'"
-        )),
-        "unexpected refusal text: {refused}"
+        unknown.starts_with("unknown effort 'hgih'"),
+        "unexpected: {unknown}"
     );
 
     client.shutdown().await;

@@ -39,14 +39,6 @@ impl Rail {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAiChat => "chat",
-            Self::OpenAiResponses => "responses",
-        }
-    }
-
     fn default_base(self) -> &'static str {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
@@ -308,24 +300,20 @@ fn selected_base(
 /// The effort this provider starts a session at: `KLOOP_EFFORT` beats the root
 /// `model_reasoning_effort`, which beats the profile's own `effort`. Like the
 /// base URL and credential overrides, the two global sources apply only to the
-/// selected provider — they must not silently retarget the others. Validated
-/// against this profile's rail so an unusable value fails at startup, not on
-/// the first request.
+/// selected provider — they must not silently retarget the others. Only the
+/// spelling is checked (at parse time): which levels are legal belongs to the
+/// model, not the wire, and the provider names its own supported set on refusal.
 fn selected_effort(
     profile: &Profile,
     selected: bool,
     root: Option<ReasoningEffort>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<ReasoningEffort>> {
-    let effort = if selected {
+    Ok(if selected {
         parse_effort_env(env)?.or(root).or(profile.effort)
     } else {
         profile.effort
-    };
-    if let Some(effort) = effort {
-        check_effort(effort, profile.wire, "effort")?;
-    }
-    Ok(effort)
+    })
 }
 
 fn parse_effort_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<ReasoningEffort>> {
@@ -335,20 +323,6 @@ fn parse_effort_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Reaso
                 .map_err(|e| anyhow!("KLOOP_EFFORT: {e}"))
         })
         .transpose()
-}
-
-/// Each rail admits its own effort vocabulary; reject a level it cannot send
-/// rather than let the provider answer with a 400 on the first request.
-fn check_effort(effort: ReasoningEffort, wire: Rail, field: &str) -> Result<()> {
-    let family = wire.api_family();
-    if !family.accepts_effort(effort) {
-        bail!(
-            "{field} '{effort}' is not accepted by {} wire_api (accepted: {})",
-            wire.label(),
-            ReasoningEffort::join(family.accepted_efforts())
-        );
-    }
-    Ok(())
 }
 
 fn selected_credential(
@@ -456,9 +430,6 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 .map_err(|e| anyhow!("model_providers.{id}.effort: {e}"))
         })
         .transpose()?;
-    if let Some(effort) = effort {
-        check_effort(effort, wire, &format!("model_providers.{id}.effort"))?;
-    }
     let thinking = match spec.get("thinking") {
         None => ThinkingMode::Unset,
         Some(Value::String(raw)) => {
@@ -827,8 +798,11 @@ effort = "minimal"
         );
     }
 
+    /// Only kloop's own spelling is enforced at load time. Which levels a model
+    /// takes is the model's contract (measured: one endpoint refuses `minimal`
+    /// and accepts `max` for the same model), so a wire never vetoes a level.
     #[test]
-    fn effort_is_rejected_when_the_rail_cannot_send_it() {
+    fn effort_rejects_only_unknown_spellings() {
         const XHIGH_ON_RESPONSES: &str = r#"
 model_provider = "responses-b"
 
@@ -841,38 +815,37 @@ effort = "xhigh"
 "#;
         assert_eq!(
             resolve(Some(XHIGH_ON_RESPONSES), &env(&[]))
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
-            "model_providers.responses-b.effort 'xhigh' is not accepted by responses wire_api \
-             (accepted: minimal, low, medium, high)"
+                .unwrap()
+                .catalog()
+                .default_effort("responses-b"),
+            Some(ReasoningEffort::XHigh)
         );
 
-        const MINIMAL_ROOT: &str = r#"
+        const TYPO: &str = r#"
 model_provider = "anthropic-a"
-model_reasoning_effort = "minimal"
 
 [model_providers.anthropic-a]
 wire_api = "anthropic"
 http_headers = { x-api-key = "a-key" }
 default_model = "claude-a"
 models = ["claude-a"]
+effort = "sky-high"
 "#;
         assert_eq!(
-            resolve(Some(MINIMAL_ROOT), &env(&[]))
+            resolve(Some(TYPO), &env(&[]))
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
-            "effort 'minimal' is not accepted by anthropic wire_api \
-             (accepted: low, medium, high, xhigh, max)"
+            "model_providers.anthropic-a.effort: unknown effort 'sky-high' \
+             (known: none, minimal, low, medium, high, xhigh, max)"
         );
         assert_eq!(
-            resolve(Some(MINIMAL_ROOT), &env(&[("KLOOP_EFFORT", "sky-high")]))
+            resolve(Some(XHIGH_ON_RESPONSES), &env(&[("KLOOP_EFFORT", "hgih")]))
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
-            "KLOOP_EFFORT: unknown effort 'sky-high' \
-             (known: minimal, low, medium, high, xhigh, max)"
+            "KLOOP_EFFORT: unknown effort 'hgih' \
+             (known: none, minimal, low, medium, high, xhigh, max)"
         );
     }
 }

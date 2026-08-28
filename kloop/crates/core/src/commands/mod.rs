@@ -728,10 +728,10 @@ mod tests {
         );
     }
 
-    /// `/effort` reads and writes the session knob, and refuses a level the
-    /// active rail cannot send instead of storing it for the provider to 400 on.
+    /// `/effort` reads and writes the session knob, enforcing only kloop's own
+    /// spelling — which levels a model takes is the model's contract.
     #[tokio::test]
-    async fn effort_shows_sets_clears_and_refuses_levels_the_rail_cannot_send() {
+    async fn effort_shows_sets_and_clears_the_session_knob() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         let catalog = Arc::new(
@@ -762,8 +762,10 @@ mod tests {
             shown,
             SlashResult::message(
                 "effort: off — no effort field is sent, the provider's own default applies \
-                 (provider responses, accepted: minimal, low, medium, high)\n\
-                 usage: /effort <level> | /effort off"
+                 (provider responses)\n\
+                 levels: none, minimal, low, medium, high, xhigh, max — a model accepts its own \
+                 subset and names it if you miss\n\
+                 usage: /effort <level> | /effort off (off sends no effort field at all)"
             )
         );
 
@@ -771,7 +773,7 @@ mod tests {
         assert_eq!(
             set,
             SlashResult::route(
-                "effort: medium (provider responses, accepted: minimal, low, medium, high)",
+                "effort: medium (provider responses)",
                 /*changed*/ true,
                 /*open_picker*/ false,
             )
@@ -784,27 +786,25 @@ mod tests {
         // Setting the level it already has is a read, not a route change.
         assert!(!run("/effort medium", &mut history).await.route_changed);
 
-        let refused = run("/effort max", &mut history).await;
-        assert_eq!(
-            refused,
-            SlashResult::message(
-                "provider 'responses' does not accept effort 'max' \
-                 (accepted: minimal, low, medium, high)"
-            )
-        );
+        // A level some models on this rail refuse is still accepted here: that
+        // contract belongs to the model, which states it in its own error.
+        assert!(run("/effort xhigh", &mut history).await.route_changed);
+        assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::XHigh));
+
+        // Only kloop's own spelling is enforced.
         let unknown = run("/effort hgih", &mut history).await;
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown effort 'hgih' (known: minimal, low, medium, high, xhigh, max)\n\
-                 provider 'responses' accepts: minimal, low, medium, high (or 'off')"
+                "unknown effort 'hgih' (known: none, minimal, low, medium, high, xhigh, max)\n\
+                 usage: /effort <level> | /effort off (off sends no effort field at all)"
             )
         );
-        assert_eq!(
-            state.effort(),
-            Some(kloop_protocol::ReasoningEffort::Medium)
-        );
+        assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::XHigh));
 
+        // `off` (send no field) is a different thing from the `none` level.
+        assert!(run("/effort none", &mut history).await.route_changed);
+        assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::None));
         assert!(run("/effort off", &mut history).await.route_changed);
         assert_eq!(state.effort(), None);
     }
