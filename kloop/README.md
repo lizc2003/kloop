@@ -1810,6 +1810,13 @@ are the levels live endpoints were measured to accept; a seventh, `minimal`, was
 carried in the first draft from a stale prior and removed once every model
 measured refused it.
 
+`none` is the one level that is not merely a different field name: on the
+Anthropic rail "do no reasoning" is the *thinking* parameter, so `/effort none`
+sends `thinking: {"type":"disabled"}` and no `output_config` at all, and it
+outranks a profile's own `thinking` setting (it is the later, session-level
+instruction). Every other level rides `output_config.effort` and leaves the
+configured thinking mode alone.
+
 **Which subset a model accepts is the model's own contract, not the rail's**, so
 kloop enforces only its own spelling (`/effort hgih` is refused locally) and lets
 the model's error settle the rest — those errors name the supported set, and a

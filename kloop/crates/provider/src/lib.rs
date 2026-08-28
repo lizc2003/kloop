@@ -466,8 +466,19 @@ impl Provider {
                     "tools": anthropic::tools_value(tools, *cache),
                     "stream": true,
                 });
-                if let Some(effort) = effort {
-                    body["output_config"] = json!({"effort": effort.as_str()});
+                // "Do no reasoning" is not an effort value on this rail — it is
+                // the thinking parameter. So `none` disables thinking and sends
+                // no effort field, while every other level rides output_config
+                // and leaves the configured thinking mode alone. An explicit
+                // `/effort none` outranks a profile's `thinking` setting: it is
+                // the later, session-level instruction.
+                let mut thinking = *thinking;
+                match effort {
+                    None => {}
+                    Some(ReasoningEffort::None) => thinking = ThinkingMode::Off,
+                    Some(effort) => {
+                        body["output_config"] = json!({"effort": effort.as_str()});
+                    }
                 }
                 match thinking {
                     ThinkingMode::Unset => {}

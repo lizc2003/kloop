@@ -41,19 +41,20 @@
 | 档位 | responses / gpt-5.6-sol | chat / gpt-5.6-sol | anthropic / claude-sonnet-4-6 |
 | --- | --- | --- | --- |
 | (不发字段,对照) | ✅ | ✅ | ✅ |
-| `none` | ✅ | ✅ | ⚠️ 未定论 |
+| `none` | ✅ | ✅ | ✅(经 `thinking: {"type":"disabled"}`) |
 | `minimal`(已删) | ❌ 400 | ❌ 400 | ⚠️ 未定论 |
 | `low` / `medium` / `high` | ✅ | ✅ | ✅ |
 | `xhigh` / `max` | ✅ | ✅ | ✅ |
 
 端点原话:`Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol' model. Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and 'max'.`
 
-Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请求 429 一次,一轮里失败行呈 `none`✗ `low`✓ `medium`✗ `high`✓ `xhigh`✗ `max`✓ 的交替形态,而 `medium`/`xhigh` 在别的轮次里成功过。sweep 因此改成**把 429 与「档位被拒」分开**:429 自动重试三次(间隔 30s),仍 429 就记 `INCONCLUSIVE` 而非 `REFUSED`。加重试后该轨 `low..max` 全绿,只剩 `none` 仍被限流挡住,如实记未定论。
+Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请求 429 一次,一轮里失败行呈 `none`✗ `low`✓ `medium`✗ `high`✓ `xhigh`✗ `max`✓ 的交替形态,而 `medium`/`xhigh` 在别的轮次里成功过。sweep 因此改成**把 429 与「档位被拒」分开**:429 自动重试三次(间隔 30s),仍 429 就记 `INCONCLUSIVE` 而非 `REFUSED`。加重试后该轨 `low..max` 全绿,只剩 `none` 仍失败——**用户指出根因**:Anthropic 的「不推理」语义归 `thinking: {"type":"disabled"}` 管,不是 effort 的取值。改成 `none` 在该轨渲染为 `thinking: disabled`(且不发 `output_config`)后,整表 ✅、不再有未定论行。
 
 据此定稿:据此定稿:
 
 - **删掉 `minimal`**。我能测到的模型没有一个支持它(gpt-5.6-sol 明确拒绝并列出不含它的支持集;Anthropic 文档的集合也是 `low..max`),它是训练期旧印象的残留。用户拍板「不用考虑兼容性」,直接删。
 - **不按轨门禁**。那张表两个方向都错:多拒了 `xhigh`/`max`(假阴性,挡住 gpt-5.6-sol 上的合法配置),又漏了 `none`。而且**两条轨实测结论完全一致**——差异是我编出来的。接受集是模型属性,provider 的 400 直接枚举支持值,比任何本地表都准。
+- **`none` 按轨渲染到不同字段**:Anthropic 走 `thinking: {"type":"disabled"}`(并压过 profile 配的 `thinking`,因为它是更晚的会话级指令),OpenAI 两轨走各自的 effort 字段。即「同一档位在不同轨上可能落在完全不同的参数里」,不只是字段改名。
 - 分工:**kloop 只管自己的拼写**(`/effort hgih` 当场拒并列出词表,打错字不该等到下一轮),**档位合法性交给模型**,provider 的 400 原样透出。
 - **`off` 改名 `unset`**。设计 `off` 时 `none` 还不在词表里;测出 `none` 是真实档位后,「off(不发字段)」和「none(发 `effort:"none"`,要求不推理)」并排会被读成同义词。`unset` 精确指「不发这个字段」。
 

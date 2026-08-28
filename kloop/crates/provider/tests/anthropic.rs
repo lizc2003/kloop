@@ -749,13 +749,23 @@ async fn message_stop_does_not_close_an_unfinished_block() {
 /// The session effort renders into `output_config` on this rail (its own
 /// spelling — `reasoning`/`reasoning_effort` belong to the OpenAI rails), and
 /// no effort sends no field, leaving the provider's own default in force.
+///
+/// `none` is the exception: "do no reasoning" is this rail's `thinking`
+/// parameter, not an effort value, so it disables thinking and sends no
+/// `output_config` at all.
 #[tokio::test]
-async fn effort_maps_to_output_config() {
-    for (effort, expected) in [
-        (None, None),
+async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
+    for (effort, output_config, thinking) in [
+        (None, None, None),
         (
             Some(ReasoningEffort::XHigh),
             Some(json!({"effort": "xhigh"})),
+            None,
+        ),
+        (
+            Some(ReasoningEffort::None),
+            None,
+            Some(json!({"type": "disabled"})),
         ),
     ] {
         let server = MockServer::start().await;
@@ -772,6 +782,43 @@ async fn effort_maps_to_output_config() {
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body.get("output_config").cloned(), expected, "{effort:?}");
+        assert_eq!(
+            body.get("output_config").cloned(),
+            output_config,
+            "{effort:?}"
+        );
+        assert_eq!(body.get("thinking").cloned(), thinking, "{effort:?}");
     }
+}
+
+/// `/effort none` outranks a profile's own `thinking` setting — it is the later,
+/// session-level instruction, and the two would otherwise contradict.
+#[tokio::test]
+async fn effort_none_overrides_a_configured_thinking_mode() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+    let provider = Arc::new(Provider::Anthropic {
+        key: "test-key".into(),
+        base: server.uri(),
+        cache: false,
+        thinking: ThinkingMode::Adaptive,
+    });
+    let attempt = provider.attempt_identity(
+        "anthropic",
+        1,
+        "test-model",
+        kloop_protocol::ProviderAttemptKind::Primary,
+    );
+    let mut rx = provider.stream_attempt(
+        &attempt,
+        Some(ReasoningEffort::None),
+        "s",
+        &[Message::user_text("hi")],
+        &[],
+    );
+    while rx.recv().await.is_some() {}
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    assert!(body.get("output_config").is_none());
 }
