@@ -96,10 +96,7 @@ fn task_panel_allowed(app: &App) -> bool {
         && app.fork_picker.is_none()
         && app.provider_picker.is_none()
         && app.popup.is_none()
-        && app
-            .task_graph
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.tasks.is_empty())
+        && app.live_task_graph().is_some()
 }
 
 /// Compute all mutable chrome that lives between transcript cells and the
@@ -130,7 +127,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
         .min(TASK_PANEL_MAX_ROWS);
     let task_lines = if task_panel_allowed(app) && max_task_rows > 0 {
         task_panel_lines(
-            app.task_graph.as_ref().expect("allowed graph exists"),
+            app.live_task_graph().expect("allowed graph exists"),
             width,
             max_task_rows,
         )
@@ -775,11 +772,7 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     } else {
         "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
     };
-    if app
-        .task_graph
-        .as_ref()
-        .is_some_and(|snapshot| !snapshot.tasks.is_empty())
-    {
+    if app.live_task_graph().is_some() {
         hints.push_str(if app.show_task_graph {
             " · ctrl+t to hide tasks"
         } else {
@@ -1378,6 +1371,29 @@ mod tests {
                 "   … +2 completed",
             ]
         );
+    }
+
+    #[test]
+    fn a_finished_graph_leaves_the_chrome_and_the_footer_hint_with_the_turn() {
+        let mut app = App::new("s".into());
+        app.task_graph = Some(task_graph(vec![task(
+            1,
+            "Done",
+            TaskStatus::Completed,
+            &[],
+        )]));
+        let viewport = Rect::new(0, 0, 80, 24);
+        assert_eq!(live_chrome_layout(&app, viewport).task_lines.len(), 1);
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
+
+        app.apply(crate::events::AgentEvent::Core(
+            kloop_core::event::Event::TurnEnded(kloop_core::agent::EndReason::Completed),
+        ));
+        assert!(
+            live_chrome_layout(&app, viewport).task_lines.is_empty(),
+            "the retired panel gives its rows back to the transcript"
+        );
+        assert!(!line_text(&footer_line(&app, 140)).contains("ctrl+t"));
     }
 
     #[test]

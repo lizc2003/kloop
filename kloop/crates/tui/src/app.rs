@@ -27,6 +27,7 @@ use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TaskGraphSnapshot;
+use kloop_core::tools::TaskStatus;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
@@ -315,6 +316,12 @@ pub struct App {
     /// Pure display preference. Snapshot updates, turns, rewinds, and `/clear`
     /// never reset it; Ctrl+T is its only mutator.
     pub show_task_graph: bool,
+    /// Set when a turn ends with every task in the graph completed: the panel
+    /// steps off the composer, though the snapshot — and the registry records
+    /// behind it — stay. The next accepted snapshot clears it. Plan 74 keeps a
+    /// finished graph queryable, so this retires the display only; it is not a
+    /// reset, and it never touches `show_task_graph`.
+    task_panel_retired: bool,
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
     pub composer: Composer,
@@ -399,6 +406,7 @@ impl App {
             cells: Vec::new(),
             task_graph: None,
             show_task_graph: true,
+            task_panel_retired: false,
             composer: Composer::new(),
             submit_images: Vec::new(),
             running: false,
@@ -747,6 +755,7 @@ impl App {
                     .is_none_or(|current| snapshot.revision > current.revision);
                 if accept {
                     self.task_graph = Some(snapshot);
+                    self.task_panel_retired = false;
                 }
             }
             Event::ItemStarted {
@@ -959,6 +968,17 @@ impl App {
                 // dropping the senders resolves them as Deny.
                 self.interactions.clear();
                 self.panel_scroll = 0;
+                // A graph with nothing left to do has nothing left to steer by,
+                // so it leaves the composer with the turn that finished it. An
+                // unfinished graph stays up — interrupted or not, it is what the
+                // next turn continues from.
+                self.task_panel_retired = self.task_graph.as_ref().is_some_and(|snapshot| {
+                    !snapshot.tasks.is_empty()
+                        && snapshot
+                            .tasks
+                            .iter()
+                            .all(|task| task.status == TaskStatus::Completed)
+                });
                 // An interrupted turn drops task futures mid-await, so a
                 // sub-agent's completion may never arrive: no row may outlive
                 // its turn still spinning.
@@ -979,6 +999,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The task graph as the chrome above the composer sees it: `None` while the
+    /// graph is empty or the panel has retired, even though the snapshot is still
+    /// held. The panel, Ctrl+T and the footer hint all ask this one question, so
+    /// they can never disagree about whether there is a panel to toggle.
+    pub fn live_task_graph(&self) -> Option<&TaskGraphSnapshot> {
+        self.task_graph
+            .as_ref()
+            .filter(|snapshot| !snapshot.tasks.is_empty() && !self.task_panel_retired)
     }
 
     fn refresh_display_streaming(&mut self) {
@@ -1094,10 +1124,7 @@ impl App {
         }
         if ctrl
             && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-            && self
-                .task_graph
-                .as_ref()
-                .is_some_and(|snapshot| !snapshot.tasks.is_empty())
+            && self.live_task_graph().is_some()
         {
             self.show_task_graph = !self.show_task_graph;
             return Command::None;
@@ -1883,6 +1910,12 @@ mod tests {
         }
     }
 
+    fn completed_task_snapshot(revision: u64, subject: &str) -> TaskGraphSnapshot {
+        let mut snapshot = task_snapshot(revision, subject);
+        snapshot.tasks[0].status = TaskStatus::Completed;
+        snapshot
+    }
+
     fn usage(u: u64) -> AgentEvent {
         AgentEvent::Core(Event::Usage(u))
     }
@@ -2138,6 +2171,49 @@ mod tests {
         assert!(app.show_task_graph);
         assert_eq!(app.on_key(80, ctrl('t')), Command::None);
         assert!(app.show_task_graph, "an empty graph has no toggle target");
+    }
+
+    #[test]
+    fn a_finished_graph_retires_the_panel_when_the_turn_ends() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            1, "Open",
+        ))));
+        // An unfinished graph is what the next turn continues from, so it
+        // survives the turn that ended — interrupted or not.
+        app.apply(turn_ended(EndReason::Aborted));
+        assert!(app.live_task_graph().is_some());
+
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(
+            completed_task_snapshot(2, "Open"),
+        )));
+        assert!(app.live_task_graph().is_some(), "still up mid-turn");
+        app.apply(turn_ended(EndReason::Completed));
+        assert!(app.live_task_graph().is_none());
+
+        // Display-only: the snapshot, its revision fence and the Ctrl+T
+        // preference all survive, so a stale snapshot still loses and cannot
+        // bring the panel back.
+        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
+        assert!(app.show_task_graph);
+        assert_eq!(app.on_key(80, ctrl('t')), Command::None);
+        assert!(app.show_task_graph, "a retired panel has no toggle target");
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            1, "Stale",
+        ))));
+        assert!(app.live_task_graph().is_none());
+
+        // The next accepted snapshot — the next epoch's first task — brings it
+        // back with no keypress.
+        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+            3,
+            "Next epoch",
+        ))));
+        assert_eq!(
+            app.live_task_graph()
+                .map(|graph| graph.tasks[0].subject.as_str()),
+            Some("Next epoch")
+        );
     }
 
     #[test]

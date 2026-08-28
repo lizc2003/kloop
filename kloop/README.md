@@ -1750,7 +1750,13 @@ into scrollback.
 Task calls still use the ordinary `toolCall` lifecycle. A successful
 panel-visible mutation additionally emits internal `TaskGraphUpdated`; only the
 TUI projects it as a read-only live graph immediately above the composer.
-`Ctrl+T` toggles that projection without mutating the registry. Plain mode prints
+`Ctrl+T` toggles that projection without mutating the registry. When a turn ends
+with every task in the graph completed, the panel **retires**: it leaves the
+composer and takes its `Ctrl+T` hint with it, while the snapshot, its revision
+fence, the registry records and the `Ctrl+T` preference all survive — the next
+accepted snapshot (the next epoch's first task) brings it back with no keypress.
+An unfinished graph stays on screen across turns, interrupted or not, because it
+is what the next turn continues from. Plain mode prints
 no checklist, and server/headless add no Task notification, native item, or
 public wire. The permission gate auto-allows these session-memory operations
 (including in plan mode); create/update/clear are serial and get/list are

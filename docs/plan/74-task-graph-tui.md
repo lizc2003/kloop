@@ -7,6 +7,8 @@
 > 基线：`d9d843b`（Plan 73）
 >
 > 依赖：Plan 20、Plan 38、Plan 39、Plan 71、Plan 72、Plan 73
+>
+> **后续修正（2026-08-28，dogfood）**：下文「TUI graph 跨 turn/steer 保留」现在有一个例外——turn 结束时若图非空且全部 completed，面板退场（不再占输入框上方，footer 的 ctrl+t 提示同时消失）。这是纯显示层：snapshot、revision fence、registry 记录、`show_task_graph` 偏好都不动，下一个被接受的 snapshot 自动让它回来；本计划拒绝的仍是 CC 那套「墙钟定时删数据」的 check→reset 竞态。见 HANDOFF 教训 87。
 
 ## Context
 
