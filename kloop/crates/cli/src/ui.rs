@@ -57,7 +57,19 @@ impl Approver for CliApprover {
                 .as_deref()
                 .map(|p| format!("\n{}", color_diff(p)))
                 .unwrap_or_default();
-            print!("\n[approve?] {}{preview}\n  {options} > ", req.description);
+            // Same layering as the TUI panel, flattened for a line-oriented
+            // terminal: what kind of action, what it acts on, why it is asked.
+            let heading = req.title.as_deref().unwrap_or("approve?");
+            let subject = match (&req.title, &req.detail) {
+                (Some(_), Some(detail)) => detail.as_str(),
+                _ => req.description.as_str(),
+            };
+            let notice = req
+                .notice
+                .as_deref()
+                .map(|notice| format!("\n  ⚠ {notice}"))
+                .unwrap_or_default();
+            print!("\n[{heading}] {subject}{notice}{preview}\n  {options} > ");
             let _ = std::io::stdout().flush();
             let line = tokio::task::spawn_blocking(|| {
                 let mut buf = String::new();
@@ -410,6 +422,7 @@ mod tests {
             approval_scopes: vec![ApprovalScope::Once],
             remember_rules: Some(vec!["write_file(src/**)".into()]),
             preview: None,
+            ..Default::default()
         };
         assert_eq!(approval_options(&once), "y = allow once / n = deny");
         assert_eq!(approval_decision("a", &once), Decision::Deny);

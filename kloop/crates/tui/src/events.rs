@@ -219,6 +219,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         };
 
         let fut = ui.confirm(req.clone());
@@ -247,6 +248,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         });
         let Some(AgentEvent::Confirm { reply, .. }) = rx.recv().await else {
             panic!("expected a Confirm event");
@@ -261,6 +263,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         });
         assert_eq!(fut.await, Decision::Deny);
     }

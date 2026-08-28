@@ -79,9 +79,18 @@ pub struct PermissionNotice {
 
 /// One confirmation request. `approval_scopes` is authoritative: frontends
 /// render only those choices and core rejects any answer outside the list.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `description` is the flat one-line form every surface can print. `title` /
+/// `detail` / `notice` are the same content pulled apart for frontends that lay
+/// a prompt out over several lines (the TUI's inline panel, plan 104): what kind
+/// of action this is, the one thing it acts on, and why the question is being
+/// asked at all. A frontend with no use for them prints `description` alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfirmRequest {
     pub description: String,
+    pub title: Option<String>,
+    pub detail: Option<String>,
+    pub notice: Option<String>,
     pub approval_scopes: Vec<ApprovalScope>,
     pub remember_rules: Option<Vec<String>>,
     pub preview: Option<String>,
@@ -734,6 +743,9 @@ impl Permissions {
         };
         let req = ConfirmRequest {
             description: describe_plan_exit(depth),
+            title: Some("Exit plan mode".to_string()),
+            detail: None,
+            notice: sub_agent_notice(depth),
             approval_scopes: vec![ApprovalScope::Once],
             remember_rules: None,
             preview: Some(plan.to_string()),
@@ -961,8 +973,12 @@ impl Permissions {
                 approval_scopes.push(ApprovalScope::Project);
             }
         }
+        let (title, detail, notice) = describe_parts(name, input, depth, hazard_tag);
         let req = ConfirmRequest {
             description: describe(name, input, depth, hazard_tag),
+            title: Some(title),
+            detail: Some(detail),
+            notice,
             approval_scopes: approval_scopes.clone(),
             remember_rules: remember.as_ref().map(|remember| remember.rules.clone()),
             preview: crate::diff::file_change_preview_with_context(name, input, preview_context)
@@ -1070,6 +1086,12 @@ impl Permissions {
         };
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
+            title: Some(tool_title("bash").to_string()),
+            detail: Some(clip(command)),
+            notice: Some(join_notices(
+                sub_agent_notice(depth),
+                "the OS sandbox blocked this — run it without the sandbox?",
+            )),
             approval_scopes: vec![ApprovalScope::Once],
             remember_rules: None,
             preview: None,
@@ -1631,7 +1653,78 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
     format!("{agent}{hazard}{no_sandbox}{shell_class}{name}: {detail}")
 }
 
-/// The escalation prompt: single-line (the TUI popup renders one line) with
+/// [`describe`] pulled apart for a multi-line frontend: the kind of action, the
+/// one thing it acts on, and why it is being asked. Same inputs, same facts —
+/// only the shape differs, so the two can never disagree about what is gated.
+fn describe_parts(
+    name: &str,
+    input: &Value,
+    depth: u8,
+    hazard_tag: Option<&str>,
+) -> (String, String, Option<String>) {
+    let mut notices: Vec<String> = Vec::new();
+    if depth > 0 {
+        notices.push("requested by a sub-agent".to_string());
+    }
+    if let Some(tag) = hazard_tag {
+        notices.push(tag.to_string());
+    }
+    if name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false) {
+        notices.push("no OS sandbox — full filesystem and network access".to_string());
+    }
+    if name == "powershell" {
+        notices.push("unclassified PowerShell".to_string());
+    }
+    let detail = match name {
+        "bash" | "powershell" => input["command"].as_str().unwrap_or("?").to_string(),
+        "write_file" | "edit_file" | "read_file" => {
+            input["path"].as_str().unwrap_or("?").to_string()
+        }
+        "notebook_edit" => input["notebook_path"].as_str().unwrap_or("?").to_string(),
+        _ => input.to_string(),
+    };
+    (
+        tool_title(name).to_string(),
+        clip(&detail),
+        (!notices.is_empty()).then(|| notices.join(" · ")),
+    )
+}
+
+/// A human name for the action a tool performs, for the panel's header row.
+/// Unknown tools (MCP, deferred) keep their own name — it is what the user
+/// configured and recognizes.
+fn tool_title(name: &str) -> &str {
+    match name {
+        "bash" => "Bash command",
+        "powershell" => "PowerShell command",
+        "read_file" => "Read file",
+        "write_file" => "Write file",
+        "edit_file" => "Edit file",
+        "notebook_edit" => "Edit notebook",
+        "web_fetch" => "Fetch a URL",
+        "web_search" => "Web search",
+        other => other,
+    }
+}
+
+fn sub_agent_notice(depth: u8) -> Option<String> {
+    (depth > 0).then(|| "requested by a sub-agent".to_string())
+}
+
+fn join_notices(first: Option<String>, second: &str) -> String {
+    match first {
+        Some(first) => format!("{first} · {second}"),
+        None => second.to_string(),
+    }
+}
+
+/// Prompt text is display, not a payload: cap it so one enormous command or
+/// path cannot dominate the panel.
+fn clip(text: &str) -> String {
+    text.chars().take(200).collect()
+}
+
+/// The escalation prompt: single-line (the flat `description` form) with
 /// a tag that says why it is being asked.
 fn describe_escalation(command: &str, depth: u8) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };

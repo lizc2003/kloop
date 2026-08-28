@@ -21,6 +21,7 @@ use kloop_core::event::ItemStatus;
 use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
+use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
@@ -136,8 +137,73 @@ pub enum PendingInteraction {
     Confirm {
         req: ConfirmRequest,
         reply: oneshot::Sender<Decision>,
+        /// Which row of [`confirm_choices`] the panel highlights. Per prompt,
+        /// so a queued one always opens on its own safe default (Yes).
+        cursor: usize,
     },
     Question(PendingQuestion),
+}
+
+/// One row of an approval panel: the answer it sends, how it reads, and the
+/// single letter that picks it without moving the cursor. Built here, from the
+/// request's authoritative `approval_scopes`, so the rendered list and the key
+/// handler's mapping cannot drift apart — and so no row can offer a scope core
+/// would reject.
+pub struct ConfirmChoice {
+    pub decision: Decision,
+    pub label: String,
+    pub detail: Option<String>,
+    pub key: char,
+}
+
+pub fn confirm_choices(req: &ConfirmRequest) -> Vec<ConfirmChoice> {
+    let rules = req
+        .remember_rules
+        .as_ref()
+        .filter(|rules| !rules.is_empty())
+        .map(|rules| rules.join(", "));
+    let mut choices: Vec<ConfirmChoice> = req
+        .approval_scopes
+        .iter()
+        .map(|scope| {
+            let (label, detail, key) = match scope {
+                ApprovalScope::Once => ("Yes", rules.clone(), 'y'),
+                ApprovalScope::WorkspaceSession => (
+                    "Yes, and don't ask again this workspace session",
+                    rules.clone(),
+                    'a',
+                ),
+                ApprovalScope::Project => (
+                    "Yes, and don't ask again in this project",
+                    Some(match &rules {
+                        Some(rules) => {
+                            format!("{rules} · across sessions and linked worktrees")
+                        }
+                        None => "across sessions and linked worktrees".to_string(),
+                    }),
+                    'p',
+                ),
+            };
+            ConfirmChoice {
+                decision: Decision::Allow(*scope),
+                label: label.to_string(),
+                detail: match scope {
+                    // The Once row needs no rule echo: nothing is remembered.
+                    ApprovalScope::Once => None,
+                    _ => detail,
+                },
+                key,
+            }
+        })
+        .collect();
+    // Denial is always the last row, so Esc has one fixed meaning everywhere.
+    choices.push(ConfirmChoice {
+        decision: Decision::Deny,
+        label: "No, and tell kloop what to do differently".to_string(),
+        detail: None,
+        key: 'n',
+    });
+    choices
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,10 +324,10 @@ pub struct App {
     submit_images: Vec<ContentBlock>,
     pub running: bool,
     pub interactions: VecDeque<PendingInteraction>,
-    /// Scroll offset (in display lines) into the active confirm popup's body,
-    /// so a diff taller than the popup can be read in full. Reset to 0 when the
-    /// front prompt changes; clamped to a valid range at render time.
-    pub confirm_scroll: usize,
+    /// Scroll offset (in display lines) into the active choice panel's body, so
+    /// a diff or plan taller than the panel can be read in full. Reset to 0 when
+    /// the front panel changes; clamped to a valid range at render time.
+    pub panel_scroll: usize,
     /// Latest Agent activity (note / tool / sub-agent). No longer churned
     /// into the status line — activity shows in the transcript. Kept as recent
     /// state for the animated status HUD (plan 38 slice 5).
@@ -337,7 +403,7 @@ impl App {
             submit_images: Vec::new(),
             running: false,
             interactions: VecDeque::new(),
-            confirm_scroll: 0,
+            panel_scroll: 0,
             last_note: None,
             assistant_open: false,
             thinking_open: false,
@@ -540,8 +606,11 @@ impl App {
                 self.fork_picker = None;
             }
             AgentEvent::Confirm { req, reply } => {
-                self.interactions
-                    .push_back(PendingInteraction::Confirm { req, reply });
+                self.interactions.push_back(PendingInteraction::Confirm {
+                    req,
+                    reply,
+                    cursor: 0,
+                });
             }
             AgentEvent::Question { req, reply } => {
                 self.interactions
@@ -889,7 +958,7 @@ impl App {
                 // Any prompt still queued belongs to the turn that just died;
                 // dropping the senders resolves them as Deny.
                 self.interactions.clear();
-                self.confirm_scroll = 0;
+                self.panel_scroll = 0;
                 // An interrupted turn drops task futures mid-await, so a
                 // sub-agent's completion may never arrive: no row may outlive
                 // its turn still spinning.
@@ -1312,64 +1381,62 @@ impl App {
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
         // Ctrl-modified keys are inert here: Ctrl+C (two-tap quit) is intercepted
-        // before routing, and no other Ctrl combo should trigger a y/n/j/k
-        // answer. Esc denies the prompt (below); to stop the turn, deny then Esc.
+        // before routing, and no other Ctrl combo should answer a prompt.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
         }
-        // Scroll the popup body (a tall diff) instead of answering. j/k mirror
-        // Up/Down for keyboard-home users; the render clamps the offset.
+        // Paging scrolls the panel body (a tall diff or plan); the arrows belong
+        // to the option list now, so a long preview is read with PgUp/PgDn.
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
-                return Command::None;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.confirm_scroll += 1;
-                return Command::None;
-            }
             KeyCode::PageUp => {
-                self.confirm_scroll = self.confirm_scroll.saturating_sub(10);
+                self.panel_scroll = self.panel_scroll.saturating_sub(10);
                 return Command::None;
             }
             KeyCode::PageDown => {
-                self.confirm_scroll += 10;
+                self.panel_scroll += 10;
                 return Command::None;
             }
             _ => {}
         }
+        let Some(PendingInteraction::Confirm { req, cursor, .. }) = self.interactions.front_mut()
+        else {
+            return Command::None;
+        };
+        let choices = confirm_choices(req);
+        let last = choices.len() - 1;
         let decision = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(Decision::Allow(
-                kloop_core::permissions::ApprovalScope::Once,
-            )),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Decision::Deny),
-            KeyCode::Char('a') | KeyCode::Char('A') => Some(Decision::Allow(
-                kloop_core::permissions::ApprovalScope::WorkspaceSession,
-            )),
-            KeyCode::Char('p') | KeyCode::Char('P') => Some(Decision::Allow(
-                kloop_core::permissions::ApprovalScope::Project,
-            )),
+            KeyCode::Up | KeyCode::Char('k') => {
+                *cursor = cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *cursor = (*cursor + 1).min(last);
+                None
+            }
+            KeyCode::Enter => Some(choices[(*cursor).min(last)].decision),
+            // Esc is the deny row, which is always last.
+            KeyCode::Esc => Some(choices[last].decision),
+            // The row numbers the panel prints, and the y/a/p/n letters a
+            // returning user's fingers already know.
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
+                choices.get(row).map(|choice| choice.decision)
+            }
+            KeyCode::Char(c) => choices
+                .iter()
+                .find(|choice| choice.key == c.to_ascii_lowercase())
+                .map(|choice| choice.decision),
             _ => None,
         };
         let Some(decision) = decision else {
             return Command::None;
         };
-        if let Decision::Allow(scope) = decision {
-            let advertised = matches!(
-                self.interactions.front(),
-                Some(PendingInteraction::Confirm { req, .. })
-                    if req.approval_scopes.contains(&scope)
-            );
-            if !advertised {
-                return Command::None;
-            }
-        }
         let pending = self.interactions.pop_front().expect("checked non-empty");
         let PendingInteraction::Confirm { reply, .. } = pending else {
             unreachable!("interaction type changed while handling approval")
         };
         // The next queued prompt (if any) starts unscrolled.
-        self.confirm_scroll = 0;
+        self.panel_scroll = 0;
         let _ = reply.send(decision);
         Command::None
     }
@@ -1386,6 +1453,31 @@ impl App {
         let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() else {
             return Command::None;
         };
+        // A row number acts as "move there, then confirm" — or, on a
+        // multi-select's own options, as "tick that row".
+        let key = match key.code {
+            KeyCode::Char(c)
+                if question.phase == QuestionPhase::Select && c.is_ascii_digit() && c != '0' =>
+            {
+                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
+                let options = question.current().options.len();
+                // The two rows past the options are Other and Chat about this.
+                if row > options + 1 {
+                    return Command::None;
+                }
+                let tick = question.current().multi_select && row < options;
+                question.cursor = row;
+                KeyEvent::new(
+                    if tick {
+                        KeyCode::Char(' ')
+                    } else {
+                        KeyCode::Enter
+                    },
+                    key.modifiers,
+                )
+            }
+            _ => key,
+        };
         let mut outcome = None;
         match question.phase {
             QuestionPhase::Select => {
@@ -1395,13 +1487,14 @@ impl App {
                         question.cursor = question.cursor.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        question.cursor = (question.cursor + 1).min(option_count);
+                        // Two rows live past the options: Other, then Chat.
+                        question.cursor = (question.cursor + 1).min(option_count + 1);
                     }
                     KeyCode::PageUp => {
-                        self.confirm_scroll = self.confirm_scroll.saturating_sub(10);
+                        self.panel_scroll = self.panel_scroll.saturating_sub(10);
                     }
                     KeyCode::PageDown => {
-                        self.confirm_scroll += 10;
+                        self.panel_scroll += 10;
                     }
                     KeyCode::Char(' ') if question.current().multi_select => {
                         if question.cursor < option_count {
@@ -1420,6 +1513,11 @@ impl App {
                     KeyCode::Enter if question.cursor == option_count => {
                         question.phase = QuestionPhase::Other;
                         question.editor.clear();
+                    }
+                    // The last row is Esc made visible: leave the question
+                    // unanswered and hand the turn back to plain conversation.
+                    KeyCode::Enter if question.cursor > option_count => {
+                        outcome = Some(QuestionOutcome::Cancelled);
                     }
                     KeyCode::Enter if question.current().multi_select => {
                         if question.selected.is_empty() {
@@ -1471,7 +1569,7 @@ impl App {
         let Some(PendingInteraction::Question(question)) = self.interactions.pop_front() else {
             return;
         };
-        self.confirm_scroll = 0;
+        self.panel_scroll = 0;
         let _ = question.reply.send(outcome);
     }
     fn on_provider_key(&mut self, key: KeyEvent) -> Command {
@@ -1481,6 +1579,27 @@ impl App {
             return Command::None;
         }
         let selecting_model = picker.model_cursor.is_some();
+        // A row number acts as "move there, then Enter": the panel prints those
+        // numbers, so they have to answer.
+        let key = match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
+                let rows = if selecting_model {
+                    picker.providers[picker.provider_cursor].models.len()
+                } else {
+                    picker.providers.len()
+                };
+                if row >= rows {
+                    return Command::None;
+                }
+                match picker.model_cursor.as_mut() {
+                    Some(cursor) => *cursor = row,
+                    None => picker.provider_cursor = row,
+                }
+                KeyEvent::new(KeyCode::Enter, key.modifiers)
+            }
+            _ => key,
+        };
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(cursor) = picker.model_cursor.as_mut() {
@@ -1534,6 +1653,18 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
         }
+        // Same as everywhere else: the printed row numbers pick directly.
+        let key = match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
+                if row >= picker.points.len() {
+                    return Command::None;
+                }
+                picker.cursor = row;
+                KeyEvent::new(KeyCode::Enter, key.modifiers)
+            }
+            _ => key,
+        };
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.cursor = picker.cursor.saturating_sub(1);
@@ -1886,6 +2017,13 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn front_confirm_cursor(app: &App) -> usize {
+        match app.interactions.front() {
+            Some(PendingInteraction::Confirm { cursor, .. }) => *cursor,
+            _ => panic!("expected a queued confirmation"),
+        }
     }
 
     fn front_confirm_description(app: &App) -> &str {
@@ -2598,6 +2736,18 @@ mod tests {
         assert!(app.fork_picker.is_none(), "selecting closes the picker");
     }
 
+    /// The panel prints row numbers, so the numbers pick — here and in every
+    /// other list. A number with no row is inert.
+    #[test]
+    fn fork_picker_rows_answer_to_their_numbers() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "two"), fp(6, "three")]));
+        app.on_key(80, key(KeyCode::Char('9')));
+        assert!(app.fork_picker.is_some(), "no ninth row to pick");
+        assert_eq!(app.on_key(80, key(KeyCode::Char('1'))), Command::Fork(4));
+        assert!(app.fork_picker.is_none());
+    }
+
     /// Esc backs out of the picker without forking.
     #[test]
     fn fork_picker_esc_cancels() {
@@ -2747,6 +2897,7 @@ mod tests {
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
+                ..Default::default()
             },
             reply,
         });
@@ -2789,6 +2940,7 @@ mod tests {
                 ],
                 remember_rules: Some(vec!["bash(git push *)".into()]),
                 preview: None,
+                ..Default::default()
             },
             reply,
         });
@@ -2806,11 +2958,10 @@ mod tests {
         assert!(app.interactions.is_empty());
     }
 
-    /// While a prompt is up, arrow/j/k/PageUp/PageDown scroll the popup instead
-    /// of leaking to the input line, and the offset never goes below zero.
-    /// Answering advances to the next queued prompt with the offset reset.
+    /// Arrows walk the option rows; paging scrolls the body. Answering one
+    /// prompt leaves the next queued one on its own default, unscrolled.
     #[tokio::test]
-    async fn confirm_scroll_keys_move_the_popup_and_reset_on_advance() {
+    async fn panel_keys_move_the_cursor_page_scrolls_and_both_reset_on_advance() {
         let mut app = App::new("s".into());
         let (r1, _rx1) = oneshot::channel();
         let (r2, _rx2) = oneshot::channel();
@@ -2819,6 +2970,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         };
         app.apply(AgentEvent::Confirm {
             req: req("first"),
@@ -2829,29 +2981,96 @@ mod tests {
             reply: r2,
         });
 
-        // Scrolling keys adjust the offset and are captured by the prompt.
+        // Arrows (and j/k) walk the option rows — Yes, then the deny row.
         app.on_key(80, key(KeyCode::Down));
+        assert_eq!(front_confirm_cursor(&app), 1);
         app.on_key(80, key(KeyCode::Char('j')));
-        assert_eq!(app.confirm_scroll, 2);
-        app.on_key(80, key(KeyCode::PageDown));
-        assert_eq!(app.confirm_scroll, 12);
-        app.on_key(80, key(KeyCode::Up));
+        assert_eq!(front_confirm_cursor(&app), 1, "the last row is the floor");
         app.on_key(80, key(KeyCode::Char('k')));
-        assert_eq!(app.confirm_scroll, 10);
+        assert_eq!(front_confirm_cursor(&app), 0);
+        assert_eq!(app.panel_scroll, 0, "moving the cursor never scrolls");
+
+        // Paging scrolls the body (a tall diff or plan) instead.
+        app.on_key(80, key(KeyCode::PageDown));
+        assert_eq!(app.panel_scroll, 10);
         app.on_key(80, key(KeyCode::PageUp));
-        assert_eq!(app.confirm_scroll, 0);
+        assert_eq!(app.panel_scroll, 0);
+        // Below zero saturates rather than wrapping.
+        app.on_key(80, key(KeyCode::PageUp));
+        assert_eq!(app.panel_scroll, 0);
         // None of that reached the input line.
         assert_eq!(app.composer.text(), "");
-        // Below-zero is saturated, not wrapped.
-        app.on_key(80, key(KeyCode::Up));
-        assert_eq!(app.confirm_scroll, 0);
 
-        // Scroll into the first diff, then answer: the next prompt starts fresh.
+        // Move and scroll, then answer: the queued prompt starts fresh.
         app.on_key(80, key(KeyCode::PageDown));
-        assert_eq!(app.confirm_scroll, 10);
+        app.on_key(80, key(KeyCode::Down));
         app.on_key(80, key(KeyCode::Char('y')));
         assert_eq!(front_confirm_description(&app), "second");
-        assert_eq!(app.confirm_scroll, 0, "the next prompt is unscrolled");
+        assert_eq!(app.panel_scroll, 0, "the next prompt is unscrolled");
+        assert_eq!(
+            front_confirm_cursor(&app),
+            0,
+            "and opens on its own safe default"
+        );
+    }
+
+    /// The panel's row numbers, Enter on the cursor row, and Esc all answer;
+    /// a number past the last row is inert rather than answering something else.
+    #[tokio::test]
+    async fn approval_answers_by_number_enter_and_esc() {
+        let scopes = vec![
+            kloop_core::permissions::ApprovalScope::Once,
+            kloop_core::permissions::ApprovalScope::WorkspaceSession,
+            kloop_core::permissions::ApprovalScope::Project,
+        ];
+        let confirm = |app: &mut App, scopes: &[kloop_core::permissions::ApprovalScope]| {
+            let (reply, rx) = oneshot::channel();
+            app.apply(AgentEvent::Confirm {
+                req: ConfirmRequest {
+                    description: "bash: git push".into(),
+                    approval_scopes: scopes.to_vec(),
+                    remember_rules: Some(vec!["bash(git push *)".into()]),
+                    ..Default::default()
+                },
+                reply,
+            });
+            rx
+        };
+
+        // Four rows: three scopes, then deny. "3" is the project row.
+        let mut app = App::new("s".into());
+        let rx = confirm(&mut app, &scopes);
+        app.on_key(80, key(KeyCode::Char('3')));
+        assert_eq!(
+            rx.await,
+            Ok(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::Project
+            ))
+        );
+
+        // Enter answers whatever the cursor is on.
+        let rx = confirm(&mut app, &scopes);
+        app.on_key(80, key(KeyCode::Down));
+        app.on_key(80, key(KeyCode::Enter));
+        assert_eq!(
+            rx.await,
+            Ok(Decision::Allow(
+                kloop_core::permissions::ApprovalScope::WorkspaceSession
+            ))
+        );
+
+        // Esc is the deny row, wherever the cursor happens to be.
+        let rx = confirm(&mut app, &scopes);
+        app.on_key(80, key(KeyCode::Down));
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(rx.await, Ok(Decision::Deny));
+
+        // A number with no row is inert — the prompt is still waiting.
+        let rx = confirm(&mut app, &[kloop_core::permissions::ApprovalScope::Once]);
+        app.on_key(80, key(KeyCode::Char('9')));
+        assert_eq!(front_confirm_description(&app), "bash: git push");
+        app.on_key(80, key(KeyCode::Char('2')));
+        assert_eq!(rx.await, Ok(Decision::Deny), "row 2 of two is deny");
     }
 
     #[tokio::test]
@@ -2864,6 +3083,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         };
         app.apply(AgentEvent::Confirm {
             req: req("first"),
@@ -2935,6 +3155,7 @@ mod tests {
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
+                ..Default::default()
             },
             reply: confirm_reply,
         });
@@ -3148,6 +3369,7 @@ mod tests {
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
+                ..Default::default()
             },
             reply,
         });

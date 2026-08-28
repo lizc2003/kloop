@@ -11,6 +11,7 @@
 
 mod anim;
 mod app;
+mod choice;
 mod clipboard;
 mod composer;
 mod events;

@@ -365,10 +365,13 @@ degradation. Each line is `{+/-/space}{line-number}  {content}`; hunks carry
 three lines of context separated by `⋮`, minified lines are clipped, and the
 whole preview is capped only by a generous 500-line ceiling (a runaway
 minified whole-file overwrite can't blow up) — ordinary edits are never cut.
-The TUI colors the popup (green adds, red deletes, dim context) and **scrolls
-it** (↑/↓/j/k/PageUp/PageDown, with a `↑↓ more` hint in the border and the
-y/a/p/n options pinned below the scroll region), the plain REPL prints the
-same ANSI, the server adds a `preview` field to `approval/request`.
+The TUI colors the preview (green adds, red deletes, dim context) inside the
+inline choice panel and **scrolls it** (PageUp/PageDown, with a `PgUp/PgDn
+scroll` hint on the panel's key-hint row and the numbered answers pinned below
+it), the plain REPL prints the same ANSI, the server adds a `preview` field to
+`approval/request`. Alongside the flat one-line `description` every frontend can
+print, the request carries `title` / `detail` / `notice` — the same facts pulled
+apart for a frontend that lays a prompt out over several lines.
 
 **Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
 (the default when the flag is omitted — ask for anything unvouched-for),
@@ -392,7 +395,7 @@ bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
 rides every request so the model knows to plan, not act. The top-level model can
 call **`enter_plan_mode {}`** from manual, accept-edits, or bypass; entering is
 idempotent and remembers the exact previous mode. When ready, it calls
-**`exit_plan_mode`** with the plan text; that rides the approval popup a
+**`exit_plan_mode`** with the plan text; that rides the approval panel a
 change-diff does (the plan is the scrollable `preview`). Approve restores the
 remembered mode and the model implements; reject leaves the session in Plan.
 Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it.
@@ -423,10 +426,22 @@ status-marked verb and its key argument — `● Bash $ ls -la` (running, cyan),
 an MCP `server__tool` verbatim — over a few lines of the result indented under a
 `└` gutter (double-limited by lines and chars, control chars sanitized, the rest
 left in history/offload). `edit_file` shows a one-line `- old` / `+ new` diff
-from its input instead. Permission prompts appear as a centered y/a/p/n popup
-over the viewport, its diff carrying a GitHub-style `+N -M` summary (green/red)
-above the line-numbered body (plan 38 slice 6); prompts from a concurrent tool
-batch queue and are answered in order.
+from its input instead. Permission prompts, model questions, and the provider and
+rewind pickers all render through one **inline choice panel** (plan 104,
+`crates/tui/src/choice.rs`) that sits directly on the composer's top rule —
+not a popup centered over the viewport, so the conversation that led to the
+prompt stays on screen instead of being cleared out from under it. A panel is a
+brand-accented header (`▌ Bash command`), the pinned subject it acts on, a
+yellow one-line notice when something warrants a pause (a hazard, a sub-agent,
+no OS sandbox), the scrollable preview, and numbered answers: `↑↓` (or `j`/`k`)
+moves, `1`–`9` picks a row directly, Enter takes the cursor row, and Esc is
+always the last row — deny, or cancel. Approvals keep their `y`/`a`/`p`/`n`
+letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
+summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
+with PgUp/PgDn, while the header, subject, options and key hint stay put. The
+panel is live chrome, counted in the same frozen-height budget as the activity
+and task rows, so a scrollback commit can never scroll it away. Prompts from a
+concurrent tool batch queue and are answered in order.
 
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
@@ -512,12 +527,13 @@ Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** interrupts the running turn and clears the input line when
 idle; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
 to exit" hint, the second quits, any other key disarms) — the same everywhere,
-including inside a popup, so it is the single quit path (Ctrl+D is disabled);
-Ctrl+R (idle) opens the rewind picker (see [Fork](#fork-and-rewind)). Scrolling
-back through history is the terminal's job now (native scrollback). While an
-approval popup or the rewind picker is up it captures the keyboard: for
-approvals the scroll keys (plus j/k) page through a tall diff and y/a/p/n
-answer, Esc denies; for rewind ↑↓/kj move and Enter/Esc select or cancel.
+including inside a choice panel, so it is the single quit path (Ctrl+D is
+disabled); Ctrl+R (idle) opens the rewind picker (see
+[Fork](#fork-and-rewind)). Scrolling back through history is the terminal's job
+now (native scrollback). While a choice panel is up it captures the keyboard,
+with the same keys on every surface: ↑↓ (or j/k) move, 1–9 pick a row, Enter
+takes the cursor row, Esc is the last row (deny / cancel), and PgUp/PgDn scroll
+a tall preview. Approvals also answer to y/a/p/n.
 `--plain` keeps the old line-based REPL; `--mock` stays on plain output.
 
 The input is a **multi-line composer** (Plan 38 slice 3, hardened by Plan 76,

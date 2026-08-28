@@ -245,6 +245,7 @@ mod tests {
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: None,
+            ..Default::default()
         };
         assert_eq!(DenyApprover.confirm(req).await, Decision::Deny);
     }

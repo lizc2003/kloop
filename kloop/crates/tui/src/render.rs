@@ -10,13 +10,13 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
+use kloop_core::permissions::ConfirmRequest;
 use kloop_core::tools::TaskGraphSnapshot;
 use kloop_core::tools::TaskGraphTask;
 use kloop_core::tools::TaskStatus;
@@ -26,22 +26,26 @@ use std::time::Duration;
 
 use crate::app::App;
 use crate::app::Cell;
+use crate::app::ForkPicker;
 use crate::app::PendingInteraction;
 use crate::app::PendingQuestion;
+use crate::app::ProviderPicker;
 use crate::app::QuestionPhase;
 use crate::app::ToolStatus;
+use crate::app::confirm_choices;
+use crate::choice;
 use crate::menu;
 use crate::menu::Popup;
 use crate::text_layout::display_width;
 use crate::text_layout::truncate;
 use crate::text_layout::wrap;
 
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+pub(crate) const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// kloop's brand accent: a vivid cyan-blue marks the agent's own presence —
 /// the session banner, the working spinner, and the mode badge. Interactive
 /// input/selection/status stays ANSI cyan, green marks success/additions, red
 /// marks errors/deletions, and secondary text is dim.
-const BRAND: Color = Color::Rgb(79, 179, 200);
+pub(crate) const BRAND: Color = Color::Rgb(79, 179, 200);
 
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
@@ -63,6 +67,11 @@ pub struct LiveChromeLayout {
     pub activity_visible: bool,
     pub activity_spacer: bool,
     pub task_lines: Vec<Line<'static>>,
+    /// The inline choice panel — an approval, a question, a picker — laid out to
+    /// the rows it may occupy. None when nothing owns the keyboard. It is chrome
+    /// like the rest: it never enters native scrollback, and its rows must be in
+    /// the frozen-height budget or a commit would scroll it off (plan 99/103).
+    pub panel: Option<choice::Layout>,
 }
 
 impl LiveChromeLayout {
@@ -70,8 +79,16 @@ impl LiveChromeLayout {
         usize::from(self.activity_visible)
             + usize::from(self.activity_spacer)
             + self.task_lines.len()
+            // The panel carries one blank row above it, separating it from the
+            // transcript.
+            + self.panel.as_ref().map_or(0, |panel| panel.lines.len() + 1)
     }
 }
+
+/// A choice panel never takes more than this many rows, however tall the
+/// terminal: a long diff or plan scrolls (PgUp/PgDn) rather than pushing the
+/// conversation that led to the prompt off screen.
+const PANEL_MAX_ROWS: usize = 20;
 
 fn task_panel_allowed(app: &App) -> bool {
     app.show_task_graph
@@ -96,8 +113,19 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     let activity_rows = usize::from(activity_visible) + usize::from(activity_spacer);
     let fixed_bottom = 2 + composer_height(app, width) + 1;
     let transcript_capacity = terminal_height.saturating_sub(fixed_bottom).max(1);
+    // The panel is the user's whole job while it is up, so it is served before
+    // the task list — but never all the way to the top: two rows are held back
+    // so the separator and at least one line of transcript survive.
+    let panel = active_panel(app, width).map(|panel| {
+        let rows = transcript_capacity
+            .saturating_sub(activity_rows + 2)
+            .clamp(1, PANEL_MAX_ROWS);
+        choice::panel_lines(&panel, width, rows, app.panel_scroll)
+    });
+    let panel_rows = panel.as_ref().map_or(0, |panel| panel.lines.len() + 1);
     let max_task_rows = transcript_capacity
         .saturating_sub(activity_rows)
+        .saturating_sub(panel_rows)
         .saturating_sub(1)
         .min(TASK_PANEL_MAX_ROWS);
     let task_lines = if task_panel_allowed(app) && max_task_rows > 0 {
@@ -113,6 +141,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
         activity_visible,
         activity_spacer,
         task_lines,
+        panel,
     }
 }
 
@@ -689,7 +718,9 @@ fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
 /// its layout reservation, where no `Hud` is available; mirrors the conditions
 /// in `activity_line`.
 pub fn has_activity_line(app: &App) -> bool {
-    app.ctrl_c_exit_armed || app.interaction_active() || app.running
+    // A choice panel says what it is waiting for in its own header, so the
+    // activity row would only repeat it — and the panel needs the rows more.
+    app.ctrl_c_exit_armed || (app.running && !app.interaction_active())
 }
 
 /// The dynamic "what's happening now" line, shown at the BOTTOM of the
@@ -701,14 +732,7 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
         // Unmissable, right above the composer where Ctrl+C was pressed.
         return Some(Line::from("press Ctrl+C again to exit".to_string()));
     }
-    if let Some(interaction) = app.interactions.front() {
-        let text = match interaction {
-            PendingInteraction::Confirm { .. } => "awaiting your approval",
-            PendingInteraction::Question(_) => "awaiting your answer",
-        };
-        return Some(Line::from(text.to_string()));
-    }
-    if !app.running {
+    if app.interaction_active() || !app.running {
         return None;
     }
     let glyph = crate::anim::spinner_glyph(hud.phase, hud.reduced_motion);
@@ -735,26 +759,8 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
 /// running/idle hint set, and the (per-turn) context gauge change — never per
 /// event — so the bar barely moves. Live activity lives in [`activity_line`].
 pub fn footer_line(app: &App, width: usize) -> Line<'static> {
-    if let Some(interaction) = app.interactions.front() {
-        let hint = match interaction {
-            PendingInteraction::Confirm { .. } => "approval: y allow · n/esc deny · ↑↓ scroll",
-            PendingInteraction::Question(question) => match question.phase {
-                QuestionPhase::Select if question.current().multi_select => {
-                    "question: ↑↓ choose · Space toggle · Enter submit · Esc cancel"
-                }
-                QuestionPhase::Select => "question: ↑↓ choose · Enter select · Esc cancel",
-                QuestionPhase::Other => "question: type Other · Enter submit · Esc cancel",
-                QuestionPhase::Notes => "question: optional notes · Enter submit · Esc cancel",
-            },
-        };
-        return Line::from(Span::styled(hint.to_string(), DIM));
-    }
-    if app.fork_picker.is_some() {
-        return Line::from(Span::styled(
-            "rewind: ↑↓ choose a point · Enter to fork · Esc to cancel".to_string(),
-            DIM,
-        ));
-    }
+    // A choice panel prints its own key hint on its last row; the footer stays
+    // still underneath it rather than saying the same thing in other words.
     if app.popup.is_some() {
         return Line::from(Span::styled(
             "↑↓ choose · Tab/⏎ complete · Esc cancel".to_string(),
@@ -881,6 +887,15 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
         }
     }
     lines.extend(chrome.task_lines);
+    // The choice panel closes the transcript: a blank row, then its own rows, so
+    // it sits directly on the composer's top rule — the eye is already there.
+    let panel_rows = chrome.panel.as_ref().map_or(0, |panel| panel.lines.len());
+    if let Some(panel) = &chrome.panel {
+        lines.push(Line::default());
+        lines.extend(panel.lines.iter().cloned());
+    }
+    // Write the clamped body offset back, so over-scrolling self-corrects.
+    app.panel_scroll = chrome.panel.as_ref().map_or(0, |panel| panel.scroll);
     let height = transcript_area.height as usize;
     // Bottom-anchor the uncommitted tail just above the composer. The event loop
     // has already frozen anything that overflowed into native scrollback, so
@@ -910,21 +925,19 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     comp_rows.extend(view.rows);
     f.render_widget(Paragraph::new(comp_rows), input_area);
 
-    if matches!(
-        app.interactions.front(),
-        Some(PendingInteraction::Confirm { .. })
-    ) {
-        draw_confirm(f, app, full);
-    } else if matches!(
-        app.interactions.front(),
-        Some(PendingInteraction::Question(_))
-    ) {
-        draw_question(f, app, full);
-    } else if app.provider_picker.is_some() {
-        draw_provider_picker(f, app, full);
-    } else if app.fork_picker.is_some() {
-        draw_fork_picker(f, app, full);
-    } else {
+    // The panel takes the cursor only while it is taking text (a question's
+    // Other / Notes phase). A list panel leaves it hidden: the composer is not
+    // where the next keystroke goes.
+    if let Some((row, column)) = chrome.panel.as_ref().and_then(|panel| panel.editor_cursor) {
+        let y = transcript_area
+            .bottom()
+            .saturating_sub(panel_rows as u16)
+            .saturating_add(row as u16);
+        f.set_cursor_position((
+            (transcript_area.x + column as u16).min(full.right().saturating_sub(1)),
+            y.min(full.bottom().saturating_sub(1)),
+        ));
+    } else if chrome.panel.is_none() {
         // A completion menu (if open) floats just above the composer; the cursor
         // stays in the input, since the user is still typing the query.
         if let Some(popup) = &app.popup {
@@ -961,8 +974,8 @@ fn draw_menu(f: &mut Frame, popup: &Popup, rule_top: Rect, width: usize) {
 }
 
 /// The menu's rows for one width, windowed to `max_rows` around the cursor. The
-/// selected row is reversed across its full width; others show the label plus a
-/// dim detail. Pure and testable.
+/// cursor row is marked and coloured the same way a choice panel marks its own
+/// (`> `, brand accent), so every list in the TUI reads alike. Pure and testable.
 pub fn menu_lines(popup: &Popup, width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let n = popup.items.len();
     if n == 0 || width == 0 {
@@ -975,362 +988,241 @@ pub fn menu_lines(popup: &Popup, width: usize, max_rows: usize) -> Vec<Line<'sta
         .map(|i| {
             let item = &popup.items[i];
             let selected = i == popup.cursor;
-            let text = if item.detail.is_empty() {
-                item.label.clone()
+            let marker = if selected { "> " } else { "  " };
+            let label_style = if selected {
+                Style::new().fg(BRAND)
             } else {
-                format!("{}  {}", item.label, item.detail)
+                Style::default()
             };
-            if selected {
-                // Reversed across the whole width: pad the text so the highlight
-                // fills the row.
-                let padded = pad(&text, width);
-                Line::from(Span::styled(
-                    padded,
-                    Style::new().add_modifier(Modifier::REVERSED),
-                ))
-            } else {
-                // Label at default weight, detail dim; truncated to width.
-                let label = truncate(&item.label, width);
-                let label_w = display_width(&label);
-                let mut spans = vec![Span::raw(label)];
-                if !item.detail.is_empty() && label_w + 2 < width {
-                    let rest = truncate(&format!("  {}", item.detail), width - label_w);
-                    spans.push(Span::styled(rest, DIM));
-                }
-                Line::from(spans)
+            let text_w = width.saturating_sub(display_width(marker));
+            let label = truncate(&item.label, text_w);
+            let label_w = display_width(&label);
+            let mut spans = vec![
+                Span::styled(marker.to_string(), label_style),
+                Span::styled(label, label_style),
+            ];
+            if !item.detail.is_empty() && label_w + 2 < text_w {
+                let rest = truncate(&format!("  {}", item.detail), text_w - label_w);
+                spans.push(Span::styled(rest, DIM));
             }
+            Line::from(spans)
         })
         .collect()
 }
 
-/// Right-pad `text` with spaces to `width` display columns (truncating first if
-/// it is already wider), so a reversed highlight fills the whole row.
-fn pad(text: &str, width: usize) -> String {
-    let mut s = truncate(text, width);
-    let w = display_width(&s);
-    if w < width {
-        s.push_str(&" ".repeat(width - w));
+/// The panel for whichever surface owns the keyboard, in the same precedence
+/// the key router uses. None when the composer has it.
+fn active_panel(app: &App, width: usize) -> Option<choice::Panel> {
+    if let Some(interaction) = app.interactions.front() {
+        return Some(match interaction {
+            PendingInteraction::Confirm { req, cursor, .. } => confirm_panel(req, *cursor, width),
+            PendingInteraction::Question(question) => question_panel(question, width),
+        });
     }
-    s
-}
-
-fn draw_provider_picker(f: &mut Frame, app: &App, area: Rect) {
-    let picker = app.provider_picker.as_ref().expect("checked some");
-    let popup_w = area.width.saturating_sub(4).clamp(24, 76);
-    let inner_w = usize::from(popup_w - 2);
-    let (rows, cursor, title): (Vec<Line>, usize, &str) = match picker.model_cursor {
-        Some(cursor) => {
-            let provider = &picker.providers[picker.provider_cursor];
-            (
-                provider
-                    .models
-                    .iter()
-                    .enumerate()
-                    .map(|(index, model)| {
-                        let marker = if model == &provider.default_model {
-                            " (default)"
-                        } else {
-                            ""
-                        };
-                        let text = pad(&format!("{model}{marker}"), inner_w);
-                        let style = if index == cursor {
-                            Style::new().add_modifier(Modifier::REVERSED)
-                        } else {
-                            Style::default()
-                        };
-                        Line::from(Span::styled(text, style))
-                    })
-                    .collect(),
-                cursor,
-                "provider model — ↑↓ enter esc",
-            )
-        }
-        None => (
-            picker
-                .providers
-                .iter()
-                .enumerate()
-                .map(|(index, provider)| {
-                    let selected_model = app.picker_model(provider);
-                    let text = pad(
-                        &format!(
-                            "{}  {}  {:?}",
-                            provider.id, selected_model, provider.availability
-                        ),
-                        inner_w,
-                    );
-                    let style = if index == picker.provider_cursor {
-                        Style::new().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    Line::from(Span::styled(text, style))
-                })
-                .collect(),
-            picker.provider_cursor,
-            "provider — ↑↓ enter esc",
-        ),
-    };
-    let avail = usize::from(area.height);
-    let popup_h = (rows.len() + 2).min(avail).max(3);
-    let content_h = popup_h - 2;
-    let scroll = cursor.saturating_sub(content_h - 1);
-    let end = (scroll + content_h).min(rows.len());
-    let visible = rows[scroll..end].to_vec();
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
-        width: popup_w,
-        height: popup_h as u16,
-    };
-    let block = Block::bordered().title(title);
-    f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(visible).block(block), popup);
-}
-
-/// reversed, windowed so the cursor stays visible in a tall list. The bottom
-/// border shows the cursor's position in the list.
-fn draw_fork_picker(f: &mut Frame, app: &App, area: Rect) {
-    let picker = app.fork_picker.as_ref().expect("checked some");
-    let popup_w = area.width.saturating_sub(4).clamp(20, 76);
-    let inner_w = usize::from(popup_w - 2);
-    let rows: Vec<Line> = picker
-        .points
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let text = truncate(&format!("#{}  {}", p.seq, p.preview), inner_w);
-            let style = if i == picker.cursor {
-                Style::new().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(text, style))
-        })
-        .collect();
-
-    // border(2) is the only overhead; window the rows so the cursor is visible.
-    let avail = usize::from(area.height);
-    let popup_h = (rows.len() + 2).min(avail).max(3);
-    let content_h = popup_h - 2;
-    let scroll = picker.cursor.saturating_sub(content_h - 1);
-    let end = (scroll + content_h).min(rows.len());
-    let visible = rows[scroll..end].to_vec();
-
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
-        width: popup_w,
-        height: popup_h as u16,
-    };
-    let block = Block::bordered()
-        .title("rewind — ↑↓ enter esc")
-        .title_bottom(
-            Line::from(format!("{}/{}", picker.cursor + 1, picker.points.len())).right_aligned(),
-        );
-    f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(visible).block(block), popup);
-}
-
-fn draw_question(f: &mut Frame, app: &mut App, area: Rect) {
-    let popup_w = area.width.saturating_sub(4).clamp(24, 84);
-    let inner_w = usize::from(popup_w - 2);
-    let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
-        return;
-    };
-    let title = format!(
-        "question {}/{} · {}",
-        question.question_index + 1,
-        question.req.questions.len(),
-        question.current().header
-    );
-    let body = question_body_lines(question, inner_w);
-    let (footer, editor_prefix) = question_footer_lines(question, inner_w);
-    let overhead = 3 + footer.len();
-    let avail = usize::from(area.height);
-    let popup_h = (body.len() + overhead).min(avail).max(overhead.min(avail));
-    let content_h = popup_h.saturating_sub(overhead).max(1);
-    let (scroll, mut lines, more_above, more_below) =
-        window_lines(&body, app.confirm_scroll, content_h);
-    app.confirm_scroll = scroll;
-    lines.push(Line::default());
-    lines.extend(footer);
-
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
-        width: popup_w,
-        height: popup_h as u16,
-    };
-    let mut block = Block::bordered().title(title);
-    if let Some(hint) = scroll_hint(more_above, more_below) {
-        block = block.title_bottom(Line::from(hint).right_aligned());
+    if let Some(picker) = &app.provider_picker {
+        return Some(provider_panel(app, picker));
     }
-    f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(lines).block(block), popup);
-
-    if let Some(prefix_width) = editor_prefix {
-        let editor_width = display_width(&question.editor);
-        let x = popup
-            .x
-            .saturating_add(1)
-            .saturating_add((prefix_width + editor_width).min(inner_w) as u16);
-        let y = popup.y.saturating_add(popup.height.saturating_sub(2));
-        f.set_cursor_position((x, y));
-    }
+    app.fork_picker.as_ref().map(fork_panel)
 }
 
-fn question_body_lines(question: &PendingQuestion, inner_w: usize) -> Vec<Line<'static>> {
-    let current = question.current();
-    let mut lines: Vec<Line<'static>> = wrap(&current.question, inner_w)
+/// An approval: what is about to run, why it is being asked, and the numbered
+/// answers. The rows come from [`confirm_choices`], which is also what the key
+/// handler maps a press through — one list, one meaning.
+fn confirm_panel(req: &ConfirmRequest, cursor: usize, width: usize) -> choice::Panel {
+    // Structured fields when core supplied them, the flat description otherwise:
+    // a request built by another frontend still has to render.
+    let acted_on = req.detail.as_ref().filter(|_| req.title.is_some());
+    let mut subject: Vec<Line<'static>> = wrap(acted_on.unwrap_or(&req.description), width)
         .into_iter()
         .map(Line::from)
         .collect();
-    lines.push(Line::default());
-    for (index, option) in current.options.iter().enumerate() {
-        let selected = question.selected.contains(&index);
-        let marker = if current.multi_select {
-            if selected { "[x]" } else { "[ ]" }
-        } else if selected {
-            "(●)"
-        } else {
-            "( )"
-        };
-        let text = format!("{marker} {} — {}", option.label, option.description);
-        let style = if question.phase == QuestionPhase::Select && question.cursor == index {
-            Style::new().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        for fragment in wrap(&text, inner_w) {
-            lines.push(Line::from(Span::styled(fragment, style)));
-        }
+    if let Some(notice) = &req.notice {
+        // Why the gate stopped here — a hazard, a sub-agent, a missing sandbox.
+        // Yellow and marked: this is the line that should give a fast "yes"
+        // pause, and colour alone is a weak signal on some terminal themes.
+        //
+        // `⚠` is Neutral width, but terminals that give it emoji presentation
+        // draw it two columns wide. Budget two either way (indenting the wrap
+        // to match) so the row can never overflow into a spurious extra line.
+        const MARK: &str = "⚠ ";
+        const MARK_W: usize = 2;
+        subject.extend(
+            wrap(notice, width.saturating_sub(MARK_W).max(1))
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let lead = if index == 0 {
+                        MARK.to_string()
+                    } else {
+                        " ".repeat(MARK_W)
+                    };
+                    Line::from(vec![
+                        Span::styled(lead, Style::new().fg(Color::Yellow)),
+                        Span::styled(line, Style::new().fg(Color::Yellow)),
+                    ])
+                }),
+        );
     }
-    let other_style =
-        if question.phase == QuestionPhase::Select && question.cursor == current.options.len() {
-            Style::new().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-    lines.push(Line::from(Span::styled(
-        "Other — type a custom answer".to_string(),
-        other_style,
-    )));
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if let Some(preview) = &req.preview {
+        if let Some(stats) = diff_stats_line(preview) {
+            body.push(stats);
+        }
+        body.extend(diff_preview_lines(preview, width));
+    }
+    let items = confirm_choices(req)
+        .into_iter()
+        .map(|row| choice::Item {
+            label: row.label,
+            detail: row.detail,
+        })
+        .collect();
+    choice::Panel {
+        header: req
+            .title
+            .clone()
+            .unwrap_or_else(|| "Permission needed".to_string()),
+        subject,
+        body,
+        prompt: Some("Do you want to proceed?".to_string()),
+        items,
+        cursor,
+        checked: Vec::new(),
+        multi_select: false,
+        hint: "Enter select · ↑↓ move · 1-9 pick · Esc deny".to_string(),
+        editor: None,
+    }
+}
+
+/// A model question. The two trailing rows are the escape hatches the model's
+/// fixed options cannot cover: answer in your own words, or set the question
+/// aside and just talk.
+fn question_panel(question: &PendingQuestion, width: usize) -> choice::Panel {
+    let current = question.current();
+    let total = question.req.questions.len();
+    let header = if total > 1 {
+        format!(
+            "{} ({}/{})",
+            current.header,
+            question.question_index + 1,
+            total
+        )
+    } else {
+        current.header.clone()
+    };
+    let mut body: Vec<Line<'static>> = Vec::new();
     if let Some(preview) = question.selected_preview() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled("Preview", DIM)));
-        lines.extend(
+        body.extend(
             preview
                 .lines()
-                .flat_map(|line| wrap(line, inner_w))
+                .flat_map(|line| wrap(line, width))
                 .map(Line::from),
         );
     }
-    lines
-}
-
-fn question_footer_lines(
-    question: &PendingQuestion,
-    inner_w: usize,
-) -> (Vec<Line<'static>>, Option<usize>) {
-    match question.phase {
-        QuestionPhase::Select => {
-            let hint = if question.current().multi_select {
-                "↑↓ choose · Space toggle · Enter submit · Esc cancel"
-            } else {
-                "↑↓ choose · Enter select · Esc cancel"
-            };
-            (
-                wrap(hint, inner_w)
-                    .into_iter()
-                    .map(|line| Line::from(Span::styled(line, Style::new().fg(Color::Cyan))))
-                    .collect(),
-                None,
-            )
-        }
-        QuestionPhase::Other => {
-            let prefix = "Other > ";
-            (
-                vec![Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(Color::Cyan)),
-                    Span::raw(truncate(
-                        &question.editor,
-                        inner_w.saturating_sub(prefix.len()),
-                    )),
-                ])],
-                Some(display_width(prefix)),
-            )
-        }
-        QuestionPhase::Notes => {
-            let prefix = "Notes (optional) > ";
-            (
-                vec![Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(Color::Cyan)),
-                    Span::raw(truncate(
-                        &question.editor,
-                        inner_w.saturating_sub(prefix.len()),
-                    )),
-                ])],
-                Some(display_width(prefix)),
-            )
-        }
-    }
-}
-
-fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
-    let popup_w = area.width.saturating_sub(4).clamp(20, 76);
-    let inner_w = usize::from(popup_w - 2);
-    let Some(PendingInteraction::Confirm { req, .. }) = app.interactions.front() else {
-        return;
-    };
-    let body = confirm_body_lines(req, inner_w);
-    // The y/a/p/n options are pinned below the scroll region — the point of the
-    // popup is those keys, so they must stay visible however far the diff runs.
-    let options = confirm_option_lines(req, inner_w);
-    // border(2) + one blank separator + the pinned options.
-    let overhead = 3 + options.len();
-    let avail = usize::from(area.height);
-    let popup_h = (body.len() + overhead).min(avail);
-    let content_h = popup_h.saturating_sub(overhead).max(1);
-    let (scroll, mut lines, more_above, more_below) =
-        window_lines(&body, app.confirm_scroll, content_h);
-    app.confirm_scroll = scroll;
-    lines.push(Line::default());
-    lines.extend(options);
-
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h as u16)) / 2,
-        width: popup_w,
-        height: popup_h as u16,
-    };
-    let mut block = Block::bordered().title("approve?");
-    if let Some(hint) = scroll_hint(more_above, more_below) {
-        block = block.title_bottom(Line::from(hint).right_aligned());
-    }
-    f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(lines).block(block), popup);
-}
-
-/// The scrollable part of a confirm popup: the wrapped description, then (if
-/// present) a blank line and the colored diff preview. Pure and testable.
-fn confirm_body_lines(
-    req: &kloop_core::permissions::ConfirmRequest,
-    inner_w: usize,
-) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = wrap(&req.description, inner_w)
-        .into_iter()
-        .map(Line::from)
+    let mut items: Vec<choice::Item> = current
+        .options
+        .iter()
+        .map(|option| choice::Item::with_detail(option.label.clone(), option.description.clone()))
         .collect();
-    if let Some(preview) = &req.preview {
-        lines.push(Line::default());
-        // A GitHub-style `+N -M` summary above the diff body (plan 38 slice 6).
-        if let Some(stats) = diff_stats_line(preview) {
-            lines.push(stats);
-        }
-        lines.extend(diff_preview_lines(preview, inner_w));
+    items.push(choice::Item::new("Type something else"));
+    items.push(choice::Item::new("Chat about this instead"));
+    let (hint, editor) = match question.phase {
+        QuestionPhase::Select if current.multi_select => (
+            "Space toggle · Enter submit · ↑↓ move · 1-9 pick · Esc cancel",
+            None,
+        ),
+        QuestionPhase::Select => ("Enter select · ↑↓ move · 1-9 pick · Esc cancel", None),
+        QuestionPhase::Other => (
+            "Enter submit · Esc cancel",
+            Some(choice::Editor {
+                prefix: "Your answer > ".to_string(),
+                text: question.editor.clone(),
+            }),
+        ),
+        QuestionPhase::Notes => (
+            "Enter submit · Esc cancel",
+            Some(choice::Editor {
+                prefix: "Notes (optional) > ".to_string(),
+                text: question.editor.clone(),
+            }),
+        ),
+    };
+    choice::Panel {
+        header,
+        subject: Vec::new(),
+        body,
+        prompt: Some(current.question.clone()),
+        items,
+        cursor: question.cursor,
+        checked: question.selected.clone(),
+        multi_select: current.multi_select,
+        hint: hint.to_string(),
+        editor,
     }
-    lines
+}
+
+fn provider_panel(app: &App, picker: &ProviderPicker) -> choice::Panel {
+    match picker.model_cursor {
+        Some(cursor) => {
+            let provider = &picker.providers[picker.provider_cursor];
+            choice::Panel {
+                header: format!("Model · {}", provider.id),
+                items: provider
+                    .models
+                    .iter()
+                    .map(|model| {
+                        if model == &provider.default_model {
+                            choice::Item::with_detail(model.clone(), "default")
+                        } else {
+                            choice::Item::new(model.clone())
+                        }
+                    })
+                    .collect(),
+                cursor,
+                prompt: Some("Which model?".to_string()),
+                hint: "Enter select · ↑↓ move · 1-9 pick · Esc back".to_string(),
+                ..choice::Panel::default()
+            }
+        }
+        None => choice::Panel {
+            header: "Provider".to_string(),
+            items: picker
+                .providers
+                .iter()
+                .map(|provider| {
+                    choice::Item::with_detail(
+                        provider.id.clone(),
+                        format!(
+                            "{} · {:?}",
+                            app.picker_model(provider),
+                            provider.availability
+                        ),
+                    )
+                })
+                .collect(),
+            cursor: picker.provider_cursor,
+            prompt: Some("Which provider?".to_string()),
+            hint: "Enter select · ↑↓ move · 1-9 pick · Esc cancel".to_string(),
+            ..choice::Panel::default()
+        },
+    }
+}
+
+fn fork_panel(picker: &ForkPicker) -> choice::Panel {
+    choice::Panel {
+        header: "Rewind".to_string(),
+        items: picker
+            .points
+            .iter()
+            .map(|point| {
+                choice::Item::with_detail(point.preview.clone(), format!("#{}", point.seq))
+            })
+            .collect(),
+        cursor: picker.cursor,
+        prompt: Some("Rewind the conversation to which point?".to_string()),
+        hint: "Enter rewind · ↑↓ move · 1-9 pick · Esc cancel".to_string(),
+        ..choice::Panel::default()
+    }
 }
 
 /// The `+N -M` change summary for a diff preview: additions green, deletions
@@ -1354,69 +1246,6 @@ fn diff_stats_line(preview: &str) -> Option<Line<'static>> {
         Span::raw(" "),
         Span::styled(format!("-{removed}"), Style::new().fg(Color::Red)),
     ]))
-}
-
-/// The pinned action line(s): the yellow y/a/p/n key hints.
-fn confirm_option_lines(
-    req: &kloop_core::permissions::ConfirmRequest,
-    inner_w: usize,
-) -> Vec<Line<'static>> {
-    let mut options = Vec::new();
-    if req
-        .approval_scopes
-        .contains(&kloop_core::permissions::ApprovalScope::Once)
-    {
-        options.push("y allow once");
-    }
-    if req
-        .approval_scopes
-        .contains(&kloop_core::permissions::ApprovalScope::WorkspaceSession)
-    {
-        options.push("a allow this workspace session");
-    }
-    if req
-        .approval_scopes
-        .contains(&kloop_core::permissions::ApprovalScope::Project)
-    {
-        options.push("p allow this project across sessions and linked worktrees");
-    }
-    options.push("n deny");
-    let options = options.join(" · ");
-    // Cyan action bar — an input tip prompting the choice (styles.md), not yellow.
-    wrap(&options, inner_w)
-        .into_iter()
-        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Cyan))))
-        .collect()
-}
-
-/// Window `lines` to `height` rows at offset `scroll`, clamped to a valid
-/// range. Returns the clamped offset (written back so it self-corrects after
-/// over-scrolling), the visible slice, and whether more lies above/below (for
-/// the scroll hint). The caller pins its own footer after the visible slice.
-fn window_lines(
-    lines: &[Line<'static>],
-    scroll: usize,
-    height: usize,
-) -> (usize, Vec<Line<'static>>, bool, bool) {
-    let height = height.max(1);
-    let scroll = scroll.min(lines.len().saturating_sub(height));
-    let end = (scroll + height).min(lines.len());
-    (
-        scroll,
-        lines[scroll..end].to_vec(),
-        scroll > 0,
-        end < lines.len(),
-    )
-}
-
-/// The bottom-border hint telling the user the popup scrolls and which way.
-fn scroll_hint(more_above: bool, more_below: bool) -> Option<String> {
-    match (more_above, more_below) {
-        (false, false) => None,
-        (true, false) => Some(" ↑ more ".into()),
-        (false, true) => Some(" ↓ more ".into()),
-        (true, true) => Some(" ↑↓ more ".into()),
-    }
 }
 
 /// Color a file-change diff preview: additions green, deletions red, context
@@ -1583,6 +1412,7 @@ mod tests {
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: None,
+                ..Default::default()
             },
             reply: confirm_reply,
         });
@@ -1794,100 +1624,149 @@ mod tests {
         assert_eq!(truncate("e\u{301}x", 1), "…");
     }
 
+    /// An approval reads as a header, the one thing being acted on, why it is
+    /// being asked, and numbered answers — not one flat line of tags.
     #[test]
-    fn window_lines_slices_by_offset_and_flags_overflow() {
-        let lines: Vec<Line<'static>> = (0..10).map(|i| Line::from(i.to_string())).collect();
-        let texts = |ls: &[Line]| -> Vec<String> { ls.iter().map(line_text).collect() };
+    fn confirm_panel_splits_subject_notice_and_numbered_answers() {
+        use kloop_core::permissions::ApprovalScope;
+        let req = ConfirmRequest {
+            description: "[destructive] [no sandbox] bash: rm -rf build".into(),
+            title: Some("Bash command".into()),
+            detail: Some("rm -rf build".into()),
+            notice: Some("destructive · no OS sandbox".into()),
+            approval_scopes: vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession],
+            remember_rules: Some(vec!["bash(rm *)".into()]),
+            preview: None,
+        };
+        let panel = confirm_panel(&req, 0, 60);
+        assert_eq!(panel.header, "Bash command");
+        assert_eq!(
+            panel.subject.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["rm -rf build", "⚠ destructive · no OS sandbox"]
+        );
+        // The notice is the row that should slow down a reflexive yes.
+        assert_eq!(
+            panel.subject[1].spans[0].style,
+            Style::new().fg(Color::Yellow)
+        );
+        assert_eq!(
+            panel
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Yes",
+                "Yes, and don't ask again this workspace session",
+                "No, and tell kloop what to do differently",
+            ]
+        );
 
-        // Everything fits: no clamp, no scroll needed, no hints.
-        let (scroll, vis, up, down) = window_lines(&lines, 0, 10);
-        assert_eq!((scroll, up, down), (0, false, false));
-        assert_eq!(texts(&vis).len(), 10);
-
-        // A window in the middle: both directions have more.
-        let (scroll, vis, up, down) = window_lines(&lines, 3, 4);
-        assert_eq!((scroll, up, down), (3, true, true));
-        assert_eq!(texts(&vis), vec!["3", "4", "5", "6"]);
-
-        // Scrolled to the very top: only more below.
-        let (_, _, up, down) = window_lines(&lines, 0, 4);
-        assert_eq!((up, down), (false, true));
-
-        // Over-scrolled: the offset self-corrects to the last full window and
-        // the "more below" hint clears.
-        let (scroll, vis, up, down) = window_lines(&lines, 999, 4);
-        assert_eq!((scroll, up, down), (6, true, false));
-        assert_eq!(texts(&vis), vec!["6", "7", "8", "9"]);
+        let text = choice::panel_lines(&panel, 60, 20, 0)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▌ Bash command"), "{text}");
+        assert!(text.contains("Do you want to proceed?"), "{text}");
+        assert!(text.contains("> 1. Yes"), "cursor row marked:\n{text}");
+        assert!(
+            text.contains("  2. Yes, and don't ask again this workspace session"),
+            "{text}"
+        );
+        // The remembered rule rides under the row that would remember it.
+        assert!(text.contains("bash(rm *)"), "{text}");
+        assert!(
+            text.contains("  3. No, and tell kloop what to do differently"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Enter select · ↑↓ move · 1-9 pick · Esc deny"),
+            "{text}"
+        );
     }
 
+    /// A notice too long for the width wraps under its own mark rather than
+    /// back to column zero, and the mark's width is budgeted whether or not the
+    /// terminal draws `⚠` as an emoji.
     #[test]
-    fn scroll_hint_reflects_available_directions() {
-        assert_eq!(scroll_hint(false, false), None);
-        assert_eq!(scroll_hint(false, true).as_deref(), Some(" ↓ more "));
-        assert_eq!(scroll_hint(true, false).as_deref(), Some(" ↑ more "));
-        assert_eq!(scroll_hint(true, true).as_deref(), Some(" ↑↓ more "));
+    fn a_long_notice_wraps_under_its_mark() {
+        let req = ConfirmRequest {
+            description: "bash: x".into(),
+            title: Some("Bash command".into()),
+            detail: Some("x".into()),
+            notice: Some("the OS sandbox blocked this — run it without the sandbox?".into()),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+            remember_rules: None,
+            preview: None,
+        };
+        let rows: Vec<String> = confirm_panel(&req, 0, 30)
+            .subject
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(rows[0], "x");
+        assert!(rows[1].starts_with("⚠ the OS sandbox"), "{rows:?}");
+        assert!(rows.len() > 2, "the notice wrapped: {rows:?}");
+        assert!(
+            rows[2].starts_with("  ") && !rows[2].starts_with("   "),
+            "continuation indents under the mark: {rows:?}"
+        );
+        // Two columns are budgeted for the mark, so every row still fits even
+        // where the terminal draws it wide.
+        assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
     }
 
-    /// The body carries the description and (when present) a blank line plus the
-    /// colored diff; the pinned options are a separate, yellow footer.
+    /// A request built without the structured fields (another frontend, an older
+    /// caller) still renders: the flat description becomes the body.
     #[test]
-    fn confirm_body_and_options_split_scrollable_from_pinned() {
-        use kloop_core::permissions::ConfirmRequest;
+    fn confirm_panel_falls_back_to_the_flat_description() {
+        let req = ConfirmRequest {
+            description: "bash: ls".into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+            ..Default::default()
+        };
+        let panel = confirm_panel(&req, 0, 60);
+        assert_eq!(panel.header, "Permission needed");
+        assert_eq!(
+            panel.subject.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["bash: ls"]
+        );
+    }
+
+    /// The diff preview keeps its `+N -M` summary and colouring inside the
+    /// panel body, where it scrolls.
+    #[test]
+    fn confirm_panel_body_carries_the_diff_summary() {
         let req = ConfirmRequest {
             description: "write_file: notes.txt".into(),
+            title: Some("Write file".into()),
+            detail: Some("notes.txt".into()),
+            notice: None,
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
             preview: Some("+1  hello\n+2  world".into()),
         };
-        let body: Vec<String> = confirm_body_lines(&req, 40).iter().map(line_text).collect();
-        // A `+N -M` stats summary (plan 38 slice 6) precedes the diff body.
+        let panel = confirm_panel(&req, 0, 40);
         assert_eq!(
-            body,
-            vec![
-                "write_file: notes.txt",
-                "",
-                "+2 -0",
-                "+1  hello",
-                "+2  world"
-            ]
+            panel.subject.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["notes.txt"]
         );
-
-        let opts = confirm_option_lines(&req, 40);
         assert_eq!(
-            opts.iter().map(line_text).collect::<Vec<_>>(),
-            vec!["y allow once · n deny"]
-        );
-        // Options are cyan (an input-tip action bar, styles.md), not yellow.
-        assert_eq!(opts[0].spans[0].style, Style::new().fg(Color::Cyan));
-
-        let all = ConfirmRequest {
-            approval_scopes: vec![
-                kloop_core::permissions::ApprovalScope::Once,
-                kloop_core::permissions::ApprovalScope::WorkspaceSession,
-                kloop_core::permissions::ApprovalScope::Project,
-            ],
-            remember_rules: Some(vec!["write_file(src/**)".into()]),
-            ..req
-        };
-        assert_eq!(
-            confirm_option_lines(&all, 200)
-                .iter()
-                .map(line_text)
-                .collect::<Vec<_>>(),
-            vec![
-                "y allow once · a allow this workspace session · p allow this project across sessions and linked worktrees · n deny"
-            ]
+            panel.body.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["+2 -0", "+1  hello", "+2  world"]
         );
     }
 
-    /// End-to-end through a real ratatui frame (TestBackend, no TTY): a diff
-    /// taller than the popup renders a windowed slice with the options pinned at
-    /// the bottom and a `↓ more` hint; scrolling to the end swaps the visible
-    /// slice and flips the hint to `↑ more`, options still pinned.
+    /// End-to-end through a real ratatui frame (TestBackend, no TTY): the panel
+    /// is inline chrome sitting on the composer's top rule — no border, nothing
+    /// cleared out from under the transcript. A diff taller than the panel
+    /// windows, the options and hint stay put, and PgDn-style over-scroll
+    /// self-corrects to the last window.
     #[test]
-    fn draw_confirm_windows_a_tall_diff_and_pins_the_options() {
+    fn draw_puts_the_panel_on_the_composer_and_scrolls_a_tall_diff() {
         use crate::events::AgentEvent;
-        use kloop_core::permissions::ConfirmRequest;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use tokio::sync::oneshot;
@@ -1909,10 +1788,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut app = App::new("s".into());
+        app.cells.push(Cell::Assistant("earlier turn".into()));
         let (reply, _rx) = oneshot::channel();
         app.apply(AgentEvent::Confirm {
             req: ConfirmRequest {
                 description: "write_file: big.txt".into(),
+                title: Some("Write file".into()),
+                detail: Some("big.txt".into()),
+                notice: None,
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
                 preview: Some(preview),
@@ -1920,51 +1803,159 @@ mod tests {
             reply,
         });
 
-        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
-
-        // Pinned to the top: early diff lines show, the tail does not, and the
-        // options plus a `↓ more` hint are on screen.
+        let mut term = Terminal::new(TestBackend::new(64, 20)).unwrap();
         term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
-        let screen = rows(&term).join("\n");
-        assert!(
-            screen.contains("+1  line 1"),
-            "top of diff visible:\n{screen}"
-        );
-        assert!(
-            !screen.contains("+60  line 60"),
-            "tail not yet visible:\n{screen}"
-        );
-        assert!(
-            screen.contains("y allow once · n deny"),
-            "options pinned:\n{screen}"
-        );
-        assert!(screen.contains("↓ more"), "down hint shown:\n{screen}");
-        assert!(!screen.contains("↑ more"), "no up hint at top:\n{screen}");
+        let rendered = rows(&term);
+        let screen = rendered.join("\n");
 
-        // Over-scroll: the offset self-corrects to the last window, the tail
-        // shows, the top scrolls off, and the hint flips — options stay pinned.
-        app.confirm_scroll = 999;
+        // The hint is the transcript's last row: 20 rows less the footer, the
+        // two rules and a one-line composer leaves rows 0..=15 for it.
+        assert!(
+            rendered[15].contains("Enter select"),
+            "hint sits on the composer's rule:\n{screen}"
+        );
+        assert!(
+            rendered[13].contains("2. No, and tell kloop"),
+            "options directly above the hint:\n{screen}"
+        );
+        assert!(
+            screen.contains("big.txt"),
+            "the file being written stays pinned:\n{screen}"
+        );
+        // Inline, not a popup: no border box, and the transcript is still there.
+        assert!(!screen.contains('╭'), "no popup border:\n{screen}");
+        assert!(
+            screen.contains("earlier turn"),
+            "transcript keeps its context:\n{screen}"
+        );
+        assert!(
+            screen.contains("+1  line 1") && !screen.contains("+60  line 60"),
+            "top of the diff visible, tail not:\n{screen}"
+        );
+        assert!(
+            screen.contains("PgUp/PgDn scroll"),
+            "the body advertises how to scroll:\n{screen}"
+        );
+
+        // Over-scroll self-corrects to the last window; the options stay put.
+        app.panel_scroll = 999;
         term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
-        let screen = rows(&term).join("\n");
-        assert!(app.confirm_scroll < 999, "offset clamped to a valid range");
+        let rendered = rows(&term);
+        let screen = rendered.join("\n");
+        assert!(app.panel_scroll < 999, "offset clamped to a valid range");
         assert!(
-            screen.contains("+60  line 60"),
-            "tail visible after scroll:\n{screen}"
+            screen.contains("+60  line 60") && !screen.contains("+1  line 1"),
+            "tail visible, top scrolled off:\n{screen}"
         );
         assert!(
-            !screen.contains("+1  line 1"),
-            "top scrolled off:\n{screen}"
+            rendered[15].contains("Enter select"),
+            "hint still pinned:\n{screen}"
         );
-        assert!(
-            screen.contains("y allow once · n deny"),
-            "options still pinned:\n{screen}"
-        );
-        assert!(screen.contains("↑ more"), "up hint shown:\n{screen}");
-        assert!(!screen.contains("↓ more"), "no down hint at end:\n{screen}");
     }
 
-    /// The menu highlights the cursor row (reversed) and windows a long list to
-    /// keep the cursor visible near the bottom (rows nearest the composer).
+    /// A model question renders through the same panel: its own header, the
+    /// question above numbered options with their descriptions underneath, and
+    /// the two escape hatches the model's fixed options cannot cover.
+    #[test]
+    fn question_panel_numbers_options_and_offers_both_escape_hatches() {
+        use kloop_core::interaction::Question;
+        use kloop_core::interaction::QuestionOption;
+        use kloop_core::interaction::QuestionRequest;
+
+        let mut app = App::new("s".into());
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.apply(crate::events::AgentEvent::Question {
+            req: QuestionRequest {
+                questions: vec![Question {
+                    question: "Which way?".into(),
+                    header: "Next step".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Upgrade recovery".into(),
+                            description: "swap the reused target for a fresh one".into(),
+                            preview: None,
+                        },
+                        QuestionOption {
+                            label: "Guardrail only".into(),
+                            description: "block the riskiest path first".into(),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+                metadata: None,
+            },
+            reply,
+        });
+
+        let panel = active_panel(&app, 60).expect("a question owns the keyboard");
+        assert_eq!(panel.header, "Next step");
+        assert_eq!(panel.prompt.as_deref(), Some("Which way?"));
+        assert_eq!(
+            choice::panel_lines(&panel, 60, 30, 0)
+                .lines
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec![
+                "▌ Next step",
+                "",
+                "Which way?",
+                "",
+                "> 1. Upgrade recovery",
+                "     swap the reused target for a fresh one",
+                "  2. Guardrail only",
+                "     block the riskiest path first",
+                "  3. Type something else",
+                "  4. Chat about this instead",
+                "",
+                "Enter select · ↑↓ move · 1-9 pick · Esc cancel",
+            ]
+        );
+    }
+
+    /// The rewind picker is the same panel, so its keys are the same keys.
+    #[test]
+    fn fork_panel_lists_rewind_points_the_same_way() {
+        let mut app = App::new("s".into());
+        app.fork_picker = Some(ForkPicker {
+            points: vec![
+                kloop_core::rollout::ForkPoint {
+                    seq: 3,
+                    preview: "fix the parser".into(),
+                },
+                kloop_core::rollout::ForkPoint {
+                    seq: 7,
+                    preview: "add the panel".into(),
+                },
+            ],
+            cursor: 1,
+        });
+        let panel = active_panel(&app, 60).expect("the picker owns the keyboard");
+        assert_eq!(
+            choice::panel_lines(&panel, 60, 30, 0)
+                .lines
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec![
+                "▌ Rewind",
+                "",
+                "Rewind the conversation to which point?",
+                "",
+                "  1. fix the parser",
+                "     #3",
+                "> 2. add the panel",
+                "     #7",
+                "",
+                "Enter rewind · ↑↓ move · 1-9 pick · Esc cancel",
+            ]
+        );
+    }
+
+    /// The menu marks the cursor row the way a choice panel does (`> `, brand)
+    /// and windows a long list to keep the cursor visible near the bottom (the
+    /// rows nearest the composer).
     #[test]
     fn menu_lines_highlight_cursor_and_window_long_lists() {
         let items: Vec<menu::MenuItem> = (0..20)
@@ -1984,23 +1975,18 @@ mod tests {
         // The cursor row (12) is the last visible row, and it is reversed.
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
-            texts.last().unwrap().starts_with("/cmd12"),
-            "cursor row last: {texts:?}"
+            texts.last().unwrap().starts_with("> /cmd12"),
+            "cursor row last and marked: {texts:?}"
         );
-        assert!(
-            lines.last().unwrap().spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED),
-            "selected row reversed"
+        assert_eq!(
+            lines.last().unwrap().spans[0].style,
+            Style::new().fg(BRAND),
+            "selected row carries the brand accent"
         );
-        // A non-selected row is not reversed and carries a dim detail span.
-        assert!(
-            !lines[0].spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        // A non-selected row is indented to match and carries a dim detail span.
+        assert!(texts[0].starts_with("  /cmd"), "{texts:?}");
+        assert_eq!(lines[0].spans[0].style, Style::default());
+        assert_eq!(lines[0].spans[2].style, DIM);
     }
 
     /// End-to-end (TestBackend): an open menu floats directly above the composer
