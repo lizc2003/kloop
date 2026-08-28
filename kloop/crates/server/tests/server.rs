@@ -492,6 +492,37 @@ async fn switch_real_provider(
     }
 }
 
+/// Drive one slash command through `turn/start` and return its `system` output.
+/// A command keeps the ordinary turn bracket, so completion is the signal that
+/// it ran — unlike `thread/provider/switch`, which has its own transaction.
+async fn run_real_command(client: &mut TestClient, thread_id: &str, line: &str) -> String {
+    let request_id = client
+        .request("turn/start", json!({"threadId": thread_id, "input": line}))
+        .await;
+    let mut text = None;
+    let mut accepted = false;
+    loop {
+        let message = client.recv_with_timeout(Duration::from_secs(120)).await;
+        if message["id"] == request_id {
+            assert!(
+                message.get("error").is_none(),
+                "slash command request was rejected: {message}"
+            );
+            accepted = true;
+        }
+        if message["method"] == "system" {
+            text = message["params"]["text"].as_str().map(str::to_string);
+        }
+        if message["method"] == "turn/completed" {
+            assert!(
+                accepted,
+                "command completed before its request was accepted"
+            );
+            return text.expect("slash command produced no system output");
+        }
+    }
+}
+
 fn tool_use(id: &str, name: &str, input: Value) -> AssistantBlock {
     AssistantBlock::ToolUse {
         id: id.into(),
@@ -3331,5 +3362,165 @@ async fn clear_command_empties_history_and_notifies() {
         messages.is_empty(),
         "after /clear the session must replay to empty: {messages:?}"
     );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// Plan 102 against a live endpoint: every effort level a rail *claims* to
+/// accept is set mid-session with `/effort` and then actually sampled at, plus
+/// `off` for the no-field path. The unit tests only lock the request body kloop
+/// builds; this is the one that fails when a real endpoint rejects a level or
+/// the field itself (e.g. a proxy that does not know `reasoning_effort`).
+/// A completed turn is the signal — the request body is not observable here.
+///
+/// One rail per run, selected by KLOOP_PROVIDER (anthropic | openai |
+/// openai-responses) with that rail's usual credential/model variables:
+///
+///   KLOOP_PROVIDER=openai-responses OPENAI_API_KEY=… OPENAI_BASE_URL=… \
+///     OPENAI_MODEL=gpt-5.6-sol cargo test -p kloop-server --test server \
+///     real_effort_sweep_contract -- --exact --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires real Anthropic, OpenAI Chat, or OpenAI Responses credentials"]
+async fn real_effort_sweep_contract() {
+    let rail = required_real_env("KLOOP_PROVIDER");
+    let (api_family, key, base, model) = match rail.as_str() {
+        "anthropic" => (
+            kloop_protocol::ProviderApiFamily::AnthropicMessages,
+            required_real_env("ANTHROPIC_API_KEY"),
+            required_real_env("ANTHROPIC_BASE_URL"),
+            required_real_env("ANTHROPIC_MODEL"),
+        ),
+        "openai" => (
+            kloop_protocol::ProviderApiFamily::OpenAiChatCompletions,
+            required_real_env("OPENAI_API_KEY"),
+            required_real_env("OPENAI_BASE_URL"),
+            required_real_env("OPENAI_MODEL"),
+        ),
+        "openai-responses" => (
+            kloop_protocol::ProviderApiFamily::OpenAiResponses,
+            required_real_env("OPENAI_API_KEY"),
+            required_real_env("OPENAI_BASE_URL"),
+            required_real_env("OPENAI_MODEL"),
+        ),
+        other => panic!("KLOOP_PROVIDER '{other}' must be anthropic, openai, or openai-responses"),
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let provider_id = format!("{rail}-real");
+
+    let factory_key = key.clone();
+    let factory_base = base.clone();
+    let catalog = Arc::new(
+        kloop_core::provider_route::ProviderCatalog::new(vec![
+            kloop_core::provider_route::ProviderCatalogEntry {
+                id: provider_id.clone(),
+                api_family,
+                endpoint_fingerprint: Provider::endpoint_fingerprint_for(api_family, &base),
+                default_model: model.clone(),
+                models: vec![model.clone()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                // The sweep sets every level explicitly; starting from "no field
+                // sent" keeps the first turn a clean control.
+                default_effort: None,
+                factory: Arc::new(move || {
+                    let key = factory_key.clone();
+                    let base = factory_base.clone();
+                    Ok(match api_family {
+                        kloop_protocol::ProviderApiFamily::AnthropicMessages => {
+                            Provider::Anthropic {
+                                key,
+                                base,
+                                cache: true,
+                                thinking: kloop_provider::ThinkingMode::Unset,
+                            }
+                        }
+                        kloop_protocol::ProviderApiFamily::OpenAiChatCompletions => {
+                            Provider::OpenAiCompat { key, base }
+                        }
+                        kloop_protocol::ProviderApiFamily::OpenAiResponses => {
+                            Provider::OpenAiResponses { key, base }
+                        }
+                        kloop_protocol::ProviderApiFamily::Mock => unreachable!("real rail only"),
+                    })
+                }),
+            },
+        ])
+        .unwrap(),
+    );
+
+    let dirs = test_dirs("real-effort-sweep");
+    std::fs::create_dir_all(&dirs.root).unwrap();
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    let mut server = ServerConfig::new(
+        real_switch_factory(dirs.offload.clone()),
+        ServerPaths {
+            sessions_dir: dirs.sessions.clone(),
+            offload_dir: dirs.offload.clone(),
+        },
+    );
+    server.provider_catalog = Arc::clone(&catalog);
+    let mut client = start_server_with_config(server);
+    client.initialize().await;
+
+    let start_id = client
+        .request(
+            "thread/start",
+            json!({"cwd": cwd, "providerId": provider_id, "model": model}),
+        )
+        .await;
+    let started = client.recv_with_timeout(Duration::from_secs(60)).await;
+    assert_eq!(started["id"], start_id);
+    assert!(started.get("error").is_none(), "real thread start failed");
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // No effort configured, so the route publishes none and no field is sent.
+    assert!(started["result"]["thread"]["route"]["effort"].is_null());
+
+    let accepted = api_family.accepted_efforts();
+    assert!(!accepted.is_empty(), "every real rail accepts some effort");
+    for effort in accepted {
+        let shown = run_real_command(&mut client, &thread_id, &format!("/effort {effort}")).await;
+        assert!(
+            shown.starts_with(&format!("effort: {effort} (provider {provider_id},")),
+            "unexpected /effort output for {effort}: {shown}"
+        );
+        run_real_provider_turn(
+            &mut client,
+            &thread_id,
+            &format!("Reply exactly EFFORT_{effort} and nothing else."),
+        )
+        .await;
+    }
+
+    // `off` must also survive a real request: the rail sends no effort field and
+    // the provider's own default stands.
+    let cleared = run_real_command(&mut client, &thread_id, "/effort off").await;
+    assert!(
+        cleared.starts_with("effort: off —"),
+        "unexpected: {cleared}"
+    );
+    run_real_provider_turn(
+        &mut client,
+        &thread_id,
+        "Reply exactly EFFORT_OFF and nothing else.",
+    )
+    .await;
+
+    // A level this rail does not accept is refused by kloop, never sent.
+    let refused_level = match api_family {
+        kloop_protocol::ProviderApiFamily::AnthropicMessages => "minimal",
+        _ => "max",
+    };
+    let refused =
+        run_real_command(&mut client, &thread_id, &format!("/effort {refused_level}")).await;
+    assert!(
+        refused.starts_with(&format!(
+            "provider '{provider_id}' does not accept effort '{refused_level}'"
+        )),
+        "unexpected refusal text: {refused}"
+    );
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
