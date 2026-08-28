@@ -1635,7 +1635,7 @@ The session tools use strict inputs:
 `name` and `path` are optional but mutually exclusive. Explicit nulls, wrong
 types, and unknown fields are rejected. Names are at most 64 characters and
 may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
-encoded as `+`. Managed trees live at `.claude/worktrees/<encoded-name>` on
+encoded as `+`. Managed trees live at `.kloop-worktrees/<encoded-name>` on
 `worktree-<encoded-name>`. An existing `path` must canonicalize to a registered
 worktree with the same Git common directory. Entering by path grants
 **External** custody only.

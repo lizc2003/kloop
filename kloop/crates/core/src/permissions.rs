@@ -3152,6 +3152,13 @@ mod tests {
         assert!(s("/home/u/.ssh/id_rsa"));
 
         assert!(!s("/w/proj/src/main.rs"));
+        // A managed worktree is a checkout the agent edits wholesale, so its
+        // directory must never sit under a sensitive component — nesting it in
+        // `.kloop/` would make every edit inside it read as escalation.
+        assert!(!s(&format!(
+            "/w/proj/{}/tree/src/main.rs",
+            crate::worktree::WORKTREES_DIR
+        )));
         assert!(!s("/w/proj/git/readme.md"), "git dir ≠ .git dir");
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
     }

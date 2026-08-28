@@ -37,7 +37,13 @@ use crate::config::Config;
 use crate::permissions::Permissions;
 use crate::sandbox::SandboxPolicy;
 
-const WORKTREES_DIR: &str = ".claude/worktrees";
+/// Managed worktrees live in kloop's own repository namespace, not in another
+/// agent's directory. Deliberately a sibling of `.kloop/` rather than
+/// `.kloop/worktrees`: `.kloop` is a sensitive path component (kloop's own
+/// state — a write there is privilege escalation, not editing) and a read-only
+/// subpath of every sandbox writable root, so a checkout nested inside it would
+/// classify every edit the agent makes in its own worktree as an escalation.
+pub(crate) const WORKTREES_DIR: &str = ".kloop-worktrees";
 const WORKTREE_BRANCH_PREFIX: &str = "worktree-";
 static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -509,7 +515,7 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
         let managed_root = repository.root.join(WORKTREES_DIR);
         if !canonical_path.starts_with(&managed_root) {
             bail!(
-                "Cannot enter worktree: {} is not under {}. Switching from this session is limited to worktrees managed under .claude/worktrees of this repository.",
+                "Cannot enter worktree: {} is not under {}. Switching from this session is limited to worktrees managed under .kloop-worktrees of this repository.",
                 canonical_path.display(),
                 managed_root.display(),
             );
@@ -982,7 +988,7 @@ mod tests {
         let path = worktree.path.clone();
         assert_eq!(worktree.custody, WorktreeCustody::Managed);
         assert_eq!(worktree.owner, WorktreeOwner::Task("agent-1".into()));
-        assert!(path.ends_with(".claude/worktrees/agent-1"));
+        assert!(path.ends_with(".kloop-worktrees/agent-1"));
         assert_eq!(worktree.branch, "worktree-agent-1");
         assert!(finish(worktree).await.unwrap().is_none());
         assert!(!path.exists());

@@ -183,3 +183,29 @@ server 会话 `enter_worktree→write_file→exit_worktree`,客户端收到两�
 
 **仍挂账**:origin/HEAD base;30 天陈旧清理;指令文件/git 快照按 worktree 重组;cc setup
 拷贝;跨仓库;server 同名 worktree 的客户端协调。
+
+## 修正（2026-08-29，plan 105 会话中 dogfood 发现）
+
+`WORKTREES_DIR` 原本是 `.claude/worktrees` —— 用户看到后一句「这个不合理」。确实:
+本文件上面写的收敛点是「**仓内专用目录**」,codex 用 `.codex/worktrees`、cc 用
+`.claude/worktrees`,两家都用**自己的**命名空间;kloop 照抄了 cc 的**字面目录名**,
+等于把自己的工作树写进另一个产品的目录里(README 里甚至有一句「kloop scans only its
+own `.kloop/`, not cc's `.claude/`」,自相矛盾)。同一仓库里同时用 cc 和 kloop 时,
+两边的 managed 树与 `worktree-*` 分支还会挤在一个命名空间里。
+
+改为 `.kloop-worktrees`。**为什么不是 `.kloop/worktrees`**(看起来更整齐,但会炸):
+
+1. `path_is_sensitive` 是**逐 component** 判定的,`.kloop` 在 `SENSITIVE_DIRS` 里
+   (kloop 自己的状态,写它是提权不是编辑)。工作树若嵌在 `.kloop/` 下,agent 在自己
+   工作树里改的**每一个文件**都会被判成敏感路径。
+2. sandbox 的 `protected_subpaths` 把每个 writable root 下的 `.kloop` 设为只读子路径。
+   worktree 模式下 `for_workspace` 会把 writable root 换成工作树本身,通常不撞;但用户
+   若额外把仓库根配成 writable root,`<repo>/.kloop` 的只读规则就会盖住里面的工作树。
+
+`.kloop-worktrees` 两条都绕开了:component 不等于 `.kloop`,而
+`raw_mentions_sensitive_path` 找的是 `/.kloop/`(带尾斜杠),`powershell_mentions_sensitive_path`
+的边界字符集不含 `-`。这条不变式已在 `permissions::tests::sensitive_path_detection_is_component_based`
+里用 `WORKTREES_DIR` 常量本身钉死,以后谁想把它挪进 `.kloop/` 会当场红。
+
+分支前缀 `worktree-<name>` **不改**:它和 `.claude/` 不同,是描述性的通用名字,不属于
+任何产品的命名空间。

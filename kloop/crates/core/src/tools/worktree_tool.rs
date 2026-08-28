@@ -186,7 +186,7 @@ mod tests {
         assert!(!is_error, "{out}");
         assert!(out.contains("Created worktree"), "{out}");
         // The session's effective cwd is now the worktree.
-        let wt = repo.join(".claude/worktrees/feat");
+        let wt = repo.join(".kloop-worktrees/feat");
         assert_eq!(base.cfg.effective_cwd(), wt);
 
         // A relative write resolves against the worktree, not the main repo.
@@ -221,10 +221,7 @@ mod tests {
         let (out, is_error) = run_tool("exit_worktree", json!({"action": "remove"}), &ctx).await;
         assert!(!is_error, "{out}");
         assert!(out.contains("removed worktree"), "{out}");
-        assert!(
-            !repo.join(".claude/worktrees/look").exists(),
-            "tree removed"
-        );
+        assert!(!repo.join(".kloop-worktrees/look").exists(), "tree removed");
         assert_eq!(ctx.cfg.effective_cwd(), repo, "back to the main repo");
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -310,7 +307,7 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert!(out.contains("Discarded"), "{out}");
-        assert!(!repo.join(".claude/worktrees/d").exists(), "tree discarded");
+        assert!(!repo.join(".kloop-worktrees/d").exists(), "tree discarded");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -333,7 +330,7 @@ mod tests {
         let (out, is_error) = run_tool("run_agent", json!({"prompt": "go"}), &ctx).await;
         assert!(!is_error, "{out}");
         // The sub-agent's relative write landed in the session's worktree.
-        assert!(repo.join(".claude/worktrees/wt/sub.txt").exists());
+        assert!(repo.join(".kloop-worktrees/wt/sub.txt").exists());
         assert!(!repo.join("sub.txt").exists());
         let _ = run_tool(
             "exit_worktree",

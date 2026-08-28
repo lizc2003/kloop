@@ -239,7 +239,7 @@ async fn parser_report() -> Value {
     )
     .await;
     assert!(!is_error, "{created}");
-    let nested_path = repository.join(".claude/worktrees/feature+plan56");
+    let nested_path = repository.join(".kloop-worktrees/feature+plan56");
     assert_eq!(context.cfg.effective_cwd(), nested_path);
     let (removed, is_error) =
         run_tool("exit_worktree", json!({"action": "remove"}), &context).await;
@@ -248,7 +248,7 @@ async fn parser_report() -> Value {
     let (default_created, is_error) = run_tool("enter_worktree", json!({}), &context).await;
     assert!(!is_error, "{default_created}");
     let generated_path = context.cfg.effective_cwd();
-    assert!(generated_path.starts_with(repository.join(".claude/worktrees")));
+    assert!(generated_path.starts_with(repository.join(".kloop-worktrees")));
     let (_, is_error) = run_tool("exit_worktree", json!({"action": "remove"}), &context).await;
     assert!(!is_error);
 
@@ -258,7 +258,7 @@ async fn parser_report() -> Value {
         "nested": {
             "created": normalized(&created, &repository),
             "removed": normalized(&removed, &repository),
-            "path": "<REPO>/.claude/worktrees/feature+plan56",
+            "path": "<REPO>/.kloop-worktrees/feature+plan56",
         },
         "default_generated": true,
     })
@@ -291,7 +291,7 @@ async fn lifecycle_report() -> Value {
         }
     )));
     assert_eq!(context.cfg.effective_cwd(), repository);
-    assert!(!repository.join(".claude/worktrees/serial").exists());
+    assert!(!repository.join(".kloop-worktrees/serial").exists());
     let cwd_events = ui.cwd_events();
     assert_eq!(cwd_events.len(), 2);
 
@@ -560,7 +560,7 @@ async fn effective_context_report() -> Value {
         "system_reanchored": system_reanchored,
         "successful_tools": successful_tools,
         "main_tree_untouched": true,
-        "worktree": "<REPO>/.claude/worktrees/context",
+        "worktree": "<REPO>/.kloop-worktrees/context",
     });
     let _ = std::fs::remove_dir_all(repository);
     report

@@ -3677,14 +3677,14 @@ mod tests {
         let mut app =
             App::new("s".into()).with_working_directory("/repo".into(), Some("main".into()));
         app.apply(AgentEvent::Core(Event::CwdChanged {
-            cwd: "/repo/.claude/worktrees/feature".into(),
+            cwd: "/repo/.kloop-worktrees/feature".into(),
             branch: Some("worktree-feature".into()),
         }));
-        assert_eq!(app.cwd, "/repo/.claude/worktrees/feature");
+        assert_eq!(app.cwd, "/repo/.kloop-worktrees/feature");
         assert_eq!(app.branch.as_deref(), Some("worktree-feature"));
         assert_eq!(
             app.last_note.as_deref(),
-            Some("working directory → /repo/.claude/worktrees/feature (branch worktree-feature)")
+            Some("working directory → /repo/.kloop-worktrees/feature (branch worktree-feature)")
         );
 
         app.apply(AgentEvent::Core(Event::CwdChanged {
