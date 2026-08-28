@@ -553,6 +553,10 @@ mod tests {
                 "item/started",
                 "item/delta",
                 "item/completed",
+                // Twice: the agent loop publishes the context size at the end
+                // of every round (a long turn's gauge must move while it runs),
+                // then the headless bracket repeats the post-turn total.
+                "thread/tokenUsage/updated",
                 "thread/tokenUsage/updated",
                 "turn/completed",
             ]

@@ -1438,6 +1438,9 @@ async fn completed_block_without_delta_still_has_one_item_lifecycle() {
                     status: crate::event::ItemStatus::Completed,
                 },
             },
+            // Every round closes by publishing the context size (plan: the
+            // footer gauge must move during a turn, not only at its end).
+            Event::Usage(history.estimated_tokens()),
         ]
     );
 }
@@ -1464,7 +1467,12 @@ async fn signed_empty_thinking_is_semantic_history_without_display_item() {
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
     assert_eq!(outcome.reason, EndReason::Completed);
-    assert!(event_ui.0.lock().unwrap().is_empty());
+    // The round's context-size event and nothing else: the empty signed block
+    // is semantic history, never a display item.
+    assert_eq!(
+        *event_ui.0.lock().unwrap(),
+        vec![Event::Usage(history.estimated_tokens())]
+    );
     assert_eq!(
         history.messages()[1],
         mock_assistant(
@@ -1474,6 +1482,58 @@ async fn signed_empty_thinking_is_semantic_history_without_display_item() {
             }],
             "mock",
         )
+    );
+}
+
+/// The context gauge is read while a turn is still running (an agentic turn
+/// lasts minutes), so every round publishes the size — the front-ends' own
+/// post-turn event is only the closing bracket. A sub-agent samples into its
+/// own History, so its rounds must stay silent.
+#[tokio::test]
+async fn context_size_is_published_each_round_and_only_at_depth_zero() {
+    struct UsageUi(std::sync::Mutex<Vec<u64>>);
+    impl Ui for UsageUi {
+        fn emit(&self, event: &Event) {
+            if let Event::Usage(used) = event {
+                self.0.lock().unwrap().push(*used);
+            }
+        }
+    }
+
+    // One tool round then an answer, each with a provider-reported total that
+    // anchors the estimate exactly.
+    async fn published_sizes(depth: u8, tag: &str) -> Vec<u64> {
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Response {
+                blocks: vec![tool_use("t1", "echo hi")],
+                outcome: AssistantOutcome::ToolUse,
+                usage: usage(1_000),
+            },
+            MockTurn::Response {
+                blocks: text("done"),
+                outcome: AssistantOutcome::EndTurn,
+                usage: usage(2_000),
+            },
+        ]);
+        let cfg = compaction_cfg(provider, 200_000, tag);
+        let usage_ui = Arc::new(UsageUi(std::sync::Mutex::new(Vec::new())));
+        let ui: Arc<dyn Ui> = usage_ui.clone();
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("go"));
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), depth).await;
+
+        assert_eq!(outcome.reason, EndReason::Completed);
+        usage_ui.0.lock().unwrap().clone()
+    }
+
+    assert_eq!(
+        published_sizes(0, "usage-per-round").await,
+        vec![usage(1_000).total(), usage(2_000).total()]
+    );
+    assert_eq!(
+        published_sizes(1, "usage-subagent").await,
+        Vec::<u64>::new()
     );
 }
 

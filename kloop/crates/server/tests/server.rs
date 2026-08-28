@@ -2096,8 +2096,8 @@ async fn turn_streams_item_events_and_completes() {
 
     // The turn/start response carries the allocated turn id; the thread's
     // notifications are the assistant message's full item lifecycle bracketed
-    // by turn/started and turn/completed, with a token-usage update before the
-    // close.
+    // by turn/started and turn/completed, with a token-usage update per round
+    // and one more before the close.
     let turn = log
         .iter()
         .find(|m| m["id"] == turn_id)
@@ -2110,6 +2110,9 @@ async fn turn_streams_item_events_and_completes() {
             "item/started",
             "item/delta",
             "item/completed",
+            // Twice: the agent loop publishes the context size at every round
+            // boundary, then the turn bracket repeats the post-turn total.
+            "thread/tokenUsage/updated",
             "thread/tokenUsage/updated",
             "turn/completed",
         ]
@@ -3010,6 +3013,7 @@ async fn parallel_threads_do_not_cross_streams() {
                 "item/started",
                 "item/delta",
                 "item/completed",
+                "thread/tokenUsage/updated",
                 "thread/tokenUsage/updated",
                 "turn/completed",
             ],

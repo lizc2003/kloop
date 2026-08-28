@@ -626,6 +626,14 @@ async fn turn_rounds(
             // recorded after this point.
             history.note_usage(usage.total());
         }
+        // Publish the context size every round, not just at turn end: an
+        // agentic turn runs for minutes and its gauge is watched while it runs
+        // (a first turn would otherwise sit at the session's opening 0 the
+        // whole time). A sub-agent's History is its own, so only the main
+        // loop's estimate describes the session.
+        if depth == 0 {
+            ui.emit(&Event::Usage(history.estimated_tokens()));
+        }
 
         let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()

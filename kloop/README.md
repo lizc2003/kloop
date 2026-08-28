@@ -566,8 +566,9 @@ While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
 "shimmer" light band sweeping the verb, and `(elapsed · esc to interrupt)`. The
 **footer** carries the mode badge and key hints on the left and the **system
-status** — model name and a context gauge (`model · N% ctx`, refreshed after
-each turn from the same usage accounting `/cost` reads) — flush right (dropped on
+status** — model name and a context gauge (`model · N% ctx`, refreshed at the end
+of every agent round from the same usage accounting `/cost` reads, so a
+long turn's gauge moves while it runs) — flush right (dropped on
 a narrow row so the hints win). A **thinking block** shows a CC-style verb and
 elapsed rather than its text: `∗ Thinking… (Xs)` while it streams, `∗ Thought for
 Xs` once sealed. The animation self-drives — a frame tick wakes the loop only
