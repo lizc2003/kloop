@@ -64,23 +64,12 @@ pub fn mock(cwd: &Path) -> GatheredContext {
     }
 }
 
-/// The one instruction file kloop reads per directory. `CLAUDE.md` was a
-/// compatibility fallback and is no longer read (see [`RETIRED_FILES`]): one
-/// name means one source of truth, so kloop, codex and cc all get the same
-/// bytes instead of drifting per tool.
+/// The instruction file kloop reads per directory. One name, so every agent on
+/// a tree reads the same bytes; a file under another name is served by pointing
+/// at this one with `@`.
 const INSTRUCTION_FILE_NAME: &str = "AGENTS.md";
 /// Private, gitignored per-directory override; loaded last, so it wins.
 const LOCAL_INSTRUCTION_FILE_NAME: &str = "AGENTS.local.md";
-/// Names kloop deliberately no longer reads, each paired with what replaced it.
-/// A retired file sitting next to a *missing* replacement is reported at
-/// startup, because losing an instruction file is silent: the session just
-/// behaves as if the rules were never written, and that symptom points nowhere
-/// near its cause. Both names present is a deliberate cc/kloop split, not a
-/// mistake — only the replacement is read, and nothing is said.
-const RETIRED_FILES: [(&str, &str); 2] = [
-    ("CLAUDE.md", INSTRUCTION_FILE_NAME),
-    ("CLAUDE.local.md", LOCAL_INSTRUCTION_FILE_NAME),
-];
 /// Modular rule fragments, loaded per directory (`<dir>/.kloop/rules/*.md`).
 const RULES_DIR: [&str; 2] = [".kloop", "rules"];
 /// Cap on `@import` recursion; matches cc's MAX_INCLUDE_DEPTH. A file at this
@@ -148,7 +137,6 @@ impl Discovery {
     /// Main instruction file for a directory, expanded.
     fn add_main_file(&mut self, dir: &Path, scope: InstructionScope) {
         self.expand(&dir.join(INSTRUCTION_FILE_NAME), scope, 0, false);
-        self.warn_retired(dir);
     }
 
     /// Private override for a directory, expanded.
@@ -159,21 +147,6 @@ impl Discovery {
             0,
             false,
         );
-    }
-
-    /// Name a retired instruction file that is sitting unread with no
-    /// replacement beside it — the one case where the migration silently costs
-    /// the session every rule in that file.
-    fn warn_retired(&mut self, dir: &Path) {
-        for (retired, replacement) in RETIRED_FILES {
-            if dir.join(retired).is_file() && !dir.join(replacement).is_file() {
-                self.warnings.push(format!(
-                    "{retired} is no longer read; rename it to {replacement}, or keep both and \
-                     put `@./{retired}` in {replacement}: {}",
-                    dir.join(retired).display()
-                ));
-            }
-        }
     }
 
     /// Every `*.md` in `<dir>/.kloop/rules/`, sorted for a stable order.
@@ -406,72 +379,6 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
     }
 
-    fn paths(files: &[InstructionFile]) -> Vec<&str> {
-        files.iter().map(|f| f.path.as_str()).collect()
-    }
-
-    #[test]
-    fn claude_md_beside_agents_md_is_read_by_neither_name_nor_warning() {
-        let root = test_tree("prefer");
-        write(&root, "AGENTS.md", "agents rules");
-        write(&root, "CLAUDE.md", "claude rules");
-        let d = discover_instruction_files(&root, None, Some(&root));
-        assert_eq!(
-            paths(&d.files),
-            vec![root.join("AGENTS.md").display().to_string()]
-        );
-        assert_eq!(d.files[0].content, "agents rules");
-        assert_eq!(d.files[0].scope, InstructionScope::Project);
-        // Keeping a cc-only CLAUDE.md alongside is a deliberate split, so the
-        // migration notice must stay quiet here or it fires on every repo.
-        assert_eq!(d.warnings, Vec::<String>::new());
-    }
-
-    /// The migration's only silent failure: a repo that has just CLAUDE.md used
-    /// to load it and now loads nothing, and an agent missing its rules reads as
-    /// "the model changed", not "a file stopped being read".
-    #[test]
-    fn claude_md_alone_loads_nothing_and_says_why() {
-        let root = test_tree("fallback");
-        write(&root, "CLAUDE.md", "claude rules");
-        let d = discover_instruction_files(&root, None, Some(&root));
-        assert_eq!(d.files.len(), 0);
-        assert_eq!(d.warnings.len(), 1);
-        assert!(
-            d.warnings[0].contains("CLAUDE.md is no longer read"),
-            "{:?}",
-            d.warnings
-        );
-        assert!(d.warnings[0].contains("AGENTS.md"), "{:?}", d.warnings);
-        assert!(
-            d.warnings[0].contains(&root.join("CLAUDE.md").display().to_string()),
-            "{:?}",
-            d.warnings
-        );
-    }
-
-    #[test]
-    fn claude_local_md_alone_is_reported_the_same_way() {
-        let root = test_tree("local-retired");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "agents rules");
-        write(&root, "CLAUDE.local.md", "claude local");
-        let d = discover_instruction_files(&root, None, Some(&root));
-        assert_eq!(
-            d.files
-                .iter()
-                .map(|f| f.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["agents rules"]
-        );
-        assert_eq!(d.warnings.len(), 1);
-        assert!(
-            d.warnings[0].contains("CLAUDE.local.md is no longer read"),
-            "{:?}",
-            d.warnings
-        );
-    }
-
     #[test]
     fn chain_runs_root_to_cwd_and_ignores_dirs_above_the_git_root() {
         let base = test_tree("chain");
@@ -679,20 +586,5 @@ mod tests {
                 (InstructionScope::Local, "private"),
             ]
         );
-    }
-
-    #[test]
-    fn only_agents_local_is_read_when_both_local_names_exist() {
-        let root = test_tree("local-prefer");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.local.md", "agents local");
-        write(&root, "CLAUDE.local.md", "claude local");
-        let locals: Vec<String> = discover_instruction_files(&root, None, Some(&root))
-            .files
-            .into_iter()
-            .filter(|f| f.scope == InstructionScope::Local)
-            .map(|f| f.content)
-            .collect();
-        assert_eq!(locals, vec!["agents local".to_string()]);
     }
 }
