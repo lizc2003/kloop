@@ -395,11 +395,20 @@ async fn turn_rounds(
     let mut item_seq = 0u64;
     let mut rounds = 0;
     let mut structured_failures = 0usize;
+    // Everything the assistant said across the turn's rounds. The round cap is a
+    // spend bound, not a verdict on the work already paid for: returning an empty
+    // string on `MaxRounds` throws away every round the cap just billed, and the
+    // caller (a parent agent, most of all) has no way to recover it — it can only
+    // redo the whole thing.
+    let mut produced_text = String::new();
+    // How many times a retryable stream error was resumed in this turn. Bounded
+    // so a persistently failing upstream still terminates the turn.
+    let mut stream_resumes = 0u32;
     loop {
         if cfg.max_rounds.is_some_and(|limit| rounds >= limit) {
             return TurnOutcome {
                 reason: EndReason::MaxRounds,
-                final_text: String::new(),
+                final_text: produced_text,
                 rounds,
                 structured_output: None,
             };
@@ -566,11 +575,39 @@ async fn turn_rounds(
                 };
             }
             Sampled::Partial { error, blocks } => {
-                let final_text = text_content(&blocks);
+                let round_text = text_content(&blocks);
+                let partial_landed = !blocks.is_empty();
                 record_provider_assistant(history, &active_attempt, blocks);
+                append_produced(&mut produced_text, &round_text);
+                // The stream died mid-response after the model had already said
+                // something. Sampling cannot retry that — replaying the same
+                // request would re-emit what the user has seen — but continuing
+                // is a different move: `blocks` is the replayable partial (no
+                // unsigned reasoning, no tool call), so what just landed is a
+                // well-formed assistant turn, and the next request carries it as
+                // context instead of repeating it. That costs one round where
+                // ending the turn costs the whole turn. It also stays on the same
+                // attempt: no fallback switch, nothing the user saw sent twice.
+                //
+                // Empty means nothing landed — a complete-but-undispatched tool
+                // call, say. "Continue where you left off" with no assistant turn
+                // to continue from is worse than ending here.
+                if partial_landed && error.is_retryable() && stream_resumes < STREAM_RESUME_LIMIT {
+                    stream_resumes += 1;
+                    ui.emit(&Event::Note(format!(
+                        "stream interrupted after partial output; continuing from it ({stream_resumes}/{STREAM_RESUME_LIMIT}): {error}"
+                    )));
+                    // Same carry as a truncated round, and for the same reason:
+                    // the model is told to continue where it stopped, so the next
+                    // round returns only the remainder. Without this the resumed
+                    // half is the whole answer the caller sees.
+                    truncated_prefix.push_str(&round_text);
+                    history.record(Message::user_text(STREAM_RESUME_MSG));
+                    continue;
+                }
                 return TurnOutcome {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text,
+                    final_text: format!("{truncated_prefix}{round_text}"),
                     rounds: round,
                     structured_output: None,
                 };
@@ -620,6 +657,7 @@ async fn turn_rounds(
             ));
         }
         record_provider_assistant(history, &active_attempt, blocks.clone());
+        append_produced(&mut produced_text, &text_content(&blocks));
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
@@ -910,6 +948,25 @@ fn text_content(blocks: &[ContentBlock]) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// Cap on resuming a turn after a retryable mid-response stream failure. Bounds
+/// a flapping upstream: each resume costs a round, and a stream that keeps dying
+/// is a real outage the turn should surface rather than grind against.
+const STREAM_RESUME_LIMIT: u32 = 3;
+const STREAM_RESUME_MSG: &str = "Your previous response was cut off by a transient \
+connection failure, not by you. Continue exactly where you left off.";
+
+/// Append one round's assistant text to the turn's running record, keeping the
+/// rounds separated and skipping the (common) rounds that only issued tool calls.
+fn append_produced(produced: &mut String, round_text: &str) {
+    if round_text.trim().is_empty() {
+        return;
+    }
+    if !produced.is_empty() {
+        produced.push_str("\n\n");
+    }
+    produced.push_str(round_text);
 }
 
 const TRUNCATION_RECOVERY_LIMIT: u32 = 3;

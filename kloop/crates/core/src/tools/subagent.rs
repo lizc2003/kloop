@@ -74,8 +74,6 @@ struct RunAgentInput {
     #[serde(default)]
     background: bool,
     #[serde(default)]
-    max_rounds: Option<u64>,
-    #[serde(default)]
     isolation: Option<String>,
 }
 
@@ -100,15 +98,6 @@ pub(crate) async fn run_agent_admitted(
     let description = super::optional_display_description(input, "run_agent")?;
     let prompt = parsed.prompt;
     let _ = parsed.description;
-    let max_rounds = match parsed.max_rounds {
-        None => None,
-        Some(n) => {
-            if n == 0 {
-                bail!("run_agent: max_rounds must be a positive integer");
-            }
-            Some(usize::try_from(n).unwrap_or(usize::MAX))
-        }
-    };
     let background = parsed.background;
     let model = match parsed.model.as_deref() {
         Some(model) => Some(
@@ -139,7 +128,16 @@ pub(crate) async fn run_agent_admitted(
     };
     let agent = next_agent_label();
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
-    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type)?;
+    // A sub-agent runs until it answers. The round cap that used to live here was
+    // model-supplied, and the model has no basis for the number — see the schema
+    // test in tools/mod.rs.
+    let mut sub = build_sub_config(
+        ctx,
+        workspace,
+        /*max_rounds*/ None,
+        agent.clone(),
+        agent_type,
+    )?;
     if let Some(model) = model.as_ref() {
         sub.provider_route = sub
             .provider_route
@@ -1188,22 +1186,24 @@ mod tests {
         assert!(out.contains("cannot spawn"));
     }
 
+    /// `max_rounds` is gone from run_agent, and `deny_unknown_fields` makes that
+    /// visible instead of silently ignoring a cap the caller thinks it set.
     #[tokio::test]
-    async fn run_agent_rejects_non_positive_round_limit() {
+    async fn run_agent_no_longer_accepts_a_round_limit() {
         let ctx = test_ctx(0, "run-agent-zero-rounds");
         let (out, is_error) = run_tool(
             "run_agent",
-            json!({"prompt": "keep going", "max_rounds": 0}),
+            json!({"prompt": "keep going", "max_rounds": 12}),
             &ctx,
         )
         .await;
 
-        assert!(is_error);
-        assert_eq!(out, "run_agent: max_rounds must be a positive integer");
+        assert!(is_error, "{out}");
+        assert!(out.contains("max_rounds"), "{out}");
     }
 
-    /// Omitting max_rounds must not inherit the parent's guardrail or the old
-    /// sub-agent default of 15: the child runs until it produces a final answer.
+    /// A sub-agent never inherits the parent's guardrail and has no default cap:
+    /// the child runs until it produces a final answer.
     #[tokio::test]
     async fn run_agent_without_round_limit_runs_until_completed() {
         let mut turns = (0..16)
@@ -1477,30 +1477,66 @@ mod tests {
             name: "write_file".into(),
             input: json!({"path": "out.txt", "content": "x"}),
         };
-        // `max_rounds: 1` makes each sub-agent sample EXACTLY once, and so the two
-        // queued write turns map one-to-one onto the two sub-agents regardless
-        // of how their sampling interleaves (a shared mock queue can't otherwise
-        // guarantee each sub-agent gets a write). The write executes, then the
-        // round limit stops it.
-        let provider = Provider::mock(vec![vec![write.clone()], vec![write]]);
+        // A shared mock queue cannot by itself guarantee each sub-agent gets a
+        // write: whoever samples twice first would take both. Gating the two
+        // write turns pins one to each sub-agent's FIRST sample, and makes the
+        // test's other premise explicit — if the two run_agent calls did not run
+        // concurrently, the second `started` never arrives and this fails loudly
+        // instead of quietly writing both files into one tree.
+        let (started_a, started_a_rx) = tokio::sync::oneshot::channel();
+        let (release_a, release_a_rx) = tokio::sync::oneshot::channel();
+        let (started_b, started_b_rx) = tokio::sync::oneshot::channel();
+        let (release_b, release_b_rx) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![
+            kloop_provider::MockTurn::Gate {
+                started: started_a,
+                release: release_a_rx,
+                blocks: vec![write.clone()],
+            },
+            kloop_provider::MockTurn::Gate {
+                started: started_b,
+                release: release_b_rx,
+                blocks: vec![write],
+            },
+            // After its write, each sub-agent samples once more and ends here.
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "done".into(),
+            }]),
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "done".into(),
+            }]),
+        ]);
         let ctx = ctx_in(with_provider(test_ctx(0, "parallel"), provider), &repo);
 
-        let results = dispatch_tools(
+        let dispatch = dispatch_tools(
             vec![
                 (
                     "t1".into(),
                     "run_agent".into(),
-                    json!({"prompt": "a", "isolation": "worktree", "max_rounds": 1}),
+                    json!({"prompt": "a", "isolation": "worktree"}),
                 ),
                 (
                     "t2".into(),
                     "run_agent".into(),
-                    json!({"prompt": "b", "isolation": "worktree", "max_rounds": 1}),
+                    json!({"prompt": "b", "isolation": "worktree"}),
                 ),
             ],
             &ctx,
-        )
-        .await;
+        );
+        let coordinate = async {
+            let wait = std::time::Duration::from_secs(10);
+            tokio::time::timeout(wait, started_a_rx)
+                .await
+                .expect("first sub-agent never sampled")
+                .expect("first start signal dropped");
+            tokio::time::timeout(wait, started_b_rx)
+                .await
+                .expect("second sub-agent never sampled concurrently with the first")
+                .expect("second start signal dropped");
+            release_a.send(()).unwrap();
+            release_b.send(()).unwrap();
+        };
+        let (results, ()) = tokio::join!(dispatch, coordinate);
         assert_eq!(results.len(), 2);
 
         assert!(!repo.join("out.txt").exists(), "main repo stays clean");

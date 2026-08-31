@@ -275,3 +275,87 @@ provider 只占 31%,其余全花在本地——它检出了一个 git worktree,�
 - **缓存本身没问题。** kloop 的 `input` 严格追加、共享部分逐字节相同,`instructions` / `tools`
   完全一致;同一个 body 连发命中 97%。之前看到的"卡在 7680"是因为 kloop 每轮只加 150–500
   token,很少跨过 1024 的块边界,不是缓存不延伸。
+
+## 片 10 ✅ — 真实场景复测:仓库找错了,结论重来
+
+用户指出实测仓库是 `被审仓库`,不是 kloop 仓库。这推翻了
+片 9 那套「上下文不对称」的因果:**gateway 的 `CLAUDE.md` 内容就是 `@AGENTS.md`**,
+两个工具读的是同一份 15,960 字节文件,codex 也照着里面第 160 行跑了 `go test`、
+`make docs-check`。不对称在那里根本不存在。
+
+同 commit(`2bb28b48`)、同 xhigh、同 gateway 实测:
+
+| | 请求数 | 总提示量 | 缓存命中 | 单请求上下文 | 墙钟 | 产出 |
+| --- | --- | --- | --- | --- | --- | --- |
+| codex | 36 | 4.17M | 95% | 116k | 877s | 完整审查报告 |
+| kloop 第 1 次 | 49 | — | — | — | 817s | 死于上游 `server_error` |
+| kloop 第 2 次 | **70** | 5.58M | 82% | 80k | **1164s** | **交接摘要,不是审查** |
+
+(注:kloop 的 `Usage` 存的是 `input_tokens = 总量 − 命中量`,第一次算命中率时拿
+未命中部分当分母,得出 456% 这种不可能的数,已更正。)
+
+**70 对 36,正好一倍的往返**,这就是用户说的"慢一倍";墙钟只差 33%,因为 kloop 单
+请求上下文小、更快。
+
+排除掉的假设(都做了实测,免得后人重走):审批不是原因(24 个 bash 全默认放行,0 次
+被拒,连 `permissions.json` 都没生成);本地构建不是原因(整包跑和 `-run` 收窄都是 8
+秒);上游 `server_error` 打死整轮不是**这个**症状的原因(用户明确说跑完了)。
+
+### 慢的真正原因
+
+链条终点是一行代码:
+
+1. 主 agent 扇出两个后台子 agent,**模型自己填了 `max_rounds: 12` 和 `10`**
+2. 审 11 文件 / 1437 行新增的提交,这点轮数不够,两个子 agent 正好用满配额
+3. `agent.rs` 的 `MaxRounds` 提前返回写死 `final_text: String::new()` —— 22 个请求、
+   35 万 input token 的工作**全部丢弃**
+4. 父 agent 收到两句"未返回有效审查结论",只能自己重做(48 轮)
+5. 拖长后触发压缩,最终输出是上下文交接摘要而不是审查报告
+
+第 3 步是纯粹的 bug:下游 `subagent.rs:648` 明明写着
+`format!("[sub-agent stopped at its round limit]\n{}", outcome.final_text)`——**管道是
+通的,源头被写死成空串**。轮次上限的用意是"别失控地烧钱",不是"把已经烧掉的钱产出的
+东西也扔掉"。
+
+## 片 11 ✅ — 三处修改
+
+**(a) `MaxRounds` 返回已产出的文本。** 回合循环外加 `produced_text`,每轮
+`record_provider_assistant` 之后用 `append_produced` 追加该轮 assistant 文本(跳过只
+发工具调用的轮次,轮次之间空行分隔),`MaxRounds` 分支返回它。
+
+**(b) 可重试的流中断改为续跑,不再打死整轮。** `Sampled::Partial` 且
+`error.is_retryable()` 时:部分输出已由 `record_provider_assistant` 入库,而
+`replayable_partial` 早就滤掉了未签名 thinking 和全部 `ToolUse`,所以 history 里是一个
+合法的 assistant 轮次,从它往下发是安全的。于是记一条 `STREAM_RESUME_MSG` 续跑提示、
+`continue`,上限 `STREAM_RESUME_LIMIT = 3` 兜底 flapping 上游。
+
+这里有个**测试逼出来的修正**:第一版只 `continue`,结果 headless 那条
+`text_mode_preserves_transport_error_partial_and_exits_one` 红了——续跑之后模型只返回
+剩余部分,`final_text` 就只剩后半段,前半段从最终答案里丢了。截断续跑那条路早就用
+`truncated_prefix` 解决过同一个问题,所以续跑也押进同一个累加器。**如果当时把那条红
+测试当成"契约过时"直接改掉,这个 bug 就会带着修复一起进仓库。**
+
+**(c) `run_agent` 不再向模型暴露 `max_rounds`。** 模型没有任何依据去猜这个数——它不知
+道每轮多贵,也不知道任务要几轮,这次猜了 12 和 10。要"别做太深"应该写在 prompt 里,而
+不是设一个会把已完成工作作废的硬闸。schema、`RunAgentInput` 字段与解析一并删除,子
+agent 固定无上限;人显式设的 `--max-rounds`(headless 跑飞兜底)保留。
+`compact.rs` / `tools/mod.rs` 里那几处 `max_rounds: Some(5)` 是**测试脚手架**的 Config,
+不是生产路径。
+
+### 验证 ✅
+
+新增五条测试:
+
+- `max_rounds_returns_the_text_produced_before_the_cap` — 断言整串 `"finding one\n\nfinding two"`
+- `retryable_stream_failure_after_output_continues_the_turn` — 断言 `Completed` 且
+  `final_text == "first halfsecond half"`(两半都在)
+- `fatal_stream_failure_after_output_still_ends_the_turn` — 不可重试仍然结束,但仍带回产出
+- `text_mode_resumes_a_dropped_stream_and_keeps_both_halves` — headless 退出码 0、输出两半
+- `text_mode_preserves_a_fatal_stream_partial_and_exits_one` — 致命错误仍退出 1 且保留部分输出
+- `run_agent_no_longer_accepts_a_round_limit` — `deny_unknown_fields` 让"这个参数没了"
+  可见,而不是静默忽略一个调用方以为设上了的上限
+
+另记一条环境教训:并行跑的审查任务会在同一个 target 目录里调 cargo,把 provider 的构建
+产物弄成过期状态,表现为 `stream_attempt` "takes 5 arguments but 6 supplied",而报错指向
+的 `lib.rs:425` 是一行文档注释。`touch crates/provider/src/lib.rs` 强制重建即可——**当
+编译器指的行号明显不是代码时,先怀疑构建缓存,别怀疑源码**。

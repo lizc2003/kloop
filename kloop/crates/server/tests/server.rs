@@ -321,10 +321,10 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
         let (provider_catalog, provider_route) =
             kloop_core::provider_route::ProviderCatalog::from_provider(
                 "mock",
-                Provider::mock_scripted(vec![MockTurn::PartialError(
-                    vec![text("half answer")],
-                    "stream dropped".into(),
-                )]),
+                Provider::mock_scripted(vec![
+                    MockTurn::PartialError(vec![text("half answer")], "stream dropped".into()),
+                    MockTurn::Blocks(vec![text(" and the rest")]),
+                ]),
                 cfg.provider_route.primary_model(),
                 cfg.provider_route.allowed_models().to_vec(),
                 cfg.provider_route.fallback_model().map(str::to_string),
@@ -2526,7 +2526,7 @@ async fn task_graph_is_isolated_per_server_thread() {
 }
 
 #[tokio::test]
-async fn partial_stream_is_recoverable_with_error_terminal() {
+async fn partial_stream_is_sealed_then_continued_and_stays_recoverable() {
     let dirs = test_dirs("partial-history");
     let mut client = start_server(partial_factory(dirs.offload.clone()), &dirs);
     let thread_id = client.init_and_start().await;
@@ -2540,7 +2540,10 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
     let log = client
         .recv_until(|message| message["method"] == "turn/completed")
         .await;
-    assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "error");
+    // The transient drop is resumed, so the turn ends normally — but the wire
+    // contract this test guards is unchanged: one terminal, and the interrupted
+    // item sealed exactly once rather than left open or re-opened.
+    assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "completed");
     assert_eq!(
         log.iter()
             .filter(|message| message["method"] == "turn/completed")
@@ -2548,12 +2551,14 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
         1,
         "the turn has exactly one terminal notification"
     );
+    let completed_items: Vec<&Value> = log
+        .iter()
+        .filter(|message| message["method"] == "item/completed")
+        .collect();
     assert_eq!(
-        log.iter()
-            .filter(|message| message["method"] == "item/completed")
-            .count(),
-        1,
-        "the partial assistant item is completed exactly once"
+        completed_items.len(),
+        2,
+        "the sealed partial and the continuation are each completed once"
     );
 
     client
@@ -2561,14 +2566,16 @@ async fn partial_stream_is_recoverable_with_error_terminal() {
         .await;
     let read = client.recv().await;
     let thread = &read["result"]["thread"];
-    assert_eq!(thread["messages"].as_array().unwrap().len(), 2);
+    // The partial survives a fresh read: it is a real assistant message in the
+    // thread, followed by the nudge and the continuation.
+    assert_eq!(thread["messages"].as_array().unwrap().len(), 4);
     assert_eq!(thread["messages"][1]["content"][0]["text"], "half answer");
+    assert_eq!(thread["messages"][3]["content"][0]["text"], " and the rest");
     assert_eq!(
         thread["terminals"],
         json!([{
-            "afterMessage": 2,
-            "status": "error",
-            "error": "provider transport error: stream dropped",
+            "afterMessage": 4,
+            "status": "completed",
         }])
     );
 

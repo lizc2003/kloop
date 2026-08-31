@@ -416,11 +416,43 @@ mod tests {
         );
     }
 
+    /// A dropped stream is transient, so the turn resumes and the caller gets the
+    /// whole answer — the half already streamed is carried into the final text
+    /// rather than replaced by the continuation.
     #[tokio::test]
-    async fn text_mode_preserves_transport_error_partial_and_exits_one() {
-        let cfg = Arc::new(mock_scripted_config(vec![MockTurn::PartialError(
+    async fn text_mode_resumes_a_dropped_stream_and_keeps_both_halves() {
+        let cfg = Arc::new(mock_scripted_config(vec![
+            MockTurn::PartialError(vec![text_block("half answer")], "stream dropped".into()),
+            MockTurn::Blocks(vec![text_block(" and the rest")]),
+        ]));
+        let history = History::new(cfg.offload_dir.clone());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let result = run_headless(
+            cfg,
+            history,
+            "hl".into(),
+            "request".into(),
+            Vec::new(),
+            false,
+            out.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            String::from_utf8(out.lock().unwrap().clone()).unwrap(),
+            "half answer and the rest\n"
+        );
+    }
+
+    /// A fatal stream failure still exits one, and still prints what was produced
+    /// before it — losing the partial is what the original regression was about.
+    #[tokio::test]
+    async fn text_mode_preserves_a_fatal_stream_partial_and_exits_one() {
+        let cfg = Arc::new(mock_scripted_config(vec![MockTurn::BlocksThenError(
             vec![text_block("half answer")],
-            "stream dropped".into(),
+            kloop_provider::ProviderFailure::protocol("malformed frame"),
         )]));
         let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));

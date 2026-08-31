@@ -1643,7 +1643,7 @@ async fn retry_recovers_from_transient_errors() {
 /// Once text is visible, a broken stream is closed in place and not retried:
 /// retrying would duplicate a partial answer in every event-driven front-end.
 #[tokio::test]
-async fn partial_stream_error_completes_open_item_without_retry() {
+async fn partial_stream_seals_the_open_item_then_continues_from_it() {
     use kloop_provider::MockTurn;
 
     struct EventUi(std::sync::Mutex<Vec<Event>>);
@@ -1655,7 +1655,7 @@ async fn partial_stream_error_completes_open_item_without_retry() {
 
     let (provider, seen) = Provider::mock_recording(vec![
         MockTurn::PartialError(text("half answer"), "stream dropped".into()),
-        MockTurn::Blocks(text("must not retry")),
+        MockTurn::Blocks(text(" and the rest")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "partial-stream").test_clone();
     cfg.set_test_route_models("mock", Some("must-not-run-after-visible-output"));
@@ -1674,20 +1674,29 @@ async fn partial_stream_error_completes_open_item_without_retry() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
-    let EndReason::Error(TurnError::ProviderFailure(failure)) = &outcome.reason else {
-        panic!("expected typed provider failure, got {:?}", outcome.reason)
-    };
-    assert_eq!(
-        failure.kind(),
-        &kloop_provider::ProviderFailureKind::Transport
-    );
-    assert!(failure.after_semantic_output());
-    assert!(failure.to_string().contains("stream dropped"));
-    assert_eq!(outcome.final_text, "half answer");
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        1,
-        "visible output must not be retried"
+    assert_eq!(outcome.reason, EndReason::Completed);
+    // Both halves reach the caller: the model was told to continue where it
+    // stopped, so the second round carries only the remainder.
+    assert_eq!(outcome.final_text, "half answer and the rest");
+    // The invariant this test has always guarded is that visible output is never
+    // produced twice — stated directly rather than through a request count. The
+    // second request is a *continuation* (the partial rides in its history), on
+    // the same attempt: the fallback model must never run once the user has seen
+    // output, because that is the shape that duplicates it.
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.model, "mock");
+    }
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == "half answer"
+            ))),
+        "the continuation carries the partial instead of re-requesting it"
     );
     assert_eq!(
         history.messages(),
@@ -1699,8 +1708,15 @@ async fn partial_stream_error_completes_open_item_without_retry() {
                 }],
                 cfg.provider_route.primary_attempt().provenance(3),
             ),
+            Message::user_text(super::STREAM_RESUME_MSG),
+            Message::assistant_from_provider(
+                vec![ContentBlock::Text {
+                    text: " and the rest".into(),
+                }],
+                cfg.provider_route.primary_attempt().provenance(5),
+            ),
         ],
-        "the completed UI item must be recoverable after restart"
+        "the sealed partial and its continuation must both be recoverable after restart"
     );
     assert_eq!(
         crate::rollout::load_session_snapshot(&session)
@@ -1709,8 +1725,19 @@ async fn partial_stream_error_completes_open_item_without_retry() {
         history.messages(),
         "the partial assistant must survive a fresh rollout read"
     );
+    // Item lifecycle only: the per-round Usage gauge carries a char-heuristic
+    // estimate, and pinning that number here would make this test fail for
+    // reasons that have nothing to do with what it checks.
+    let events: Vec<Event> = event_ui
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| !matches!(event, Event::Usage(_)))
+        .cloned()
+        .collect();
     assert_eq!(
-        *event_ui.0.lock().unwrap(),
+        events,
         vec![
             Event::ItemStarted {
                 id: "msg-0".into(),
@@ -1723,11 +1750,36 @@ async fn partial_stream_error_completes_open_item_without_retry() {
                 id: "msg-0".into(),
                 delta: Delta::Text("half answer".into()),
             },
+            // The open item is sealed as Failed before anything else happens —
+            // the UI never leaves a half-streamed message hanging in progress.
             Event::ItemCompleted {
                 id: "msg-0".into(),
                 item: Item::AssistantMessage {
                     text: "half answer".into(),
                     status: crate::event::ItemStatus::Failed,
+                },
+            },
+            Event::Note(format!(
+                "stream interrupted after partial output; continuing from it (1/{}): {}",
+                super::STREAM_RESUME_LIMIT,
+                "provider transport error: stream dropped"
+            )),
+            Event::ItemStarted {
+                id: "msg-1".into(),
+                item: Item::AssistantMessage {
+                    text: String::new(),
+                    status: crate::event::ItemStatus::InProgress,
+                },
+            },
+            Event::ItemDelta {
+                id: "msg-1".into(),
+                delta: Delta::Text(" and the rest".into()),
+            },
+            Event::ItemCompleted {
+                id: "msg-1".into(),
+                item: Item::AssistantMessage {
+                    text: " and the rest".into(),
+                    status: crate::event::ItemStatus::Completed,
                 },
             },
         ]
@@ -1737,13 +1789,18 @@ async fn partial_stream_error_completes_open_item_without_retry() {
 
 #[tokio::test]
 async fn semantic_partial_preserves_signed_reasoning_provenance() {
-    let (provider, seen) = Provider::mock_recording(vec![MockTurn::BlocksThenError(
-        vec![AssistantBlock::Thinking {
-            thinking: "summary".into(),
-            signature: "opaque".into(),
-        }],
-        ProviderFailure::transport("reasoning stream dropped"),
-    )]);
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::BlocksThenError(
+            vec![AssistantBlock::Thinking {
+                thinking: "summary".into(),
+                signature: "opaque".into(),
+            }],
+            ProviderFailure::transport("reasoning stream dropped"),
+        ),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "answer".into(),
+        }]),
+    ]);
     let cfg = compaction_cfg(provider, 200_000, "partial-reasoning");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1751,11 +1808,11 @@ async fn semantic_partial_preserves_signed_reasoning_provenance() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
-    let EndReason::Error(TurnError::ProviderFailure(failure)) = outcome.reason else {
-        panic!("expected typed provider failure")
-    };
-    assert!(failure.after_semantic_output());
-    assert_eq!(seen.lock().unwrap().len(), 1);
+    // The subject is provenance on the salvaged reasoning block, not how the
+    // turn ended: signed thinking survives the interruption and is replayed as a
+    // provider-attributed assistant message, which is what makes continuing legal.
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(seen.lock().unwrap().len(), 2);
     assert_eq!(
         history.messages()[1],
         mock_assistant(
@@ -1798,10 +1855,10 @@ async fn complete_tool_block_seals_retry_without_dispatching_it() {
 }
 
 #[tokio::test]
-async fn subagent_internal_delta_also_seals_retry() {
+async fn subagent_internal_delta_seals_then_continues_in_its_own_history() {
     let (provider, seen) = Provider::mock_recording(vec![
         MockTurn::PartialError(text("private partial"), "child stream dropped".into()),
-        MockTurn::Blocks(text("must not retry")),
+        MockTurn::Blocks(text(" and the rest")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "subagent-seals-retry").test_clone();
     cfg.set_test_route_models("mock", Some("must-not-fallback"));
@@ -1813,10 +1870,15 @@ async fn subagent_internal_delta_also_seals_retry() {
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
 
-    assert!(
-        matches!(&outcome.reason, EndReason::Error(error) if error.contains("child stream dropped"))
-    );
-    assert_eq!(seen.lock().unwrap().len(), 1);
+    // A sub-agent resumes the same way the root does, and — the point of this
+    // test — its partial stays in its OWN history; the fallback model, named to
+    // fail loudly if it ever ran, must not be reached.
+    assert_eq!(outcome.reason, EndReason::Completed);
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.model, "mock");
+    }
     assert_eq!(
         history.messages(),
         &[
@@ -1827,8 +1889,20 @@ async fn subagent_internal_delta_also_seals_retry() {
                 }],
                 "mock",
             ),
+            Message::user_text(super::STREAM_RESUME_MSG),
+            Message::assistant_from_provider(
+                vec![ContentBlock::Text {
+                    text: " and the rest".into(),
+                }],
+                ProviderResponseProvenance {
+                    origin_boundary: 4,
+                    ..mock_assistant(Vec::new(), "mock")
+                        .provider_provenance
+                        .unwrap()
+                },
+            ),
         ],
-        "the child records replay-safe partial text in its own history without retrying"
+        "the child's replay-safe partial and its continuation stay in the child's own history"
     );
 }
 
@@ -1933,6 +2007,96 @@ async fn endless_tool_calls_hit_max_rounds() {
     assert_eq!(outcome.rounds, 3);
     // 1 user + 3 * (assistant + tool_results): every round paired.
     assert_eq!(history.messages().len(), 7);
+}
+
+/// The round cap bounds spend; it does not void what the spend bought. Returning
+/// an empty string here is how a capped sub-agent used to hand its parent nothing
+/// after burning every round it was given — the parent could only redo the work.
+#[tokio::test]
+async fn max_rounds_returns_the_text_produced_before_the_cap() {
+    let provider = Provider::mock(vec![
+        vec![
+            AssistantBlock::Text {
+                text: "finding one".into(),
+            },
+            tool_use("t1", "echo 1"),
+        ],
+        vec![
+            AssistantBlock::Text {
+                text: "finding two".into(),
+            },
+            tool_use("t2", "echo 2"),
+        ],
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "maxrounds-text").test_clone();
+    cfg.max_rounds = Some(2);
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("review this"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::MaxRounds);
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.final_text, "finding one\n\nfinding two");
+}
+
+/// A transient stream failure mid-response used to end the whole turn: sampling
+/// cannot replay a request whose output the user already saw, so it gave up. But
+/// the partial is recorded first, and `replayable_partial` has already dropped
+/// unsigned reasoning and every tool call, so what is in history is a well-formed
+/// assistant turn — continuing from it costs one round instead of the turn.
+#[tokio::test]
+async fn retryable_stream_failure_after_output_continues_the_turn() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::BlocksThenError(
+            vec![AssistantBlock::Text {
+                text: "first half".into(),
+            }],
+            ProviderFailure::transport("connection reset"),
+        ),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "second half".into(),
+        }]),
+    ]);
+    let cfg = Arc::new(compaction_cfg(provider, 200_000, "stream-resume").test_clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write it out"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    // Both halves: the model was told to continue where it stopped, so the
+    // second round carries only the remainder.
+    assert_eq!(outcome.final_text, "first halfsecond half");
+    assert_eq!(outcome.rounds, 2);
+}
+
+/// The resume is for transient failures only: a fatal one after partial output
+/// still ends the turn, and still hands back what was produced.
+#[tokio::test]
+async fn fatal_stream_failure_after_output_still_ends_the_turn() {
+    let provider = Provider::mock_scripted(vec![MockTurn::BlocksThenError(
+        vec![AssistantBlock::Text {
+            text: "all I got".into(),
+        }],
+        ProviderFailure::protocol("malformed frame"),
+    )]);
+    let cfg = Arc::new(compaction_cfg(provider, 200_000, "stream-fatal").test_clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write it out"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(outcome.reason, EndReason::Error(_)),
+        "{:?}",
+        outcome.reason
+    );
+    assert_eq!(outcome.final_text, "all I got");
 }
 
 /// With no configured guardrail, the loop continues beyond the former default
