@@ -690,7 +690,11 @@ sub-agent sidechains hidden, `limit` capped at 500); `thread/read {threadId}` �
 `{thread:{id,cwd,route,resumable}, messageCount}`; `turn/start {threadId,
 input}` → `{turn:{id}}`, `turn/steer {threadId, input}` → `{turnId}`,
 `turn/interrupt {threadId}`. Old rollouts without route timelines are rejected,
-not migrated. `input` is a string or an array of content parts
+not migrated. A `threadId` the client supplies must be ASCII letters, digits,
+`.`, `-` or `_` and cannot start with `.` — server-minted ids
+(`YYYYMMDD-HHMMSS[-N]`) always are, and the constraint is what lets a thread id
+be used unescaped as a filename, an HTTP header value, and a log field.
+`input` is a string or an array of content parts
 (`{type:"text",text}` / `{type:"image",source:{…}}`).
 
 **Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | threadId?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.

@@ -152,6 +152,20 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 **未做**:`x-claude-code-agent-id` / `parent-agent-id`。kloop 的子 agent 在网关侧目前不可分辨(内部有 `child_session_id = {parent}-{agent}`,只用于转录文件名)。这属于成本归属而非缓存亲和,不在本次目标内。Chat 轨也未动(无实测)。
 
+### 片 7 — 收紧会话 id 字符集 ✅（2026-08-31；提交 SHA 以本条所在提交为准；用户拍板「收紧,不用考虑兼容性」）
+
+片 6 在 provider 层加了一道「非 ASCII 不发 header」的过滤,用户追问:**thread id 为什么要允许非 ASCII?**
+
+查下来答案是——**没有理由,那是缺省不是决定**。`checked_session_path` 那组校验只回答路径穿越(非空、非 `.`/`..`、无 `/`、无 `\`、无控制字符、单路径组件、leaf 非符号链接),ASCII 与它正交,所以没人挡。
+
+**先纠正调查中期一个说过头的结论。** 我一度断言这是活的正确性 bug,给出两个方向(`thread/start` 的 `create_new` claim 撞车、`thread/resume` 恢复没点名的会话)。在这台 macOS 上实测文件系统行为属实——NFC `é`(`\xc3\xa9`)与 NFD `é`(`e\xcc\x81`)字节不同,`create_new` 第二个报 `FileExistsError`,目录里只有一个文件。**但可达性不成立**:`thread_start`(`server/src/lib.rs:654`)用 `rollout::new_session_id` **服务端生成** id,客户端只能在 `resume`/`fork` 递 id 且必走 `checked_session_path`;而纯 ASCII 字符串没有非 ASCII 的 Unicode 规范等价形式,所以客户端递的非 ASCII id 永远匹配不到任何现有会话。文件系统那个观测是真的,把它接到 kloop 上的那条链是我编的。
+
+**收紧的真实理由**:「会话 id 是安全 ASCII token」此前是**偶然事实而非被保证的性质**,下游想依赖只能各自重新推导——片 6 那道 header 过滤正是这么来的。收紧后它成为显式不变量,文件名/header/日志/wire 可直接依赖。成本为零:kloop 铸的每个 id 都在新集合内。
+
+新规则 `session_id_is_safe`:非空、不以 `.` 开头、只含 `[A-Za-z0-9._-]`。前导点规则蕴含 `.`/`..`,字符集蕴含分隔符与控制字符,故旧的路径组件检查是冗余的,一并删去;符号链接 leaf 检查保留。片 6 那道 provider 过滤**也保留**——provider 不该信任调用方。
+
+测试扩充既有的 `checked_session_paths_reject_traversal_and_symlink_leaves`:除原有穿越用例,新增非 ASCII、空格、前导点、控制字符、集合外标点五类拒绝;并**正向断言** kloop 自己铸的 id 全部通过(`new_session_id` 实时产物、`20260831-083106`、`-2` 撞名变体、`-agent-1` 子 agent 形态)——防止收紧收过头砸到自己。
+
 ### 片 5 — 未做:effort 档位
 
 慢的主因(xhigh vs codex 实际在跑的 medium)是**用户配置**不是代码问题,`~/.kloop/config.toml` 改 `effort = "medium"` 即可,代码不动。

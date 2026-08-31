@@ -1639,18 +1639,36 @@ pub fn session_path(sessions_dir: &Path, id: &str) -> PathBuf {
     sessions_dir.join(format!("{id}.jsonl"))
 }
 
+/// The character set a session id may use. Every id kloop mints already fits —
+/// CLI and server stems are `YYYYMMDD-HHMMSS[-N]`, sub-agent transcripts append
+/// `-agent-N` — so this rejects nothing kloop produces.
+///
+/// The rule it replaced asked only about path traversal (no `/`, no `..`, no
+/// control characters), which left non-ASCII ids accepted. That was never
+/// reachable into a wrong session — the ids kloop mints are all ASCII, and a
+/// pure-ASCII name has no non-ASCII Unicode-canonical equivalent, so a
+/// non-ASCII id could not collide with one on a normalizing filesystem — but
+/// "no caller happens to produce one" is a weaker guarantee than "none is
+/// accepted", and it was the only guarantee downstream had. Consumers now get
+/// an id that is safe as a filename *and* as an HTTP header value, a log field,
+/// and a wire token, instead of each re-deriving that for itself (the gateway
+/// session header in `provider/src/anthropic.rs` had to).
+///
+/// The leading-dot rule subsumes `.` and `..`; the charset subsumes separators
+/// and control characters, so the old path-component check is implied.
+fn session_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
 pub fn checked_session_path(sessions_dir: &Path, id: &str) -> io::Result<PathBuf> {
-    if id.is_empty()
-        || id == "."
-        || id == ".."
-        || id.contains('/')
-        || id.contains('\\')
-        || id.chars().any(char::is_control)
-        || Path::new(id).components().count() != 1
-    {
+    if !session_id_is_safe(id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session id must be a single safe filename",
+            "session id must be ASCII letters, digits, '.', '-' or '_', and cannot start with '.'",
         ));
     }
     let path = session_path(sessions_dir, id);
@@ -2967,8 +2985,33 @@ mod tests {
         let path = temp_file("checked-path");
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();
-        for id in ["", ".", "..", "../outside", "a/b", "a\\\\b", "/tmp/out"] {
+        for id in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\\\b",
+            "/tmp/out",
+            // Beyond traversal: an id is a token every downstream consumer can
+            // hand to a filesystem, an HTTP header, a log, and the wire.
+            "线程-1",    // non-ASCII
+            "a b",       // space
+            ".hidden",   // leading dot
+            "a\\u{7f}b", // control character
+            "sess:1",    // punctuation outside the set
+        ] {
             assert!(checked_session_path(dir, id).is_err(), "accepted {id:?}");
+        }
+        // Everything kloop mints must still pass: CLI/server stems and the
+        // sub-agent transcripts derived from them.
+        for id in [
+            new_session_id(dir).as_str(),
+            "20260831-083106",
+            "20260831-083106-2",
+            "20260831-083106-agent-1",
+        ] {
+            assert!(checked_session_path(dir, id).is_ok(), "rejected {id:?}");
         }
         let target = dir.join("outside.jsonl");
         std::fs::write(&target, b"not a session").unwrap();
