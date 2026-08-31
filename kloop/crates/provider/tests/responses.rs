@@ -1165,8 +1165,92 @@ async fn out_of_band_codex_event_after_terminal_is_ignored() {
     ));
 }
 
-/// The out-of-band window is narrow: any non-`codex.` unknown event is still
-/// a fatal protocol error (fail-closed boundary preserved).
+/// gateway's `keepalive` heartbeat, on the real wire shape, is skipped like
+/// `codex.*`. It arrives while the model is still thinking — the more thinking,
+/// the more of them — so a high reasoning effort makes it the norm, not an edge
+/// case, and treating it as fatal killed every xhigh turn.
+#[tokio::test]
+async fn keepalive_event_is_ignored_mid_stream() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"sequence_number": 2, "type": "keepalive"}),
+            json!({"sequence_number": 3, "type": "keepalive"}),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::TextDelta(t) if t == "hi"));
+    assert!(matches!(
+        &ok[1],
+        StreamEvent::BlockDone(AssistantBlock::Text { text }) if text == "hi"
+    ));
+    assert!(matches!(
+        &ok[2],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
+    ));
+    assert_eq!(ok.len(), 3);
+}
+
+/// A `keepalive` after the semantic terminal is exempt from the terminal-after
+/// guard too — both rejection points treat the out-of-band list alike.
+#[tokio::test]
+async fn keepalive_after_terminal_is_ignored() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.completed", "response": {"id": "r", "status": "completed"}}),
+            json!({"sequence_number": 9, "type": "keepalive"}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        })]
+    ));
+}
+
+/// The out-of-band window is narrow: any event outside the recognized list is
+/// still a fatal protocol error (fail-closed boundary preserved), and the
+/// message names the offender — identifying `keepalive` otherwise cost an SSE
+/// capture, because the error said only "an unknown semantic event".
 #[tokio::test]
 async fn unknown_non_codex_event_still_fails_closed() {
     let server = MockServer::start().await;
@@ -1184,6 +1268,37 @@ async fn unknown_non_codex_event_still_fails_closed() {
     let error = events.into_iter().next().unwrap().unwrap_err();
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
     assert!(!error.is_retryable());
+    assert_eq!(
+        error.to_string(),
+        "provider protocol error: openai-responses returned an unknown semantic event: \
+         some.unknown.event"
+    );
+}
+
+/// A hostile or runaway event name cannot turn the error into an unbounded
+/// echo of provider bytes.
+#[tokio::test]
+async fn unknown_event_name_is_bounded_in_the_error() {
+    let server = MockServer::start().await;
+    let long = "x".repeat(500);
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({ "type": long }),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "provider protocol error: openai-responses returned an unknown semantic event: {}…",
+            "x".repeat(80)
+        )
+    );
 }
 
 #[tokio::test]

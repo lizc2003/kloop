@@ -280,11 +280,15 @@ fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, Provide
     Ok(kind)
 }
 
-/// gateway/Codex 代理往 Responses 流里塞的厂商带外事件(如
-/// `codex.rate_limits`)只携带限流遥测、不属官方语义族——识别后跳过,
-/// 其余未知事件仍 fail-closed(见 match 兜底)。对齐 anthropic 的 `ping` 处理。
+/// gateway/Codex 代理往 Responses 流里塞的厂商带外事件只携带遥测或心跳、
+/// 不属官方语义族——识别后跳过,其余未知事件仍 fail-closed(见 match 兜底)。
+/// 对齐 anthropic 的 `ping` 处理。名单两类:
+/// - `codex.*`:厂商命名空间前缀,目前只见 `codex.rate_limits` 的限流遥测。
+/// - `keepalive`:裸名心跳,gateway 在模型思考期间填。填得多少只取决于思考
+///   多久——实测 effort=low 一个没有,xhigh 一轮 2~14 个——所以它对高 effort
+///   是常态而非异常。
 fn is_out_of_band(event: &str) -> bool {
-    event.starts_with("codex.")
+    event.starts_with("codex.") || event == "keepalive"
 }
 
 fn response_identity(response: &Value) -> Result<(&str, &str), ProviderFailure> {
@@ -1157,7 +1161,14 @@ pub(super) async fn stream(
                     return Err(crate::stream_error("openai-responses", label));
                 }
                 _ if is_out_of_band(event) => {}
-                _ => return Err(protocol("returned an unknown semantic event")),
+                // Name the offender: without it a new vendor event costs an SSE
+                // capture to identify (how `keepalive` was found).
+                _ => {
+                    return Err(protocol(format!(
+                        "returned an unknown semantic event: {}",
+                        bounded_reason(event)
+                    )));
+                }
             }
         }
         if let Some(completion) = completion.take() {

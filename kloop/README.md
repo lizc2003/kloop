@@ -21,9 +21,10 @@ validate five architectural bets before committing to a larger agent design.
    translate Anthropic native SSE and OpenAI-compat `tool_calls` streaming
    into one `StreamEvent` enum. A Mock provider enables keyless end-to-end
    runs. The Responses adapter passes gateway/Codex vendor out-of-band
-   telemetry (`codex.*`, e.g. `codex.rate_limits`) through as a no-op both
-   before and after the terminal — mirroring Anthropic's `ping` — while every
-   other unknown SSE event still fails closed. Responses function-call
+   events — `codex.*` telemetry (e.g. `codex.rate_limits`) and the `keepalive`
+   heartbeat gateway emits while the model is thinking — through as a no-op
+   both before and after the terminal, mirroring Anthropic's `ping`. Every
+   other unknown SSE event still fails closed, naming the event. Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas
    but echo a pretty-printed `.done`), while text and reasoning stay byte-exact;
    genuinely divergent or non-JSON arguments still fail closed.
