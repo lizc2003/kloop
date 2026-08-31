@@ -1652,15 +1652,43 @@ fn sync_parent(_parent: &std::fs::File, _tool: &str, _display_path: &str) -> Res
     bail!("safe file mutation is unsupported on this platform")
 }
 
+/// How much of an offloaded output one `read_offloaded` call returns. Must stay
+/// strictly below [`OFFLOAD_CAP_CHARS`] with room for the continuation line,
+/// because a reply at or over the cap is offloaded again on the way into the
+/// history: the model then gets a byte-identical preview under a fresh id and
+/// has burned a round trip for nothing. Windowing is what makes the escape hatch
+/// terminate — every call either delivers the tail or names the next offset.
+pub(super) const OFFLOAD_WINDOW_CHARS: usize = 6000;
+
 pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "id", "read_offloaded")?;
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         bail!("read_offloaded: invalid id (only [A-Za-z0-9-] allowed)");
     }
     let path = ctx.cfg.offload_dir.join(format!("{id}.txt"));
-    tokio::fs::read_to_string(&path)
+    let content = tokio::fs::read_to_string(&path)
         .await
-        .with_context(|| format!("read_offloaded: no offloaded output with id {id}"))
+        .with_context(|| format!("read_offloaded: no offloaded output with id {id}"))?;
+    let start = integer_arg(input, "char_offset", "read_offloaded")?.unwrap_or(0);
+    let total = content.chars().count();
+    if start > total {
+        bail!("read_offloaded: char_offset {start} is past the end of {id} ({total} chars)");
+    }
+    let window: String = content
+        .chars()
+        .skip(start)
+        .take(OFFLOAD_WINDOW_CHARS)
+        .collect();
+    let end = start.saturating_add(window.chars().count());
+    if end < total {
+        // The next offset is spelled out so the model copies a number instead of
+        // deriving one — the unit here is chars, unlike read_file's line offset.
+        Ok(format!(
+            "{window}\n[chars {start}..{end} of {total}; call read_offloaded again with char_offset={end} for the rest]"
+        ))
+    } else {
+        Ok(window)
+    }
 }
 
 #[cfg(test)]
@@ -3274,6 +3302,56 @@ mod tests {
             run_tool("read_offloaded", json!({"id": "../../etc/passwd"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("invalid id"));
+        let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
+    }
+
+    /// The escape hatch has to terminate. Before windowing, fetching an output
+    /// larger than the history cap produced a reply that was itself offloaded,
+    /// so the model got back the same preview under a new id — a round trip that
+    /// bought nothing, at exactly the size `read_offloaded` exists for.
+    #[tokio::test]
+    async fn read_offloaded_windows_a_large_output_without_spilling_again() {
+        let ctx = test_ctx(0, "offloaded-window");
+        std::fs::create_dir_all(&ctx.cfg.offload_dir).unwrap();
+        let payload: String = (0..40_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        std::fs::write(ctx.cfg.offload_dir.join("off-8888.txt"), &payload).unwrap();
+
+        let mut seen = String::new();
+        let mut offset = 0usize;
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            assert!(calls <= 16, "windowing did not terminate");
+            let input = json!({"id": "off-8888", "char_offset": offset});
+            let (out, is_error) = run_tool("read_offloaded", input, &ctx).await;
+            assert!(!is_error, "{out}");
+            assert!(
+                out.chars().count() < crate::history::OFFLOAD_CAP_CHARS,
+                "a reply at or over the cap would be offloaded again"
+            );
+            match out.rsplit_once("char_offset=") {
+                Some((body, rest)) => {
+                    let next: usize = rest.trim_end_matches(" for the rest]").parse().unwrap();
+                    seen.push_str(body.rsplit_once("\n[chars ").unwrap().0);
+                    assert_eq!(next, offset + super::OFFLOAD_WINDOW_CHARS);
+                    offset = next;
+                }
+                None => {
+                    seen.push_str(&out);
+                    break;
+                }
+            }
+        }
+        assert_eq!(seen, payload);
+
+        // An offset past the end is an error, not an empty final window that
+        // would read as "done" to the model.
+        let input = json!({"id": "off-8888", "char_offset": 40_001});
+        let (out, is_error) = run_tool("read_offloaded", input, &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("past the end"), "{out}");
         let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
     }
 }

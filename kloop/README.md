@@ -6,9 +6,13 @@ validate five architectural bets before committing to a larger agent design.
 ## The five bets
 
 1. **Append-only history + offload at record time.** History is only ever
-   appended. A tool result over 8000 chars is spilled to the session store
-   when recorded; the history keeps a head/tail preview plus a pointer, and a
-   `read_offloaded` tool fetches the full output on demand.
+   appended. A tool result over `OFFLOAD_CAP_CHARS` (8000) is spilled to the
+   session store when recorded; the history keeps a head/tail preview plus a
+   pointer, and `read_offloaded` fetches the output on demand — in windows of
+   `OFFLOAD_WINDOW_CHARS` (6000), each reply naming the `char_offset` to resume
+   from. The window is what makes the hatch terminate: a reply at or over the
+   cap would be offloaded on its own way into history, handing the model back a
+   byte-identical preview under a fresh id.
 2. **Continuation signal = presence of `tool_use` blocks.** Never
    `stop_reason` — it is unreliable across providers.
 3. **Concurrency safety decided per call, by name AND input.**

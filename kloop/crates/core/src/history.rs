@@ -26,6 +26,13 @@ static NEXT_OFFLOAD_ID: AtomicUsize = AtomicUsize::new(1);
 const HEAD_CHARS: usize = 1500;
 const TAIL_CHARS: usize = 500;
 
+/// Char count above which a text tool result spills to disk instead of entering
+/// the history. Public because `read_offloaded` has to stay strictly under it:
+/// its whole job is to escape the spill, so a reply that spills again hands the
+/// model a byte-identical preview under a fresh id — the escape hatch failing at
+/// the only size that ever needs it (see `tools::fs::OFFLOAD_WINDOW_CHARS`).
+pub const OFFLOAD_CAP_CHARS: usize = 8000;
+
 /// Append-only conversation history. Oversized tool results are offloaded to
 /// disk at record time; the history keeps a preview plus a pointer the model
 /// can dereference with the `read_offloaded` tool.
@@ -49,7 +56,7 @@ impl History {
         Self {
             items: Vec::new(),
             offload_dir,
-            cap: 8000,
+            cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
             provider_usage: UsageLedger::default(),
             provider_routes: Vec::new(),
@@ -73,7 +80,7 @@ impl History {
         Self {
             items: resumed.messages,
             offload_dir,
-            cap: 8000,
+            cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
             provider_usage: resumed.provider_usage,
             provider_routes,

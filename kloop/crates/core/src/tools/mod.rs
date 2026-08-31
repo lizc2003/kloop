@@ -840,11 +840,12 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_offloaded".into(),
-            description: "Fetch the full content of an offloaded tool result by its id (e.g. off-0001).".into(),
+            description: "Fetch an offloaded tool result by its id (e.g. off-0001). Returns one window of it; if more remains the reply ends with the char_offset to pass on the next call.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Offload id from a truncation pointer, e.g. off-0001"}
+                    "id": {"type": "string", "description": "Offload id from a truncation pointer, e.g. off-0001"},
+                    "char_offset": {"type": "integer", "description": "Character offset to resume from (not a line number); omit for the start. The previous reply names the value to use."}
                 },
                 "required": ["id"]
             }),

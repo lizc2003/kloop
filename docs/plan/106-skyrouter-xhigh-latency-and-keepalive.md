@@ -211,3 +211,67 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 ## 完成标准
 
 每片:`cargo fmt` + `cargo clippy --all-targets -- -D warnings` + `cargo test` 全绿,新增行为带测试,一次 commit 写清验证方式;本文件补 ✅ 与提交号;教训进 HANDOFF.md。
+
+## 片 9 ✅ — `read_offloaded` 的逃生口自己会被 offload
+
+抓真实审查任务的请求体时发现的,不是推理出来的:
+
+```
+input[ 7] function_call_output  2093 字符  …[full output offloaded, id=off-0005, …]
+input[11] function_call read_offloaded  {"id":"off-0005"}
+input[12] function_call_output  2093 字符  …[full output offloaded, id=off-0006, …]
+```
+
+`bash` 的输出超过 8000 字符 → 被 offload,留下 head/tail 预览 + `off-0005`。模型照提示调
+`read_offloaded(off-0005)`,取回的**全文在进 history 的路上又过了一次同一个阈值**,于是拿回
+逐字节相同的预览,只换了个新 id。模型烧掉一个往返、什么也没得到,而且被引着再试一次。
+
+而这恰恰是 `read_offloaded` **唯一该被调用的尺寸**——内容小于阈值时它根本不会存在。
+
+改法:`read_offloaded` 按 `OFFLOAD_WINDOW_CHARS`(6000)开窗返回,还有剩余时结尾写明
+`char_offset=<下一个偏移>`。窗口宽度必须**严格小于** `OFFLOAD_CAP_CHARS`(8000)并留出续行的
+余量,否则同一个坑原样复现;这条约束写进了两个常量的文档注释,互相点名。参数取名
+`char_offset` 而非 `offset`,因为 `read_file` 的 `offset` 是**行号**,同名不同单位是给模型
+埋雷;续行提示直接把下一个数字印出来,模型抄即可,不必自己算。
+
+测试 `read_offloaded_windows_a_large_output_without_spilling_again`:40,000 字符的载荷循环取窗,
+断言(a) 每次返回都 `< OFFLOAD_CAP_CHARS`(直接编码那条不变量),(b) 拼回去与原文逐字节相等,
+(c) 循环在 16 次内终止,(d) 越界 offset 报错而不是返回空窗——空窗对模型读起来就是"取完了"。
+
+## 慢的真正原因(推翻本文件前面的判断)
+
+用户指出对照组是 **codex 源头、手选 xhigh**,不是 codex 的 medium 记录。重测,同一个 commit、
+同一个 gateway、都走本地抓包代理:
+
+| | 墙钟 | 请求数 | provider 耗时 | 本地工具耗时 |
+| --- | --- | --- | --- | --- |
+| kloop medium | 353s | 16 | — | — |
+| codex medium | 418s | 20 | — | — |
+| kloop xhigh | 3312s | 45 | 1018s (31%) | **2294s (69%)** |
+| codex xhigh | **317s** | 13 | 306s (97%) | 11s |
+
+medium 下 kloop **更快**。xhigh 下差 10 倍,但差的不是模型也不是线路:kloop 那轮 0 个协议错误,
+provider 只占 31%,其余全花在本地——它检出了一个 git worktree,跑了 63 次 cargo 编译和测试。
+
+原因是**两边加载的项目指南不对称**:
+
+- 仓库根有 `CLAUDE.md`,全仓没有 `AGENTS.md`。
+- kloop 的 `context.rs` 把 `CLAUDE.md` 当兼容回退加载,于是「完成标准:cargo fmt + clippy +
+  test 全绿」进了第一个请求(已核对 `instructions` 文本命中)。
+- codex 只找 `AGENTS.md`(实测它执行 `rg --files -g 'AGENTS.md' ..`,零命中),整轮**没有任何
+  项目指南**。
+
+也就是说 kloop 把仓库自己的完成标准套到了"审查"这类只读任务上,把审查办成了验证。这不是引擎
+缺陷,是上下文不对称加上该标准没有区分任务类型。要缩到 codex 的量级,给仓库加一个 `AGENTS.md`
+(kloop 与 codex 都优先读它),并在完成标准里写明它约束的是**改动**而非审查。
+
+顺带把两个前面的猜测记为**已证伪**,免得再走回头路:
+
+- **不是请求头。** codex 每个请求带 `session-id` / `thread-id` / `originator` /
+  `x-client-request-id` / `x-openai-internal-codex-responses-lite`,kloop 只有 auth。交错发、
+  各 8 次的对照实验里两组的命中率**逐次完全相同**(95% 均值),头没有影响。
+- **不是回放推理条目,也不是 `reasoning.context`。** codex 的 `input` 里一条 `reasoning` 都
+  没有,kloop 有;剥掉 reasoning 条目、加上 `context: "all_turns"`,命中率都纹丝不动。
+- **缓存本身没问题。** kloop 的 `input` 严格追加、共享部分逐字节相同,`instructions` / `tools`
+  完全一致;同一个 body 连发命中 97%。之前看到的"卡在 7680"是因为 kloop 每轮只加 150–500
+  token,很少跨过 1024 的块边界,不是缓存不延伸。
