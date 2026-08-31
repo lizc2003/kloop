@@ -229,17 +229,41 @@ fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
     }
 }
 
+/// The gateway-facing session header. Anthropic's own endpoint has no
+/// prompt-cache routing knob — its cache is prefix-keyed and workspace-scoped,
+/// so affinity is the platform's problem, not ours. A gateway in the middle is
+/// a different story: it needs a stable per-conversation id to route on, and
+/// Claude Code's gateway protocol names this header for exactly that ("use it
+/// to aggregate all requests from one session without parsing the body"), so
+/// existing gateways already key off it. kloop follows that convention rather
+/// than inventing a name nothing reads.
+const SESSION_HEADER: &str = "x-claude-code-session-id";
+
 pub(super) async fn stream(
     url: &str,
     key: &str,
+    session: Option<&str>,
     body: &Value,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let req = crate::http_client()
+    let mut req = crate::http_client()
         .post(url)
         .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
-        .json(body);
+        .header("anthropic-version", "2023-06-01");
+    // A session id only has to be a safe filename, so it can hold bytes that do
+    // not belong in a header: `HeaderValue` would accept a non-ASCII id as
+    // obs-text rather than reject it, and obs-text is deprecated and handled
+    // unevenly by proxies — precisely the hop this header exists for. Empty is
+    // not a session either, and HTTP would accept that too. Both are dropped:
+    // the header is a routing hint, so losing it costs cache affinity, while
+    // sending one a gateway chokes on costs the request.
+    if let Some(value) = session
+        .filter(|id| !id.is_empty() && id.is_ascii())
+        .and_then(|id| reqwest::header::HeaderValue::from_str(id).ok())
+    {
+        req = req.header(SESSION_HEADER, value);
+    }
+    let req = req.json(body);
     let resp = crate::send_checked(req, "anthropic", key).await?;
 
     let mut parser = SseParser::default();

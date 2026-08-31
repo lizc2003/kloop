@@ -31,6 +31,12 @@ validate five architectural bets before committing to a larger agent design.
    requests also carry `prompt_cache_key` — the session id, shared by sampling,
    compaction, and sub-agents — so the growing prefix keeps landing on a backend
    that already holds it; an unbound session (`--mock`, tests) sends no field.
+   The Anthropic rail carries the same id as the `x-claude-code-session-id`
+   header instead: that API has no such body field (its cache is prefix-keyed
+   and workspace-scoped, needing no affinity hint), so the id is there for the
+   gateways in front of it, under the name their protocol already defines. A
+   non-ASCII or empty id is dropped rather than sent — the header is a hint,
+   and one a gateway chokes on costs more than a missing one.
 
 Provider sampling is bounded and typed: each attempt has one terminal outcome;
 open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE

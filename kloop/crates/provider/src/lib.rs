@@ -426,12 +426,20 @@ impl Provider {
     /// sends no effort field on any rail. The caller has already validated it
     /// against this rail's [`ProviderApiFamily::accepted_efforts`].
     ///
-    /// `cache_key` is the session-stable prompt-cache routing hint. It only
-    /// steers which backend serves the request — never what the request means —
-    /// so a wrong or missing value costs cache hits, not correctness. Measured
-    /// against gateway, sending nothing makes hits a coin flip: the same
-    /// 7,697-token prefix sent three times in a row cached 0, then 6,656, then
-    /// 0 again. Only the Responses rail carries it (see the arm below).
+    /// `cache_key` is the session-stable cache-affinity hint: the session id,
+    /// shared by sampling, compaction, and sub-agents. It only steers which
+    /// backend serves the request — never what the request means — so a wrong
+    /// or missing value costs cache hits, not correctness. Measured against
+    /// gateway, sending nothing makes hits a coin flip: the same 7,697-token
+    /// prefix sent three times in a row cached 0, then 6,656, then 0 again.
+    ///
+    /// Each rail carries it the way its ecosystem expects: Responses as the
+    /// `prompt_cache_key` body field (codex sends the session id there), and
+    /// Anthropic as the `x-claude-code-session-id` header — that rail has no
+    /// such body field, because Anthropic's own cache is prefix-keyed and
+    /// workspace-scoped and needs no affinity hint. The header exists for the
+    /// gateways that sit in front of it. Chat carries neither: untested there,
+    /// and an unmeasured guess is not worth a wire change.
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
@@ -501,8 +509,9 @@ impl Provider {
                         body["max_tokens"] = json!(MAX_OUTPUT_TOKENS + n);
                     }
                 }
+                let session = cache_key.map(str::to_string);
                 spawn_stream(move |sink| async move {
-                    anthropic::stream(&url, &key, &body, &sink).await
+                    anthropic::stream(&url, &key, session.as_deref(), &body, &sink).await
                 })
             }
             Provider::OpenAiResponses { key, base } => {

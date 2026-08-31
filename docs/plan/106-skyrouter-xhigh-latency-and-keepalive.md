@@ -130,6 +130,28 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 - 继续砍工具描述散文 = 拿模型行为冒险,`grep`(2,110 B)、`run_agent`(2,465 B)、`bash`(1,542 B)那些字都是 plan 49/66/98 一条条调出来的。
 - 把冷门内置(scheduler 2,365 B + worktree 1,420 B + task_\* 3,158 B + send_message/list_agents 1,539 B ≈ 8.5 KB ≈ 2,100 token)挪到既有 `tool_search` 后面 = 能力仍可达,但每次用到都多一个完整往返(xhigh 下是几分钟),且模型可能压根发现不了。**在片 2 已经让前缀大概率命中缓存之后,这笔买卖不划算**,故不做。
 
+### 片 6 — Anthropic 轨发 `x-claude-code-session-id` ✅（2026-08-31；提交 SHA 以本条所在提交为准）
+
+片 2 只给 Responses 轨补了 body 里的 `prompt_cache_key`,理由写的是「Anthropic 没这个字段」。用户指出那个理由不完整:**字段没有,但真实部署里前面架着网关,网关要的是 header,而 kloop 一个都没发**——`anthropic.rs` 当时只发 `x-api-key` + `anthropic-version`。
+
+用户给的参考是 Claude Code 的 gateway 协议(`code.claude.com/docs/zh-CN/llm-gateway-protocol`),它把这件事写死了:
+
+| 请求头 | 文档定性 |
+| --- | --- |
+| `x-claude-code-session-id` | 会话唯一标识,「**使用它来聚合来自一个会话的所有请求,而无需解析请求体**」 |
+| `x-claude-code-agent-id` | 子代理标识,仅子代理请求上存在 |
+| `x-claude-code-parent-agent-id` | 父代理标识,仅嵌套时存在 |
+
+分类是**「使用」不是「转发不变」**——只有 `anthropic-version`/`anthropic-beta`(以及 AWS 上的 `anthropic-workspace-id`)要求逐字转发,这三个会话头明写着给网关自己读,用途含**路由**。
+
+**用户拍板「要兼容当前的网关」**:照抄这个名字,不另起 `x-kloop-*`。代价是网关会把 kloop 流量归属成 Claude Code——用户知情并接受。
+
+落地:`anthropic::stream` 增 `session: Option<&str>`,取值仍是 `Config::cache_key()`(与 Responses 轨同源,采样/压缩/子 agent 共享)。两道过滤:空串不发(HTTP 接受空 header 值,过滤只能是我们自己做),**非 ASCII 不发**——`HeaderValue::from_str` 会把非 ASCII 当 obs-text **放行而不是拒绝**,而 obs-text 已废弃、代理处理不一致,正好砸在这个头唯一要经过的那一跳上;而会话 id 只要求是合法文件名(`checked_session_path` 只挡控制字符和路径分隔符),非 ASCII 的 `thread/start` id 完全合法。丢掉提示只损失缓存亲和,发一个网关噎住的头损失整个请求。
+
+测试 `session_id_rides_the_gateway_header_without_touching_the_body`:五态表驱动(正常值发、空串不发、None 不发、非 ASCII 不发、控制字符不发),并断言 body 里**没有** `prompt_cache_key`——两条轨的载体不同,不能互相串味。
+
+**未做**:`x-claude-code-agent-id` / `parent-agent-id`。kloop 的子 agent 在网关侧目前不可分辨(内部有 `child_session_id = {parent}-{agent}`,只用于转录文件名)。这属于成本归属而非缓存亲和,不在本次目标内。Chat 轨也未动(无实测)。
+
 ### 片 5 — 未做:effort 档位
 
 慢的主因(xhigh vs codex 实际在跑的 medium)是**用户配置**不是代码问题,`~/.kloop/config.toml` 改 `effort = "medium"` 即可,代码不动。

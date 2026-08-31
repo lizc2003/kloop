@@ -221,6 +221,59 @@ async fn request_body_carries_cache_breakpoints() {
     );
 }
 
+/// The session id rides the Anthropic rail as a header, not a body field:
+/// Anthropic's own cache is prefix-keyed and workspace-scoped, so the hint
+/// exists for gateways in front of it, and `x-claude-code-session-id` is the
+/// name their protocol already defines. The body is untouched either way.
+#[tokio::test]
+async fn session_id_rides_the_gateway_header_without_touching_the_body() {
+    for (session, expected) in [
+        (Some("sess-42"), Some("sess-42")),
+        (Some(""), None),
+        (None, None),
+        // A thread id only has to be a safe filename. Non-ASCII would ride as
+        // obs-text rather than be rejected, so the guard has to be ours.
+        (Some("线程-1"), None),
+        // Control characters are rejected by HeaderValue itself; assert the
+        // outcome, not which layer caught it.
+        (Some("a\u{7f}b"), None),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+        let provider = Arc::new(anthropic(&server));
+        let attempt = provider.attempt_identity(
+            "test",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            None,
+            session,
+            "be brief",
+            &[Message::user_text("hi")],
+            &[],
+        );
+        while rx.recv().await.is_some() {}
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("x-claude-code-session-id")
+                .and_then(|value| value.to_str().ok()),
+            expected,
+            "session {session:?}"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "the Anthropic rail has no such body field: {body}"
+        );
+    }
+}
+
 /// With caching off the request is byte-identical to the pre-caching shape:
 /// plain string system, no cache_control anywhere.
 #[tokio::test]
