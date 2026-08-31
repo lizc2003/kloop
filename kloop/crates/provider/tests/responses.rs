@@ -1215,6 +1215,110 @@ async fn out_of_band_codex_event_after_terminal_is_ignored() {
     ));
 }
 
+/// gateway's real reasoning shape: every summary part is opened and streamed,
+/// but only the last one is closed with `text.done` + `part.done`. Two
+/// independent captures, 24 reasoning items, all this shape — so the parts are
+/// independent by index, not strictly nested. Correctness rides on the item
+/// boundary, which still matches each accumulated part against the final array.
+#[tokio::test]
+async fn reasoning_summary_parts_may_stay_open_until_the_item_closes() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "status": "in_progress",
+                "content": [], "summary": []
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 0, "delta": "first"}),
+            // No done for index 0 — index 1 opens on top of it.
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 1,
+                "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 1, "delta": "second"}),
+            json!({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 1, "text": "second"}),
+            json!({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 1,
+                "part": {"type": "summary_text", "text": "second"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "status": "completed", "content": [],
+                "summary": [
+                    {"type": "summary_text", "text": "first"},
+                    {"type": "summary_text", "text": "second"},
+                ],
+                "encrypted_content": "enc-blob"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::ThinkingDelta(t) if t == "first"));
+    assert!(matches!(&ok[1], StreamEvent::ThinkingDelta(t) if t == "second"));
+    assert!(matches!(
+        &ok[2],
+        StreamEvent::BlockDone(AssistantBlock::Thinking { thinking, signature })
+            if thinking == "firstsecond" && signature == "enc-blob"
+    ));
+    assert!(matches!(
+        &ok[3],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
+    ));
+    assert_eq!(ok.len(), 4);
+}
+
+/// Relaxing the per-part close did not relax what actually guarantees the
+/// content: a never-closed part whose final text disagrees with the streamed
+/// deltas still fails closed at the item boundary.
+#[tokio::test]
+async fn unclosed_reasoning_part_still_fails_when_final_text_diverges() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "status": "in_progress",
+                "content": [], "summary": []
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs_1", "summary_index": 0, "delta": "streamed"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "status": "completed", "content": [],
+                "summary": [{"type": "summary_text", "text": "something else"}],
+                "encrypted_content": "enc-blob"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events.into_iter().find_map(|e| e.err()).unwrap();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert_eq!(
+        error.to_string(),
+        "provider protocol error: openai-responses final reasoning text did not match streamed text"
+    );
+}
 /// gateway's `keepalive` heartbeat, on the real wire shape, is skipped like
 /// `codex.*`. It arrives while the model is still thinking — the more thinking,
 /// the more of them — so a high reasoning effort makes it the norm, not an edge

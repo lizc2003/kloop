@@ -83,7 +83,7 @@ item.done  summary_len=3
 
 kloop 假设的是严格嵌套(`added(i) → delta(i) → text.done(i) → part.done(i)` 之后才允许 `added(i+1)`),并在 `reasoning_summary_part.added` 处用"有未关闭的 part 就报错"来强制它。两种形状都自洽,但不兼容。
 
-处置待定(见本文件末尾"待用户拍板")。
+处置见片 3(用户已拍板"接受")。
 
 ### 片 2 — `prompt_cache_key` ✅（2026-08-31；提交 SHA 以本条所在提交为准）
 
@@ -97,7 +97,19 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 **验证**:`cargo fmt --check`、`cargo clippy --all-targets -D warnings`、`cargo test --workspace` 全绿。新增 4 条测试:provider 层 `prompt_cache_key_is_sent_when_bound_and_omitted_otherwise`(三态表驱动:给 key 则发、空串不发、None 不发)、core 层 `turn_samples_with_the_session_id_as_the_cache_key`、`unbound_session_sends_no_cache_key`、`compaction_reuses_the_session_cache_key`。
 
-### 片 3 — 前缀瘦身(不在本计划落地)
+### 片 3 — reasoning summary part 生命周期放宽 ✅（2026-08-31；提交 SHA 以本条所在提交为准；用户已拍板"接受"）
+
+片 1 回归暴露的那道墙。gateway 对每个 reasoning item 的真实形状是「每个 part 都 added+delta,只有最后一个 part 有 `.done`」,kloop 假设严格嵌套并在三处强制它。按用户拍板放宽,**放宽的只是冗余复核,真正的保证一个没动**:
+
+- `reasoning_summary_part.added`:去掉"有未关闭 part 就报错"的守卫。
+- `add_content_part` 的 `ItemKind::Reasoning` 分支:同样去掉。两处是同一个生命周期问题,只放宽一半会留下另一半随时再炸。**Message 分支保持严格**——没有观测到消息内容 part 重叠,窄口不外扩。
+- `verify_reasoning_parts`:不再要求 `field_done`/`part_closed`。**保留**索引稠密有序、part 数量与最终数组一致、每个 part 的累积文本逐字等于最终数组对应项;错误名相应改为 `reasoning part indices were not dense`。
+
+代价如实记:某个 part 的文本若只在流中出现而与最终数组不符,发现点从"part 关闭时"推迟到"item 结束时"——仍然 fail closed,只是晚一步。`part_closed`/`field_done` 本身没删,`.done` 到达时的乱序/重复关闭检查照旧。
+
+新增两条测试:`reasoning_summary_parts_may_stay_open_until_the_item_closes`(复刻真实形状:index 0 只 added+delta 不收口、index 1 收口,断言 ThinkingDelta×2 + BlockDone(拼接文本 + `enc-blob`)+ Terminal 恰好四个事件)、`unclosed_reasoning_part_still_fails_when_final_text_diverges`(永不收口的 part 最终文本与流式累积不符时仍 fail closed,逐字断言 `final reasoning text did not match streamed text`)——后者是关键,它证明动的是冗余那层。
+
+### 片 4 — 前缀瘦身(不在本计划落地)
 
 固定前缀 7,697 token(30 个工具的 JSON 占 32KB,`run_program` 一个 9KB)。要不要砍、砍哪些,单独再议。
 

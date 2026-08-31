@@ -464,12 +464,13 @@ fn add_content_part(
             }
             Ok(kind == MessagePartKind::Refusal)
         }
-        ItemKind::Reasoning { summary, content } => {
-            if summary.values().any(|part| !part.part_closed)
-                || content.values().any(|part| !part.part_closed)
-            {
-                return Err(protocol("reasoning parts overlapped"));
-            }
+        ItemKind::Reasoning { content, .. } => {
+            // No overlap guard here, unlike Message above: gateway opens every
+            // reasoning part and streams its delta but closes only the last one,
+            // so a new part legitimately opens while earlier ones are still
+            // open. Reasoning parts are independent by index, and correctness
+            // rides on the item boundary instead — `verify_reasoning_parts`
+            // matches each accumulated part against the final array.
             if required_str(&part["type"], "reasoning content part type")? != "reasoning_text" {
                 return Err(protocol("reasoning contained an unsupported content part"));
             }
@@ -632,8 +633,12 @@ fn verify_reasoning_parts(
     }
     let mut texts = Vec::with_capacity(parts.len());
     for (position, (index, part)) in parts.into_iter().enumerate() {
-        if index != position as u64 || !part.field_done || !part.part_closed {
-            return Err(protocol("reasoning parts were not fully closed"));
+        // Indices must still be dense and ordered, but an unclosed part is not
+        // an error: gateway closes only the last one. What actually verifies
+        // the stream is the text comparison below against the final array —
+        // per-part `.done` was only ever a redundant, earlier check.
+        if index != position as u64 {
+            return Err(protocol("reasoning part indices were not dense"));
         }
         let final_part = &final_parts[position];
         if required_str(&final_part["type"], "final reasoning part type")? != final_type
@@ -922,14 +927,11 @@ pub(super) async fn stream(
                         .get_mut(&key)
                         .ok_or_else(|| protocol("reasoning part referenced an unknown item"))?;
                     let index = required_u64(&value["summary_index"], "summary_index")?;
-                    let ItemKind::Reasoning { summary, content } = &mut state.kind else {
+                    let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
                         return Err(protocol("reasoning part referenced the wrong item type"));
                     };
-                    if summary.values().any(|part| !part.part_closed)
-                        || content.values().any(|part| !part.part_closed)
-                    {
-                        return Err(protocol("reasoning parts overlapped"));
-                    }
+                    // Opening a part while earlier ones are still open is the
+                    // norm on this wire, not a violation — see `add_content_part`.
                     if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
                     {
                         return Err(protocol("reasoning summary part type was unsupported"));
