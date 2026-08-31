@@ -192,7 +192,13 @@ server 会话 `enter_worktree→write_file→exit_worktree`,客户端收到两�
 等于把自己的工作树写进另一个产品的目录里(README 里甚至有一句「kloop scans only its
 own `.kloop/`, not cc's `.claude/`」,自相矛盾)。同一仓库里同时用 cc 和 kloop 时,
 两边的 managed 树与分支还会挤在一个命名空间里。分支前缀同理,`worktree-<slug>` 和 cc
-逐字相同,一并改成 `kloop/worktree/<name>`(codex 的 `codex/worktree/<name>` 同形)。
+逐字相同,一并改掉(最终形态见下一节)。
+
+**这其实是一次回退,不是新决定。** plan 35 原本用的就是 `.kloop/worktrees` +
+`kloop/worktree/*`(本文件上面 92/181 行仍是当时的记录);是 **Plan 56「Worktree 工具对齐」**
+在追 Claude Code 2.1.220 的 exact parity 时,把受管目录和分支前缀一并换成了 cc 的字面值
+(`56-worktree-parity.md:47`)。对齐该抄的是**行为契约**——enter/exit 的 schema、custody
+与删除权、清理判定;**命名空间**抄过去就变成了把自己的状态写进别人家。
 
 目录名反复过一次,过程值得留下:
 
@@ -231,3 +237,29 @@ root 的 `.kloop` 设为只读子路径,但 SBPL 生成的是**一个 `(allow fi
 的析取**:进树后 `for_workspace` 把工作树本身加成 writable root,它那一部分独立放行,
 仓库根那一部分的 `require-not` 只约束它自己。即使用户额外把仓库根配成 writable root
 也不受影响。已加测试 `a_worktree_under_the_protected_state_dir_stays_writable` 钉死。
+
+### 分支前缀:为什么是扁平的 `kloop-worktree-` 而不是 `kloop/worktree/`
+
+第一版跟 codex 取了 slashed 的 `kloop/worktree/<name>`。用户问「用 `/` 做分割好吗」,实测两向:
+
+```
+$ git branch kloop && git worktree add -b kloop/worktree/x wt1
+fatal: cannot lock ref 'refs/heads/kloop/worktree/x':
+       'refs/heads/kloop' exists; cannot create 'refs/heads/kloop/worktree/x'
+
+$ git worktree add -b kloop/worktree/x wt1 && git branch kloop
+fatal: cannot lock ref 'refs/heads/kloop':
+       'refs/heads/kloop/worktree/x' exists; cannot create 'refs/heads/kloop'
+```
+
+第二向是真代价:**只要有一棵托管树活着,用户就建不了叫 `kloop` 的分支**——ref 存成
+`refs/heads/` 下的文件,slashed 前缀要求 `kloop` 是目录,两者互斥。而在 kloop 自己的仓库里
+`kloop` 恰是除 `main` 外最可能被用到的名字。换来的只有 `git branch` 里的分组显示。
+
+这正是 `encode_name` 把名字里的 `/` 编码成 `+` 时已经避开的同一个 D/F 冲突,从前缀那头请
+回来不划算;cc 选扁平 `worktree-` 时的注释写的也是这条。codex 用 slashed 能跑,是因为随便
+哪个仓库里叫 `codex` 的分支不太可能存在——那是运气,不是设计没问题。
+
+扁平的 `kloop-worktree-<name>` 冲突面归零(`kloop-worktree` 与 `kloop-worktree-x` 都是
+文件,不互斥),`git branch --list 'kloop-worktree-*'` 照样筛。目录侧保持 `.kloop/worktrees/`
+——那边是真目录,天然分层,没有这个问题。

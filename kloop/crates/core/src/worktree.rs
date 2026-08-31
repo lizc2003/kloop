@@ -49,9 +49,14 @@ use crate::sandbox::SandboxPolicy;
 pub(crate) const WORKTREES_DIR: &str = ".kloop/worktrees";
 /// Branches carry kloop's namespace for the same reason the directory does:
 /// cc creates `worktree-<slug>` verbatim, so sharing the prefix makes the two
-/// tools' branches indistinguishable in `git branch` and turns a collision into
-/// a confusing "branch already exists" from the other agent's tree.
-const WORKTREE_BRANCH_PREFIX: &str = "kloop/worktree/";
+/// tools' branches indistinguishable in `git branch`.
+///
+/// Flat rather than a slashed `kloop/worktree/<name>`: refs are files, so a
+/// slashed prefix needs `refs/heads/kloop` to be a directory, which reserves the
+/// branch name `kloop` for as long as any managed tree lives — a plausible name
+/// to want, traded for a cosmetic grouping win. It is the same D/F conflict
+/// [`encode_name`] already avoids inside the name itself.
+const WORKTREE_BRANCH_PREFIX: &str = "kloop-worktree-";
 static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -996,7 +1001,7 @@ mod tests {
         assert_eq!(worktree.custody, WorktreeCustody::Managed);
         assert_eq!(worktree.owner, WorktreeOwner::Task("agent-1".into()));
         assert!(path.ends_with(".kloop/worktrees/agent-1"));
-        assert_eq!(worktree.branch, "kloop/worktree/agent-1");
+        assert_eq!(worktree.branch, "kloop-worktree-agent-1");
         assert!(finish(worktree).await.unwrap().is_none());
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(root);
@@ -1009,7 +1014,7 @@ mod tests {
         std::fs::write(worktree.path.join("new.txt"), "work").unwrap();
         let path = worktree.path.clone();
         let note = finish(worktree).await.unwrap().unwrap();
-        assert!(note.contains("kloop/worktree/agent-2"));
+        assert!(note.contains("kloop-worktree-agent-2"));
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(root);
     }

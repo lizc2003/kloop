@@ -204,7 +204,7 @@ mod tests {
         assert!(!is_error, "{out}");
         assert!(out.contains("back in"), "{out}");
         assert!(
-            out.contains("kloop/worktree/feat"),
+            out.contains("kloop-worktree-feat"),
             "kept tree named: {out}"
         );
         assert!(

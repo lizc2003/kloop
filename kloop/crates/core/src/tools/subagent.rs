@@ -1263,7 +1263,7 @@ mod tests {
             "carries the sub-agent result: {out}"
         );
         assert!(
-            out.contains("kloop/worktree/agent-"),
+            out.contains("kloop-worktree-agent-"),
             "the kept tree's branch is named: {out}"
         );
 
@@ -1420,7 +1420,7 @@ mod tests {
         let branches = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["branch", "--list", "kloop/worktree/*"])
+            .args(["branch", "--list", "kloop-worktree-*"])
             .output()
             .unwrap();
         assert!(

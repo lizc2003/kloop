@@ -409,7 +409,7 @@ async fn file_search_bash_worktree_report() -> Value {
     assert!(
         git(
             root.path(),
-            &["branch", "--list", "kloop/worktree/plan59-chain"]
+            &["branch", "--list", "kloop-worktree-plan59-chain"]
         )
         .is_empty()
     );

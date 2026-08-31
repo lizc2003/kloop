@@ -2036,7 +2036,7 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
         .filter(|m| m["method"] == "thread/cwd/updated")
         .collect();
     assert_eq!(wt.len(), 2, "enter + exit notifications");
-    assert_eq!(wt[0]["params"]["branch"], "kloop/worktree/srv");
+    assert_eq!(wt[0]["params"]["branch"], "kloop-worktree-srv");
     let entered_cwd = wt[0]["params"]["cwd"].as_str().unwrap().replace('\\', "/");
     assert!(entered_cwd.ends_with(".kloop/worktrees/srv"));
     assert_eq!(wt[1]["params"]["branch"], Value::Null);

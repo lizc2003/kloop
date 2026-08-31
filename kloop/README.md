@@ -1636,7 +1636,7 @@ The session tools use strict inputs:
 types, and unknown fields are rejected. Names are at most 64 characters and
 may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
 encoded as `+`. Managed trees live at `.kloop/worktrees/<encoded-name>` on
-`kloop/worktree/<encoded-name>` — kloop's own namespace, not another agent's
+`kloop-worktree-<encoded-name>` — kloop's own namespace, not another agent's
 (cc uses `.claude/worktrees` + `worktree-<slug>`, codex `.codex/worktrees` +
 `codex/worktree/<name>`). An existing `path` must canonicalize to a registered
 worktree with the same Git common directory. Entering by path grants
