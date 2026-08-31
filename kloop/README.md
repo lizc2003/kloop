@@ -36,7 +36,8 @@ validate five architectural bets before committing to a larger agent design.
    and workspace-scoped, needing no affinity hint), so the id is there for the
    gateways in front of it, under the name their protocol already defines. A
    non-ASCII or empty id is dropped rather than sent — the header is a hint,
-   and one a gateway chokes on costs more than a missing one.
+   and one a gateway chokes on costs more than a missing one. The chat rail
+   spells it as Responses does.
 
 Provider sampling is bounded and typed: each attempt has one terminal outcome;
 open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE

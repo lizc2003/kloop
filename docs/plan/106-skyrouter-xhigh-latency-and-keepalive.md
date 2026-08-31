@@ -166,6 +166,35 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 测试扩充既有的 `checked_session_paths_reject_traversal_and_symlink_leaves`:除原有穿越用例,新增非 ASCII、空格、前导点、控制字符、集合外标点五类拒绝;并**正向断言** kloop 自己铸的 id 全部通过(`new_session_id` 实时产物、`20260831-083106`、`-2` 撞名变体、`-agent-1` 子 agent 形态)——防止收紧收过头砸到自己。
 
+### 片 8 — Chat 轨补 `prompt_cache_key` ✅（2026-08-31；提交 SHA 以本条所在提交为准）
+
+片 2 把 Chat 轨列为非目标,理由是「无实测」。用户要求补上,于是**先测再定**(教训 84c:探针必须带一行「不发这个字段」的对照)。
+
+真实 gateway `/chat/completions`,body 形状照抄 kloop 实际所发(`max_tokens`、`stream_options`、tools、`reasoning_effort`):
+
+| 行 | 结果 |
+| --- | --- |
+| 带 `prompt_cache_key` | HTTP 200 |
+| 对照:不带 | HTTP 200 |
+
+**字段被接受**,且对照行同样 200,所以这个 200 有意义(不是"整条轨都能通"的假阳性)。
+
+**中途一个错误结论,连同纠正一起记下来。** 我看到这次探针的 usage 里没有 `prompt_tokens_details`,就断言「这条轨不上报缓存,效果不可测,`/cost` 恒显示 cache-read 0」。用户指出 `cost_breakdown` 才是这个平台的观测点,复测推翻了我的结论——**那个探针只有 47 token、只发一次,根本形不成缓存**,我把「字段缺席」读成了「平台不上报」。
+
+用 3,076 token 的稳定前缀连发三次:
+
+| 次 | `prompt_tokens_details` | `prompt_text_cost` | `prompt_cached_cost` |
+| --- | --- | --- | --- |
+| 1 | 缺席 | 0.0012304 | — |
+| 2 | 缺席 | 0.0012304 | — |
+| 3 | `{cached_tokens: 2816}` | 0.000104 | 0.00011264 |
+
+即 **chat 轨的缓存是真的会生效的**,命中时 prompt 成本降约 12 倍。`prompt_tokens_details` **只在命中时出现**,缺席意味着「没命中」而不是「不上报」——kloop 的 `openai.rs:253` 把缺失读作 0 而不是报错,行为正确;`/cost` 在命中时会显示真实数字。另外命中出现在第 3 次而非第 2 次,与 Responses 轨 0/6656/0 的抖动同型,是缓存亲和这条线的旁证。
+
+按用户的界定,`cost_breakdown` / `prompt_cached_cost` 是 example.com 平台自己的字段而非 OpenAI 标准,所以 **kloop 不解析它**(`Usage` 是 provider 无关类型);它只作为诊断手段记在这里。顺带观测:chat 的 `router_detail.router_name` 是 `ccp`,responses 是 `polo`,两条轨走不同上游。
+
+因此这一片**接受与收益都是实测的**。测试 `chat_carries_the_session_id_as_prompt_cache_key` 只断言 wire 形状(给 key 则发、空串不发、None 不发),命中率属于端点不属于我们。
+
 ### 片 5 — 未做:effort 档位
 
 慢的主因(xhigh vs codex 实际在跑的 medium)是**用户配置**不是代码问题,`~/.kloop/config.toml` 改 `effort = "medium"` 即可,代码不动。

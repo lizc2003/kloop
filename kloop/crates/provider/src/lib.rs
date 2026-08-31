@@ -438,8 +438,9 @@ impl Provider {
     /// Anthropic as the `x-claude-code-session-id` header — that rail has no
     /// such body field, because Anthropic's own cache is prefix-keyed and
     /// workspace-scoped and needs no affinity hint. The header exists for the
-    /// gateways that sit in front of it. Chat carries neither: untested there,
-    /// and an unmeasured guess is not worth a wire change.
+    /// gateways that sit in front of it. Chat spells it the same way Responses
+    /// does; see that arm for why the field rides there on acceptance rather
+    /// than on a measured win.
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
@@ -574,6 +575,16 @@ impl Provider {
                 // session explicitly set an effort.
                 if let Some(effort) = effort {
                     body["reasoning_effort"] = json!(effort.as_str());
+                }
+                // Same field and same empty-is-not-a-key rule as Responses,
+                // and caching demonstrably works here: an identical 3,076-token
+                // prompt sent three times reported `cached_tokens: 2816` on the
+                // third, with prompt cost dropping ~12x. `prompt_tokens_details`
+                // is absent on a miss rather than zeroed, so its absence means
+                // "no hit", not "not reported" — which is why `usage_from` in
+                // `openai.rs` reads a missing block as 0 instead of failing.
+                if let Some(cache_key) = cache_key.filter(|key| !key.is_empty()) {
+                    body["prompt_cache_key"] = json!(cache_key);
                 }
                 spawn_stream(
                     move |sink| async move { openai::stream(&url, &key, &body, &sink).await },

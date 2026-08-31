@@ -605,6 +605,47 @@ async fn unknown_non_error_named_event_still_fails_closed() {
     assert!(error.to_string().contains("unknown SSE event name"));
 }
 
+/// The chat rail carries the session id in the same body field as Responses.
+/// Both halves are measured: the field is accepted (against a control row that
+/// sent nothing and also succeeded), and caching works on this rail — an
+/// identical 3,076-token prompt reported `cached_tokens: 2816` on its third
+/// send. The test asserts only the wire shape; hit rates belong to the
+/// endpoint, not to us.
+#[tokio::test]
+async fn chat_carries_the_session_id_as_prompt_cache_key() {
+    for (cache_key, expected) in [
+        (Some("sess-7"), Some(json!("sess-7"))),
+        (Some(""), None),
+        (None, None),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[], /*done*/ true)).await;
+        let provider = Arc::new(openai(&server));
+        let attempt = provider.attempt_identity(
+            "chat",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            None,
+            cache_key,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
+        while rx.recv().await.is_some() {}
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("prompt_cache_key").cloned(),
+            expected,
+            "cache_key {cache_key:?}"
+        );
+    }
+}
+
 /// The chat rail spells the knob `reasoning_effort` (a bare string, not the
 /// nested object the other two rails use). It is absent unless the session set
 /// an effort, because a non-reasoning model rejects the field.
