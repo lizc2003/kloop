@@ -1045,7 +1045,11 @@ source owner/generation and read-only verdict for foreground and background
 execution; a post-sampling refresh, same-name owner switch, or newly appearing
 tool fails closed instead of changing what old JavaScript can call. Workspace,
 permission, sandbox, hooks, and ordinary tool-call gates still apply. Below the
-threshold ordinary source tools ship inline.
+threshold ordinary source tools ship inline. A typed declaration carries a
+label capped at 120 characters, elided with `…`: the tool's full description is
+already in the same request's catalog, so the manifest is a signature index, not
+a second copy. Deferred tools are the exception — no catalog entry backs them,
+so their manifest line keeps the whole description.
 
 ## Hooks (Phase 2, seventh slice)
 

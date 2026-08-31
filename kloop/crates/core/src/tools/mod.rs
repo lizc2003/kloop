@@ -2753,6 +2753,70 @@ mod tests {
         );
     }
 
+    /// The typed manifest carries a capped label, not a second copy of the tool
+    /// catalog: every declared tool is already in the same request's `tools`
+    /// array with its full description, so repeating it verbatim beside the
+    /// signature cost ~3.1 KB per request and told the model nothing new.
+    /// Deferred tools are the deliberate exception — they have no catalog entry.
+    #[test]
+    fn typed_manifest_labels_are_capped_but_deferred_lines_stay_whole() {
+        let defs = tool_defs(0, &ShellPrograms::native_posix());
+        let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
+        let labels: Vec<&str> = rp
+            .description
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("/**"))
+            .collect();
+        assert!(!labels.is_empty(), "expected typed labels in the manifest");
+        for label in &labels {
+            let body = label
+                .trim_start_matches("/**")
+                .trim_end_matches("*/")
+                .trim();
+            assert!(
+                body.chars().count() <= crate::tools::codemode::MANIFEST_SUMMARY_CHARS + 1,
+                "label exceeded the manifest cap: {label}"
+            );
+        }
+        // read_file's own description is far longer than the cap, so its label
+        // must be the elided prefix rather than the whole paragraph.
+        let read_file = defs.iter().find(|d| d.name == "read_file").unwrap();
+        assert!(
+            read_file.description.chars().count() > crate::tools::codemode::MANIFEST_SUMMARY_CHARS,
+            "fixture assumption: read_file has a long description"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains('…')),
+            "a description past the cap must be marked elided: {labels:?}"
+        );
+
+        // The deferred manifest is the exception: no catalog entry backs it, so
+        // its line keeps the whole description.
+        let sources: Vec<Arc<dyn ToolSource>> = vec![StubSource::new("srv")];
+        let deferred = all_tool_defs(
+            0,
+            &sources,
+            tool_defs(0, &ShellPrograms::native_posix()).len(),
+            interactive_surface(),
+            &ShellPrograms::native_posix(),
+        );
+        let rp = deferred.iter().find(|d| d.name == "run_program").unwrap();
+        let echo = sources[0]
+            .defs()
+            .iter()
+            .find(|d| d.name == "srv__echo")
+            .unwrap()
+            .description
+            .clone();
+        assert!(
+            rp.description
+                .contains(&format!("- tools.srv__echo: {echo}")),
+            "deferred manifest line must keep the full description: {}",
+            rp.description
+        );
+    }
+
     /// Slice 2: past the threshold source tools degrade to a compact name +
     /// description manifest in run_program's description — no full signatures —
     /// with guidance that they stay callable from a program.

@@ -109,7 +109,30 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 新增两条测试:`reasoning_summary_parts_may_stay_open_until_the_item_closes`(复刻真实形状:index 0 只 added+delta 不收口、index 1 收口,断言 ThinkingDelta×2 + BlockDone(拼接文本 + `enc-blob`)+ Terminal 恰好四个事件)、`unclosed_reasoning_part_still_fails_when_final_text_diverges`(永不收口的 part 最终文本与流式累积不符时仍 fail closed,逐字断言 `final reasoning text did not match streamed text`)——后者是关键,它证明动的是冗余那层。
 
-### 片 4 — 前缀瘦身(不在本计划落地)
+### 片 4 — 前缀瘦身 ✅（2026-08-31；提交 SHA 以本条所在提交为准）
+
+固定前缀 7,697 input token(instructions 7,977 B + 30 个工具 32,365 B)。逐项拆下来,唯一**零能力损失**的肥肉是 `run_program` 的 TypeScript manifest:它给每个可编程内置工具生成 `/** 完整描述 */` + 签名,而那份描述**在同一个请求的 `tools` 数组里已经原样存在一遍**。实测构成:描述 7,940 B 中,注释占 3,101 B(39%),真正的签名只有 1,159 B(15%)。
+
+改法:新增 `summary_line`(在 `one_line` 之上按 `MANIFEST_SUMMARY_CHARS = 120` 字符截断,截断处加 `…`),用于内置与 inline source 两处 typed 声明。**deferred 工具那处继续用 `one_line` 不截断**——它们没有 catalog 条目,那行是模型唯一的信息来源。
+
+实测效果(本地捕获服务收 kloop 真实请求体,改前 vs 改后):
+
+| | 改前 | 改后 |
+| --- | --- | --- |
+| `run_program` | 9,019 B | 7,135 B |
+| tools 总计 | 32,365 B | 30,481 B |
+| 整个请求体 | 40,816 B | 38,971 B |
+
+省 1,845 B ≈ 470 token ≈ 前缀的 6%。同一次捕获顺带确认片 2 的 `prompt_cache_key` 已在线上(值为会话 id)。
+
+**到此为止,后面的都不是零成本的**,结论记在这里免得下次重走:
+
+- 继续砍工具描述散文 = 拿模型行为冒险,`grep`(2,110 B)、`run_agent`(2,465 B)、`bash`(1,542 B)那些字都是 plan 49/66/98 一条条调出来的。
+- 把冷门内置(scheduler 2,365 B + worktree 1,420 B + task_\* 3,158 B + send_message/list_agents 1,539 B ≈ 8.5 KB ≈ 2,100 token)挪到既有 `tool_search` 后面 = 能力仍可达,但每次用到都多一个完整往返(xhigh 下是几分钟),且模型可能压根发现不了。**在片 2 已经让前缀大概率命中缓存之后,这笔买卖不划算**,故不做。
+
+### 片 5 — 未做:effort 档位
+
+慢的主因(xhigh vs codex 实际在跑的 medium)是**用户配置**不是代码问题,`~/.kloop/config.toml` 改 `effort = "medium"` 即可,代码不动。
 
 固定前缀 7,697 token(30 个工具的 JSON 占 32KB,`run_program` 一个 9KB)。要不要砍、砍哪些,单独再议。
 

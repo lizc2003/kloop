@@ -60,6 +60,11 @@ use kloop_protocol::ToolDef;
 /// failure is truncated so its noise can't crowd the parent's context.
 const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 
+/// Cap on a tool's label in the program manifest. Long enough to disambiguate a
+/// call, short enough that the manifest stops being a second copy of the tool
+/// catalog — see [`summary_line`].
+pub(super) const MANIFEST_SUMMARY_CHARS: usize = 120;
+
 /// Process-global so parallel background spawns never collide on a label — same
 /// reasoning as the offload/agent counters.
 static PROGRAM_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -788,7 +793,7 @@ pub(super) fn run_program_def(
                 schema,
             )
         } else {
-            (one_line(&def.description), def.schema.clone())
+            (summary_line(&def.description), def.schema.clone())
         };
         decls.push_str(&format!("  /** {description} */\n"));
         decls.push_str(&format!(
@@ -799,7 +804,7 @@ pub(super) fn run_program_def(
         ));
     }
     for def in sources.iter().filter(|d| is_program_callable(&d.name)) {
-        decls.push_str(&format!("  /** {} */\n", one_line(&def.description)));
+        decls.push_str(&format!("  /** {} */\n", summary_line(&def.description)));
         decls.push_str(&format!(
             "  {}(args: {}): Promise<CallToolResult>;\n",
             def.name,
@@ -890,6 +895,20 @@ the program:\n",
             "additionalProperties": false
         }),
     }
+}
+
+/// The manifest label beside a typed signature. The tool's full description is
+/// already in the same request's catalog, so repeating it verbatim here bought
+/// nothing and cost 3.1 KB on every request — the label only has to be enough
+/// to pick the right call. Deferred tools are the exception and keep
+/// [`one_line`]: they have no catalog entry, so this is all the model gets.
+fn summary_line(s: &str) -> String {
+    let line = one_line(s);
+    let mut kept: String = line.chars().take(MANIFEST_SUMMARY_CHARS).collect();
+    if line.chars().nth(MANIFEST_SUMMARY_CHARS).is_some() {
+        kept.push('…');
+    }
+    kept
 }
 
 fn one_line(s: &str) -> String {
