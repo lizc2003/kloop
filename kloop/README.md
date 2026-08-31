@@ -27,7 +27,10 @@ validate five architectural bets before committing to a larger agent design.
    other unknown SSE event still fails closed, naming the event. Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas
    but echo a pretty-printed `.done`), while text and reasoning stay byte-exact;
-   genuinely divergent or non-JSON arguments still fail closed.
+   genuinely divergent or non-JSON arguments still fail closed. Responses
+   requests also carry `prompt_cache_key` — the session id, shared by sampling,
+   compaction, and sub-agents — so the growing prefix keeps landing on a backend
+   that already holds it; an unbound session (`--mock`, tests) sends no field.
 
 Provider sampling is bounded and typed: each attempt has one terminal outcome;
 open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE

@@ -160,7 +160,7 @@ pub(super) async fn sample_with_retry(
 
 #[allow(clippy::too_many_arguments)]
 async fn sample_once(
-    _cfg: &Arc<Config>,
+    cfg: &Arc<Config>,
     provider_attempt: &FrozenProviderAttempt,
     messages: &[Message],
     tools: &[ToolDef],
@@ -174,6 +174,7 @@ async fn sample_once(
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
         provider_attempt.effort(),
+        cfg.cache_key(),
         system,
         messages,
         tools,

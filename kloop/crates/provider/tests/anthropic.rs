@@ -777,8 +777,14 @@ async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
             "test-model",
             kloop_protocol::ProviderAttemptKind::Primary,
         );
-        let mut rx =
-            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            effort,
+            None,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -812,6 +818,7 @@ async fn effort_none_overrides_a_configured_thinking_mode() {
     let mut rx = provider.stream_attempt(
         &attempt,
         Some(ReasoningEffort::None),
+        /*cache_key*/ None,
         "s",
         &[Message::user_text("hi")],
         &[],

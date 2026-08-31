@@ -61,6 +61,7 @@ pub struct MockRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub effort: Option<ReasoningEffort>,
+    pub cache_key: Option<String>,
 }
 
 /// One scripted Mock response: content blocks, a gate-delayed response, a
@@ -411,7 +412,9 @@ impl Provider {
         tools: &[ToolDef],
     ) -> ProviderStream {
         let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
-        self.stream_attempt(&attempt, None, system, messages, tools)
+        self.stream_attempt(
+            &attempt, None, /*cache_key*/ None, system, messages, tools,
+        )
     }
 
     /// Start one streaming request from an immutable provider attempt. The final
@@ -422,10 +425,18 @@ impl Provider {
     /// (the catalog hands out one cached `Provider` per configured id). `None`
     /// sends no effort field on any rail. The caller has already validated it
     /// against this rail's [`ProviderApiFamily::accepted_efforts`].
+    ///
+    /// `cache_key` is the session-stable prompt-cache routing hint. It only
+    /// steers which backend serves the request — never what the request means —
+    /// so a wrong or missing value costs cache hits, not correctness. Measured
+    /// against gateway, sending nothing makes hits a coin flip: the same
+    /// 7,697-token prefix sent three times in a row cached 0, then 6,656, then
+    /// 0 again. Only the Responses rail carries it (see the arm below).
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
         effort: Option<ReasoningEffort>,
+        cache_key: Option<&str>,
         system: &str,
         messages: &[Message],
         tools: &[ToolDef],
@@ -442,6 +453,7 @@ impl Provider {
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
                     effort,
+                    cache_key: cache_key.map(str::to_string),
                 });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                     MockTurn::Blocks(vec![AssistantBlock::Text {
@@ -514,6 +526,11 @@ impl Provider {
                 });
                 if let Some(effort) = effort {
                     body["reasoning"] = json!({"effort": effort.as_str(), "summary": "auto"});
+                }
+                // Empty is not a key: an unbound session would otherwise pin
+                // every such run onto one shared bucket.
+                if let Some(cache_key) = cache_key.filter(|key| !key.is_empty()) {
+                    body["prompt_cache_key"] = json!(cache_key);
                 }
                 spawn_stream(move |sink| async move {
                     responses::stream(&url, &key, &body, &sink).await

@@ -85,9 +85,17 @@ kloop 假设的是严格嵌套(`added(i) → delta(i) → text.done(i) → part.
 
 处置待定(见本文件末尾"待用户拍板")。
 
-### 片 2 — `prompt_cache_key`
+### 片 2 — `prompt_cache_key` ✅（2026-08-31；提交 SHA 以本条所在提交为准）
 
 Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
+
+**完成记录**:按 Plan 102 教训 84 的形状——会话级旋钮走**请求期参数**、不烘进 `Provider` 构造——给 `stream_attempt` 增 `cache_key: Option<&str>` 参数(紧跟 `effort`)。取值来自新的 `Config::cache_key()`:`session_id` 非空则用它,空则 `None`(`--mock`/测试不发这个字段;空串会把所有未绑定会话赶进同一个桶)。**采样与压缩共用同一个 key**——压缩是同一段对话的又一次请求,单独一个 key 只会把它送到一台没有前缀的后端(与 codex 的 `reuses_prompt_cache_key` 同款)。**子 agent 随 Config 继承父会话的 id**,这是有意的:它的前缀与父会话共享开头字节,同机放置对两者都有利(codex 的 `api_key_subagent_uses_session_id_as_prompt_cache_key` 同款)。
+
+**只上 Responses 轨**。Chat 轨同名字段虽然 OpenAI 也支持,但本次没有针对该轨的实测数据,按教训 84b「不知道就别假装知道」不动它;Anthropic 轨走的是显式 `cache_control` 断点,与此无关。
+
+`MockRequest` 加 `cache_key` 字段(与既有 `effort` 同款),让 core 侧能断言接线。
+
+**验证**:`cargo fmt --check`、`cargo clippy --all-targets -D warnings`、`cargo test --workspace` 全绿。新增 4 条测试:provider 层 `prompt_cache_key_is_sent_when_bound_and_omitted_otherwise`(三态表驱动:给 key 则发、空串不发、None 不发)、core 层 `turn_samples_with_the_session_id_as_the_cache_key`、`unbound_session_sends_no_cache_key`、`compaction_reuses_the_session_cache_key`。
 
 ### 片 3 — 前缀瘦身(不在本计划落地)
 

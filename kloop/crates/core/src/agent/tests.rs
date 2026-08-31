@@ -917,6 +917,46 @@ async fn turn_samples_at_the_session_effort() {
     );
 }
 
+/// The session id rides every sampling request as the prompt-cache routing
+/// hint. It is a routing hint only — a missing one costs cache hits, never
+/// correctness — but on gateway that cost is real: without it an identical
+/// prefix hit the cache on only one of three consecutive requests.
+#[tokio::test]
+async fn turn_samples_with_the_session_id_as_the_cache_key() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("answer"))]);
+    let mut cfg = compaction_cfg(provider, 200_000, "turn-cache-key").test_clone();
+    cfg.session_id = "sess-abc".into();
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hi"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        seen.lock().unwrap()[0].cache_key.as_deref(),
+        Some("sess-abc")
+    );
+}
+
+/// An unbound session (`--mock`, tests) sends no cache key at all rather than
+/// an empty one, which would herd every such run onto a single bucket.
+#[tokio::test]
+async fn unbound_session_sends_no_cache_key() {
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("answer"))]);
+    let cfg = compaction_cfg(provider, 200_000, "turn-no-cache-key");
+    assert_eq!(cfg.session_id, "", "fixture must start unbound");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hi"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(seen.lock().unwrap()[0].cache_key, None);
+}
+
 /// Reactive NoOp ends the turn instead of retrying an unchanged request.
 #[tokio::test]
 async fn reactive_noop_does_not_retry_after_overflow() {

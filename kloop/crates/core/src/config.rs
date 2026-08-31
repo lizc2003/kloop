@@ -576,6 +576,17 @@ impl Config {
         Ok(())
     }
 
+    /// The prompt-cache routing hint for every request this session makes,
+    /// sampling and compaction alike: one value for the whole conversation, so
+    /// the growing prefix keeps landing on a backend that already holds it.
+    /// A sub-agent inherits the parent's id along with the rest of this Config
+    /// — deliberately, since its prefix shares the session's opening bytes and
+    /// co-locating them helps both. `None` until a session is bound (`--mock`
+    /// and tests), which sends no field at all.
+    pub fn cache_key(&self) -> Option<&str> {
+        (!self.session_id.is_empty()).then_some(self.session_id.as_str())
+    }
+
     /// Drop non-durable deferred-tool receipts when the conversation branches or
     /// resets. Same-session compaction deliberately does not call this method.
     pub fn reset_deferred_tool_capabilities(&self) {

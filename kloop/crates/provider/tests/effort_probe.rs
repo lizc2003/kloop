@@ -75,6 +75,7 @@ async fn probe_effort_levels() {
         let mut rx = provider.stream_attempt(
             &attempt,
             level,
+            /*cache_key*/ None,
             "Reply with OK.",
             &[Message::user_text("hi")],
             &[],

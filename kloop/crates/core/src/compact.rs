@@ -226,7 +226,13 @@ pub(crate) async fn compact_once(
     let projected_request = history
         .provider_request_view_for(&request_plan.request, provider_attempt)
         .map_err(anyhow::Error::new)?;
-    let (summary, usage) = sample_summary(provider_attempt, &projected_request, cancel).await?;
+    let (summary, usage) = sample_summary(
+        provider_attempt,
+        cfg.cache_key(),
+        &projected_request,
+        cancel,
+    )
+    .await?;
     let summary = canonicalize_summary(&summary)?;
     let items = build_replacement(&request_plan, &summary);
     if items == messages {
@@ -295,12 +301,14 @@ pub async fn run_compaction(
 /// One summarization request: no tools, text collected from BlockDone.
 async fn sample_summary(
     provider_attempt: &FrozenProviderAttempt,
+    cache_key: Option<&str>,
     request: &[Message],
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Usage>)> {
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
         provider_attempt.effort(),
+        cache_key,
         COMPACT_SYSTEM,
         request,
         &[],
@@ -444,6 +452,31 @@ mod tests {
         );
         assert_eq!(msgs.last().unwrap(), &Message::user_text("current request"));
         assert!(msgs.len() < 4);
+    }
+
+    /// Compaction reuses the session's cache key rather than minting its own:
+    /// it is one more request against the same conversation, and a separate key
+    /// would send it to a backend holding none of the prefix.
+    #[tokio::test]
+    async fn compaction_reuses_the_session_cache_key() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary".into(),
+            }]),
+        ]);
+        let mut cfg = compact_test_cfg(provider, "compact-cache-key").test_clone();
+        cfg.session_id = "sess-xyz".into();
+        let cfg = Arc::new(cfg);
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        run_compaction(&cfg, "mock", &mut history, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0].cache_key.as_deref(),
+            Some("sess-xyz")
+        );
     }
 
     #[tokio::test]

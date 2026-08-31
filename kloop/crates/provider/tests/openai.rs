@@ -623,8 +623,14 @@ async fn effort_maps_to_reasoning_effort_field() {
             "test-model",
             kloop_protocol::ProviderAttemptKind::Primary,
         );
-        let mut rx =
-            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            effort,
+            None,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();

@@ -150,6 +150,50 @@ async fn request_body_is_stateless_with_reasoning_include() {
     );
 }
 
+/// The prompt-cache routing hint rides every request when the session is
+/// bound, and is absent otherwise — an empty key would herd every unbound run
+/// onto one bucket. It only steers routing, so the rest of the body is
+/// unchanged either way.
+#[tokio::test]
+async fn prompt_cache_key_is_sent_when_bound_and_omitted_otherwise() {
+    for (cache_key, expected) in [
+        (Some("sess-42"), Some(json!("sess-42"))),
+        (Some(""), None),
+        (None, None),
+    ] {
+        let server = MockServer::start().await;
+        mount_sse(
+            &server,
+            sse_body(&[json!({"type": "response.completed", "response": {}})]),
+        )
+        .await;
+        let provider = Arc::new(responses(&server));
+        let attempt = provider.attempt_identity(
+            "test",
+            1,
+            "test-model",
+            kloop_protocol::ProviderAttemptKind::Primary,
+        );
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            None,
+            cache_key,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
+        while rx.recv().await.is_some() {}
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("prompt_cache_key").cloned(),
+            expected,
+            "cache_key {cache_key:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn error_tool_output_replays_program_resume_contract_verbatim() {
     let server = MockServer::start().await;
@@ -233,8 +277,14 @@ async fn effort_maps_to_reasoning_field() {
             "test-model",
             kloop_protocol::ProviderAttemptKind::Primary,
         );
-        let mut rx =
-            provider.stream_attempt(&attempt, effort, "s", &[Message::user_text("hi")], &[]);
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            effort,
+            None,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
