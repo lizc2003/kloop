@@ -207,5 +207,10 @@ own `.kloop/`, not cc's `.claude/`」,自相矛盾)。同一仓库里同时用 c
 的边界字符集不含 `-`。这条不变式已在 `permissions::tests::sensitive_path_detection_is_component_based`
 里用 `WORKTREES_DIR` 常量本身钉死,以后谁想把它挪进 `.kloop/` 会当场红。
 
-分支前缀 `worktree-<name>` **不改**:它和 `.claude/` 不同,是描述性的通用名字,不属于
-任何产品的命名空间。
+分支前缀同批改掉:`worktree-<name>` → `kloop/worktree/<name>`(codex 的
+`codex/worktree/<name>` 同形)。第一版判断是「描述性通用名,不属于任何产品的命名
+空间,可以不改」,但用户要求继续后重看:cc 创建的正是**逐字相同**的 `worktree-<slug>`,
+所以同仓两个 agent 的分支在 `git branch` 里完全无法区分,撞名时用户拿到的是一句
+指着别人的树说「branch already exists」。目录改了而分支不改,等于只做了一半。
+前缀只在 `create_managed` 用于拼名(无任何按前缀反查/清理的代码),`encode_name`
+已把用户名字里的 `/` 编码成 `+`,所以分支恒为三段、无歧义。

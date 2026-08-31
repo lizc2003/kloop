@@ -406,7 +406,13 @@ async fn file_search_bash_worktree_report() -> Value {
         &context.cfg.effective_file_state()
     ));
     assert!(!worktree.exists());
-    assert!(git(root.path(), &["branch", "--list", "worktree-plan59-chain"]).is_empty());
+    assert!(
+        git(
+            root.path(),
+            &["branch", "--list", "kloop/worktree/plan59-chain"]
+        )
+        .is_empty()
+    );
     assert_eq!(
         std::fs::read_to_string(root.path().join("chain.txt")).unwrap(),
         "ALPHA\nbeta\n"

@@ -203,7 +203,10 @@ mod tests {
         let (out, is_error) = run_tool("exit_worktree", json!({"action": "keep"}), &base).await;
         assert!(!is_error, "{out}");
         assert!(out.contains("back in"), "{out}");
-        assert!(out.contains("worktree-feat"), "kept tree named: {out}");
+        assert!(
+            out.contains("kloop/worktree/feat"),
+            "kept tree named: {out}"
+        );
         assert!(
             base.cfg.active_worktree.read().unwrap().is_none(),
             "slot cleared"
