@@ -1123,15 +1123,21 @@ At startup kloop assembles what the model knows about where it is:
   platform, today's UTC date, whether cwd is a git repo) + a git snapshot
   (current branch, `git status --short` capped at 1000 bytes, last 5 commits)
   labeled as a start-of-session snapshot.
-- **Instruction files**: per directory `AGENTS.md` wins, `CLAUDE.md` is the
-  compatibility fallback. Layers, in order: `~/.kloop/` (global), then every
-  directory from the git root down to cwd (closest to cwd last). Within each
-  project directory the order is the main file, then `.kloop/rules/*.md`
-  (modular fragments, loaded sorted), then a private `AGENTS.local.md` /
-  `CLAUDE.local.md` override (gitignore it — loaded last, so it wins). Without
-  a git root only cwd is consulted. Missing files are simply absent. Total
-  budget 32 KiB across all files — over it, the overflowing file is truncated
-  and the rest skipped, with startup warnings.
+- **Instruction files**: one name per directory, `AGENTS.md`. Layers, in order:
+  `~/.kloop/` (global), then every directory from the git root down to cwd
+  (closest to cwd last). Within each project directory the order is the main
+  file, then `.kloop/rules/*.md` (modular fragments, loaded sorted), then a
+  private `AGENTS.local.md` override (gitignore it — loaded last, so it wins).
+  Without a git root only cwd is consulted. Missing files are simply absent.
+  Total budget 32 KiB across all files — over it, the overflowing file is
+  truncated and the rest skipped, with startup warnings.
+  `CLAUDE.md` / `CLAUDE.local.md` were a compatibility fallback and are **not
+  read any more** — one name means kloop, codex and cc read the same bytes
+  instead of drifting per tool. To serve a cc-only reader from the same source,
+  keep `CLAUDE.md` as a one-line `@./AGENTS.md`. A retired file found with no
+  replacement beside it produces a startup warning naming both, because losing
+  an instruction file is otherwise silent: the session simply behaves as if the
+  rules were never written.
 - **`@import`**: any instruction file can pull in another with a line like
   `@./coding-style.md` (also `@../x.md`, `@~/x.md`, `@/abs/x.md`) — resolved
   relative to the importing file, expanded recursively (depth ≤ 5, cycles
