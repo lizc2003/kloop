@@ -359,7 +359,7 @@ async fn file_search_bash_worktree_report() -> Value {
     let (entered, enter_error) =
         run_tool("enter_worktree", json!({"name": "plan59-chain"}), &context).await;
     assert!(!enter_error && entered.contains("plan59-chain"));
-    let worktree = root.path().join(".kloop-worktrees/plan59-chain");
+    let worktree = root.path().join(".kloop/worktrees/plan59-chain");
     assert!(worktree.is_dir());
     assert_eq!(context.cfg.effective_cwd(), worktree);
     let worktree_file_state = context.cfg.effective_file_state();

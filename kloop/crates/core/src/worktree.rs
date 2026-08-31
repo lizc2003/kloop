@@ -38,12 +38,15 @@ use crate::permissions::Permissions;
 use crate::sandbox::SandboxPolicy;
 
 /// Managed worktrees live in kloop's own repository namespace, not in another
-/// agent's directory. Deliberately a sibling of `.kloop/` rather than
-/// `.kloop/worktrees`: `.kloop` is a sensitive path component (kloop's own
-/// state — a write there is privilege escalation, not editing) and a read-only
-/// subpath of every sandbox writable root, so a checkout nested inside it would
-/// classify every edit the agent makes in its own worktree as an escalation.
-pub(crate) const WORKTREES_DIR: &str = ".kloop-worktrees";
+/// agent's directory (cc's `.claude/worktrees`, codex's `.codex/worktrees`).
+///
+/// Nesting under `.kloop/` costs an exemption: `.kloop` is otherwise a sensitive
+/// path component — kloop's own state, where a write is privilege escalation and
+/// a *read* is a hard unapprovable deny — so a checkout below it would classify
+/// every edit and every read the agent makes in its own worktree as an attack on
+/// kloop itself. [`crate::permissions`] carves out exactly this segment pair; cc
+/// pays the same price for the same tidiness (`isDangerousFilePathToAutoEdit`).
+pub(crate) const WORKTREES_DIR: &str = ".kloop/worktrees";
 /// Branches carry kloop's namespace for the same reason the directory does:
 /// cc creates `worktree-<slug>` verbatim, so sharing the prefix makes the two
 /// tools' branches indistinguishable in `git branch` and turns a collision into
@@ -519,7 +522,7 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
         let managed_root = repository.root.join(WORKTREES_DIR);
         if !canonical_path.starts_with(&managed_root) {
             bail!(
-                "Cannot enter worktree: {} is not under {}. Switching from this session is limited to worktrees managed under .kloop-worktrees of this repository.",
+                "Cannot enter worktree: {} is not under {}. Switching from this session is limited to worktrees managed under .kloop/worktrees of this repository.",
                 canonical_path.display(),
                 managed_root.display(),
             );
@@ -992,7 +995,7 @@ mod tests {
         let path = worktree.path.clone();
         assert_eq!(worktree.custody, WorktreeCustody::Managed);
         assert_eq!(worktree.owner, WorktreeOwner::Task("agent-1".into()));
-        assert!(path.ends_with(".kloop-worktrees/agent-1"));
+        assert!(path.ends_with(".kloop/worktrees/agent-1"));
         assert_eq!(worktree.branch, "kloop/worktree/agent-1");
         assert!(finish(worktree).await.unwrap().is_none());
         assert!(!path.exists());

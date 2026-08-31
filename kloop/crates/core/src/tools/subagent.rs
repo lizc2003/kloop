@@ -1272,7 +1272,7 @@ mod tests {
             !repo.join("isolated.txt").exists(),
             "main repo must be untouched"
         );
-        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -1328,7 +1328,7 @@ mod tests {
         )
         .await;
         assert!(!is_error, "{out}");
-        let children: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let children: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
@@ -1382,7 +1382,7 @@ mod tests {
         assert!(
             system
                 .replace('\\', "/")
-                .contains(".kloop-worktrees/agent-"),
+                .contains(".kloop/worktrees/agent-"),
             "system points at the worktree: {system}"
         );
         assert!(
@@ -1410,7 +1410,7 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert_eq!(out, "looked around", "no branch note for a clean tree");
-        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
             .map(|d| d.filter_map(|e| e.ok()).collect())
             .unwrap_or_default();
         assert!(
@@ -1459,7 +1459,7 @@ mod tests {
             Ok(_) => panic!("registration unexpectedly succeeded during shutdown"),
         };
         assert!(error.contains("session is closing"), "{error}");
-        let trees = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let trees = std::fs::read_dir(repo.join(".kloop/worktrees"))
             .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
             .unwrap_or_default();
         assert!(trees.is_empty(), "registration failure leaked {trees:?}");
@@ -1504,7 +1504,7 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         assert!(!repo.join("out.txt").exists(), "main repo stays clean");
-        let mut trees: Vec<_> = std::fs::read_dir(repo.join(".kloop-worktrees"))
+        let mut trees: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())

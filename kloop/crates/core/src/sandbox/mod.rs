@@ -514,6 +514,44 @@ mod tests {
         assert!(!policy.allow_network);
     }
 
+    /// Managed worktrees live at `<repo>/.kloop/worktrees/<name>`, i.e. inside
+    /// the repo root's read-only `.kloop` subpath. Writes there stay allowed
+    /// because each writable root contributes its own alternative to one
+    /// `(allow file-write* ...)` disjunction: the worktree's own part grants
+    /// the write, and the repo part's `require-not` constrains only itself.
+    #[test]
+    fn a_worktree_under_the_protected_state_dir_stays_writable() {
+        let repo = PathBuf::from("/work/proj");
+        let worktree = repo.join(".kloop/worktrees/wt");
+        let target = worktree.join("src/main.rs");
+        // Worst case: the repo is *also* an explicitly configured root, so its
+        // `.kloop` read-only subpath survives the workspace swap.
+        let policy = SandboxPolicy::workspace(&repo, std::slice::from_ref(&repo), false)
+            .for_workspace(&worktree);
+
+        let permits = |root: &WritableRoot| {
+            target.starts_with(&root.root)
+                && !root
+                    .read_only_subpaths
+                    .iter()
+                    .any(|read_only| target.starts_with(read_only))
+        };
+        assert!(
+            policy.writable_roots.iter().any(permits),
+            "no writable root permits {}: {:?}",
+            target.display(),
+            policy.writable_roots
+        );
+        // The repo's own part still refuses it, which is why the disjunction
+        // (not a narrower `.kloop` rule) is what makes this work.
+        let repo_root = policy
+            .writable_roots
+            .iter()
+            .find(|root| root.root == repo)
+            .expect("configured repo root survives the swap");
+        assert!(!permits(repo_root));
+    }
+
     #[test]
     fn for_workspace_replaces_only_the_workspace_derived_root() {
         let base_root = PathBuf::from("/work/base");

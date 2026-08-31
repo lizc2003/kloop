@@ -1635,10 +1635,25 @@ The session tools use strict inputs:
 `name` and `path` are optional but mutually exclusive. Explicit nulls, wrong
 types, and unknown fields are rejected. Names are at most 64 characters and
 may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
-encoded as `+`. Managed trees live at `.kloop-worktrees/<encoded-name>` on
-`kloop/worktree/<encoded-name>`. An existing `path` must canonicalize to a registered
+encoded as `+`. Managed trees live at `.kloop/worktrees/<encoded-name>` on
+`kloop/worktree/<encoded-name>` — kloop's own namespace, not another agent's
+(cc uses `.claude/worktrees` + `worktree-<slug>`, codex `.codex/worktrees` +
+`codex/worktree/<name>`). An existing `path` must canonicalize to a registered
 worktree with the same Git common directory. Entering by path grants
 **External** custody only.
+
+Nesting the trees under `.kloop/` costs one exemption, because `.kloop` is
+otherwise a sensitive path component: a write there is privilege escalation and
+a *read* is a hard, unapprovable deny. `.kloop` immediately followed by
+`worktrees` is therefore treated as structural in `path_is_sensitive` and in the
+two raw-command screens — and nowhere else. The exemption is skipped entirely
+for any path or command carrying `..`, so `.kloop/worktrees/../sessions` cannot
+walk out through it, and a `.kloop` nested *inside* a worktree stays sensitive.
+cc pays the same price for the same tidiness (`isDangerousFilePathToAutoEdit`);
+codex does not need to, because it only protects the top level of each
+writable root rather than every path component. The sandbox needs no exemption:
+its writable roots are a disjunction, so the worktree's own root grants the
+write regardless of the repo root's read-only `.kloop`.
 
 `exit_worktree` always requires an explicit action. `keep` restores the base cwd
 and leaves the checkout and branch intact. `remove` may delete only the

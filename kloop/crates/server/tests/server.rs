@@ -2038,12 +2038,12 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
     assert_eq!(wt.len(), 2, "enter + exit notifications");
     assert_eq!(wt[0]["params"]["branch"], "kloop/worktree/srv");
     let entered_cwd = wt[0]["params"]["cwd"].as_str().unwrap().replace('\\', "/");
-    assert!(entered_cwd.ends_with(".kloop-worktrees/srv"));
+    assert!(entered_cwd.ends_with(".kloop/worktrees/srv"));
     assert_eq!(wt[1]["params"]["branch"], Value::Null);
 
     // The write landed in the worktree, not the main repo; the dirty tree is
     // kept (model exited with default keep).
-    assert!(repo.join(".kloop-worktrees/srv/s.txt").exists());
+    assert!(repo.join(".kloop/worktrees/srv/s.txt").exists());
     assert!(!repo.join("s.txt").exists());
 
     client.shutdown().await;
@@ -2070,7 +2070,7 @@ async fn unexited_worktree_is_retained_on_shutdown() {
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(
-        repo.join(".kloop-worktrees/leak").exists(),
+        repo.join(".kloop/worktrees/leak").exists(),
         "tree exists mid-session"
     );
 
@@ -2078,7 +2078,7 @@ async fn unexited_worktree_is_retained_on_shutdown() {
     // worker restores the base cwd and retains the clean tree.
     client.shutdown().await;
     assert!(
-        repo.join(".kloop-worktrees/leak").exists(),
+        repo.join(".kloop/worktrees/leak").exists(),
         "clean tree retained on shutdown"
     );
     let _ = std::fs::remove_dir_all(&repo);

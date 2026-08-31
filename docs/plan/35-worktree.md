@@ -184,33 +184,50 @@ server 会话 `enter_worktree→write_file→exit_worktree`,客户端收到两�
 **仍挂账**:origin/HEAD base;30 天陈旧清理;指令文件/git 快照按 worktree 重组;cc setup
 拷贝;跨仓库;server 同名 worktree 的客户端协调。
 
-## 修正（2026-08-29，plan 105 会话中 dogfood 发现）
+## 修正（2026-08-29 → 2026-08-31，plan 105 会话中 dogfood 发现）
 
 `WORKTREES_DIR` 原本是 `.claude/worktrees` —— 用户看到后一句「这个不合理」。确实:
 本文件上面写的收敛点是「**仓内专用目录**」,codex 用 `.codex/worktrees`、cc 用
 `.claude/worktrees`,两家都用**自己的**命名空间;kloop 照抄了 cc 的**字面目录名**,
 等于把自己的工作树写进另一个产品的目录里(README 里甚至有一句「kloop scans only its
 own `.kloop/`, not cc's `.claude/`」,自相矛盾)。同一仓库里同时用 cc 和 kloop 时,
-两边的 managed 树与 `worktree-*` 分支还会挤在一个命名空间里。
+两边的 managed 树与分支还会挤在一个命名空间里。分支前缀同理,`worktree-<slug>` 和 cc
+逐字相同,一并改成 `kloop/worktree/<name>`(codex 的 `codex/worktree/<name>` 同形)。
 
-改为 `.kloop-worktrees`。**为什么不是 `.kloop/worktrees`**(看起来更整齐,但会炸):
+目录名反复过一次,过程值得留下:
 
-1. `path_is_sensitive` 是**逐 component** 判定的,`.kloop` 在 `SENSITIVE_DIRS` 里
-   (kloop 自己的状态,写它是提权不是编辑)。工作树若嵌在 `.kloop/` 下,agent 在自己
-   工作树里改的**每一个文件**都会被判成敏感路径。
-2. sandbox 的 `protected_subpaths` 把每个 writable root 下的 `.kloop` 设为只读子路径。
-   worktree 模式下 `for_workspace` 会把 writable root 换成工作树本身,通常不撞;但用户
-   若额外把仓库根配成 writable root,`<repo>/.kloop` 的只读规则就会盖住里面的工作树。
+**第一版落在 `.kloop-worktrees`(同级兄弟)**,理由是别往 fail-closed 的分类器上打洞。
+**用户拍板「我看重 `.kloop/` 整齐」,改为 `.kloop/worktrees`**,代价是三个豁免。
 
-`.kloop-worktrees` 两条都绕开了:component 不等于 `.kloop`,而
-`raw_mentions_sensitive_path` 找的是 `/.kloop/`(带尾斜杠),`powershell_mentions_sensitive_path`
-的边界字符集不含 `-`。这条不变式已在 `permissions::tests::sensitive_path_detection_is_component_based`
-里用 `WORKTREES_DIR` 常量本身钉死,以后谁想把它挪进 `.kloop/` 会当场红。
+回源核对(第一版说「cc/codex 显然没有这层保护」是错的,两家都有):
 
-分支前缀同批改掉:`worktree-<name>` → `kloop/worktree/<name>`(codex 的
-`codex/worktree/<name>` 同形)。第一版判断是「描述性通用名,不属于任何产品的命名
-空间,可以不改」,但用户要求继续后重看:cc 创建的正是**逐字相同**的 `worktree-<slug>`,
-所以同仓两个 agent 的分支在 `git branch` 里完全无法区分,撞名时用户拿到的是一句
-指着别人的树说「branch already exists」。目录改了而分支不改,等于只做了一半。
-前缀只在 `create_managed` 用于拼名(无任何按前缀反查/清理的代码),`encode_name`
-已把用户名字里的 `/` 编码成 `+`,所以分支恒为三段、无歧义。
+- **cc 有一模一样的规则,并且为此开了特例**:`DANGEROUS_DIRECTORIES` 含 `.claude`,
+  `isDangerousFilePathToAutoEdit`(`filesystem.ts:447`)逐 segment 扫,和 kloop 的
+  `path_is_sensitive` 同形;它硬编码了「`.claude` 紧跟 `worktrees` 就跳过」,注释写明
+  这是 structural path,并且跳过后继续扫剩余 segment,树**内部**的 `.claude/` 照拦。
+- **codex 不需要特例,因为规则窄一档**:`default_read_only_subpaths_for_writable_root`
+  (`protocol/src/permissions.rs:1632`)保护的是 `writable_root.join(".codex")`——
+  每个 writable root 的**顶层**,不是路径里任何一处 component。进树后 writable root
+  换成树本身,`<repo>/.codex/worktrees/...` 从不在判定范围内。
+
+kloop 的规则是 cc 那种形状,所以走 cc 那条路:一个豁免,三处接线。
+
+**三处豁免(缺一不可,且都 fail-closed 守 `..`)**:
+
+1. `path_is_sensitive`:逐 component 扫时,`.kloop` 紧跟 `worktrees` 则 `continue`
+   (不是 return false——继续扫,树内嵌套的 `.kloop` 仍然敏感)。
+2. `raw_mentions_sensitive_path`:裸串层。**必需**,不是优化——它命中就是**硬 deny、
+   不可审批**(`permissions.rs:828`),而 `bash_reads_sensitive_path` 会把相对路径按 cwd
+   归一化,cwd 就是工作树,所以不开这个洞的话树里**每一次读**都被拒。
+3. `powershell_mentions_sensitive_path`:同上。
+
+裸串两层(2/3)只在命令里**不含 `..`** 时才给豁免——argv 解析失败时它们是仅剩的防线,
+`.kloop/worktrees/../sessions` 不能从洞里走出去。`path_is_sensitive` 也同样守:
+路径里出现任何 `ParentDir` 就整体作废豁免,不依赖调用方先归一化(这条是被自己的测试
+抓出来的——第一版只跳 segment,`..` 直接穿过去了)。
+
+**sandbox 不需要豁免**,这点第一版判断也错了。`protected_subpaths` 把每个 writable
+root 的 `.kloop` 设为只读子路径,但 SBPL 生成的是**一个 `(allow file-write* 部分0 部分1 …)`
+的析取**:进树后 `for_workspace` 把工作树本身加成 writable root,它那一部分独立放行,
+仓库根那一部分的 `require-not` 只约束它自己。即使用户额外把仓库根配成 writable root
+也不受影响。已加测试 `a_worktree_under_the_protected_state_dir_stays_writable` 钉死。

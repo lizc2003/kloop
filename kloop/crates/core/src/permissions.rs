@@ -1324,9 +1324,35 @@ fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path)
     })
 }
 
+/// The one exemption to `.kloop` being sensitive: `.kloop/worktrees/<name>` holds
+/// checkouts the agent is *supposed* to edit wholesale. Only this exact segment
+/// pair is structural — a nested `.kloop` inside the worktree, and every other
+/// child of `.kloop`, stays sensitive.
+const WORKTREE_SEGMENT: &str = "worktrees";
+
+/// Whether a raw command string may mention `.kloop/worktrees/`. The string
+/// layer is the only protection left when a command is too opaque to parse into
+/// argv, so it refuses to grant the exemption to anything carrying a `..`: a
+/// spelling like `.kloop/worktrees/../sessions` must not walk out through the
+/// hole. Normalized paths are exempted structurally instead, in
+/// [`path_is_sensitive`].
+fn worktree_mention_is_structural(command: &str) -> bool {
+    !command.contains("..")
+}
+
 fn raw_mentions_sensitive_path(command: &str) -> bool {
     let folded = fs_fold(command);
     let command = folded.as_ref();
+    if command.contains("/.kloop/worktrees/") && worktree_mention_is_structural(command) {
+        // Re-test with the managed worktree prefix neutralized, so the rest of
+        // the command is still screened for real state paths.
+        let masked = command.replace("/.kloop/worktrees/", "/worktrees/");
+        return mentions_sensitive_needle(&masked);
+    }
+    mentions_sensitive_needle(command)
+}
+
+fn mentions_sensitive_needle(command: &str) -> bool {
     [
         "~/.kloop", "/.kloop/", "~/.ssh", "/.ssh/", "~/.gnupg", "/.gnupg/", "~/.aws", "/.aws/",
     ]
@@ -1336,6 +1362,14 @@ fn raw_mentions_sensitive_path(command: &str) -> bool {
 
 fn powershell_mentions_sensitive_path(command: &str) -> bool {
     let normalized = command.to_lowercase().replace('\\', "/");
+    let normalized = if normalized.contains("/.kloop/worktrees/")
+        && worktree_mention_is_structural(&normalized)
+    {
+        normalized.replace("/.kloop/worktrees/", "/worktrees/")
+    } else {
+        normalized
+    };
+    let normalized = normalized.as_str();
     [".kloop", ".ssh", ".gnupg", ".aws", ".env"]
         .into_iter()
         .any(|needle| {
@@ -1528,6 +1562,12 @@ fn path_is_sensitive(normalized: &Path) -> bool {
         ".gitconfig",
         ".envrc",
     ];
+    // Callers normalize first, but the exemption below must not depend on that:
+    // `.kloop/worktrees/../sessions` is only a worktree path if you stop reading
+    // at the second segment. A `..` anywhere forfeits the exemption entirely.
+    let traversal = normalized
+        .components()
+        .any(|comp| matches!(comp, Component::ParentDir));
     let mut components = normalized.components().peekable();
     while let Some(comp) = components.next() {
         let Component::Normal(name) = comp else {
@@ -1539,6 +1579,18 @@ fn path_is_sensitive(normalized: &Path) -> bool {
         let folded = fs_fold(name);
         let name = folded.as_ref();
         let is_last = components.peek().is_none();
+        // `.kloop/worktrees/...` is a checkout, not kloop's state. Skipping the
+        // `.kloop` segment (rather than returning false) keeps the scan running
+        // over the rest, so a nested `.kloop` inside the worktree still trips.
+        if name == ".kloop"
+            && !traversal
+            && components.peek().is_some_and(|next| {
+                matches!(next, Component::Normal(next)
+                    if fs_fold(&next.to_string_lossy()) == WORKTREE_SEGMENT)
+            })
+        {
+            continue;
+        }
         if SENSITIVE_DIRS.contains(&name) && !is_last {
             return true;
         }
@@ -3127,6 +3179,31 @@ mod tests {
         assert!(parse_rule("powershell").is_ok());
     }
 
+    /// The string layer is the only screen left for a command too opaque to
+    /// parse into argv, so its exemption must not become a traversal hole.
+    #[test]
+    fn raw_command_exemption_covers_worktrees_but_never_a_traversal() {
+        assert!(!raw_mentions_sensitive_path(
+            "cat /w/proj/.kloop/worktrees/wt/src/main.rs"
+        ));
+        assert!(raw_mentions_sensitive_path(
+            "cat /w/proj/.kloop/sessions/x.jsonl"
+        ));
+        assert!(raw_mentions_sensitive_path(
+            "cat /w/proj/.kloop/worktrees/../sessions/x.jsonl"
+        ));
+        // The rest of an exempted command is still screened.
+        assert!(raw_mentions_sensitive_path(
+            "cp /w/proj/.kloop/worktrees/wt/a ~/.ssh/authorized_keys"
+        ));
+        assert!(powershell_mentions_sensitive_path(
+            "Get-Content /w/proj/.kloop/sessions/x.jsonl"
+        ));
+        assert!(!powershell_mentions_sensitive_path(
+            "Get-Content /w/proj/.kloop/worktrees/wt/src/main.rs"
+        ));
+    }
+
     #[test]
     fn rule_parsing_accepts_valid_and_rejects_malformed() {
         assert!(parse_rule("write_file").is_ok());
@@ -3152,13 +3229,18 @@ mod tests {
         assert!(s("/home/u/.ssh/id_rsa"));
 
         assert!(!s("/w/proj/src/main.rs"));
-        // A managed worktree is a checkout the agent edits wholesale, so its
-        // directory must never sit under a sensitive component — nesting it in
-        // `.kloop/` would make every edit inside it read as escalation.
-        assert!(!s(&format!(
-            "/w/proj/{}/tree/src/main.rs",
-            crate::worktree::WORKTREES_DIR
-        )));
+        // A managed worktree is a checkout the agent edits wholesale: the one
+        // exempt segment pair. Everything else under `.kloop` stays sensitive,
+        // including a nested `.kloop` inside the worktree and a traversal that
+        // re-enters kloop's own state through the exemption.
+        let tree = format!("/w/proj/{}/wt", crate::worktree::WORKTREES_DIR);
+        assert!(!s(&format!("{tree}/src/main.rs")));
+        assert!(s(&format!("{tree}/.kloop/config.toml")), "nested state");
+        assert!(s("/w/proj/.kloop/worktrees/../sessions/x.jsonl"));
+        assert!(
+            s("/w/proj/.kloop/worktreesx/src/main.rs"),
+            "prefix ≠ segment"
+        );
         assert!(!s("/w/proj/git/readme.md"), "git dir ≠ .git dir");
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
     }
