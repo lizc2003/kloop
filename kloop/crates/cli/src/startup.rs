@@ -61,7 +61,11 @@ pub(crate) struct RuntimeSettings {
     sandbox_disabled_by_env: bool,
     agent_types: Arc<Vec<AgentType>>,
     program_limits: kloop_core::ProgramLimits,
-    context_window: Option<u64>,
+    /// `KLOOP_CONTEXT_WINDOW` as given: `None` means the user said nothing, so a
+    /// provider's declared window applies. Collapsing that into the resolved
+    /// value would make "unset" and "explicitly 200_000" indistinguishable, and
+    /// the provider's window would never get a chance to win.
+    context_window_env: Option<Option<u64>>,
     defer_threshold: usize,
     shell_programs: Arc<ShellPrograms>,
     shell_warnings: Vec<String>,
@@ -81,7 +85,7 @@ impl RuntimeSettings {
                 sandbox_disabled_by_env: false,
                 agent_types: Arc::new(Vec::new()),
                 program_limits: kloop_core::ProgramLimits::default(),
-                context_window: Some(200_000),
+                context_window_env: Some(Some(DEFAULT_CONTEXT_WINDOW)),
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
                 shell_programs: Arc::new(shell_programs),
                 shell_warnings,
@@ -111,7 +115,7 @@ impl RuntimeSettings {
             sandbox_disabled_by_env: sandbox_disabled_from_env(),
             agent_types: Arc::new(load_agent_types(table)?),
             program_limits: load_program_limits(table)?,
-            context_window: context_window_from_env()?,
+            context_window_env: context_window_from_env()?,
             defer_threshold: defer_threshold_from_env()?,
             shell_programs: Arc::new(shell_programs),
             shell_warnings,
@@ -800,14 +804,20 @@ fn defer_threshold_from_env() -> Result<usize> {
     }
 }
 
-fn context_window_from_env() -> Result<Option<u64>> {
+/// The default when neither the env var nor the provider declares a window.
+/// Deliberately conservative: it has to be safe for the smallest model anyone
+/// routes to, which is why a provider that knows better should say so.
+const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
+/// `Ok(None)` = the user said nothing. `Ok(Some(None))` = explicitly off.
+fn context_window_from_env() -> Result<Option<Option<u64>>> {
     match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
-        Some("off") | Some("0") => Ok(None),
-        Some(raw) => Ok(Some(
+        Some("off") | Some("0") => Ok(Some(None)),
+        Some(raw) => Ok(Some(Some(
             raw.parse::<u64>()
                 .context("KLOOP_CONTEXT_WINDOW must be a token count or 'off'")?,
-        )),
-        None => Ok(Some(200_000)),
+        ))),
+        None => Ok(None),
     }
 }
 
@@ -832,7 +842,14 @@ pub(crate) fn server_config_snapshot(
         } else {
             args.permission_mode.label().into()
         },
-        context_window: runtime.context_window,
+        // Env override, then the provider's declared window, then the default.
+        // The env var wins so a wrong or missing provider value can be corrected
+        // without editing the provider block.
+        context_window: runtime.context_window_env.unwrap_or_else(|| {
+            provider
+                .initial_context_window()
+                .or(Some(DEFAULT_CONTEXT_WINDOW))
+        }),
         defer_threshold: runtime.defer_threshold,
         sandbox: SandboxConfigInfo {
             enabled: sandbox_enabled,
@@ -942,7 +959,14 @@ pub(crate) fn config_from_settings(
         cwd,
         offload_dir: session_dirs.offload.clone(),
         sessions_dir: session_dirs.sessions.clone(),
-        context_window: runtime.context_window,
+        // Env override, then the provider's declared window, then the default.
+        // The env var wins so a wrong or missing provider value can be corrected
+        // without editing the provider block.
+        context_window: runtime.context_window_env.unwrap_or_else(|| {
+            provider
+                .initial_context_window()
+                .or(Some(DEFAULT_CONTEXT_WINDOW))
+        }),
         permissions,
         questioner,
         file_state: Default::default(),

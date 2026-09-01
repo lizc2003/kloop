@@ -53,6 +53,10 @@ pub(crate) struct ResolvedProviderSettings {
     catalog: Arc<ProviderCatalog>,
     initial_provider: String,
     initial_route: FrozenProviderRoute,
+    /// The selected provider's declared window, if it declared one. Only the
+    /// initial provider's matters: `/provider` switching mid-session would need
+    /// the whole compaction budget re-derived, which is a separate change.
+    initial_context_window: Option<u64>,
 }
 
 impl ResolvedProviderSettings {
@@ -69,6 +73,7 @@ impl ResolvedProviderSettings {
             catalog,
             initial_provider: "mock".into(),
             initial_route,
+            initial_context_window: None,
         }
     }
 
@@ -82,6 +87,10 @@ impl ResolvedProviderSettings {
 
     pub(crate) fn initial_provider(&self) -> &str {
         &self.initial_provider
+    }
+
+    pub(crate) fn initial_context_window(&self) -> Option<u64> {
+        self.initial_context_window
     }
 
     #[cfg(test)]
@@ -100,6 +109,12 @@ struct Profile {
     cache: bool,
     thinking: ThinkingMode,
     effort: Option<ReasoningEffort>,
+    /// The model's real context window, when the provider knows it. Only the
+    /// provider can: the global default has to be conservative enough for the
+    /// smallest model anyone routes to, and a window set too low costs nothing
+    /// visible — it just compacts earlier than it had to, which is why it stays
+    /// wrong for a long time.
+    context_window: Option<u64>,
 }
 
 struct GlobalFile {
@@ -158,6 +173,8 @@ fn resolve_table(
             "initial model '{initial_model}' is not in provider '{initial_provider}' models allowlist"
         );
     }
+    // Read before the loop below moves the profiles out.
+    let initial_context_window = profile.context_window;
 
     let root_effort = file.initial_effort;
     let mut entries = Vec::with_capacity(file.profiles.len());
@@ -217,6 +234,7 @@ fn resolve_table(
         catalog,
         initial_provider,
         initial_route,
+        initial_context_window,
     })
 }
 
@@ -273,6 +291,8 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
         // provider — which, here, is the only one.
         effort: None,
+        // No config file to declare it in; the global default applies.
+        context_window: None,
     };
     Ok(GlobalFile {
         initial_model: Some(model),
@@ -390,6 +410,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "cache"
                 | "thinking"
                 | "effort"
+                | "context_window"
         ) {
             bail!("model_providers.{id} has unknown key '{key}'");
         }
@@ -442,6 +463,11 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
         bail!("model_providers.{id}: cache/thinking are only valid for anthropic wire_api");
     }
+    let context_window = optional_integer(
+        spec,
+        "context_window",
+        &format!("model_providers.{id}.context_window"),
+    )?;
     let headers = parse_headers(id, spec.get("http_headers"), wire)?;
     Ok(Profile {
         wire,
@@ -453,6 +479,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         cache,
         thinking,
         effort,
+        context_window,
     })
 }
 
@@ -565,6 +592,24 @@ fn optional_string(table: &toml::Table, key: &str, field: &str) -> Result<Option
         .transpose()
 }
 
+/// A positive token count. Zero is rejected rather than read as "unbounded":
+/// `KLOOP_CONTEXT_WINDOW=0` means off, but a config file saying `0` is far more
+/// likely a mistake than a request to disable the guard.
+fn optional_integer(table: &toml::Table, key: &str, field: &str) -> Result<Option<u64>> {
+    table
+        .get(key)
+        .map(|value| {
+            let raw = value
+                .as_integer()
+                .with_context(|| format!("{field} must be an integer token count"))?;
+            u64::try_from(raw)
+                .ok()
+                .filter(|count| *count > 0)
+                .with_context(|| format!("{field} must be a positive token count, got {raw}"))
+        })
+        .transpose()
+}
+
 fn optional_bool(table: &toml::Table, key: &str, field: &str) -> Result<Option<bool>> {
     table
         .get(key)
@@ -651,6 +696,83 @@ base_url = "https://chat-c.example/v1"
 default_model = "chat-a"
 models = ["chat-a", "shared"]
 "#;
+
+    /// Only the selected provider's window is read, and a provider that declares
+    /// nothing yields `None` so the caller can fall back — the distinction the
+    /// whole precedence chain rests on.
+    #[test]
+    fn context_window_comes_from_the_selected_provider_only() {
+        let table: toml::Table = r#"
+model_provider = "responses-b"
+
+[model_providers.anthropic-a]
+wire_api = "anthropic"
+base_url = "https://anthropic-a.example"
+http_headers = { x-api-key = "a-key" }
+default_model = "claude-a"
+models = ["claude-a"]
+context_window = 111000
+
+[model_providers.responses-b]
+wire_api = "responses"
+base_url = "https://responses-b.example/v1"
+http_headers = { Authorization = "Bearer b-key" }
+default_model = "gpt-a"
+models = ["gpt-a"]
+context_window = 258400
+"#
+        .parse()
+        .unwrap();
+        let selected = resolve_table(Some(&table), &env(&[])).unwrap();
+        assert_eq!(selected.initial_context_window(), Some(258_400));
+
+        // The other provider's 111000 must not leak in when it is selected away
+        // from; and a profile without the key declares nothing.
+        let other =
+            resolve_table(Some(&table), &env(&[("KLOOP_PROVIDER", "anthropic-a")])).unwrap();
+        assert_eq!(other.initial_context_window(), Some(111_000));
+
+        let bare: toml::Table = CATALOG.parse().unwrap();
+        assert_eq!(
+            resolve_table(Some(&bare), &env(&[]))
+                .unwrap()
+                .initial_context_window(),
+            None
+        );
+    }
+
+    #[test]
+    fn context_window_rejects_non_positive_and_non_integer() {
+        for (raw, want) in [
+            ("context_window = 0", "must be a positive token count"),
+            ("context_window = -5", "must be a positive token count"),
+            (
+                "context_window = \"258400\"",
+                "must be an integer token count",
+            ),
+        ] {
+            let table: toml::Table = format!(
+                r#"
+model_provider = "responses-b"
+
+[model_providers.responses-b]
+wire_api = "responses"
+base_url = "https://responses-b.example/v1"
+http_headers = {{ Authorization = "Bearer b-key" }}
+default_model = "gpt-a"
+models = ["gpt-a"]
+{raw}
+"#
+            )
+            .parse()
+            .unwrap();
+            let error = resolve_table(Some(&table), &env(&[]))
+                .err()
+                .expect("invalid context_window must be rejected")
+                .to_string();
+            assert!(error.contains(want), "{raw} → {error}");
+        }
+    }
 
     #[test]
     fn canonical_catalog_preserves_ordered_allowlists_and_availability() {

@@ -126,10 +126,20 @@ fork:
   `context_length_exceeded`) compacts once per turn and retries; a second
   overflow surfaces as an error instead of looping.
 
-Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary, canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a ~2k-token recent tail verbatim (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. Failed or cancelled summary requests leave history untouched.
+Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary, canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a recent tail verbatim (`KEEP_RECENT_TOKENS`) (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. Failed or cancelled summary requests leave history untouched.
 
-`KLOOP_CONTEXT_WINDOW` sets the usable window in tokens (default 200000,
-`off` disables compaction).
+The usable window resolves in three steps: `KLOOP_CONTEXT_WINDOW` (a token
+count, or `off` to disable compaction) wins, then the selected provider's
+`context_window` key, then 200000. A provider block should declare its model's
+real window — the default has to stay safe for the smallest model anyone routes
+to, and a window set too low is invisible: it just compacts earlier than it had
+to. The env var still wins so a wrong provider value can be corrected without
+editing the block.
+
+```toml
+[model_providers.gw_router]
+context_window = 258400
+```
 
 ## Session persistence (Phase 2, second slice)
 
