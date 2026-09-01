@@ -45,6 +45,12 @@ pub struct History {
     usage_anchor: Option<(usize, u64)>,
     provider_usage: UsageLedger,
     provider_routes: Vec<ProviderRouteReceipt>,
+    /// The smallest request size the provider has actually rejected as too
+    /// large, in estimated tokens. A configured window is a claim; a rejection
+    /// is ground truth, and it is the only signal that the claim was wrong.
+    /// Recording it makes the predictive threshold self-correct instead of
+    /// walking into the same rejection every round.
+    observed_overflow_ceiling: Option<u64>,
     /// Session file written through on every record/replace_all; None for
     /// in-memory-only histories (sub-agents, tests).
     rollout: Option<Rollout>,
@@ -58,6 +64,7 @@ impl History {
             offload_dir,
             cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
+            observed_overflow_ceiling: None,
             provider_usage: UsageLedger::default(),
             provider_routes: Vec::new(),
             rollout: None,
@@ -82,6 +89,7 @@ impl History {
             offload_dir,
             cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
+            observed_overflow_ceiling: None,
             provider_usage: resumed.provider_usage,
             provider_routes,
             next_memory_boundary: resumed.rollout.next_boundary(),
@@ -356,6 +364,24 @@ impl History {
 
     /// Current context size: the last real usage anchor plus a ~4 chars/token
     /// estimate for everything recorded after it.
+    /// The window to plan against: the configured value, lowered to anything the
+    /// provider has actually rejected. Never raised — a rejection at N proves
+    /// only that N is too big, never that anything is safe.
+    pub fn effective_window(&self, configured: u64) -> u64 {
+        match self.observed_overflow_ceiling {
+            Some(observed) => configured.min(observed),
+            None => configured,
+        }
+    }
+
+    /// Record a size the provider refused. Keeps the smallest seen.
+    pub fn note_overflow_at(&mut self, estimated_tokens: u64) {
+        self.observed_overflow_ceiling = Some(match self.observed_overflow_ceiling {
+            Some(previous) => previous.min(estimated_tokens),
+            None => estimated_tokens,
+        });
+    }
+
     pub fn estimated_tokens(&self) -> u64 {
         let (anchored_len, anchored_tokens) = self.usage_anchor.unwrap_or((0, 0));
         let tail: u64 = self.items[anchored_len.min(self.items.len())..]

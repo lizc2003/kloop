@@ -453,7 +453,9 @@ async fn turn_rounds(
             && compact::predicted_overflow(
                 history.estimated_tokens() + instructions_tokens,
                 growth,
-                window,
+                // A configured window is a claim; a rejection already observed
+                // this session is a measurement, and it wins.
+                history.effective_window(window),
             )
         {
             ui.emit(&Event::Note(
@@ -534,10 +536,7 @@ async fn turn_rounds(
                 .await;
                 match compaction {
                     Ok(compact::CompactionOutcome::Applied(receipt)) => {
-                        ui.emit(&Event::Note(format!(
-                            "history compacted: {} summarized, {} kept verbatim",
-                            receipt.summarized, receipt.kept
-                        )));
+                        ui.emit(&Event::Note(compact::describe(&receipt)));
                         continue;
                     }
                     Ok(compact::CompactionOutcome::NoOp(_)) => {
