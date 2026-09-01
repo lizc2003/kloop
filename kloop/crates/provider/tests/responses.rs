@@ -1376,6 +1376,51 @@ async fn keepalive_event_is_ignored_mid_stream() {
     assert_eq!(ok.len(), 3);
 }
 
+/// `responsesapi.websocket_timing` is transport telemetry from the same proxy.
+/// It surfaced at the tail of an 856-second review and killed the whole turn:
+/// like `keepalive`, it only appears in runs long enough that a short probe
+/// never samples it.
+#[tokio::test]
+async fn vendor_namespaced_timing_event_is_ignored_mid_stream() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "responsesapi.websocket_timing", "sequence_number": 2, "ms": 17}),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::TextDelta(t) if t == "hi"));
+    assert_eq!(ok.len(), 3);
+}
+
 /// A `keepalive` after the semantic terminal is exempt from the terminal-after
 /// guard too — both rejection points treat the out-of-band list alike.
 #[tokio::test]

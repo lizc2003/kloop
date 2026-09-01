@@ -287,8 +287,15 @@ fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, Provide
 /// - `keepalive`:裸名心跳,gateway 在模型思考期间填。填得多少只取决于思考
 ///   多久——实测 effort=low 一个没有,xhigh 一轮 2~14 个——所以它对高 effort
 ///   是常态而非异常。
+/// - `responsesapi.*`:另一个厂商命名空间,目前只见 `responsesapi.websocket_timing`
+///   的传输计时遥测。它在一次 856 秒的真实审查末尾出现并打死整轮——同 keepalive
+///   一样,只在长跑里才撞得到,所以短探针取样不到(见教训 89a)。
+///
+/// 官方语义族全部以 `response.` 开头(外加裸名 `error`),厂商噪声一律走自己的
+/// 命名空间;这条名单每长一次,都在提示"非 `response.` 前缀即带外"可能才是正确
+/// 的规则,但那要把 fail-closed 的边界整体挪一次,不在本片范围内。
 fn is_out_of_band(event: &str) -> bool {
-    event.starts_with("codex.") || event == "keepalive"
+    event.starts_with("codex.") || event.starts_with("responsesapi.") || event == "keepalive"
 }
 
 fn response_identity(response: &Value) -> Result<(&str, &str), ProviderFailure> {
