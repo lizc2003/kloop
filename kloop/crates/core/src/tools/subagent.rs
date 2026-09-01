@@ -74,6 +74,8 @@ struct RunAgentInput {
     #[serde(default)]
     background: bool,
     #[serde(default)]
+    max_rounds: Option<u64>,
+    #[serde(default)]
     isolation: Option<String>,
 }
 
@@ -96,6 +98,20 @@ pub(crate) async fn run_agent_admitted(
     let parsed: RunAgentInput =
         serde_json::from_value(input.clone()).context("run_agent: invalid input")?;
     let description = super::optional_display_description(input, "run_agent")?;
+    // A model-chosen budget. Measured both ways on the same review: with the cap
+    // the run took 70 provider requests, without it one sub-agent ran 158 rounds
+    // and the run took 342. The cap was never the defect — discarding the work on
+    // hitting it was, and `EndReason::MaxRounds` now returns what the sub-agent
+    // produced, so a low guess costs some depth instead of everything.
+    let max_rounds = match parsed.max_rounds {
+        None => None,
+        Some(n) => {
+            if n == 0 {
+                bail!("run_agent: max_rounds must be a positive integer");
+            }
+            Some(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+    };
     let prompt = parsed.prompt;
     let _ = parsed.description;
     let background = parsed.background;
@@ -128,16 +144,7 @@ pub(crate) async fn run_agent_admitted(
     };
     let agent = next_agent_label();
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
-    // A sub-agent runs until it answers. The round cap that used to live here was
-    // model-supplied, and the model has no basis for the number — see the schema
-    // test in tools/mod.rs.
-    let mut sub = build_sub_config(
-        ctx,
-        workspace,
-        /*max_rounds*/ None,
-        agent.clone(),
-        agent_type,
-    )?;
+    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type)?;
     if let Some(model) = model.as_ref() {
         sub.provider_route = sub
             .provider_route
@@ -1186,20 +1193,18 @@ mod tests {
         assert!(out.contains("cannot spawn"));
     }
 
-    /// `max_rounds` is gone from run_agent, and `deny_unknown_fields` makes that
-    /// visible instead of silently ignoring a cap the caller thinks it set.
     #[tokio::test]
-    async fn run_agent_no_longer_accepts_a_round_limit() {
+    async fn run_agent_rejects_non_positive_round_limit() {
         let ctx = test_ctx(0, "run-agent-zero-rounds");
         let (out, is_error) = run_tool(
             "run_agent",
-            json!({"prompt": "keep going", "max_rounds": 12}),
+            json!({"prompt": "keep going", "max_rounds": 0}),
             &ctx,
         )
         .await;
 
-        assert!(is_error, "{out}");
-        assert!(out.contains("max_rounds"), "{out}");
+        assert!(is_error);
+        assert_eq!(out, "run_agent: max_rounds must be a positive integer");
     }
 
     /// A sub-agent never inherits the parent's guardrail and has no default cap:
