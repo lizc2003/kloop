@@ -404,3 +404,33 @@ agent 固定无上限;人显式设的 `--max-rounds`(headless 跑飞兜底)保�
 `STREAM_OPEN_TIMEOUT = 45s`(等响应头)vs codex 的 `stream_idle_timeout` 默认 300s,
 而本会话实测 xhigh 的 TTFT 可达 69~238 秒。网络好时触发 0 次,网络差时一轮触发 34
 次、每次 45 秒空等加整请求重发。不是常态成因,但是真实脆弱点。是否放宽未决。
+
+
+## 片 13 ✅ — 两处按实测结论的改动
+
+**(a) `STREAM_OPEN_TIMEOUT` 45s → 300s。** 这个超时等的是**响应头**,而在 gateway
+这类代理上,头要等到模型开始产出才发,于是思考时间被折进了这个窗口:实测 TTFT 低
+effort 约 3 秒,xhigh 是 69~238 秒。45 秒等于把"慢但健康的 xhigh 请求"判成断连——
+一轮真实审查触发了 34 次,每次代价是空等加整个请求重发。codex 的同位旋钮
+`stream_idle_timeout` 默认就是 300 秒。真正断掉的连接仍会被发现,只是晚一点;
+30 分钟的 wall timeout 仍是外层兜底(契约测试新增了 open < wall 的断言)。
+
+**(b) BASE_SYSTEM 补压缩后的连续性约束。** 用户提出"是不是 codex 的 system prompt
+里有约束",比对属实:
+
+- kloop 原文只有一句"上下文不受窗口限制,**别为了省地方少干活**"——在鼓励多做,
+  而**压缩之后该怎么办一个字没写**。
+- codex 有:"Do not restart from scratch… **Do not redo completely finished work**…
+  treat a turn spanning compactions as **one logical chain of events**"。
+
+实测症状精确对应:99 个请求里 83 个在主 agent,而压缩触发后主 agent 开始
+`git show … | sed -n` 逐段重读子 agent 已审过的文件——它把摘要读成了"我还没做过"。
+补的措辞除了照抄"当成一条链、别重做已完成的工作",还加了一条 kloop 特有的:
+**不要重新推导子 agent 已经报过的结论;摘要里丢了哪个细节就去取那个细节,不要把
+整轮调查重做一遍**。
+
+并行那条不用改:kloop 已有"Independent tool calls in one turn run in parallel;
+batch them",而且实测 kloop 每请求 3.6 个工具、codex 只有 1.1,批得更狠。
+
+这两条的效果需要下一轮实测验证(基线:99 请求 / 1911s,codex 36 / 877s),**本片
+未测**。

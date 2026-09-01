@@ -18,7 +18,15 @@ use tokio::time::Sleep;
 use crate::ProviderFailure;
 use crate::TimeoutStage;
 
-pub(crate) const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long to wait for response *headers*. Generous because on some proxies the
+/// headers do not arrive until the model starts producing, which folds thinking
+/// time into this window: measured TTFT on gateway is ~3s at low effort but
+/// 69–238s at xhigh. At 45s a slow-but-healthy xhigh request looked like a dead
+/// connection — one real review burned 34 timeouts, each costing the wait plus a
+/// full re-request. Codex's comparable knob (`stream_idle_timeout`) defaults to
+/// 300s. A genuinely dead connection is still caught, just later; the wall
+/// timeout below remains the real backstop.
+pub(crate) const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(crate) const STREAM_WALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const STREAM_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
@@ -382,7 +390,13 @@ mod tests {
 
     #[test]
     fn fixed_guard_defaults_are_the_public_contract() {
-        assert_eq!(STREAM_OPEN_TIMEOUT, Duration::from_secs(45));
+        // 300s, not 45s: on this proxy the headers wait on the model's first
+        // token, and xhigh thinking runs past 45s routinely.
+        assert_eq!(STREAM_OPEN_TIMEOUT, Duration::from_secs(300));
+        assert!(
+            STREAM_OPEN_TIMEOUT < STREAM_WALL_TIMEOUT,
+            "the wall timeout must stay the outer backstop"
+        );
         assert_eq!(STREAM_IDLE_TIMEOUT, Duration::from_secs(15 * 60));
         assert_eq!(STREAM_WALL_TIMEOUT, Duration::from_secs(30 * 60));
         assert_eq!(STREAM_MAX_RESPONSE_BYTES, 10 * 1024 * 1024);
