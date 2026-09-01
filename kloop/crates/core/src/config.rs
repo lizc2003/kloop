@@ -484,7 +484,18 @@ impl Config {
             questioner: None,
             file_state: Arc::new(FileState::default()),
             tool_sources: self.tool_sources.clone(),
-            session_id: self.session_id.clone(),
+            // The child's own cache identity, not the parent's. `prompt_cache_key`
+            // exists so requests that share a prefix route together; a sub-agent's
+            // prefix (its own system scope, a fresh history) has nothing in common
+            // with the parent's, so handing them one key asks the router to pin
+            // unrelated conversations to the same backend. It also matches the
+            // child's session file, which was already `{parent}-{label}` — the two
+            // identities were out of step.
+            session_id: if self.session_id.is_empty() {
+                String::new()
+            } else {
+                format!("{}-{}", self.session_id, agent_id)
+            },
             local_agent: self.local_agent.child(agent_id),
             hooks: Arc::clone(&self.hooks),
             background_shells: Arc::clone(&self.background_shells),

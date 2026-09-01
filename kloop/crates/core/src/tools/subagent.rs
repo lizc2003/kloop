@@ -331,10 +331,9 @@ pub(crate) async fn structured_agent_admitted(
     let execution = receipt.as_execution_ref();
     let handle = tokio::spawn({
         let ui = ui.clone();
-        let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
                 Ok(history) => history,
                 Err(error) => {
                     return crate::agent::TurnOutcome {
@@ -610,10 +609,9 @@ async fn run_sub_agent_sync(
     let execution = receipt.as_execution_ref();
     let handle = tokio::spawn({
         let ui = ui.clone();
-        let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
                 Ok(history) => history,
                 Err(error) => {
                     return crate::agent::TurnOutcome {
@@ -794,7 +792,7 @@ async fn spawn_background(
     let parent_inbox = ctx.cfg.inbox.clone();
     let background_executions = ctx.cfg.background_executions.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
-    let session_note = child_session_note(&sub_cfg, &agent, subagent_of.as_deref());
+    let session_note = child_session_note(&sub_cfg, subagent_of.as_deref());
     let description = preview.to_string();
     emit_background_task(
         &ui,
@@ -812,10 +810,9 @@ async fn spawn_background(
     let execution = receipt.as_execution_ref();
     let worker = tokio::spawn({
         let ui = ui.clone();
-        let label = agent.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, &label, subagent_of.as_deref()) {
+            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
                 Ok(history) => history,
                 Err(error) => {
                     return crate::agent::TurnOutcome {
@@ -925,12 +922,12 @@ async fn spawn_background(
 /// transcript is auditable and separately resumable, yet kept out of the
 /// default resume picker. A parent with no session (mock, tests) or with a
 /// dropped rollout leaves the sub-agent in-memory, exactly as before.
-fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> Result<History> {
+fn sub_history(cfg: &Config, subagent_of: Option<&str>) -> Result<History> {
     let mut history = History::new(cfg.offload_dir.clone());
     if let Some(parent_line) = subagent_of
         && !cfg.session_id.is_empty()
     {
-        let path = session_path(&cfg.sessions_dir, &child_session_id(cfg, agent));
+        let path = session_path(&cfg.sessions_dir, &cfg.session_id);
         history.attach_rollout(Rollout::new_subagent_with_route(
             path,
             parent_line.to_string(),
@@ -942,19 +939,12 @@ fn sub_history(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> Result<H
     Ok(history)
 }
 
-/// The sub-agent's session id: parent id + its label, so the file name itself
-/// shows the lineage and stays unique (parent id is unique, the label is
-/// process-global monotonic).
-fn child_session_id(cfg: &Config, agent: &str) -> String {
-    format!("{}-{}", cfg.session_id, agent)
-}
-
 /// A pointer to the child's session log for the parent's tool_result — so a
 /// human auditing the parent session can jump to what the sub-agent did.
 /// Empty when the sub-agent isn't being persisted (mock, tests).
-fn child_session_note(cfg: &Config, agent: &str, subagent_of: Option<&str>) -> String {
+fn child_session_note(cfg: &Config, subagent_of: Option<&str>) -> String {
     if subagent_of.is_some() && !cfg.session_id.is_empty() {
-        format!(" Its session log is {}.", child_session_id(cfg, agent))
+        format!(" Its session log is {}.", cfg.session_id)
     } else {
         String::new()
     }
