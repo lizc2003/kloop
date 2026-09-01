@@ -2514,7 +2514,7 @@ mod tests {
             let mut history = History::resume(dir.clone(), resumed);
             history.record(Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "big".into(),
-                content: "x".repeat(9_000).into(),
+                content: "x".repeat(crate::history::OFFLOAD_CAP_CHARS + 1_000).into(),
                 is_error: false,
             }]));
             let ContentBlock::ToolResult { content, .. } =

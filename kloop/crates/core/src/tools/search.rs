@@ -41,7 +41,8 @@ const GREP_DEFAULT_LIMIT: usize = 250;
 /// cc's Glob maxResults.
 const GLOB_LIMIT: usize = 100;
 /// Keep model-facing search text below History's generic 8k offload threshold.
-const SEARCH_CONTENT_CHARS: usize = 7_000;
+/// Cap on one grep reply; same trade as `READ_CONTENT_CHARS` and sized with it.
+const SEARCH_CONTENT_CHARS: usize = 30_000;
 /// cc kills rg after 20s; we stop between files and return partial results.
 const SEARCH_BUDGET: Duration = Duration::from_secs(20);
 
@@ -1231,15 +1232,22 @@ mod tests {
     #[tokio::test]
     async fn glob_truncates_past_100_files() {
         let t = Tree::new("glob-cap", &[]);
+        // Paths long enough that the character cap bites before GLOB_LIMIT does.
+        // With short names it cannot: GLOB_LIMIT entries times a filesystem's
+        // 255-char component limit stays under the budget, so a fixture of short
+        // names would quietly stop testing the character cap.
+        let deep = format!("{a}/{a}", a = "d".repeat(180));
         for i in 0..105 {
-            t.write(&format!("long-search-result-name-{i:03}.txt"), "x");
+            t.write(&format!("{deep}/long-search-result-name-{i:03}.txt"), "x");
         }
         let out = glob(json!({"pattern": "*.txt", "path": t.path()}))
             .await
             .unwrap();
         assert!(out.lines().count() <= 103, "bounded path list plus notices");
-        assert!(out.chars().count() < 8_000);
-        assert!(out.contains("[search output truncated at 7000 characters"));
+        assert!(out.chars().count() < crate::history::OFFLOAD_CAP_CHARS);
+        assert!(out.contains(&format!(
+            "[search output truncated at {SEARCH_CONTENT_CHARS} characters"
+        )));
         let listed = out
             .split_once("\n\n[search output truncated")
             .map(|(listed, _)| listed)
@@ -1255,9 +1263,13 @@ mod tests {
     #[tokio::test]
     async fn glob_model_text_is_character_bounded_without_shrinking_program_array() {
         let t = Tree::new("glob-char-cap", &[]);
+        // Two nested long segments so each path is ~400 chars; the count is
+        // derived from the budget and kept under GLOB_LIMIT so the character cap,
+        // not the entry cap, is what truncates.
         let segment = "x".repeat(180);
-        for index in 0..40 {
-            t.write(&format!("{segment}/file-{index:03}.txt"), "x");
+        let entries = (SEARCH_CONTENT_CHARS / 400 + 10).min(GLOB_LIMIT - 5);
+        for index in 0..entries {
+            t.write(&format!("{segment}/{segment}/file-{index:03}.txt"), "x");
         }
         let sink: crate::tools::ProgramResultSink = Arc::new(std::sync::Mutex::new(None));
         let out = glob_tool(
@@ -1269,8 +1281,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.chars().count() < 8_000);
-        assert!(out.contains("[search output truncated at 7000 characters"));
+        assert!(out.chars().count() < crate::history::OFFLOAD_CAP_CHARS);
+        assert!(out.contains(&format!(
+            "[search output truncated at {SEARCH_CONTENT_CHARS} characters"
+        )));
         assert_eq!(
             sink.lock()
                 .unwrap()
@@ -1278,7 +1292,7 @@ mod tests {
                 .and_then(Value::as_array)
                 .unwrap()
                 .len(),
-            40
+            entries
         );
     }
 

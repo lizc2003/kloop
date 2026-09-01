@@ -31,7 +31,7 @@ const TAIL_CHARS: usize = 500;
 /// its whole job is to escape the spill, so a reply that spills again hands the
 /// model a byte-identical preview under a fresh id — the escape hatch failing at
 /// the only size that ever needs it (see `tools::fs::OFFLOAD_WINDOW_CHARS`).
-pub const OFFLOAD_CAP_CHARS: usize = 8000;
+pub const OFFLOAD_CAP_CHARS: usize = 32_000;
 
 /// Append-only conversation history. Oversized tool results are offloaded to
 /// disk at record time; the history keeps a preview plus a pointer the model
@@ -597,14 +597,14 @@ mod tests {
     fn oversized_tool_result_is_offloaded_with_pointer() {
         let dir = temp_dir("spill");
         let mut h = History::new(dir.clone());
-        let big = "x".repeat(9000);
+        let big = "x".repeat(OFFLOAD_CAP_CHARS + 1_000);
         h.record(tool_result(big.clone()));
 
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
             panic!("expected tool result");
         };
         let content = content.as_text();
-        assert!(content.chars().count() < 9000);
+        assert!(content.chars().count() < OFFLOAD_CAP_CHARS);
         assert!(content.contains("…[truncated]…"));
         assert!(content.contains("read_offloaded"));
         let id_start = content.find("id=off-").expect("pointer has id") + 3;
@@ -620,7 +620,7 @@ mod tests {
         let mut history = History::new(dir.clone());
         assert_eq!(history.offload_text("small".into()), "small");
 
-        let big = "result".repeat(1_500);
+        let big = "result".repeat(OFFLOAD_CAP_CHARS / 6 + 200);
         let preview = history.offload_text(big.clone());
         assert!(preview.contains("…[truncated]…"), "{preview}");
         assert!(preview.contains("read_offloaded"), "{preview}");
@@ -683,8 +683,8 @@ mod tests {
         let dir = temp_dir("shared");
         let mut a = History::new(dir.clone());
         let mut b = History::new(dir.clone());
-        a.record(tool_result("a".repeat(9_000)));
-        b.record(tool_result("b".repeat(9_000)));
+        a.record(tool_result("a".repeat(OFFLOAD_CAP_CHARS + 1_000)));
+        b.record(tool_result("b".repeat(OFFLOAD_CAP_CHARS + 1_000)));
         let id_of = |h: &History| {
             let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
                 panic!("expected tool result");
@@ -708,7 +708,7 @@ mod tests {
             },
             ContentBlock::ToolResult {
                 tool_use_id: "big".into(),
-                content: "z".repeat(9_000).into(),
+                content: "z".repeat(OFFLOAD_CAP_CHARS + 1_000).into(),
                 is_error: false,
             },
         ]));
@@ -854,7 +854,7 @@ mod tests {
         sync_offload_counter(&dir);
 
         let mut h = History::new(dir.clone());
-        h.record(tool_result("n".repeat(9_000)));
+        h.record(tool_result("n".repeat(OFFLOAD_CAP_CHARS + 1_000)));
         assert_eq!(
             std::fs::read_to_string(dir.join("off-0007.txt")).unwrap(),
             "old spill",

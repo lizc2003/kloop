@@ -445,7 +445,7 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("old request"));
         history.record(Message::assistant(vec![ContentBlock::Text {
-            text: "old work ".repeat(1_500), // exceeds the keep budget
+            text: "old work ".repeat(crate::compact::keep_recent_tokens() as usize),
         }]));
         history.record(Message::user_text("current request"));
 

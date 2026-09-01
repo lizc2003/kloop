@@ -14,6 +14,11 @@ use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
 use kloop_provider::MockTurn;
+
+/// Local alias so the fixtures below read as sizes, not as a module path.
+fn kloop_core_offload_cap() -> usize {
+    crate::history::OFFLOAD_CAP_CHARS
+}
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
 use serde_json::json;
@@ -88,9 +93,12 @@ fn drain_inbox_offloads_only_large_machine_results() {
     let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let inbox = Inbox::default();
-    let large_agent = "agent-result".repeat(1_000);
-    let large_program = "program-result".repeat(1_000);
-    let large_user = "user-text".repeat(1_000);
+    // Sized off the offload threshold so the fixture stays "large" when the
+    // constant moves; a literal here silently stops testing the spill.
+    let over = kloop_core_offload_cap() / 8;
+    let large_agent = "agent-result".repeat(over);
+    let large_program = "program-result".repeat(over);
+    let large_user = "user-text".repeat(over);
     inbox.push(InboxItem::SubAgentResult {
         label: "agent-1".into(),
         summary: large_agent.clone(),
@@ -769,15 +777,19 @@ async fn predictive_compaction_fires_before_sampling() {
             text: "final answer".into(),
         }],
     ]);
-    // growth = 8192 + 15_000 = 23_192; window 30_000 → threshold ≈ 6_808
-    // tokens ≈ 27k chars. Two fat user messages blow past it.
+    // growth = 8192 + 15_000 = 23_192; window 30_000 → threshold ≈ 6_808 tokens.
+    // Each fat message is sized off the keep budget so one of them still has to
+    // fold when that constant moves — at a literal size a larger keep budget
+    // swallows the whole fixture and the test silently stops exercising
+    // compaction.
+    let fat = crate::compact::keep_recent_tokens() as usize * 4;
     let cfg = compaction_cfg(provider, 30_000, "predictive");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let cancel = CancellationToken::new();
     let mut history = History::new(cfg.offload_dir.clone());
-    history.record(Message::user_text("x".repeat(30_000)));
+    history.record(Message::user_text("x".repeat(fat)));
     history.record(Message::assistant(vec![ContentBlock::Text {
-        text: "y".repeat(30_000),
+        text: "y".repeat(fat),
     }]));
     history.record(Message::user_text("now answer briefly"));
 

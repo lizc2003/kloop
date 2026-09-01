@@ -82,7 +82,14 @@ impl std::fmt::Display for UnsafeHardLink {
 impl std::error::Error for UnsafeHardLink {}
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const READ_CONTENT_CHARS: usize = 7_000;
+/// Cap on one `read_file` reply. Sized against the round trip, not the context:
+/// measured on a real review, 46% of 392 reads hit the old 7,000-char cap and
+/// paged, so a 1,000-line Go file cost six round trips to read once and the same
+/// file was read 60 times across the turn. Context is the cheap resource here —
+/// the provider served 93–95% of it from cache — and a round trip is ~20s. Must
+/// stay below [`crate::history::OFFLOAD_CAP_CHARS`], or every large read spills
+/// to disk and the model gets a preview instead.
+const READ_CONTENT_CHARS: usize = 30_000;
 
 #[derive(Clone)]
 enum Mutation {
@@ -1658,7 +1665,7 @@ fn sync_parent(_parent: &std::fs::File, _tool: &str, _display_path: &str) -> Res
 /// history: the model then gets a byte-identical preview under a fresh id and
 /// has burned a round trip for nothing. Windowing is what makes the escape hatch
 /// terminate — every call either delivers the tail or names the next offset.
-pub(super) const OFFLOAD_WINDOW_CHARS: usize = 6000;
+pub(super) const OFFLOAD_WINDOW_CHARS: usize = 24_000;
 
 pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "id", "read_offloaded")?;
@@ -1920,7 +1927,11 @@ mod tests {
     async fn read_empty_pdf_and_character_budget_are_explicit() {
         let empty = temp_file("read-empty", "");
         let pdf = temp_bytes("read-pdf", b"%PDF-1.4\nminimal\n");
-        let long = temp_file("read-budget", &"long line content\n".repeat(1_000));
+        // Long enough to exceed the read budget whatever it is set to.
+        let long = temp_file(
+            "read-budget",
+            &"long line content\n".repeat(super::READ_CONTENT_CHARS / 8),
+        );
         let long_key = std::fs::canonicalize(&long).unwrap();
         let ctx = test_ctx(0, "read-bounds");
 
@@ -1940,7 +1951,13 @@ mod tests {
         let (out, is_error) =
             run_tool("read_file", json!({"path": long.to_str().unwrap()}), &ctx).await;
         assert!(!is_error);
-        assert!(out.chars().count() < 8_000, "{} chars", out.chars().count());
+        // Below the offload threshold, so a capped read still reaches the model
+        // whole instead of spilling to disk — the two caps move together.
+        assert!(
+            out.chars().count() < crate::history::OFFLOAD_CAP_CHARS,
+            "{} chars",
+            out.chars().count()
+        );
         assert!(out.contains("[read output truncated; call read_file with offset="));
         assert!(
             !ctx.cfg

@@ -24,7 +24,17 @@ const OUTPUT_GROWTH_CAP: u64 = 20_000;
 const TOOL_RESULT_GROWTH_ESTIMATE: u64 = 15_000;
 /// Budget (in estimated tokens) of recent messages kept verbatim through a
 /// compaction; everything older is replaced by the summary.
-const KEEP_RECENT_TOKENS: u64 = 2_000;
+/// How much recent history survives a compaction verbatim. At 2,000 tokens a
+/// compaction left the agent with a summary and almost no original text, and it
+/// re-read files it had already reviewed; the summary cannot carry the detail a
+/// code review works from.
+const KEEP_RECENT_TOKENS: u64 = 20_000;
+
+/// The keep budget, for test fixtures in other modules that must outweigh it.
+#[cfg(test)]
+pub(crate) fn keep_recent_tokens() -> u64 {
+    KEEP_RECENT_TOKENS
+}
 
 pub const SUMMARY_PREFIX: &str =
     "[Context summary of the earlier part of this session — earlier messages were compacted]\n";
@@ -412,7 +422,9 @@ mod tests {
         let mut h = History::new(offload_dir);
         h.record(Message::user_text("old request"));
         h.record(Message::assistant(vec![ContentBlock::Text {
-            text: "old work ".repeat(1_500), // ~3.4k tokens: exceeds keep budget
+            // Sized off the keep budget so the fixture keeps exceeding it when the
+            // constant moves — a literal here silently stops testing compaction.
+            text: "old work ".repeat(KEEP_RECENT_TOKENS as usize),
         }]));
         h.record(Message::user_text("current request"));
         h
@@ -875,7 +887,8 @@ mod tests {
         );
 
         let old_work = Message::assistant(vec![ContentBlock::Text {
-            text: "old work ".repeat(1_500),
+            // Must outweigh the keep budget or there is nothing to fold.
+            text: "old work ".repeat(KEEP_RECENT_TOKENS as usize),
         }]);
         let plan = plan_compaction(&[summary.clone(), old_work.clone(), current.clone()])
             .expect("new work after a summary should be foldable");
@@ -896,7 +909,7 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text(format!("{SUMMARY_PREFIX}old summary")));
         history.record(Message::assistant(vec![ContentBlock::Text {
-            text: "old work ".repeat(1_500),
+            text: "old work ".repeat(KEEP_RECENT_TOKENS as usize),
         }]));
         history.record(Message::user_text("current request"));
 
