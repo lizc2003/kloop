@@ -159,7 +159,10 @@ fn task_line(
     first: bool,
     width: usize,
 ) -> Line<'static> {
-    let prefix = if first { "⎿ " } else { "   " };
+    // `⎿` is one column wide (neutral width), so the continuation indent is two
+    // spaces — three would push every row after the first one column right of
+    // the glyph it is meant to line up under.
+    let prefix = if first { "⎿ " } else { "  " };
     let (glyph, glyph_style, subject_style) = match task.status {
         TaskStatus::InProgress => (
             "◼",
@@ -213,7 +216,7 @@ fn task_line(
 }
 
 fn task_summary_line(label: String, first: bool, width: usize) -> Line<'static> {
-    let prefix = if first { "⎿ " } else { "   " };
+    let prefix = if first { "⎿ " } else { "  " };
     let budget = width.saturating_sub(display_width(prefix)).max(1);
     Line::from(vec![
         Span::styled(prefix.to_string(), DIM),
@@ -1315,13 +1318,25 @@ mod tests {
             texts,
             vec![
                 "⎿ ◼ Active",
-                "   ◻ Ready",
-                "   ◻ Blocked › blocked by #2",
-                "   ✔ Done one",
-                "   ✔ Done five",
-                "   ✔ Done six",
-                "   … +1 completed",
+                "  ◻ Ready",
+                "  ◻ Blocked › blocked by #2",
+                "  ✔ Done one",
+                "  ✔ Done five",
+                "  ✔ Done six",
+                "  … +1 completed",
             ]
+        );
+        // Every row's glyph starts in the same display column: the `⎿` gutter is
+        // one column wide, so the continuation rows indent by two, not three.
+        assert!(
+            texts.iter().all(|text| {
+                let gutter = text
+                    .chars()
+                    .take_while(|ch| *ch == ' ' || *ch == '⎿')
+                    .collect::<String>();
+                display_width(&gutter) == 2
+            }),
+            "{texts:?}"
         );
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Cyan));
         assert!(
@@ -1345,8 +1360,8 @@ mod tests {
         let lines = task_panel_lines(&snapshot, 18, TASK_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(lines.len(), TASK_PANEL_MAX_ROWS);
-        assert!(texts.iter().any(|line| line == "   … +6 unfinished"));
-        assert!(texts.iter().any(|line| line == "   … +5 completed"));
+        assert!(texts.iter().any(|line| line == "  … +6 unfinished"));
+        assert!(texts.iter().any(|line| line == "  … +5 completed"));
         assert!(
             lines
                 .iter()
@@ -1364,12 +1379,7 @@ mod tests {
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>(),
-            vec![
-                "⎿ ✔ Done 1",
-                "   ✔ Done 2",
-                "   ✔ Done 3",
-                "   … +2 completed",
-            ]
+            vec!["⎿ ✔ Done 1", "  ✔ Done 2", "  ✔ Done 3", "  … +2 completed"]
         );
     }
 
