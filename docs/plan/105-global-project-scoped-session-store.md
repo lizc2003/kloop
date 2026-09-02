@@ -112,7 +112,7 @@ deny-read 已有 `startup::tests::sandbox_denies_private_state_tree_reads_and_wr
 用户追问"现在还会在 cwd 下创建 `.kloop` 吗"。核查结果:
 
 - **非 mock 模式:不再创建**。cwd 下 `.kloop` 的剩余消费者全是只读输入(`rules/`、
-  `skills/`、`commands/`),kloop 不会创建它们;`--worktree` 用的是 `.claude/worktrees`
+  `skills/`、`commands/`),kloop 不会创建它们;`--worktree` 用的是 `.kloop/worktrees`(本文写作时是 `.claude/worktrees`,2026-08-31 回退到 kloop 自己的命名空间)
   (对齐 cc),不是 `.kloop`;scheduler 本来就在 `~/.kloop/scheduler/`。
 - **`--mock`:仍然创建**,`<cwd>/.kloop/{sessions,offload}`,这是 hermetic 的定义,故意的。
 - **`program-runs`/`workflow-runs` 自动跟着搬了**:`RunStore::new` 以
