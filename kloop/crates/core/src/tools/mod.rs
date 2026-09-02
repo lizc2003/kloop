@@ -881,7 +881,6 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
                     "prompt": {"type": "string", "description": "Complete standalone work description"},
                     "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
                     "model": {"type": ["string", "null"], "minLength": 1, "pattern": ".*\\S.*", "description": "Optional model override on this sub-agent's inherited frozen provider; it must be in that provider's model allowlist"},
-                    "max_rounds": {"type": ["integer", "null"], "minimum": 1, "description": "Optional round cap; omitted means no limit. Hitting it returns what the sub-agent produced so far, not nothing."},
                     "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
                     "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}
                 },
@@ -2137,10 +2136,10 @@ mod tests {
             run_agent.schema["properties"]["agent_type"]["type"],
             json!(["string", "null"])
         );
-        assert_eq!(
-            run_agent.schema["properties"]["max_rounds"]["type"],
-            json!(["integer", "null"])
-        );
+        // The round cap is fixed in code, not offered to the model: it has no
+        // basis for the number, and both wrong answers were measured (12/10 ran
+        // out; unbounded reached 158 rounds and tripled the request count).
+        assert!(run_agent.schema["properties"]["max_rounds"].is_null());
         let run_program = definitions
             .iter()
             .find(|definition| definition.name == "run_program")

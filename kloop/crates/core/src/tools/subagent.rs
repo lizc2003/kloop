@@ -74,10 +74,18 @@ struct RunAgentInput {
     #[serde(default)]
     background: bool,
     #[serde(default)]
-    max_rounds: Option<u64>,
-    #[serde(default)]
     isolation: Option<String>,
 }
+
+/// The sub-agent round cap. Not a knob the model gets: it has no basis for the
+/// number — asked to pick one it chose 12 and 10 for an 11-file review and ran
+/// out — and a wrong guess used to cost everything the child had produced.
+/// Removing the cap entirely was measured and is worse: one sub-agent then ran
+/// 158 rounds and the review went from 70 provider requests to 342. So the shape
+/// cc uses: a fixed bound, large enough that real work never reaches it, small
+/// enough to stop a runaway. Hitting it now returns what the child produced
+/// (plan 108), which is what makes a fixed bound safe to impose.
+const SUBAGENT_MAX_ROUNDS: usize = 200;
 
 pub(super) async fn run_agent_tool(
     input: &Value,
@@ -98,20 +106,6 @@ pub(crate) async fn run_agent_admitted(
     let parsed: RunAgentInput =
         serde_json::from_value(input.clone()).context("run_agent: invalid input")?;
     let description = super::optional_display_description(input, "run_agent")?;
-    // A model-chosen budget. Measured both ways on the same review: with the cap
-    // the run took 70 provider requests, without it one sub-agent ran 158 rounds
-    // and the run took 342. The cap was never the defect — discarding the work on
-    // hitting it was, and `EndReason::MaxRounds` now returns what the sub-agent
-    // produced, so a low guess costs some depth instead of everything.
-    let max_rounds = match parsed.max_rounds {
-        None => None,
-        Some(n) => {
-            if n == 0 {
-                bail!("run_agent: max_rounds must be a positive integer");
-            }
-            Some(usize::try_from(n).unwrap_or(usize::MAX))
-        }
-    };
     let prompt = parsed.prompt;
     let _ = parsed.description;
     let background = parsed.background;
@@ -144,7 +138,13 @@ pub(crate) async fn run_agent_admitted(
     };
     let agent = next_agent_label();
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
-    let mut sub = build_sub_config(ctx, workspace, max_rounds, agent.clone(), agent_type)?;
+    let mut sub = build_sub_config(
+        ctx,
+        workspace,
+        Some(SUBAGENT_MAX_ROUNDS),
+        agent.clone(),
+        agent_type,
+    )?;
     if let Some(model) = model.as_ref() {
         sub.provider_route = sub
             .provider_route
@@ -1183,22 +1183,70 @@ mod tests {
         assert!(out.contains("cannot spawn"));
     }
 
+    /// The cap is fixed in code. `deny_unknown_fields` makes a caller that thinks
+    /// it set one find out, instead of having the value silently ignored.
     #[tokio::test]
-    async fn run_agent_rejects_non_positive_round_limit() {
+    async fn run_agent_does_not_take_a_round_limit_from_the_model() {
         let ctx = test_ctx(0, "run-agent-zero-rounds");
         let (out, is_error) = run_tool(
             "run_agent",
-            json!({"prompt": "keep going", "max_rounds": 0}),
+            json!({"prompt": "keep going", "max_rounds": 12}),
             &ctx,
         )
         .await;
 
-        assert!(is_error);
-        assert_eq!(out, "run_agent: max_rounds must be a positive integer");
+        assert!(is_error, "{out}");
+        assert!(out.contains("max_rounds"), "{out}");
     }
 
-    /// A sub-agent never inherits the parent's guardrail and has no default cap:
-    /// the child runs until it produces a final answer.
+    /// The other half of the same claim: the cap is real, and hitting it hands
+    /// back what the child produced rather than nothing — that is what makes a
+    /// bound safe to impose without asking the model's permission. Driven through
+    /// `run_turn` directly, since exercising 200 rounds through the tool would be
+    /// 200 mock turns.
+    #[tokio::test]
+    async fn a_capped_subagent_still_returns_its_findings() {
+        let turns: Vec<Vec<AssistantBlock>> = (0..4)
+            .map(|i| {
+                vec![
+                    AssistantBlock::Text {
+                        text: format!("finding {i}"),
+                    },
+                    AssistantBlock::ToolUse {
+                        id: format!("r{i}"),
+                        name: "read_file".into(),
+                        input: json!({"path": format!("missing-{i}")}),
+                    },
+                ]
+            })
+            .collect();
+        let ctx = with_provider(test_ctx(0, "capped-child"), Provider::mock(turns));
+        let mut sub = ctx.cfg.test_clone();
+        sub.max_rounds = Some(2);
+        let sub = Arc::new(sub);
+        struct Silent;
+        impl crate::agent::Ui for Silent {
+            fn emit(&self, _: &crate::event::Event) {}
+        }
+        let ui: Arc<dyn crate::agent::Ui> = Arc::new(Silent);
+        let mut history = crate::history::History::new(sub.offload_dir.clone());
+        history.record(kloop_protocol::Message::user_text("investigate"));
+
+        let outcome = crate::agent::run_turn(
+            &sub,
+            &mut history,
+            &ui,
+            &tokio_util::sync::CancellationToken::new(),
+            1,
+        )
+        .await;
+
+        assert_eq!(outcome.reason, crate::agent::EndReason::MaxRounds);
+        assert_eq!(outcome.final_text, "finding 0\n\nfinding 1");
+    }
+
+    /// A sub-agent never inherits the parent's guardrail, and the fixed cap sits
+    /// far above real work: sixteen tool rounds must not trip it.
     #[tokio::test]
     async fn run_agent_without_round_limit_runs_until_completed() {
         let mut turns = (0..16)
