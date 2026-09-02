@@ -2111,6 +2111,106 @@ async fn fatal_stream_failure_after_output_still_ends_the_turn() {
     assert_eq!(outcome.final_text, "all I got");
 }
 
+/// Every exit that happens *after* the turn produced something must hand that
+/// something back. History and the UI already have it; `final_text` is what the
+/// caller — a parent agent, most of all — actually receives, and an empty string
+/// there is indistinguishable from "produced nothing". `MaxRounds` was fixed
+/// when it was measured; these are the same shape, found by enumeration.
+#[tokio::test]
+async fn terminal_provider_failure_still_returns_what_the_turn_produced() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text {
+                text: "finding one".into(),
+            },
+            tool_use("t1", "echo 1"),
+        ]),
+        MockTurn::Failure(ProviderFailure::protocol("malformed frame")),
+    ]);
+    let cfg = Arc::new(compaction_cfg(provider, 200_000, "terminal-keeps").test_clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("go"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(outcome.reason, EndReason::Error(_)),
+        "{:?}",
+        outcome.reason
+    );
+    assert!(
+        outcome.final_text.contains("finding one"),
+        "a terminal failure dropped the turn's work: {:?}",
+        outcome.final_text
+    );
+}
+
+#[tokio::test]
+async fn overflow_without_compaction_still_returns_what_the_turn_produced() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text {
+                text: "finding one".into(),
+            },
+            tool_use("t1", "echo 1"),
+        ]),
+        MockTurn::Overflow,
+    ]);
+    let mut cfg = compaction_cfg(provider, 200_000, "overflow-keeps").test_clone();
+    // No window: the reactive path is unavailable, so the turn ends here.
+    cfg.context_window = None;
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("go"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(outcome.reason, EndReason::Error(_)),
+        "{:?}",
+        outcome.reason
+    );
+    assert!(
+        outcome.final_text.contains("finding one"),
+        "an unrecoverable overflow dropped the turn's work: {:?}",
+        outcome.final_text
+    );
+}
+
+#[tokio::test]
+async fn failed_reactive_compaction_still_returns_what_the_turn_produced() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text {
+                text: "finding one".into(),
+            },
+            tool_use("t1", "echo 1"),
+        ]),
+        MockTurn::Overflow,
+        // The compaction request itself fails for a reason shrinking cannot fix.
+        MockTurn::Failure(ProviderFailure::protocol("compaction refused")),
+    ]);
+    let cfg = Arc::new(compaction_cfg(provider, 200_000, "compact-fail-keeps").test_clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("go"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        matches!(outcome.reason, EndReason::Error(_)),
+        "{:?}",
+        outcome.reason
+    );
+    assert!(
+        outcome.final_text.contains("finding one"),
+        "a failed reactive compaction dropped the turn's work: {:?}",
+        outcome.final_text
+    );
+}
+
 /// With no configured guardrail, the loop continues beyond the former default
 /// of 30 rounds and stops only when the model returns no tool call.
 #[tokio::test]

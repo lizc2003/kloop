@@ -395,11 +395,14 @@ async fn turn_rounds(
     let mut item_seq = 0u64;
     let mut rounds = 0;
     let mut structured_failures = 0usize;
-    // Everything the assistant said across the turn's rounds. The round cap is a
-    // spend bound, not a verdict on the work already paid for: returning an empty
-    // string on `MaxRounds` throws away every round the cap just billed, and the
-    // caller (a parent agent, most of all) has no way to recover it — it can only
-    // redo the whole thing.
+    // Everything the assistant said across the turn's rounds. Every exit inside
+    // the loop hands this back, because the caller — a parent agent, most of all
+    // — receives only `final_text`, and an empty string there is indistinguishable
+    // from "produced nothing". History and the UI already hold the work; this is
+    // the one channel that used to drop it. `MaxRounds` was the instance that got
+    // measured; enumerating the exits found seven more of the same shape, so the
+    // rule is now uniform: an early exit never spells its result `String::new()`.
+    // (Exits *before* the loop legitimately do — nothing has been produced yet.)
     let mut produced_text = String::new();
     // How many times a retryable stream error was resumed in this turn. Bounded
     // so a persistently failing upstream still terminates the turn.
@@ -425,7 +428,7 @@ async fn turn_rounds(
                 Err(error) => {
                     return TurnOutcome {
                         reason: EndReason::Error(error.into()),
-                        final_text: String::new(),
+                        final_text: produced_text.clone(),
                         rounds,
                         structured_output: None,
                     };
@@ -479,7 +482,7 @@ async fn turn_rounds(
                     if cancel.is_cancelled() {
                         return TurnOutcome {
                             reason: EndReason::Aborted,
-                            final_text: String::new(),
+                            final_text: produced_text.clone(),
                             rounds: round,
                             structured_output: None,
                         };
@@ -517,7 +520,7 @@ async fn turn_rounds(
                             "context window exceeded (compaction unavailable or already tried)"
                                 .into(),
                         ),
-                        final_text: String::new(),
+                        final_text: produced_text.clone(),
                         rounds: round,
                         structured_output: None,
                     };
@@ -542,7 +545,7 @@ async fn turn_rounds(
                     Ok(compact::CompactionOutcome::NoOp(_)) => {
                         return TurnOutcome {
                             reason: EndReason::Error("reactive compaction made no changes".into()),
-                            final_text: String::new(),
+                            final_text: produced_text.clone(),
                             rounds: round,
                             structured_output: None,
                         };
@@ -556,7 +559,7 @@ async fn turn_rounds(
                                     format!("reactive compaction failed: {e:#}").into(),
                                 )
                             },
-                            final_text: String::new(),
+                            final_text: produced_text.clone(),
                             rounds: round,
                             structured_output: None,
                         };
@@ -614,7 +617,7 @@ async fn turn_rounds(
             Sampled::Terminal(error) => {
                 return TurnOutcome {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text: String::new(),
+                    final_text: produced_text.clone(),
                     rounds: round,
                     structured_output: None,
                 };
@@ -634,7 +637,7 @@ async fn turn_rounds(
                 }
                 return TurnOutcome {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text: String::new(),
+                    final_text: produced_text.clone(),
                     rounds: round,
                     structured_output: None,
                 };
@@ -643,7 +646,7 @@ async fn turn_rounds(
         if let Err(error) = validate_assistant_result(&outcome, &blocks) {
             return TurnOutcome {
                 reason: EndReason::Error(error.into()),
-                final_text: String::new(),
+                final_text: produced_text.clone(),
                 rounds: round + 1,
                 structured_output: None,
             };
@@ -724,7 +727,7 @@ async fn turn_rounds(
                             reason: EndReason::Error(
                                 "structured output was not produced after 3 attempts".into(),
                             ),
-                            final_text: String::new(),
+                            final_text: produced_text.clone(),
                             rounds: round + 1,
                             structured_output: None,
                         };
@@ -788,7 +791,7 @@ async fn turn_rounds(
         if cancel.is_cancelled() {
             return TurnOutcome {
                 reason: EndReason::Aborted,
-                final_text: String::new(),
+                final_text: produced_text.clone(),
                 rounds: round + 1,
                 structured_output: None,
             };
@@ -802,7 +805,7 @@ async fn turn_rounds(
             }
             return TurnOutcome {
                 reason: EndReason::Completed,
-                final_text: String::new(),
+                final_text: produced_text.clone(),
                 rounds: round + 1,
                 structured_output: Some(value),
             };
@@ -814,7 +817,7 @@ async fn turn_rounds(
                     reason: EndReason::Error(
                         "valid structured output was not produced after 3 attempts".into(),
                     ),
-                    final_text: String::new(),
+                    final_text: produced_text.clone(),
                     rounds: round + 1,
                     structured_output: None,
                 };
