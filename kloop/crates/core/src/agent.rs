@@ -407,13 +407,14 @@ async fn turn_rounds(
     // How many times a retryable stream error was resumed in this turn. Bounded
     // so a persistently failing upstream still terminates the turn.
     let mut stream_resumes = 0u32;
-    loop {
+    let ending = 'turn: loop {
         if cfg.max_rounds.is_some_and(|limit| rounds >= limit) {
-            return TurnOutcome {
+            break 'turn Ending {
                 reason: EndReason::MaxRounds,
-                final_text: produced_text,
+                // The default is exactly right here: hand back what was produced.
+                text: None,
                 rounds,
-                structured_output: None,
+                structured: None,
             };
         }
         if rounds > 0 {
@@ -426,11 +427,11 @@ async fn turn_rounds(
                     program_tool_manifest = next_manifest;
                 }
                 Err(error) => {
-                    return TurnOutcome {
+                    break 'turn Ending {
                         reason: EndReason::Error(error.into()),
-                        final_text: produced_text.clone(),
+                        text: None,
                         rounds,
-                        structured_output: None,
+                        structured: None,
                     };
                 }
             }
@@ -480,11 +481,11 @@ async fn turn_rounds(
                 Ok(compact::CompactionOutcome::NoOp(_)) => {}
                 Err(e) => {
                     if cancel.is_cancelled() {
-                        return TurnOutcome {
+                        break 'turn Ending {
                             reason: EndReason::Aborted,
-                            final_text: produced_text.clone(),
+                            text: None,
                             rounds: round,
-                            structured_output: None,
+                            structured: None,
                         };
                     }
                     // Predictive failure is not fatal: fall through and let
@@ -515,14 +516,14 @@ async fn turn_rounds(
             Sampled::Ok(ok) => ok,
             Sampled::Overflow => {
                 if cfg.context_window.is_none() || overflow_compact_attempted {
-                    return TurnOutcome {
+                    break 'turn Ending {
                         reason: EndReason::Error(
                             "context window exceeded (compaction unavailable or already tried)"
                                 .into(),
                         ),
-                        final_text: produced_text.clone(),
+                        text: None,
                         rounds: round,
-                        structured_output: None,
+                        structured: None,
                     };
                 }
                 overflow_compact_attempted = true;
@@ -543,15 +544,15 @@ async fn turn_rounds(
                         continue;
                     }
                     Ok(compact::CompactionOutcome::NoOp(_)) => {
-                        return TurnOutcome {
+                        break 'turn Ending {
                             reason: EndReason::Error("reactive compaction made no changes".into()),
-                            final_text: produced_text.clone(),
+                            text: None,
                             rounds: round,
-                            structured_output: None,
+                            structured: None,
                         };
                     }
                     Err(e) => {
-                        return TurnOutcome {
+                        break 'turn Ending {
                             reason: if cancel.is_cancelled() {
                                 EndReason::Aborted
                             } else {
@@ -559,9 +560,9 @@ async fn turn_rounds(
                                     format!("reactive compaction failed: {e:#}").into(),
                                 )
                             },
-                            final_text: produced_text.clone(),
+                            text: None,
                             rounds: round,
-                            structured_output: None,
+                            structured: None,
                         };
                     }
                 }
@@ -569,11 +570,11 @@ async fn turn_rounds(
             Sampled::Cancelled { partial } => {
                 let final_text = text_content(&partial);
                 record_provider_assistant(history, &active_attempt, partial);
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Aborted,
-                    final_text,
+                    text: Some(final_text),
                     rounds: round,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             Sampled::Partial { error, blocks } => {
@@ -607,19 +608,19 @@ async fn turn_rounds(
                     history.record(Message::user_text(STREAM_RESUME_MSG));
                     continue;
                 }
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text: format!("{truncated_prefix}{round_text}"),
+                    text: Some(format!("{truncated_prefix}{round_text}")),
                     rounds: round,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             Sampled::Terminal(error) => {
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text: produced_text.clone(),
+                    text: None,
                     rounds: round,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             Sampled::Failed(error) => {
@@ -635,20 +636,20 @@ async fn turn_rounds(
                     active_attempt = fallback;
                     continue;
                 }
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    final_text: produced_text.clone(),
+                    text: None,
                     rounds: round,
-                    structured_output: None,
+                    structured: None,
                 };
             }
         };
         if let Err(error) = validate_assistant_result(&outcome, &blocks) {
-            return TurnOutcome {
+            break 'turn Ending {
                 reason: EndReason::Error(error.into()),
-                final_text: produced_text.clone(),
+                text: None,
                 rounds: round + 1,
-                structured_output: None,
+                structured: None,
             };
         }
         if let Some(usage) = usage {
@@ -693,11 +694,11 @@ async fn turn_rounds(
             AssistantOutcome::Refused
             | AssistantOutcome::Filtered
             | AssistantOutcome::Incomplete(_) => {
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                    final_text: text_content(&blocks),
+                    text: Some(text_content(&blocks)),
                     rounds: round + 1,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             AssistantOutcome::OutputLimit(_) => {
@@ -712,24 +713,24 @@ async fn turn_rounds(
                     continue;
                 }
                 let final_text = format!("{truncated_prefix}{round_text}");
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                    final_text,
+                    text: Some(final_text),
                     rounds: round + 1,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             AssistantOutcome::EndTurn => {
                 if options.structured_schema.is_some() {
                     structured_failures += 1;
                     if structured_failures >= 3 {
-                        return TurnOutcome {
+                        break 'turn Ending {
                             reason: EndReason::Error(
                                 "structured output was not produced after 3 attempts".into(),
                             ),
-                            final_text: produced_text.clone(),
+                            text: None,
                             rounds: round + 1,
-                            structured_output: None,
+                            structured: None,
                         };
                     }
                     history.record(Message::user_text(crate::structured_output::nudge()));
@@ -751,11 +752,11 @@ async fn turn_rounds(
                 } else {
                     format!("{truncated_prefix}{round_text}")
                 };
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Completed,
-                    final_text,
+                    text: Some(final_text),
                     rounds: round + 1,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             AssistantOutcome::ToolUse => {}
@@ -789,11 +790,11 @@ async fn turn_rounds(
             history.record(Message::user_text(text));
         }
         if cancel.is_cancelled() {
-            return TurnOutcome {
+            break 'turn Ending {
                 reason: EndReason::Aborted,
-                final_text: produced_text.clone(),
+                text: None,
                 rounds: round + 1,
-                structured_output: None,
+                structured: None,
             };
         }
         if let Some(value) = structured_output {
@@ -803,27 +804,39 @@ async fn turn_rounds(
             if !cfg.local_agent.can_finish_naturally() {
                 continue;
             }
-            return TurnOutcome {
+            break 'turn Ending {
                 reason: EndReason::Completed,
-                final_text: produced_text.clone(),
+                text: None,
                 rounds: round + 1,
-                structured_output: Some(value),
+                structured: Some(value),
             };
         }
         if options.structured_schema.is_some() {
             structured_failures += 1;
             if structured_failures >= 3 {
-                return TurnOutcome {
+                break 'turn Ending {
                     reason: EndReason::Error(
                         "valid structured output was not produced after 3 attempts".into(),
                     ),
-                    final_text: produced_text.clone(),
+                    text: None,
                     rounds: round + 1,
-                    structured_output: None,
+                    structured: None,
                 };
             }
             history.record(Message::user_text(crate::structured_output::nudge()));
         }
+    };
+
+    // The turn's one exit. Everything above decides *why* it ended; only here is
+    // the result assembled, and only here does `final_text` get a value — so an
+    // exit that says nothing about text hands back what the turn produced instead
+    // of an empty string. Exits *before* the loop still return directly: nothing
+    // has been produced yet, and there is nothing to lose.
+    TurnOutcome {
+        reason: ending.reason,
+        final_text: ending.text.unwrap_or(produced_text),
+        rounds: ending.rounds,
+        structured_output: ending.structured,
     }
 }
 
@@ -955,6 +968,21 @@ fn text_content(blocks: &[ContentBlock]) -> String {
 /// Cap on resuming a turn after a retryable mid-response stream failure. Bounds
 /// a flapping upstream: each resume costs a round, and a stream that keeps dying
 /// is a real outage the turn should surface rather than grind against.
+/// How one round decides the turn ends. Exists so the loop cannot build a
+/// `TurnOutcome` itself: there is exactly one place that does, and it is the
+/// place that knows what the turn produced. `text: None` means "hand back
+/// everything the turn produced" and is the default an exit gets by saying
+/// nothing; a site that means something narrower — the completed answer, a
+/// truncated-then-continued deliverable — says so with `Some`. Writing
+/// `Some(String::new())` is still possible, but now it is a visible claim that
+/// this exit really has nothing, not an oversight.
+struct Ending {
+    reason: EndReason,
+    text: Option<String>,
+    rounds: usize,
+    structured: Option<serde_json::Value>,
+}
+
 const STREAM_RESUME_LIMIT: u32 = 3;
 const STREAM_RESUME_MSG: &str = "Your previous response was cut off by a transient \
 connection failure, not by you. Continue exactly where you left off.";
