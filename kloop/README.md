@@ -19,10 +19,20 @@ validate five architectural bets before committing to a larger agent design.
    `MAX_INVITED_WINDOWS` (4) windows remain. Windowing a large artifact is the
    wrong shape — a 2 MB schema is 88 round trips, and a live run walked exactly
    that treadmill until it ran out of rounds — so past a few windows both the
-   pointer and the continuation line redirect to querying the file: `grep` /
-   `read_file` when it is line-structured, `run_program` or `bash` otherwise
-   (line-oriented tools cannot slice a one-line 2 MB document). Querying answers
-   a question about the artifact and lets only the answer into the context.
+   pointer and the continuation line lead with the one call that works at that
+   size, spelled out to be copied: `run_program` with
+   `tools.read_offloaded({id})`.
+
+   **The window is a context bound, not a data bound.** It exists because the
+   reply lands in history, where an oversized one is offloaded again. A program's
+   return value is a JS variable, so `read_offloaded` called with
+   `ToolCtx::from_program` returns the artifact **whole** — windowing there would
+   only make the program loop. Same shape as `from_program` passing the deferred
+   `locked()` gate: that is a discovery gate, this is a context gate, and neither
+   is a security gate (permissions, hooks and sandbox are untouched). `grep` /
+   `read_file` remain the fallback for line-structured output only — they cannot
+   slice a one-line 2 MB document, and `read_file` caps at `READ_CONTENT_CHARS`
+   (30000) inside a program too.
 
    This is also why `web_fetch` has no text cap: bounding what the model sees is
    this seam's job, and a cap in the fetcher deletes the rest of the artifact
@@ -1562,7 +1572,12 @@ network-free, reqwest lives only in provider and web):
   Download truncation is reported. There is **no model-text cap**: the body is a
   fetched artifact, and clipping one deletes evidence that the offload seam would
   otherwise keep on disk (bet 1). Everything downloaded is handed to core, which
-  spills it and gives the model a preview plus a queryable path.
+  spills it and gives the model a preview plus a queryable path. The description
+  steers a *first* fetch of a large target into `run_program`, where the body
+  lives in a JS variable and never enters the context at all; a body already
+  offloaded is reused with `tools.read_offloaded` rather than fetched again. That
+  split matters — while both hints stood unscoped, a live run re-downloaded the
+  same 2.1 MB on every retry.
 - **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
   at least two characters; allow/block lists are mutually exclusive) —
   pluggable `SearchBackend` trait with Tavily (default, `TAVILY_API_KEY`) and

@@ -427,10 +427,12 @@ impl History {
             // and pointing at them without saying so just relocates the dead end.
             Ok(()) => format!(
                 "[full output offloaded: id={id}, {chars} chars, saved to {path}. \
-                 read_offloaded reads it back in windows. To keep it out of the \
-                 context, query the file at path=\"{path}\" instead: grep or \
-                 read_file when it is line-structured, otherwise run_program or \
-                 bash — line-oriented tools cannot slice a one-line document]",
+                 Best move for anything this size: run_program with \
+                 `const t = await tools.read_offloaded({{id:\"{id}\"}});` — inside a \
+                 program it comes back whole and costs no context, so extract there \
+                 and return only the answer. read_offloaded outside a program pages \
+                 in windows; grep or read_file with path=\"{path}\" work only if the \
+                 output is line-structured (they cannot slice a one-line document)]",
                 chars = content.chars().count(),
                 path = path.display(),
             ),
@@ -684,8 +686,13 @@ mod tests {
             "{content}"
         );
         assert!(content.contains(&path.display().to_string()), "{content}");
+        assert!(
+            content.contains(&format!(
+                "run_program with `const t = await tools.read_offloaded({{id:\"{id}\"}});`"
+            )),
+            "{content}"
+        );
         assert!(content.contains("grep or read_file"), "{content}");
-        assert!(content.contains("run_program or bash"), "{content}");
         assert!(
             content.contains(&format!("path=\"{}\"", path.display())),
             "{content}"

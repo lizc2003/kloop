@@ -1687,6 +1687,16 @@ pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<
     if start > total {
         bail!("read_offloaded: char_offset {start} is past the end of {id} ({total} chars)");
     }
+    // The window is a *context* bound, not a data bound: it exists because the
+    // reply lands in the model's history, where an oversized one is offloaded
+    // again. A program's return value goes to a JS variable instead, so none of
+    // that applies and windowing there would only force the program to loop.
+    // Same shape as plan 27 letting `from_program` past the deferred `locked()`
+    // gate — that was a discovery gate, this is a context gate; neither is a
+    // security gate, and permissions/hooks/sandbox are untouched either way.
+    if ctx.from_program {
+        return Ok(content.chars().skip(start).collect());
+    }
     let window: String = content
         .chars()
         .skip(start)
@@ -1703,14 +1713,16 @@ pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<
         // a live run took the unconditional invitation literally: it walked a
         // 2.1 MB OpenAPI document 24k at a time and spent its whole round budget
         // without answering. Past a few windows the honest advice is to stop
-        // paging and query the file, so this stops naming the next offset — the
-        // number was what made the treadmill easy to keep walking.
+        // paging, so this stops naming the next offset — the number was what made
+        // the treadmill easy to keep walking — and hands over the one call that
+        // actually works at this size, spelled out to be copied.
         return Ok(format!(
             "{window}\n[chars {start}..{end} of {total}. {remaining_windows} more \
-             read_offloaded calls would be needed — do not page this. The whole \
-             output is on disk at {path}: query it with grep or read_file when it \
-             is line-structured, otherwise run_program or bash, so only what you \
-             extract enters the context]",
+             read_offloaded calls would be needed — do not page this. Read it whole \
+             inside a program instead, where it costs no context: run_program with \
+             `const t = await tools.read_offloaded({{id:\"{id}\"}});` then extract in \
+             JS and return only the answer. It is also on disk at {path}, but \
+             grep/read_file are line-oriented and cannot slice a one-line document]",
             path = path.display(),
         ));
     }
@@ -3417,6 +3429,13 @@ mod tests {
         );
         assert!(out.contains("do not page this"), "{out}");
         assert!(
+            out.contains(
+                "run_program with `const t = await tools.read_offloaded({id:\"off-9999\"})"
+            ),
+            "the redirect spells out the call that works at this size: {}",
+            &out[out.len().saturating_sub(500)..]
+        );
+        assert!(
             out.contains(&path.display().to_string()),
             "{}",
             &out[out.len().saturating_sub(400)..]
@@ -3425,6 +3444,18 @@ mod tests {
             out.chars().count() < crate::history::OFFLOAD_CAP_CHARS,
             "a reply at or over the cap would be offloaded again"
         );
+
+        // Inside a program the same artifact comes back whole: the window is a
+        // context bound, and a program's return value is a JS variable, not
+        // context. Windowing there would only make the program loop.
+        let mut program_ctx = ctx.clone();
+        program_ctx.from_program = true;
+        let (out, is_error) =
+            run_tool("read_offloaded", json!({"id": "off-9999"}), &program_ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out, payload, "a program gets the artifact whole");
+        assert!(!out.contains("do not page this"));
+
         let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
     }
 }

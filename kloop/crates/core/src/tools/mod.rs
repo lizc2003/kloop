@@ -840,7 +840,12 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_offloaded".into(),
-            description: "Fetch an offloaded tool result by its id (e.g. off-0001). Returns one window of it; if more remains the reply ends with the char_offset to pass on the next call.".into(),
+            // The two behaviours have to be stated together because this text is
+            // also what run_program's generated TypeScript API shows: a program
+            // reading "returns one window" would either loop pointlessly or go
+            // looking for another tool, when in fact it is the one caller that
+            // gets the artifact whole.
+            description: "Fetch an offloaded tool result by its id (e.g. off-0001). Inside run_program it returns the whole thing (a program's value is a JS variable, not context), so extract there and return only the answer. Called directly it returns one window; if more remains the reply ends with the char_offset to pass on the next call. Takes an id, not a path — read_file is for workspace files and pages by line, which cannot slice a one-line document.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
