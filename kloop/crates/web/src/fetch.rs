@@ -1,5 +1,6 @@
-//! web_fetch: manual redirect following with a per-hop SSRF guard, download
-//! and text caps, HTML→text conversion.
+//! web_fetch: manual redirect following with a per-hop SSRF guard, a download
+//! cap, HTML→text conversion. There is deliberately no model-text cap — see
+//! `read_body`.
 
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -133,14 +134,19 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     if text.is_empty() {
         text = "(empty response body)".into();
     }
-    let (mut clipped, text_truncated) = limits::truncate_chars(text, limits::MAX_TEXT_CHARS);
-    if text_truncated {
-        clipped.push_str("\n\n[content truncated at 50000 characters]");
-    }
+    // No model-text clip here. It used to cut at 50k chars and drop the rest,
+    // which duplicated the offload seam while destroying what that seam exists
+    // to preserve: `History::record` already spills an oversized tool result to
+    // the session store and hands the model a preview plus pointer, so the whole
+    // body stays reachable. Dogfooding a review against
+    // https://api.elevenlabs.io/openapi.json (2,106,298 bytes) kept 50,000 chars
+    // — 2.4%, the head — and `components.schemas` was past the cut with no way
+    // back. The download cap below still bounds the transfer; model visibility
+    // is the offload seam's job alone.
     if download_truncated {
-        clipped.push_str("\n\n[download truncated at 5MB]");
+        text.push_str("\n\n[download truncated at 5MB]");
     }
-    Ok(clipped)
+    Ok(text)
 }
 
 /// Scheme and address policy. Every redirect hop passes through here; DNS
@@ -439,27 +445,26 @@ mod tests {
         assert!(format!("{err:#}").contains("unsupported content type"));
     }
 
+    /// A body far past the old 50k clip comes back whole. Bounding what the
+    /// model sees belongs to core's offload seam, which keeps the rest on disk;
+    /// clipping here used to delete it instead.
     #[tokio::test]
-    async fn long_text_is_clipped_with_a_note() {
+    async fn long_text_is_returned_whole() {
         let server = MockServer::start().await;
-        let body = "x".repeat(60_000);
+        let body = "x".repeat(600_000);
         Mock::given(method("GET"))
             .and(path("/long"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
             .mount(&server)
             .await;
         let out = fetch_private(&format!("{}/long", server.uri()))
             .await
             .unwrap();
-        assert!(
-            out.ends_with("[content truncated at 50000 characters]"),
-            "note appended"
-        );
-        assert!(out.len() < 51_000);
+        assert_eq!(out, body);
     }
 
     #[tokio::test]
-    async fn download_and_text_caps_are_reported_independently() {
+    async fn the_download_cap_still_bounds_the_transfer_and_is_reported() {
         let server = MockServer::start().await;
         let body = vec![b'x'; limits::MAX_DOWNLOAD_BYTES + 1024];
         Mock::given(method("GET"))
@@ -471,11 +476,13 @@ mod tests {
         let out = fetch_private(&format!("{}/oversized", server.uri()))
             .await
             .unwrap();
-        assert!(
-            out.contains("[content truncated at 50000 characters]"),
-            "{out:?}"
-        );
         assert!(out.ends_with("[download truncated at 5MB]"), "{out:?}");
-        assert!(out.len() < 51_000);
+        assert!(!out.contains("content truncated"), "{out:?}");
+        assert_eq!(
+            out.trim_end_matches("\n\n[download truncated at 5MB]")
+                .len(),
+            limits::MAX_DOWNLOAD_BYTES,
+            "everything downloaded is kept",
+        );
     }
 }

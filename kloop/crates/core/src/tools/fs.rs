@@ -1667,6 +1667,12 @@ fn sync_parent(_parent: &std::fs::File, _tool: &str, _display_path: &str) -> Res
 /// terminate — every call either delivers the tail or names the next offset.
 pub(super) const OFFLOAD_WINDOW_CHARS: usize = 24_000;
 
+/// How many further windows `read_offloaded` will still invite the model to walk.
+/// Within this many, paging back a truncated result is cheaper than any
+/// alternative; beyond it the reply redirects to the file on disk instead of
+/// naming the next offset.
+const MAX_INVITED_WINDOWS: usize = 4;
+
 pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "id", "read_offloaded")?;
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -1687,15 +1693,32 @@ pub(super) async fn read_offloaded_tool(input: &Value, ctx: &ToolCtx) -> Result<
         .take(OFFLOAD_WINDOW_CHARS)
         .collect();
     let end = start.saturating_add(window.chars().count());
-    if end < total {
-        // The next offset is spelled out so the model copies a number instead of
-        // deriving one — the unit here is chars, unlike read_file's line offset.
-        Ok(format!(
-            "{window}\n[chars {start}..{end} of {total}; call read_offloaded again with char_offset={end} for the rest]"
-        ))
-    } else {
-        Ok(window)
+    if end >= total {
+        return Ok(window);
     }
+    let remaining_windows = total.saturating_sub(end).div_ceil(OFFLOAD_WINDOW_CHARS);
+    if remaining_windows > MAX_INVITED_WINDOWS {
+        // Paging is only an escape hatch while the exit is in sight. Since
+        // `web_fetch` stopped clipping bodies an artifact can be megabytes, and
+        // a live run took the unconditional invitation literally: it walked a
+        // 2.1 MB OpenAPI document 24k at a time and spent its whole round budget
+        // without answering. Past a few windows the honest advice is to stop
+        // paging and query the file, so this stops naming the next offset — the
+        // number was what made the treadmill easy to keep walking.
+        return Ok(format!(
+            "{window}\n[chars {start}..{end} of {total}. {remaining_windows} more \
+             read_offloaded calls would be needed — do not page this. The whole \
+             output is on disk at {path}: query it with grep or read_file when it \
+             is line-structured, otherwise run_program or bash, so only what you \
+             extract enters the context]",
+            path = path.display(),
+        ));
+    }
+    // The next offset is spelled out so the model copies a number instead of
+    // deriving one — the unit here is chars, unlike read_file's line offset.
+    Ok(format!(
+        "{window}\n[chars {start}..{end} of {total}; call read_offloaded again with char_offset={end} for the rest]"
+    ))
 }
 
 #[cfg(test)]
@@ -3369,6 +3392,39 @@ mod tests {
         let (out, is_error) = run_tool("read_offloaded", input, &ctx).await;
         assert!(is_error);
         assert!(out.contains("past the end"), "{out}");
+        let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
+    }
+
+    /// Windowing terminates, but "terminates" is not the same as "is worth
+    /// walking". Once `web_fetch` stopped clipping bodies, an artifact could be
+    /// megabytes, and naming the next offset every time is an invitation to
+    /// spend a whole round budget paging. Past a few windows the reply must stop
+    /// offering the next number and name the file instead.
+    #[tokio::test]
+    async fn read_offloaded_redirects_to_the_file_instead_of_inviting_a_long_walk() {
+        let ctx = test_ctx(0, "offloaded-redirect");
+        std::fs::create_dir_all(&ctx.cfg.offload_dir).unwrap();
+        let payload = "z".repeat(super::OFFLOAD_WINDOW_CHARS * (super::MAX_INVITED_WINDOWS + 2));
+        let path = ctx.cfg.offload_dir.join("off-9999.txt");
+        std::fs::write(&path, &payload).unwrap();
+
+        let (out, is_error) = run_tool("read_offloaded", json!({"id": "off-9999"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(
+            !out.contains("char_offset="),
+            "the next offset must not be offered: {}",
+            &out[out.len().saturating_sub(400)..]
+        );
+        assert!(out.contains("do not page this"), "{out}");
+        assert!(
+            out.contains(&path.display().to_string()),
+            "{}",
+            &out[out.len().saturating_sub(400)..]
+        );
+        assert!(
+            out.chars().count() < crate::history::OFFLOAD_CAP_CHARS,
+            "a reply at or over the cap would be offloaded again"
+        );
         let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
     }
 }

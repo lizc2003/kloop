@@ -6,13 +6,27 @@ validate five architectural bets before committing to a larger agent design.
 ## The five bets
 
 1. **Append-only history + offload at record time.** History is only ever
-   appended. A tool result over `OFFLOAD_CAP_CHARS` (8000) is spilled to the
+   appended. A tool result over `OFFLOAD_CAP_CHARS` (32000) is spilled to the
    session store when recorded; the history keeps a head/tail preview plus a
    pointer, and `read_offloaded` fetches the output on demand — in windows of
-   `OFFLOAD_WINDOW_CHARS` (6000), each reply naming the `char_offset` to resume
+   `OFFLOAD_WINDOW_CHARS` (24000), each reply naming the `char_offset` to resume
    from. The window is what makes the hatch terminate: a reply at or over the
    cap would be offloaded on its own way into history, handing the model back a
    byte-identical preview under a fresh id.
+
+   The pointer names the id, the character count **and the file's absolute
+   path**, and `read_offloaded` stops naming the next offset once more than
+   `MAX_INVITED_WINDOWS` (4) windows remain. Windowing a large artifact is the
+   wrong shape — a 2 MB schema is 88 round trips, and a live run walked exactly
+   that treadmill until it ran out of rounds — so past a few windows both the
+   pointer and the continuation line redirect to querying the file: `grep` /
+   `read_file` when it is line-structured, `run_program` or `bash` otherwise
+   (line-oriented tools cannot slice a one-line 2 MB document). Querying answers
+   a question about the artifact and lets only the answer into the context.
+
+   This is also why `web_fetch` has no text cap: bounding what the model sees is
+   this seam's job, and a cap in the fetcher deletes the rest of the artifact
+   instead of keeping it on disk.
 2. **Continuation signal = presence of `tool_use` blocks.** Never
    `stop_reason` — it is unreliable across providers.
 3. **Concurrency safety decided per call, by name AND input.**
@@ -1544,9 +1558,11 @@ network-free, reqwest lives only in provider and web):
   HTTPS, embedded credentials and 2000-char URLs rejected, SSRF guard
   (loopback/private/link-local/CGNAT/metadata ranges refused, DNS names resolved
   and checked on every hop), same-site redirects followed (max 5), cross-host
-  redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text,
-  and a 50k-character model-text cap. Download and text truncation are reported
-  independently.
+  redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text.
+  Download truncation is reported. There is **no model-text cap**: the body is a
+  fetched artifact, and clipping one deletes evidence that the offload seam would
+  otherwise keep on disk (bet 1). Everything downloaded is handed to core, which
+  spills it and gives the model a preview plus a queryable path.
 - **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
   at least two characters; allow/block lists are mutually exclusive) —
   pluggable `SearchBackend` trait with Tavily (default, `TAVILY_API_KEY`) and

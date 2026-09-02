@@ -406,12 +406,34 @@ impl History {
         let head: String = content.chars().take(HEAD_CHARS).collect();
         let tail_rev: Vec<char> = content.chars().rev().take(TAIL_CHARS).collect();
         let tail: String = tail_rev.into_iter().rev().collect();
-        let write = std::fs::create_dir_all(&self.offload_dir)
-            .and_then(|_| std::fs::write(self.offload_dir.join(format!("{id}.txt")), content));
+        let path = self.offload_dir.join(format!("{id}.txt"));
+        let write =
+            std::fs::create_dir_all(&self.offload_dir).and_then(|_| std::fs::write(&path, content));
+        // The path is named, not just the id: `read_offloaded` walks a large
+        // artifact one window at a time, which is the wrong shape for a 2 MB
+        // schema — grep/read_file/run_program answer a question about the file
+        // and let only the answer into the context. Those readers are in-process,
+        // so they reach the session store; sandboxed bash cannot (plan 105), which
+        // is why it is not offered here.
         let pointer = match write {
-            Ok(()) => {
-                format!("[full output offloaded, id={id}, use the read_offloaded tool to fetch it]")
-            }
+            // Two things this wording had to learn from live runs. Spelling the
+            // argument out (`path="…"`) rather than saying "that file": the
+            // friendlier phrasing was read as an invitation to
+            // `grep {glob: "off-NNNN.txt"}`, which searches the workspace, finds
+            // nothing, and sends the model off to re-download what it is already
+            // holding. And naming the shape caveat: `grep`/`read_file` are
+            // line-oriented, so on the artifact that motivated all of this — a
+            // 2.1 MB single-line OpenAPI document — they cannot slice anything,
+            // and pointing at them without saying so just relocates the dead end.
+            Ok(()) => format!(
+                "[full output offloaded: id={id}, {chars} chars, saved to {path}. \
+                 read_offloaded reads it back in windows. To keep it out of the \
+                 context, query the file at path=\"{path}\" instead: grep or \
+                 read_file when it is line-structured, otherwise run_program or \
+                 bash — line-oriented tools cannot slice a one-line document]",
+                chars = content.chars().count(),
+                path = path.display(),
+            ),
             Err(e) => format!("[offload to disk failed ({e}); output truncated]"),
         };
         format!("{head}\n…[truncated]…\n{tail}\n{pointer}")
@@ -637,6 +659,38 @@ mod tests {
         let id = &content[id_start..id_start + 8];
         let on_disk = std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap();
         assert_eq!(on_disk, big);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The pointer names the file, not just the id: paging a large artifact
+    /// through `read_offloaded` windows is the wrong shape, and without a path
+    /// the model cannot grep it instead.
+    #[test]
+    fn the_offload_pointer_names_size_and_a_queryable_path() {
+        let dir = temp_dir("spill-path");
+        let mut h = History::new(dir.clone());
+        let big = "x".repeat(OFFLOAD_CAP_CHARS + 1_000);
+        h.record(tool_result(big.clone()));
+
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
+            panic!("expected tool result");
+        };
+        let content = content.as_text();
+        let id_start = content.find("id=off-").expect("pointer has id") + 3;
+        let id = &content[id_start..id_start + 8];
+        let path = dir.join(format!("{id}.txt"));
+        assert!(
+            content.contains(&format!("{} chars", big.chars().count())),
+            "{content}"
+        );
+        assert!(content.contains(&path.display().to_string()), "{content}");
+        assert!(content.contains("grep or read_file"), "{content}");
+        assert!(content.contains("run_program or bash"), "{content}");
+        assert!(
+            content.contains(&format!("path=\"{}\"", path.display())),
+            "{content}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
         let _ = std::fs::remove_dir_all(dir);
     }
 
