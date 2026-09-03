@@ -131,6 +131,7 @@ fn tool_use(id: &str, name: &str, input: Value) -> AssistantBlock {
 fn enabled_surface() -> SurfaceCapabilities {
     SurfaceCapabilities {
         questions: true,
+        program: true,
         plan_control: true,
         workflow: true,
         ..Default::default()

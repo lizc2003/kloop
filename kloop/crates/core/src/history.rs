@@ -421,9 +421,8 @@ impl History {
         let pointer = match write {
             Ok(()) => format!(
                 "[full output saved to {path} ({chars} chars). Query it in place instead of \
-                 reading it back — a program is cheapest, since its value is a JS variable and \
-                 never enters the context: run_program with `await tools.bash({{command: \
-                 \"python3 -c '...'\"}})` over that path, returning only what you extract]",
+                 reading it back: bash with `python3 -c '...'` over that path, printing only the \
+                 fields you need, so only what you extract enters the context]",
                 chars = content.chars().count(),
                 path = path.display(),
             ),
@@ -662,7 +661,8 @@ mod tests {
     }
 
     /// cc's shape: the pointer names a path and the size, and points at querying
-    /// the file in place. No id, and no reader tool to dereference one.
+    /// the file in place with the shell. No id, no reader tool to dereference one,
+    /// and no wrapper primitive — cc reads a 2 MB spec with `python3 -c`.
     #[test]
     fn the_offload_pointer_names_a_path_and_says_to_query_it_in_place() {
         let dir = temp_dir("spill-path");
@@ -680,7 +680,7 @@ mod tests {
             "{content}"
         );
         assert!(content.contains(&path.display().to_string()), "{content}");
-        assert!(content.contains("run_program"), "{content}");
+        assert!(content.contains("python3 -c"), "{content}");
         assert!(content.contains("Query it in place"), "{content}");
         // The retired vocabulary must not come back: no id, no reader tool.
         assert!(!content.contains("read_offloaded"), "{content}");

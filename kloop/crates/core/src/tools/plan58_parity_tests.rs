@@ -149,6 +149,9 @@ fn scheduled_statuses(events: Vec<Event>) -> Vec<&'static str> {
 fn schema_report() -> Value {
     let surface = SurfaceCapabilities {
         scheduler: true,
+        // This report inspects run_program's generated wire, so it asks for the
+        // branch that ships it (plan 113 changed the default, not the behaviour).
+        program: true,
         ..Default::default()
     };
     let definitions = all_tool_defs(

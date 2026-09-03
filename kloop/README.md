@@ -15,8 +15,9 @@ validate five architectural bets before committing to a larger agent design.
    the model reads it with `Read`/`Bash`, and its own `Read` has no raw mode
    either. The pointer's advice is to query the file **in place** rather than
    read it back: `python3 -c` printing three fields never pulls the document
-   into the conversation, and inside `run_program` even that extraction costs no
-   context, because a program's return value is a JS variable.
+   into the conversation. That is the whole technique — no wrapper primitive is
+   needed, which is why `run_program` is off by default (see **One door onto the
+   code engine**).
 
    Two gates had to open for that path, and **the permission gate is the one
    that binds** — it runs before the sandbox and is immune to
@@ -97,6 +98,42 @@ keeps the recent tail verbatim, while resume and fork preserve this provenance
 with the complete message. Public `thread/read` and event snapshots remove the
 private provenance, signatures, encrypted content, and redacted blobs; only the
 same display reasoning text already emitted by live `reasoning` items remains.
+
+## One door onto the code engine
+
+The QuickJS engine (`kloop-codemode`) has two possible model-facing doors:
+`run_program` (orchestrate **tools**, plus agents) and `workflow` (orchestrate
+**agents only** — no `tools` object, no `Date`, no randomness, always background,
+durable `wf_*` resume). They are one implementation: `workflow` reuses the same
+engine, the same `HostBridge` seam and the same journal, and the two share their
+concurrency caps.
+
+`SurfaceCapabilities::program` decides whether `run_program` (and `stop_program`,
+which has nothing to stop without it) reaches the model. **It is off by default,
+and nothing is deleted** — the engine, `CoreBridge` with its full gate re-entry,
+the journal and the MCP structured-result path are all still there, so flipping
+the flag restores the previous surface exactly.
+
+The reason is a measurement, not a preference. A code runtime is self-consistent
+as the *only* tool (codex) or as *absent*, with the shell filling the role (cc,
+whose `Read` has no raw mode either — it reads a 2 MB spec with `curl -o` plus
+`python3 -c`). As one of sixteen discrete tools it is never the locally cheapest
+choice, and the model correctly never chooses it: **2 uses across 45 sessions,
+against 1666 `bash` calls**, and 0 uses across the real review sessions run
+alongside them. Its three roles each lost ground — extraction is better served by
+`bash` + `python3 -c` (the fastest measured run used exactly that), agent fan-out
+overlaps `workflow`, and the mixed tool-plus-agent orchestration only it can
+express was used 0 times in 25 calls.
+
+`workflow` stays because it is not competing with `bash` at all: it does agent
+orchestration, which the shell cannot express, and its own 0 usage is a policy
+("only when the user asked for multi-agent orchestration") rather than a loss.
+
+Honest limits: two acceptance questions after the switch came in at 2 rounds
+(matching the best measurement ever taken) and 5 rounds (against 3 with
+`run_program`, the extra rounds spent iterating on a `python3` heredoc). n=1 each,
+one model, one scenario. If that second shape recurs in real use, the flag is one
+line.
 
 ## Claude Code 2.1.220 parity baseline
 

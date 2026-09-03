@@ -388,11 +388,19 @@ pub fn all_tool_defs(
     // (typed `Promise<CallToolResult>`), or a compact manifest for deferred
     // ones — both callable at runtime.
     if depth == 0 {
-        defs.push(codemode::run_program_def(
-            &builtin_defs(0, shell_programs),
-            &inline_sources,
-            &deferred,
-        ));
+        // The QuickJS engine keeps one model-facing door, and by default that is
+        // `workflow`. `run_program` returns only when this capability is enabled,
+        // and `stop_program` rides with it because it has nothing to stop without
+        // it. Nothing is deleted: the engine, `CoreBridge` and the journal are
+        // untouched, so flipping the flag restores the previous surface exactly.
+        if surface.program {
+            defs.push(codemode::run_program_def(
+                &builtin_defs(0, shell_programs),
+                &inline_sources,
+                &deferred,
+            ));
+            defs.push(stop_program_def());
+        }
         if surface.scheduler {
             defs.push(scheduler::cron_create_def());
             defs.push(scheduler::cron_delete_def());
@@ -861,7 +869,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "run_agent".into(),
-            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
+            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use bash for fixed tool/code batching (a shell one-liner or `python3 -c` beats a wrapper), and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -899,33 +907,37 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         });
-        defs.push(ToolDef {
-            name: "stop_program".into(),
-            description: "Stop a running background code-mode program by its program-N id. It ends without reporting a result. Use stop_agent for agent-N, stop_workflow for workflow-N, or stop_bash for bg-N; this is not a durable run_id.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "program_id": {"type": "string", "description": "The program-N id from run_program with background=true"}
-                },
-                "required": ["program_id"],
-                "additionalProperties": false
-            }),
-        });
     }
     defs
 }
 
-/// The built-ins plus a built-ins-only `run_program`. This is what tool-counting
-/// (`defer_active`, `tool_merge_warnings`) sees, so `run_program` counts toward
-/// the defer threshold like any other built-in. The definition actually sent to
-/// the model — whose TypeScript API also lists the external source tools — is
-/// built in [`all_tool_defs`], which can see the sources.
-pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
-    let mut defs = builtin_defs(depth, shell_programs);
-    if depth == 0 {
-        defs.push(codemode::run_program_def(&defs, &[], &[]));
+/// Kept out of [`builtin_defs`] so it rides the same surface flag as
+/// `run_program`: without that tool there is no `program-N` to stop.
+fn stop_program_def() -> ToolDef {
+    ToolDef {
+        name: "stop_program".into(),
+        description: "Stop a running background code-mode program by its program-N id. It ends without reporting a result. Use stop_agent for agent-N, stop_workflow for workflow-N, or stop_bash for bg-N; this is not a durable run_id.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "program_id": {"type": "string", "description": "The program-N id from run_program with background=true"}
+            },
+            "required": ["program_id"],
+            "additionalProperties": false
+        }),
     }
-    defs
+}
+
+/// What tool-counting (`defer_active`, `tool_merge_warnings`) sees: the built-ins
+/// only. Surface-gated depth-0 tools are excluded because they may not be sent at
+/// all, and `run_program` now joins them
+/// ([`crate::config::SurfaceCapabilities::program`]), so it no longer counts
+/// toward the defer threshold — the treatment `workflow`, `worktree` and the rest
+/// have always had. What is actually sent, whose TypeScript API also lists the
+/// external source tools, is built in [`all_tool_defs`], which sees both the
+/// sources and the surface.
+pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
+    builtin_defs(depth, shell_programs)
 }
 
 /// Concurrency safety by name AND input: read-only tools are always safe,
@@ -1846,12 +1858,77 @@ mod tests {
     use super::testutil::*;
     use super::*;
 
+    /// Definitions as sent when the `program` surface is on — the branch that
+    /// still ships `run_program`. Its own tests keep exercising it; plan 113 only
+    /// changed which branch is the default.
+    fn program_surface_defs() -> Vec<ToolDef> {
+        all_tool_defs(
+            0,
+            &[],
+            /*defer_threshold*/ 200,
+            crate::config::SurfaceCapabilities {
+                program: true,
+                ..Default::default()
+            },
+            &ShellPrograms::native_posix(),
+        )
+    }
+
     fn interactive_surface() -> crate::config::SurfaceCapabilities {
         crate::config::SurfaceCapabilities {
             questions: true,
+            program: true,
             plan_control: true,
             ..Default::default()
         }
+    }
+
+    /// Plan 113: the code engine keeps one model-facing door. Off — the default —
+    /// neither `run_program` nor its `stop_program` reaches the model, and the
+    /// count that drives the defer threshold drops with them. On restores both.
+    /// Nothing is deleted either way; this pins both branches so flipping back is
+    /// a config change, not a revival.
+    #[test]
+    fn the_program_surface_gates_run_program_and_its_stop_tool() {
+        let names = |program: bool| {
+            all_tool_defs(
+                0,
+                &[],
+                /*defer_threshold*/ 200,
+                crate::config::SurfaceCapabilities {
+                    program,
+                    workflow: true,
+                    ..interactive_surface()
+                },
+                &ShellPrograms::native_posix(),
+            )
+            .into_iter()
+            .map(|def| def.name)
+            .collect::<Vec<_>>()
+        };
+        let off = names(false);
+        assert!(!off.contains(&"run_program".to_string()), "{off:?}");
+        assert!(!off.contains(&"stop_program".to_string()), "{off:?}");
+        // The other door onto the same engine is untouched.
+        assert!(off.contains(&"workflow".to_string()), "{off:?}");
+        assert!(off.contains(&"run_agent".to_string()), "{off:?}");
+
+        let on = names(true);
+        assert!(on.contains(&"run_program".to_string()), "{on:?}");
+        assert!(on.contains(&"stop_program".to_string()), "{on:?}");
+        assert_eq!(on.len(), off.len() + 2);
+
+        // Counting follows what is actually sent: a surface-gated tool is not in
+        // the built-in count, exactly like workflow and worktree.
+        let counted = tool_defs(0, &ShellPrograms::native_posix())
+            .into_iter()
+            .map(|def| def.name)
+            .collect::<Vec<_>>();
+        assert!(!counted.contains(&"run_program".to_string()), "{counted:?}");
+        assert!(
+            !counted.contains(&"stop_program".to_string()),
+            "{counted:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -2093,7 +2170,7 @@ mod tests {
 
     #[test]
     fn agent_and_program_schemas_match_strict_optional_string_parsers() {
-        let definitions = tool_defs(0, &ShellPrograms::native_posix());
+        let definitions = program_surface_defs();
         for name in ["run_agent", "run_program"] {
             let definition = definitions
                 .iter()
@@ -2395,9 +2472,10 @@ mod tests {
         .map(|d| d.name)
         .collect();
         // Built-ins first, then the first source; the duplicate source's
-        // identical names are dropped. run_program comes last: its TypeScript
-        // API is generated from the built-ins AND the source tools, so it is
-        // appended only after the sources are merged.
+        // identical names are dropped. run_program comes after the sources
+        // because its TypeScript API is generated from the built-ins AND the
+        // source tools, and `stop_program` now rides beside it on the same
+        // surface flag instead of sitting among the built-ins.
         assert_eq!(
             names,
             vec![
@@ -2420,11 +2498,11 @@ mod tests {
                 "run_agent",
                 "wait_for_activity",
                 "stop_agent",
-                "stop_program",
                 "srv__echo",
                 "srv__fail",
                 "srv__image",
                 "run_program",
+                "stop_program",
                 "ask_user_question",
                 "enter_plan_mode",
                 "exit_plan_mode",
@@ -2690,7 +2768,11 @@ mod tests {
 
         // One past it: built-ins + tool_search + call_tool only; sources
         // deferred. The three always-present depth-0 interaction controls are
-        // appended after run_program and do not count toward the threshold.
+        // appended after run_program and do not count toward the threshold —
+        // and neither do run_program and stop_program themselves any more, since
+        // plan 113 put them behind the `program` surface (which this helper
+        // enables, so they are present in the result even though absent from
+        // `builtin_count`).
         let deferred_regime = all_tool_defs(
             0,
             &sources,
@@ -2705,7 +2787,7 @@ mod tests {
         assert!(names.contains(&"enter_plan_mode"));
         assert!(names.contains(&"exit_plan_mode"));
         assert!(!names.contains(&"srv__echo"));
-        assert_eq!(deferred_regime.len(), builtin_count + 5);
+        assert_eq!(deferred_regime.len(), builtin_count + 7);
         let deferred: Vec<String> =
             deferred_tool_defs(&sources, builtin_count + 2, &ShellPrograms::native_posix())
                 .into_iter()
@@ -2746,7 +2828,7 @@ mod tests {
     /// Deferred tools are the deliberate exception — they have no catalog entry.
     #[test]
     fn typed_manifest_labels_are_capped_but_deferred_lines_stay_whole() {
-        let defs = tool_defs(0, &ShellPrograms::native_posix());
+        let defs = program_surface_defs();
         let rp = defs.iter().find(|d| d.name == "run_program").unwrap();
         let labels: Vec<&str> = rp
             .description

@@ -1001,6 +1001,9 @@ pub(crate) fn config_from_settings(
         surface: kloop_core::config::SurfaceCapabilities {
             questions: questions_enabled,
             plan_control: !args.headless,
+            // Plan 113: the QuickJS engine keeps one model-facing door and it is
+            // `workflow`. Nothing is deleted — flip this to restore run_program.
+            program: false,
             workflow: !args.headless,
             worktree: !args.mock,
             scheduler: !args.mock,

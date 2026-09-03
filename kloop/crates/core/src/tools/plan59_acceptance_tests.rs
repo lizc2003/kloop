@@ -920,6 +920,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     config.permissions = Arc::new(permissions);
     config.surface = SurfaceCapabilities {
         questions: true,
+        program: true,
         plan_control: true,
         workflow: true,
         ..Default::default()

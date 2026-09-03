@@ -235,6 +235,14 @@ mod powershell_gate_tests {
 pub struct SurfaceCapabilities {
     pub questions: bool,
     pub plan_control: bool,
+    /// Whether `run_program` (and its `stop_program`) reach the model. Off by
+    /// default: the QuickJS engine stays, but `workflow` is its only model-facing
+    /// door. As one of sixteen discrete tools a code runtime is never the locally
+    /// cheapest choice — measured at 2 uses across 45 sessions, against 1666 bash
+    /// calls — while codex (runtime as the *only* tool) and cc (no runtime, bash
+    /// fills the role) are each self-consistent. Flip this back on to restore the
+    /// previous surface; nothing is deleted.
+    pub program: bool,
     pub workflow: bool,
     pub worktree: bool,
     pub scheduler: bool,

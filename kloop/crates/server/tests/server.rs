@@ -282,6 +282,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             surface: kloop_core::config::SurfaceCapabilities {
                 questions,
                 plan_control: true,
+                program: false,
                 workflow: true,
                 worktree: false,
                 scheduler: false,
@@ -692,6 +693,7 @@ fn worktree_factory(
             surface: kloop_core::config::SurfaceCapabilities {
                 questions,
                 plan_control: true,
+                program: false,
                 workflow: true,
                 worktree: true,
                 scheduler: false,

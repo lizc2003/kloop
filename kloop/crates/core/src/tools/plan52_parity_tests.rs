@@ -483,7 +483,11 @@ async fn inbox_final_boundary_report() -> Value {
 }
 
 async fn native_surface_report() -> Value {
-    const EXPECTED_NATIVE: [&str; 9] = [
+    // `stop_program` left this list with plan 113: it now ships only on the
+    // `program` surface, which is off by default, and this report reads the
+    // default surface. Its own gating is pinned by
+    // `the_program_surface_gates_run_program_and_its_stop_tool`.
+    const EXPECTED_NATIVE: [&str; 8] = [
         "run_agent",
         "task_create",
         "task_get",
@@ -492,7 +496,6 @@ async fn native_surface_report() -> Value {
         "task_clear",
         "wait_for_activity",
         "stop_agent",
-        "stop_program",
     ];
     const TASK_TOOLS: [&str; 5] = [
         "task_create",

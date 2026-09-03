@@ -2857,6 +2857,9 @@ async fn run_program_binds_source_generation_to_the_sampling_request() {
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "program-sampling-manifest").test_clone();
     cfg.tool_sources = vec![source.clone()];
+    // This test is about run_program's generated manifest, so it opts into the
+    // surface that ships it (plan 113 made that surface off by default).
+    cfg.surface.program = true;
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
