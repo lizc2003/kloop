@@ -18,6 +18,7 @@ use kloop_core::event::Delta;
 use kloop_core::event::Event;
 use kloop_core::event::Item;
 use kloop_core::event::ItemStatus;
+use kloop_core::inbox::Replayed;
 use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
@@ -1777,7 +1778,19 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
         for block in &message.content {
             match (message.role, block) {
                 (Role::User, ContentBlock::Text { text }) => {
-                    cells.push(Cell::User(text.clone()));
+                    // Not every user-role message is the user talking: the inbox
+                    // reinjects sub-agent results, background output and steering
+                    // as user text so the model folds them in. Replaying those
+                    // verbatim shows a page of machine framing as if it had been
+                    // typed — a background sub-agent's summary alone runs to
+                    // thousands of characters.
+                    match kloop_core::inbox::replayed(text) {
+                        Some(Replayed::UserText(typed)) => {
+                            cells.push(Cell::User(typed.to_string()))
+                        }
+                        Some(Replayed::Note(note)) => cells.push(Cell::Note(note)),
+                        None => cells.push(Cell::User(text.clone())),
+                    }
                 }
                 // A user image replays as a placeholder line: the base64 is not
                 // shown, only that an image rode this turn.
@@ -1798,11 +1811,24 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                     if !thinking.is_empty() =>
                 {
                     // No timing on disk, so a resumed block shows `∗ Thought`
-                    // without an elapsed.
-                    cells.push(Cell::Thinking {
-                        text: thinking.clone(),
-                        seconds: None,
-                    });
+                    // without an elapsed — and a second identical line says
+                    // nothing the first did not. A turn often holds several
+                    // blocks, so they fold into one row (keeping every block's
+                    // text, which the row does not show but a future expander
+                    // would).
+                    match cells.last_mut() {
+                        Some(Cell::Thinking {
+                            text,
+                            seconds: None,
+                        }) => {
+                            text.push_str("\n\n");
+                            text.push_str(thinking);
+                        }
+                        _ => cells.push(Cell::Thinking {
+                            text: thinking.clone(),
+                            seconds: None,
+                        }),
+                    }
                 }
                 (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
                     let (status, output) = match results.get(id.as_str()) {
@@ -3390,6 +3416,54 @@ mod tests {
                 Cell::User("what is this".into()),
                 Cell::User("[image: image/png]".into()),
                 Cell::Note("resumed session — 1 message(s)".into()),
+            ]
+        );
+    }
+
+    /// A replayed transcript shows the conversation, not the plumbing: an inbox
+    /// reinjection collapses to one note (the sub-agent summary it carries runs
+    /// to thousands of characters and was never addressed to the reader), and a
+    /// run of untimed thinking blocks folds into the single `∗ Thought` row that
+    /// says everything each of them would.
+    #[test]
+    fn replay_collapses_injections_and_thinking_runs() {
+        let reinjected = kloop_core::inbox::InboxItem::SubAgentResult {
+            label: "agent-1".into(),
+            summary: "P1: the silent path skips validation".into(),
+        }
+        .into_message();
+        let steered =
+            kloop_core::inbox::InboxItem::Steer("also check the poller".into()).into_message();
+        let messages = vec![
+            Message::user_text("review these commits"),
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "first".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Thinking {
+                    thinking: "second".into(),
+                    signature: String::new(),
+                },
+            ]),
+            Message::user_text(&reinjected),
+            Message::user_text(&steered),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]),
+        ];
+        assert_eq!(
+            cells_from_history(&messages),
+            vec![
+                Cell::User("review these commits".into()),
+                Cell::Thinking {
+                    text: "first\n\nsecond".into(),
+                    seconds: None,
+                },
+                Cell::Note("sub-agent result · [Agent agent-1]".into()),
+                Cell::User("also check the poller".into()),
+                Cell::Assistant("done".into()),
+                Cell::Note("resumed session — 5 message(s)".into()),
             ]
         );
     }

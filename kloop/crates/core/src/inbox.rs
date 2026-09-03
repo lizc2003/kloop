@@ -35,7 +35,9 @@ as part of the current task — finish any step already in progress, then act on
 /// task the parent dispatched reporting back. Weaker models need the explicit
 /// cue not to mistake it for a fresh user request.
 const SUBAGENT_PREFIX: &str = "A background sub-agent you dispatched has finished. Its result is \
-below — fold it into your work, and if you were waiting on it, continue from here:";
+below — fold it into your work, and if you were waiting on it, continue from here. If you \
+already delivered this turn's answer, add only what this result changes or adds; do not restate \
+what you already said:";
 
 /// Framing for a background program's result reinjected into its parent
 /// (plan 24: `run_program {"background": true}`). Like a sub-agent result but
@@ -122,6 +124,57 @@ pub enum InboxItem {
         failures: Vec<AgentMessageFailure>,
         reason: String,
     },
+}
+
+/// How an injected message reads when a saved transcript is replayed. The
+/// framings above are written for the model; a person rereading the session
+/// wants the opposite. Steering is the user talking — show what they typed and
+/// drop the wrapper. Everything else is the harness reporting back mid-turn,
+/// and replaying it verbatim buries the conversation under a page of machine
+/// text it was never meant to show (a background sub-agent's summary is
+/// thousands of characters).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Replayed<'a> {
+    /// The user's own words, with the steering framing stripped.
+    UserText(&'a str),
+    /// A harness injection, collapsed to one line: what it was, and the first
+    /// detail line naming which one.
+    Note(String),
+}
+
+/// Classify a replayed user message. `None` is an ordinary message the user
+/// typed, which replays as itself.
+pub fn replayed(text: &str) -> Option<Replayed<'_>> {
+    if let Some(rest) = text.strip_prefix(STEERING_PREFIX) {
+        return Some(Replayed::UserText(rest.trim_start_matches('\n')));
+    }
+    // Ordered longest-prefix-first is unnecessary: no framing is a prefix of
+    // another, they all open with a distinct sentence.
+    let labelled = [
+        (SUBAGENT_PREFIX, "sub-agent result"),
+        (PROGRAM_PREFIX, "background program result"),
+        (WORKFLOW_PREFIX, "workflow result"),
+        (SHELL_PREFIX, "background shell update"),
+        (SCHEDULED_PREFIX, "scheduled task"),
+        (MISSED_SCHEDULED_PREFIX, "missed scheduled task"),
+        (SCHEDULER_FAILURE_PREFIX, "scheduler failure"),
+        (AGENT_MESSAGE_PREFIX, "peer agent message"),
+        (AGENT_UNDELIVERABLE_PREFIX, "peer agent delivery failure"),
+    ];
+    labelled.into_iter().find_map(|(prefix, label)| {
+        let rest = text.strip_prefix(prefix)?;
+        let detail = rest
+            .trim_start_matches('\n')
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim();
+        Some(Replayed::Note(if detail.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} · {detail}")
+        }))
+    })
 }
 
 impl InboxItem {
@@ -289,6 +342,53 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replay reverses the framing: steering was the user talking (show the
+    /// words, drop the wrapper), everything else was the harness reporting back
+    /// mid-turn and collapses to one line naming which one.
+    #[test]
+    fn replay_strips_steering_and_collapses_harness_injections() {
+        let steer = InboxItem::Steer("check logs".into()).into_message();
+        assert_eq!(replayed(&steer), Some(Replayed::UserText("check logs")));
+
+        let sub_agent = InboxItem::SubAgentResult {
+            label: "agent-2".into(),
+            summary: "found 3 matches".into(),
+        }
+        .into_message();
+        assert_eq!(
+            replayed(&sub_agent),
+            Some(Replayed::Note("sub-agent result · [Agent agent-2]".into()))
+        );
+
+        let shell = InboxItem::ShellResult {
+            id: "bg-3".into(),
+            status: "completed".into(),
+            output_path: "/tmp/bg-3.out".into(),
+            summary: "Background command completed (exit code 0)".into(),
+        }
+        .into_message();
+        assert_eq!(
+            replayed(&shell),
+            Some(Replayed::Note(
+                "background shell update · [bg-3] completed".into()
+            ))
+        );
+
+        // What the user actually typed replays as itself.
+        assert_eq!(replayed("just a message"), None);
+        assert_eq!(replayed(""), None);
+    }
+
+    /// The clause exists because a background result can land after the parent
+    /// already delivered its answer and ended its turn: without it the model's
+    /// default is to rewrite the whole answer, and the user watches one review
+    /// scroll past twice (measured: 2026-09-03 dogfood, 15 minutes apart).
+    #[test]
+    fn subagent_framing_asks_for_the_delta_once_delivered() {
+        assert!(SUBAGENT_PREFIX.contains("already delivered this turn's answer"));
+        assert!(SUBAGENT_PREFIX.contains("do not restate what you already said"));
+    }
 
     #[test]
     fn item_kinds_have_distinct_framing() {
