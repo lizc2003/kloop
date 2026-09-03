@@ -371,6 +371,18 @@ enum RolloutLine {
 }
 
 impl RolloutLine {
+    /// Whether the line is opening preamble — the runtime and the provider
+    /// route a session records before it has anything to say. A file holding
+    /// only these replays as an empty conversation.
+    fn is_preamble(&self) -> bool {
+        matches!(
+            self,
+            RolloutLine::Session { .. }
+                | RolloutLine::ProviderRouteInitial { .. }
+                | RolloutLine::ProviderRouteChanged { .. }
+        )
+    }
+
     /// The line's metadata, common to every variant.
     fn meta(&self) -> &LineMeta {
         match self {
@@ -400,10 +412,13 @@ impl RolloutLine {
     }
 }
 
-/// Append-only writer for one session file. The file (and its directory) is
-/// created lazily on first append, so a session that never records anything
-/// leaves nothing behind. Tracks the id chain: each line's `parent` is the
-/// previous line's id.
+/// Append-only writer for one session file. The file (and its directory) are
+/// created on first append — which is the opening preamble, so the file exists
+/// from the start and its name reserves the session id against a concurrent
+/// process picking the same one. A writer that never gets past that preamble
+/// removes the file again when it is dropped, so starting kloop and quitting
+/// without a word leaves nothing behind. Tracks the id chain: each line's
+/// `parent` is the previous line's id.
 pub struct Rollout {
     path: PathBuf,
     prefix: String,
@@ -413,6 +428,25 @@ pub struct Rollout {
     /// line's envelope (`subagent_of`) and ignored thereafter.
     subagent_of: Option<String>,
     route_timeline: Vec<ProviderRouteReceipt>,
+    /// The file was already on disk when this writer opened it, so the writer
+    /// does not own it and never removes it.
+    preexisting: bool,
+    /// Something past the opening preamble has been appended, i.e. the file now
+    /// holds a session worth resuming.
+    wrote_content: bool,
+}
+
+impl Drop for Rollout {
+    fn drop(&mut self) {
+        if self.preexisting || self.wrote_content {
+            return;
+        }
+        // Nothing but the preamble was ever written: launching kloop and
+        // quitting without a word must not leave a session behind, or
+        // `--continue` picks that empty shell over the last real conversation.
+        // Only a file this writer created can be removed here.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl Rollout {
@@ -483,12 +517,16 @@ impl Rollout {
     fn with_origin(path: PathBuf, subagent_of: Option<String>) -> Self {
         let prefix = id_prefix(&path);
         Self {
+            // A file already on disk belongs to a resumed or forked session:
+            // this writer did not create it and must never remove it.
+            preexisting: path.exists(),
             path,
             prefix,
             next_seq: 1,
             last_id: None,
             subagent_of,
             route_timeline: Vec::new(),
+            wrote_content: false,
         }
     }
 
@@ -659,6 +697,7 @@ impl Rollout {
             ));
         }
         let json = serde_json::to_string(&line).map_err(io::Error::other)?;
+        let content = !line.is_preamble();
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -668,6 +707,7 @@ impl Rollout {
             .open(&self.path)?;
         writeln!(file, "{json}")?;
         // Only advance the chain once the line is durably in the file.
+        self.wrote_content |= content;
         self.last_id = Some(line.into_meta().id);
         self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "session sequence exhausted")
@@ -1089,6 +1129,10 @@ impl SessionRead {
             last_id: self.last_id,
             subagent_of: None,
             route_timeline: self.snapshot.provider_routes.clone(),
+            // A resumed session's file is on disk and belongs to whoever wrote
+            // it; this writer only continues it.
+            preexisting: true,
+            wrote_content: true,
         };
         if self.intact_end < self.raw_len {
             std::fs::OpenOptions::new()
@@ -2934,6 +2978,49 @@ mod tests {
             }
         );
         assert_eq!(raw_lines(&path).len(), after_marker);
+        cleanup(&path);
+    }
+
+    /// Launching kloop and quitting without saying anything leaves no session:
+    /// the file exists while the writer lives (its name reserves the id), and
+    /// goes away with it. Otherwise `--continue` picks the empty shell over the
+    /// last real conversation.
+    #[test]
+    fn a_session_with_only_preamble_removes_itself() {
+        let path = temp_file("preamble-only");
+        let rollout = Rollout::new(path.clone());
+        assert!(path.exists(), "the id is reserved while the writer lives");
+        drop(rollout);
+        assert!(!path.exists());
+        cleanup(&path);
+    }
+
+    /// One recorded message is enough to keep it: the preamble it was holding
+    /// is already in the file, so replay is unaffected.
+    #[test]
+    fn one_message_keeps_the_session_file() {
+        let path = temp_file("kept-after-message");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("hi")).unwrap();
+        drop(rollout);
+        assert!(path.exists());
+        assert_eq!(load_session_snapshot(&path).unwrap().messages.len(), 1);
+        cleanup(&path);
+    }
+
+    /// A resumed session's file belongs to whoever wrote it. Resuming one and
+    /// quitting without a word must not delete the conversation.
+    #[test]
+    fn resuming_and_saying_nothing_never_deletes_the_file() {
+        let path = temp_file("resume-then-quit");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("hi")).unwrap();
+        drop(rollout);
+
+        let resumed = resume_session(&path).unwrap();
+        drop(resumed.rollout);
+        assert!(path.exists());
+        assert_eq!(load_session_snapshot(&path).unwrap().messages.len(), 1);
         cleanup(&path);
     }
 

@@ -258,7 +258,14 @@ Consequences worth knowing:
 Every session is persisted to `{project store}/sessions/{id}.jsonl`
 (`crates/core/src/rollout.rs`), one JSON line per recorded message or
 provider-usage record, written through as the history records — so a killed
-process loses at most the line being written. A `provider_usage` line preserves
+process loses at most the line being written. The file appears at startup (its
+name is what reserves the id against a concurrent process picking the same
+timestamp), but a writer that never gets past its opening preamble — the
+`session` and `provider_route_initial` lines — **removes the file again when it
+is dropped** (plan 115): launching kloop and quitting without a word leaves no
+session, and cannot beat the last real conversation to `--continue`. Only a file
+that writer created is ever removed, and only while it holds nothing else — a
+resumed or forked session's file is never touched. A `provider_usage` line preserves
 the actual model, operation (`sampling` or `compaction`), and all four canonical
 provider-reported categories (input, output, cache-read input, cache-creation
 input). It is historical transcript data, separate from the resettable context
@@ -390,7 +397,10 @@ nested dirs or codex's SQLite `thread_spawn_edges`:
 - `--list-sessions` shows sub-agent sessions labelled `[sub-agent of …]`, but
   the default `--resume`/`--continue` picker skips them (they are reachable
   only by explicit id) — matching cc hiding sidechains and codex's source
-  filter, while still keeping them visible for audit;
+  filter, while still keeping them visible for audit. The picker also skips a
+  session that replays as an empty conversation (plan 115), so a shell left by a
+  hard kill cannot win `--continue` on recency; `--list-sessions` still reports
+  it, being a diagnostic view of what is actually on disk;
 - the parent's `run_agent {background:true}` reply names the child's session log so
   a human reading the parent transcript can jump to it. A parent with no
   session (`--mock`, tests) leaves the sub-agent in memory, as before.

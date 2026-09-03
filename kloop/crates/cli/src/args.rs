@@ -391,6 +391,13 @@ fn resumable_sessions(sessions_dir: &Path) -> Vec<PathBuf> {
     sessions_by_recency(sessions_dir)
         .into_iter()
         .filter(|path| !is_subagent_session(path))
+        // A session holding nothing but its opening preamble replays as an empty
+        // conversation — there is nothing to continue into. A writer no longer
+        // leaves one behind, but the ones already on disk (and any left by a
+        // hard kill) would still win `--continue` on recency alone. An unreadable
+        // file stays listed: `session_line` reports why, and hiding it would hide
+        // the problem.
+        .filter(|path| !matches!(load_session(path), Ok(messages) if messages.is_empty()))
         .collect()
 }
 
@@ -809,6 +816,35 @@ mod tests {
             missing,
             "no session '20260303-000003' (try --list-sessions)"
         );
+    }
+
+    /// A shell holding only its preamble replays as an empty conversation. Its
+    /// writer removes it on the way out, but a hard kill (and every one already
+    /// on disk from before that) leaves one behind — and it must not win
+    /// `--continue` by being the most recently touched file.
+    #[test]
+    fn an_empty_shell_never_wins_the_continue_pick() {
+        use kloop_protocol::Message;
+
+        let dir = std::env::temp_dir().join(format!("kloop-args-shell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let real = dir.join("20260101-000001.jsonl");
+        let mut rollout = Rollout::new(real.clone());
+        rollout.append_message(&Message::user_text("hi")).unwrap();
+        drop(rollout);
+
+        // A hard kill gives the writer no chance to remove its own file.
+        let shell = dir.join("20260202-000002.jsonl");
+        std::mem::forget(Rollout::new(shell.clone()));
+        assert!(
+            shell.exists(),
+            "the shell is on disk, and it is the newer file"
+        );
+
+        assert_eq!(resumable_sessions(&dir), vec![real]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
