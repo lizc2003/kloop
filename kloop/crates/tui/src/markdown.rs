@@ -2,10 +2,13 @@
 //!
 //! `pulldown-cmark` drives a small block/inline walker that emits styled
 //! [`Line`]s: headings, emphasis, inline code, ordered/unordered lists, block
-//! quotes, box-drawing tables, and dim-background code blocks. Fenced code
-//! blocks that name a supported language are syntax-highlighted with `synoptic`
-//! (plan 38 slice 7, 关键决定 2): a tight styles.md-safe palette over the code
-//! background — see [`token_style`].
+//! quotes, box-drawing tables, and indented code blocks. Fenced code blocks that
+//! name a supported language are syntax-highlighted with `synoptic` (plan 38
+//! slice 7, 关键决定 2): a tight styles.md-safe palette — see [`token_style`].
+//!
+//! Emphasis carries real weight (plan 114): a bold span is the brand accent, so
+//! a conclusion the model marked up stands out from the prose it sits in, while
+//! code spans stay one quiet colour and never outshine it.
 //!
 //! Streaming uses a claw-style safe-boundary buffer ([`find_stream_safe_boundary`]):
 //! only the part of the stream that ends on a stable boundary (a blank line, or a
@@ -28,13 +31,20 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthChar;
 
+use crate::render::BRAND;
 use crate::text_layout::wrap;
 
-/// Dim-grey background behind code (inline spans and fenced blocks). A neutral
-/// backdrop reads as "code"; fenced blocks additionally carry per-token
-/// foregrounds from a styles.md-safe palette (slice 7, [`token_style`]).
-const CODE_BG: Color = Color::Indexed(236);
+/// Code (inline spans and fenced blocks) carries a foreground only. A filled
+/// grey chip behind every span made dense technical prose read as a wall of
+/// blocks — the `30s`/`status=0` noise outweighed the sentence's conclusion
+/// (plan 114) — and the same fill padded each fence into a ragged rectangle.
+const CODE_FG: Color = Color::Cyan;
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// Fenced blocks are set off by an indent instead of that fill.
+const CODE_INDENT: &str = "  ";
+/// Bullets by nesting depth. A single `•` at every level flattened the nesting
+/// the model wrote; `-` and `·` keep the levels apart the way cc/codex do.
+const BULLETS: [&str; 3] = ["• ", "- ", "· "];
 /// Tab stop for code blocks — passed to synoptic (which expands tabs) and used
 /// to expand tabs in the unhighlighted path, so both keep indentation.
 const TAB_WIDTH: usize = 4;
@@ -108,6 +118,11 @@ struct Renderer {
     marker: Option<Span<'static>>,
     /// Open list levels; `Some(n)` is an ordered list's next ordinal.
     lists: Vec<Option<u64>>,
+    /// Items opened so far at each list level, so a loose list can tell its
+    /// first item (which needs no gap above it) from the rest.
+    list_items: Vec<u64>,
+    /// The open list items, innermost last.
+    items: Vec<OpenItem>,
     quote_depth: usize,
     /// Whether any top-level block has been emitted, so the next one is
     /// preceded by a blank separator (blocks nested in lists/quotes are tight).
@@ -115,6 +130,9 @@ struct Renderer {
     /// The fenced code block currently open (raw text accumulates here, not as
     /// inline styled chars).
     code: Option<String>,
+    /// Destinations of the open links, so the URL can follow the link text —
+    /// a terminal cannot click it, and dropping it loses the address entirely.
+    link_urls: Vec<String>,
     /// The open code block's info string (its language, e.g. `rust`), used to
     /// pick a syntax highlighter at flush (plan 38 slice 7). None for an
     /// indented block or a bare fence.
@@ -125,6 +143,15 @@ struct Renderer {
 
 /// A table under construction: alignments from the `Table` tag, the header
 /// cells, then body rows. Cells are the inline styled chars of each `TableCell`.
+/// One open list item: where its content starts in `out`, and whether the
+/// source wrote the list loose. Loose means the item's blocks arrive wrapped in
+/// paragraphs — the author left blank lines — and only then do the blocks inside
+/// it get blank lines here. A tight nested list must stay tight.
+struct OpenItem {
+    start: usize,
+    loose: bool,
+}
+
 struct TableAcc {
     aligns: Vec<Alignment>,
     head: Vec<Chars>,
@@ -143,8 +170,11 @@ impl Renderer {
             prefix: Vec::new(),
             marker: None,
             lists: Vec::new(),
+            list_items: Vec::new(),
+            items: Vec::new(),
             quote_depth: 0,
             blocks_emitted: false,
+            link_urls: Vec::new(),
             code: None,
             code_lang: None,
             table: None,
@@ -166,6 +196,22 @@ impl Renderer {
         self.width.saturating_sub(used).max(1)
     }
 
+    /// Whether the inline buffer already ends with `text` — an autolink whose
+    /// visible text is its own URL.
+    fn inline_ends_with(&self, text: &str) -> bool {
+        let tail: String = self
+            .inline
+            .iter()
+            .rev()
+            .take(text.chars().count())
+            .map(|(c, _)| *c)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail == text
+    }
+
     fn push_str(&mut self, s: &str, style: Style) {
         for c in s.chars() {
             self.inline.push((c, style));
@@ -185,7 +231,7 @@ impl Renderer {
                 self.push_str(&t, st);
             }
             Event::Code(t) => {
-                let st = self.eff().patch(Style::new().bg(CODE_BG));
+                let st = self.eff().patch(Style::new().fg(CODE_FG));
                 self.push_str(&t, st);
             }
             // A soft line break (single newline in the source) reflows as a
@@ -194,7 +240,7 @@ impl Renderer {
             Event::HardBreak => self.inline.push(('\n', Style::default())),
             Event::Rule => {
                 self.flush_para();
-                self.block_sep();
+                self.block_gap();
                 let w = self.content_width();
                 self.out.push(prefixed(
                     &self.prefix,
@@ -222,21 +268,37 @@ impl Renderer {
 
     fn start(&mut self, tag: Tag) {
         match tag {
-            Tag::Paragraph => self.block_sep(),
+            // A paragraph sitting directly under an item marker means a loose
+            // list — its items are blank-line separated in the source, and they
+            // read that way here too, except above the first (the gap before the
+            // list already covers that one).
+            Tag::Paragraph => {
+                if self.marker.is_some() {
+                    // Reaching a paragraph before the item's marker was consumed
+                    // is what identifies a loose list.
+                    if let Some(item) = self.items.last_mut() {
+                        item.loose = true;
+                    }
+                    if self.blocks_emitted && self.list_items.last().is_some_and(|&n| n > 1) {
+                        self.out.push(Line::default());
+                    }
+                } else {
+                    self.block_gap();
+                }
+            }
             Tag::Heading { level, .. } => {
                 self.flush_para();
-                self.block_sep();
+                self.block_gap();
                 self.styles.push(heading_style(level));
             }
             Tag::BlockQuote(_) => {
                 self.flush_para();
-                self.block_sep();
+                self.block_gap();
                 self.prefix.push(Span::styled("│ ".to_string(), DIM));
                 self.quote_depth += 1;
             }
             Tag::CodeBlock(kind) => {
                 self.flush_para();
-                self.block_sep();
                 self.code = Some(String::new());
                 self.code_lang = match kind {
                     CodeBlockKind::Fenced(info) => Some(info.to_string()),
@@ -245,10 +307,19 @@ impl Renderer {
             }
             Tag::List(first) => {
                 self.flush_para();
-                self.block_sep();
+                self.block_gap();
                 self.lists.push(first);
+                self.list_items.push(0);
             }
             Tag::Item => {
+                if let Some(n) = self.list_items.last_mut() {
+                    *n += 1;
+                }
+                self.items.push(OpenItem {
+                    start: self.out.len(),
+                    loose: false,
+                });
+                let depth = self.lists.len().saturating_sub(1);
                 let marker = match self.lists.last().copied() {
                     Some(Some(n)) => {
                         if let Some(slot) = self.lists.last_mut() {
@@ -256,27 +327,44 @@ impl Renderer {
                         }
                         format!("{n}. ")
                     }
-                    _ => "• ".to_string(),
+                    _ => BULLETS[depth.min(BULLETS.len() - 1)].to_string(),
                 };
                 let w = display_width(&marker);
-                self.marker = Some(Span::raw(marker));
+                // The outermost marker carries the accent; nested ones stay dim
+                // so depth reads as receding, not as another thing to look at.
+                let style = if depth == 0 {
+                    Style::new().fg(BRAND)
+                } else {
+                    DIM
+                };
+                self.marker = Some(Span::styled(marker, style));
                 self.prefix.push(Span::raw(" ".repeat(w)));
             }
             Tag::Emphasis => self
                 .styles
                 .push(Style::new().add_modifier(Modifier::ITALIC)),
-            Tag::Strong => self.styles.push(Style::new().add_modifier(Modifier::BOLD)),
+            // Bold is how a model marks its verdict; give it the accent colour
+            // so it carries across a screen of prose, not just a weight the
+            // terminal may or may not render heavier.
+            Tag::Strong => self
+                .styles
+                .push(Style::new().add_modifier(Modifier::BOLD).fg(BRAND)),
             Tag::Strikethrough => self
                 .styles
                 .push(Style::new().add_modifier(Modifier::CROSSED_OUT)),
-            // A link/image renders its text underlined; the URL is dropped (it
-            // would bloat the transcript and can't be clicked here anyway).
-            Tag::Link { .. } | Tag::Image { .. } => self
+            // A link renders its text underlined and keeps its URL (appended at
+            // the end tag). An image has no useful address to show, so its URL
+            // is dropped.
+            Tag::Link { dest_url, .. } => {
+                self.link_urls.push(dest_url.to_string());
+                self.styles
+                    .push(Style::new().add_modifier(Modifier::UNDERLINED));
+            }
+            Tag::Image { .. } => self
                 .styles
                 .push(Style::new().add_modifier(Modifier::UNDERLINED)),
             Tag::Table(aligns) => {
                 self.flush_para();
-                self.block_sep();
                 self.table = Some(TableAcc {
                     aligns,
                     head: Vec::new(),
@@ -317,17 +405,26 @@ impl Renderer {
             TagEnd::CodeBlock => self.flush_code(),
             TagEnd::List(_) => {
                 self.lists.pop();
+                self.list_items.pop();
             }
             TagEnd::Item => {
                 self.flush_para();
                 self.prefix.pop();
+                self.items.pop();
                 self.marker = None;
             }
-            TagEnd::Emphasis
-            | TagEnd::Strong
-            | TagEnd::Strikethrough
-            | TagEnd::Link
-            | TagEnd::Image => {
+            TagEnd::Link => {
+                self.styles.pop();
+                // An autolink's text is already the URL; printing it twice is
+                // noise, not information.
+                if let Some(url) = self.link_urls.pop()
+                    && !url.is_empty()
+                    && !self.inline_ends_with(&url)
+                {
+                    self.push_str(&format!(" ({url})"), DIM);
+                }
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Image => {
                 self.styles.pop();
             }
             TagEnd::Table => {
@@ -369,8 +466,20 @@ impl Renderer {
     /// A blank separator before the next top-level block. Blocks nested inside a
     /// list or quote are tight (no blank), matching how markdown reads in a
     /// terminal.
-    fn block_sep(&mut self) {
-        if self.blocks_emitted && self.lists.is_empty() && self.quote_depth == 0 {
+    /// The blank line between two blocks. At the top level every pair gets one.
+    /// Inside a list or quote only a block that follows content the same item
+    /// already emitted does — a gap above an item's first line would open a hole
+    /// under its own bullet.
+    fn block_gap(&mut self) {
+        if !self.blocks_emitted {
+            return;
+        }
+        let nested = !self.lists.is_empty() || self.quote_depth > 0;
+        let item_has_content = self
+            .items
+            .last()
+            .is_some_and(|item| item.loose && self.out.len() > item.start);
+        if !nested || item_has_content {
             self.out.push(Line::default());
         }
     }
@@ -407,7 +516,10 @@ impl Renderer {
         if body.is_empty() {
             return;
         }
-        self.block_sep();
+        self.block_gap();
+        // Set off by an indent, not by a filled rectangle: a grey slab sized to
+        // the longest line drew the eye before the prose explaining it did.
+        self.prefix.push(Span::raw(CODE_INDENT.to_string()));
         let avail = self.content_width();
         // One styled `Chars` per source line, then hard-wrap each to width
         // (code never reflows on spaces), preserving per-token styles.
@@ -415,16 +527,10 @@ impl Renderer {
             .into_iter()
             .flat_map(|line| hard_wrap_chars(&line, avail))
             .collect();
-        let block_w = frags
-            .iter()
-            .map(chars_width)
-            .max()
-            .unwrap_or(0)
-            .clamp(1, avail);
         for frag in frags {
-            let padded = pad_chars(frag, block_w);
-            self.out.push(prefixed(&self.prefix, coalesce(padded)));
+            self.out.push(prefixed(&self.prefix, coalesce(frag)));
         }
+        self.prefix.pop();
         self.blocks_emitted = true;
     }
 
@@ -440,7 +546,7 @@ impl Renderer {
         if ncols == 0 {
             return;
         }
-        self.block_sep();
+        self.block_gap();
 
         let mut colw = vec![0usize; ncols];
         let mut fit = |cells: &[Chars]| {
@@ -487,10 +593,13 @@ impl Renderer {
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
-    // Bold for every level; the full colour hierarchy is slice 6. Level 1/2 also
-    // read as headings from the surrounding blank lines and bold weight.
-    let _ = level;
-    Style::new().add_modifier(Modifier::BOLD)
+    // The top two levels carry the accent so a section title outranks the bold
+    // spans inside it; deeper ones stay bold-only.
+    let base = Style::new().add_modifier(Modifier::BOLD);
+    match level {
+        HeadingLevel::H1 | HeadingLevel::H2 => base.fg(BRAND),
+        _ => base,
+    }
 }
 
 /// The first-line prefix of a list item: the enclosing levels' indents with the
@@ -604,7 +713,14 @@ fn wrap_segment(chars: &Chars, width: usize) -> Vec<Chars> {
             cur_w = ww;
         } else {
             if sep == 1 {
-                cur.push((' ', Style::default()));
+                // Carry the run's own style across the space when both sides
+                // agree, so a bold phrase stays one span; at a style boundary
+                // the separator stays plain (an underline must not stretch).
+                let style = match (cur.last(), word.first()) {
+                    (Some((_, left)), Some((_, right))) if left == right => *left,
+                    _ => Style::default(),
+                };
+                cur.push((' ', style));
                 cur_w += 1;
             }
             cur.extend(word);
@@ -635,17 +751,6 @@ fn split_words(chars: &Chars) -> Vec<Chars> {
     words
 }
 
-/// Pad styled chars with trailing code-background spaces to `width` columns, so
-/// the code block renders as a clean filled rectangle (no-op if already wide).
-fn pad_chars(mut chars: Chars, width: usize) -> Chars {
-    let w = chars_width(&chars);
-    if w < width {
-        let space = Style::new().bg(CODE_BG);
-        chars.extend(std::iter::repeat_n((' ', space), width - w));
-    }
-    chars
-}
-
 /// Hard-wrap one source line of styled chars at `width` columns (CJK-aware),
 /// breaking purely at the column boundary — code does not reflow on spaces.
 /// Always yields at least one (possibly empty) line so a blank line keeps its row.
@@ -668,10 +773,10 @@ fn hard_wrap_chars(chars: &Chars, width: usize) -> Vec<Chars> {
 }
 
 /// Syntax-highlight a code block body into one styled `Chars` per source line.
-/// Each char carries the code background plus its token colour; with no
-/// supported language (or a bare fence) every char is plain over the background.
+/// Each char carries its token colour; with no supported language (or a bare
+/// fence) every char is plain.
 fn highlight_code(body: &str, lang: Option<&str>) -> Vec<Chars> {
-    let base = Style::new().bg(CODE_BG);
+    let base = Style::default();
     let lines: Vec<String> = body.split('\n').map(str::to_string).collect();
     let highlighter = lang.and_then(lang_to_ext).map(|ext| {
         let mut h = synoptic::from_extension(ext, TAB_WIDTH).expect("from_extension is total");
@@ -706,19 +811,19 @@ fn highlight_code(body: &str, lang: Option<&str>) -> Vec<Chars> {
         .collect()
 }
 
-/// Map a synoptic token kind to a styles.md-safe style patched over the code
-/// background (plan 38 slice 7). The palette is tight on purpose — cyan for
-/// structure, green for strings, magenta for keywords, dim for comments — no
-/// yellow/blue/black/white foregrounds that theme unreliably. Magenta does
-/// double duty as the brand accent, but inside the dim code rectangle it reads
-/// as a keyword, not chrome.
+/// Map a synoptic token kind to a styles.md-safe style (plan 38 slice 7). The
+/// palette is tight on purpose — cyan for structure, green for strings, magenta
+/// for keywords, dim for comments — no yellow/blue/black/white foregrounds that
+/// theme unreliably. Magenta does double duty as the brand accent, but inside an
+/// indented code block it reads as a keyword, not chrome. Operators and digits
+/// stay plain: colouring them lit up every `.`, `/` and `=1` in a shell block.
 fn token_style(kind: &str) -> Style {
     match kind {
         "keyword" | "boolean" => Style::new().fg(Color::Magenta),
         "string" => Style::new().fg(Color::Green),
         "comment" => DIM,
-        "digit" | "function" | "struct" | "namespace" | "tag" | "attribute" | "operator"
-        | "type" | "key" | "header" | "heading" => Style::new().fg(Color::Cyan),
+        "function" | "struct" | "namespace" | "tag" | "attribute" | "type" | "key" | "header"
+        | "heading" => Style::new().fg(Color::Cyan),
         _ => Style::default(),
     }
 }
@@ -1053,12 +1158,15 @@ mod tests {
     fn emphasis_and_inline_code_carry_styles() {
         let lines = markdown_lines("a **b** `c`", 40);
         assert_eq!(texts(&lines), vec!["a b c"]);
-        // Spans: "a " (plain), "b" (bold), " " (plain), "c" (code bg).
+        // Spans: "a " (plain), "b" (bold accent), " " (plain), "c" (code fg).
         let spans = &lines[0].spans;
         let bold = spans.iter().find(|s| s.content.as_ref() == "b").unwrap();
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(bold.style.fg, Some(BRAND));
         let code = spans.iter().find(|s| s.content.as_ref() == "c").unwrap();
-        assert_eq!(code.style.bg, Some(CODE_BG));
+        assert_eq!(code.style.fg, Some(CODE_FG));
+        // No filled chip behind a code span: the colour alone marks it.
+        assert_eq!(code.style.bg, None);
     }
 
     #[test]
@@ -1071,6 +1179,9 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
+        // The top two levels take the accent; deeper ones are bold only.
+        assert_eq!(lines[0].spans[0].style.fg, Some(BRAND));
+        assert_eq!(markdown_lines("### Sub", 40)[0].spans[0].style.fg, None);
         assert!(
             !lines[2].spans[0]
                 .style
@@ -1104,16 +1215,15 @@ mod tests {
     }
 
     #[test]
-    fn code_block_has_dim_background_and_keeps_source() {
+    fn code_block_is_indented_and_keeps_source() {
         let lines = markdown_lines("```rust\nlet x = 1;\n```", 40);
-        assert_eq!(texts(&lines), vec!["let x = 1;"]);
-        // Padded to a rectangle over the code background.
-        assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG));
+        assert_eq!(texts(&lines), vec!["  let x = 1;"]);
+        // Set off by the indent alone — no filled rectangle behind it.
+        assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
     }
 
-    /// A fenced block with a supported language is syntax-highlighted over the
-    /// code background (plan 38 slice 7): keyword magenta, string green, comment
-    /// dim, and every cell keeps the code background.
+    /// A fenced block with a supported language is syntax-highlighted (plan 38
+    /// slice 7): keyword magenta, string green, comment dim, no background.
     #[test]
     fn code_block_syntax_highlights_by_language() {
         let lines = markdown_lines("```rust\nlet s = \"hi\"; // note\n```", 40);
@@ -1127,13 +1237,12 @@ mod tests {
         assert_eq!(find("let").style.fg, Some(Color::Magenta));
         assert_eq!(find("hi").style.fg, Some(Color::Green));
         assert!(find("note").style.add_modifier.contains(Modifier::DIM));
-        // The whole rectangle still sits on the code background, no yellow.
-        assert!(spans.iter().all(|s| s.style.bg == Some(CODE_BG)));
+        assert!(spans.iter().all(|s| s.style.bg.is_none()));
         assert!(spans.iter().all(|s| s.style.fg != Some(Color::Yellow)));
     }
 
     /// A bare fence (no language) or an unknown language is not highlighted —
-    /// every span is plain over the background.
+    /// every span is plain.
     #[test]
     fn code_block_without_language_is_plain() {
         for md in ["```\nlet x = 1;\n```", "```nope\nlet x = 1;\n```"] {
@@ -1142,7 +1251,7 @@ mod tests {
                 lines[0].spans.iter().all(|s| s.style.fg.is_none()),
                 "unhighlighted: {md}"
             );
-            assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG));
+            assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
         }
     }
 
@@ -1153,10 +1262,10 @@ mod tests {
     #[test]
     fn unhighlighted_code_block_expands_tabs() {
         let lines = markdown_lines("```makefile\n\tall:\n```", 40);
-        assert!(
-            texts(&lines)[0].starts_with("    all:"),
-            "tab expanded to 4 spaces: {:?}",
-            texts(&lines)
+        assert_eq!(
+            texts(&lines)[0],
+            "      all:",
+            "two-column indent + a tab expanded to 4 spaces"
         );
     }
 
@@ -1176,14 +1285,65 @@ mod tests {
     fn token_style_uses_the_safe_palette() {
         assert_eq!(token_style("keyword").fg, Some(Color::Magenta));
         assert_eq!(token_style("string").fg, Some(Color::Green));
-        assert_eq!(token_style("digit").fg, Some(Color::Cyan));
+        assert_eq!(token_style("type").fg, Some(Color::Cyan));
+        // Punctuation and numbers keep the plain foreground — see the doc above.
+        assert_eq!(token_style("operator"), Style::default());
+        assert_eq!(token_style("digit"), Style::default());
         assert!(token_style("comment").add_modifier.contains(Modifier::DIM));
         assert_eq!(token_style("whatever"), Style::default());
         // No banned foregrounds anywhere in the map.
-        for kind in ["keyword", "string", "digit", "function", "comment", "type"] {
+        for kind in ["keyword", "string", "function", "comment", "type"] {
             let fg = token_style(kind).fg;
             assert!(fg != Some(Color::Yellow) && fg != Some(Color::Blue));
         }
+    }
+
+    /// Nesting reads as nesting: each level gets its own glyph, so a sub-point
+    /// is visibly subordinate instead of another `•` at a different indent.
+    #[test]
+    fn nested_bullets_change_glyph_by_depth() {
+        let lines = markdown_lines("- a\n  - b\n    - c\n      - d", 40);
+        assert_eq!(texts(&lines), vec!["• a", "  - b", "    · c", "      · d"]);
+        // The outer marker is the accent, deeper ones recede.
+        assert_eq!(lines[0].spans[0].style.fg, Some(BRAND));
+        assert!(lines[1].spans[1].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A loose list (blank lines in the source) keeps them; a tight one stays
+    /// tight. Same markup, same rhythm the model wrote.
+    #[test]
+    fn loose_list_keeps_its_blank_lines_and_tight_stays_tight() {
+        assert_eq!(texts(&markdown_lines("- a\n- b", 40)), vec!["• a", "• b"]);
+        assert_eq!(
+            texts(&markdown_lines("- a\n\n- b", 40)),
+            vec!["• a", "", "• b"]
+        );
+    }
+
+    /// A second block inside one item — a nested list, another paragraph — is
+    /// separated from the item's first line, which is what makes a long review
+    /// item readable instead of one slab.
+    #[test]
+    fn blocks_inside_an_item_are_separated() {
+        let lines = markdown_lines("- head\n\n  - sub\n\n    detail", 40);
+        assert_eq!(
+            texts(&lines),
+            vec!["• head", "", "  - sub", "", "    detail"]
+        );
+    }
+
+    /// A link keeps its address (a terminal cannot click the text), but an
+    /// autolink whose text is already the URL does not print it twice.
+    #[test]
+    fn links_keep_their_url_without_repeating_an_autolink() {
+        assert_eq!(
+            texts(&markdown_lines("see [docs](https://x.dev/a)", 40)),
+            vec!["see docs (https://x.dev/a)"]
+        );
+        assert_eq!(
+            texts(&markdown_lines("<https://x.dev/a>", 40)),
+            vec!["https://x.dev/a"]
+        );
     }
 
     /// A code fence containing a nested triple-backtick example is upgraded to a
@@ -1193,9 +1353,13 @@ mod tests {
         let md = "````\n```\ninner\n```\n````";
         let lines = markdown_lines(md, 40);
         // The inner backticks render as literal code content, not a broken
-        // block; each line is padded to the block's rectangle over the code bg.
-        assert_eq!(texts(&lines), vec!["```  ", "inner", "```  "]);
-        assert!(lines.iter().all(|l| l.spans[0].style.bg == Some(CODE_BG)));
+        // block; every line carries the block indent and nothing else.
+        assert_eq!(texts(&lines), vec!["  ```", "  inner", "  ```"]);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg.is_none()))
+        );
     }
 
     #[test]

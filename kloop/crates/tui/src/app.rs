@@ -27,7 +27,6 @@ use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TaskGraphSnapshot;
-use kloop_core::tools::TaskStatus;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
@@ -114,6 +113,11 @@ pub enum Cell {
     /// Local peer-message delivery state, keyed by message-N and independent of
     /// the sender/recipient Agent execution lifecycle.
     AgentMessage(AgentMessageUpdate),
+    /// The rule that closes a turn, carrying its wall-clock seconds. A turn
+    /// that simply stops producing output leaves the screen looking like it is
+    /// still working; this is where the eye stops, and it is what separates one
+    /// turn from the next once both are in scrollback.
+    TurnEnd(u64),
     Note(String),
     /// Output of a slash command — a wrapped, dim multi-line block (unlike a
     /// Note, which collapses to one truncated line).
@@ -316,11 +320,11 @@ pub struct App {
     /// Pure display preference. Snapshot updates, turns, rewinds, and `/clear`
     /// never reset it; Ctrl+T is its only mutator.
     pub show_task_graph: bool,
-    /// Set when a turn ends with every task in the graph completed: the panel
-    /// steps off the composer, though the snapshot — and the registry records
-    /// behind it — stay. The next accepted snapshot clears it. Plan 74 keeps a
-    /// finished graph queryable, so this retires the display only; it is not a
-    /// reset, and it never touches `show_task_graph`.
+    /// Set when a turn ends: the panel steps off the composer, though the
+    /// snapshot — and the registry records behind it — stay. The next accepted
+    /// snapshot clears it. Plan 74 keeps a finished graph queryable, so this
+    /// retires the display only; it is not a reset, and it never touches
+    /// `show_task_graph`.
     task_panel_retired: bool,
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
@@ -968,17 +972,13 @@ impl App {
                 // dropping the senders resolves them as Deny.
                 self.interactions.clear();
                 self.panel_scroll = 0;
-                // A graph with nothing left to do has nothing left to steer by,
-                // so it leaves the composer with the turn that finished it. An
-                // unfinished graph stays up — interrupted or not, it is what the
-                // next turn continues from.
-                self.task_panel_retired = self.task_graph.as_ref().is_some_and(|snapshot| {
-                    !snapshot.tasks.is_empty()
-                        && snapshot
-                            .tasks
-                            .iter()
-                            .all(|task| task.status == TaskStatus::Completed)
-                });
+                // The panel tracks a turn in flight, not a standing checklist:
+                // it leaves the composer with the turn that raised it, finished
+                // or not. Keeping an unfinished graph pinned there was the
+                // common case — a model that has delivered its answer rarely
+                // goes back to tick its own boxes — and between turns it read as
+                // work still running. The next task update brings it back.
+                self.task_panel_retired = true;
                 // An interrupted turn drops task futures mid-await, so a
                 // sub-agent's completion may never arrive: no row may outlive
                 // its turn still spinning.
@@ -1053,6 +1053,13 @@ impl App {
         {
             *s = Some(seconds);
         }
+    }
+
+    /// Close the transcript's turn with its wall-clock elapsed. The event loop
+    /// owns the clock (the `App` has none), so it stamps this the moment
+    /// `running` drops — after any end-of-turn note, so the rule sits last.
+    pub fn seal_turn(&mut self, seconds: u64) {
+        self.cells.push(Cell::TurnEnd(seconds));
     }
 
     fn agent_cell(&mut self, agent: &str) -> Option<&mut Cell> {
@@ -1912,7 +1919,7 @@ mod tests {
 
     fn completed_task_snapshot(revision: u64, subject: &str) -> TaskGraphSnapshot {
         let mut snapshot = task_snapshot(revision, subject);
-        snapshot.tasks[0].status = TaskStatus::Completed;
+        snapshot.tasks[0].status = kloop_core::tools::TaskStatus::Completed;
         snapshot
     }
 
@@ -2174,20 +2181,21 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_graph_retires_the_panel_when_the_turn_ends() {
+    fn the_panel_retires_with_the_turn_that_raised_it() {
         let mut app = App::new("s".into());
         app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
             1, "Open",
         ))));
-        // An unfinished graph is what the next turn continues from, so it
-        // survives the turn that ended — interrupted or not.
+        assert!(app.live_task_graph().is_some(), "still up mid-turn");
+        // An unfinished graph goes too: the model that stopped answering is not
+        // going to come back and tick its own boxes.
         app.apply(turn_ended(EndReason::Aborted));
-        assert!(app.live_task_graph().is_some());
+        assert!(app.live_task_graph().is_none());
 
         app.apply(AgentEvent::Core(Event::TaskGraphUpdated(
             completed_task_snapshot(2, "Open"),
         )));
-        assert!(app.live_task_graph().is_some(), "still up mid-turn");
+        assert!(app.live_task_graph().is_some());
         app.apply(turn_ended(EndReason::Completed));
         assert!(app.live_task_graph().is_none());
 

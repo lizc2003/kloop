@@ -593,14 +593,30 @@ cyan, so agent chrome remains recognizable without the previous pink cast.
 
 Assistant messages render as **markdown** (plan 38 slice 1, `crates/tui/src/markdown.rs`
 via `pulldown-cmark`): headings and `**bold**`/`*italic*`/`~~strike~~` weight,
-inline `code` and fenced code blocks over a dim background, ordered and unordered
-lists with a hanging indent, block quotes with a `│` bar, and GitHub-style tables
-drawn with box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single
-newline inside a paragraph reflows to a space (CommonMark soft break), so answers
-re-wrap to the terminal width. Fenced code blocks that name a supported language
-are **syntax-highlighted** (plan 38 slice 7, `synoptic`): a tight theme-safe
-palette over the dim background — keywords magenta, strings green, comments dim,
-numbers/types/functions cyan, everything else plain (no yellow/blue). While a
+inline `code`, fenced code blocks, ordered and unordered lists with a hanging
+indent, block quotes with a `│` bar, and GitHub-style tables drawn with
+box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single newline
+inside a paragraph reflows to a space (CommonMark soft break), so answers re-wrap
+to the terminal width.
+
+Emphasis is ranked so a **verdict** survives the prose around it (plan 114): bold
+spans and `#`/`##` headings take the brand accent, so the conclusion a model marks
+up is the brightest thing in its own paragraph, while code carries a foreground
+only — ANSI cyan, no filled background. (The dim-grey chip behind every span made
+dense review prose read as a wall of blocks: `30s`, `status=0` and the like
+outweighed the sentence that judged them.) Fenced blocks are set off by a
+two-column indent rather than a padded rectangle, list bullets change glyph by
+depth (`•`, `-`, `·`) so nesting reads as nesting, a loose list keeps the blank
+lines its author wrote (a tight one stays tight), and a link keeps its URL in dim
+parentheses after the text — a terminal cannot click the underline. The base
+prompt carries the other half of this: lead a finding with its conclusion, in
+bold, then the reasoning.
+
+Fenced code blocks that name a supported language are **syntax-highlighted**
+(plan 38 slice 7, `synoptic`): a tight theme-safe palette — keywords magenta,
+strings green, comments dim, types/functions cyan, everything else (operators and
+digits included, or a shell block lights up every `.`, `/` and `=1`) plain, and
+never yellow/blue. While a
 message is still streaming, only the part up to the last **stable boundary** (a
 blank line, or a closed code fence) is rendered as markdown; the forming tail
 shows raw, so a half-written table or fence never reflows mid-stream, and it
@@ -742,6 +758,10 @@ while a turn runs, so an idle session redraws on nothing and spends no CPU (toki
 plays the FrameRequester role); `KLOOP_NO_ANIM` (or a `dumb` terminal) freezes
 the spinner and drops the shimmer for reduced motion. The pure `App` has no
 clock — the event loop owns the timing and feeds it in as a `Hud` each frame.
+When the turn stops, that same clock stamps a **closing rule** into the transcript
+(plan 114): a dim full-width `── Worked for 12m05s ───…`. A turn that simply stops
+producing output leaves the screen looking like it is still working; this is where
+the eye stops, and once both turns are in scrollback it is the seam between them.
 
 `--resume` replays the saved session into the tail (user/assistant text plus
 tool status rows re-derived from the recorded tool_use/tool_result pairs); a
@@ -1919,12 +1939,14 @@ Task calls still use the ordinary `toolCall` lifecycle. A successful
 panel-visible mutation additionally emits internal `TaskGraphUpdated`; only the
 TUI projects it as a read-only live graph immediately above the composer.
 `Ctrl+T` toggles that projection without mutating the registry. When a turn ends
-with every task in the graph completed, the panel **retires**: it leaves the
-composer and takes its `Ctrl+T` hint with it, while the snapshot, its revision
-fence, the registry records and the `Ctrl+T` preference all survive — the next
-accepted snapshot (the next epoch's first task) brings it back with no keypress.
-An unfinished graph stays on screen across turns, interrupted or not, because it
-is what the next turn continues from. Plain mode prints
+the panel **retires**: it leaves the composer and takes its `Ctrl+T` hint with it,
+while the snapshot, its revision fence, the registry records and the `Ctrl+T`
+preference all survive — the next accepted snapshot (the next epoch's first task)
+brings it back with no keypress. Retirement is unconditional (plan 114): the panel
+tracks a turn in flight, not a standing checklist, and an unfinished graph is the
+common case — a model that has delivered its answer rarely goes back to tick its
+own boxes, and a checklist pinned above an idle composer reads as work still
+running. Plain mode prints
 no checklist, and server/headless add no Task notification, native item, or
 public wire. The permission gate auto-allows these session-memory operations
 (including in plan mode); create/update/clear are serial and get/list are

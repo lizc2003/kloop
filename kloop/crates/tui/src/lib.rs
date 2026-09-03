@@ -1100,6 +1100,14 @@ async fn ui_loop(
                     && let Some(t) = thinking_started.take() {
                         app.seal_thinking(t.elapsed().as_secs());
                     }
+                // Same for the turn itself: stamp its elapsed onto the transcript
+                // the moment it stops running — the top of the loop drops the
+                // clock on the next iteration, and by then the time is gone.
+                if !app.running
+                    && let Some(t) = turn_started.take()
+                {
+                    app.seal_turn(t.elapsed().as_secs());
+                }
                 // Autowake (plan 26): a background sub-agent finished (its
                 // agent_end woke this select) and left a result in the inbox
                 // while the agent sits idle. Start a turn to deliver it without

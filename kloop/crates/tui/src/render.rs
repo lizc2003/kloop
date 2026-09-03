@@ -505,6 +505,18 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 DIM,
             )));
         }
+        Cell::TurnEnd(seconds) => {
+            // A dim full-width rule with the turn's elapsed set into its left
+            // end: the closing counterpart to the running `Working (…)` line,
+            // and the seam between two turns in scrollback.
+            let label = format!("── Worked for {} ", crate::anim::format_elapsed(*seconds));
+            let rule = match width.checked_sub(display_width(&label)) {
+                Some(tail) => format!("{label}{}", "─".repeat(tail)),
+                None => truncate(&label, width),
+            };
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(rule, DIM)));
+        }
         Cell::Note(text) => {
             lines.push(Line::from(Span::styled(
                 truncate(&format!("[{text}]"), width),
@@ -1638,6 +1650,22 @@ mod tests {
         assert_eq!(wrap("a👩🏽‍💻b", 2), vec!["a", "👩🏽‍💻", "b"]);
         assert_eq!(wrap("ae\u{301}b", 2), vec!["ae\u{301}", "b"]);
         assert_eq!(wrap("abc", 0), vec!["a", "b", "c"]);
+    }
+
+    /// The turn closes on a dim full-width rule carrying its elapsed — the idle
+    /// counterpart to the running `Working (…)` line, and the seam between two
+    /// turns once both are in scrollback.
+    #[test]
+    fn turn_end_rule_carries_the_elapsed_and_fills_the_width() {
+        let lines = cell_lines(&Cell::TurnEnd(725), 40);
+        assert_eq!(line_text(&lines[0]), "", "a blank line sets the rule apart");
+        let rule = line_text(&lines[1]);
+        assert!(rule.starts_with("── Worked for 12m05s ─"), "{rule}");
+        assert_eq!(display_width(&rule), 40);
+        assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::DIM));
+        // A terminal too narrow for the label truncates instead of overflowing.
+        let narrow = cell_lines(&Cell::TurnEnd(5), 8);
+        assert!(display_width(&line_text(&narrow[1])) <= 8);
     }
 
     #[test]
