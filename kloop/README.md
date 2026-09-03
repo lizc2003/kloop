@@ -59,9 +59,11 @@ validate five architectural bets before committing to a larger agent design.
    arguments are reconciled by JSON value (the proxy may stream compact deltas
    but echo a pretty-printed `.done`), while text and reasoning stay byte-exact;
    genuinely divergent or non-JSON arguments still fail closed. Responses
-   requests also carry `prompt_cache_key` — the session id, shared by sampling,
-   compaction, and sub-agents — so the growing prefix keeps landing on a backend
-   that already holds it; an unbound session (`--mock`, tests) sends no field.
+   requests also carry `prompt_cache_key` — the session id, shared by this
+   session's sampling and compaction — so the growing prefix keeps landing on a
+   backend that already holds it; a sub-agent sends its own `{parent}-{agent-N}`
+   instead, its prefix having nothing in common with the parent's. An unbound
+   session (`--mock`, tests) sends no field.
    The Anthropic rail carries the same id as the `x-claude-code-session-id`
    header instead: that API has no such body field (its cache is prefix-keyed
    and workspace-scoped, needing no affinity hint), so the id is there for the
