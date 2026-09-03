@@ -838,23 +838,6 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
                 "required": ["pattern"]
             }),
         },
-        ToolDef {
-            name: "read_offloaded".into(),
-            // The two behaviours have to be stated together because this text is
-            // also what run_program's generated TypeScript API shows: a program
-            // reading "returns one window" would either loop pointlessly or go
-            // looking for another tool, when in fact it is the one caller that
-            // gets the artifact whole.
-            description: "Fetch an offloaded tool result by its id (e.g. off-0001). Inside run_program it returns the whole thing (a program's value is a JS variable, not context), so extract there and return only the answer. Called directly it returns one window; if more remains the reply ends with the char_offset to pass on the next call. Takes an id, not a path — read_file is for workspace files and pages by line, which cannot slice a one-line document.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Offload id from a truncation pointer, e.g. off-0001"},
-                    "char_offset": {"type": "integer", "description": "Character offset to resume from (not a line number); omit for the start. The previous reply names the value to use."}
-                },
-                "required": ["id"]
-            }),
-        },
     ];
     defs.retain(|definition| match definition.name.as_str() {
         "bash" | "bash_output" | "stop_bash" => shell_programs.bash_available(),
@@ -878,7 +861,7 @@ fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     if depth == 0 {
         defs.push(ToolDef {
             name: "run_agent".into(),
-            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is offloaded for read_offloaded). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
+            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Use Agent when the outcome is clear but the investigation path is not; use run_program for fixed code-controlled loops/tool batches, and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -954,7 +937,7 @@ pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
 /// dispatch.
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
     match name {
-        "read_file" | "read_offloaded" | "grep" | "glob" => true,
+        "read_file" | "grep" | "glob" => true,
         // These inspect or signal resources already created by a gated call.
         "bash_output" | "stop_bash" => true,
         // tool_search grows the capability store. Keep it as an ordering barrier
@@ -1529,7 +1512,6 @@ fn execute_tool<'a>(
                 )
                 .await
             }
-            "read_offloaded" => fs::read_offloaded_tool(input, ctx).await,
             "task_create" => task::task_create_tool(input, ctx),
             "task_get" => task::task_get_tool(input, ctx),
             "task_update" => task::task_update_tool(input, ctx),
@@ -2428,7 +2410,6 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "read_offloaded",
                 "task_create",
                 "task_get",
                 "task_update",
@@ -2989,7 +2970,7 @@ mod tests {
 
     /// A sub-agent with a tool allowlist has calls to tools outside it
     /// rejected at dispatch (defense in depth — the defs are already
-    /// filtered), while read_offloaded stays available regardless.
+    /// filtered), while coordination tools stay available regardless.
     #[tokio::test]
     async fn tool_allowlist_rejects_tools_outside_the_set() {
         let base = test_ctx(1, "allowlist");
@@ -3008,8 +2989,8 @@ mod tests {
         let (out, _) = run_tool("grep", json!({"pattern": "x"}), &ctx).await;
         assert!(!out.contains("not available to this agent type"), "{out}");
 
-        // read_offloaded is the infra exception: never blocked by the list.
-        let (out, _) = run_tool("read_offloaded", json!({"id": "off-9999"}), &ctx).await;
+        // Coordination is the infra exception: never blocked by the list.
+        let (out, _) = run_tool("list_agents", json!({}), &ctx).await;
         assert!(!out.contains("not available to this agent type"), "{out}");
     }
 
@@ -3395,10 +3376,6 @@ mod tests {
             super::is_concurrency_safe(name, input, &[])
         }
         assert!(is_concurrency_safe("read_file", &json!({"path": "x"})));
-        assert!(is_concurrency_safe(
-            "read_offloaded",
-            &json!({"id": "off-0001"})
-        ));
         assert!(is_concurrency_safe("grep", &json!({"pattern": "x"})));
         assert!(is_concurrency_safe("glob", &json!({"pattern": "*.rs"})));
         assert!(is_concurrency_safe(

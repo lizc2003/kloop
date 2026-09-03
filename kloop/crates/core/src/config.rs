@@ -346,7 +346,7 @@ pub struct Config {
     pub agent_types: Arc<Vec<crate::agent_type::AgentType>>,
     /// Exact tool-name allowlist for THIS agent; None = the full tool set.
     /// Set only on a sub-agent whose agent_type restricts its tools; the
-    /// main agent is always None. `read_offloaded` stays available either way.
+    /// main agent is always None.
     pub tool_allowlist: Option<Arc<std::collections::HashSet<String>>>,
     /// Above this many tools (depth-0 view: built-ins + merged sources) the
     /// source tools are deferred: excluded from the request's tool defs and

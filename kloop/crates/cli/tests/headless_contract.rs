@@ -52,7 +52,7 @@ fn mock_headless_text_keeps_answer_on_stdout() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(
         stdout,
-        "Demo complete: root-owned tasks, parallel batch, offload + read-back, and a result-only sub-agent all worked.\n"
+        "Demo complete: root-owned tasks, parallel batch, offload + query-in-place, and a result-only sub-agent all worked.\n"
     );
     assert!(!stderr.contains("Demo complete:"));
     assert!(!stdout.contains("item/"));

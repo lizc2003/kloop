@@ -21,7 +21,7 @@ pub struct AgentType {
     /// None inherits the parent's model — the point of a cheap search agent.
     pub model: Option<String>,
     /// Exact tool-name allowlist for the sub-agent; None inherits the
-    /// parent's full set. `read_offloaded` stays available regardless (see
+    /// parent's full set. Coordination tools stay available regardless (see
     /// [`tool_available`]).
     pub tools: Option<Vec<String>>,
 }
@@ -47,10 +47,17 @@ impl AgentType {
 }
 
 /// Whether a tool is usable under an agent type's allowlist. Infrastructure
-/// needed for any real Agent to consume bounded output and coordinate with the
-/// local live roster stays available regardless of a task-specific allowlist.
+/// needed for any real Agent to coordinate with the local live roster stays
+/// available regardless of a task-specific allowlist.
+///
+/// Reading back an oversized tool result is deliberately *not* on this list any
+/// more. It used to be, because `read_offloaded` was a hatch that did nothing
+/// else; now the spilled output is an ordinary file named by an ordinary path,
+/// so opening it is `read_file`/`grep`/`bash` — real capabilities an allowlist
+/// may mean to withhold. An agent type that will produce large results should
+/// list one of them.
 pub fn tool_available(allowlist: Option<&HashSet<String>>, tool: &str) -> bool {
-    matches!(tool, "read_offloaded" | "send_message" | "list_agents")
+    matches!(tool, "send_message" | "list_agents")
         || allowlist.is_none_or(|allow| allow.contains(tool))
 }
 
@@ -120,14 +127,18 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_gates_tools_but_never_read_offloaded() {
+    fn allowlist_gates_tools_but_never_coordination() {
         let allow: HashSet<String> = ["grep".to_string(), "read_file".to_string()]
             .into_iter()
             .collect();
         assert!(tool_available(Some(&allow), "grep"));
         assert!(!tool_available(Some(&allow), "bash"));
-        // Infrastructure exception: always available.
-        assert!(tool_available(Some(&allow), "read_offloaded"));
+        // Reading back a spilled result is no longer an infrastructure
+        // exception: it is an ordinary file now, so an allowlist that withholds
+        // file access withholds it too.
+        let no_files: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        assert!(!tool_available(Some(&no_files), "read_file"));
+        // Coordination stays the exception: always available.
         assert!(tool_available(Some(&allow), "send_message"));
         assert!(tool_available(Some(&allow), "list_agents"));
         // No allowlist = everything.

@@ -2523,7 +2523,8 @@ mod tests {
                 panic!("expected tool result");
             };
             let content = content.as_text();
-            let start = content.find("id=off-").expect("pointer has id") + 3;
+            // The id lives only in the path the pointer names now.
+            let start = content.find("off-").expect("pointer names the file");
             content[start..start + 8].to_string()
         };
         let main_id = spill_from(&path);

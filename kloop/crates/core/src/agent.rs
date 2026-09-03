@@ -346,7 +346,7 @@ async fn turn_rounds(
                 tools.push(crate::tools::skill_tool_def());
             }
             // A custom agent type may restrict this sub-agent's tools; the main agent
-            // (None) keeps them all. read_offloaded is never filtered out.
+            // (None) keeps them all.
             if cfg.tool_allowlist.is_some() {
                 let allow = cfg.tool_allowlist.as_deref();
                 tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));

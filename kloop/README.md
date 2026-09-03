@@ -7,32 +7,34 @@ validate five architectural bets before committing to a larger agent design.
 
 1. **Append-only history + offload at record time.** History is only ever
    appended. A tool result over `OFFLOAD_CAP_CHARS` (32000) is spilled to the
-   session store when recorded; the history keeps a head/tail preview plus a
-   pointer, and `read_offloaded` fetches the output on demand — in windows of
-   `OFFLOAD_WINDOW_CHARS` (24000), each reply naming the `char_offset` to resume
-   from. The window is what makes the hatch terminate: a reply at or over the
-   cap would be offloaded on its own way into history, handing the model back a
-   byte-identical preview under a fresh id.
+   session store when recorded; the history keeps a head/tail preview plus the
+   spilled file's **absolute path** and character count.
 
-   The pointer names the id, the character count **and the file's absolute
-   path**, and `read_offloaded` stops naming the next offset once more than
-   `MAX_INVITED_WINDOWS` (4) windows remain. Windowing a large artifact is the
-   wrong shape — a 2 MB schema is 88 round trips, and a live run walked exactly
-   that treadmill until it ran out of rounds — so past a few windows both the
-   pointer and the continuation line lead with the one call that works at that
-   size, spelled out to be copied: `run_program` with
-   `tools.read_offloaded({id})`.
+   **There is no reader tool.** The artifact is an ordinary file, so the ordinary
+   tools open it — which is cc's shape: it hands back an `outputFile` path and
+   the model reads it with `Read`/`Bash`, and its own `Read` has no raw mode
+   either. The pointer's advice is to query the file **in place** rather than
+   read it back: `python3 -c` printing three fields never pulls the document
+   into the conversation, and inside `run_program` even that extraction costs no
+   context, because a program's return value is a JS variable.
 
-   **The window is a context bound, not a data bound.** It exists because the
-   reply lands in history, where an oversized one is offloaded again. A program's
-   return value is a JS variable, so `read_offloaded` called with
-   `ToolCtx::from_program` returns the artifact **whole** — windowing there would
-   only make the program loop. Same shape as `from_program` passing the deferred
-   `locked()` gate: that is a discovery gate, this is a context gate, and neither
-   is a security gate (permissions, hooks and sandbox are untouched). `grep` /
-   `read_file` remain the fallback for line-structured output only — they cannot
-   slice a one-line 2 MB document, and `read_file` caps at `READ_CONTENT_CHARS`
-   (30000) inside a program too.
+   Two gates had to open for that path, and **the permission gate is the one
+   that binds** — it runs before the sandbox and is immune to
+   `--permission-mode bypass`. Both now carry the same narrow exemption, keyed on
+   the file name (`off-NNNN.txt`, `bg-N.out`) rather than the directory: those are
+   the model's own output, which it was handed a preview of and this exact path,
+   so re-reading one discloses nothing a tool would not have returned anyway.
+   `config.toml` (the provider credential) and `sessions/` (every project's
+   transcript) stay sensitive, writes stay denied, and a `..` forfeits the
+   exemption — as it does for `.kloop/worktrees/`, the other structural
+   exemption this one is modelled on. The string layer masks **per token**, so
+   exempting one path never unmasks a `.kloop` mention sitting beside it in the
+   same command.
+
+   Whatever reads a spilled result must stay strictly under `OFFLOAD_CAP_CHARS`,
+   or the reply spills again and hands back a byte-identical preview under a
+   fresh path. `read_file`'s `READ_CONTENT_CHARS` (30000) is the budget that
+   respects it today.
 
    This is also why `web_fetch` has no text cap: bounding what the model sees is
    this seam's job, and a cap in the fetcher deletes the rest of the artifact
@@ -195,10 +197,16 @@ Consequences worth knowing:
 
 - the partition directory is shared with the permission store, which refuses to
   open one that group or other can reach, so every level is created `0700`;
-- `~/.kloop` is denied read and write inside the sandbox, so a sandboxed `bash`
-  cannot read transcripts or offload files. In-process readers are unaffected
-  (`read_offloaded`, `read_file`, `bash_output`), and a background shell's
-  output file is opened by the parent and inherited as a descriptor;
+- `~/.kloop` is denied read and write inside the sandbox — it holds the provider
+  credential and every project's transcript — **except** for spilled tool output
+  (`offload/off-NNNN.txt`, `offload/bg-N.out`), which is carved back out as
+  readable. The permission gate carries the matching exemption (see bet 1); the
+  sandbox alone would not have been enough, because the permission gate refuses
+  first. The carve-out is read-only: writes stay denied with the rest of the
+  store, and the deny/allow pair is emitted in that order because seatbelt takes
+  the last matching rule. In-process readers are unaffected (`read_file`,
+  `bash_output`), and a background shell's output file is opened by the parent
+  and inherited as a descriptor;
 - `--resume`/`--fork` stay inside the current project. An id that belongs to
   another one is refused by name (`session 'X' belongs to /path; run kloop
   there`) rather than adopted into the wrong repository. `thread/resume` does
@@ -1575,7 +1583,7 @@ network-free, reqwest lives only in provider and web):
   spills it and gives the model a preview plus a queryable path. The description
   steers a *first* fetch of a large target into `run_program`, where the body
   lives in a JS variable and never enters the context at all; a body already
-  offloaded is reused with `tools.read_offloaded` rather than fetched again. That
+  saved to a file is queried in place rather than fetched again. That
   split matters — while both hints stood unscoped, a live run re-downloaded the
   same 2.1 MB on every retry.
 - **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
@@ -1658,7 +1666,7 @@ Each field overrides the sub-agent's Config (cc's `.claude/agents`
 semantics): `system` **replaces** the system prompt (not concatenated),
 `model` swaps the model (the point of a cheap searcher), and `tools` is an
 exact allowlist — the sub-agent's tool defs are filtered to it and a call to
-anything outside is rejected at dispatch (`read_offloaded`, `send_message`, and
+anything outside is rejected at dispatch (`send_message`, and
 `list_agents` always stay available as runtime infrastructure, so a restricted
 agent can read back a truncated result and coordinate with live peers).
 Only `description` is required; it is shown to the model in the run_agent tool's
@@ -2137,7 +2145,7 @@ different identities: transient
 ID accepted by `resume_from_run_id`. The result is delivered to the parent as a
 later message, so a long fan-out/migration does not hold up the turn. Oversized
 successful results use the same offload store as tool results: history receives
-a bounded head/tail preview plus a `read_offloaded` pointer, not an unbounded
+a bounded head/tail preview plus the spilled file's path, not an unbounded
 user message. Background Program shares `BackgroundExecutions`, inbox activity,
 `wait_for_activity`, and idle autodelivery with background Agent and Workflow.
 Both Program Running and its unique terminal `BackgroundTaskUpdated` carry the
@@ -2315,7 +2323,7 @@ parent's `Config.inbox` — the same step-boundary queue as steering — as a fr
 (the drain side was already built for steering; this is the queue's second
 consumer). A short success passes through verbatim; an oversized success is
 stored in the session offload directory and reinjected as a bounded head/tail
-preview plus a `read_offloaded` pointer. Program success uses the same drain-time
+preview plus the spilled file's path. Program success uses the same drain-time
 rule. A failure is already truncated (~900 tokens, codex's cap) with
 re-dispatch guidance; an **interrupted sub-agent reinjects nothing** (codex's
 `is_final` — its partial output is noise, and cc diverges here by delivering a
@@ -2924,7 +2932,7 @@ Every session is saved and resumable — see Session persistence above.
   compaction, truncation continuation, retry/fallback, max-rounds,
   pre-cancelled abort, sub-agent round-trip, denied-tool-continues-turn;
   custom agent types (type lookup + unknown-type error listing, tool
-  allowlist gating with the read_offloaded exception, agent_type routing the
+  allowlist gating with the coordination exception, agent_type routing the
   sub-agent's system/model/filtered tools through the recorded request,
   dispatch rejecting a tool outside the allowlist, `[agents.<name>]` parsing
   with malformed-field rejection); shell analysis contracts (word-only
@@ -3127,7 +3135,7 @@ crates/core/        kloop-core — the agent, network-free
     bash.rs         foreground + background Bash execution, the
                     BackgroundShells registry, bash_output/stop_bash
     powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
-    fs.rs           read/write/edit file, read_offloaded
+    fs.rs           read/write/edit file
     web.rs          web_fetch/web_search agent contracts: names, descriptions,
                     input schemas (network execution stays in kloop-web)
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware

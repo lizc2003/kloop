@@ -1259,7 +1259,7 @@ impl CallFacts {
 
     fn is_readonly(&self, name: &str) -> bool {
         match name {
-            "read_file" | "read_offloaded" | "grep" | "glob" => true,
+            "read_file" | "grep" | "glob" => true,
             // bash_output reads registry state; stop_bash only signals
             // processes the agent itself started via bash — neither can
             // touch anything the original bash call wasn't already gated on.
@@ -1340,9 +1340,74 @@ fn worktree_mention_is_structural(command: &str) -> bool {
     !command.contains("..")
 }
 
+/// The second structural exemption to `.kloop` being sensitive: a spilled tool
+/// result (`…/offload/off-0001.txt`) or a background shell's output
+/// (`…/offload/bg-3.out`). These are the model's *own* output — it was handed a
+/// head/tail preview and this exact path — so re-reading one discloses nothing a
+/// tool would not have returned anyway, while refusing turns every oversized
+/// result into a dead end. Nothing else in the store qualifies: the provider
+/// credential is in `config.toml` and every project's transcript in `sessions/`,
+/// and both stay sensitive.
+fn is_spill_file_name(name: &str) -> bool {
+    let numbered = |rest: &str, ext: &str| {
+        rest.strip_suffix(ext)
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    name.strip_prefix("off-")
+        .is_some_and(|rest| numbered(rest, ".txt"))
+        || name
+            .strip_prefix("bg-")
+            .is_some_and(|rest| numbered(rest, ".out"))
+}
+
+/// Whether one shell token is exactly such a spill path. Token-wise rather than
+/// a substring scan of the whole command, so masking one path never unmasks a
+/// different `.kloop` mention sitting beside it. A `..` forfeits the exemption,
+/// as it does for worktrees.
+fn is_spill_path_token(token: &str) -> bool {
+    if token.contains("..") {
+        return false;
+    }
+    let Some((parent, name)) = token.rsplit_once('/') else {
+        return false;
+    };
+    parent.ends_with("/offload") && is_spill_file_name(name)
+}
+
+/// Neutralize the `.kloop` inside spill tokens only, leaving every other token
+/// for the needle scan. Separators are preserved so the rebuilt string keeps the
+/// original shape.
+fn mask_spill_tokens(command: &str) -> String {
+    const SEPARATORS: &[char] = &[
+        ' ', '\t', '\n', '\r', '\'', '"', '`', '(', ')', ';', '|', '<', '>', '=', ',', '&', '{',
+        '}',
+    ];
+    let mut out = String::with_capacity(command.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if is_spill_path_token(token) {
+            out.push_str(&token.replace("/.kloop/", "/kloop/"));
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for ch in command.chars() {
+        if SEPARATORS.contains(&ch) {
+            flush(&mut token, &mut out);
+            out.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
 fn raw_mentions_sensitive_path(command: &str) -> bool {
     let folded = fs_fold(command);
-    let command = folded.as_ref();
+    let masked = mask_spill_tokens(folded.as_ref());
+    let command = masked.as_str();
     if command.contains("/.kloop/worktrees/") && worktree_mention_is_structural(command) {
         // Re-test with the managed worktree prefix neutralized, so the rest of
         // the command is still screened for real state paths.
@@ -1550,6 +1615,22 @@ fn fs_fold(name: &str) -> std::borrow::Cow<'_, str> {
 /// (hooks run code), kloop's own state, key material, shell/git rc files
 /// (cc's `checkPathSafetyForAutoEdit` list, trimmed to this project's
 /// blast radius).
+/// Whether a normalized path ends in `offload/<spill file>` — the structural
+/// form of [`is_spill_file_name`], for callers that already have components.
+fn path_tail_is_spill(normalized: &Path) -> bool {
+    let Some(name) = normalized.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !is_spill_file_name(fs_fold(name).as_ref()) {
+        return false;
+    }
+    normalized
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|parent| parent.to_str())
+        .is_some_and(|parent| fs_fold(parent) == "offload")
+}
+
 fn path_is_sensitive(normalized: &Path) -> bool {
     const SENSITIVE_DIRS: &[&str] = &[".git", ".kloop", ".ssh", ".gnupg", ".aws"];
     const SENSITIVE_FILES: &[&str] = &[
@@ -1589,6 +1670,14 @@ fn path_is_sensitive(normalized: &Path) -> bool {
                     if fs_fold(&next.to_string_lossy()) == WORKTREE_SEGMENT)
             })
         {
+            continue;
+        }
+        // The spill exemption reads the *tail* rather than the next segment,
+        // because the store partitions by project between the two
+        // (`.kloop/projects/v1/<id>/offload/off-0001.txt`). Skipping `.kloop`
+        // rather than returning keeps the scan running, so a `.ssh` or a nested
+        // `.kloop` elsewhere in the path still trips.
+        if name == ".kloop" && !traversal && path_tail_is_spill(normalized) {
             continue;
         }
         if SENSITIVE_DIRS.contains(&name) && !is_last {
@@ -1950,7 +2039,6 @@ mod tests {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "read_file", json!({"path": "x"})).await);
-        assert!(ok(&p, "read_offloaded", json!({"id": "off-1"})).await);
         assert!(ok(&p, "grep", json!({"pattern": "fn main"})).await);
         assert!(ok(&p, "glob", json!({"pattern": "**/*.rs"})).await);
         assert!(ok(&p, "bash_output", json!({"bash_id": "bg-1"})).await);
@@ -2214,6 +2302,64 @@ mod tests {
             assert!(!ok(&p, "write_file", file(path)).await, "{path}");
         }
         assert_eq!(approver.ask_count(), 4);
+    }
+
+    /// The spill exemption is the model reading back its own oversized output.
+    /// It must not become a way into the store: the credential, the transcripts,
+    /// a non-spill file under `offload/`, a `..` spelling, and a second `.kloop`
+    /// mention riding along in the same command all stay blocked.
+    #[tokio::test]
+    async fn spilled_output_is_readable_but_the_exemption_does_not_widen() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 16]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        let store = "/home/u/.kloop/projects/v1/p1_abc";
+
+        for command in [
+            format!("wc -c {store}/offload/off-0001.txt"),
+            format!("python3 -c 'print(1)' < {store}/offload/off-0042.txt"),
+            format!("cat {store}/offload/bg-3.out"),
+        ] {
+            assert!(
+                ok(&p, "bash", json!({"command": command})).await,
+                "spilled output must be readable: {command}"
+            );
+        }
+        assert!(
+            ok(
+                &p,
+                "read_file",
+                json!({"path": format!("{store}/offload/off-0001.txt")})
+            )
+            .await
+        );
+
+        for command in [
+            // The credential and the transcripts are what the deny is for.
+            "cat /home/u/.kloop/config.toml".to_string(),
+            format!("cat {store}/sessions/20260101-000000.jsonl"),
+            // Not a spill file, merely sitting next to one.
+            format!("cat {store}/offload/notes.txt"),
+            format!("cat {store}/offload/off-0001.txt.bak"),
+            // Traversal forfeits the exemption, as it does for worktrees.
+            format!("cat {store}/offload/../../../config.toml"),
+            format!("cat {store}/offload/off-0001.txt/../../config.toml"),
+            // Masking one token must not unmask another in the same command.
+            format!("cat {store}/offload/off-0001.txt /home/u/.kloop/config.toml"),
+            format!("cat {store}/offload/off-0001.txt; cat ~/.kloop/config.toml"),
+        ] {
+            assert!(
+                !ok(&p, "bash", json!({"command": command})).await,
+                "must stay blocked: {command}"
+            );
+        }
+        assert!(
+            !ok(
+                &p,
+                "read_file",
+                json!({"path": format!("{store}/offload/notes.txt")})
+            )
+            .await
+        );
     }
 
     #[tokio::test]

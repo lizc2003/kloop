@@ -701,7 +701,7 @@ pub(crate) async fn fork_skill(
             .map_err(|error| anyhow!("skill fork: {error}"))?;
     }
     // `allowed-tools` restricts the sub-agent's tool set (like an agent_type's
-    // tools) — a capability limit, not a permission grant; read_offloaded stays
+    // tools) — a capability limit, not a permission grant; coordination tools stay
     // available regardless (see `agent_type::tool_available`).
     if let Some(tools) = &skill.allowed_tools {
         sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
@@ -1832,7 +1832,7 @@ mod tests {
 
     /// agent_type overrides route to the sub-agent's request: its system
     /// prompt, model, and tool set are all the type's, and the tool set is
-    /// filtered to the allowlist (plus the always-on read_offloaded).
+    /// filtered to the allowlist (plus the always-on coordination tools).
     #[tokio::test]
     async fn agent_type_routes_system_model_and_tools() {
         use kloop_provider::MockTurn;
@@ -1872,8 +1872,8 @@ mod tests {
         let names: Vec<&str> = reqs[0].tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"grep") && names.contains(&"read_file"));
         assert!(
-            names.contains(&"read_offloaded"),
-            "infra tool kept: {names:?}"
+            names.contains(&"send_message"),
+            "coordination tool kept: {names:?}"
         );
         assert!(
             !names.contains(&"bash"),

@@ -192,8 +192,18 @@ async fn main() -> Result<ExitCode> {
                 for warning in &project.warnings {
                     notify(warning);
                 }
-                let sandbox =
-                    build_sandbox(&args, &options.cwd, &runtime, |warning| notify(warning))?;
+                // Each thread pins its own cwd, so each resolves its own
+                // project partition rather than inheriting the process one.
+                // Resolved before the sandbox because the policy carves the
+                // partition's offload directory back out of the denied store.
+                let session_dirs = factory_store.ensure(&options.cwd)?;
+                let sandbox = build_sandbox(
+                    &args,
+                    &options.cwd,
+                    &runtime,
+                    &session_dirs.offload,
+                    |warning| notify(warning),
+                )?;
                 let skills = Arc::new(if args.mock {
                     Vec::new()
                 } else {
@@ -203,9 +213,6 @@ async fn main() -> Result<ExitCode> {
                     }
                     skills
                 });
-                // Each thread pins its own cwd, so each resolves its own
-                // project partition rather than inheriting the process one.
-                let session_dirs = factory_store.ensure(&options.cwd)?;
                 let mut cfg = config_from_settings(
                     &args,
                     &provider,
@@ -270,7 +277,12 @@ async fn main() -> Result<ExitCode> {
     for warning in &project.warnings {
         eprintln!("\x1b[2m[{warning}]\x1b[0m");
     }
-    let sandbox = build_sandbox(&args, &cwd, &runtime, |warning| {
+    // Ahead of the sandbox: the policy carves this project's offload directory
+    // back out of the otherwise denied private state root.
+    let session_dirs = session_store
+        .ensure(&cwd)
+        .context("cannot create the session directory")?;
+    let sandbox = build_sandbox(&args, &cwd, &runtime, &session_dirs.offload, |warning| {
         eprintln!("\x1b[2m[{warning}]\x1b[0m")
     })?;
     let skills = Arc::new(if args.mock {
@@ -282,9 +294,6 @@ async fn main() -> Result<ExitCode> {
         }
         skills
     });
-    let session_dirs = session_store
-        .ensure(&cwd)
-        .context("cannot create the session directory")?;
     let (history, session_id) = open_history(
         &session_store,
         &session_dirs,

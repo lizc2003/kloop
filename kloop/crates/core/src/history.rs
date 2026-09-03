@@ -27,15 +27,16 @@ const HEAD_CHARS: usize = 1500;
 const TAIL_CHARS: usize = 500;
 
 /// Char count above which a text tool result spills to disk instead of entering
-/// the history. Public because `read_offloaded` has to stay strictly under it:
-/// its whole job is to escape the spill, so a reply that spills again hands the
-/// model a byte-identical preview under a fresh id — the escape hatch failing at
-/// the only size that ever needs it (see `tools::fs::OFFLOAD_WINDOW_CHARS`).
+/// the history. Public because whatever reads a spilled result back must stay
+/// strictly under it: a reply that spills again would hand the model a
+/// byte-identical preview under a fresh path, the escape failing at exactly the
+/// size that needs it. `read_file`'s budget (`READ_CONTENT_CHARS`) is the one
+/// that has to respect this today.
 pub const OFFLOAD_CAP_CHARS: usize = 32_000;
 
 /// Append-only conversation history. Oversized tool results are offloaded to
-/// disk at record time; the history keeps a preview plus a pointer the model
-/// can dereference with the `read_offloaded` tool.
+/// disk at record time; the history keeps a preview plus the file's path, which
+/// the model queries in place (cc's shape) rather than reading back.
 pub struct History {
     items: Vec<Message>,
     offload_dir: PathBuf,
@@ -291,7 +292,7 @@ impl History {
     /// Bound machine-produced text before injecting it as a non-tool user
     /// message (for example a detached Agent/Program result). Ordinary user text
     /// does not use this helper. Oversized content lands in the same offload store
-    /// as tool results and returns a preview plus `read_offloaded` pointer.
+    /// as tool results and returns a preview plus the file's path.
     pub(crate) fn offload_text(&mut self, content: String) -> String {
         if content.chars().count() > self.cap {
             self.spill(&content)
@@ -409,30 +410,20 @@ impl History {
         let path = self.offload_dir.join(format!("{id}.txt"));
         let write =
             std::fs::create_dir_all(&self.offload_dir).and_then(|_| std::fs::write(&path, content));
-        // The path is named, not just the id: `read_offloaded` walks a large
-        // artifact one window at a time, which is the wrong shape for a 2 MB
-        // schema — grep/read_file/run_program answer a question about the file
-        // and let only the answer into the context. Those readers are in-process,
-        // so they reach the session store; sandboxed bash cannot (plan 105), which
-        // is why it is not offered here.
+        // cc's shape: hand over a path and let the general tools work on it, rather
+        // than mint an opaque id for a reader that exists only to dereference it.
+        // The advice is to extract *in place* — cc reads a 2 MB spec with
+        // `python3 -c` printing three fields, never by pulling the file into the
+        // conversation — and inside a program even that extraction costs no
+        // context. Sandboxed bash can read this directory (the private state root
+        // is denied for its credential, with the offload store carved back out)
+        // but still cannot write it.
         let pointer = match write {
-            // Two things this wording had to learn from live runs. Spelling the
-            // argument out (`path="…"`) rather than saying "that file": the
-            // friendlier phrasing was read as an invitation to
-            // `grep {glob: "off-NNNN.txt"}`, which searches the workspace, finds
-            // nothing, and sends the model off to re-download what it is already
-            // holding. And naming the shape caveat: `grep`/`read_file` are
-            // line-oriented, so on the artifact that motivated all of this — a
-            // 2.1 MB single-line OpenAPI document — they cannot slice anything,
-            // and pointing at them without saying so just relocates the dead end.
             Ok(()) => format!(
-                "[full output offloaded: id={id}, {chars} chars, saved to {path}. \
-                 Best move for anything this size: run_program with \
-                 `const t = await tools.read_offloaded({{id:\"{id}\"}});` — inside a \
-                 program it comes back whole and costs no context, so extract there \
-                 and return only the answer. read_offloaded outside a program pages \
-                 in windows; grep or read_file with path=\"{path}\" work only if the \
-                 output is line-structured (they cannot slice a one-line document)]",
+                "[full output saved to {path} ({chars} chars). Query it in place instead of \
+                 reading it back — a program is cheapest, since its value is a JS variable and \
+                 never enters the context: run_program with `await tools.bash({{command: \
+                 \"python3 -c '...'\"}})` over that path, returning only what you extract]",
                 chars = content.chars().count(),
                 path = path.display(),
             ),
@@ -643,6 +634,13 @@ mod tests {
         }])
     }
 
+    /// The spilled file's stem, read back out of the path the pointer names —
+    /// the only place it appears now that the id is not a model-facing handle.
+    fn pointer_id(pointer: &str) -> String {
+        let start = pointer.find("off-").expect("pointer names the file");
+        pointer[start..start + 8].to_string()
+    }
+
     #[test]
     fn oversized_tool_result_is_offloaded_with_pointer() {
         let dir = temp_dir("spill");
@@ -656,19 +654,17 @@ mod tests {
         let content = content.as_text();
         assert!(content.chars().count() < OFFLOAD_CAP_CHARS);
         assert!(content.contains("…[truncated]…"));
-        assert!(content.contains("read_offloaded"));
-        let id_start = content.find("id=off-").expect("pointer has id") + 3;
-        let id = &content[id_start..id_start + 8];
+        assert!(content.contains("saved to"));
+        let id = pointer_id(&content);
         let on_disk = std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap();
         assert_eq!(on_disk, big);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The pointer names the file, not just the id: paging a large artifact
-    /// through `read_offloaded` windows is the wrong shape, and without a path
-    /// the model cannot grep it instead.
+    /// cc's shape: the pointer names a path and the size, and points at querying
+    /// the file in place. No id, and no reader tool to dereference one.
     #[test]
-    fn the_offload_pointer_names_size_and_a_queryable_path() {
+    fn the_offload_pointer_names_a_path_and_says_to_query_it_in_place() {
         let dir = temp_dir("spill-path");
         let mut h = History::new(dir.clone());
         let big = "x".repeat(OFFLOAD_CAP_CHARS + 1_000);
@@ -678,25 +674,17 @@ mod tests {
             panic!("expected tool result");
         };
         let content = content.as_text();
-        let id_start = content.find("id=off-").expect("pointer has id") + 3;
-        let id = &content[id_start..id_start + 8];
-        let path = dir.join(format!("{id}.txt"));
+        let path = dir.join(format!("{}.txt", pointer_id(&content)));
         assert!(
-            content.contains(&format!("{} chars", big.chars().count())),
+            content.contains(&format!("({} chars)", big.chars().count())),
             "{content}"
         );
         assert!(content.contains(&path.display().to_string()), "{content}");
-        assert!(
-            content.contains(&format!(
-                "run_program with `const t = await tools.read_offloaded({{id:\"{id}\"}});`"
-            )),
-            "{content}"
-        );
-        assert!(content.contains("grep or read_file"), "{content}");
-        assert!(
-            content.contains(&format!("path=\"{}\"", path.display())),
-            "{content}"
-        );
+        assert!(content.contains("run_program"), "{content}");
+        assert!(content.contains("Query it in place"), "{content}");
+        // The retired vocabulary must not come back: no id, no reader tool.
+        assert!(!content.contains("read_offloaded"), "{content}");
+        assert!(!content.contains("id=off-"), "{content}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -710,11 +698,9 @@ mod tests {
         let big = "result".repeat(OFFLOAD_CAP_CHARS / 6 + 200);
         let preview = history.offload_text(big.clone());
         assert!(preview.contains("…[truncated]…"), "{preview}");
-        assert!(preview.contains("read_offloaded"), "{preview}");
-        let id_start = preview.find("id=off-").expect("pointer has id") + 3;
-        let id = &preview[id_start..id_start + 8];
+        assert!(preview.contains("saved to"), "{preview}");
         assert_eq!(
-            std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap(),
+            std::fs::read_to_string(dir.join(format!("{}.txt", pointer_id(&preview)))).unwrap(),
             big
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -777,8 +763,7 @@ mod tests {
                 panic!("expected tool result");
             };
             let content = content.as_text();
-            let start = content.find("id=off-").expect("pointer has id") + 3;
-            content[start..start + 8].to_string()
+            pointer_id(&content)
         };
         assert_ne!(id_of(&a), id_of(&b));
         let _ = std::fs::remove_dir_all(dir);
@@ -806,7 +791,7 @@ mod tests {
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[1] else {
             panic!()
         };
-        assert!(content.as_text().contains("read_offloaded"));
+        assert!(content.as_text().contains("saved to"));
     }
 
     #[test]

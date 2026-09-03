@@ -758,6 +758,7 @@ pub(crate) fn build_sandbox(
     args: &CliArgs,
     cwd: &Path,
     runtime: &RuntimeSettings,
+    offload_dir: &Path,
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
     // --mock stays hermetic; the env escape hatch was captured at startup.
@@ -778,7 +779,13 @@ pub(crate) fn build_sandbox(
                 settings.allow_network,
             )
             .with_denied_read_path(&private_state_root)
-            .with_denied_write_path(&private_state_root);
+            .with_denied_write_path(&private_state_root)
+            // The store as a whole stays denied — config.toml holds the provider
+            // credential and sessions/ holds every project's transcript. Only the
+            // offload directory is read-back: it is the model's own oversized tool
+            // output, which it was handed a preview of and a path to. Writes there
+            // remain denied.
+            .with_allowed_read_path(offload_dir);
             policy.auto_allow = settings.auto_allow;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
@@ -1058,8 +1065,8 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             ),
         ],
         vec![
-            text("Reading the offloaded output back…\n"),
-            tool_use("t4", "read_offloaded", json!({"id": "off-0001"})),
+            text("Querying the saved output in place…\n"),
+            tool_use("t4", "bash", json!({"command": "wc -l"})),
         ],
         vec![
             text("Delegating to a sub-agent…\n"),
@@ -1068,7 +1075,7 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
         // consumed by the sub-agent's own run_turn
         vec![text("hi from the sub-agent")],
         vec![text(
-            "Demo complete: root-owned tasks, parallel batch, offload + read-back, and a result-only sub-agent all worked.",
+            "Demo complete: root-owned tasks, parallel batch, offload + query-in-place, and a result-only sub-agent all worked.",
         )],
     ]
 }
@@ -1298,7 +1305,8 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
         let args = crate::args::parse_args(&[]).unwrap();
 
-        let policy = build_sandbox(&args, &private_state_root, &runtime, |_| {})
+        let offload = private_state_root.join("projects/v1/p1_test/offload");
+        let policy = build_sandbox(&args, &private_state_root, &runtime, &offload, |_| {})
             .unwrap()
             .unwrap();
 
@@ -1310,6 +1318,11 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         );
         assert!(policy.denied_read_paths.contains(&private_state_root));
         assert!(policy.denied_write_paths.contains(&private_state_root));
+        // The offload store is the one read-back inside the denied tree: it holds
+        // the model's own oversized tool output, not credentials. Writes there are
+        // still denied along with the rest of the store.
+        assert!(policy.allowed_read_paths.contains(&offload));
+        assert!(!policy.denied_write_paths.contains(&offload));
         let (_, params) = kloop_core::sandbox::seatbelt_profile(&policy);
         assert!(
             params

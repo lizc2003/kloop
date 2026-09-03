@@ -77,6 +77,14 @@ pub struct SandboxPolicy {
     /// Credential-bearing files that sandboxed model shell commands may never
     /// read. The parent kloop process loads them before spawning a command.
     pub denied_read_paths: Vec<PathBuf>,
+    /// Read-back carve-outs inside a denied tree. The private state root is
+    /// denied wholesale because it holds the provider credential, but the
+    /// offload store under it is only the model's own oversized tool output —
+    /// the model was handed a preview of it and a path to the rest, so a shell
+    /// that cannot read it turns every large artifact into an escalation.
+    /// Emitted after the denies so the last matching rule wins; writes are not
+    /// carved out.
+    pub allowed_read_paths: Vec<PathBuf>,
     /// Private application state that remains read-only even when it overlaps a
     /// workspace or an explicitly configured writable root.
     pub denied_write_paths: Vec<PathBuf>,
@@ -121,6 +129,7 @@ impl SandboxPolicy {
         SandboxPolicy {
             writable_roots,
             denied_read_paths: Vec::new(),
+            allowed_read_paths: Vec::new(),
             denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,
@@ -151,6 +160,14 @@ impl SandboxPolicy {
     /// Add a file the model-facing shell must never read. Keep literal and
     /// canonical spellings: macOS aliases `/tmp` and symlinked paths otherwise
     /// leave a second name for the same credential file.
+    /// Re-allow reads under `path` even though a denied ancestor covers it.
+    /// Read-only: the write deny on that ancestor is untouched.
+    pub fn with_allowed_read_path(&self, path: &Path) -> Self {
+        let mut policy = self.clone();
+        push_path_aliases(&mut policy.allowed_read_paths, path);
+        policy
+    }
+
     pub fn with_denied_read_path(&self, path: &Path) -> Self {
         let mut policy = self.clone();
         push_path_aliases(&mut policy.denied_read_paths, path);
@@ -235,13 +252,27 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
             "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
         ));
     }
+    let mut read_allows = Vec::new();
+    for (i, path) in policy.allowed_read_paths.iter().enumerate() {
+        let key = format!("ALLOWED_READ_{i}");
+        params.push((key.clone(), path.clone()));
+        read_allows.push(format!(
+            "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
+        ));
+    }
     let file_read = if read_denies.is_empty() {
         "(allow file-read*)".to_string()
     } else {
-        format!(
+        let mut rule = format!(
             "(allow file-read*)\n(deny file-read* {})",
             read_denies.join(" ")
-        )
+        );
+        if !read_allows.is_empty() {
+            // Seatbelt takes the last matching rule, so this re-allows the
+            // carve-outs the deny above just swept up with their parent tree.
+            rule.push_str(&format!("\n(allow file-read* {})", read_allows.join(" ")));
+        }
+        rule
     };
     let mut write_denies = Vec::new();
     for (i, path) in policy.denied_write_paths.iter().enumerate() {
@@ -366,6 +397,7 @@ mod tests {
         SandboxPolicy {
             writable_roots: roots,
             denied_read_paths: Vec::new(),
+            allowed_read_paths: Vec::new(),
             denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,

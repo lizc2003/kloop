@@ -119,14 +119,14 @@ fn drain_inbox_offloads_only_large_machine_results() {
         other => panic!("expected text, got {other:?}"),
     };
     assert!(text(0).contains("[Agent agent-1]"), "{}", text(0));
-    assert!(text(0).contains("read_offloaded"), "{}", text(0));
+    assert!(text(0).contains("saved to"), "{}", text(0));
     assert!(!text(0).contains(&large_agent), "agent body stayed inline");
     assert!(
         text(1).contains("[Program program-1] run run-1"),
         "{}",
         text(1)
     );
-    assert!(text(1).contains("read_offloaded"), "{}", text(1));
+    assert!(text(1).contains("saved to"), "{}", text(1));
     assert!(
         !text(1).contains(&large_program),
         "program body stayed inline"
@@ -2687,7 +2687,7 @@ async fn fork_skill_runs_as_isolated_subagent() {
 
 /// A fork skill's `allowed-tools` restricts its sub-agent's tool set (plan
 /// 28 slice 3): the sub-agent is offered only the listed tools plus the
-/// always-on read_offloaded, mapped from cc names to kloop's.
+/// always-on coordination tools, mapped from cc names to kloop's.
 #[tokio::test]
 async fn fork_skill_allowed_tools_restricts_subagent() {
     use kloop_provider::MockTurn;
@@ -2736,7 +2736,7 @@ async fn fork_skill_allowed_tools_restricts_subagent() {
         "allowed tools offered: {names:?}"
     );
     assert!(
-        names.contains(&"read_offloaded"),
+        names.contains(&"send_message"),
         "infra tool kept: {names:?}"
     );
     assert!(!names.contains(&"bash"), "restricted out: {names:?}");

@@ -39,7 +39,7 @@ pub struct Skill {
     /// Tool allowlist for a `Fork` skill's sub-agent (plan 28 slice 3), mapped
     /// from the frontmatter `allowed-tools` to kloop's tool names. `Some`
     /// restricts the sub-agent to exactly these (plus the always-on
-    /// `read_offloaded`); None inherits the full set. Ignored for an `Inline`
+    /// `grep`); None inherits the full set. Ignored for an `Inline`
     /// skill, which runs in the caller's own context. This is a capability
     /// restriction, not a permission grant — the tools still face the gate.
     pub allowed_tools: Option<Vec<String>>,
