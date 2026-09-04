@@ -30,6 +30,7 @@ mod help;
 #[path = "loop.rs"]
 mod loop_command;
 mod provider;
+mod skills;
 
 /// What a command produced. `output` is shown to the user as-is; `cleared`
 /// tells the front-end to reset its own transcript view — only `/clear` sets
@@ -159,6 +160,10 @@ pub const BUILTINS: &[Builtin] = &[
         summary: loop_command::SUMMARY,
     },
     Builtin {
+        name: "skills",
+        summary: skills::SUMMARY,
+    },
+    Builtin {
         name: "exit",
         summary: exit::SUMMARY,
     },
@@ -199,13 +204,14 @@ pub async fn run_with_provider_state(
         None => (rest, ""),
     };
     match name {
-        "help" => help::run(),
+        "help" => help::run(cfg),
         "provider" => provider::run(args, history, cfg, provider_state),
         "effort" => effort::run(args, provider_state),
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
         "loop" => loop_command::run(args),
+        "skills" => skills::run(args, cfg),
         "exit" => exit::run(),
         // A user-invoked skill or command: expand its body (same seam the
         // model's `skill` tool uses) and hand it back as a turn to run. Searches
@@ -546,7 +552,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit)"
+                "unknown command '/frobnicate' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit)"
             )
         );
     }
@@ -584,9 +590,89 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /greet)"
             )
         );
+    }
+
+    /// `/help` names the skills too (plan 119): they are `/name`-invocable like
+    /// a built-in, and leaving them out hid the builtins from everyone — the
+    /// only listing that named them was the unknown-command error.
+    #[tokio::test]
+    async fn help_lists_skills_after_the_builtins() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let cfg = Arc::new(Config {
+            skills: Arc::new(crate::skills::builtin()),
+            ..base.test_clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        let result = run("/help", &mut history, &cfg, &CancellationToken::new()).await;
+        assert!(result.output.starts_with("commands:"));
+        let (commands, skills) = result
+            .output
+            .split_once("\n\nskills:")
+            .expect("a skills section follows the commands");
+        assert!(commands.contains("/help"), "{commands}");
+        assert!(
+            skills.contains("/code-review") && skills.contains("(builtin)"),
+            "{skills}"
+        );
+        assert!(skills.contains("/skills <name>"), "{skills}");
+    }
+
+    /// `/skills` lists what is loaded and where each entry came from; `/skills
+    /// <name>` prints that skill's body. For a builtin there is no file to
+    /// open, so this is the only way to read what you would be replacing.
+    #[tokio::test]
+    async fn skills_lists_entries_and_prints_one_body() {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut loaded = crate::skills::builtin();
+        loaded.push(crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Ship it.".into(),
+            body: "Deploy now.".into(),
+            dir: "/repo/.kloop/commands".into(),
+            source: crate::skills::SkillSource::Command,
+            ..Default::default()
+        });
+        let cfg = Arc::new(Config {
+            skills: Arc::new(loaded),
+            ..base.test_clone()
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+
+        let list = run("/skills", &mut history, &cfg, &CancellationToken::new()).await;
+        assert!(list.output.contains("/code-review"), "{}", list.output);
+        assert!(list.output.contains("builtin"), "{}", list.output);
+        assert!(
+            list.output.contains("user command · /repo/.kloop/commands"),
+            "{}",
+            list.output
+        );
+
+        let one = run(
+            "/skills code-review",
+            &mut history,
+            &cfg,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(one.output.contains("source: builtin"), "{}", one.output);
+        assert!(
+            one.output.contains("failure scenario"),
+            "the body is printed in full: {}",
+            one.output
+        );
+        assert_eq!(one.run_turn, None, "printing a skill must not start a turn");
+
+        let missing = run(
+            "/skills nope",
+            &mut history,
+            &cfg,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(missing.output.starts_with("unknown skill 'nope'"));
     }
 
     /// A user command (`SkillSource::Command`) is `/name`-invocable through the
@@ -621,7 +707,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /deploy)"
             )
         );
     }

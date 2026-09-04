@@ -172,6 +172,29 @@ not on labels」。那次 kloop 照做了，却把加粗花在了「未发现回
 **改动。** 那条后面补一句：结论是"哪里不对"时，加粗给不对的地方；"这里没问题"
 是背景，既不加粗也不占开头。
 
+## 七、上线之后才暴露的：skill 是看不见的
+
+内置 skill 落地后实测 `/nope`，可用列表里确实有 `/code-review`；但 `/help` 只列
+`BUILTINS` 常量（`commands/help.rs:9`），**不列 skills**——唯一会说出 skill 名字的
+地方是"命令敲错了"的报错。以前 skill 全靠用户自己往 `.kloop/skills/` 放，看不见还
+说得过去;现在每个用户开箱就有一个,`/help` 里没有它就是纯粹的失联。
+
+第二个缺口跟着来：内置 skill 不落盘（这是对的——见下），所以想改它的人**没有任何
+途径读到它现在写了什么**。`skills/list` 有意不返回 body（它答的是 wire 上的客户端），
+于是唯一的办法是去 kloop 源码里翻。
+
+**改动。** `/help` 在命令之后追加一段 skills（名字 + description + `(builtin)` /
+`(user command)` 标记）；新增 `/skills`：不带参数列出全部并标明来源（磁盘 skill 显示
+目录——那本身就区分了 project 和 global），带名字则原样打印那个 skill 的 body。本地
+REPL 打印 body 与 `skills/list` 不返回 body 并不矛盾：前者答的是坐在终端前的本人。
+
+**为什么不"自动安装"到 `~/.kloop/skills/`**：`merge_builtins` 的规则是磁盘同名永远
+赢。一旦把内置 body 写进用户目录，kloop 以后升级,skill 内容再也不更新——用户拿着
+僵死的旧版本还以为是最新的。cc 也不安装：bundled skill 的 `SKILL.md` 同样只在二进制
+里,只有 `files` 附加资源会落盘,而且落在
+`{tmp}/bundled-skills/{VERSION}/{每进程 nonce}/`（`filesystem.ts:365`）,带版本、每
+进程 nonce、0700/0600,每次调用 write-before-read——那是临时提取,不是安装。
+
 ## 不做的
 
 - **不做多 agent 分维度并行审查**。cc 插件那 5 个 agent 服务的是 PR 场景里三个
@@ -198,6 +221,10 @@ not on labels」。那次 kloop 照做了，却把加粗花在了「未发现回
 - `builtins_ride_the_catalog` — 内置进 catalog，`model_invocable()` 三个变体逐一断言。
 - `a_discovered_skill_replaces_the_builtin_of_the_same_name` — `merge_builtins`
   纯函数：磁盘同名替换内置且不留重名；什么都没发现时内置就是全部注册表。
+- `help_lists_skills_after_the_builtins` / `skills_lists_entries_and_prints_one_body`
+  — `/help` 的 skills 段带 `(builtin)` 标记；`/skills` 列出来源、`/skills <name>`
+  原样打印 body 且不启动 turn、未知名字报 `unknown skill`。三处既有测试的可用命令
+  期望值跟着加了 `/skills`。
 - `builtin_skills_alone_advertise_the_tool_and_catalog` — 端到端：注册表里只有
   内置（`--mock` 和无 skill 仓库拿到的就是这个）时，`skill` 工具照常上场、
   catalog 里有 `- code-review:`，而 body 仍不泄漏。
