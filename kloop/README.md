@@ -2595,12 +2595,16 @@ malformed skill (no `description`, bad frontmatter) is skipped with a startup
 warning, never an error.
 
 **Builtin skills** ship inside the binary, so a repository that has never heard
-of kloop still gets them: `code-review` (plan 119), a `fork` skill carrying the
+of kloop still gets them: `code-review` (plan 119), an inline skill carrying the
 review contract — a finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
 (confirmed / downgraded / excluded) so none disappears silently; and a review
-runs the affected package's tests, never the project's pre-merge gate. They come
-last in precedence: writing `.kloop/skills/code-review/SKILL.md` replaces the
+runs the affected package's tests, never the project's pre-merge gate. It runs
+**inline**, in the conversation that asked for it: a forked review keeps its
+evidence in the sub-agent, so the delegating agent — which must not take a
+sub-agent's report as fact — is left re-collecting it (measured: 42 minutes and
+254 sub-agent tool calls, then 67 more in the parent plus a second reviewer).
+They come last in precedence: writing `.kloop/skills/code-review/SKILL.md` replaces the
 shipped one. A builtin has no directory (so its body cannot use
 `${CLAUDE_SKILL_DIR}`), and `skills/list` reports it with `scope: "builtin"` and
 an empty `path`. `--mock` skips disk discovery but keeps the builtins — they

@@ -1,7 +1,6 @@
 ---
 name: code-review
 description: Review a commit, a diff, or working-tree changes for defects — correctness, regressions, contract drift, test gaps. Use whenever the user asks to review, audit, or check over code, including a bare "review <sha>". Not for writing code, and not for re-reading edits you just made yourself.
-context: fork
 ---
 
 # Code review

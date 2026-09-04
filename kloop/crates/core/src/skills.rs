@@ -820,16 +820,21 @@ mod tests {
         }
     }
 
-    /// The `code-review` builtin (plan 119) forks, so a review's dozens of tool
-    /// calls stay out of the delegating context, and keeps the full tool set —
-    /// a review needs bash for `git` and for the affected package's tests.
+    /// The `code-review` builtin runs **inline**, not forked. Measured on a real
+    /// review (plan 119): forked, the sub-agent spent 42 minutes and 254 tool
+    /// calls, then the delegating agent — which must not take a sub-agent's
+    /// report as fact — had no evidence to check it against, because the fork
+    /// kept it, so it re-ran 67 tool calls of its own *and* dispatched a second
+    /// reviewer. Isolation removes the noise and the evidence together. It also
+    /// keeps the full tool set: a review needs bash for `git` and for the
+    /// affected package's tests.
     #[test]
-    fn code_review_builtin_forks_with_the_full_tool_set() {
+    fn code_review_builtin_runs_inline_with_the_full_tool_set() {
         let skill = builtin()
             .into_iter()
             .find(|s| s.name == "code-review")
             .expect("code-review ships");
-        assert_eq!(skill.context, SkillContext::Fork);
+        assert_eq!(skill.context, SkillContext::Inline);
         assert_eq!(skill.allowed_tools, None);
         assert!(skill.body.contains("$ARGUMENTS"), "takes a review target");
     }

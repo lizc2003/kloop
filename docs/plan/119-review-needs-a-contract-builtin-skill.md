@@ -92,13 +92,11 @@ findings... empty array if nothing survived verification"——**不要求报告
 
 ## 二、code-review skill 的产出契约
 
-`context: fork`（隔离上下文），不设 `allowed-tools`（审查要 bash 跑 `git diff` 和
-目标包测试，隔离由 fork 提供，不靠工具白名单），不指定 `model`（继承）。
+**inline**（见下方"八、fork 被数据推翻"），不设 `allowed-tools`（审查要 bash 跑
+`git diff` 和目标包测试），不指定 `model`（继承）。
 
-**不加 background。** claude 那次是后台跑的（13.2 分钟里用户还切了一次 model），
-kloop 的 fork 是同步的。同步等待对单用户 CLI 没有本质损失，而 fork 的真正价值在
-**上下文隔离**：那次 kloop 主线程独自吞了 199 次工具调用的结果，末尾上下文 226k
-（窗口 258k），中途触发过一次压缩。
+> 本节最初写的是 `context: fork`，理由是"主线程别被 199 次工具调用的结果撑爆"。
+> 上线后的实测把这个理由推翻了，见第八节。
 
 body 写死四件事：
 
@@ -195,13 +193,46 @@ REPL 打印 body 与 `skills/list` 不返回 body 并不矛盾：前者答的是
 `{tmp}/bundled-skills/{VERSION}/{每进程 nonce}/`（`filesystem.ts:365`）,带版本、每
 进程 nonce、0700/0600,每次调用 write-before-read——那是临时提取,不是安装。
 
+## 八、fork 被数据推翻：改回 inline
+
+上线后跑了两轮真实审查（`审查：0a79ae9a，eee68cfe` 与复测 `审查：7fed2427`），
+`context: fork` 的收益被证伪。一次完整会话的账：
+
+- 子 agent ①:79 次采样、**254 次工具调用**、7.2M input、**42 分钟**,交回一份
+  5260 字的报告;
+- 主 agent 收到后 **自己又跑了 67 次工具调用**(31 bash + 17 read_file + 18 grep)、
+  18 次采样、1.85M input;
+- 然后在 21:52:30 **又委派了子 agent ②**:「审查提交 0a79ae9a 和 eee68cfe;只读,
+  重点核验确认的 P1/P2 findings」。
+
+主 agent 的 thinking 全程是 `Reviewing commit snapshots independently`——它在执行
+第四节刚加的那条"子 agent 的报告是证据不是事实,转述前先抽查"。**但 fork 把抽查
+所需的证据一起隔离掉了**:子 agent 读过的代码、grep 出的调用链都留在它自己的上下
+文里,主 agent 手上只有结论。想核验就只能重新收集——它两条路都走了(自己重做 +
+再委派一个)。
+
+**隔离掉的不只是噪声,还有复核的依据。** 这两条要求(不盲信 + 上下文隔离)在同步
+fork 下必然打架,而同步 fork 连并发都换不来:用户照样从头等到尾,还看不见过程。
+
+**改动。** frontmatter 去掉 `context: fork`,回到默认 inline。代价是主线程上下文
+会涨回 200k 量级——接受,因为:(a) 上一轮那次漏报的成因是产出契约缺失,不是压缩,
+候选是在压缩**之后**才提出又蒸发的;(b) 第五节新加的 `Open candidates` 给压缩兜了
+底;(c) Plan 118 第一节的 `read_file` 改动已经在压重读。
+
+**参考项目在这一点上并不支持 fork**:cc 的 code-review 是 fork 到**后台**,主 agent
+当场继续和用户对话(那次会话里用户还切了一次 model),而且实测中 claude 的主 agent
+**自己并行查了 44 次 Bash,6 分钟就出了报告**,子 agent 还没回来。它拿到的不是"隔离"
+而是"并发",kloop 的同步 fork 只学到了形。真要 fork,前提是先有 background skill;
+在那之前 inline 是对的。
+
 ## 不做的
 
 - **不做多 agent 分维度并行审查**。cc 插件那 5 个 agent 服务的是 PR 场景里三个
   彼此独立的信息源（git blame、历史 PR 评论、代码注释）；这次 kloop 的漏报不是
   覆盖面问题——它读到了全部相关代码，是落笔问题。codex 单 agent 也命中了最重的那条。
 - **不做 0–100 置信打分 + 阈值过滤**。那是压误报的机制，kloop 这次的失败方向相反。
-- **不给 skill 加 `background` 字段。**
+- **不给 skill 加 `background` 字段。** 但第八节把它变成了一个真实的候选:
+  cc 的 code-review 靠后台 fork 换到并发,kloop 没有这个能力,所以只能 inline。
 - **不做结构化 findings**（cc 的 `ReportFindings` typed list）。它存在的前提是
   host UI 能渲染 typed findings；kloop 的 TUI 只渲染 markdown（e7037e6 刚给
   finding 之间的 `---` 做了短线处理），散文报告才是当前的落点。三要素照搬，
