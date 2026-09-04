@@ -42,6 +42,12 @@ const CODE_FG: Color = Color::Cyan;
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// Fenced blocks are set off by an indent instead of that fill.
 const CODE_INDENT: &str = "  ";
+/// A thematic break (`---`) is a short left-aligned dash run, not a full-width
+/// line. A review with four findings writes four of them, and full-width rules
+/// at that density read as a stack of bars; short ones separate without
+/// shouting, and they stay clearly distinct from the full-width rule that closes
+/// a turn.
+const RULE_WIDTH: usize = 16;
 /// Bullets by nesting depth. A single `•` at every level flattened the nesting
 /// the model wrote; `-` and `·` keep the levels apart the way cc/codex do.
 const BULLETS: [&str; 3] = ["• ", "- ", "· "];
@@ -241,7 +247,7 @@ impl Renderer {
             Event::Rule => {
                 self.flush_para();
                 self.block_gap();
-                let w = self.content_width();
+                let w = RULE_WIDTH.min(self.content_width());
                 self.out.push(prefixed(
                     &self.prefix,
                     vec![Span::styled("─".repeat(w), DIM)],
@@ -1205,6 +1211,18 @@ mod tests {
     fn list_item_wraps_with_hanging_indent() {
         let lines = markdown_lines("- alpha beta gamma", 9);
         assert_eq!(texts(&lines), vec!["• alpha", "  beta", "  gamma"]);
+    }
+
+    /// A thematic break separates without shouting: a short dash run, dim, and
+    /// never the full width — a four-finding review writes four of these.
+    #[test]
+    fn thematic_break_is_a_short_dim_rule() {
+        let lines = markdown_lines("a\n\n---\n\nb", 80);
+        let rule = "─".repeat(16);
+        assert_eq!(texts(&lines), vec!["a", "", &rule, "", "b"]);
+        assert!(lines[2].spans[0].style.add_modifier.contains(Modifier::DIM));
+        // A terminal narrower than the rule keeps it inside the frame.
+        assert_eq!(texts(&markdown_lines("---", 9))[0], "─".repeat(9));
     }
 
     #[test]

@@ -625,8 +625,11 @@ up is the brightest thing in its own paragraph, while code carries a foreground
 only — ANSI cyan, no filled background. (The dim-grey chip behind every span made
 dense review prose read as a wall of blocks: `30s`, `status=0` and the like
 outweighed the sentence that judged them.) Fenced blocks are set off by a
-two-column indent rather than a padded rectangle, list bullets change glyph by
-depth (`•`, `-`, `·`) so nesting reads as nesting, a loose list keeps the blank
+two-column indent rather than a padded rectangle, a thematic break (`---`) is a
+short 16-column dash run rather than a full-width bar (a four-finding review
+writes four of them, and it stays distinct from the full-width rule that closes a
+turn), list bullets change glyph by depth (`•`, `-`, `·`) so nesting reads as
+nesting, a loose list keeps the blank
 lines its author wrote (a tight one stays tight), and a link keeps its URL in dim
 parentheses after the text — a terminal cannot click the underline. The base
 prompt carries the other half of this: lead a finding with its conclusion, in
