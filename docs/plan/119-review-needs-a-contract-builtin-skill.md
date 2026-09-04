@@ -225,6 +225,41 @@ fork 下必然打架,而同步 fork 连并发都换不来:用户照样从头等�
 而是"并发",kloop 的同步 fork 只学到了形。真要 fork,前提是先有 background skill;
 在那之前 inline 是对的。
 
+## 九、证据来自被审查的代码库
+
+第二轮实测（`审查：0a79ae9a，eee68cfe`）暴露的病根,和 fork 那条同样是数据打出来的:
+
+- 子 agent 发了 **65 次 web_search + 3 次 web_fetch**,逐个错误码去搜火山引擎 Ark
+  的官方文档(`site:docs.volcengine.com "OperationDenied.InvalidState"`、
+  `"ModelAccountIpmRateLimitExceeded"` …),**这是那 42 分钟的大头**;最终产出只有
+  一句降级理由:「当前无法从可访问的官方错误码资料证明某个具体 code 会产生错误的
+  HTTP status」。
+- 更糟的是它**把一条本地就能定案的候选也降级了**:vidu 的
+  `ResponseFormat:"url"→"b64_json"` 同时把 `supportsURL` 翻成 false,显式要 url 的
+  调用方被 `gptImageCapabilityError` 踢去 fallback。claude 用一次本地实验就定了案
+  (`err=*upstream.gptImageCapabilityError originCalls=0 isCapability=true`),kloop
+  的理由却是"没有可验证的 Vidu legacy provider 文档"。
+
+两件事同一个病:**分不清"这个外部值是什么意思"和"本仓库拿到这个值会做什么"**。
+后者永远在代码里,而且正是缺陷所在——claude 那条 P0 (`QuotaExceeded` 让 accepted
+task 被判死)就是纯内部推导,`poller.go` 的重试白名单里写着。
+
+**改动。** skill 的 Verifying 一节加三段:
+
+1. 证据来自被审查的代码库;看似需要外部事实的问题,可答的版本永远是"本仓库拿到
+   每一种外部输入会怎么做"。
+2. 不要向外查——搜上游文档找每个错误码的含义,是"花掉一小时、拿回来没法用"的
+   典型路径;改为本地证明:读分支、跟到调用方,或写个一次性程序跑一遍打印结果。
+3. **"证据不足"要留给真正取决于外部事实、且本地后果已经追到底的候选**。它是一个
+   真实的裁决,不是没做完的候选的货架——**能靠跑一遍代码定案的claim,缺的不是证据,
+   是一次实验**。
+
+第三段是专门对着 vidu 那次误降级写的:第三节给了"候选必须落纸"的出口(降级/排除),
+而这个出口不能变成偷懒的去处。
+
+同时新增 `code_review_keeps_its_load_bearing_clauses`,按 `compact.rs` 那套
+"按意图而非措辞断言"的做法锁住这几条(写完就抓到一处措辞不符,证明它有用)。
+
 ## 不做的
 
 - **不做多 agent 分维度并行审查**。cc 插件那 5 个 agent 服务的是 PR 场景里三个

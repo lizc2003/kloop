@@ -2598,8 +2598,11 @@ warning, never an error.
 of kloop still gets them: `code-review` (plan 119), an inline skill carrying the
 review contract — a finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
-(confirmed / downgraded / excluded) so none disappears silently; and a review
-runs the affected package's tests, never the project's pre-merge gate. It runs
+(confirmed / downgraded / excluded) so none disappears silently; evidence comes
+from the repository under review, so a question that seems to need an outside
+fact is re-asked as "what does this code do with that input" and settled locally
+rather than by searching an upstream's docs; and a review runs the affected
+package's tests, never the project's pre-merge gate. It runs
 **inline**, in the conversation that asked for it: a forked review keeps its
 evidence in the sub-agent, so the delegating agent — which must not take a
 sub-agent's report as fact — is left re-collecting it (measured: 42 minutes and

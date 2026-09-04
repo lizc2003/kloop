@@ -839,6 +839,41 @@ mod tests {
         assert!(skill.body.contains("$ARGUMENTS"), "takes a review target");
     }
 
+    /// The review contract's load-bearing clauses, asserted by intent rather than
+    /// wording so a rewrite stays free but a deletion is caught. Each one exists
+    /// because a measured review went wrong without it (plan 119).
+    #[test]
+    fn code_review_keeps_its_load_bearing_clauses() {
+        let body = builtin()
+            .into_iter()
+            .find(|s| s.name == "code-review")
+            .expect("code-review ships")
+            .body;
+        for clause in [
+            // A finding needs a concrete input reaching a concrete wrong output.
+            "failure scenario",
+            // Every candidate investigated gets a written verdict — the first
+            // measured review found the worst defect, then dropped it silently.
+            "confirmed",
+            "downgraded",
+            "excluded",
+            // "the change meant to do that" is not an exemption on its own.
+            "are different questions",
+            // A review is not the author's pre-merge gate.
+            "pre-merge gate",
+            // The second measured review spent 65 web searches on an upstream's
+            // error-code docs, then downgraded a claim the code could settle.
+            "Evidence comes from the repository under review",
+            "Prove the claim locally",
+            "not a shelf for candidates you did not finish",
+        ] {
+            assert!(
+                body.contains(clause),
+                "code-review skill lost its clause: {clause}"
+            );
+        }
+    }
+
     /// A builtin is model-facing like a discovered skill: it rides the catalog
     /// and the `skill` tool, unlike a user command.
     #[test]

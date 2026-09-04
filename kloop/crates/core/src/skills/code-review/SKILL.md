@@ -61,7 +61,31 @@ prevent.**
 ## Verifying
 
 The code already exists and already compiles. What needs verifying is *your
-claim*, not the repository:
+claim*, not the repository.
+
+**Evidence comes from the repository under review.** A defect is something this
+code does, so every question resolves to "what does this repository do now, and
+what did it do before". When a claim looks like it needs an outside fact — what
+an upstream error code means, whether a third-party API rejects some value —
+that is usually the wrong question. The answerable one is what *this* code does
+with each possible outside input: if the upstream returns that code, does this
+repository retry the poll or settle the task as failed; if that value is
+rejected, which branch runs and what does the caller receive. Both are in the
+code in front of you.
+
+So do not go looking outward. Searching an upstream's documentation for the
+meaning of each error code is a well-worn way to spend an hour and come back
+with nothing usable. Prove the claim locally instead: read the branch, follow it
+to the caller, or write a throwaway program that runs the path and prints what
+comes out.
+
+Reserve "not enough evidence" for a claim that genuinely turns on an outside
+fact **and** whose local consequences you have already traced to the end. It is
+a real verdict, not a shelf for candidates you did not finish — a claim you
+could have settled by running the code is not short of evidence, it is short of
+one experiment.
+
+How to verify a claim:
 
 - When the claim is a regression, read the parent revision and prove the old
   behavior differed.
