@@ -126,6 +126,9 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
             "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
         );
     }
+    // Sampled before `raw` can be moved by the non-HTML branch below.
+    let html_bytes = if is_html { raw.len() } else { 0 };
+    let html_has_script = is_html && raw.contains("<script");
     let mut text = if is_html {
         crate::html::html_to_text(&raw)
     } else {
@@ -133,6 +136,9 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     };
     if text.is_empty() {
         text = "(empty response body)".into();
+    }
+    if is_html && is_client_rendered(html_bytes, html_has_script, &text) {
+        text.push_str(CLIENT_RENDERED_NOTE);
     }
     // No model-text clip here. It used to cut at 50k chars and drop the rest,
     // which duplicated the offload seam while destroying what that seam exists
@@ -147,6 +153,22 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
         text.push_str("\n\n[download truncated at 5MB]");
     }
     Ok(text)
+}
+
+/// Appended when the extracted text is a client-render placeholder rather than
+/// the page. Without it the model gets a non-empty, plausible-looking body
+/// ("You need to enable JavaScript to run this app.") with no way to tell a
+/// short page from a failed fetch — measured cost on one session: two URLs
+/// tried, then four rounds of web_search guessing at the content.
+const CLIENT_RENDERED_NOTE: &str = "\n\n[this page is client-rendered: the HTML \
+carries scripts but almost no text, so the content is not in the response body. \
+Fetching this URL again returns the same shell — use web_search, or look for a \
+static/raw version of the document]";
+
+/// Conservative: all three must hold, so a genuinely short static page (no
+/// scripts, or markup no larger than its text) is never flagged.
+fn is_client_rendered(html_bytes: usize, has_script: bool, text: &str) -> bool {
+    has_script && html_bytes > 1000 && text.trim().chars().count() < 200
 }
 
 /// Scheme and address policy. Every redirect hop passes through here; DNS
@@ -248,6 +270,22 @@ fn ip_is_public(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Three signals must agree, so this never fires on a short static page.
+    #[test]
+    fn client_render_shell_is_flagged_but_short_static_pages_are_not() {
+        let shell_html = 4000;
+        let placeholder = "You need to enable JavaScript to run this app.";
+        assert!(super::is_client_rendered(shell_html, true, placeholder));
+
+        // Short page with no scripts: real content, however brief.
+        assert!(!super::is_client_rendered(shell_html, false, placeholder));
+        // Markup barely larger than its text: not a shell.
+        assert!(!super::is_client_rendered(300, true, placeholder));
+        // Scripts plus a real article: the text carries the page.
+        let article = "x".repeat(200);
+        assert!(!super::is_client_rendered(shell_html, true, &article));
+    }
     use super::*;
     use crate::testutil::fetch_private;
     use wiremock::Mock;

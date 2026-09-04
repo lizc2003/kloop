@@ -142,10 +142,14 @@ cache identity `{parent}-{agent_id}`，因为它的前缀和父的没有共同�
 ## 四、查过但**不改**的（结论写在这里，免得下次再查一遍）
 
 - **cache 命中率 ~20%**（主 590k/(2.40M+590k)，子 1.34M/(5.64M+1.34M)；同一天的
-  claude 会话是 96%）。不是 kloop 的 bug：`prompt_cache_key` 已经在发
+  claude 会话是 96%，口径不同不可直接比）。不是 kloop 的 bug：`prompt_cache_key` 已经在发
   （`provider/src/lib.rs:543`），逐轮数据呈「要么 0 要么几乎全中」的跳跃，正是
   `lib.rs:433-436` 注释里已经实测记录过的 gateway 亲和不稳（同一 7,697-token
-  前缀连发三次：0 / 6,656 / 0）。kloop 侧无可修。
+  前缀连发三次：0 / 6,656 / 0）。
+  **后续更正（见 plan 118 第四节）**：拿到 key 做了两组对照实验——同渠道同模型下
+  codex 41.3% / kloop 19.7%，而受控条件下两种请求布局都能到 90%+。所以命中率是
+  **结果**不是病因，病因是每轮往上下文里塞多少（kloop 每轮 +10,664 token，
+  codex +3,706）。
   - 附带澄清：`responses.rs:361` 有意把 `input_tokens` 存成「未缓存部分」，
     cache_read 单列，`Usage::total()` 再加回来。所以 rollout 里 `cache_read >
     input_tokens` 是设计，不是错账。
@@ -157,6 +161,7 @@ cache identity `{parent}-{agent_id}`，因为它的前缀和父的没有共同�
   to run this app.`，随后退化成 4–5 轮 web_search 猜。要修得上 headless 浏览器，
   远超本片。**但这条路仍然产出了三家里唯一的独家发现**（AUC 请求 `language`
   字段层级错位）——联网核对方向是对的，卡的是抓取能力。单独开片。
+  **→ plan 118 做了半步：不真渲染，但把「这是客户端渲染的壳」讲清楚，省掉盲试那几轮。**
 
 ## 五、留给下一片的两个候选（本片不做）
 
@@ -164,11 +169,12 @@ cache identity `{parent}-{agent_id}`，因为它的前缀和父的没有共同�
   （`tools/mod.rs:824-828`，`search.rs:92` 里 `context` 覆盖 `-C`，`-C` 覆盖
   `-A`/`-B`）。模型每次调用把 7 个开关全填满，还自相矛盾（`-A:15, -B:15, -C:15,
   context:0`）。瘦身能省输出 token，但这套参数名是 cc 形态，动之前要拍板。
+  **→ 已由 plan 118 做掉：删的是 kloop 自己加的 `context` 别名，留下 cc 的 `-A`/`-B`/`-C`。**
 - **`read_file` 反复读同一文件**：本次 `upstream/elevenlabs/batch.go` 被读了 7 次，
   `async_submit.go` 3 次——其中一轮里同时发了 `offset 1 limit 220` 和
   `offset 1 limit 260` 两个完全重叠的调用。典型模式是「先小 limit 试，不够再大
   limit 重读」（220→260→520，430→620）。工具结果里**回报文件总行数**大概率能掐掉
-  这类试探。
+  这类试探。**→ 已由 plan 118 做掉。**
 
 ## 验证 ✅
 

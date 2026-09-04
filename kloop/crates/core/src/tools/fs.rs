@@ -375,7 +375,7 @@ pub(super) async fn read_file_tool(
             1,
         )
     } else {
-        numbered_text_page(content, start, requested_end, offset)
+        numbered_text_page(content, start, requested_end, offset, total_lines)
     };
     let observation = FileObservation::from_read_with_identity(
         &bytes,
@@ -428,6 +428,7 @@ fn numbered_text_page(
     start: usize,
     requested_end: usize,
     display_start: usize,
+    total_lines: usize,
 ) -> (String, usize) {
     let mut out = String::new();
     let mut chars = 0usize;
@@ -458,17 +459,21 @@ fn numbered_text_page(
         chars += separator + rendered_chars;
         observed_end = start + relative + 1;
     }
-    if observed_end < requested_end {
-        if let Some(line) = partial_line {
-            out.push_str(&format!(
-                "\n\n[read output truncated within line {line}; use grep or a narrower reader to inspect it]"
-            ));
-        } else {
-            out.push_str(&format!(
-                "\n\n[read output truncated; call read_file with offset={} to continue]",
-                observed_end + 1
-            ));
-        }
+    // Every exit that leaves content unread says how much is left and where to
+    // resume. Without the total the model cannot tell a finished read from a
+    // `limit`-shaped one, and its only recourse is to reread the same file with
+    // a bigger limit — measured on one review session: batch.go read 7 times,
+    // async_submit.go 3, twice in a single round with overlapping ranges.
+    if let Some(line) = partial_line {
+        out.push_str(&format!(
+            "\n\n[read output truncated within line {line} of {total_lines}; use grep or a narrower reader to inspect it]"
+        ));
+    } else if observed_end < total_lines {
+        out.push_str(&format!(
+            "\n\n[showing lines {}-{observed_end} of {total_lines}; call read_file with offset={} to continue]",
+            display_start,
+            observed_end + 1
+        ));
     }
     (out, observed_end)
 }
@@ -1768,13 +1773,52 @@ mod tests {
         )
         .await;
         assert!(!is_error);
-        assert_eq!(out, "2\tbeta\n3\tgamma");
+        assert_eq!(
+            out,
+            "2\tbeta\n3\tgamma\n\n[showing lines 2-3 of 5; call read_file with offset=4 to continue]"
+        );
 
         let (out, is_error) =
             run_tool("read_file", json!({"path": "/nonexistent/kloop"}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("cannot read"));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The three exits a paged read can take. The `limit`-shaped one used to say
+    /// nothing at all, which is what invited the reread-with-a-bigger-limit loop
+    /// (plan 118).
+    #[tokio::test]
+    async fn read_file_reports_what_is_left_on_every_partial_exit() {
+        let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        let path = temp_file("read-remaining", &body);
+        let p = path.to_str().unwrap();
+        let ctx = test_ctx(0, "read-remaining");
+
+        // limit stops short: say how many lines exist and where to resume.
+        let (out, is_error) = run_tool("read_file", json!({"path": p, "limit": 10}), &ctx).await;
+        assert!(!is_error);
+        assert!(
+            out.ends_with("[showing lines 1-10 of 51; call read_file with offset=11 to continue]"),
+            "{out}"
+        );
+
+        // Mid-file page: the window is reported from the requested offset.
+        let (out, _) = run_tool(
+            "read_file",
+            json!({"path": p, "offset": 20, "limit": 5}),
+            &ctx,
+        )
+        .await;
+        assert!(
+            out.ends_with("[showing lines 20-24 of 51; call read_file with offset=25 to continue]"),
+            "{out}"
+        );
+
+        // Read to the end: nothing appended.
+        let (out, _) = run_tool("read_file", json!({"path": p}), &ctx).await;
+        assert!(!out.contains("showing lines"), "{out}");
+        assert!(out.ends_with("50\tline 50\n51\t"), "{out}");
     }
 
     #[tokio::test]
@@ -1803,7 +1847,10 @@ mod tests {
         )
         .await;
         assert!(!is_error);
-        assert_eq!(out, "2\tsecond");
+        assert_eq!(
+            out,
+            "2\tsecond\n\n[showing lines 2-2 of 4; call read_file with offset=3 to continue]"
+        );
 
         let (out, is_error) = run_tool("read_file", json!({"path": p, "offset": 100}), &ctx).await;
         assert!(!is_error);
@@ -1919,7 +1966,10 @@ mod tests {
             "{} chars",
             out.chars().count()
         );
-        assert!(out.contains("[read output truncated; call read_file with offset="));
+        assert!(
+            out.contains("call read_file with offset=") || out.contains("truncated within line"),
+            "{out}"
+        );
         assert!(
             !ctx.cfg
                 .file_state

@@ -89,7 +89,7 @@ impl GrepArgs {
         let root = supplied_path
             .map(|path| crate::tools::resolve_path(cwd, path))
             .unwrap_or_else(|| cwd.to_path_buf());
-        let around = integer_arg(input, "context", "grep")?.or(integer_arg(input, "-C", "grep")?);
+        let around = integer_arg(input, "-C", "grep")?;
         Ok(GrepArgs {
             pattern,
             root,
@@ -875,7 +875,7 @@ mod tests {
             "pattern": "alpha",
             "path": file,
             "output_mode": "content",
-            "context": 1,
+            "-C": 1,
             "-n": true
         }))
         .await

@@ -40,6 +40,14 @@ validate five architectural bets before committing to a larger agent design.
    This is also why `web_fetch` has no text cap: bounding what the model sees is
    this seam's job, and a cap in the fetcher deletes the rest of the artifact
    instead of keeping it on disk.
+
+   Whatever bounds a result, the result says so. A partial `read_file` ends with
+   `[showing lines X-Y of N; call read_file with offset=Y+1 to continue]` — the
+   total was always known and withholding it just made the model reread the file
+   with a bigger `limit`. A complete read appends nothing. `web_fetch` likewise
+   flags a client-rendered shell (scripts present, markup far larger than the
+   text it yields, text under 200 chars) instead of handing back
+   "You need to enable JavaScript to run this app." as if it were the page.
 2. **Continuation signal = presence of `tool_use` blocks.** Never
    `stop_reason` — it is unreliable across providers.
 3. **Concurrency safety decided per call, by name AND input.**
