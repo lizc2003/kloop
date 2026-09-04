@@ -666,7 +666,15 @@ drains that exact prefix, and the loop immediately repaints the tail while the
 size fence is still held. The commit only freezes a leading prefix that still
 leaves the live tail at least a viewport tall, so a tall final message (e.g. the
 last turn on `-c` resume, trailed by a one-line note) is never stranded behind a
-full-screen blank pad. Because the inline viewport is the full terminal height,
+full-screen blank pad. One cell can be taller than the whole screen on its own
+(a replayed final answer, a long tool output), and there the two rules would
+collide: freezing it whole strands the note behind that blank pad, keeping it
+whole leaves `draw` to bottom-anchor and clip its top — content that is then on
+no screen and in no scrollback, unreachable by scrolling (plan 121). So the
+commit also freezes *lines*: the head cell's overflowing prefix goes to
+scrollback and the viewport picks the same cell up one line below the seam, which
+is what makes a resumed session's long conclusion scroll back in full. Because
+the inline viewport is the full terminal height,
 `insert_before` runs Ratatui's default path (the `scrolling-regions` cargo
 feature is deliberately off): it scrolls committed lines into scrollback with
 plain line feeds (`append_lines`) at the bottom row, not the DECSTBM one-row
@@ -2040,7 +2048,15 @@ An input line starting with `/` is a **built-in command**, not a message to
 the model. The set is small and lives one-file-per-command under
 `core/src/commands/` (the directory listing *is* the catalog):
 
-- `/help` — list the commands.
+- `/help` — list the commands, then the loaded skills (they are `/name`-invocable
+  too, so leaving them out hid the builtins from everyone; a builtin is tagged
+  as such, a user command likewise).
+- `/skills` — list the loaded skills with where each came from (a disk skill's
+  directory, `builtin`, or `user command`); `/skills <name>` prints that
+  skill's full instructions. A builtin has no file to open, so this is the only
+  way to read what a same-named `SKILL.md` of your own would be replacing. This
+  is the local REPL, not the `skills/list` read surface — that one withholds
+  bodies on purpose, because it answers a client over the wire.
 - `/provider` — show the configured providers, or `/provider <provider>
   [model]` to switch the session route (see **Provider catalog and session
   route** above; the TUI opens a picker when called bare).

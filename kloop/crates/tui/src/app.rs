@@ -314,6 +314,14 @@ pub struct App {
     /// finalized ones the viewport shows. Older finalized cells have left for
     /// native scrollback (see [`Cell`], [`App::drain_committed`]).
     pub cells: Vec<Cell>,
+    /// Rendered lines of `cells[0]` already frozen into native scrollback, with
+    /// the width they were rendered at. A cell taller than the viewport cannot
+    /// be shown whole, and committing it whole would strand the live tail behind
+    /// a full-screen blank pad (plan 99), so the commit freezes its overflowing
+    /// prefix instead and the viewport picks the cell up where scrollback left
+    /// off. The width is part of the state because the count only means anything
+    /// at the width it was wrapped for.
+    pub(crate) head_frozen: Option<(usize, usize)>,
     /// Latest immutable projection of the root-owned task graph. `None` means the
     /// startup seed has not arrived yet; an accepted revision-0 empty snapshot is
     /// therefore distinct from uninitialized state.
@@ -409,6 +417,7 @@ impl App {
         Self {
             session_id,
             cells: Vec::new(),
+            head_frozen: None,
             task_graph: None,
             show_task_graph: true,
             task_panel_retired: false,
@@ -560,6 +569,7 @@ impl App {
                 // (inline can't erase scrollback) but are out of the model's
                 // context — the System note that follows says so.
                 self.cells.clear();
+                self.head_frozen = None;
                 self.tool_cells.clear();
                 self.agent_cells.clear();
                 self.background_task_cells.clear();
@@ -596,6 +606,7 @@ impl App {
                 self.session_id = session_id;
                 self.accept_selected_route(route);
                 self.cells = cells_from_history(&messages);
+                self.head_frozen = None;
                 // cells_from_history tags the tail "resumed session"; relabel it
                 // so the transcript says a rewind happened, not a resume.
                 if matches!(self.cells.last(), Some(Cell::Note(_))) {
@@ -1020,6 +1031,24 @@ impl App {
             last.is_some_and(|last| self.reasoning_cells.values().any(|index| *index == last));
     }
 
+    /// How many of the head cell's rendered lines are already in native
+    /// scrollback at `width`. A prefix frozen at another width says nothing
+    /// about this one's wrapping, so it counts as zero: the cell comes back
+    /// whole and the next commit re-freezes its overflow at the new width
+    /// (a duplicated prefix in scrollback beats a blind cut in the live tail).
+    pub(crate) fn head_skip(&self, width: usize) -> usize {
+        match self.head_frozen {
+            Some((frozen_width, lines)) if frozen_width == width => lines,
+            _ => 0,
+        }
+    }
+
+    /// Record that the head cell's first `lines` rendered lines (at `width`)
+    /// have just been written into native scrollback.
+    pub(crate) fn freeze_head_lines(&mut self, width: usize, lines: usize) {
+        self.head_frozen = Some((width, lines));
+    }
+
     pub(crate) fn display_cell_live(&self, index: usize) -> bool {
         self.assistant_cells.values().any(|value| *value == index)
             || self.reasoning_cells.values().any(|value| *value == index)
@@ -1078,6 +1107,9 @@ impl App {
             return;
         }
         let n = n.min(self.cells.len());
+        // The partially frozen head is part of the committed prefix; whatever
+        // comes next starts unfrozen.
+        self.head_frozen = None;
         for cell in &self.cells[..n] {
             match cell {
                 Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running => {

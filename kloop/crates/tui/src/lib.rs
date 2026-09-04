@@ -727,23 +727,37 @@ fn spawn_input_thread(
     })
 }
 
-fn overflow_commit_count(app: &App, viewport: Rect) -> usize {
+/// The transcript rows a draw at `viewport` leaves for the live tail: the
+/// viewport minus the composer, its rules, the footer and any mutable chrome.
+/// Draw and commit share this one calculation — activity plus the revisioned
+/// Task panel must both stay out of native scrollback.
+fn overflow_active_h(app: &App, viewport: Rect) -> usize {
     let width = usize::from(viewport.width).max(1);
     let height = usize::from(viewport.height);
-    // Draw and commit share one mutable-chrome calculation: activity plus the
-    // revisioned Task panel must both stay out of native scrollback.
     let chrome = render::live_chrome_layout(app, viewport);
     let reserve = 2 + render::composer_height(app, width) + 1 + chrome.reserved_rows();
-    let active_h = height.saturating_sub(reserve).max(1);
-    render::commit_count(&app.cells, width, active_h, |index| {
-        app.display_cell_live(index)
-    })
+    height.saturating_sub(reserve).max(1)
+}
+
+fn overflow_commit_count(app: &App, viewport: Rect) -> usize {
+    let width = usize::from(viewport.width).max(1);
+    render::commit_count(
+        &app.cells,
+        width,
+        overflow_active_h(app, viewport),
+        |index| app.display_cell_live(index),
+    )
 }
 
 /// Freeze finalized cells that overflow the last successfully drawn live region
 /// into native scrollback, then drop them from the app's tail. The caller must
 /// pass the viewport from that draw; committing from a pre-draw size probe would
 /// race Ratatui's own autoresize and could irreversibly freeze the wrong prefix.
+///
+/// Whole cells go first; whatever still overflows is a single head cell taller
+/// than the viewport, and its own overflowing lines are frozen too
+/// ([`render::head_freeze_lines`]) — otherwise the draw would clip that top off
+/// the screen without ever putting it in scrollback.
 fn commit_overflow<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
@@ -753,18 +767,36 @@ where
     B: ratatui::backend::Backend,
 {
     let width = usize::from(viewport.width).max(1);
+    let active_h = overflow_active_h(app, viewport);
     let n = overflow_commit_count(app, viewport);
-    if n == 0 {
-        return Ok(false);
-    }
     // Render each cell to fixed-height lines up front so the borrow of
     // `app.cells` ends before `drain_committed` takes it mutably.
-    let blocks: Vec<Vec<Line<'static>>> = app.cells[..n]
+    let mut blocks: Vec<Vec<Line<'static>>> = app.cells[..n]
         .iter()
         .map(|c| render::cell_lines(c, width))
         .collect();
-    insert_scrollback_blocks(terminal, blocks)?;
+    // The head's already-frozen prefix is in scrollback; committing the cell
+    // whole must not write it a second time.
+    if let Some(head) = blocks.first_mut() {
+        let skip = app.head_skip(width).min(head.len());
+        head.drain(..skip);
+    }
     app.drain_committed(n);
+
+    let frozen = app.head_skip(width);
+    let head_live = app.display_cell_live(0);
+    let target = render::head_freeze_lines(&app.cells, width, active_h, frozen, head_live);
+    if target > frozen {
+        let mut head = render::cell_lines(&app.cells[0], width);
+        head.truncate(target);
+        head.drain(..frozen);
+        blocks.push(head);
+        app.freeze_head_lines(width, target);
+    }
+    if blocks.is_empty() {
+        return Ok(false);
+    }
+    insert_scrollback_blocks(terminal, blocks)?;
     Ok(true)
 }
 
@@ -1387,6 +1419,57 @@ mod tests {
 
         let grown = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
         assert_eq!((grown.width, grown.height), (80, 24));
+    }
+
+    /// End of a resumed session: one answer taller than the whole screen, then
+    /// the resume note. `commit_count` cannot take the answer (that would strand
+    /// the note behind a blank pad) and `draw` clips its top, so the commit has
+    /// to freeze the overflowing lines themselves — otherwise the opening of the
+    /// conclusion is on no screen and in no scrollback, and `kloop -r` can never
+    /// show it.
+    #[test]
+    fn a_tall_resumed_answer_is_frozen_instead_of_clipped_away() {
+        let backend = PinnedBackend::new(TestBackend::new(40, 12));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .unwrap();
+
+        let mut app = App::new("resume-tall".into());
+        // A System cell renders one row per source line: 40 rows of answer.
+        app.cells = vec![
+            Cell::System(
+                (0..40)
+                    .map(|i| format!("row {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Cell::Note("resumed session — 32 message(s)".into()),
+        ];
+        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+
+        let width = usize::from(viewport.width);
+        let active_h = overflow_active_h(&app, viewport);
+        let frozen = app.head_skip(width);
+        let visible: Vec<String> = render::visible_transcript(&app, &render::Hud::default(), width)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(app.cells.len(), 2, "neither whole cell is committable");
+        assert_eq!(visible.len(), active_h, "the live tail fills the viewport");
+        assert_eq!(
+            frozen + visible.len(),
+            41,
+            "every answer line plus the note is either frozen or on screen"
+        );
+        assert_eq!(
+            visible.first().map(String::as_str),
+            Some(format!("row {frozen}").as_str()),
+            "the viewport opens on the line after the scrollback seam"
+        );
     }
 
     #[test]

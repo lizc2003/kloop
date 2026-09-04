@@ -641,16 +641,24 @@ pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'stati
     let mut lines = Vec::new();
     let last = app.cells.len().saturating_sub(1);
     for (i, cell) in app.cells.iter().enumerate() {
-        match cell {
+        let mut rendered = match cell {
             Cell::Assistant(text) if i == last && app.streaming_assistant() => {
-                lines.extend(crate::markdown::assistant_stream_lines(text, width));
+                crate::markdown::assistant_stream_lines(text, width)
             }
             Cell::Thinking { .. } if i == last && app.streaming_thinking() => {
                 let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
-                lines.push(thinking_line(None, Some(secs), width));
+                vec![thinking_line(None, Some(secs), width)]
             }
-            _ => lines.extend(cell_lines(cell, width)),
+            _ => cell_lines(cell, width),
+        };
+        // A head cell too tall for the viewport has had its overflowing prefix
+        // frozen into scrollback ([`head_freeze_lines`]); the viewport resumes
+        // the same cell one line below the seam.
+        if i == 0 {
+            let skip = app.head_skip(width).min(rendered.len());
+            rendered.drain(..skip);
         }
+        lines.extend(rendered);
     }
     lines
 }
@@ -706,6 +714,45 @@ pub fn commit_count(
         committed += 1;
     }
     committed
+}
+
+/// How many of the head cell's leading rendered lines belong in native
+/// scrollback so the live tail fits `active_h` rows — the line-level remainder
+/// [`commit_count`] cannot take, because it only ever moves whole cells and
+/// never the last one. Returns the new total (never below `frozen`).
+///
+/// One cell can be taller than the whole viewport: a replayed final answer, a
+/// long tool output. Committing it whole would leave a one-line note alone
+/// behind a full-screen blank pad (plan 99), so `commit_count` keeps it — and
+/// then [`draw`] bottom-anchors the tail and clips the top, which is content the
+/// user can never reach: it is neither on screen nor in scrollback. Freezing
+/// exactly the overflow instead keeps the seam continuous — scrollback ends
+/// where the viewport begins — and nothing is dropped.
+///
+/// The head is left alone while it can still change: a cell whose lines may
+/// re-wrap (a code fence closing, a table gaining a row) must not have half of
+/// it already nailed into scrollback. The last cell is never touched at all,
+/// for the same reason [`commit_count`] leaves it.
+pub fn head_freeze_lines(
+    cells: &[Cell],
+    width: usize,
+    active_h: usize,
+    frozen: usize,
+    head_live: bool,
+) -> usize {
+    let active_h = active_h.max(1);
+    if cells.len() < 2 || head_live || !is_committable(&cells[0]) {
+        return frozen;
+    }
+    let head_h = cell_lines(&cells[0], width).len();
+    let rest: usize = cells[1..].iter().map(|c| cell_lines(c, width).len()).sum();
+    let live = (head_h + rest).saturating_sub(frozen);
+    if live <= active_h {
+        return frozen;
+    }
+    // Freeze only what overflows, and never past the head's own last line:
+    // whole cells after it are `commit_count`'s business.
+    (frozen + (live - active_h)).min(head_h)
 }
 
 /// The on-screen height of the composer at `width`: its wrapped rows (already
@@ -1290,6 +1337,17 @@ mod tests {
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A cell exactly `rows` display lines tall: a System cell renders one row
+    /// per source line, so the row index doubles as the line index.
+    fn tall_cell(rows: usize) -> Cell {
+        Cell::System(
+            (0..rows)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     fn task(id: u64, subject: &str, status: TaskStatus, blocked_by: &[u64]) -> TaskGraphTask {
@@ -2520,6 +2578,121 @@ mod tests {
         assert!(
             live_tail >= active_h,
             "live tail {live_tail} must fill the {active_h}-row viewport",
+        );
+    }
+
+    /// The other half of the plan-99 rule: `commit_count` keeps the tall final
+    /// message live, and this freezes the lines of it that overflow the viewport
+    /// anyway — otherwise `draw` bottom-anchors the tail and clips a top that is
+    /// in no scrollback either, so a resumed answer's opening is unreachable.
+    #[test]
+    fn head_freeze_takes_exactly_the_tall_head_overflow() {
+        let width = 40;
+        let active_h = 5;
+        // 20 rows of message, then the one-line resume note: 16 rows overflow.
+        let cells = vec![
+            tall_cell(20),
+            Cell::Note("resumed session — 32 message(s)".into()),
+        ];
+        assert_eq!(
+            commit_count(&cells, width, active_h, |_| false),
+            0,
+            "the tall message stays live (plan 99)"
+        );
+        let frozen = head_freeze_lines(&cells, width, active_h, 0, /*head_live=*/ false);
+        assert_eq!(frozen, 16);
+        // Seam: scrollback ends on the last frozen line, the viewport opens on
+        // the next one, and together they are the whole message.
+        let head = cell_lines(&cells[0], width);
+        assert_eq!(line_text(&head[frozen - 1]), "row 15");
+        assert_eq!(line_text(&head[frozen]), "row 16");
+        let live: usize = head.len() - frozen + cell_lines(&cells[1], width).len();
+        assert_eq!(live, active_h, "the live tail fills the viewport exactly");
+    }
+
+    /// Freezing is per frame and cumulative: a later turn pushes more rows in,
+    /// and only the newly overflowing ones are added to what is already frozen.
+    #[test]
+    fn head_freeze_adds_only_the_new_overflow() {
+        let width = 40;
+        let cells = vec![
+            tall_cell(20),
+            Cell::Note("resumed session — 32 message(s)".into()),
+            Cell::User("and now what".into()),
+        ];
+        // The User cell renders a leading blank plus its text: two more rows.
+        assert_eq!(
+            head_freeze_lines(&cells, width, 5, 16, /*head_live=*/ false),
+            18
+        );
+    }
+
+    /// A head that can still change keeps its lines: half a cell nailed into
+    /// scrollback cannot be re-wrapped when the rest of it lands.
+    #[test]
+    fn head_freeze_leaves_a_settled_or_fitting_head_alone() {
+        let width = 40;
+        let active_h = 5;
+        let tail = Cell::Note("resumed session — 32 message(s)".into());
+        let running = Cell::Tool {
+            name: "Bash".into(),
+            input: "{}".into(),
+            status: ToolStatus::Running,
+            output: None,
+        };
+        let cases: Vec<(&str, Vec<Cell>, bool, usize)> = vec![
+            (
+                "fits the viewport",
+                vec![tall_cell(3), tail.clone()],
+                false,
+                0,
+            ),
+            ("head is the last cell", vec![tall_cell(20)], false, 0),
+            (
+                "head still streaming",
+                vec![tall_cell(20), tail.clone()],
+                true,
+                0,
+            ),
+            ("head still running", vec![running, tall_cell(20)], false, 0),
+        ];
+        let frozen: Vec<(&str, usize)> = cases
+            .iter()
+            .map(|(name, cells, head_live, _)| {
+                (
+                    *name,
+                    head_freeze_lines(cells, width, active_h, 0, *head_live),
+                )
+            })
+            .collect();
+        assert_eq!(
+            frozen,
+            cases
+                .iter()
+                .map(|(name, _, _, want)| (*name, *want))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The viewport picks the head cell up one line past the seam — and a prefix
+    /// frozen at another width says nothing about this wrapping, so it is ignored
+    /// rather than cutting blind.
+    #[test]
+    fn visible_transcript_resumes_the_head_below_the_frozen_seam() {
+        let mut app = App::new("s".into());
+        app.cells = vec![tall_cell(4), Cell::Note("resumed session".into())];
+        app.freeze_head_lines(40, 3);
+        let shown = |app: &App, width: usize| -> Vec<String> {
+            visible_transcript(app, &Hud::default(), width)
+                .iter()
+                .map(line_text)
+                .collect()
+        };
+        assert_eq!(shown(&app, 40), vec!["row 3", "[resumed session]"]);
+        assert_eq!(
+            shown(&app, 30),
+            vec!["row 0", "row 1", "row 2", "row 3", "[resumed session]"],
+            "a freeze from another width does not cut this one"
         );
     }
 
