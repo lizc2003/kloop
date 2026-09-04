@@ -481,7 +481,8 @@ pub(crate) fn load_agent_types(root: &toml::Table) -> Result<Vec<AgentType>> {
 /// dropped in — the SKILL.md format is what matters, so we scan only kloop's
 /// own dir, not cc's `.claude/`. The project layer wins on a name collision,
 /// letting it override a global skill. A malformed skill is skipped with a
-/// warning, never an error; `--mock` skips discovery entirely (hermetic).
+/// warning, never an error; `--mock` skips discovery entirely (hermetic) but
+/// still gets the builtins, which touch no filesystem.
 pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
     let home = std::env::home_dir();
     let mut skill_roots = vec![cwd.join(".kloop").join("skills")];
@@ -491,11 +492,27 @@ pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
         command_roots.push(home.join(".kloop").join("commands"));
     }
     let (skills, mut warnings) = skills_from_roots(&skill_roots);
+    let skills = merge_builtins(skills, kloop_core::skills::builtin());
     // User commands (plan 36) join the same registry as `SkillSource::Command`
     // entries, so the rest of the wiring is unchanged.
     let (commands, command_warnings) = commands_from_roots(&command_roots);
     warnings.extend(command_warnings);
     (merge_commands(skills, commands), warnings)
+}
+
+/// Fold the compiled-in skills (plan 119) into the discovered ones, with a
+/// discovered skill winning on a name collision — the same first-name-wins rule
+/// the two discovery roots already follow between themselves, extended one layer
+/// down so a project can replace a shipped skill by writing its own. Split out
+/// so the precedence is testable without touching the filesystem.
+fn merge_builtins(mut skills: Vec<Skill>, builtins: Vec<Skill>) -> Vec<Skill> {
+    let taken: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    let fresh: Vec<Skill> = builtins
+        .into_iter()
+        .filter(|b| !taken.contains(b.name.as_str()))
+        .collect();
+    skills.extend(fresh);
+    skills
 }
 
 /// Cwd-scoped metadata for the native `skills/list` read surface. User commands
@@ -507,12 +524,14 @@ pub(crate) fn server_skills_snapshot(cwd: &Path) -> SkillsSnapshot {
     let project_root = cwd.join(".kloop").join("skills");
     let skills = skills
         .into_iter()
-        .filter(|skill| skill.source == SkillSource::Skill)
+        .filter(|skill| skill.source.model_invocable())
         .map(|skill| {
-            let scope = if Path::new(&skill.dir).starts_with(&project_root) {
-                SkillScope::Project
-            } else {
-                SkillScope::User
+            let scope = match skill.source {
+                // A builtin has no directory, so the path-prefix test below would
+                // mislabel it as a user skill.
+                SkillSource::Builtin => SkillScope::Builtin,
+                _ if Path::new(&skill.dir).starts_with(&project_root) => SkillScope::Project,
+                _ => SkillScope::User,
             };
             let context = match skill.context {
                 CoreSkillContext::Inline => ServerSkillContext::Inline,
@@ -521,10 +540,14 @@ pub(crate) fn server_skills_snapshot(cwd: &Path) -> SkillsSnapshot {
             SkillInfo {
                 name: skill.name,
                 description: skill.description,
-                path: Path::new(&skill.dir)
-                    .join("SKILL.md")
-                    .to_string_lossy()
-                    .to_string(),
+                // Empty for a builtin: there is no file to open.
+                path: match skill.source {
+                    SkillSource::Builtin => String::new(),
+                    _ => Path::new(&skill.dir)
+                        .join("SKILL.md")
+                        .to_string_lossy()
+                        .to_string(),
+                },
                 scope,
                 context,
                 model: skill.model,
@@ -1373,6 +1396,14 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             }
         );
         assert!(!snapshot.skills.iter().any(|skill| skill.name == "deploy"));
+        // A builtin is listed too, under its own scope and with no file to open.
+        let builtin = snapshot
+            .skills
+            .iter()
+            .find(|skill| skill.name == "code-review")
+            .expect("builtins are listed");
+        assert_eq!(builtin.scope, SkillScope::Builtin);
+        assert_eq!(builtin.path, "");
         let wire = serde_json::to_string(&snapshot).unwrap();
         assert!(!wire.contains("SECRET BODY"));
         assert!(!wire.contains("SECRET COMMAND"));
@@ -1493,6 +1524,33 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         assert!(warnings[0].contains("broken") && warnings[0].contains("frontmatter"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Builtins (plan 119) join the registry behind whatever was discovered: a
+    /// same-named skill on disk replaces the shipped one, and the rest still
+    /// load. The replacement is silent, like project-over-global.
+    #[test]
+    fn a_discovered_skill_replaces_the_builtin_of_the_same_name() {
+        let mine = Skill {
+            name: "code-review".into(),
+            description: "my own review".into(),
+            body: "mine".into(),
+            dir: "/p/.kloop/skills/code-review".into(),
+            ..Default::default()
+        };
+        let merged = merge_builtins(vec![mine], kloop_core::skills::builtin());
+        let review: Vec<&Skill> = merged.iter().filter(|s| s.name == "code-review").collect();
+        assert_eq!(review.len(), 1, "no duplicate name: {merged:?}");
+        assert_eq!(review[0].description, "my own review");
+        assert_eq!(review[0].source, SkillSource::Skill);
+
+        // Nothing discovered: the builtins are the whole registry.
+        let only_builtins = merge_builtins(Vec::new(), kloop_core::skills::builtin());
+        assert!(
+            only_builtins
+                .iter()
+                .any(|s| s.name == "code-review" && s.source == SkillSource::Builtin)
+        );
     }
 
     #[test]

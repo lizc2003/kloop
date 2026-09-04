@@ -13,7 +13,6 @@ use super::str_arg;
 use crate::config::EffectiveWorkspace;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
-use crate::skills::SkillSource;
 use crate::skills::expand_body;
 use kloop_protocol::ToolDef;
 
@@ -55,11 +54,7 @@ pub(super) async fn skill_tool(
     let args = input.get("arguments").and_then(Value::as_str).unwrap_or("");
     // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is
     // `/name`-only and must not be reachable here even if the model guesses it.
-    let candidates = ctx
-        .cfg
-        .skills
-        .iter()
-        .filter(|s| s.source == SkillSource::Skill);
+    let candidates = ctx.cfg.skills.iter().filter(|s| s.source.model_invocable());
     let skill = Skill::lookup(candidates, name).map_err(|e| anyhow::anyhow!(e))?;
     let body = expand_body(&skill.body, &skill.dir, args);
     // Then run any `!cmd` / `@file` injections (plan 36 slice 3), gated exactly

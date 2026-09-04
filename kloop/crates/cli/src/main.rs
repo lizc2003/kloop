@@ -204,8 +204,10 @@ async fn main() -> Result<ExitCode> {
                     &session_dirs.offload,
                     |warning| notify(warning),
                 )?;
+                // `--mock` skips disk discovery (hermetic) but keeps the
+                // builtins, which are compiled in and touch no filesystem.
                 let skills = Arc::new(if args.mock {
-                    Vec::new()
+                    kloop_core::skills::builtin()
                 } else {
                     let (skills, warnings) = load_skills(&options.cwd);
                     for warning in &warnings {
@@ -286,7 +288,7 @@ async fn main() -> Result<ExitCode> {
         eprintln!("\x1b[2m[{warning}]\x1b[0m")
     })?;
     let skills = Arc::new(if args.mock {
-        Vec::new()
+        kloop_core::skills::builtin()
     } else {
         let (skills, warnings) = load_skills(&cwd);
         for warning in &warnings {

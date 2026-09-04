@@ -139,6 +139,8 @@ pub struct SandboxConfigInfo {
 pub enum SkillScope {
     Project,
     User,
+    /// Compiled into the binary (plan 119); no file on disk, so `path` is empty.
+    Builtin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

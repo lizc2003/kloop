@@ -63,6 +63,19 @@ pub enum SkillSource {
     /// A single-file user command (`.kloop/commands/*.md`): `/name`-invocable
     /// only, never advertised to or triggerable by the model.
     Command,
+    /// A skill compiled into the binary (plan 119). Behaves exactly like a
+    /// discovered `SKILL.md` — catalog, `skill` tool, `/name` — but has no
+    /// directory on disk, and a same-named skill in either discovery root
+    /// replaces it.
+    Builtin,
+}
+
+impl SkillSource {
+    /// Whether the model may see and trigger this entry. Only a user command is
+    /// hidden; a builtin is a skill like any other.
+    pub fn model_invocable(self) -> bool {
+        self != SkillSource::Command
+    }
 }
 
 /// A skill's execution mode (its `context` frontmatter field).
@@ -189,6 +202,15 @@ impl Skill {
     /// default skill name); `dir` its display path. Errors are strings the CLI
     /// turns into skip-with-warning — a malformed skill never aborts startup.
     pub fn parse(dir_name: &str, dir: &str, content: &str) -> Result<Skill, String> {
+        Self::parse_with_source(dir_name, dir, content, SkillSource::Skill)
+    }
+
+    fn parse_with_source(
+        dir_name: &str,
+        dir: &str,
+        content: &str,
+        source: SkillSource,
+    ) -> Result<Skill, String> {
         let (yaml, body) = split_frontmatter(content)
             .ok_or("no YAML frontmatter (expected a `---` delimited block at the top)")?;
         let mut fm: Frontmatter =
@@ -205,13 +227,7 @@ impl Skill {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .ok_or("missing 'description' (the field the model matches on)")?;
-        fm.into_skill(
-            name,
-            description,
-            body.trim().to_string(),
-            dir,
-            SkillSource::Skill,
-        )
+        fm.into_skill(name, description, body.trim().to_string(), dir, source)
     }
 
     /// Parse one single-file user command (`.kloop/commands/*.md`, plan 36).
@@ -317,6 +333,27 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Skills compiled into the binary, as `(name, SKILL.md source)` pairs — the
+/// one list a new builtin has to touch.
+const BUILTIN_SKILLS: &[(&str, &str)] =
+    &[("code-review", include_str!("skills/code-review/SKILL.md"))];
+
+/// Skills that ship with the binary (plan 119), so a repository that has never
+/// heard of kloop still gets them. They have no directory on disk, so `dir` is
+/// empty and a builtin body must not reference `${CLAUDE_SKILL_DIR}` — there is
+/// nothing to substitute. A malformed builtin is a kloop bug rather than a user
+/// error (the bodies are compiled in and covered by tests), so it panics instead
+/// of silently vanishing from the catalog.
+pub fn builtin() -> Vec<Skill> {
+    BUILTIN_SKILLS
+        .iter()
+        .map(|(name, content)| {
+            Skill::parse_with_source(name, "", content, SkillSource::Builtin)
+                .unwrap_or_else(|e| panic!("builtin skill '{name}' is malformed: {e}"))
+        })
+        .collect()
+}
+
 /// The progressive-disclosure catalog: name + description for every skill,
 /// riding the injected first user message alongside the deferred-tools notice.
 /// Session-stable (config-derived), so it stays byte-stable for the prompt
@@ -326,7 +363,7 @@ pub fn skills_catalog(skills: &[Skill]) -> Option<String> {
     // the model's catalog (plan 36 decision 3).
     let listed: Vec<&Skill> = skills
         .iter()
-        .filter(|s| s.source == SkillSource::Skill)
+        .filter(|s| s.source.model_invocable())
         .collect();
     if listed.is_empty() {
         return None;
@@ -762,6 +799,50 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(skills_catalog(&only_commands), None);
+    }
+
+    /// Every builtin parses (they ship with the binary, so a malformed one is a
+    /// kloop bug) and carries no directory — which means a builtin body must not
+    /// reference `${CLAUDE_SKILL_DIR}`, as there is nothing to substitute.
+    #[test]
+    fn builtins_parse_and_reference_no_directory() {
+        let builtins = builtin();
+        assert!(!builtins.is_empty(), "at least code-review ships");
+        for skill in &builtins {
+            assert_eq!(skill.source, SkillSource::Builtin, "{}", skill.name);
+            assert_eq!(skill.dir, "", "a builtin has no directory: {}", skill.name);
+            assert!(
+                !skill.body.contains("${CLAUDE_SKILL_DIR}"),
+                "{} points at a directory it does not have",
+                skill.name
+            );
+            assert!(!skill.description.is_empty(), "{}", skill.name);
+        }
+    }
+
+    /// The `code-review` builtin (plan 119) forks, so a review's dozens of tool
+    /// calls stay out of the delegating context, and keeps the full tool set —
+    /// a review needs bash for `git` and for the affected package's tests.
+    #[test]
+    fn code_review_builtin_forks_with_the_full_tool_set() {
+        let skill = builtin()
+            .into_iter()
+            .find(|s| s.name == "code-review")
+            .expect("code-review ships");
+        assert_eq!(skill.context, SkillContext::Fork);
+        assert_eq!(skill.allowed_tools, None);
+        assert!(skill.body.contains("$ARGUMENTS"), "takes a review target");
+    }
+
+    /// A builtin is model-facing like a discovered skill: it rides the catalog
+    /// and the `skill` tool, unlike a user command.
+    #[test]
+    fn builtins_ride_the_catalog() {
+        let catalog = skills_catalog(&builtin()).expect("builtins are advertised");
+        assert!(catalog.contains("\n- code-review:"), "{catalog}");
+        assert!(SkillSource::Builtin.model_invocable());
+        assert!(SkillSource::Skill.model_invocable());
+        assert!(!SkillSource::Command.model_invocable());
     }
 
     /// `lookup` searches whatever candidates the caller scopes to: the model's

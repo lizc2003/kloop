@@ -338,10 +338,7 @@ async fn turn_rounds(
             // to run_program's API — it is a prompt-activation seam, not a source tool.
             // Placed before the allowlist filter so a restricted agent type can gate it
             // like any tool.
-            let has_model_skill = cfg
-                .skills
-                .iter()
-                .any(|s| s.source == crate::skills::SkillSource::Skill);
+            let has_model_skill = cfg.skills.iter().any(|s| s.source.model_invocable());
             if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
                 tools.push(crate::tools::skill_tool_def());
             }

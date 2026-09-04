@@ -112,6 +112,10 @@ when it was skipped or blocked.
 9. Work in progress and next step — what was happening immediately before this summary, and \
 the single best next action, with a direct quote from the recent conversation showing where \
 the work left off.
+10. Open candidates — anything noticed but not yet judged: a suspected defect, an \
+inconsistency, a question raised and not answered. One line each, with its location. These \
+are the first thing lost when a session is summarized, and nothing else in this list carries \
+them. Write none when there are none.
 
 Reply with the two blocks only.";
 
@@ -717,6 +721,9 @@ mod tests {
             "direct quote",
             "<analysis>",
             "<summary>",
+            // Plan 119: a suspicion that is noticed but not yet judged fits in
+            // none of the other sections, so compaction used to drop it.
+            "Open candidates",
         ] {
             assert!(
                 COMPACT_INSTRUCTION.contains(clause),
