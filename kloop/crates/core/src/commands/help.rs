@@ -36,7 +36,7 @@ pub fn run(cfg: &Arc<Config>) -> SlashResult {
             output.push_str(&format!(
                 "\n  /{:pad$}  {}{tag}",
                 s.name,
-                s.description,
+                super::skills::one_line(&s.description),
                 pad = pad
             ));
         }

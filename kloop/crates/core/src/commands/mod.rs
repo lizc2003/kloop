@@ -617,6 +617,18 @@ mod tests {
             skills.contains("/code-review") && skills.contains("(builtin)"),
             "{skills}"
         );
+        // The listing is one line per skill: a description carries both what the
+        // skill does and when to use it, so printed whole it wraps to four lines
+        // and buries the next entry. Truncated here, full text via /skills.
+        let entry = skills
+            .lines()
+            .find(|l| l.contains("/code-review"))
+            .expect("the code-review line");
+        assert!(
+            entry.chars().count() < 130,
+            "listing line too long: {entry}"
+        );
+        assert!(entry.contains("..."), "truncated with an ellipsis: {entry}");
         assert!(skills.contains("/skills <name>"), "{skills}");
     }
 
@@ -658,6 +670,13 @@ mod tests {
         )
         .await;
         assert!(one.output.contains("source: builtin"), "{}", one.output);
+        // Naming one skill gives the untruncated description, unlike the listing.
+        assert!(
+            one.output
+                .contains("not for re-reading edits you just made yourself"),
+            "the full description: {}",
+            one.output
+        );
         assert!(
             one.output.contains("failure scenario"),
             "the body is printed in full: {}",

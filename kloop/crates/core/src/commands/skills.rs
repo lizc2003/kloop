@@ -15,6 +15,21 @@ use crate::skills::SkillSource;
 
 pub const SUMMARY: &str = "list the loaded skills, or print one's instructions";
 
+/// One column-friendly line for a listing. A skill's `description` carries both
+/// what it does and when to use it — that is the model's only matching signal,
+/// so it stays long — but printed whole it wraps to four lines per entry and
+/// buries the next one. Newlines collapse (a block-scalar description is still
+/// one field), then it truncates the way `description_from_body` does: 100
+/// chars with an ellipsis. The full text is one `/skills <name>` away.
+pub(super) fn one_line(description: &str) -> String {
+    let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 100 {
+        format!("{}...", flat.chars().take(97).collect::<String>())
+    } else {
+        flat
+    }
+}
+
 /// Where an entry came from, for the listing. A disk skill shows its directory
 /// (which is what distinguishes a project skill from a global one), a builtin
 /// says so, and a user command is labelled — it is `/name`-invocable but the
@@ -39,7 +54,7 @@ pub fn run(args: &str, cfg: &Arc<Config>) -> SlashResult {
             output.push_str(&format!(
                 "\n  /{:pad$}  {}\n  {:pad$}   {}",
                 s.name,
-                s.description,
+                one_line(&s.description),
                 "",
                 origin(s),
                 pad = pad
