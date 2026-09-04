@@ -591,6 +591,7 @@ mod tests {
                     },
                 ],
                 provider_provenance: None,
+                injected: None,
             },
             Message {
                 role: Role::User,
@@ -605,6 +606,7 @@ mod tests {
                     },
                 ],
                 provider_provenance: None,
+                injected: None,
             },
             Message {
                 role: Role::User,
@@ -614,6 +616,7 @@ mod tests {
                     is_error: true,
                 }],
                 provider_provenance: None,
+                injected: None,
             },
         ];
         assert_eq!(
@@ -653,6 +656,7 @@ mod tests {
                 role: Role::User,
                 content: vec![ContentBlock::RedactedThinking { data: "d".into() }],
                 provider_provenance: None,
+                injected: None,
             },
         ];
         let error = to_openai_messages("s", &messages).unwrap_err();
@@ -692,6 +696,7 @@ mod tests {
                 },
             ],
             provider_provenance: None,
+            injected: None,
         }];
         assert_eq!(
             to_openai_messages("s", &messages).unwrap(),

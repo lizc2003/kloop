@@ -13,8 +13,8 @@ use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::Injected;
 use kloop_protocol::Message;
-use kloop_protocol::Role;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 
@@ -238,15 +238,9 @@ struct CompactionPlan {
 }
 
 fn is_existing_summary(message: &Message) -> bool {
-    matches!(
-        message,
-        Message {
-            role: Role::User,
-            content,
-            ..
-        } if content.len() == 1
-            && matches!(&content[0], ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX))
-    )
+    // The producer stamps it; the marker text is for the model to read, not for
+    // this to match on.
+    message.injected == Some(Injected::ContextSummary)
 }
 
 fn plan_compaction(messages: &[Message]) -> std::result::Result<CompactionPlan, NoOpReason> {
@@ -339,14 +333,17 @@ fn build_replacement(
 ) -> Vec<Message> {
     let mut items = Vec::with_capacity(plan.tail.len() + 2);
     if dropped > 0 {
-        items.push(Message::user_text(format!(
-            "{DROPPED_PREFIX}{dropped} message(s) are not represented in the summary below."
-        )));
+        items.push(Message::injected(
+            Injected::DroppedPrefix,
+            format!(
+                "{DROPPED_PREFIX}{dropped} message(s) are not represented in the summary below."
+            ),
+        ));
     }
-    items.push(Message::user_text(format!(
-        "{SUMMARY_PREFIX}{summary}{}",
-        pointer.unwrap_or("")
-    )));
+    items.push(Message::injected(
+        Injected::ContextSummary,
+        format!("{SUMMARY_PREFIX}{summary}{}", pointer.unwrap_or("")),
+    ));
     items.extend_from_slice(&plan.tail);
     items
 }
@@ -564,6 +561,8 @@ async fn sample_summary(
 
 #[cfg(test)]
 mod tests {
+    use kloop_protocol::Role;
+
     use super::*;
     use serde_json::json;
 
@@ -858,7 +857,10 @@ mod tests {
         // kept tail survives verbatim.
         assert_eq!(
             msgs[0],
-            Message::user_text(format!("{SUMMARY_PREFIX}what happened so far"))
+            Message::injected(
+                Injected::ContextSummary,
+                format!("{SUMMARY_PREFIX}what happened so far"),
+            )
         );
         assert_eq!(msgs.last().unwrap(), &Message::user_text("current request"));
         assert!(msgs.len() < 4);
@@ -1208,10 +1210,10 @@ mod tests {
         assert!(matches!(
             history.messages(),
             [
-                Message { role: kloop_protocol::Role::User, content, .. },
-                Message { role: kloop_protocol::Role::Assistant, content: tool_use, .. },
-                Message { role: kloop_protocol::Role::User, content: tool_result, .. },
-                Message { role: kloop_protocol::Role::Assistant, content: tail, .. },
+                Message { role: Role::User, content, .. },
+                Message { role: Role::Assistant, content: tool_use, .. },
+                Message { role: Role::User, content: tool_result, .. },
+                Message { role: Role::Assistant, content: tail, .. },
             ] if content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)))
                 && tool_use.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "t1"))
                 && tool_result.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"))
@@ -1277,7 +1279,10 @@ mod tests {
 
     #[test]
     fn plan_skips_existing_summary_but_allows_new_foldable_messages() {
-        let summary = Message::user_text(format!("{SUMMARY_PREFIX}old summary"));
+        let summary = Message::injected(
+            Injected::ContextSummary,
+            format!("{SUMMARY_PREFIX}old summary"),
+        );
         let current = Message::user_text("current request");
         assert_eq!(
             plan_compaction(&[summary.clone(), current.clone()]),
@@ -1305,7 +1310,10 @@ mod tests {
         ]);
         let cfg = compact_test_cfg(provider, "existing-summary");
         let mut history = History::new(cfg.offload_dir.clone());
-        history.record(Message::user_text(format!("{SUMMARY_PREFIX}old summary")));
+        history.record(Message::injected(
+            Injected::ContextSummary,
+            format!("{SUMMARY_PREFIX}old summary"),
+        ));
         history.record(Message::assistant(vec![ContentBlock::Text {
             text: "old work ".repeat(KEEP_RECENT_TOKENS as usize),
         }]));
@@ -1335,9 +1343,14 @@ mod tests {
                 trigger: CompactionTrigger::Predictive,
             })
         );
+        // The replacement carries the identity, so the next compaction finds it
+        // without reading the marker text.
         assert_eq!(
             history.messages()[0],
-            Message::user_text(format!("{SUMMARY_PREFIX}new summary"))
+            Message::injected(
+                Injected::ContextSummary,
+                format!("{SUMMARY_PREFIX}new summary")
+            )
         );
         assert_eq!(
             history.messages().last(),

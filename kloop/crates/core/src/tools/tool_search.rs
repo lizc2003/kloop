@@ -1722,7 +1722,10 @@ mod tests {
         assert_eq!(stats.kept, 2);
         assert_eq!(
             history.messages()[0],
-            Message::user_text(format!("{}summary", crate::compact::SUMMARY_PREFIX))
+            kloop_protocol::Message::injected(
+                kloop_protocol::Injected::ContextSummary,
+                format!("{}summary", crate::compact::SUMMARY_PREFIX),
+            )
         );
         assert_eq!(
             ctx.cfg.unlocked_tools.receipts(),

@@ -1166,6 +1166,7 @@ mod tests {
                     is_error: false,
                 }],
                 provider_provenance: None,
+                injected: None,
             }
         );
     }

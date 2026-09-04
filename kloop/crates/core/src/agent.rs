@@ -1066,7 +1066,7 @@ fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
             }
             _ => {}
         }
-        history.record(Message::user_text(item.into_message()));
+        history.record(item.into_user_message());
     }
     true
 }
@@ -1076,7 +1076,7 @@ fn drain_local_mailbox(cfg: &Config, history: &mut History, ui: &Arc<dyn Ui>) ->
         return false;
     };
     for item in batch.items().iter().cloned() {
-        history.record(Message::user_text(item.into_message()));
+        history.record(item.into_user_message());
     }
     batch.commit(ui);
     true

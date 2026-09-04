@@ -18,7 +18,6 @@ use kloop_core::event::Delta;
 use kloop_core::event::Event;
 use kloop_core::event::Item;
 use kloop_core::event::ItemStatus;
-use kloop_core::inbox::Replayed;
 use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
@@ -30,6 +29,7 @@ use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TaskGraphSnapshot;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
+use kloop_protocol::Injected;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
 use tokio::sync::oneshot;
@@ -1755,6 +1755,26 @@ fn finish_question(
 /// decides ✓/✗, and an unpaired call renders as failed (resume repair marks
 /// orphans as interrupted errors anyway). Tool-result blocks themselves are
 /// skipped — their content is history-internal.
+/// One line for an injected message: what it was, and which one — two
+/// reinjections in the same turn have to stay apart.
+fn injected_label(injected: &Injected) -> String {
+    match injected {
+        // Handled by the caller, which shows the user's own words instead.
+        Injected::Steering => "steering".into(),
+        Injected::SubAgent { label } => format!("sub-agent result · {label}"),
+        Injected::Program { label } => format!("background program result · {label}"),
+        Injected::Workflow { task_id } => format!("workflow result · {task_id}"),
+        Injected::Shell { id } => format!("background shell update · {id}"),
+        Injected::Scheduled { id } => format!("scheduled task · {id}"),
+        Injected::MissedScheduled { id } => format!("missed scheduled task · {id}"),
+        Injected::SchedulerFailure => "scheduler failure".into(),
+        Injected::PeerMessage { from } => format!("peer agent message · from {from}"),
+        Injected::PeerUndeliverable => "peer agent delivery failure".into(),
+        Injected::ContextSummary => "context summary — earlier messages compacted".into(),
+        Injected::DroppedPrefix => "earlier messages dropped without summarization".into(),
+    }
+}
+
 pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
     // Pair each tool_use with its result: the is_error decides ✓/✗ and the
     // (bounded) content becomes the preview under the row, same as the live path.
@@ -1775,22 +1795,37 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
         .collect();
     let mut cells = Vec::new();
     for message in messages {
+        // A user-role message is not always the user talking: the inbox reinjects
+        // sub-agent results, background output and steering as user text so the
+        // model folds them in, and compaction replaces a folded prefix the same
+        // way. Replaying those verbatim shows machine framing as if it had been
+        // typed — a background sub-agent's summary alone runs past twenty
+        // thousand characters. The producer records what it made, so this reads
+        // that identity rather than the framing prose (which is prompt wording,
+        // and does get reworded).
+        if let Some(injected) = &message.injected {
+            cells.push(match injected {
+                // Steering is the user talking; the framing was for the model.
+                Injected::Steering => Cell::User(
+                    message
+                        .content
+                        .iter()
+                        .find_map(|block| match block {
+                            ContentBlock::Text { text } => {
+                                Some(kloop_core::inbox::steering_body(text).to_string())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                ),
+                other => Cell::Note(injected_label(other)),
+            });
+            continue;
+        }
         for block in &message.content {
             match (message.role, block) {
                 (Role::User, ContentBlock::Text { text }) => {
-                    // Not every user-role message is the user talking: the inbox
-                    // reinjects sub-agent results, background output and steering
-                    // as user text so the model folds them in. Replaying those
-                    // verbatim shows a page of machine framing as if it had been
-                    // typed — a background sub-agent's summary alone runs to
-                    // thousands of characters.
-                    match kloop_core::inbox::replayed(text) {
-                        Some(Replayed::UserText(typed)) => {
-                            cells.push(Cell::User(typed.to_string()))
-                        }
-                        Some(Replayed::Note(note)) => cells.push(Cell::Note(note)),
-                        None => cells.push(Cell::User(text.clone())),
-                    }
+                    cells.push(Cell::User(text.clone()));
                 }
                 // A user image replays as a placeholder line: the base64 is not
                 // shown, only that an image rode this turn.
@@ -3421,8 +3456,9 @@ mod tests {
     }
 
     /// A replayed transcript shows the conversation, not the plumbing: an inbox
-    /// reinjection collapses to one note (the sub-agent summary it carries runs
-    /// to thousands of characters and was never addressed to the reader), and a
+    /// reinjection collapses to one note naming which one it was (the sub-agent
+    /// summary it carries runs past twenty thousand characters and was never
+    /// addressed to the reader), steering gives back the user's own words, and a
     /// run of untimed thinking blocks folds into the single `∗ Thought` row that
     /// says everything each of them would.
     #[test]
@@ -3431,9 +3467,9 @@ mod tests {
             label: "agent-1".into(),
             summary: "P1: the silent path skips validation".into(),
         }
-        .into_message();
+        .into_user_message();
         let steered =
-            kloop_core::inbox::InboxItem::Steer("also check the poller".into()).into_message();
+            kloop_core::inbox::InboxItem::Steer("also check the poller".into()).into_user_message();
         let messages = vec![
             Message::user_text("review these commits"),
             Message::assistant(vec![
@@ -3446,8 +3482,8 @@ mod tests {
                     signature: String::new(),
                 },
             ]),
-            Message::user_text(&reinjected),
-            Message::user_text(&steered),
+            reinjected,
+            steered,
             Message::assistant(vec![ContentBlock::Text {
                 text: "done".into(),
             }]),
@@ -3460,7 +3496,7 @@ mod tests {
                     text: "first\n\nsecond".into(),
                     seconds: None,
                 },
-                Cell::Note("sub-agent result · [Agent agent-1]".into()),
+                Cell::Note("sub-agent result · agent-1".into()),
                 Cell::User("also check the poller".into()),
                 Cell::Assistant("done".into()),
                 Cell::Note("resumed session — 5 message(s)".into()),

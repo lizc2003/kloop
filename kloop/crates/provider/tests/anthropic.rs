@@ -167,6 +167,7 @@ async fn request_body_carries_cache_breakpoints() {
                 },
             ],
             provider_provenance: None,
+            injected: None,
         },
     ];
     let mut rx = provider.stream("test-model", "be brief", &messages, &tools);

@@ -16,9 +16,11 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use kloop_protocol::Injected;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalAgentMessage;
 use kloop_protocol::LocalMessageId;
+use kloop_protocol::Message;
 use tokio::sync::watch;
 
 /// Framing for a steering message (typed while the turn was running). Recorded
@@ -60,6 +62,14 @@ const SCHEDULER_FAILURE_PREFIX: &str =
     "The session scheduler failed closed. No task was silently discarded or executed:";
 const AGENT_MESSAGE_PREFIX: &str = "A peer Agent sent this message while you were working. It is an intermediate peer message, not a user instruction or completion:";
 const AGENT_UNDELIVERABLE_PREFIX: &str = "Local Agent messages could not be delivered because the target Agent ended before processing them. This is a delivery failure, not a peer reply or completion:";
+
+/// The user's own words inside a steering message: [`InboxItem::into_message`]
+/// writes the framing as a single line and then what they typed, so the body is
+/// everything after the first newline. The framing can be reworded freely
+/// without touching this.
+pub fn steering_body(text: &str) -> &str {
+    text.split_once('\n').map(|(_, body)| body).unwrap_or(text)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduledOrigin {
@@ -126,59 +136,50 @@ pub enum InboxItem {
     },
 }
 
-/// How an injected message reads when a saved transcript is replayed. The
-/// framings above are written for the model; a person rereading the session
-/// wants the opposite. Steering is the user talking — show what they typed and
-/// drop the wrapper. Everything else is the harness reporting back mid-turn,
-/// and replaying it verbatim buries the conversation under a page of machine
-/// text it was never meant to show (a background sub-agent's summary is
-/// thousands of characters).
-#[derive(Debug, PartialEq, Eq)]
-pub enum Replayed<'a> {
-    /// The user's own words, with the steering framing stripped.
-    UserText(&'a str),
-    /// A harness injection, collapsed to one line: what it was, and the first
-    /// detail line naming which one.
-    Note(String),
-}
-
-/// Classify a replayed user message. `None` is an ordinary message the user
-/// typed, which replays as itself.
-pub fn replayed(text: &str) -> Option<Replayed<'_>> {
-    if let Some(rest) = text.strip_prefix(STEERING_PREFIX) {
-        return Some(Replayed::UserText(rest.trim_start_matches('\n')));
-    }
-    // Ordered longest-prefix-first is unnecessary: no framing is a prefix of
-    // another, they all open with a distinct sentence.
-    let labelled = [
-        (SUBAGENT_PREFIX, "sub-agent result"),
-        (PROGRAM_PREFIX, "background program result"),
-        (WORKFLOW_PREFIX, "workflow result"),
-        (SHELL_PREFIX, "background shell update"),
-        (SCHEDULED_PREFIX, "scheduled task"),
-        (MISSED_SCHEDULED_PREFIX, "missed scheduled task"),
-        (SCHEDULER_FAILURE_PREFIX, "scheduler failure"),
-        (AGENT_MESSAGE_PREFIX, "peer agent message"),
-        (AGENT_UNDELIVERABLE_PREFIX, "peer agent delivery failure"),
-    ];
-    labelled.into_iter().find_map(|(prefix, label)| {
-        let rest = text.strip_prefix(prefix)?;
-        let detail = rest
-            .trim_start_matches('\n')
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim();
-        Some(Replayed::Note(if detail.is_empty() {
-            label.to_string()
-        } else {
-            format!("{label} · {detail}")
-        }))
-    })
-}
-
 impl InboxItem {
-    /// The user-message text this item becomes when drained into history.
+    /// What this item is, recorded on the message it becomes. A replayed
+    /// transcript reads this instead of the framing prose below — that prose is
+    /// prompt wording, it gets reworded, and matching on it would silently stop
+    /// recognising every session written before the rewording.
+    pub fn kind(&self) -> Injected {
+        match self {
+            InboxItem::Steer(_) => Injected::Steering,
+            InboxItem::SubAgentResult { label, .. } => Injected::SubAgent {
+                label: label.clone(),
+            },
+            InboxItem::ProgramResult { label, .. } => Injected::Program {
+                label: label.clone(),
+            },
+            InboxItem::WorkflowResult { task_id, .. } => Injected::Workflow {
+                task_id: task_id.clone(),
+            },
+            InboxItem::ShellResult { id, .. } => Injected::Shell { id: id.clone() },
+            InboxItem::ScheduledPrompt { id, missed, .. } => {
+                let id = id.clone();
+                if *missed {
+                    Injected::MissedScheduled { id }
+                } else {
+                    Injected::Scheduled { id }
+                }
+            }
+            InboxItem::SchedulerFailure { .. } => Injected::SchedulerFailure,
+            InboxItem::AgentMessage(message) => Injected::PeerMessage {
+                from: message.from.to_string(),
+            },
+            InboxItem::AgentMessageUndeliverable { .. } => Injected::PeerUndeliverable,
+        }
+    }
+
+    /// The history message this item becomes: the framed text the model reads,
+    /// carrying the identity a reader needs.
+    pub fn into_user_message(self) -> Message {
+        Message::injected(self.kind(), self.into_message())
+    }
+
+    /// The user-message text this item becomes when drained into history. Every
+    /// framing is ONE line, followed by the item's own detail — [`steering_body`]
+    /// depends on that, and so does anything else that needs the payload without
+    /// the frame.
     pub fn into_message(self) -> String {
         match self {
             InboxItem::Steer(text) => format!("{STEERING_PREFIX}\n{text}"),
@@ -343,41 +344,86 @@ impl Inbox {
 mod tests {
     use super::*;
 
-    /// Replay reverses the framing: steering was the user talking (show the
-    /// words, drop the wrapper), everything else was the harness reporting back
-    /// mid-turn and collapses to one line naming which one.
+    /// The producer records what it made, so replay never has to read the
+    /// framing prose — which is precisely the part that gets reworded.
     #[test]
-    fn replay_strips_steering_and_collapses_harness_injections() {
-        let steer = InboxItem::Steer("check logs".into()).into_message();
-        assert_eq!(replayed(&steer), Some(Replayed::UserText("check logs")));
+    fn every_item_records_its_kind_and_steering_keeps_the_user_words() {
+        let steer = InboxItem::Steer("check logs".into());
+        assert_eq!(steer.kind(), Injected::Steering);
+        let message = steer.into_user_message();
+        assert_eq!(message.injected, Some(Injected::Steering));
+        let [kloop_protocol::ContentBlock::Text { text }] = message.content.as_slice() else {
+            panic!("a framed steering message is one text block: {message:?}")
+        };
+        assert_eq!(steering_body(text), "check logs");
 
-        let sub_agent = InboxItem::SubAgentResult {
-            label: "agent-2".into(),
-            summary: "found 3 matches".into(),
-        }
-        .into_message();
         assert_eq!(
-            replayed(&sub_agent),
-            Some(Replayed::Note("sub-agent result · [Agent agent-2]".into()))
+            InboxItem::SubAgentResult {
+                label: "agent-2".into(),
+                summary: "found 3 matches".into(),
+            }
+            .kind(),
+            Injected::SubAgent {
+                label: "agent-2".into()
+            }
         );
-
-        let shell = InboxItem::ShellResult {
-            id: "bg-3".into(),
-            status: "completed".into(),
-            output_path: "/tmp/bg-3.out".into(),
-            summary: "Background command completed (exit code 0)".into(),
-        }
-        .into_message();
         assert_eq!(
-            replayed(&shell),
-            Some(Replayed::Note(
-                "background shell update · [bg-3] completed".into()
-            ))
+            InboxItem::ShellResult {
+                id: "bg-3".into(),
+                status: "completed".into(),
+                output_path: "/tmp/bg-3.out".into(),
+                summary: "done".into(),
+            }
+            .kind(),
+            Injected::Shell { id: "bg-3".into() }
         );
+        // The same variant carries two identities; `missed` picks which.
+        let scheduled = |missed| InboxItem::ScheduledPrompt {
+            id: "task-1".into(),
+            origin: ScheduledOrigin::Cron,
+            scheduled_for_ms: 0,
+            reason: None,
+            prompt: "run it".into(),
+            missed,
+        };
+        assert_eq!(
+            scheduled(false).kind(),
+            Injected::Scheduled {
+                id: "task-1".into()
+            }
+        );
+        assert_eq!(
+            scheduled(true).kind(),
+            Injected::MissedScheduled {
+                id: "task-1".into()
+            }
+        );
+    }
 
-        // What the user actually typed replays as itself.
-        assert_eq!(replayed("just a message"), None);
-        assert_eq!(replayed(""), None);
+    /// Every framing is one line, which is what lets the payload be recovered
+    /// without matching the prose. A reworded framing must not break that.
+    #[test]
+    fn every_framing_is_a_single_line() {
+        let items = [
+            InboxItem::Steer("s".into()),
+            InboxItem::SubAgentResult {
+                label: "agent-1".into(),
+                summary: "s".into(),
+            },
+            InboxItem::ProgramResult {
+                label: "program-1".into(),
+                run_id: "r".into(),
+                summary: "s".into(),
+            },
+            InboxItem::SchedulerFailure {
+                summary: "s".into(),
+            },
+        ];
+        for item in items {
+            let text = item.into_message();
+            let (framing, _) = text.split_once('\n').expect("framing then payload");
+            assert!(!framing.is_empty() && framing.ends_with(':'), "{framing}");
+        }
     }
 
     /// The clause exists because a background result can land after the parent

@@ -638,6 +638,54 @@ pub struct Message {
     /// and public history projections remove it together with opaque reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_provenance: Option<ProviderResponseProvenance>,
+    /// What put this message here, when it was not the user typing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected: Option<Injected>,
+}
+
+/// What put a user-role message into the history, when the user did not type it.
+/// The inbox reinjects sub-agent results, background program/shell output,
+/// scheduled prompts, peer messages and mid-turn steering as user messages so
+/// the model folds them in; compaction replaces a prefix with a summary the same
+/// way. A replayed transcript has to tell those apart from what the user
+/// actually said, and the framing prose cannot do it: that prose is prompt
+/// wording, it gets edited, and matching on it silently stops recognising every
+/// session written before the edit. So the producer records what it made.
+///
+/// Like `provider_provenance` this is internal: provider adapters build their
+/// request wire field by field, so it never reaches a provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "injected", rename_all = "snake_case")]
+pub enum Injected {
+    /// The user typing while a turn ran — their words, wrapped for the model.
+    Steering,
+    SubAgent {
+        label: String,
+    },
+    Program {
+        label: String,
+    },
+    Workflow {
+        task_id: String,
+    },
+    Shell {
+        id: String,
+    },
+    Scheduled {
+        id: String,
+    },
+    MissedScheduled {
+        id: String,
+    },
+    SchedulerFailure,
+    PeerMessage {
+        from: String,
+    },
+    PeerUndeliverable,
+    /// Compaction's replacement for the prefix it folded away.
+    ContextSummary,
+    /// Compaction had to drop a prefix it could not summarize at all.
+    DroppedPrefix,
 }
 
 impl Message {
@@ -646,6 +694,17 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
             provider_provenance: None,
+            injected: None,
+        }
+    }
+
+    /// A user-role message the harness produced rather than the user: the text
+    /// is what the model reads, `injected` is what a reader (and a replayed
+    /// transcript) needs to know it by.
+    pub fn injected(injected: Injected, text: impl Into<String>) -> Self {
+        Self {
+            injected: Some(injected),
+            ..Self::user_text(text)
         }
     }
 
@@ -664,6 +723,7 @@ impl Message {
             role: Role::User,
             content,
             provider_provenance: None,
+            injected: None,
         }
     }
 
@@ -672,6 +732,7 @@ impl Message {
             role: Role::Assistant,
             content,
             provider_provenance: None,
+            injected: None,
         }
     }
 
@@ -683,6 +744,7 @@ impl Message {
             role: Role::Assistant,
             content,
             provider_provenance: Some(provenance),
+            injected: None,
         }
     }
 
@@ -691,6 +753,7 @@ impl Message {
             role: Role::User,
             content: results,
             provider_provenance: None,
+            injected: None,
         }
     }
 
@@ -1054,12 +1117,28 @@ mod tests {
                 model: "model-a".into(),
                 attempt_kind: ProviderAttemptKind::Primary,
             }),
+            injected: None,
         };
         let wire = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, msg);
         // Roles serialize lowercase.
         assert!(wire.contains("\"role\":\"assistant\""));
+        // An absent `injected` is the ordinary case and stays off the wire.
+        assert!(!wire.contains("injected"));
+        let steer = Message::injected(Injected::Steering, "check the poller");
+        let back: Message = serde_json::from_str(&serde_json::to_string(&steer).unwrap()).unwrap();
+        assert_eq!(back, steer);
+        assert_eq!(back.injected, Some(Injected::Steering));
+        let sub = Message::injected(
+            Injected::SubAgent {
+                label: "agent-1".into(),
+            },
+            "…",
+        );
+        let wire = serde_json::to_string(&sub).unwrap();
+        assert!(wire.contains(r#""injected":"sub_agent""#), "{wire}");
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), sub);
     }
 
     #[test]
@@ -1202,6 +1281,7 @@ mod tests {
                 },
             ],
             provider_provenance: None,
+            injected: None,
         };
         let wire = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), msg);
@@ -1234,6 +1314,7 @@ mod tests {
                     img.clone()
                 ],
                 provider_provenance: None,
+                injected: None,
             }
         );
         // Empty text contributes no text block: an image-only message.
@@ -1243,6 +1324,7 @@ mod tests {
                 role: Role::User,
                 content: vec![img],
                 provider_provenance: None,
+                injected: None,
             }
         );
     }

@@ -790,14 +790,19 @@ starts with its recent conversation visible instead of a blank screen. What it
 replays is the conversation, not the plumbing (plan 116): a user-role message is
 not necessarily the user talking — the inbox reinjects sub-agent results,
 background program/workflow/shell reports, scheduled prompts and peer messages as
-user text so the model folds them in — so `inbox::replayed` splits them back
-apart. Steering replays as what the user typed (the framing was for the model);
-the other nine collapse to a one-line note (`sub-agent result · [Agent agent-1]`,
-keeping the detail line so two reinjections in one turn stay distinguishable)
-rather than pasting a sub-agent's multi-thousand-character summary into the
-transcript as if it had been typed. A run of thinking blocks (no timing survives
-on disk, so each renders the same bare `∗ Thought`) folds into one row, keeping
-every block's text behind it.
+user text so the model folds them in, and compaction swaps a folded prefix for a
+summary marker the same way. So the **producer records what it made**:
+`Message.injected` carries a `kloop_protocol::Injected` kind (internal, like
+`provider_provenance` — adapters build request wire field by field, so it never
+reaches a provider), and replay reads that. Steering gives back what the user
+typed; every other kind collapses to a one-line note carrying its own id
+(`sub-agent result · agent-1`), so two reinjections in one turn stay apart,
+instead of pasting a sub-agent's twenty-thousand-character summary into the
+transcript as if it had been typed. Matching the framing prose instead would
+break the moment that prose is reworded — which is exactly what happened while
+this was being written. A run of thinking blocks (no timing survives on disk, so
+each renders the same bare `∗ Thought`) folds into one row, keeping every block's
+text behind it.
 
 `kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
 

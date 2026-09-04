@@ -887,11 +887,10 @@ async fn predictive_noop_continues_sampling_without_provider_compaction() {
     let cfg = compaction_cfg(provider, 30_000, "predictive-noop");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
-    history.record(Message::user_text(format!(
-        "{}{}",
-        crate::compact::SUMMARY_PREFIX,
-        "x".repeat(30_000)
-    )));
+    history.record(kloop_protocol::Message::injected(
+        kloop_protocol::Injected::ContextSummary,
+        format!("{}{}", crate::compact::SUMMARY_PREFIX, "x".repeat(30_000)),
+    ));
     history.record(Message::user_text("current request"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -976,10 +975,13 @@ async fn reactive_noop_does_not_retry_after_overflow() {
     let cfg = compaction_cfg(provider, 200_000, "reactive-noop");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
-    history.record(Message::user_text(format!(
-        "{prefix}already compacted",
-        prefix = crate::compact::SUMMARY_PREFIX
-    )));
+    history.record(kloop_protocol::Message::injected(
+        kloop_protocol::Injected::ContextSummary,
+        format!(
+            "{prefix}already compacted",
+            prefix = crate::compact::SUMMARY_PREFIX
+        ),
+    ));
     history.record(Message::user_text("current request"));
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
@@ -3230,7 +3232,7 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.rounds, 2);
-    let steer = Message::user_text(format!("{STEERING_PREFIX}\nalso check the logs"));
+    let steer = crate::inbox::InboxItem::Steer("also check the logs".into()).into_user_message();
     // [user go, assistant tool_use, user tool_results, user steer, assistant done]
     assert_eq!(
         history.messages()[3],
@@ -3453,7 +3455,7 @@ async fn late_steering_keeps_the_turn_going() {
         outcome.rounds, 2,
         "the late steer prevented ending at round 1"
     );
-    let steer = Message::user_text(format!("{STEERING_PREFIX}\nwait, also do Y"));
+    let steer = crate::inbox::InboxItem::Steer("wait, also do Y".into()).into_user_message();
     assert!(history.messages().contains(&steer));
     assert!(cfg.inbox.is_empty(), "the queue was drained");
 }

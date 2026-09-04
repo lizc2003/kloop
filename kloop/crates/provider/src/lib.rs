@@ -722,6 +722,7 @@ mod tests {
                 signature: "opaque".into(),
             }],
             provider_provenance: provenance,
+            injected: None,
         };
         let provider = Provider::mock(Vec::new());
         let attempt = provider.attempt_identity("test", 1, "model-a", ProviderAttemptKind::Primary);

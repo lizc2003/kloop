@@ -501,6 +501,7 @@ mod tests {
                 },
             ],
             provider_provenance: None,
+            injected: None,
         }];
         assert_eq!(
             messages_value(&messages, true),
