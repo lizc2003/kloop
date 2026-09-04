@@ -2584,6 +2584,37 @@ async fn skill_catalog_injected_and_tool_expands_body_inline() {
     );
 }
 
+/// The builtins (plan 119) reach the model with nothing on disk: a registry of
+/// exactly `skills::builtin()` — which is what `--mock` and a skill-less
+/// repository both get — still advertises the `skill` tool and carries the
+/// catalog, with the body still withheld until the skill is triggered.
+#[tokio::test]
+async fn builtin_skills_alone_advertise_the_tool_and_catalog() {
+    use kloop_provider::MockTurn;
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("done"))]);
+    let mut cfg = compaction_cfg(provider, 200_000, "builtin-skills").test_clone();
+    cfg.skills = Arc::new(crate::skills::builtin());
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("review 7fed2427"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].tools.iter().any(|t| t.name == "skill"));
+    let injected = match &seen[0].messages[0].content[0] {
+        ContentBlock::Text { text } => text,
+        other => panic!("expected injected text, got {other:?}"),
+    };
+    assert!(injected.contains("- code-review:"), "{injected}");
+    assert!(
+        !injected.contains("failure scenario"),
+        "the body stays out until triggered: {injected}"
+    );
+}
+
 /// A `context: fork` skill runs as an isolated sub-agent: the model triggers
 /// it, the body becomes the sub-agent's task, and only the sub-agent's final
 /// result comes back as the skill tool_result — the skill body never enters

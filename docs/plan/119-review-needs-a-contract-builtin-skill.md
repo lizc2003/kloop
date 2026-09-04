@@ -187,7 +187,7 @@ not on labels」。那次 kloop 照做了，却把加粗花在了「未发现回
 ## 验证
 
 `cargo fmt` + `cargo clippy --workspace --all-targets` 无警告；
-`cargo test --workspace` 全绿（kloop-core 783、kloop-tui 202，其余分包不变）。
+`cargo test --workspace` 全绿（kloop-core 784、kloop-tui 202，其余分包不变）。
 
 新增测试：
 
@@ -198,6 +198,9 @@ not on labels」。那次 kloop 照做了，却把加粗花在了「未发现回
 - `builtins_ride_the_catalog` — 内置进 catalog，`model_invocable()` 三个变体逐一断言。
 - `a_discovered_skill_replaces_the_builtin_of_the_same_name` — `merge_builtins`
   纯函数：磁盘同名替换内置且不留重名；什么都没发现时内置就是全部注册表。
+- `builtin_skills_alone_advertise_the_tool_and_catalog` — 端到端：注册表里只有
+  内置（`--mock` 和无 skill 仓库拿到的就是这个）时，`skill` 工具照常上场、
+  catalog 里有 `- code-review:`，而 body 仍不泄漏。
 - `native_skills_snapshot_omits_commands_and_bodies` 补断言：内置以
   `SkillScope::Builtin` + 空 `path` 出现在 `skills/list`。
 - `compaction_prompt_keeps_its_load_bearing_clauses` 补 `Open candidates`。
