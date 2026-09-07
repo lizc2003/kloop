@@ -3398,6 +3398,18 @@ async fn slash_commands_surface_as_system_notifications() {
         messages.is_empty(),
         "slash commands must not record user turns: {messages:?}"
     );
+    // Nor a terminal. The terminal is written by run_turn, which a command line
+    // never reaches — a command reads and rewrites History, but nothing is
+    // sampled, so there is no turn to end.
+    let terminals =
+        kloop_core::rollout::inspect_session(&dirs.sessions.join(format!("{tid}.jsonl")))
+            .unwrap()
+            .snapshot()
+            .terminals;
+    assert!(
+        terminals.is_empty(),
+        "a slash command is not a model turn: {terminals:?}"
+    );
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

@@ -1173,10 +1173,15 @@ async fn validated_terminal_usage_is_recorded_before_assistant_message() {
             "message",
             "provider_usage",
             "message",
+            // The turn's terminal closes the file; it is written after every
+            // message the turn produced, so it never lands between the usage
+            // record and the assistant message this test pins.
+            "turn_terminal",
         ]
     );
     assert_eq!(lines[2]["parent"], lines[1]["id"]);
     assert_eq!(lines[3]["parent"], lines[2]["id"]);
+    assert_eq!(lines[4]["status"], "completed");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2442,6 +2447,87 @@ async fn pre_turn_hook_block_prevents_the_turn() {
     );
     assert_eq!(outcome.rounds, 0);
     assert_eq!(history.messages().len(), 1, "nothing recorded");
+}
+
+/// Why a turn stopped is rollout data, not just a UI event: a front end that
+/// only forwards `outcome.reason` leaves the transcript unable to say whether
+/// the turn finished, failed, or was blocked before it began. Both exits that
+/// never reach the loop are covered here — they are the ones that look, from
+/// the transcript alone, like the agent simply stopped answering.
+#[tokio::test]
+async fn every_exit_records_why_the_turn_stopped() {
+    use crate::hooks::HookEvent;
+
+    fn terminals(session: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(session)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["type"] == "turn_terminal")
+            .collect()
+    }
+
+    let dir = std::env::temp_dir().join(format!("kloop-terminals-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+    // A turn that runs and fails: the terminal carries the provider's reason.
+    let refused = dir.join("refused.jsonl");
+    let cfg = compaction_cfg(
+        Provider::mock_scripted(vec![MockTurn::Response {
+            blocks: Vec::new(),
+            outcome: AssistantOutcome::Refused,
+            usage: usage(3),
+        }]),
+        200_000,
+        "terminal-refused",
+    );
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(refused.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("go"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error(TurnError::ProviderOutcome(AssistantOutcome::Refused))
+    );
+    let lines = terminals(&refused);
+    assert_eq!(lines.len(), 1, "exactly one terminal per turn");
+    assert_eq!(lines[0]["status"], "error");
+    assert_eq!(
+        lines[0]["typedError"]["kind"], "provider_outcome",
+        "the typed reason survives, not just its rendered text"
+    );
+
+    // A turn blocked before it starts: nothing is sampled, but the transcript
+    // still says why.
+    let blocked = dir.join("blocked.jsonl");
+    let cfg = hooked_cfg(
+        Provider::mock(vec![vec![AssistantBlock::Text {
+            text: "never sampled".into(),
+        }]]),
+        vec![hook(HookEvent::PreTurn, "echo out of office 1>&2; exit 2")],
+        "terminal-blocked",
+    );
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(blocked.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("go"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.rounds, 0);
+    let lines = terminals(&blocked);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["status"], "error");
+    assert_eq!(
+        lines[0]["error"], "turn blocked by pre_turn hook: out of office",
+        "the blocked turn names the hook that stopped it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Allowing hooks' stdout lands in history as user-message context, in

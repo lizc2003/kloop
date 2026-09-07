@@ -96,6 +96,18 @@ How to verify a claim:
 - Run the affected package's tests when a claim turns on runtime behavior you
   cannot read off the code.
 
+**A fix you suggest gets the same scrutiny as the defect.** Before recommending a
+change, confirm it holds on every branch you have already read — including the
+ones sitting in your own excluded list. A suggestion that introduces a second
+defect is worse than no suggestion: the reader trusts it precisely because the
+diagnosis was right.
+
+**One trigger is not the trigger set.** Once an input reaches the wrong output,
+go back to the branch that let it through and ask what else that branch accepts.
+Boundary values — zero, empty, absent — usually reach it without the contrived
+configuration your first example needed, and they are the ones a document is
+most likely to have already promised.
+
 Do **not** run the project's pre-merge gate — whole-suite tests, full lint, full
 build, docs checks — as a review step. It cannot find the defect you are looking
 for, it costs minutes, and a broken local toolchain then eats a paragraph of the

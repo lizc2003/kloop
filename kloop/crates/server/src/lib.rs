@@ -68,7 +68,6 @@ use kloop_core::rollout;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
-use kloop_core::rollout::TurnTerminal;
 use kloop_core::session_store::SessionDirs;
 use kloop_core::session_store::SessionStore;
 use kloop_protocol::ActiveProviderRoute;
@@ -1753,7 +1752,6 @@ async fn thread_worker(
             &turn,
         )
         .await;
-        history.record_turn_terminal(turn_terminal(&reason));
         ui.emit(&Event::Usage(history.estimated_tokens()));
         ui.notify(
             "turn/completed",
@@ -1773,14 +1771,6 @@ async fn thread_worker(
     let active_worktree = kloop_core::worktree::finish_active(&cfg).await;
     if let Some(note) = active_worktree {
         ui.emit(&Event::Note(note.trim().to_string()));
-    }
-}
-
-fn turn_terminal(reason: &EndReason) -> TurnTerminal {
-    TurnTerminal {
-        status: reason.terminal_status().into(),
-        error: reason.terminal_error().map(ToString::to_string),
-        typed_error: reason.terminal_error().cloned(),
     }
 }
 

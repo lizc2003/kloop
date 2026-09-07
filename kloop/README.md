@@ -283,9 +283,12 @@ estimate and never enters provider replay, public display events, or snapshots.
 The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display `turn_terminal`
 records (completed/maxRounds/aborted/error, positioned after a message index).
-Error terminals add an internal typed provider outcome/failure while preserving
-the protocol 2.0 status/error projection; terminals never enter provider replay
-or token accounting. If a stream fails or is cancelled after visible text, that
+Every turn writes exactly one, from the agent loop's own exits rather than from
+a front end — including the two that end a turn before its first sampling
+request — so a transcript always says why the turn stopped; a slash-command line
+is not a model turn and records none. Error terminals add an internal typed
+provider outcome/failure while preserving the protocol 2.0 status/error
+projection; terminals never enter provider replay or token accounting. If a stream fails or is cancelled after visible text, that
 partial assistant block and its provider provenance are recorded before the
 terminal, so restart/fork keeps the replay boundary without generating a second
 answer. Compaction appends a `compacted` marker line carrying the

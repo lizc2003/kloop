@@ -22,6 +22,7 @@ use kloop_protocol::Message;
 mod sampling;
 
 pub use crate::rollout::TurnError;
+use crate::rollout::TurnTerminal;
 use sampling::SampleOk;
 use sampling::Sampled;
 use sampling::sample_with_retry;
@@ -59,6 +60,14 @@ impl EndReason {
         match self {
             Self::Error(error) => Some(error),
             Self::Completed | Self::MaxRounds | Self::Aborted => None,
+        }
+    }
+
+    pub fn terminal(&self) -> TurnTerminal {
+        TurnTerminal {
+            status: self.terminal_status().into(),
+            error: self.terminal_error().map(ToString::to_string),
+            typed_error: self.terminal_error().cloned(),
         }
     }
 }
@@ -179,6 +188,10 @@ pub(crate) async fn run_turn_in_execution(
     .await
 }
 
+/// Every exit records the turn's terminal state, so a rollout always says why
+/// the turn stopped — including the two exits that never reach the loop. Front
+/// ends must not record it themselves: they would write a second line for the
+/// same turn.
 async fn run_turn_with_options(
     cfg: &Arc<Config>,
     history: &mut History,
@@ -189,10 +202,11 @@ async fn run_turn_with_options(
     enclosing_execution: Option<ExecutionRef>,
 ) -> TurnOutcome {
     if let Err(error) = history.ensure_initial_provider_route(&cfg.provider_route) {
+        let reason =
+            EndReason::Error(format!("provider route initialization failed: {error}").into());
+        history.record_turn_terminal(reason.terminal());
         return TurnOutcome {
-            reason: EndReason::Error(
-                format!("provider route initialization failed: {error}").into(),
-            ),
+            reason,
             final_text: String::new(),
             rounds: 0,
             structured_output: None,
@@ -217,8 +231,11 @@ async fn run_turn_with_options(
             } else {
                 "subagent_start"
             };
+            let blocked =
+                EndReason::Error(format!("turn blocked by {which} hook: {reason}").into());
+            history.record_turn_terminal(blocked.terminal());
             return TurnOutcome {
-                reason: EndReason::Error(format!("turn blocked by {which} hook: {reason}").into()),
+                reason: blocked,
                 final_text: String::new(),
                 rounds: 0,
                 structured_output: None,
@@ -258,6 +275,10 @@ async fn run_turn_with_options(
     for text in stop_context {
         history.record(Message::user_text(text));
     }
+    // The turn's last rollout line. Every message this turn produced — the stop
+    // hook's injected context included — is already recorded, so the terminal is
+    // a true separator and not a marker some later write can slip behind.
+    history.record_turn_terminal(outcome.reason.terminal());
     outcome
 }
 
