@@ -601,6 +601,13 @@ panel is live chrome, counted in the same frozen-height budget as the activity
 and task rows, so a scrollback commit can never scroll it away. Prompts from a
 concurrent tool batch queue and are answered in order.
 
+Notices — a retry, a mode switch, a resumed session, a failed turn — render as
+dim bracketed **notes** (`[error: provider http error: openai-responses http
+403: …]`). A note **wraps** to the terminal width, continuation rows indented one
+column under the bracket, so a provider's error body reads to its end instead of
+being cut at the right edge; past 10 rows it stops and says how many lines it
+dropped (the body of an HTTP error is only bounded at 64 KiB upstream).
+
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
 scrolls into scrollback as the conversation grows. Colour uses a restrained

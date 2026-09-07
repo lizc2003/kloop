@@ -47,6 +47,11 @@ pub(crate) const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// marks errors/deletions, and secondary text is dim.
 pub(crate) const BRAND: Color = Color::Rgb(79, 179, 200);
 
+/// Rows a single [`Cell::Note`] may claim once wrapped. Provider errors carry
+/// the response body (bounded at 64 KiB upstream), which would otherwise push
+/// the whole turn out of the viewport.
+const NOTE_MAX_LINES: usize = 10;
+
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
 /// live thinking block's durations (None when not active); `phase` drives the
@@ -518,14 +523,26 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(rule, DIM)));
         }
         Cell::Note(text) => {
-            lines.push(Line::from(Span::styled(
-                truncate(&format!("[{text}]"), width),
-                DIM,
-            )));
+            // Notes carry provider failures, whose text routinely runs past the
+            // terminal width, so wrap instead of cutting the tail off. The body
+            // of an HTTP error is only bounded at 64 KiB upstream, so cap the
+            // rows a single note may claim and say how many were dropped.
+            let wrapped = wrap(&format!("[{text}]"), width.saturating_sub(1).max(1));
+            let dropped = wrapped.len().saturating_sub(NOTE_MAX_LINES);
+            for (i, l) in wrapped.into_iter().take(NOTE_MAX_LINES).enumerate() {
+                let indent = if i == 0 { "" } else { " " };
+                lines.push(Line::from(Span::styled(format!("{indent}{l}"), DIM)));
+            }
+            if dropped > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(" …(+{dropped} more line(s))"),
+                    DIM,
+                )));
+            }
         }
         Cell::System(text) => {
-            // Slash-command output: dim, but wrapped in full (not collapsed
-            // like a Note) since /help and /cost are multi-line.
+            // Slash-command output: dim, and wrapped in full — /help and /cost
+            // are multi-line by design, so no line cap like a Note's.
             for l in wrap(text, width) {
                 lines.push(Line::from(Span::styled(l, DIM)));
             }
@@ -1724,6 +1741,42 @@ mod tests {
         // A terminal too narrow for the label truncates instead of overflowing.
         let narrow = cell_lines(&Cell::TurnEnd(5), 8);
         assert!(display_width(&line_text(&narrow[1])) <= 8);
+    }
+
+    /// A provider failure arrives as a note; its tail has to survive the wrap
+    /// instead of being cut, with continuation rows aligned under the bracket.
+    #[test]
+    fn note_wraps_long_text_instead_of_truncating() {
+        let cell = Cell::Note(
+            "error: provider http error: openai-responses http 403: \
+             {\"error\":{\"code\":\"model_not_allowed\"}}"
+                .into(),
+        );
+        let lines = cell_lines(&cell, 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.len() > 1, "{texts:?}");
+        assert!(texts[0].starts_with("[error: provider"), "{texts:?}");
+        assert!(texts[1].starts_with(' '), "{texts:?}");
+        assert!(texts.last().unwrap().ends_with("}}]"), "{texts:?}");
+        assert!(
+            texts
+                .concat()
+                .replace(" ", "")
+                .contains("model_not_allowed")
+        );
+        for text in &texts {
+            assert!(display_width(text) <= 40, "{text:?}");
+        }
+    }
+
+    /// A pathological error body (the upstream cap is 64 KiB) must not push the
+    /// turn out of the viewport: cap the rows and say how many were dropped.
+    #[test]
+    fn note_caps_rows_and_reports_the_dropped_ones() {
+        let lines = cell_lines(&Cell::Note("x".repeat(1000)), 50);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts.len(), NOTE_MAX_LINES + 1);
+        assert_eq!(texts.last().unwrap(), " …(+11 more line(s))");
     }
 
     #[test]
