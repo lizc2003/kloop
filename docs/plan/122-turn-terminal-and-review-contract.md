@@ -9,16 +9,21 @@
 
 | | 采样轮 | 工具调用 | 未缓存 input | 命中率 |
 |---|---|---|---|---|
-| kloop（首轮审查） | 17 | 82 | 538k | 73% |
-| codex | 37 | 36 | 2.26M | 64% |
+| kloop（首轮审查） | 18 | 82 | 538k | 73% |
+| codex | 35 | 34 | 1.35M | 73% |
 | claude | 34 | 33 | 0.2M | 96%（Anthropic 直连，不可比） |
 
 codex 与 kloop 这次是**同一个 provider（`gw_router`）、同一个模型
 （`gpt-5.6-sol`）、同一个 API family（Responses）、同一天的同一个任务**，对照
 干净（codex 侧 `model_reasoning_effort = "xhigh"`，kloop 侧 rollout 不记 effort，
-这是唯一未对齐的变量）。**kloop 轮数只有 codex 的一半，总 prompt 是它的三分之一，
-命中率反超 9 个点**——Plan 120 记的「codex 70% / kloop inline 版 51%」那个差距
+这是唯一未对齐的变量）。**kloop 轮数只有 codex 的一半、未缓存 input 是它的
+40%，命中率持平**——Plan 120 记的「codex 70% / kloop inline 版 51%」那个差距
 已经追平。这次不动缓存。
+
+> 数字更正（本条随第二轮追记补入）：初版这张表写的是 kloop 17 轮、codex
+> 「37 轮 / 36 次 / 2.26M / 64%」,并据此说"命中率反超 9 个点"。**那是采数时
+> codex 的会话还没跑完**——它第二轮的 `token_usage_record` 已经混进了第一轮的
+> 累加。按 turn_id 分组重算后命中率是 73% 对 73%,持平。教训见第五节。
 
 ## 二、kloop 的两处实质差距（已在 gateway 源码上核实）
 
@@ -146,3 +151,67 @@ message，server 那处是把命令分支和 turn 分支一起兜了；
 - server 侧 `slash_commands_surface_as_system_notifications` 断言 terminals 为空。
 - README 那段同步成「每个 turn 恰好写一条、来自 agent loop 自己的出口而非前端、
   命令行不写」。
+
+---
+
+## 第二轮追记（2026-09-07 晚）：kloop 在 `ed15d4c3` 上漏报了两条
+
+第一轮的三份报告让 claude 提交了修复 `ed15d4c3`。三家又各审了一次那个修复。
+
+| | 采样轮 | 工具调用 | 未缓存 input | 命中率 | 结论 |
+|---|---|---|---|---|---|
+| kloop | 11 | 27 | 1.03M | 53% | **no findings** |
+| codex | 87 | 83 | 6.99M | 41% | **2 个 P2** |
+| claude | — | — | — | — | 复核两条，第 1 条改处方、第 2 条认账，提交 `58282466` |
+
+**两条都是真问题**（已在 gateway 源码上核实，claude 的复核也确认）：
+
+1. **正数下溢被当成合法零结算。** `upstream/<module>/pricing.go` 自带的
+   `formatCost` 对正数直接 `%.8f`，`4e-09` 变成 `"0.00000000"`;而仓库对这条
+   规则有两个明确 owner——`domain/<file>.go:69`
+   （`cost > 0 && formatted == "0.00000000"` 判不可表示）和
+   `upstream/<file>.go:54`——**只有 <module> 自己那个格式化函数绕开了**。
+   实测症状是 `upstream=0.32000000 / billed=0.00000000 / 无告警`,**静默漏收**。
+   codex 把处方开在 `<file>.go`（不该拿 credits 当零金额的证明）,claude
+   复核后指出那一步不成立——下溢时账本本身就是 0,wire 上的 `cost: 0` 是忠实
+   报账,**错的是账本不是 wire**,于是修在源头。
+2. **文档过度承诺。** `ed15d4c3` 自己新写的 `docs/api/images.md:88` 说"`cost`
+   缺失表示没有可结算的费用事实",但非 credits 图片渠道在合法 `discount=0` 时
+   会产生已结算的零额而 `InjectUsageExtras` 仍省略 `cost`。claude 承认是自己
+   写过头,已收窄。
+
+### kloop 为什么两条都没碰
+
+- **第 1 条**:kloop 第二轮读了 `infra/pricing/precomputed.go`、
+  `<file>.go`、`discount.go`——它已经站在"精度契约"这条线上,
+  **却没有回到被改的那个模块去看它有没有绕开这条契约**。它两轮都没打开
+  `upstream/<module>/pricing.go` 里的 `formatCost`(第一轮引用过同文件的
+  `:46` 讲 discount 合法性,没看紧邻的格式化函数)。
+- **第 2 条**:`ed15d4c3` 的改动清单里有 `docs/api/images.md`,kloop 第二轮
+  读的是 `docs/api/overview.md`,**被这次提交改动的那份文档从未被打开**,
+  排除列表里也没有任何一条与文档有关。
+
+两条合起来是同一个缺口:**改动清单是审查的最小覆盖面,而"这个模块有没有绕开
+系统的通用规则"是一个必须显式问出来的问题**。第三节第 2 条补的两句(验修复
+建议、穷举同一判断点)方向对但不够——它们管的是"已经盯上的那个点",管不了
+"该盯而没盯的点"。
+
+### 两轮的失败模式不同,共同点是早收敛
+
+- 第一轮:82 次工具调用、读得不少,但结论没有回头检验(修复建议在另一条真实
+  分支上会制造更糟的缺陷,触发路径只找了三分之一)。
+- 第二轮:27 次工具调用、11 轮就收敛到 no findings,而 codex 花了 83 次 / 87 轮
+  才把这两条挖出来。
+
+`code-review` skill 现在写着「Finding nothing is a legitimate outcome」,没有
+任何门槛。**"没找到"和"没找"在报告里长得一模一样**,这是第二轮暴露的真正缺口。
+
+## 五、采数教训
+
+第一节那张表的初版数字是错的,因为**采数时 codex 的会话还在跑**:它第二轮的
+`token_usage_record` 已经写进文件,而按逐条累加的口径把两轮混成了一份,于是
+codex 的第一轮被算成"37 轮 / 2.26M / 64%",实际是"35 轮 / 1.35M / 73%"。
+
+判据:**拿别人的会话文件做对照统计之前,先确认那个会话已经结束**;跨 turn 的
+累计字段(codex 的 `turn_token_usage` / `thread_token_usage`)必须按 turn 分组
+取,不能逐条累加。文件还在长的时候,任何"总量"都是快照而不是结论。

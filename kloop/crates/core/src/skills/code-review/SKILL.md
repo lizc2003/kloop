@@ -12,6 +12,11 @@ commit against its parent. Read the whole diff first, then the surrounding code
 the diff does not show — most real defects live in what the change stopped
 doing, not in the lines it added.
 
+The change's own file list is the minimum you have to cover: every file in it
+gets opened, the documentation it touches included. A doc the change writes is a
+promise the change is making, and nothing else in the repository will check it —
+read each sentence against what the code actually guarantees.
+
 ## What counts as a finding
 
 A finding is a defect someone should act on. Each one needs three things:
@@ -96,6 +101,13 @@ How to verify a claim:
 - Run the affected package's tests when a claim turns on runtime behavior you
   cannot read off the code.
 
+**Ask whether this module went around a rule the repository already has.** When
+the change computes, formats, validates, rounds, or truncates a value, find who
+else owns that same decision and compare them. A module carrying its own private
+copy of a shared rule is exactly where the two quietly diverge, and the private
+copy is usually the one missing the guard — the shared one is where the guard
+was added after someone got burned.
+
 **A fix you suggest gets the same scrutiny as the defect.** Before recommending a
 change, confirm it holds on every branch you have already read — including the
 ones sitting in your own excluded list. A suggestion that introduces a second
@@ -125,7 +137,9 @@ two lines on what you ran and what you did not.
 - Every finding carries its `file:line` and its failure scenario. A reader
   should be able to act without re-deriving your reasoning.
 - Finding nothing is a legitimate outcome. Say it in a sentence and show the
-  excluded list; do not pad it into a report.
+  excluded list; do not pad it into a report. But "found nothing" and "did not
+  look" read identically on the page, so before writing it, confirm every file
+  in the change's list was opened and every candidate you raised got a verdict.
 
 ## Scope
 
