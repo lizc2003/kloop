@@ -1,13 +1,20 @@
 use kloop_protocol::ReasoningEffort;
 
 use super::SlashResult;
+use crate::config::Config;
+use crate::history::History;
 use crate::provider_route::SessionProviderState;
 
 pub const SUMMARY: &str = "show or set the session reasoning effort";
 
 const USAGE: &str = "usage: /effort <level> | /effort unset (send no effort field at all)";
 
-pub fn run(args: &str, state: &SessionProviderState) -> SlashResult {
+pub fn run(
+    args: &str,
+    history: &mut History,
+    cfg: &Config,
+    state: &SessionProviderState,
+) -> SlashResult {
     let mut parts = args.split_whitespace();
     let Some(requested) = parts.next() else {
         return SlashResult::message(format!(
@@ -36,7 +43,26 @@ pub fn run(args: &str, state: &SessionProviderState) -> SlashResult {
     if state.effort() == target {
         return SlashResult::message(format!("{}\n{USAGE}", status_line(state)));
     }
-    state.set_effort(target);
+    // A revision can only follow one, and setting the effort before the first
+    // turn is the normal way to start a session — so open the timeline here if
+    // sampling has not already done it. Guarded on emptiness rather than left to
+    // `ensure`'s own idempotence: once the timeline has moved past `cfg`'s
+    // frozen revision, `ensure` reads that as a mismatch and refuses.
+    if !history.has_provider_route()
+        && let Err(error) = history.ensure_initial_provider_route(&cfg.provider_route)
+    {
+        return SlashResult::message(format!("effort not changed: {error}"));
+    }
+    // Recorded as a route revision, so the transcript says which effort each
+    // stretch of the session ran at instead of only how it opened.
+    let committed = state.commit_effort(target, |next| {
+        history
+            .append_provider_route_changed(next, next.continuity())
+            .map(|_| ())
+    });
+    if let Err(error) = committed {
+        return SlashResult::message(format!("effort not changed: {error}"));
+    }
     // Sampling reads the effort off the frozen route, so the front-ends must
     // re-freeze `cfg` before the next turn — the same signal a provider switch
     // raises.

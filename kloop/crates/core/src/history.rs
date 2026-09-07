@@ -156,6 +156,13 @@ impl History {
         self.next_memory_boundary = origin_boundary.saturating_add(1);
     }
 
+    /// Whether this session's route timeline has been opened yet. A revision can
+    /// only follow an existing one, so a caller that wants to append before the
+    /// first turn has to ask.
+    pub fn has_provider_route(&self) -> bool {
+        !self.provider_routes.is_empty()
+    }
+
     pub fn ensure_initial_provider_route(
         &mut self,
         route: &crate::provider_route::FrozenProviderRoute,

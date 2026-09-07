@@ -343,17 +343,118 @@ async fn repeated_lifecycle_frames_are_tolerated_when_the_identity_holds() {
     );
 }
 
-/// The identity check is what actually matters: a second `created` naming a
-/// different response means two of them are multiplexed onto one stream, and
-/// everything after it would be attributed to the wrong one.
+// `a_second_response_identity_still_fails_closed` used to sit here. It pinned
+// "a second `created` with a different id fails the stream" — written before the
+// relay was seen doing exactly that on a retry, with no output in between. The
+// scenario is now split by *when* the new id lands, and the two tests above
+// carry both halves: followed before output, refused after it. Deleted rather
+// than relaxed — a test whose scenario has been re-decided should not keep its
+// old name and its old claim.
+
+/// `status` on the opening frames is descriptive and never read. A relay that
+/// queues the request and says so has changed nothing about what happens next,
+/// so it must not be a protocol violation.
 #[tokio::test]
-async fn a_second_response_identity_still_fails_closed() {
+async fn a_queued_status_on_the_opening_frames_is_not_a_violation() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "queued"}}),
+            json!({"type": "response.in_progress", "response": {"id": "r", "status": "queued"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "a queued opening frame must not fail the stream: {events:?}"
+    );
+}
+
+/// A new identity before any output is an upstream restart — the relay retried
+/// and is now forwarding the real response. Nothing has been attributed yet, so
+/// following it is safe and keeps the turn alive.
+#[tokio::test]
+async fn a_new_identity_before_any_output_is_followed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "first", "status": "in_progress"}}),
+            json!({"type": "response.created", "response": {"id": "retry", "status": "in_progress"}}),
+            json!({"type": "response.in_progress", "response": {"id": "retry", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "retry", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "a restart before output must be followed: {events:?}"
+    );
+}
+
+/// After output has landed the same frame means the opposite: two responses are
+/// sharing one stream, and everything from here would be attributed to the wrong
+/// one. Both ids are named so the next reader does not have to guess.
+#[tokio::test]
+async fn a_new_identity_after_output_still_fails_closed() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
         sse_body(&[
             json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
-            json!({"type": "response.created", "response": {"id": "other", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.in_progress", "response": {"id": "other", "status": "in_progress"}}),
         ]),
     )
     .await;
@@ -362,18 +463,95 @@ async fn a_second_response_identity_still_fails_closed() {
     let error = events
         .into_iter()
         .find_map(|event| event.err())
-        .expect("a conflicting identity must fail the stream");
+        .expect("a conflicting identity after output must fail the stream");
     assert!(!error.is_retryable());
+    let rendered = error.to_string();
+    assert!(rendered.contains("from r to other"), "{rendered}");
+    assert!(rendered.contains("after output had landed"), "{rendered}");
+}
+
+/// A reasoning item that only has a summary omits `content` entirely. Absent and
+/// empty say the same thing here, and demanding the key made a shape choice
+/// upstream into a protocol violation — one that killed the turn after the model
+/// had already done the work.
+#[tokio::test]
+async fn a_reasoning_item_without_a_content_key_is_accepted() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress",
+                "summary": []
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs", "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "delta": "thought"}),
+            json!({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "text": "thought"}),
+            json!({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0,
+                "part": {"type": "summary_text", "text": "thought"}}),
+            // No `content` key at all — the shape this test exists for.
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "completed",
+                "summary": [{"type": "summary_text", "text": "thought"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
     assert!(
-        error
-            .to_string()
-            .contains("response.created identity changed"),
-        "{error}"
+        events.iter().all(|event| event.is_ok()),
+        "an omitted content key must not fail the stream: {events:?}"
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Ok(StreamEvent::BlockDone(AssistantBlock::Thinking { thinking, .. })) if thinking == "thought"
+    )));
+}
+
+/// Absent is tolerated; a present-but-wrong type is still bad data, and the
+/// error now names what actually arrived.
+#[tokio::test]
+async fn a_non_array_parts_field_still_fails_and_names_its_type() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress", "summary": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "completed", "summary": "oops"
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("a non-array parts field must fail the stream");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("reasoning parts was not an array"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("got string"), "{rendered}");
 }
 
 /// Deltas stream for display; complete items arrive whole in
-/// output_item.done; usage (with cached split out) rides response.completed./// Deltas stream for display; complete items arrive whole in
 /// output_item.done; usage (with cached split out) rides response.completed.
 #[tokio::test]
 async fn streams_reasoning_text_and_function_call() {

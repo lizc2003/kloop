@@ -569,9 +569,7 @@ fn finish_message(
     if required_str(&item["role"], "final message role")? != "assistant" {
         return Err(protocol("final output message role was not assistant"));
     }
-    let content = item["content"]
-        .as_array()
-        .ok_or_else(|| protocol("final message content was not an array"))?;
+    let content = parts_array(&item["content"], "message content")?;
     let ItemKind::Message { parts } = state.kind else {
         return Err(protocol("final message referenced the wrong item type"));
     };
@@ -617,14 +615,40 @@ fn finish_message(
         .collect())
 }
 
+/// An absent parts array and an empty one say the same thing: this item carried
+/// none. The relay omits `content` on a reasoning item that only has a summary,
+/// and demanding the key turned a shape choice upstream into a protocol
+/// violation down here. A present-but-wrong type is still bad data — and now
+/// says what it actually was, so the next report does not need a guess.
+fn parts_array<'a>(value: &'a Value, what: &str) -> Result<&'a [Value], ProviderFailure> {
+    match value {
+        Value::Null => Ok(&[]),
+        other => other.as_array().map(Vec::as_slice).ok_or_else(|| {
+            protocol(format!(
+                "final {what} was not an array (got {})",
+                json_type(other)
+            ))
+        }),
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn verify_reasoning_parts(
     final_parts: &Value,
     parts: BTreeMap<u64, ReasoningPart>,
     final_type: &str,
 ) -> Result<Vec<String>, ProviderFailure> {
-    let final_parts = final_parts
-        .as_array()
-        .ok_or_else(|| protocol("final reasoning parts were not an array"))?;
+    let final_parts = parts_array(final_parts, "reasoning parts")?;
     if parts.is_empty() {
         if final_parts.is_empty() {
             return Ok(Vec::new());
@@ -841,29 +865,41 @@ pub(super) async fn stream(
                 // later frame does not repeat. A relay that re-sends one — after
                 // an internal retry, or when merging an upstream stream — has
                 // told us nothing new, and killing the turn over it costs the
-                // whole round. What must still fail closed is a *different*
-                // identity: that is two responses multiplexed onto one stream,
-                // and everything after it would be attributed to the wrong one.
-                "response.created" => {
-                    let (id, status) = response_identity(&value["response"])?;
-                    if status != "in_progress" {
-                        return Err(protocol("created response was not in_progress"));
-                    }
-                    match response_id.as_deref() {
-                        Some(seen) if seen != id => {
-                            return Err(protocol("response.created identity changed"));
+                // whole round.
+                //
+                // Their `status` is descriptive and never read: nothing below
+                // branches on it, and a relay that queues the request and says
+                // so has changed nothing about what we do. Checking it made a
+                // word choice upstream into a protocol violation down here.
+                //
+                // A *different* identity is the one thing that matters, and it
+                // means two things depending on when it lands. Before any output
+                // item, it is an upstream restart — the relay retried and is now
+                // forwarding the real response, and nothing has been attributed
+                // yet, so follow it. After output, it is two responses sharing
+                // one stream, and everything from here would land on the wrong
+                // one: fail closed, naming both ids so the next reader does not
+                // have to guess which half moved.
+                "response.created" | "response.in_progress" => {
+                    let (id, _status) = response_identity(&value["response"])?;
+                    let adopt = match response_id.as_deref() {
+                        None if event == "response.in_progress" => {
+                            return Err(protocol("response.in_progress arrived before created"));
                         }
-                        Some(_) => {}
-                        None => response_id = Some(id.to_string()),
-                    }
-                }
-                "response.in_progress" => {
-                    let expected = response_id
-                        .as_deref()
-                        .ok_or_else(|| protocol("response.in_progress arrived before created"))?;
-                    let (id, status) = response_identity(&value["response"])?;
-                    if id != expected || status != "in_progress" {
-                        return Err(protocol("response.in_progress identity or status changed"));
+                        None => true,
+                        Some(seen) if seen == id => false,
+                        Some(seen) => {
+                            if !seen_items.is_empty() || !completed_blocks.is_empty() {
+                                return Err(protocol(format!(
+                                    "response identity changed from {seen} to {id} after output \
+                                     had landed"
+                                )));
+                            }
+                            true
+                        }
+                    };
+                    if adopt {
+                        response_id = Some(id.to_string());
                     }
                 }
                 "response.output_item.added" => {

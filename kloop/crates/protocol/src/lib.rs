@@ -579,6 +579,13 @@ pub struct ProviderRouteReceipt {
     pub primary_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<String>,
+    /// The reasoning effort this route samples at. Absent means no effort field
+    /// is sent at all, which is a different state from any named level — and the
+    /// one that makes a transcript readable months later, because effort decides
+    /// how much of a turn is reasoning and therefore which failure windows the
+    /// session was even exposed to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
     pub continuity: ReasoningContinuity,
 }
 

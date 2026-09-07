@@ -168,14 +168,24 @@ async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Res
 
     harness.write(b"first turn")?;
     harness.write(ENTER)?;
+    // Wait for the composer, not just for the answer. The turn's last output and
+    // the repainted composer land in different frames, so a predicate that stops
+    // at the text returns a transitional frame — one where "Working" has gone,
+    // the prompt has not yet come back, and typing into it would go nowhere.
+    // Waiting for the prompt costs nothing: if it never returns, this still
+    // fails, just by timeout.
     harness.wait_for("first long turn", Duration::from_secs(8), |frame| {
-        frame.contains("FIRST_OVERFLOW_TAIL") && !frame.contains("Working")
+        frame.contains("FIRST_OVERFLOW_TAIL")
+            && !frame.contains("Working")
+            && frame.contains("Type a message")
     })?;
 
     harness.write(b"second turn")?;
     harness.write(ENTER)?;
     let final_frame = harness.wait_for("second turn", Duration::from_secs(8), |frame| {
-        frame.contains("SECOND_TAIL") && !frame.contains("Working")
+        frame.contains("SECOND_TAIL")
+            && !frame.contains("Working")
+            && frame.contains("Type a message")
     })?;
     assert_eq!(final_frame.count("Type a message"), 1);
     assert_eq!(final_frame.count("[manual]"), 1);

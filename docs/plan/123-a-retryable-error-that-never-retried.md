@@ -121,9 +121,61 @@ turn 当场结束。而网关内部重试或合并上游流时重放开场帧是
 `in_progress_seen` 唯一的用途就是那个计数检查,已删除;`response_id` 保留,终态
 校验仍要用它。
 
-**这两条是同一个模式的两个实例**:一个本可容忍的上游行为被判成永久失败,代价
-是整轮工作。区别在于 `server_error` 那条是「可重试却没重试」,这条是「根本没被
-当成可重试」。
+### 用最新版跑，仍然中断：`identity or status changed`
+
+> 用户装上上面那版之后报的:`[error: provider protocol error: openai-responses
+> response.in_progress identity or status changed]`。
+
+上一版把「来过几次」换成了「身份对不对」,但那个身份检查本身有两个问题:
+
+**其一,`status` 根本不该被检查。** kloop 从这两个开场帧里唯一需要的是"这还是
+同一个响应";`status` 在下面**没有任何一处被读**(终态事件的 status 是另一条
+路径,那里确实消费它)。而 OpenAI Responses 的开场 status 合法取值就包含
+`queued`——网关排队或重试时发 `queued` 完全正常。**检查一个不消费的字段,是把
+上游的用词变成了这里的协议违约。**
+
+**其二,同一个"新 id"在两个时点意味着相反的事。**
+
+- **在任何 output item 之前**:这是上游重启——网关重试后开始转发真正的响应,
+  此时没有任何内容被归属过,跟随新 id 是安全的,turn 保住;
+- **在 output 之后**:两个响应共用一条流,之后所有内容都会记到错的响应上,
+  仍然 fail closed。
+
+顺带把错误信息拆开并带上实际值(`from r to other ... after output had landed`)。
+上一版把两个条件合并成一句 `identity or status changed`——**用户报这个错时,
+无法知道触发的是哪一半**,只能靠推理。这本身就是诊断缺陷,与本文件第四节的
+`error_detail` 同源。
+
+**契约被重新决定,所以旧测试删掉而不是放宽。**
+`a_second_response_identity_still_fails_closed`(上一版刚加的)钉的正是"无 output
+时 id 冲突要失败",而这一版认定那种情况应当跟随。它被删除并留下一行说明,由
+`a_new_identity_before_any_output_is_followed` /
+`a_new_identity_after_output_still_fails_closed` 两条分别承接两半——**一个场景
+被重新裁定之后,不该让旧测试留着旧名字和旧主张。**
+
+### 第三条:可选字段被当成必填 —— `final reasoning parts were not an array`
+
+`finish_reasoning` 对 `item["summary"]` 和 `item["content"]` 都要求必须是数组,
+但 **`content` 在 reasoning item 里是可选字段**:一个只有 summary 的 reasoning
+item 根本不发这个 key,`item["content"]` 于是是 `Null`,`as_array()` 直接失败,
+turn 在模型已经把活干完之后被杀掉。
+
+**为什么一直没暴露**:现有测试的 fixture 全都显式写了 `"content": []`——
+**测试构造的是"理想形状",不是真实上游会发的形状**。
+
+改法:抽出 `parts_array()`,reasoning parts 与 message content 两处都走它——
+缺席按空处理,因为「没有 content」与「content 为空」在这里语义等价。不放松任何
+真正的校验:
+
+- 缺席 + 流里也没有 parts → 正常通过;
+- 缺席 + 流里有 parts → 仍被既有的 `count did not match` 抓住;
+- present 但不是数组(比如字符串)→ 仍然失败,且**现在会说出实际类型**
+  (`got string`)。
+
+**这些都是同一个模式的实例**:上游一个合法但非典型的选择,被 kloop 当成协议违约
+杀掉整个 turn。区别只在于是哪个字段——`server_error` 那条是「可重试却没重试」,
+重复开场帧那条是「根本没被当成可重试」,身份校验那条是「校验了一个不消费的字段」,
+可选字段那条是「把可选当成了必填」。**共同的教训在 HANDOFF 112。**
 
 ## 五、非目标
 

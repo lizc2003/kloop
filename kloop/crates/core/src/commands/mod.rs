@@ -206,7 +206,7 @@ pub async fn run_with_provider_state(
     match name {
         "help" => help::run(cfg),
         "provider" => provider::run(args, history, cfg, provider_state),
-        "effort" => effort::run(args, provider_state),
+        "effort" => effort::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, cancel).await,
         "clear" => clear::run(history, cfg),
@@ -881,6 +881,57 @@ mod tests {
             result.output.contains("blocked by a deny permission rule"),
             "got: {}",
             result.output
+        );
+    }
+
+    /// Effort rides the route timeline, so a transcript says which effort each
+    /// stretch of the session ran at. Recording only the opening value would be
+    /// worse than recording none: it states an answer with confidence and is
+    /// wrong the moment `/effort` is used.
+    #[tokio::test]
+    async fn effort_changes_land_on_the_route_timeline() {
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        let catalog = Arc::new(
+            crate::provider_route::ProviderCatalog::new(vec![
+                crate::provider_route::ProviderCatalogEntry {
+                    id: "responses".into(),
+                    api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                    endpoint_fingerprint: "responses:test".into(),
+                    default_model: "m1".into(),
+                    models: vec!["m1".into()],
+                    fallback_model: None,
+                    availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                    default_effort: None,
+                    factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
+                },
+            ])
+            .unwrap(),
+        );
+        let state =
+            crate::provider_route::SessionProviderState::new(catalog, "responses", None).unwrap();
+        let cancel = CancellationToken::new();
+
+        // Before any turn: setting the effort opens the timeline itself.
+        assert!(!history.has_provider_route());
+        run_with_provider_state("/effort high", &mut history, &cfg, &state, &cancel).await;
+        run_with_provider_state("/effort low", &mut history, &cfg, &state, &cancel).await;
+        // Re-setting the same value is not a revision.
+        run_with_provider_state("/effort low", &mut history, &cfg, &state, &cancel).await;
+        run_with_provider_state("/effort unset", &mut history, &cfg, &state, &cancel).await;
+
+        assert_eq!(
+            history
+                .provider_routes()
+                .iter()
+                .map(|receipt| (receipt.revision, receipt.effort))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, None),
+                (2, Some(kloop_protocol::ReasoningEffort::High)),
+                (3, Some(kloop_protocol::ReasoningEffort::Low)),
+                (4, None),
+            ]
         );
     }
 

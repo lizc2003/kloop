@@ -475,6 +475,45 @@ impl SessionProviderState {
         self.catalog.resolve(provider_id, &target_model).map(|_| ())
     }
 
+    /// Change the session's reasoning effort as a route revision. `/effort` is a
+    /// user decision that changes what every later request looks like, so it
+    /// belongs on the same timeline as a provider switch rather than mutating
+    /// state invisibly — a transcript that recorded only the opening effort
+    /// would state it with confidence and be wrong. `commit` writes the receipt
+    /// and may refuse; nothing lands unless it succeeds. `Ok(None)` means the
+    /// value was already this.
+    pub fn commit_effort<E>(
+        &self,
+        effort: Option<ReasoningEffort>,
+        commit: impl FnOnce(&FrozenProviderRoute) -> Result<(), E>,
+    ) -> Result<Option<FrozenProviderRoute>, E> {
+        let mut state = self.state.lock().unwrap();
+        if state.effort == effort {
+            state.effort_pinned = true;
+            return Ok(None);
+        }
+        let Some(next_revision) = state.revision.checked_add(1) else {
+            // Out of revisions is not a reason to lose the user's choice: apply
+            // it in memory, unrecorded, exactly as before this method existed.
+            state.effort = effort;
+            state.effort_pinned = true;
+            return Ok(None);
+        };
+        // Same provider, same model: nothing about reasoning replay changes, so
+        // the continuity this route already carries rides forward untouched.
+        let next = FrozenProviderRoute::with_continuity(
+            next_revision,
+            state.active.clone(),
+            state.continuity,
+            effort,
+        );
+        commit(&next)?;
+        state.revision = next_revision;
+        state.effort = effort;
+        state.effort_pinned = true;
+        Ok(Some(next))
+    }
+
     pub fn switch_with<E>(
         &self,
         expected_revision: u64,
@@ -766,8 +805,13 @@ impl FrozenProviderRoute {
             endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
             primary_model: self.route.primary_model.clone(),
             fallback_model: self.route.fallback_model.clone(),
+            effort: self.effort,
             continuity,
         }
+    }
+
+    pub fn continuity(&self) -> ReasoningContinuity {
+        self.continuity
     }
 
     pub fn public_route(&self) -> ActiveProviderRoute {
@@ -940,6 +984,7 @@ mod tests {
             endpoint_fingerprint: format!("mock:{provider_id}"),
             primary_model: model.into(),
             fallback_model: None,
+            effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
     }

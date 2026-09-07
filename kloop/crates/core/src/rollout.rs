@@ -567,6 +567,7 @@ impl Rollout {
             ),
             primary_model: "mock".into(),
             fallback_model: None,
+            effort: None,
             continuity: ReasoningContinuity::Preserved,
         };
         self.append_line(RolloutLine::ProviderRouteInitial {
@@ -1840,6 +1841,7 @@ mod tests {
             ),
             primary_model: "mock".into(),
             fallback_model: None,
+            effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
     }
