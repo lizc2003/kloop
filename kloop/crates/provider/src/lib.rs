@@ -173,6 +173,28 @@ pub(crate) fn error_label(error: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
+/// The relay's own sentence about what went wrong, which `error_label` throws
+/// away. Without it a note reads `stream error (server_error)` and the reader
+/// cannot tell an overloaded upstream from a rejected request.
+///
+/// Redacted through the same primitive as an HTTP error body and bounded on top
+/// of it: this text is written by whoever relayed it, at whatever length they
+/// chose, and it lands in a note the TUI renders.
+pub(crate) fn error_detail(error: &Value, secret: &str) -> Option<String> {
+    let message = error["message"].as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let safe = stream::redact_secret(message, secret)?;
+    if safe.chars().count() <= MAX_ERROR_DETAIL_CHARS {
+        return Some(safe);
+    }
+    let truncated: String = safe.chars().take(MAX_ERROR_DETAIL_CHARS).collect();
+    Some(format!("{truncated}…"))
+}
+
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
 /// Classify a faithfully-surfaced stream-error `label` into a typed failure.
 /// Only client-side / permanent conditions are fatal; every other error —
 /// transient upstream, overload, rate limit, or an unrecognized label — defaults
@@ -182,8 +204,11 @@ pub(crate) fn error_label(error: &Value) -> &str {
 /// `after_semantic_output` (see `stream.rs`), so a retryable stream error only
 /// ever replays before any semantic output. Context-window overflow is
 /// classified earlier by each rail and never reaches here.
-pub(crate) fn stream_error(rail: &str, label: &str) -> ProviderFailure {
-    let message = format!("{rail} stream error ({label})");
+pub(crate) fn stream_error(rail: &str, label: &str, detail: Option<String>) -> ProviderFailure {
+    let message = match detail {
+        Some(detail) => format!("{rail} stream error ({label}): {detail}"),
+        None => format!("{rail} stream error ({label})"),
+    };
     if is_fatal_stream_error(label) {
         ProviderFailure::protocol(message)
     } else {

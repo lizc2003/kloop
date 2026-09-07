@@ -444,6 +444,7 @@ pub(super) async fn stream(
                 return Err(crate::stream_error(
                     "openai-compat",
                     crate::error_label(&value["error"]),
+                    crate::error_detail(&value["error"], key),
                 ));
             }
 

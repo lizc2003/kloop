@@ -1659,6 +1659,59 @@ async fn retry_recovers_from_transient_errors() {
     assert_eq!(outcome.final_text, "made it");
 }
 
+/// The gap that used to end a turn on a transient upstream error: reasoning
+/// counts as semantic output, but unsigned reasoning is not replayable, so a
+/// stream that dies after thinking and before any text left nothing to continue
+/// from and nothing to repeat — and both the retry loop and the resume path
+/// declined it. Under a high reasoning effort that window is most of the
+/// request, so a single relayed `server_error` cost the whole turn.
+#[tokio::test]
+async fn a_stream_that_dies_during_reasoning_is_retried_not_ended() {
+    use kloop_provider::MockTurn;
+
+    let thinking = vec![AssistantBlock::Thinking {
+        thinking: "weighing the options".into(),
+        signature: String::new(),
+    }];
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::PartialError(
+            thinking,
+            "openai-responses stream error (server_error)".into(),
+        ),
+        MockTurn::Blocks(text("the answer")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "reasoning-stream-death");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hello"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "the answer");
+    // Retried, not resumed: the second request is the same one over again, so it
+    // carries no partial assistant turn and no resume nudge. Nothing the caller
+    // saw is duplicated, because nothing replayable ever landed.
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].messages, requests[1].messages);
+    assert_eq!(
+        history.messages(),
+        &[
+            Message::user_text("hello"),
+            Message::assistant_from_provider(
+                vec![ContentBlock::Text {
+                    text: "the answer".into(),
+                }],
+                // Boundary 2, not 3: the retry happens inside sampling, so it
+                // adds no history event of its own.
+                cfg.provider_route.primary_attempt().provenance(2),
+            ),
+        ],
+        "the discarded reasoning leaves no empty assistant turn behind"
+    );
+}
+
 /// Once text is visible, a broken stream is closed in place and not retried:
 /// retrying would duplicate a partial answer in every event-driven front-end.
 #[tokio::test]
@@ -1871,6 +1924,11 @@ async fn complete_tool_block_seals_retry_without_dispatching_it() {
         &[Message::user_text("run a tool")],
         "the uncommitted tool block must be dropped, not executed or persisted"
     );
+    // Both this and `a_stream_that_dies_during_reasoning_is_retried_not_ended`
+    // reach sampling with an empty replayable partial — reasoning and a complete
+    // tool call are both dropped on the way there. They must not share a fate:
+    // the model committed to an action here, and asking again can commit it to a
+    // different one.
 }
 
 #[tokio::test]

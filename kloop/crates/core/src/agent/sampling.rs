@@ -218,14 +218,35 @@ async fn sample_once(
                         &think_accum,
                         ItemStatus::Failed,
                     );
-                    return Err(if error.after_semantic_output() {
-                        SampleError::AfterOutput {
-                            error,
-                            partial: replayable_partial(blocks, &text_accum),
-                        }
+                    // Two different things make `replayable_partial` empty, and
+                    // only one of them is safe to re-request. A complete tool
+                    // call means the model already decided to act and the caller
+                    // has seen that decision; asking again can produce a
+                    // different one, so that stays an ending. Unsigned reasoning
+                    // is the other: nothing survives it, so there is nothing a
+                    // re-request could duplicate.
+                    let decided_to_act = blocks
+                        .iter()
+                        .any(|block| matches!(block, AssistantBlock::ToolUse { .. }));
+                    let partial = if error.after_semantic_output() {
+                        replayable_partial(blocks, &text_accum)
+                    } else {
+                        Vec::new()
+                    };
+                    return Err(if !partial.is_empty() || decided_to_act {
+                        SampleError::AfterOutput { error, partial }
                     } else if error.is_context_overflow() {
                         SampleError::Overflow
                     } else {
+                        // Semantic output happened, but only as reasoning that
+                        // cannot be replayed — the half-streamed thinking was
+                        // already sealed Failed and nothing reached history. The
+                        // one reason `AfterOutput` exists is that re-requesting
+                        // would repeat output the caller already has; with
+                        // nothing carried forward there is nothing to repeat. So
+                        // this is an ordinary retryable failure, and skipping the
+                        // retry loop here is what used to end the whole turn on a
+                        // transient `server_error`.
                         SampleError::Provider(error)
                     });
                 }

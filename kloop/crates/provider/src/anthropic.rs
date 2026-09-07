@@ -460,6 +460,7 @@ pub(super) async fn stream(
                     return Err(crate::stream_error(
                         "anthropic",
                         crate::error_label(&value["error"]),
+                        crate::error_detail(&value["error"], key),
                     ));
                 }
                 _ => return Err(protocol("returned an unknown semantic event")),

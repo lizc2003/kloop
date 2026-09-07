@@ -349,14 +349,25 @@ async fn bounded_http_error_body(mut response: reqwest::Response) -> String {
     }
 }
 
-pub(crate) fn sanitized_http_error(text: &str, secret: &str) -> String {
-    if !secret.is_empty() && secret.len() < 8 {
-        return "[response body redacted]".into();
+/// Strip a known credential out of provider-authored text. `None` means the
+/// text cannot be made safe and the caller must drop it wholesale: a secret
+/// short enough to occur by chance cannot be substring-matched without risking
+/// both false negatives on the real thing and mangled output. Every path that
+/// surfaces upstream-authored text goes through here — an SSE error frame is as
+/// capable of echoing an Authorization header as an HTTP body is.
+pub(crate) fn redact_secret(text: &str, secret: &str) -> Option<String> {
+    if secret.is_empty() {
+        return Some(text.to_string());
     }
-    let redacted = if secret.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(secret, "[redacted]")
+    if secret.len() < 8 {
+        return None;
+    }
+    Some(text.replace(secret, "[redacted]"))
+}
+
+pub(crate) fn sanitized_http_error(text: &str, secret: &str) -> String {
+    let Some(redacted) = redact_secret(text, secret) else {
+        return "[response body redacted]".into();
     };
     let mut chars = redacted.chars();
     let mut bounded: String = chars.by_ref().take(4096).collect();

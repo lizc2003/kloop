@@ -108,6 +108,15 @@ copy of a shared rule is exactly where the two quietly diverge, and the private
 copy is usually the one missing the guard — the shared one is where the guard
 was added after someone got burned.
 
+**When the change takes on a class of problem, the rest of that class is in
+scope.** A commit that exists to stop a bad value from being accepted, and
+closes one of the three paths that produce it, has not finished — and the two it
+left are not "pre-existing" in the sense the exclusion list means, because this
+change is the one that claimed the class. Watch hardest at the entry point it
+rewrote: a helper that gains a new signature or delegates to the shared rule,
+yet still hard-codes the old answer for a neighbouring input, has gone from
+merely inheriting that answer to asserting it.
+
 **A fix you suggest gets the same scrutiny as the defect.** Before recommending a
 change, confirm it holds on every branch you have already read — including the
 ones sitting in your own excluded list. A suggestion that introduces a second

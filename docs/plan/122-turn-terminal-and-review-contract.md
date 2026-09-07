@@ -14,9 +14,11 @@
 | claude | 34 | 33 | 0.2M | 96%（Anthropic 直连，不可比） |
 
 codex 与 kloop 这次是**同一个 provider（`gw_router`）、同一个模型
-（`gpt-5.6-sol`）、同一个 API family（Responses）、同一天的同一个任务**，对照
-干净（codex 侧 `model_reasoning_effort = "xhigh"`，kloop 侧 rollout 不记 effort，
-这是唯一未对齐的变量）。**kloop 轮数只有 codex 的一半、未缓存 input 是它的
+（`gpt-5.6-sol`）、同一个 API family（Responses）、同一个 effort（两边都是
+`xhigh`——codex 在 `~/.codex/config.toml` 的 `model_reasoning_effort`，kloop 在
+`~/.kloop/config.toml` 的 `effort`；kloop 的 rollout 不记 effort，初版据此误标为
+"唯一未对齐的变量"，用户指出后核实两边一致）、同一天的同一个任务**，对照干净。
+**投入差异因此不是配置差异,是行为差异。****kloop 轮数只有 codex 的一半、未缓存 input 是它的
 40%，命中率持平**——Plan 120 记的「codex 70% / kloop inline 版 51%」那个差距
 已经追平。这次不动缓存。
 
@@ -205,6 +207,45 @@ message，server 那处是把命令分支和 turn 分支一起兜了；
 
 `code-review` skill 现在写着「Finding nothing is a legitimate outcome」,没有
 任何门槛。**"没找到"和"没找"在报告里长得一模一样**,这是第二轮暴露的真正缺口。
+
+---
+
+## 第三轮追记：反转，以及 skill 的第四条
+
+第二轮的报告让 claude 提交了 `58282466`。三家再审那个修复。
+
+| | 采样轮 | 工具调用 | 未缓存 input | 命中率 | 结论 |
+|---|---|---|---|---|---|
+| kloop | 39 | 75 | 569k | 87% | **1 P1 + 1 P2** |
+| codex | 27 | 24 | 346k | 88% | 3 P1（其中 1 条 kloop 明确排除了）|
+| claude | — | — | — | — | 三条全部核实成立，提交 `a9b4f05b` |
+
+**kloop 这轮投入是 codex 的 1.4 倍，并独立找到了那个 P1**：`58282466` 把「金额
+不可表示」并进了 fail-closed 分支,而 `domain/adapter.go:189` 的契约写着这种
+输出必须保持 **deliverable**;于是已完成的图片任务被丢弃,`gateway/orchestrator`
+还会把无 response 的普通 error 改判成 `Transient` 去重跑一次已经完成的任务。
+claude 承认这是自己引入的方向性错误。
+
+**所以第二轮的塌陷是波动,不是能力上限。** 三轮 kloop 的采样轮数是
+18 → 11 → 39,codex 是 35 → 87 → 27,两边都不稳。
+
+### 唯一的分歧,和它暴露的第四条
+
+codex 报 `formatCost` 仍把 `+Inf` / 精确下溢当合法零(P1),**kloop 明确排除**:
+
+> 父提交中的 `formatCost` 已经完全相同;本提交未引入或加重它,因此按 review
+> 规则排除。
+
+字节级核对属实:`Inf → ("0", true)` 在 `ed15d4c3` 与 `58282466` 里一致,按
+「A pre-existing issue the change did not introduce or worsen」kloop 排得没错。
+但 claude 判它成立并修了,理由是:**`58282466` 这个提交本身就是为了修「不可表示
+金额被当成零结算」这一类问题**,它引入了 `(string, bool)` 新签名、把正数委托给
+`domain.FormatRecordCost`,却把同类的 Inf/NaN 显式留在 `return zeroCost, true`
+——新签名让"这是合法零"从"没表态"变成了一句明确断言。
+
+这是既有三条都管不到的缺口,于是补第四条:**当改动接手了一类问题,这一类的其余
+入口就在范围内**;尤其盯它改写过的那个入口——一个换了签名或改为委托共享规则的
+helper,若仍为相邻输入硬编码旧答案,它就从"继承那个答案"变成了"断言那个答案"。
 
 ## 五、采数教训
 

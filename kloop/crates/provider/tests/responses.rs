@@ -296,7 +296,84 @@ async fn effort_maps_to_reasoning_field() {
     }
 }
 
+/// A relay re-sending the opening lifecycle frames is not a protocol violation.
+/// gateway does it — an internal retry replays `response.created` /
+/// `response.in_progress` — and treating it as one killed the whole turn over a
+/// frame that carries nothing the first one did not.
+#[tokio::test]
+async fn repeated_lifecycle_frames_are_tolerated_when_the_identity_holds() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.in_progress", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.in_progress", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "a repeated opening frame must not fail the stream: {events:?}"
+    );
+}
+
+/// The identity check is what actually matters: a second `created` naming a
+/// different response means two of them are multiplexed onto one stream, and
+/// everything after it would be attributed to the wrong one.
+#[tokio::test]
+async fn a_second_response_identity_still_fails_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.created", "response": {"id": "other", "status": "in_progress"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("a conflicting identity must fail the stream");
+    assert!(!error.is_retryable());
+    assert!(
+        error
+            .to_string()
+            .contains("response.created identity changed"),
+        "{error}"
+    );
+}
+
 /// Deltas stream for display; complete items arrive whole in
+/// output_item.done; usage (with cached split out) rides response.completed./// Deltas stream for display; complete items arrive whole in
 /// output_item.done; usage (with cached split out) rides response.completed.
 #[tokio::test]
 async fn streams_reasoning_text_and_function_call() {

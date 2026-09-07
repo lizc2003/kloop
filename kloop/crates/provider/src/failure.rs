@@ -175,7 +175,15 @@ impl ProviderFailure {
 
 impl fmt::Display for ProviderFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind.label(), self.message)
+        // A retryable protocol failure is an upstream hiccup relayed mid-stream,
+        // not a contract the provider broke. Both used to render as "provider
+        // protocol error", which reads as permanent when it is not — and the
+        // reader has no other way to tell whether re-running is worth it.
+        let label = match (&self.kind, self.retryable) {
+            (ProviderFailureKind::Protocol, true) => "provider stream interrupted",
+            _ => self.kind.label(),
+        };
+        write!(f, "{label}: {}", self.message)
     }
 }
 
@@ -206,6 +214,24 @@ impl ProviderFailureKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two protocol constructors share a kind, so Display is the only thing
+    /// telling a reader whether re-running is worth it.
+    #[test]
+    fn a_retryable_protocol_failure_does_not_read_as_a_permanent_one() {
+        let transient =
+            ProviderFailure::incomplete_protocol("openai-responses stream error (server_error)");
+        let permanent = ProviderFailure::protocol("openai-responses returned an unknown event");
+        assert_eq!(transient.kind(), permanent.kind());
+        assert_eq!(
+            transient.to_string(),
+            "provider stream interrupted: openai-responses stream error (server_error)"
+        );
+        assert_eq!(
+            permanent.to_string(),
+            "provider protocol error: openai-responses returned an unknown event"
+        );
+    }
 
     #[test]
     fn http_retryability_is_an_explicit_status_allowlist() {

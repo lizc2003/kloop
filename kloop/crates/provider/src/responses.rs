@@ -811,7 +811,6 @@ pub(super) async fn stream(
     let mut parser = SseParser::default();
     let mut byte_stream = GuardedBody::new(resp.bytes_stream());
     let mut response_id: Option<String> = None;
-    let mut in_progress_seen = false;
     let mut items: BTreeMap<ItemKey, ItemState> = BTreeMap::new();
     let mut seen_items = HashSet::new();
     let mut completed_blocks = Vec::new();
@@ -837,28 +836,35 @@ pub(super) async fn stream(
                 return Err(protocol("semantic event arrived after response terminal"));
             }
             match event {
+                // `response.created` and `response.in_progress` are pure
+                // lifecycle metadata: they open the response and say nothing a
+                // later frame does not repeat. A relay that re-sends one — after
+                // an internal retry, or when merging an upstream stream — has
+                // told us nothing new, and killing the turn over it costs the
+                // whole round. What must still fail closed is a *different*
+                // identity: that is two responses multiplexed onto one stream,
+                // and everything after it would be attributed to the wrong one.
                 "response.created" => {
-                    if response_id.is_some() {
-                        return Err(protocol("received duplicate response.created"));
-                    }
                     let (id, status) = response_identity(&value["response"])?;
                     if status != "in_progress" {
                         return Err(protocol("created response was not in_progress"));
                     }
-                    response_id = Some(id.to_string());
+                    match response_id.as_deref() {
+                        Some(seen) if seen != id => {
+                            return Err(protocol("response.created identity changed"));
+                        }
+                        Some(_) => {}
+                        None => response_id = Some(id.to_string()),
+                    }
                 }
                 "response.in_progress" => {
                     let expected = response_id
                         .as_deref()
                         .ok_or_else(|| protocol("response.in_progress arrived before created"))?;
-                    if in_progress_seen {
-                        return Err(protocol("received duplicate response.in_progress"));
-                    }
                     let (id, status) = response_identity(&value["response"])?;
                     if id != expected || status != "in_progress" {
                         return Err(protocol("response.in_progress identity or status changed"));
                     }
-                    in_progress_seen = true;
                 }
                 "response.output_item.added" => {
                     if response_id.is_none() {
@@ -1158,6 +1164,7 @@ pub(super) async fn stream(
                     return Err(crate::stream_error(
                         "openai-responses",
                         crate::error_label(error),
+                        crate::error_detail(error, key),
                     ));
                 }
                 "error" => {
@@ -1167,7 +1174,11 @@ pub(super) async fn stream(
                     // The `error` event's own `type` is the envelope ("error"),
                     // so only its `code` names the failure here.
                     let label = value["code"].as_str().unwrap_or("unknown");
-                    return Err(crate::stream_error("openai-responses", label));
+                    return Err(crate::stream_error(
+                        "openai-responses",
+                        label,
+                        crate::error_detail(&value, key),
+                    ));
                 }
                 _ if is_out_of_band(event) => {}
                 // Name the offender: without it a new vendor event costs an SSE

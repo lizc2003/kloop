@@ -538,6 +538,64 @@ async fn named_error_event_surfaces_upstream_error_and_is_retryable() {
     assert!(!error.to_string().contains("unknown SSE event name"));
 }
 
+/// The relay's own sentence reaches the reader. Without it every transient
+/// upstream failure renders as a bare `stream error (server_error)`, which says
+/// the class but not the cause — the note the user is left staring at.
+#[tokio::test]
+async fn named_error_event_carries_the_relayed_message() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {
+        "message": "Upstream service temporarily unavailable",
+        "type": "server_error",
+    }});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.to_string(),
+        "provider stream interrupted: openai-compat stream error (server_error): \
+         Upstream service temporarily unavailable"
+    );
+}
+
+/// A relay that echoes the request's credential into its error message must not
+/// have it read back out in a note. Same rule as the HTTP error body — the SSE
+/// frame is no more trustworthy than the body is.
+#[tokio::test]
+async fn a_relayed_message_never_carries_the_key_back() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {
+        // The key this fixture actually sends (`openai()` above).
+        "message": "rejected Authorization: Bearer test-key",
+        "type": "server_error",
+    }});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    let rendered = error.to_string();
+    assert!(!rendered.contains("test-key"), "{rendered}");
+    assert!(rendered.contains("[redacted]"), "{rendered}");
+}
+
+/// A frame with no usable message still names the class rather than trailing an
+/// empty colon.
+#[tokio::test]
+async fn named_error_event_without_a_message_stays_bare() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {"message": "   ", "type": "server_error"}});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "provider stream interrupted: openai-compat stream error (server_error)"
+    );
+}
+
 /// A named error frame whose type is a client-side/permanent class stays fatal.
 #[tokio::test]
 async fn named_error_event_with_fatal_type_stays_fatal() {
