@@ -819,6 +819,13 @@ impl Usage {
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
     }
+
+    /// Everything the provider counted as prompt for this request. Cached
+    /// reads and cache writes are both prompt; only writes were a miss, which
+    /// is what makes this the denominator of a cache hit rate.
+    pub fn prompt_tokens(self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
 }
 
 /// A provider-produced assistant block. This is intentionally narrower than

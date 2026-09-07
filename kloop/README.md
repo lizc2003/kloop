@@ -2068,8 +2068,14 @@ the model. The set is small and lives one-file-per-command under
   durable provider-reported usage across all models in the current transcript:
   input, output, cache-read input, cache-creation input, and reported-response
   count. An empty ledger is `unavailable`; a reported all-zero response remains
-  available as four zeros. The command reports no prices, billable total,
-  quota, or budget, and it does not aggregate child-agent transcripts.
+  available as four zeros. A final `cache hit: <read> of <prompt> prompt tokens
+  (pct%)` line sums those rows into the prefix-cache hit rate for the whole
+  transcript — cache **creation** counts in the denominator, because writing
+  the prefix means this request did not read it. Plan 120 measured that this
+  rate is a function of how much each round appends, so it belongs where you
+  can watch it mid-session rather than recompute it from a rollout afterwards.
+  The command reports no prices, billable total, quota, or budget, and it does
+  not aggregate child-agent transcripts.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an

@@ -379,7 +379,7 @@ mod tests {
             run("/cost", &mut history, &cfg, &CancellationToken::new())
                 .await
                 .output,
-            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1"
+            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\ncache hit: 0 of 0 prompt tokens (n/a)"
         );
         history.record_provider_usage(ProviderUsageRecord {
             provider_id: "test".into(),
@@ -400,7 +400,7 @@ mod tests {
             .output;
         assert_eq!(
             output,
-            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\n  test/fallback [Mock]: input=10 output=20 cache-read=30 cache-create=40 responses=1"
+            "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\n  test/fallback [Mock]: input=10 output=20 cache-read=30 cache-create=40 responses=1\ncache hit: 30 of 80 prompt tokens (38%)"
         );
         for forbidden in [
             "$", "currency", "price", "quota", "budget", "coverage", "total",
@@ -410,6 +410,57 @@ mod tests {
                 "unexpected {forbidden}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cost_cache_hit_counts_cache_creation_as_a_miss() {
+        use crate::usage::{ProviderUsageRecord, UsageOperation};
+        use kloop_protocol::Usage;
+
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        fn record(history: &mut History, usage: Usage) {
+            history.record_provider_usage(ProviderUsageRecord {
+                provider_id: "test".into(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                route_revision: 1,
+                model: "primary".into(),
+                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
+                operation: UsageOperation::Sampling,
+                usage,
+            });
+        }
+        record(
+            &mut history,
+            Usage {
+                input_tokens: 25,
+                output_tokens: 1_000,
+                cache_read_input_tokens: 75,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        let hit = |output: &str| output.lines().last().unwrap().to_string();
+
+        assert_eq!(
+            hit(&run("/cost", &mut history, &cfg, &CancellationToken::new())
+                .await
+                .output),
+            "cache hit: 75 of 100 prompt tokens (75%)"
+        );
+
+        record(
+            &mut history,
+            Usage {
+                cache_creation_input_tokens: 100,
+                ..Usage::default()
+            },
+        );
+        assert_eq!(
+            hit(&run("/cost", &mut history, &cfg, &CancellationToken::new())
+                .await
+                .output),
+            "cache hit: 75 of 200 prompt tokens (38%)"
+        );
     }
 
     #[tokio::test]

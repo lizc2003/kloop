@@ -73,9 +73,18 @@ parallel; batch them"），而并行度正是单轮增量的来源——一轮 5
 
 无论选哪条，都要先做第四条：
 
-4. **观测**：`/cost` 目前报的是 durable ledger 的累计 usage，不报**命中率**。加一行
-   「cache hit / miss（本会话）」，让这个指标从"事后翻 rollout 才能算"变成随时可见。
-   这是纯读，不改行为，任何一条路都需要它。
+4. ✅ **观测**（本条已实施）：`/cost` 目前报的是 durable ledger 的累计 usage，不报
+   **命中率**。加一行「cache hit / miss（本会话）」，让这个指标从"事后翻 rollout 才能算"
+   变成随时可见。这是纯读，不改行为，任何一条路都需要它。
+
+   落地形状：`/cost` 在 provider/model 分组之后多一行
+   `cache hit: <read> of <prompt> prompt tokens (pct%)`，跨全部分组求和（它回答的是
+   "这个会话在不在读自己的前缀"，不是"哪个模型更会命中"）。分母用新的
+   `Usage::prompt_tokens()` = `input + cache_read + cache_creation`——**cache
+   creation 算在分母里，因为写前缀恰恰说明这一发没读到它**；OpenAI-compat 侧
+   `cache_creation` 恒为 0，于是自动退化成第一节那个 `input + cache_read` 的口径，
+   与本文件的统计可比。空账本仍是 `unavailable`（不多印一行 0），全零响应印
+   `(n/a)` 而不是除零。
 
 ## 四、还需要验证的
 
@@ -100,5 +109,9 @@ parallel; batch them"），而并行度正是单轮增量的来源——一轮 5
 
 - 若实施第 4 条：`/cost` 多一行命中率，`cargo fmt` + `clippy -D warnings` +
   `cargo test --workspace` 全绿，数字与 rollout 里 `provider_usage` 算出来的一致。
+  ✅ 已验：`20260904-153347.jsonl`（85 条 `provider_usage`，`gw_router` /
+  `gpt-5.6-sol`）按同一口径手算是
+  `cache hit: 7381632 of 10401850 prompt tokens (71%)`——即该会话 resume 之后
+  `/cost` 会打印的那一行。
 - 若实施第 1 条：需给出墙钟时间的前后对比，不能只报命中率。
 - 实验记录（增量 × 命中率的对照表）写进本文件末尾，脚本不入库。
