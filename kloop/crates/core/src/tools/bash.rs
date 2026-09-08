@@ -230,7 +230,8 @@ pub(super) async fn bash_tool(
     // disable_sandbox / no policy leaves `sandbox` None and skips it.
     if let Some(policy) = &sandbox
         && !output.status.success()
-        && sandbox::is_likely_sandbox_denied(output.status.code(), &text, !policy.allow_network)
+        && let Some(denial) =
+            sandbox::classify_sandbox_denial(output.status.code(), &text, !policy.allow_network)
     {
         if policy.escalate {
             // The code-level escalation loop (codex's retry-on-denial):
@@ -238,15 +239,19 @@ pub(super) async fn bash_tool(
             // one fewer model round-trip than the disable_sandbox hint.
             match workspace
                 .permissions
-                .escalate_sandbox(command, ctx.depth)
+                .escalate_sandbox(command, Some(&denial), ctx.depth)
                 .await
             {
                 EscalationOutcome::Approved => {
                     let raw =
                         run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel).await?;
+                    // What the sandbox refused is the only record of why this
+                    // ran uncontained, and the sandboxed output is about to be
+                    // dropped for the unsandboxed one. Carrying the line keeps
+                    // the escalation attributable after the fact.
                     return Ok(format!(
                         "{}{}",
-                        sandbox::ESCALATED_PREFIX,
+                        sandbox::escalated_prefix(&denial),
                         format_output(&raw)
                     ));
                 }

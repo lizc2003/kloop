@@ -276,8 +276,24 @@ pub trait ProjectPermissionWriter: Send + Sync {
 #[derive(Clone, Debug)]
 enum Rule {
     Tool(String),
-    BashPrefix { tokens: Vec<String>, wildcard: bool },
-    PathGlob { tool: String, glob: GlobMatcher },
+    BashPrefix {
+        tokens: Vec<String>,
+        wildcard: bool,
+    },
+    PathGlob {
+        tool: String,
+        glob: GlobMatcher,
+    },
+    /// Consent to re-run one bash command *outside* the OS sandbox after it was
+    /// denied inside it. Deliberately its own variant rather than a `bash(...)`
+    /// rule: allowing a command to run is not the same permission as allowing it
+    /// to run uncontained, so neither form may stand in for the other. It never
+    /// matches the ordinary gate (`matches_argv` below) and `bash`/`Tool` rules
+    /// never match an escalation.
+    SandboxEscalatePrefix {
+        tokens: Vec<String>,
+        wildcard: bool,
+    },
 }
 
 impl Rule {
@@ -296,7 +312,24 @@ impl Rule {
                     argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
                 }
             }
-            Rule::PathGlob { .. } => false,
+            Rule::PathGlob { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+        }
+    }
+
+    /// Whether this rule vouches for re-running one parsed bash argv without the
+    /// sandbox. Only the dedicated variant can: a whole-tool `bash` rule or a
+    /// `bash(<prefix>)` rule says the call may run, not that it may run
+    /// uncontained.
+    fn matches_escalation_argv(&self, argv: &[String]) -> bool {
+        match self {
+            Rule::SandboxEscalatePrefix { tokens, wildcard } => {
+                if *wildcard {
+                    argv.len() >= tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
+                } else {
+                    argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
+                }
+            }
+            Rule::Tool(_) | Rule::BashPrefix { .. } | Rule::PathGlob { .. } => false,
         }
     }
 
@@ -319,7 +352,7 @@ impl Rule {
                         || glob.is_match(&facts.normalized)
                         || glob.is_match(&facts.original))
             }
-            Rule::BashPrefix { .. } => false,
+            Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
         }
     }
 }
@@ -341,6 +374,18 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                     bail!("rule 'bash({inner})': empty command pattern");
                 }
                 Ok(Rule::BashPrefix { tokens, wildcard })
+            }
+            "sandbox_escalate" => {
+                let mut tokens: Vec<String> =
+                    inner.split_whitespace().map(str::to_string).collect();
+                let wildcard = tokens.last().is_some_and(|t| t == "*");
+                if wildcard {
+                    tokens.pop();
+                }
+                if tokens.is_empty() {
+                    bail!("rule 'sandbox_escalate({inner})': empty command pattern");
+                }
+                Ok(Rule::SandboxEscalatePrefix { tokens, wildcard })
             }
             "powershell" => {
                 bail!(
@@ -469,6 +514,20 @@ impl ProjectPermissionPolicy {
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
         let state = self.state.read().unwrap();
         allow_rules_match(state.snapshot.allow.parsed(), name, call)
+    }
+
+    /// Whether durable rules consent to re-running every one of these argvs
+    /// outside the sandbox. Strict like `matches_allow`: one uncovered segment
+    /// means the whole command still has to be asked about.
+    fn matches_escalation(&self, argvs: &[Vec<String>]) -> bool {
+        if argvs.is_empty() {
+            return false;
+        }
+        let state = self.state.read().unwrap();
+        let rules = state.snapshot.allow.parsed();
+        argvs
+            .iter()
+            .all(|argv| rules.iter().any(|rule| rule.matches_escalation_argv(argv)))
     }
 
     fn can_persist(&self) -> bool {
@@ -1069,7 +1128,12 @@ impl Permissions {
     /// cleared this gate — deny rules and safety checks sit above the
     /// sandbox layers — so this asks only about removing containment, never
     /// re-litigates whether the command may run.
-    pub async fn escalate_sandbox(&self, command: &str, depth: u8) -> EscalationOutcome {
+    pub async fn escalate_sandbox(
+        &self,
+        command: &str,
+        denial: Option<&crate::sandbox::SandboxDenial>,
+        depth: u8,
+    ) -> EscalationOutcome {
         // Tests / `--mock`: nobody is watching (and the sandbox is off in
         // `--mock` anyway). Don't silently escalate.
         if self.allow_everything {
@@ -1081,27 +1145,153 @@ impl Permissions {
         if self.mode() == Mode::Bypass {
             return EscalationOutcome::Approved;
         }
+        // A remembered escalation answers before the ask, exactly as a durable
+        // allow rule does for the ordinary gate. Opaque scripts produce no
+        // payload and so can never be remembered — the same rule the ordinary
+        // gate follows, and stricter here matters more.
+        let remember = escalation_remember_payload(command);
+        if let Some(remember) = &remember
+            && self.escalation_remembered(remember)
+        {
+            return EscalationOutcome::Approved;
+        }
         let Some(approver) = &self.session.approver else {
             return EscalationOutcome::NotAttempted;
         };
+        let mut approval_scopes = vec![ApprovalScope::Once];
+        if remember.is_some() {
+            approval_scopes.push(ApprovalScope::WorkspaceSession);
+            if self.project.can_persist() {
+                approval_scopes.push(ApprovalScope::Project);
+            }
+        }
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
             title: Some(tool_title("bash").to_string()),
             detail: Some(clip(command)),
             notice: Some(join_notices(
                 sub_agent_notice(depth),
-                "the OS sandbox blocked this — run it without the sandbox?",
+                &describe_denial(denial),
             )),
-            approval_scopes: vec![ApprovalScope::Once],
-            remember_rules: None,
+            approval_scopes: approval_scopes.clone(),
+            remember_rules: remember.as_ref().map(|remember| remember.rules.clone()),
             preview: None,
         };
-        match approver.confirm(req).await {
-            Decision::Allow(ApprovalScope::Once) => EscalationOutcome::Approved,
-            Decision::Allow(ApprovalScope::WorkspaceSession | ApprovalScope::Project)
-            | Decision::Deny => EscalationOutcome::Declined,
+        let decision = approver.confirm(req).await;
+        let Decision::Allow(scope) = decision else {
+            return EscalationOutcome::Declined;
+        };
+        if !approval_scopes.contains(&scope) {
+            return EscalationOutcome::Declined;
+        }
+        match scope {
+            ApprovalScope::Once => EscalationOutcome::Approved,
+            ApprovalScope::WorkspaceSession => {
+                let Some(remember) = remember else {
+                    return EscalationOutcome::Declined;
+                };
+                let mut caches = self.session.cache.lock().unwrap();
+                let cache = caches
+                    .entry(self.identity.workspace_id().clone())
+                    .or_default();
+                let before = cache.signatures.len();
+                cache.signatures.extend(remember.signatures);
+                if cache.signatures.len() != before {
+                    advance_epoch(
+                        &mut cache.capability_epoch,
+                        "workspace permission capability",
+                    );
+                }
+                EscalationOutcome::Approved
+            }
+            ApprovalScope::Project => {
+                let Some(remember) = remember else {
+                    return EscalationOutcome::Declined;
+                };
+                let Ok(additions) = ProjectAllowRules::parse(&remember.rules) else {
+                    return EscalationOutcome::Declined;
+                };
+                // A failed durable write still approves this call — the user
+                // said yes. It just will not be remembered, same as the
+                // ordinary gate's project scope.
+                let _ = self.project.persist(additions).await;
+                EscalationOutcome::Approved
+            }
         }
     }
+
+    /// Whether a durable project rule or this workspace's session cache already
+    /// consented to running these commands uncontained.
+    fn escalation_remembered(&self, remember: &Remember) -> bool {
+        if self.project.matches_escalation(&remember.argvs) {
+            return true;
+        }
+        let caches = self.session.cache.lock().unwrap();
+        caches
+            .get(self.identity.workspace_id())
+            .is_some_and(|cache| {
+                remember
+                    .signatures
+                    .iter()
+                    .all(|signature| cache.signatures.contains(signature))
+            })
+    }
+}
+
+/// What the sandbox actually refused, for the approval prompt. "The sandbox
+/// blocked this" alone is the one thing the reader already knows; the class and
+/// the line that proves it are what decide whether the answer is a writable
+/// root, the network switch, or a different command.
+fn describe_denial(denial: Option<&crate::sandbox::SandboxDenial>) -> String {
+    let Some(denial) = denial else {
+        return "the OS sandbox blocked this — run it without the sandbox?".to_string();
+    };
+    format!(
+        "the OS sandbox blocked this ({}) — run it without the sandbox?\n{}",
+        denial.kind.label(),
+        denial.evidence
+    )
+}
+
+/// Escalation consent is remembered at the same granularity the ordinary gate
+/// uses for bash — a two-word command prefix per segment — but under its own
+/// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
+/// are different permissions. Read-only segments are *not* skipped the way
+/// `remember_payload` skips them: a read-only command still had to be denied to
+/// get here, so it is part of what is being consented to. `None` = opaque
+/// script or a token that would corrupt a rule string, i.e. not remember-able.
+fn escalation_remember_payload(command: &str) -> Option<Remember> {
+    let BashAnalysis::Commands(cmds) = analyze_bash(command) else {
+        return None;
+    };
+    let mut rules = Vec::new();
+    let mut signatures = Vec::new();
+    let mut argvs = Vec::new();
+    for argv in cmds {
+        let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
+        if prefix.is_empty()
+            || prefix
+                .iter()
+                .any(|t| t.contains(['(', ')', ',']) || t.chars().any(char::is_whitespace))
+        {
+            return None;
+        }
+        let head = prefix.join(" ");
+        let rule = format!("sandbox_escalate({head} *)");
+        if !rules.contains(&rule) {
+            rules.push(rule);
+            signatures.push(format!("sandbox_escalate:{head}"));
+        }
+        argvs.push(argv);
+    }
+    if rules.is_empty() {
+        return None;
+    }
+    Some(Remember {
+        rules,
+        signatures,
+        argvs,
+    })
 }
 
 fn user_denial(name: &str) -> String {
@@ -1699,6 +1889,11 @@ struct Remember {
     rules: Vec<String>,
     /// Session-cache keys, one per non-covered segment / path scope.
     signatures: Vec<String>,
+    /// The parsed argv of each remembered segment. Only the sandbox-escalation
+    /// path reads this — it has to test the command against durable rules
+    /// itself, where the ordinary gate has already done that upstream. Empty
+    /// for the ordinary gate's payloads.
+    argvs: Vec<Vec<String>>,
 }
 
 /// cc's "always allow" granularity: bash remembers a two-word command
@@ -1737,7 +1932,11 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
             if rules.is_empty() {
                 return None;
             }
-            Some(Remember { rules, signatures })
+            Some(Remember {
+                rules,
+                signatures,
+                argvs: Vec::new(),
+            })
         }
         (Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque), _) => None,
         (None, Some(path)) => {
@@ -1756,11 +1955,13 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
             Some(Remember {
                 rules: vec![format!("{name}({pattern})")],
                 signatures: vec![format!("{name}:{scope}")],
+                argvs: Vec::new(),
             })
         }
         (None, None) => Some(Remember {
             rules: vec![name.to_string()],
             signatures: vec![name.to_string()],
+            argvs: Vec::new(),
         }),
     }
 }
@@ -2960,11 +3161,11 @@ mod tests {
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("npm install", 0).await,
+            p.escalate_sandbox("npm install", None, 0).await,
             EscalationOutcome::Approved
         );
         assert_eq!(
-            p.escalate_sandbox("git push", 0).await,
+            p.escalate_sandbox("git push", None, 0).await,
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 2);
@@ -2978,14 +3179,16 @@ mod tests {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("curl x", 0).await,
+            p.escalate_sandbox("curl x", None, 0).await,
             EscalationOutcome::Approved
         );
         assert_eq!(approver.ask_count(), 0, "bypass does not prompt");
 
         // allow_all (tests / --mock): never auto-escalate.
         assert_eq!(
-            Permissions::allow_all().escalate_sandbox("rm x", 0).await,
+            Permissions::allow_all()
+                .escalate_sandbox("rm x", None, 0)
+                .await,
             EscalationOutcome::NotAttempted
         );
 
@@ -2998,9 +3201,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            p.escalate_sandbox("touch x", 0).await,
+            p.escalate_sandbox("touch x", None, 0).await,
             EscalationOutcome::NotAttempted
         );
+    }
+
+    /// The escalation ask is remember-able like any other: answering with the
+    /// workspace scope records `sandbox_escalate(...)` and the next identical
+    /// command escalates without a second prompt. This is the whole point —
+    /// one real session asked about the same `go test` over and over.
+    #[tokio::test]
+    async fn a_remembered_escalation_is_not_asked_again() {
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+
+        assert_eq!(
+            p.escalate_sandbox("go test ./pkg -run X", None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(approver.ask_count(), 1);
+        assert_eq!(
+            approver.asked()[0].remember_rules,
+            Some(vec!["sandbox_escalate(go test *)".to_string()]),
+            "the offered rule is escalation-specific, not bash(...)"
+        );
+        assert!(
+            approver.asked()[0]
+                .approval_scopes
+                .contains(&ApprovalScope::WorkspaceSession)
+        );
+
+        // Same two-word prefix, different arguments: covered, no second ask.
+        assert_eq!(
+            p.escalate_sandbox("go test ./other", None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(approver.ask_count(), 1, "remembered, so not asked again");
+
+        // A different command is still asked about (the scripted approver is
+        // exhausted, so a prompt would deny — which is what proves it asked).
+        assert_eq!(
+            p.escalate_sandbox("cargo build", None, 0).await,
+            EscalationOutcome::Declined
+        );
+        assert_eq!(approver.ask_count(), 2);
+    }
+
+    /// An opaque script (pipes, redirection) cannot be remembered, exactly as
+    /// the ordinary gate refuses to remember one — so it is offered `Once` only
+    /// and asked again every time.
+    #[tokio::test]
+    async fn an_opaque_command_offers_no_remember() {
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let cmd = "go test ./... > /tmp/out 2>&1";
+
+        assert_eq!(
+            p.escalate_sandbox(cmd, None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(
+            approver.asked()[0].approval_scopes,
+            vec![ApprovalScope::Once]
+        );
+        assert_eq!(approver.asked()[0].remember_rules, None);
+
+        assert_eq!(
+            p.escalate_sandbox(cmd, None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(approver.ask_count(), 2, "opaque is never remembered");
+    }
+
+    /// What the sandbox refused rides the prompt. Without it the notice tells
+    /// the reader only that the sandbox blocked something, which is the one
+    /// thing they already knew — and a blocked socket and a blocked write are
+    /// answered with completely different knobs.
+    #[tokio::test]
+    async fn the_escalation_prompt_says_what_was_blocked() {
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let denial = crate::sandbox::SandboxDenial {
+            kind: crate::sandbox::DenialKind::Network,
+            evidence: "listen tcp6 [::1]:0: bind: operation not permitted".to_string(),
+        };
+        p.escalate_sandbox("go test ./pkg", Some(&denial), 0).await;
+        let notice = approver.asked()[0]
+            .notice
+            .clone()
+            .expect("the escalation ask carries a notice");
+        assert!(notice.contains("(network)"), "{notice}");
+        assert!(
+            notice.contains("listen tcp6 [::1]:0: bind: operation not permitted"),
+            "{notice}"
+        );
+    }
+
+    /// "May run" and "may run outside the sandbox" are different permissions,
+    /// so neither rule form may stand in for the other.
+    #[test]
+    fn escalation_rules_and_bash_rules_do_not_substitute_for_each_other() {
+        let argv = vec!["go".to_string(), "test".to_string(), "./pkg".to_string()];
+        let escalate = parse_rule("sandbox_escalate(go test *)").unwrap();
+        let bash = parse_rule("bash(go test *)").unwrap();
+        let whole_tool = parse_rule("bash").unwrap();
+
+        assert!(escalate.matches_escalation_argv(&argv));
+        assert!(
+            !bash.matches_escalation_argv(&argv),
+            "bash(...) is not consent to uncontained"
+        );
+        assert!(
+            !whole_tool.matches_escalation_argv(&argv),
+            "the whole-tool bash rule is not consent to uncontained either"
+        );
+
+        assert!(bash.matches_argv(&argv));
+        assert!(
+            !escalate.matches_argv(&argv),
+            "escalation consent does not let the command past the ordinary gate"
+        );
+        assert!(!escalate.matches_tool("bash"));
     }
 
     #[tokio::test]

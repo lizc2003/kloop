@@ -1923,7 +1923,23 @@ disables network), there are two escalation paths:
   that one call with `disable_sandbox: true`, which faces the permission
   gate like any call and is tagged `[no sandbox]` in the approval prompt.
 
-Either way, escalation is per call — the next command is sandboxed again —
+The escalation ask says **what** was refused — `file write`, `network`, or
+`unclassified`, plus the failure line that proves it. A blocked socket and a
+blocked write both read as `operation not permitted` on macOS and are answered
+with completely different knobs, so the class is the actionable half; the same
+line is carried into the escalated result, which is otherwise the only record of
+why containment was removed.
+
+Escalation consent is **remember-able** at the same granularity bash approvals
+use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
+rule. It is deliberately not a `bash(...)` rule: *may run* and *may run
+uncontained* are different permissions, so neither form matches the other's
+check. Opaque scripts (pipes, redirection) offer no remember and are asked every
+time, as with the ordinary gate. Without this a test suite that binds a local
+port re-asked on every run — one measured review spent 20 minutes of its 63 on
+escalation round-trips, against 1 minute for the same review without them.
+
+Otherwise escalation is per call — the next command is sandboxed again —
 and the command already cleared the permission gate (deny rules and safety
 checks sit above the sandbox), so escalation asks only about removing
 containment.

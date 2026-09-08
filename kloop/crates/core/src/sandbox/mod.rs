@@ -39,6 +39,18 @@ pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file 
 /// left hanging.
 pub const ESCALATED_PREFIX: &str = "[Re-ran without the sandbox after user approval.]\n";
 
+/// The same marker carrying what the sandbox had refused. The unsandboxed run
+/// replaces the contained one, so without this line the only record of *why*
+/// containment was removed is gone — which is what made one 107-minute
+/// escalation impossible to attribute afterwards.
+pub fn escalated_prefix(denial: &SandboxDenial) -> String {
+    format!(
+        "[Re-ran without the sandbox after user approval; it had been denied ({}): {}]\n",
+        denial.kind.label(),
+        denial.evidence
+    )
+}
+
 /// Appended when the user was asked to escalate and declined. Unlike
 /// [`DENIAL_HINT`] it must NOT invite a disable_sandbox retry — the user
 /// already said no.
@@ -398,30 +410,134 @@ pub fn is_likely_sandbox_denied(
     output: &str,
     network_disabled: bool,
 ) -> bool {
+    classify_sandbox_denial(exit_code, output, network_disabled).is_some()
+}
+
+/// Which containment the command ran into. The class is the actionable half:
+/// a blocked write is answered by a writable root, a blocked socket by the
+/// network switch, and on macOS both of them say `operation not permitted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenialKind {
+    Write,
+    Network,
+    /// Denial-shaped, but the line does not say which resource. Reported as
+    /// such rather than guessed at — a wrong label sends the reader after the
+    /// wrong knob.
+    Unclassified,
+}
+
+impl DenialKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            DenialKind::Write => "file write",
+            DenialKind::Network => "network",
+            DenialKind::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// A sandboxed failure that looks like a denial, carrying the line that says
+/// so. Without the line the user is told only that "the sandbox blocked this",
+/// which is the one thing they already know.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxDenial {
+    pub kind: DenialKind,
+    pub evidence: String,
+}
+
+const MAX_DENIAL_EVIDENCE_CHARS: usize = 200;
+
+/// Denial-shaped failure texts. `sandbox`/`seccomp`/`landlock` name the
+/// mechanism; the rest are what the OS actually returns through libc.
+const DENIED_KEYWORDS: [&str; 7] = [
+    "operation not permitted",
+    "permission denied",
+    "read-only file system",
+    "seccomp",
+    "sandbox",
+    "landlock",
+    "failed to write file",
+];
+
+/// getaddrinfo failure texts across curl / git / python / node. Only meaningful
+/// when the sandbox actually disabled the network — otherwise a real DNS outage
+/// would read as containment.
+const DNS_KEYWORDS: [&str; 4] = [
+    "could not resolve host",
+    "name resolution",
+    "nodename nor servname",
+    "getaddrinfo",
+];
+
+/// Socket-layer verbs. `dial`/`bind`/`listen`/`connect` cover Go, C, Python and
+/// Node phrasings of the same refusal.
+const NETWORK_HINTS: [&str; 8] = [
+    "bind",
+    "listen",
+    "connect",
+    "dial",
+    "socket",
+    "network is unreachable",
+    "no route to host",
+    "tcp",
+];
+
+/// Filesystem verbs, for the same reason.
+const WRITE_HINTS: [&str; 9] = [
+    "mkdir",
+    "open",
+    "create",
+    "write",
+    "rename",
+    "unlink",
+    "remove",
+    "chmod",
+    "read-only file system",
+];
+
+/// The failure line that made this look like a denial, plus what it was denied.
+/// `None` means the failure does not look like containment at all.
+pub fn classify_sandbox_denial(
+    exit_code: Option<i32>,
+    output: &str,
+    network_disabled: bool,
+) -> Option<SandboxDenial> {
     if exit_code == Some(0) {
-        return false;
+        return None;
     }
-    const DENIED_KEYWORDS: [&str; 7] = [
-        "operation not permitted",
-        "permission denied",
-        "read-only file system",
-        "seccomp",
-        "sandbox",
-        "landlock",
-        "failed to write file",
-    ];
-    // getaddrinfo failure texts across curl / git / python / node.
-    const DNS_KEYWORDS: [&str; 4] = [
-        "could not resolve host",
-        "name resolution",
-        "nodename nor servname",
-        "getaddrinfo",
-    ];
-    let lower = output.to_lowercase();
-    if DENIED_KEYWORDS.iter().any(|k| lower.contains(k)) {
-        return true;
+    // Per line, so the evidence handed back is the sentence that matched rather
+    // than the whole (possibly enormous) output, and so the network/write hints
+    // are read from the *same* line as the denial — a build log mentioning
+    // "connect" ten lines above a write denial must not turn it into a network
+    // verdict.
+    for line in output.lines() {
+        let lower = line.to_lowercase();
+        let denied = DENIED_KEYWORDS.iter().any(|k| lower.contains(k));
+        let dns = network_disabled && DNS_KEYWORDS.iter().any(|k| lower.contains(k));
+        if !denied && !dns {
+            continue;
+        }
+        let kind = if dns || NETWORK_HINTS.iter().any(|h| lower.contains(h)) {
+            DenialKind::Network
+        } else if WRITE_HINTS.iter().any(|h| lower.contains(h)) {
+            DenialKind::Write
+        } else {
+            DenialKind::Unclassified
+        };
+        return Some(SandboxDenial {
+            kind,
+            evidence: clip_evidence(line.trim()),
+        });
     }
-    network_disabled && DNS_KEYWORDS.iter().any(|k| lower.contains(k))
+    None
+}
+
+fn clip_evidence(line: &str) -> String {
+    if line.chars().count() <= MAX_DENIAL_EVIDENCE_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_DENIAL_EVIDENCE_CHARS).collect();
+    format!("{head}…")
 }
 
 #[cfg(test)]
@@ -579,6 +695,84 @@ mod tests {
             );
         }
         assert!(!policy.allow_network);
+    }
+
+    /// The class is the actionable half of a denial: on macOS a blocked socket
+    /// and a blocked write both say `operation not permitted`, and they are
+    /// answered with different knobs. The evidence is the line that matched, so
+    /// the reader sees the sentence rather than the whole build log.
+    #[test]
+    fn a_denial_is_classified_and_carries_the_line_that_proves_it() {
+        let network = classify_sandbox_denial(
+            Some(1),
+            "--- FAIL: TestPricing\n    panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: bind: operation not permitted\n",
+            true,
+        )
+        .expect("denial-shaped");
+        assert_eq!(network.kind, DenialKind::Network);
+        assert_eq!(
+            network.evidence,
+            "panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: bind: operation not permitted"
+        );
+
+        let write = classify_sandbox_denial(
+            Some(1),
+            "go: creating work dir: mkdir /var/folders/x/T/go-build1: operation not permitted",
+            false,
+        )
+        .expect("denial-shaped");
+        assert_eq!(write.kind, DenialKind::Write);
+
+        // Denial-shaped but silent about the resource: reported as such rather
+        // than guessed at, because a wrong label sends the reader to the wrong
+        // knob.
+        let bare = classify_sandbox_denial(Some(1), "sandbox: deny", false).expect("denial-shaped");
+        assert_eq!(bare.kind, DenialKind::Unclassified);
+
+        // DNS text only counts as a denial when the sandbox actually cut the
+        // network — otherwise a real outage would read as containment.
+        assert!(classify_sandbox_denial(Some(1), "could not resolve host", false).is_none());
+        assert_eq!(
+            classify_sandbox_denial(Some(1), "could not resolve host", true)
+                .expect("denial-shaped")
+                .kind,
+            DenialKind::Network
+        );
+
+        // Success is never a denial, whatever the output says.
+        assert!(classify_sandbox_denial(Some(0), "operation not permitted", true).is_none());
+    }
+
+    /// Hints are read from the *same* line as the denial. A build log that
+    /// mentions a socket ten lines above a write denial must not turn the write
+    /// into a network verdict.
+    #[test]
+    fn classification_does_not_read_hints_across_lines() {
+        let denial = classify_sandbox_denial(
+            Some(1),
+            "connecting to tcp cache server\nmore chatter\nopen /Users/x/Library/Caches/f: operation not permitted",
+            true,
+        )
+        .expect("denial-shaped");
+        assert_eq!(denial.kind, DenialKind::Write);
+        assert!(
+            denial.evidence.starts_with("open /Users/x/"),
+            "{}",
+            denial.evidence
+        );
+    }
+
+    /// The escalated result keeps what had been refused: the unsandboxed run
+    /// replaces the contained one, so this line is the only record left of why
+    /// containment was removed.
+    #[test]
+    fn the_escalated_marker_carries_the_denial() {
+        let marker = escalated_prefix(&SandboxDenial {
+            kind: DenialKind::Network,
+            evidence: "bind: operation not permitted".to_string(),
+        });
+        assert!(marker.contains("(network)"), "{marker}");
+        assert!(marker.contains("bind: operation not permitted"), "{marker}");
     }
 
     /// The toolchain cache is the one writable root that exists for a compiler
