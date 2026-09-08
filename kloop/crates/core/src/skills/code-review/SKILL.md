@@ -47,14 +47,25 @@ Do not report these; if you investigated one, it goes in the excluded list:
 
 ## Every candidate gets a verdict, in writing
 
-Keep a list of every suspicion you investigate. Before writing the report, each
-one is exactly one of:
+Write a candidate down when it first occurs to you, in the visible text of the
+turn — not in reasoning you cannot read back. Twenty tool calls later, when you
+come to write the report, a suspicion you only thought about is gone, and it
+goes without a verdict because it goes without a trace. The list you can still
+see is the list that survives.
+
+Before writing the report, each one is exactly one of:
 
 - **confirmed** — report it.
 - **downgraded** — real, but smaller than it first looked. Report it at its true
   severity and say what reduced it.
 - **excluded** — one of the cases above, or otherwise not a defect. One line,
-  with the reason.
+  with the reason. **The change's own words are not that reason.** "The commit
+  message says it only touches the background path", "the new doc says the
+  foreground is unchanged" — that is the author's belief, and whether the belief
+  holds is the candidate you are holding. An exclusion names the consequence you
+  traced and why it is harmless. When the only thing standing between you and
+  the finding is a sentence the change itself wrote, you have not excluded it,
+  you have taken its word.
 
 The report ends with the downgraded and excluded ones. That section is not
 filler: "I checked X, it is fine because Y" is what tells the reader X was
@@ -89,6 +100,17 @@ fact **and** whose local consequences you have already traced to the end. It is
 a real verdict, not a shelf for candidates you did not finish — a claim you
 could have settled by running the code is not short of evidence, it is short of
 one experiment.
+
+**A fact only the user has is asked, not assumed.** A few verdicts turn on
+something no revision of this repository records: what is actually deployed in
+that environment, why the switch was added, which of two callers is real. Trace
+the local consequences first — most questions that look like this one are not.
+For what is left, put the question in the report: what you traced, what each
+possible answer would change, and the verdict each one produces. Quietly picking
+the answer that leaves you with no finding does not settle the question, it
+hides it, and the reader cannot tell it was ever asked. The user is the source
+here — this is the one place a review looks outward, and it still never looks at
+an upstream's docs.
 
 How to verify a claim:
 
@@ -149,6 +171,8 @@ two lines on what you ran and what you did not.
   excluded list; do not pad it into a report. But "found nothing" and "did not
   look" read identically on the page, so before writing it, confirm every file
   in the change's list was opened and every candidate you raised got a verdict.
+- An open question, when you have one, goes last: phrased so the user can answer
+  it in one line, carrying the verdict each answer would produce.
 
 ## Scope
 

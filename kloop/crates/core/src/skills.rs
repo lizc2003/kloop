@@ -841,7 +841,7 @@ mod tests {
 
     /// The review contract's load-bearing clauses, asserted by intent rather than
     /// wording so a rewrite stays free but a deletion is caught. Each one exists
-    /// because a measured review went wrong without it (plan 119).
+    /// because a measured review went wrong without it (plans 119, 122, 123, 125).
     #[test]
     fn code_review_keeps_its_load_bearing_clauses() {
         let body = builtin()
@@ -866,6 +866,23 @@ mod tests {
             "Evidence comes from the repository under review",
             "Prove the claim locally",
             "not a shelf for candidates you did not finish",
+            // Plan 122: the fix it recommended was refuted by its own excluded
+            // list, and its one trigger needed a contrived config while the
+            // boundary value reached the same branch unaided.
+            "same scrutiny as the defect",
+            "One trigger is not the trigger set",
+            // Plan 123: a change that claims a class owns the rest of the class.
+            "takes on a class of problem",
+            // Plan 125: six candidates reached the reasoning and none reached the
+            // report, because reasoning is not a place the model can read back
+            // from — write the candidate where it survives to the report.
+            "visible text",
+            // Same review excluded on what the commit's own doc promised, which
+            // is the claim under review, not evidence for it.
+            "The change's own words are not that reason",
+            // And it filled the one gap only the user could fill by picking the
+            // reading that yielded no finding, silently.
+            "asked, not assumed",
         ] {
             assert!(
                 body.contains(clause),
