@@ -1876,12 +1876,19 @@ On macOS, bash commands run inside a seatbelt sandbox by default
 deny-by-default SBPL profile — the shape cc and codex converged on):
 
 - **Writes** are allow-listed: the current workspace-derived root + `/tmp` +
-  `$TMPDIR` + configured explicit extras. Entering or creating a worktree
-  **replaces** the derived root rather than appending to the old policy; tmp roots
-  and explicit extras survive, and the old main checkout remains writable only
-  when the user explicitly listed it as an extra. Inside a writable root,
-  `.git/hooks`, `.git/config` and `.kloop` stay read-only (they are
-  privilege-escalation surfaces — hooks and git config run code, and project
+  `$TMPDIR` + the platform user cache directory (`~/Library/Caches` on macOS,
+  else `$XDG_CACHE_HOME` or `~/.cache`) + configured explicit extras. The cache
+  root is granted because compiling anything writes an object cache there
+  (Go's `GOCACHE` defaults under it) and everything below it is rebuildable by
+  definition; denying it does not contain a review, it turns every build into an
+  approval prompt. Only the conventional location is granted — a toolchain
+  pointed elsewhere by an environment variable is user configuration, and an
+  explicit extra root covers it. Entering or creating a worktree
+  **replaces** the derived root rather than appending to the old policy; tmp and
+  cache roots and explicit extras survive, and the old main checkout remains
+  writable only when the user explicitly listed it as an extra. Inside a
+  writable root, `.git/hooks`, `.git/config` and `.kloop` stay read-only (they
+  are privilege-escalation surfaces — hooks and git config run code, and project
   `.kloop` contains agent instructions/state; the rest of `.git` stays writable
   so `git commit` works sandboxed). The user-private `~/.kloop` state tree is a
   separate recursive deny-read/deny-write boundary.

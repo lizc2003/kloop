@@ -51,6 +51,10 @@ pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside 
 pub enum WritableRootOrigin {
     Workspace,
     Temporary,
+    /// The platform's user cache directory. Separate from `Temporary` because a
+    /// workspace switch must keep it (`for_workspace`) and because it is the one
+    /// root outside the workspace that exists for a toolchain, not for the model.
+    ToolchainCache,
     Extra,
 }
 
@@ -106,9 +110,10 @@ pub struct SandboxPolicy {
 
 impl SandboxPolicy {
     /// The workspace-write policy both references converged on: writable =
-    /// workspace + `/tmp` + `$TMPDIR` + configured extras, everything else
-    /// read-only, network per config. Roots retain their provenance so a
-    /// worktree transition replaces only the workspace contribution.
+    /// workspace + `/tmp` + `$TMPDIR` + the user cache directory + configured
+    /// extras, everything else read-only, network per config. Roots retain their
+    /// provenance so a worktree transition replaces only the workspace
+    /// contribution.
     pub fn workspace(cwd: &Path, extra_roots: &[PathBuf], allow_network: bool) -> Self {
         let mut writable_roots = Vec::new();
         push_root_aliases(&mut writable_roots, cwd, WritableRootOrigin::Workspace);
@@ -121,6 +126,22 @@ impl SandboxPolicy {
                 &mut writable_roots,
                 Path::new(&tmpdir),
                 WritableRootOrigin::Temporary,
+            );
+        }
+        // Compiling anything writes an object cache here, and the toolchains put
+        // it outside both the workspace and the temp roots: Go's `GOCACHE`
+        // defaults to `~/Library/Caches/go-build` (`~/.cache/go-build` on
+        // Linux). Denying it does not contain a review, it converts every build
+        // into an approval prompt — one real review spent 107 minutes blocked on
+        // exactly this, because `escalate_sandbox` waits for a user who had
+        // stepped away. Everything under a cache directory is rebuildable by
+        // definition, which is what makes the write safe to allow; reads were
+        // never restricted.
+        if let Some(cache) = user_cache_dir().filter(|dir| dir.is_dir()) {
+            push_root_aliases(
+                &mut writable_roots,
+                &cache,
+                WritableRootOrigin::ToolchainCache,
             );
         }
         for extra in extra_roots {
@@ -181,6 +202,20 @@ impl SandboxPolicy {
         push_path_aliases(&mut policy.denied_write_paths, path);
         policy
     }
+}
+
+/// The platform's user cache directory: `~/Library/Caches` on macOS, else
+/// `$XDG_CACHE_HOME` or `~/.cache`. Only the conventional location is granted —
+/// a toolchain pointed somewhere else by an environment variable is the user's
+/// own configuration, and an explicit `[sandbox]` extra root covers it.
+fn user_cache_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return std::env::home_dir().map(|home| home.join("Library").join("Caches"));
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))
 }
 
 fn push_path_aliases(paths: &mut Vec<PathBuf>, path: &Path) {
@@ -544,6 +579,53 @@ mod tests {
             );
         }
         assert!(!policy.allow_network);
+    }
+
+    /// The toolchain cache is the one writable root that exists for a compiler
+    /// rather than for the model, so it is asserted on its own: present with its
+    /// own origin, and — like the temp roots — surviving a workspace switch,
+    /// because a worktree transition does not change where Go puts `GOCACHE`.
+    #[test]
+    fn the_user_cache_dir_is_writable_and_survives_a_workspace_switch() {
+        let cwd = std::env::temp_dir().join("kloop-sbx-cache");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let policy = SandboxPolicy::workspace(&cwd, &[], false);
+
+        let Some(cache) = user_cache_dir().filter(|dir| dir.is_dir()) else {
+            // No conventional cache directory on this machine: the policy must
+            // simply not have invented one.
+            assert!(
+                !policy
+                    .writable_roots
+                    .iter()
+                    .any(|root| root.origins.contains(&WritableRootOrigin::ToolchainCache)),
+                "no cache dir exists, so no root may claim that origin"
+            );
+            return;
+        };
+
+        let found = policy
+            .writable_roots
+            .iter()
+            .find(|root| root.root == cache)
+            .expect("the user cache directory is writable");
+        assert_eq!(found.origins, vec![WritableRootOrigin::ToolchainCache]);
+        assert_eq!(
+            found.read_only_subpaths,
+            vec![
+                cache.join(".git/hooks"),
+                cache.join(".git/config"),
+                cache.join(".kloop"),
+            ],
+            "the cache root protects the same escalation surfaces as any other"
+        );
+
+        let switched = policy.for_workspace(&std::env::temp_dir().join("kloop-sbx-cache-2"));
+        assert!(
+            switched.writable_roots.iter().any(|root| root.root == cache
+                && root.origins.contains(&WritableRootOrigin::ToolchainCache)),
+            "a workspace switch must keep the toolchain cache writable"
+        );
     }
 
     /// Managed worktrees live at `<repo>/.kloop/worktrees/<name>`, i.e. inside

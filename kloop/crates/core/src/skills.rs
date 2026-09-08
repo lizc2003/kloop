@@ -883,6 +883,16 @@ mod tests {
             // And it filled the one gap only the user could fill by picking the
             // reading that yielded no finding, silently.
             "asked, not assumed",
+            // Plan 126: the same review wrote its throwaway programs as test
+            // files, which have to live in a package directory — under a
+            // read-only review that means unpacking the whole tree to hold one,
+            // twelve times, and every build then wrote a cache outside the
+            // sandbox's writable roots.
+            "not a second checkout",
+            "check whether the file even changed",
+            // And it spent those builds on exclusions, which never needed a
+            // finding's evidence in the first place.
+            "does not need the evidence a finding",
         ] {
             assert!(
                 body.contains(clause),

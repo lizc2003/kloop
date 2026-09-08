@@ -65,7 +65,11 @@ Before writing the report, each one is exactly one of:
   holds is the candidate you are holding. An exclusion names the consequence you
   traced and why it is harmless. When the only thing standing between you and
   the finding is a sentence the change itself wrote, you have not excluded it,
-  you have taken its word.
+  you have taken its word. An exclusion does not need the evidence a finding
+  needs: a finding has to carry a concrete failure scenario, so it earns an
+  experiment; an exclusion has to show the consequence is harmless, and reading
+  the path to its caller usually shows that. Spend the experiments on what you
+  are going to report.
 
 The report ends with the downgraded and excluded ones. That section is not
 filler: "I checked X, it is fine because Y" is what tells the reader X was
@@ -94,6 +98,17 @@ meaning of each error code is a well-worn way to spend an hour and come back
 with nothing usable. Prove the claim locally instead: read the branch, follow it
 to the caller, or write a throwaway program that runs the path and prints what
 comes out.
+
+Keep the experiment small enough that it stays an experiment. A throwaway
+program belongs *outside* the repository — written to a temp path, run with the
+repository as its dependency — not inside its source tree. The form that has to
+live in a package directory (a test file, usually) cannot be written at all
+under a read-only review, and the usual way around that, copying the whole tree
+somewhere writable to hold it, turns one question into a full build. One
+question is worth one small program, not a second checkout.
+
+Before isolating a revision to run it, check whether the file even changed
+since then. Usually it did not, and the working tree answers the same question.
 
 Reserve "not enough evidence" for a claim that genuinely turns on an outside
 fact **and** whose local consequences you have already traced to the end. It is
