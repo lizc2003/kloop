@@ -1150,20 +1150,21 @@ impl Permissions {
         // payload and so can never be remembered — the same rule the ordinary
         // gate follows, and stricter here matters more.
         let remember = escalation_remember_payload(command);
-        if let Some(remember) = &remember
-            && self.escalation_remembered(remember)
+        if self.blanket_escalation_granted()
+            || remember
+                .as_ref()
+                .is_some_and(|remember| self.escalation_remembered(remember))
         {
             return EscalationOutcome::Approved;
         }
         let Some(approver) = &self.session.approver else {
             return EscalationOutcome::NotAttempted;
         };
-        let mut approval_scopes = vec![ApprovalScope::Once];
-        if remember.is_some() {
-            approval_scopes.push(ApprovalScope::WorkspaceSession);
-            if self.project.can_persist() {
-                approval_scopes.push(ApprovalScope::Project);
-            }
+        // The session scope is offered either way; only the durable one needs a
+        // rule it can be written down as.
+        let mut approval_scopes = vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession];
+        if remember.is_some() && self.project.can_persist() {
+            approval_scopes.push(ApprovalScope::Project);
         }
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
@@ -1174,7 +1175,12 @@ impl Permissions {
                 &describe_denial(denial),
             )),
             approval_scopes: approval_scopes.clone(),
-            remember_rules: remember.as_ref().map(|remember| remember.rules.clone()),
+            // Shown under the remembering choices. An opaque script has no rule
+            // to echo, and leaving it blank would read as "just this command".
+            remember_rules: Some(remember.as_ref().map_or_else(
+                || vec![BLANKET_ESCALATION_RULE.to_string()],
+                |remember| remember.rules.clone(),
+            )),
             preview: None,
         };
         let decision = approver.confirm(req).await;
@@ -1187,15 +1193,16 @@ impl Permissions {
         match scope {
             ApprovalScope::Once => EscalationOutcome::Approved,
             ApprovalScope::WorkspaceSession => {
-                let Some(remember) = remember else {
-                    return EscalationOutcome::Declined;
-                };
+                let signatures = remember.map_or_else(
+                    || vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
+                    |remember| remember.signatures,
+                );
                 let mut caches = self.session.cache.lock().unwrap();
                 let cache = caches
                     .entry(self.identity.workspace_id().clone())
                     .or_default();
                 let before = cache.signatures.len();
-                cache.signatures.extend(remember.signatures);
+                cache.signatures.extend(signatures);
                 if cache.signatures.len() != before {
                     advance_epoch(
                         &mut cache.capability_epoch,
@@ -1231,8 +1238,25 @@ impl Permissions {
         if self.allow_everything {
             return false;
         }
+        if self.blanket_escalation_granted() {
+            return true;
+        }
         escalation_remember_payload(command)
             .is_some_and(|remember| self.escalation_remembered(&remember))
+    }
+
+    /// Whether this workspace session has blanket consent to escalate. It is the
+    /// only thing an unparseable script can be remembered by: a review's probe
+    /// scripts are opaque almost by construction (`tmp=$(mktemp -d …)`, a pipe
+    /// into `tar`, a `cd`), so keying on a command prefix would offer the choice
+    /// exactly where it can never apply. Session-only and never persisted —
+    /// "stop asking me for the rest of this session" is a statement about the
+    /// sitting, not about the project.
+    fn blanket_escalation_granted(&self) -> bool {
+        let caches = self.session.cache.lock().unwrap();
+        caches
+            .get(self.identity.workspace_id())
+            .is_some_and(|cache| cache.signatures.contains(BLANKET_ESCALATION_SIGNATURE))
     }
 
     /// Whether a durable project rule or this workspace's session cache already
@@ -1267,6 +1291,17 @@ fn describe_denial(denial: Option<&crate::sandbox::SandboxDenial>) -> String {
         denial.evidence
     )
 }
+
+/// The session-cache key standing for "every sandbox escalation in this
+/// workspace session". Never written to the durable store: a script this
+/// coarse cannot be spelled as a rule, and consent that broad should not
+/// outlive the sitting it was given in.
+const BLANKET_ESCALATION_SIGNATURE: &str = "sandbox_escalate:*";
+
+/// What the prompt shows under the remembering choices when the script is too
+/// opaque to key on — the scope really is every escalation, and saying so is
+/// the difference between an informed yes and a misread one.
+const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this session";
 
 /// Escalation consent is remembered at the same granularity the ordinary gate
 /// uses for bash — a two-word command prefix per segment — but under its own
@@ -3263,33 +3298,47 @@ mod tests {
         assert_eq!(approver.ask_count(), 2);
     }
 
-    /// An opaque script (pipes, redirection) cannot be remembered, exactly as
-    /// the ordinary gate refuses to remember one — so it is offered `Once` only
-    /// and asked again every time.
+    /// An opaque script cannot be keyed on, so it gets the session scope and not
+    /// the durable one — and the prompt says the scope is every escalation, not
+    /// this command. A review's probe scripts are opaque almost by construction
+    /// (`tmp=$(mktemp -d …)`, a pipe into `tar`, a `cd`), so offering only
+    /// `Once` here was offering the memory exactly where it could never apply.
     #[tokio::test]
-    async fn an_opaque_command_offers_no_remember() {
-        let approver = ScriptedApprover::new(vec![
-            Decision::Allow(ApprovalScope::Once),
-            Decision::Allow(ApprovalScope::Once),
-        ]);
+    async fn an_opaque_command_can_still_be_remembered_for_the_session() {
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        let cmd = "go test ./... > /tmp/out 2>&1";
+        let opaque = "tmp=$(mktemp -d) && git archive HEAD | tar -x -C \"$tmp\"";
 
         assert_eq!(
-            p.escalate_sandbox(cmd, None, 0).await,
+            p.escalate_sandbox(opaque, None, 0).await,
             EscalationOutcome::Approved
         );
         assert_eq!(
             approver.asked()[0].approval_scopes,
-            vec![ApprovalScope::Once]
+            vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession],
+            "session scope offered, durable scope withheld"
         );
-        assert_eq!(approver.asked()[0].remember_rules, None);
-
         assert_eq!(
-            p.escalate_sandbox(cmd, None, 0).await,
+            approver.asked()[0].remember_rules,
+            Some(vec!["every sandbox escalation this session".to_string()]),
+            "the prompt states the real scope"
+        );
+
+        // Blanket consent covers another opaque script and a parseable one.
+        assert_eq!(
+            p.escalate_sandbox("x=$(date) && echo $x", None, 0).await,
             EscalationOutcome::Approved
         );
-        assert_eq!(approver.ask_count(), 2, "opaque is never remembered");
+        assert_eq!(
+            p.escalate_sandbox("go test ./pkg", None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert_eq!(approver.ask_count(), 1, "asked once for the whole session");
+
+        // It also reaches the pre-execution check, so the sandboxed attempt that
+        // was going to fail is skipped rather than run and thrown away.
+        assert!(p.sandbox_escalation_remembered(opaque));
     }
 
     /// What the sandbox refused rides the prompt. Without it the notice tells
