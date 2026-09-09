@@ -54,7 +54,8 @@ def tasks_in(path: pathlib.Path, want: str | None):
             if text.startswith("审查") or (want and want in text):
                 current = {
                     "name": text[:60], "ctx": [], "calls": [],
-                    "compacted_at": None, "rounds": 0, "t0": None, "t1": None,
+                    "compacted": [], "rounds": 0, "t0": None, "t1": None,
+                    "terminal": None,
                 }
                 out.append(current)
             continue
@@ -70,28 +71,38 @@ def tasks_in(path: pathlib.Path, want: str | None):
                 usage["input_tokens"] + usage.get("cache_read_input_tokens", 0)
             )
         elif kind_ == "compacted":
-            current["compacted_at"] = current["rounds"]
+            current["compacted"].append(current["rounds"])
+        elif kind_ == "turn_terminal":
+            # 没有这一条就说明任务还在跑；此时的墙钟和批处理度都是中途读数，
+            # 拿它们当结论会把「还没收敛」误读成「收敛得很好」。
+            current["terminal"] = (event.get("status"), current["t1"])
         elif kind_ == "message" and event.get("role") == "assistant":
             calls = [c for c in event.get("content", []) if c.get("type") == "tool_use"]
             if calls:
-                current["calls"].append((current["compacted_at"] is not None, calls))
+                current["calls"].append((bool(current["compacted"]), calls))
     return out
 
 
 def report(task: dict) -> None:
     print(f"\n=== {task['name']} ===")
-    if task["t0"]:
-        print(f"墙钟 {(task['t1'] - task['t0']) / 60000:.1f} min, {task['rounds']} 轮采样")
+    if not task["terminal"]:
+        elapsed = (task["t1"] - task["t0"]) / 60000 if task["t0"] else 0
+        print(f"!! 未见终态：仍在跑或被中断（已 {elapsed:.1f} min, {task['rounds']} 轮）")
+        print("   下面的数字都是中途读数，不能当结论")
+    elif task["t0"]:
+        status, end = task["terminal"]
+        print(f"墙钟 {(end - task['t0']) / 60000:.1f} min, {task['rounds']} 轮采样, 终态 {status}")
 
     reached = next(
         (i + 1 for i, ctx in enumerate(task["ctx"]) if ctx >= CONTEXT_MARK), None
     )
     print(f"[2] 爬到 200k: {reached or '未到'} 轮   (基线 kloop 10 / codex 31，越大越好)")
-    print(
-        f"    压缩点: 第 {task['compacted_at']} 轮"
-        if task["compacted_at"]
-        else "    未压缩"
-    )
+    if task["compacted"]:
+        rounds = "、".join(f"第 {r} 轮" for r in task["compacted"])
+        note = "（压缩不止一次说明它在反复撞窗口）" if len(task["compacted"]) > 1 else ""
+        print(f"    压缩点: {rounds}{note}")
+    else:
+        print("    未压缩")
 
     post = [calls for after, calls in task["calls"] if after]
     if not post:
