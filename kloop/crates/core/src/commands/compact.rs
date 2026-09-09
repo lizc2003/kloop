@@ -6,10 +6,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::SlashResult;
+use crate::agent::Ui;
 use crate::compact::CompactionOutcome;
 use crate::compact::CompactionTrigger;
 use crate::compact::compact_once;
 use crate::config::Config;
+use crate::event::Event;
 use crate::history::History;
 
 pub const SUMMARY: &str = "summarize and shrink the conversation now";
@@ -17,6 +19,7 @@ pub const SUMMARY: &str = "summarize and shrink the conversation now";
 pub async fn run(
     history: &mut History,
     cfg: &Arc<Config>,
+    ui: &dyn Ui,
     cancel: &CancellationToken,
 ) -> SlashResult {
     if let Err(error) = history.ensure_initial_provider_route(&cfg.provider_route) {
@@ -24,6 +27,13 @@ pub async fn run(
             "compaction failed: provider route initialization failed: {error}"
         ));
     }
+    // A full round-trip (the whole conversation out, a summary back) whose
+    // `SlashResult` exists only once it is over: without a line on the live
+    // seam the front-end shows a generic spinner over an unchanged screen.
+    // Emitted before the outcome is known — a failed or no-op compaction still
+    // owes an account of the wait — in the words the automatic triggers use
+    // (`agent.rs`).
+    ui.emit(&Event::Note("compacting history".into()));
     let provider_attempt = cfg.provider_route.primary_attempt();
     let output = match compact_once(
         cfg,

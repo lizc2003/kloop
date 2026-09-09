@@ -14,7 +14,7 @@ use kloop_provider::Provider;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::testutil::{run_tool, test_ctx};
+use super::testutil::{SilentUi, run_tool, test_ctx};
 use super::{ToolCtx, all_tool_defs, is_concurrency_safe};
 use crate::agent::{Ui, run_turn};
 use crate::config::SurfaceCapabilities;
@@ -672,10 +672,16 @@ async fn loop_report() -> Value {
     let context = test_ctx(0, "plan58-loop");
     let mut history = History::new(root.path().join("offload"));
     let cancel = CancellationToken::new();
-    let fixed = crate::commands::run("/loop 5m check status", &mut history, &context.cfg, &cancel)
-        .await
-        .run_turn
-        .unwrap();
+    let fixed = crate::commands::run(
+        "/loop 5m check status",
+        &mut history,
+        &context.cfg,
+        &SilentUi,
+        &cancel,
+    )
+    .await
+    .run_turn
+    .unwrap();
     assert!(fixed.contains("first do the requested work once now"));
     assert!(fixed.contains("cron_create"));
     assert!(fixed.contains("\"*/5 * * * *\""));
@@ -684,6 +690,7 @@ async fn loop_report() -> Value {
         "/loop check status every 2h",
         &mut history,
         &context.cfg,
+        &SilentUi,
         &cancel,
     )
     .await
@@ -694,6 +701,7 @@ async fn loop_report() -> Value {
         "/loop check deployment",
         &mut history,
         &context.cfg,
+        &SilentUi,
         &cancel,
     )
     .await
@@ -701,13 +709,19 @@ async fn loop_report() -> Value {
     .unwrap();
     assert!(dynamic.contains("schedule_wakeup"));
     assert!(dynamic.contains("stop=true"));
-    let autonomous = crate::commands::run("/loop", &mut history, &context.cfg, &cancel)
+    let autonomous = crate::commands::run("/loop", &mut history, &context.cfg, &SilentUi, &cancel)
         .await
         .run_turn
         .unwrap();
     assert!(autonomous.contains("<<autonomous-loop-dynamic>>"));
-    let seconds =
-        crate::commands::run("/loop 30s check", &mut history, &context.cfg, &cancel).await;
+    let seconds = crate::commands::run(
+        "/loop 30s check",
+        &mut history,
+        &context.cfg,
+        &SilentUi,
+        &cancel,
+    )
+    .await;
     assert!(seconds.run_turn.is_none());
     assert!(
         seconds

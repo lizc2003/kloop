@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::History;
 use crate::tools::TaskGraphSnapshot;
@@ -178,17 +179,23 @@ pub fn is_command(line: &str) -> bool {
 /// Parse and run a slash-command line. Assumes [`is_command`] already held; an
 /// unrecognized name is handled (not an error) so the reply can list what
 /// exists — the same discoverable shape as an unknown agent_type.
+///
+/// `ui` is the live event seam. Most commands never touch it: they return text
+/// and the front-end shows it. `/compact` does — a [`SlashResult`] only exists
+/// once the work is over, and for a compaction that is a minute in which the
+/// screen has nothing to say.
 pub async fn run(
     line: &str,
     history: &mut History,
     cfg: &Arc<Config>,
+    ui: &dyn Ui,
     cancel: &CancellationToken,
 ) -> SlashResult {
     let state = crate::provider_route::SessionProviderState::from_route(
         Arc::clone(&cfg.provider_catalog),
         cfg.provider_route.clone(),
     );
-    run_with_provider_state(line, history, cfg, &state, cancel).await
+    run_with_provider_state(line, history, cfg, &state, ui, cancel).await
 }
 
 pub async fn run_with_provider_state(
@@ -196,6 +203,7 @@ pub async fn run_with_provider_state(
     history: &mut History,
     cfg: &Arc<Config>,
     provider_state: &crate::provider_route::SessionProviderState,
+    ui: &dyn Ui,
     cancel: &CancellationToken,
 ) -> SlashResult {
     let rest = line.strip_prefix('/').unwrap_or(line);
@@ -208,7 +216,7 @@ pub async fn run_with_provider_state(
         "provider" => provider::run(args, history, cfg, provider_state),
         "effort" => effort::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
-        "compact" => compact::run(history, cfg, cancel).await,
+        "compact" => compact::run(history, cfg, ui, cancel).await,
         "clear" => clear::run(history, cfg),
         "loop" => loop_command::run(args),
         "skills" => skills::run(args, cfg),
@@ -247,8 +255,29 @@ fn unknown(name: &str, cfg: &Config) -> SlashResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Event;
+    use crate::tools::testutil::SilentUi;
     use kloop_protocol::ContentBlock;
     use kloop_protocol::Message;
+
+    /// Collects what a command puts on the live event seam while it runs, as
+    /// opposed to the `SlashResult` it returns when it is over.
+    #[derive(Default)]
+    struct NoteUi(std::sync::Mutex<Vec<String>>);
+
+    impl Ui for NoteUi {
+        fn emit(&self, ev: &Event) {
+            if let Event::Note(note) = ev {
+                self.0.lock().unwrap().push(note.clone());
+            }
+        }
+    }
+
+    impl NoteUi {
+        fn notes(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
 
     /// A Config wired to the given provider; only the fields the commands read
     /// (provider route/context_window/tasks/inbox) matter here.
@@ -316,7 +345,14 @@ mod tests {
     async fn help_lists_every_builtin() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
-        let result = run("/help", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/help",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(!result.cleared);
         assert!(result.output.starts_with("commands:"));
         for b in BUILTINS {
@@ -335,7 +371,14 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         // Anchor the estimate with no tail after it, for a deterministic count.
         history.note_usage(20_000);
-        let result = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/cost",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             result,
             SlashResult::message(
@@ -348,7 +391,14 @@ mod tests {
     async fn cost_notes_when_the_window_is_off() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), None);
         let mut history = History::new(cfg.offload_dir.clone());
-        let result = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/cost",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(result.output.contains("window limit off"));
     }
 
@@ -360,10 +410,16 @@ mod tests {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         assert!(
-            run("/cost", &mut history, &cfg, &CancellationToken::new())
-                .await
-                .output
-                .ends_with("provider-reported usage by provider/model: unavailable")
+            run(
+                "/cost",
+                &mut history,
+                &cfg,
+                &SilentUi,
+                &CancellationToken::new()
+            )
+            .await
+            .output
+            .ends_with("provider-reported usage by provider/model: unavailable")
         );
 
         history.record_provider_usage(ProviderUsageRecord {
@@ -376,9 +432,15 @@ mod tests {
             usage: Usage::default(),
         });
         assert_eq!(
-            run("/cost", &mut history, &cfg, &CancellationToken::new())
-                .await
-                .output,
+            run(
+                "/cost",
+                &mut history,
+                &cfg,
+                &SilentUi,
+                &CancellationToken::new()
+            )
+            .await
+            .output,
             "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\ncache hit: 0 of 0 prompt tokens (n/a)"
         );
         history.record_provider_usage(ProviderUsageRecord {
@@ -395,9 +457,15 @@ mod tests {
                 cache_creation_input_tokens: 40,
             },
         });
-        let output = run("/cost", &mut history, &cfg, &CancellationToken::new())
-            .await
-            .output;
+        let output = run(
+            "/cost",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await
+        .output;
         assert_eq!(
             output,
             "provider: test\nmodel: test-model\nroute revision: 1\ncontext: ~0 / 200000 tokens (0%)\nprovider-reported usage by provider/model: \n  test/primary [Mock]: input=0 output=0 cache-read=0 cache-create=0 responses=1\n  test/fallback [Mock]: input=10 output=20 cache-read=30 cache-create=40 responses=1\ncache hit: 30 of 80 prompt tokens (38%)"
@@ -442,9 +510,15 @@ mod tests {
         let hit = |output: &str| output.lines().last().unwrap().to_string();
 
         assert_eq!(
-            hit(&run("/cost", &mut history, &cfg, &CancellationToken::new())
-                .await
-                .output),
+            hit(&run(
+                "/cost",
+                &mut history,
+                &cfg,
+                &SilentUi,
+                &CancellationToken::new()
+            )
+            .await
+            .output),
             "cache hit: 75 of 100 prompt tokens (75%)"
         );
 
@@ -456,9 +530,15 @@ mod tests {
             },
         );
         assert_eq!(
-            hit(&run("/cost", &mut history, &cfg, &CancellationToken::new())
-                .await
-                .output),
+            hit(&run(
+                "/cost",
+                &mut history,
+                &cfg,
+                &SilentUi,
+                &CancellationToken::new()
+            )
+            .await
+            .output),
             "cache hit: 75 of 200 prompt tokens (38%)"
         );
     }
@@ -484,8 +564,22 @@ mod tests {
             },
         });
 
-        let _ = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
-        let cost = run("/cost", &mut history, &cfg, &CancellationToken::new()).await;
+        let _ = run(
+            "/clear",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
+        let cost = run(
+            "/cost",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(history.messages().is_empty());
         assert!(cost.output.contains("input=1"), "{}", cost.output);
@@ -506,12 +600,23 @@ mod tests {
         }]));
         history.record(Message::user_text("current request"));
 
-        let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
+        let ui = NoteUi::default();
+        let result = run(
+            "/compact",
+            &mut history,
+            &cfg,
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             result,
             SlashResult::message("history compacted: 2 summarized, 1 kept verbatim")
         );
         assert!(history.messages().len() < 3, "history shrank");
+        // The receipt above is the `SlashResult`; this is what the screen said
+        // during the summary request, which is where the whole wait happens.
+        assert_eq!(ui.notes(), ["compacting history"]);
     }
 
     #[tokio::test]
@@ -521,12 +626,23 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("only message"));
 
-        let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
+        let ui = NoteUi::default();
+        let result = run(
+            "/compact",
+            &mut history,
+            &cfg,
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert_eq!(
             result,
             SlashResult::message("history already compacted: nothing new to summarize")
         );
+        // Announced before the outcome is known: the provider was never called
+        // here, so a note that exists at all was emitted ahead of the work.
+        assert_eq!(ui.notes(), ["compacting history"]);
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(history.messages(), &[Message::user_text("only message")]);
     }
@@ -543,9 +659,18 @@ mod tests {
         history.record(Message::user_text("current request"));
         let before = history.messages().to_vec();
 
-        let result = run("/compact", &mut history, &cfg, &CancellationToken::new()).await;
+        let ui = NoteUi::default();
+        let result = run(
+            "/compact",
+            &mut history,
+            &cfg,
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.output.starts_with("compaction failed: "));
+        assert_eq!(ui.notes(), ["compacting history"]);
         assert_eq!(history.messages(), before.as_slice());
         assert!(history.provider_usage().records().is_empty());
     }
@@ -567,7 +692,14 @@ mod tests {
         cfg.inbox
             .push(crate::inbox::InboxItem::Steer("stale steer".into()));
 
-        let result = run("/clear", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/clear",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             result,
             SlashResult::cleared_message(
@@ -597,6 +729,7 @@ mod tests {
             "/frobnicate now",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
@@ -631,13 +764,21 @@ mod tests {
             "/greet world",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
         assert_eq!(result, SlashResult::turn("Say hi to world.".into()));
         assert!(history.messages().is_empty());
 
-        let unknown = run("/nope", &mut history, &cfg, &CancellationToken::new()).await;
+        let unknown = run(
+            "/nope",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             unknown,
             SlashResult::message(
@@ -657,7 +798,14 @@ mod tests {
             ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
-        let result = run("/help", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/help",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(result.output.starts_with("commands:"));
         let (commands, skills) = result
             .output
@@ -704,7 +852,14 @@ mod tests {
         });
         let mut history = History::new(cfg.offload_dir.clone());
 
-        let list = run("/skills", &mut history, &cfg, &CancellationToken::new()).await;
+        let list = run(
+            "/skills",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(list.output.contains("/code-review"), "{}", list.output);
         assert!(list.output.contains("builtin"), "{}", list.output);
         assert!(
@@ -717,6 +872,7 @@ mod tests {
             "/skills code-review",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
@@ -739,6 +895,7 @@ mod tests {
             "/skills nope",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
@@ -768,12 +925,20 @@ mod tests {
             "/deploy prod",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
         assert_eq!(result, SlashResult::turn("Deploy prod now.".into()));
 
-        let unknown = run("/nope", &mut history, &cfg, &CancellationToken::new()).await;
+        let unknown = run(
+            "/nope",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             unknown,
             SlashResult::message(
@@ -803,6 +968,7 @@ mod tests {
             "/greet world",
             &mut history,
             &cfg,
+            &SilentUi,
             &CancellationToken::new(),
         )
         .await;
@@ -830,10 +996,16 @@ mod tests {
             ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
-        let prompt = run("/ctx", &mut history, &cfg, &CancellationToken::new())
-            .await
-            .run_turn
-            .expect("a turn");
+        let prompt = run(
+            "/ctx",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await
+        .run_turn
+        .expect("a turn");
         assert!(prompt.starts_with("Review @notes.txt now."));
         assert!(
             prompt.contains("\n\n@notes.txt:\nFILE-BODY-XYZ"),
@@ -870,7 +1042,14 @@ mod tests {
             ..base.test_clone()
         });
         let mut history = History::new(cfg.offload_dir.clone());
-        let result = run("/danger", &mut history, &cfg, &CancellationToken::new()).await;
+        let result = run(
+            "/danger",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(result.run_turn, None, "blocked: no turn runs");
         assert!(
             result.output.starts_with("/danger:"),
@@ -914,11 +1093,43 @@ mod tests {
 
         // Before any turn: setting the effort opens the timeline itself.
         assert!(!history.has_provider_route());
-        run_with_provider_state("/effort high", &mut history, &cfg, &state, &cancel).await;
-        run_with_provider_state("/effort low", &mut history, &cfg, &state, &cancel).await;
+        run_with_provider_state(
+            "/effort high",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        run_with_provider_state(
+            "/effort low",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
         // Re-setting the same value is not a revision.
-        run_with_provider_state("/effort low", &mut history, &cfg, &state, &cancel).await;
-        run_with_provider_state("/effort unset", &mut history, &cfg, &state, &cancel).await;
+        run_with_provider_state(
+            "/effort low",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        run_with_provider_state(
+            "/effort unset",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
 
         assert_eq!(
             history
@@ -961,7 +1172,7 @@ mod tests {
             crate::provider_route::SessionProviderState::new(catalog, "responses", None).unwrap();
         let cancel = CancellationToken::new();
         let run = async |line: &str, history: &mut History| {
-            run_with_provider_state(line, history, &cfg, &state, &cancel).await
+            run_with_provider_state(line, history, &cfg, &state, &SilentUi, &cancel).await
         };
 
         let shown = run("/effort", &mut history).await;

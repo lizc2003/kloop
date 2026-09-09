@@ -780,10 +780,12 @@ complete the highlighted entry into the composer (Enter completes rather than
 submits while the menu is open), **Esc** dismisses it, and every other key edits
 the query and re-filters. At most one menu is open at a time, and a pending
 approval prompt or rewind picker takes precedence. The slash menu is suppressed
-while a turn runs (a `/` line is then steering text). Trigger detection carries
-the exact byte range and cursor identity through file search and popup accept;
-late results with the same query at another position are rejected instead of
-editing the wrong token.
+while a turn runs (a `/` line is then steering text). A submitted slash line
+echoes into the transcript like a user turn — it records no user message, but
+`/compact` can work for a minute, and the echo is what says the command was
+accepted. Trigger detection carries the exact byte range and cursor identity
+through file search and popup accept; late results with the same query at
+another position are rejected instead of editing the wrong token.
 
 While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
@@ -791,8 +793,9 @@ While a turn runs, an **animated status line** (plan 38 slice 5,
 **footer** carries the mode badge and key hints on the left and the **system
 status** — model name and a context gauge (`model · N% ctx`, refreshed at the end
 of every agent round from the same usage accounting `/cost` reads, so a
-long turn's gauge moves while it runs) — flush right (dropped on
-a narrow row so the hints win). A **thinking block** shows a CC-style verb and
+long turn's gauge moves while it runs, and once more after a slash command, so
+`/compact` and `/clear` move it without any turn at all) — flush right (dropped
+on a narrow row so the hints win). A **thinking block** shows a CC-style verb and
 elapsed rather than its text: `∗ Thinking… (Xs)` while it streams, `∗ Thought for
 Xs` once sealed. The animation self-drives — a frame tick wakes the loop only
 while a turn runs, so an idle session redraws on nothing and spends no CPU (tokio
@@ -884,7 +887,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detai
 for owner-scoped scheduler lifecycle (**no `turnId`**),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` runs on the ordinary command path but likewise re-freezes the session route, so its new `effort` reaches the next turn and the published route.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` runs on the ordinary command path but likewise re-freezes the session route, so its new `effort` reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is

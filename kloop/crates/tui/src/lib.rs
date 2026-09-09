@@ -311,6 +311,7 @@ fn slash_catalog(cfg: &Config) -> Vec<menu::CommandInfo> {
 fn send_command_result_events(
     events: &mpsc::UnboundedSender<AgentEvent>,
     result: &kloop_core::commands::SlashResult,
+    context_used: u64,
 ) -> bool {
     if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
         return false;
@@ -324,10 +325,20 @@ fn send_command_result_events(
     {
         return false;
     }
-    result.output.is_empty()
-        || events
+    if !result.output.is_empty()
+        && events
             .send(AgentEvent::System(result.output.clone()))
-            .is_ok()
+            .is_err()
+    {
+        return false;
+    }
+    // The footer's context gauge only moves on a Usage event, and those are
+    // sent around turns. `/compact` and `/clear` rewrite History without one,
+    // so the gauge kept quoting the size of a conversation that no longer
+    // existed until the next turn ended.
+    events
+        .send(AgentEvent::Core(CoreEvent::Usage(context_used)))
+        .is_ok()
 }
 
 /// Owns History for its whole lifetime and runs turns strictly one at a time;
@@ -407,6 +418,7 @@ async fn agent_worker(
                     &mut history,
                     &cfg,
                     &provider_state,
+                    ui.as_ref(),
                     &cancel,
                 )
                 .await;
@@ -417,7 +429,7 @@ async fn agent_worker(
                 }
                 // Clear first (drops the old cells), then apply the exact empty
                 // graph fence, then show the result on the now-blank transcript.
-                if !send_command_result_events(&events, &result) {
+                if !send_command_result_events(&events, &result, history.estimated_tokens()) {
                     return;
                 }
                 if result.open_provider_picker
@@ -1330,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_command_events_order_transcript_then_graph_fence_then_system() {
+    fn clear_command_events_order_transcript_then_graph_fence_then_system_then_gauge() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = kloop_core::commands::SlashResult {
             output: "cleared".into(),
@@ -1341,7 +1353,7 @@ mod tests {
             route_changed: false,
             open_provider_picker: false,
         };
-        assert!(send_command_result_events(&tx, &result));
+        assert!(send_command_result_events(&tx, &result, 40_000));
         assert!(matches!(
             rx.try_recv().unwrap(),
             AgentEvent::ClearTranscript
@@ -1354,6 +1366,12 @@ mod tests {
         assert!(matches!(
             rx.try_recv().unwrap(),
             AgentEvent::System(output) if output == "cleared"
+        ));
+        // Last, so the footer gauge stops quoting the history the command just
+        // rewrote — no turn runs here to send a Usage of its own.
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::Core(CoreEvent::Usage(used)) if used == 40_000
         ));
         assert!(rx.try_recv().is_err());
     }

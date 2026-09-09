@@ -1859,6 +1859,7 @@ async fn run_turn_or_command(
             history,
             cfg,
             provider_state,
+            ui.as_ref(),
             &turn.cancel,
         )
         .await;

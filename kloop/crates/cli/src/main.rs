@@ -766,6 +766,7 @@ async fn plain_main(
                     &mut history,
                     &cfg,
                     &provider_state,
+                    ui.as_ref(),
                     &cancel,
                 ),
                 &cancel,

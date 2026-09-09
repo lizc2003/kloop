@@ -1356,10 +1356,13 @@ impl App {
         // transcript and used for slash detection; the submission carries the
         // expanded text.
         let display = self.composer.text().trim().to_string();
-        // A slash command runs only when idle; it is not a message, so no User
-        // cell. While a turn runs, a '/'-line is steering.
+        // A slash command runs only when idle; it records no user message, but
+        // it is echoed like one: `/compact` can work for a minute, and without
+        // the echo pressing Enter leaves the screen exactly as it was. While a
+        // turn runs, a '/'-line is steering.
         if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
             let _ = self.composer.submit_text();
+            self.cells.push(Cell::User(display.clone()));
             self.running = true;
             self.freeze_selected_route();
             return Command::Slash(display);
@@ -2684,9 +2687,10 @@ mod tests {
         );
     }
 
-    /// An idle slash line routes to the worker as Command::Slash and marks the
-    /// app busy without pushing a User cell. While a turn runs, the same text is
-    /// steering — Ctrl+C is the only hard stop.
+    /// An idle slash line routes to the worker as Command::Slash, marks the app
+    /// busy, and echoes itself into the transcript — a command that works for a
+    /// minute (`/compact`) must not leave the screen unchanged. While a turn
+    /// runs, the same text is steering — Ctrl+C is the only hard stop.
     #[test]
     fn slash_command_routes_only_when_idle() {
         let mut app = App::new("s".into());
@@ -2695,7 +2699,7 @@ mod tests {
         assert_eq!(cmd, Command::Slash("/help".into()));
         assert!(app.running, "the app shows busy until the worker replies");
         assert_eq!(app.composer.text(), "");
-        assert!(app.cells.is_empty(), "a command is not a User message");
+        assert_eq!(app.cells, vec![Cell::User("/help".into())]);
 
         // While running, a '/'-line is just steering text, not a command.
         type_str(&mut app, "/cost");
@@ -2703,7 +2707,10 @@ mod tests {
             app.on_key(80, key(KeyCode::Enter)),
             Command::Steer("/cost".into())
         );
-        assert_eq!(app.cells, vec![Cell::User("/cost".into())]);
+        assert_eq!(
+            app.cells,
+            vec![Cell::User("/help".into()), Cell::User("/cost".into())]
+        );
     }
 
     /// A command's System output renders as its own cell; ClearTranscript wipes
