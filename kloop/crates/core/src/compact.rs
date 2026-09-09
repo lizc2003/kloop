@@ -78,7 +78,10 @@ no other copy in context to fall back on.";
 ///   kloop fans out, and a summary that drops what a child reported makes the
 ///   parent redo the child's whole investigation (measured: 83 of 99 rounds);
 /// - the next step must quote the conversation, so continuation cannot drift
-///   onto a task nobody asked for;
+///   onto a task nobody asked for — but it names every independent thing that
+///   is waiting, because batching needs a list and this section is the only
+///   place a list survives compaction (asking for "the single best next
+///   action" was read as an instruction to take exactly one step per round);
 /// - established facts are their own section for the same reason sub-agent
 ///   findings are: a summary that keeps only what was *done* leaves the next
 ///   agent unable to tell what it already knows, and an agent that cannot tell
@@ -117,8 +120,10 @@ are already established must not be re-derived.
 8. Verification state — what has been checked and what has not. Do not imply a check passed \
 when it was skipped or blocked.
 9. Work in progress and next step — what was happening immediately before this summary, and \
-the single best next action, with a direct quote from the recent conversation showing where \
-the work left off.
+what to do next, with a direct quote from the recent conversation showing where the work left \
+off. When several independent things are waiting — files to open, symbols to trace, checks to \
+run — name them all, not just the first: they can be started in one round, and a summary that \
+names a single next action is read as an instruction to take one step at a time.
 10. Open candidates — anything noticed but not yet judged: a suspected defect, an \
 inconsistency, a question raised and not answered. One line each, with its location. These \
 are the first thing lost when a session is summarized, and nothing else in this list carries \
@@ -731,6 +736,9 @@ mod tests {
             "Sub-agent results",
             "must not be re-derived",
             "direct quote",
+            // Plan 128: "the single best next action" was doing exactly what it
+            // said — one action per round, for the 45 rounds after a compaction.
+            "name them all, not just the first",
             "<analysis>",
             "<summary>",
             // Plan 119: a suspicion that is noticed but not yet judged fits in
