@@ -1932,7 +1932,12 @@ why containment was removed.
 
 Escalation consent is **remember-able** at the same granularity bash approvals
 use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
-rule. It is deliberately not a `bash(...)` rule: *may run* and *may run
+rule. A remembered rule is consulted **before** the sandboxed attempt, not after
+it fails: the command runs uncontained from the start and the result says so
+(`[Ran without the sandbox: a remembered sandbox_escalate rule …]`). Consulting
+it only at the denial would save the question but still pay for the contained
+run — which is the expensive half, the one that compiles the test binary and
+binds the port before finding out it may not. It is deliberately not a `bash(...)` rule: *may run* and *may run
 uncontained* are different permissions, so neither form matches the other's
 check. Opaque scripts (pipes, redirection) offer no remember and are asked every
 time, as with the ordinary gate. Without this a test suite that binds a local

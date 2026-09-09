@@ -39,6 +39,14 @@ pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file 
 /// left hanging.
 pub const ESCALATED_PREFIX: &str = "[Re-ran without the sandbox after user approval.]\n";
 
+/// Prepended when a remembered `sandbox_escalate(...)` rule let the command run
+/// uncontained from the start. Distinct from [`ESCALATED_PREFIX`]: nothing was
+/// denied this time and nobody was asked, so saying "after user approval" would
+/// misdescribe both. The model still has to be told the sandbox was not in
+/// force — otherwise it reads a plain success and assumes containment held.
+pub const REMEMBERED_ESCALATION_PREFIX: &str =
+    "[Ran without the sandbox: a remembered sandbox_escalate rule already covers this command.]\n";
+
 /// The same marker carrying what the sandbox had refused. The unsandboxed run
 /// replaces the contained one, so without this line the only record of *why*
 /// containment was removed is gone — which is what made one 107-minute

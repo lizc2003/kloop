@@ -215,16 +215,31 @@ pub(super) async fn bash_tool(
         bail!("interrupted");
     }
     let timeout_ms = parsed.timeout_ms.unwrap_or(60_000);
+    // A remembered escalation is consent to run this command uncontained, so
+    // the contained attempt is skipped rather than run and thrown away. It is
+    // the expensive half — the run that compiles the test binary, binds the
+    // port, and only then discovers it may not — and re-running it every time
+    // is what made "remember this" feel like it had not been remembered.
+    let remembered_escalation = sandbox.as_ref().is_some_and(|policy| policy.escalate)
+        && workspace.permissions.sandbox_escalation_remembered(command);
+    let effective_sandbox = if remembered_escalation {
+        None
+    } else {
+        sandbox.as_deref()
+    };
     let output = run_foreground(
         command,
         &cwd,
-        sandbox.as_deref(),
+        effective_sandbox,
         bash,
         timeout_ms,
         &ctx.cancel,
     )
     .await?;
     let mut text = format_output(&output);
+    if remembered_escalation {
+        return Ok(format!("{}{text}", sandbox::REMEMBERED_ESCALATION_PREFIX));
+    }
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
     // disable_sandbox / no policy leaves `sandbox` None and skips it.
@@ -2372,6 +2387,66 @@ Wait-Process -Id $grandchild.Id
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
             assert_eq!(asked.load(Ordering::SeqCst), 1, "asked exactly once: {out}");
+        }
+
+        /// A remembered escalation skips the contained attempt entirely: the
+        /// command runs uncontained on the first try, nobody is asked, and the
+        /// result says so. Remembering the answer without this only saves the
+        /// click — the expensive half is the run that was always going to be
+        /// thrown away.
+        #[tokio::test]
+        async fn a_remembered_escalation_skips_the_sandboxed_attempt() {
+            let (ctx, asked) = escalating_ctx(
+                "esc-remembered",
+                crate::permissions::Decision::Allow(
+                    crate::permissions::ApprovalScope::WorkspaceSession,
+                ),
+            );
+            // `mkdir -p` so the remembered two-word prefix is the subcommand,
+            // not the path — the second call must be a *different* argument
+            // covered by the same rule, which is the point of the prefix.
+            let dir = outside_dir("esc-remembered");
+            let first = dir.join("one");
+            let second = dir.join("two");
+            let _ = std::fs::remove_dir_all(&first);
+            let _ = std::fs::remove_dir_all(&second);
+
+            // First call: denied inside the sandbox, asked once, approved with
+            // the workspace scope.
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("mkdir -p {}", first.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("Re-ran without the sandbox"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+            // Second call, same two-word prefix: no ask, and no contained
+            // attempt — the marker says the rule covered it up front rather
+            // than that a denial was escalated.
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("mkdir -p {}", second.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "not asked again: {out}");
+            assert!(
+                out.contains("a remembered sandbox_escalate rule already covers this"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("Re-ran without the sandbox"),
+                "the contained attempt must not have run: {out}"
+            );
+            assert!(
+                !out.contains("Operation not permitted"),
+                "no denial output from a skipped attempt: {out}"
+            );
+            assert!(second.is_dir(), "the uncontained run actually did the work");
         }
 
         /// Escalation loop, declined: the sandboxed failure is kept and the

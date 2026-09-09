@@ -1220,6 +1220,21 @@ impl Permissions {
         }
     }
 
+    /// Whether consent to run this command uncontained is already on record —
+    /// asked *before* the sandboxed attempt, not after it failed. Remembering
+    /// the answer only skips the question; skipping the attempt is what the
+    /// answer was actually for, because the contained run is the expensive half
+    /// (a test suite compiles, binds a port, and only then finds out it may
+    /// not). Bypass mode is deliberately not consulted here: it means "do not
+    /// ask", not "do not contain".
+    pub fn sandbox_escalation_remembered(&self, command: &str) -> bool {
+        if self.allow_everything {
+            return false;
+        }
+        escalation_remember_payload(command)
+            .is_some_and(|remember| self.escalation_remembered(&remember))
+    }
+
     /// Whether a durable project rule or this workspace's session cache already
     /// consented to running these commands uncontained.
     fn escalation_remembered(&self, remember: &Remember) -> bool {

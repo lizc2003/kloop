@@ -69,7 +69,8 @@ plan 126 的 skill 三句已经生效。同一个 agent、同一个仓库：
 codex 跑的是**同一批包**（`go test ./upstream/aliyunimage ./gateway/handler -count=1`），
 它的工具段最慢 **12 秒**。差 20–45 倍，因为 kloop 每个 `go test` 都要走
 「沙箱内跑 → 被 httptest 的网络拦住 → 弹审批 → 等人点 → 无沙箱**重跑一遍**」。
-codex 快，是因为它把批准记住了：既不问，也不跑两遍。
+codex 快，是因为它把批准记住了：既不问，也不跑两遍。**"不跑两遍"这半句是本片最容易
+漏掉的**——见第四节第 2 条的补记。
 
 ## 三、为什么原来记不住
 
@@ -103,13 +104,22 @@ Decision::Allow(ApprovalScope::WorkspaceSession | ApprovalScope::Project)
 `sandbox_escalate(...)` 也**不**让命令通过普通 gate（`matches_argv`）。*可以运行*和
 *可以不受约束地运行*是两种权限。
 
-**2. 三档审批 + 先查记忆。** `escalate_sandbox` 先算 payload、先查项目规则与本工作区
-会话缓存，命中直接 `Approved` 不问；未命中才问，并按 `remember.is_some()` /
+**2. 三档审批 + 记忆前置到执行之前。** `escalate_sandbox` 先算 payload、先查项目规则
+与本工作区会话缓存，命中直接 `Approved` 不问；未命中才问，并按 `remember.is_some()` /
 `project.can_persist()` 决定提供哪几档。落盘失败仍然放行这一次（用户已经说了是），只是
 记不住——与普通 gate 的 project 档同构。粒度也与普通 bash 审批一致：两词前缀。**但
 read-only 段不跳过**——`remember_payload` 会跳过只读命令，这里不能，因为一条只读命令
 既然被拒到了这一步，它就是被同意的内容的一部分。opaque 脚本（管道、重定向）产生不出
 payload，因此永远只有 `Once`。
+
+**补记（同日，用户指出）**：第一版只把记忆用在了「问不问」上，`tools/bash.rs` 仍然
+先跑一遍沙箱内的、注定失败的执行，再无沙箱重跑——**记住的只是那次点击，不是那段时
+间**，而对一条 5–9 分钟的 `go test` 来说，被扔掉的那一遍才是账单本身。记忆检查因此
+前移到第一次 `run_foreground` 之前（`Permissions::sandbox_escalation_remembered`）：
+命中就直接不带沙箱跑，结果冠以 `REMEMBERED_ESCALATION_PREFIX` 而不是
+`ESCALATED_PREFIX`——这次没有任何东西被拒绝、也没有人被问，说成「after user approval」
+会把两件事都描述错，而模型必须知道这一跑没有沙箱，否则它读到的是一个普通的成功。
+`Mode::Bypass` 刻意不参与这个前置判断：bypass 的意思是「不要问」，不是「不要约束」。
 
 **3. 说清被什么拦了。** `is_likely_sandbox_denied` 从 `bool` 变成
 `classify_sandbox_denial() -> Option<SandboxDenial>`，带 `DenialKind`
@@ -146,6 +156,11 @@ build log 在写拒绝上方十行提到 socket，不能把写判成网络。审
 
 - `a_remembered_escalation_is_not_asked_again`：workspace 档答一次后，同前缀不同参数
   的命令不再问；换一条命令仍然问（脚本 approver 已耗尽 → 拒绝，正是它确实问了的证明）。
+- `a_remembered_escalation_skips_the_sandboxed_attempt`（补记那条）：第二次调用既没
+  被问，也**没有沙箱内那一遍**——断言结果带 remembered 前缀、不带 `Re-ran without the
+  sandbox`、不带 `Operation not permitted`。用 `mkdir -p` 而不是 `echo x > file`：后者
+  带重定向、是 opaque，按本片自己的规则本来就不可记忆（第一版测试就是这么写红的），
+  而 `mkdir -p` 的两词前缀是子命令，第二次才能用**不同的参数**命中同一条规则。
 - `an_opaque_command_offers_no_remember`：带重定向的脚本只拿到 `Once`、
   `remember_rules` 为 `None`，两次都问。
 - `escalation_rules_and_bash_rules_do_not_substitute_for_each_other`：四个方向逐条断言。
@@ -159,7 +174,7 @@ build log 在写拒绝上方十行提到 socket，不能把写判成网络。审
 ### 验证
 
 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -D warnings`、
-`cargo test --workspace`（33 个 target、1443 passed、0 failed）全绿。
+`cargo test --workspace`（33 个 target、1444 passed、0 failed）全绿。
 
 ### 下一轮复查
 
