@@ -12,6 +12,14 @@ commit against its parent. Read the whole diff first, then the surrounding code
 the diff does not show — most real defects live in what the change stopped
 doing, not in the lines it added.
 
+Take that diff with enough context that it answers the next question on its
+own — tens of lines on each side, not the default three. Opening the whole file
+is the expensive way to get the same context back, and most of what it returns
+is unrelated to the change. When the change is large, take the diff a few files
+at a time rather than in one piece: everything already in context is carried
+into every round that follows, and the rounds after a summary are the expensive
+ones.
+
 The change's own file list is the minimum you have to cover: every file in it
 gets opened, the documentation it touches included. A doc the change writes is a
 promise the change is making, and nothing else in the repository will check it —

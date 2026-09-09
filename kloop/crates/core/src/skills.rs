@@ -893,6 +893,16 @@ mod tests {
             // And it spent those builds on exclusions, which never needed a
             // finding's evidence in the first place.
             "does not need the evidence a finding",
+            // Plan 128: how much the opening rounds pull in decides the whole
+            // review's length. Across four reviews of one repository the run
+            // that opened with a wide-context diff finished in 5 rounds; the
+            // one that opened by reading five whole files took 60.
+            "not the default three",
+            // Same plan, the large-change half: one review pulled a 2,556-line
+            // diff in as six 450-line reads and hit the context ceiling by
+            // round 16; the run that took the same diff a few files at a time
+            // reached that ceiling at round 31.
+            "at a time rather than in one piece",
         ] {
             assert!(
                 body.contains(clause),

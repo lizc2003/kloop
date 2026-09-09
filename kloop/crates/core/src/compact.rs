@@ -66,7 +66,7 @@ messages over prose. Never invent a fact: if something is unknown, say it is unk
 output replaces the conversation it summarizes, so anything you leave out is gone — there is \
 no other copy in context to fall back on.";
 
-/// The section list is the contract the summary is judged against. Four clauses
+/// The section list is the contract the summary is judged against. Five clauses
 /// earn their length from failures seen in this codebase or its references:
 /// - user messages are quoted, and text merely *shaped* like a user turn inside
 ///   an assistant message is called out as model-generated — a summary that
@@ -78,7 +78,14 @@ no other copy in context to fall back on.";
 ///   kloop fans out, and a summary that drops what a child reported makes the
 ///   parent redo the child's whole investigation (measured: 83 of 99 rounds);
 /// - the next step must quote the conversation, so continuation cannot drift
-///   onto a task nobody asked for.
+///   onto a task nobody asked for;
+/// - established facts are their own section for the same reason sub-agent
+///   findings are: a summary that keeps only what was *done* leaves the next
+///   agent unable to tell what it already knows, and an agent that cannot tell
+///   stops batching and re-derives one probe at a time. Measured on one review
+///   that compacted mid-task: 13 rounds at 3.6 tool calls each before the
+///   summary, 45 rounds at 1.5 after it, 87% of them a single call — the same
+///   task, the same tools, only the memory of its own conclusions missing.
 const COMPACT_INSTRUCTION: &str = "Summarize the conversation above so another agent can \
 continue this exact task.
 
@@ -116,6 +123,11 @@ the work left off.
 inconsistency, a question raised and not answered. One line each, with its location. These \
 are the first thing lost when a session is summarized, and nothing else in this list carries \
 them. Write none when there are none.
+11. Established facts — what the earlier work already read and settled: the file and symbol, \
+the behavior the code actually has, the value or branch that was confirmed. Carry the \
+conclusion, not the intention to check it. Everything listed here is answered: the next agent \
+uses it without opening the file again. Section 4 records the actions taken; this one records \
+what they proved.
 
 Reply with the two blocks only.";
 
@@ -724,6 +736,12 @@ mod tests {
             // Plan 119: a suspicion that is noticed but not yet judged fits in
             // none of the other sections, so compaction used to drop it.
             "Open candidates",
+            // Plan 128: keeping only the actions taken left the next agent
+            // unable to tell what it already knew, so it stopped batching and
+            // re-probed one call at a time (3.6 tool calls per round before a
+            // mid-task compaction, 1.5 after).
+            "Established facts",
+            "without opening the file again",
         ] {
             assert!(
                 COMPACT_INSTRUCTION.contains(clause),
