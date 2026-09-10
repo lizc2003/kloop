@@ -183,15 +183,32 @@ enum MessagePartKind {
     Refusal,
 }
 
+fn message_part_field(kind: MessagePartKind) -> &'static str {
+    match kind {
+        MessagePartKind::OutputText => "text",
+        MessagePartKind::Refusal => "refusal",
+    }
+}
+
 fn message_part_value<'a>(
     value: &'a Value,
     kind: MessagePartKind,
     field: &str,
 ) -> Result<&'a str, ProviderFailure> {
-    match kind {
-        MessagePartKind::OutputText => required_str(&value["text"], field),
-        MessagePartKind::Refusal => required_str(&value["refusal"], field),
+    required_str(&value[message_part_field(kind)], field)
+}
+
+/// The text a part opens with. `*_part.added` carries `""` on the reference
+/// wire, and a gateway that drops the key entirely is saying the same thing:
+/// an opening part holds nothing yet, and every character it ends up with
+/// arrives as a delta. The `.done` twin keeps `required_str` — there the value
+/// is compared against what the deltas built, and a missing key is a claim that
+/// cannot be checked.
+fn opening_part_text<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
+    if value.is_null() {
+        return Ok("");
     }
+    required_str(value, field)
 }
 
 struct TextPart {
@@ -298,11 +315,12 @@ fn is_out_of_band(event: &str) -> bool {
     event.starts_with("codex.") || event.starts_with("responsesapi.") || event == "keepalive"
 }
 
-fn response_identity(response: &Value) -> Result<(&str, &str), ProviderFailure> {
-    Ok((
-        required_non_empty(&response["id"], "response id")?,
-        required_str(&response["status"], "response status")?,
-    ))
+/// The one field every `response.*` envelope must carry. `status` is read only
+/// where it decides something (the terminal events), so it is checked there and
+/// not here: a gateway that omits it from the opening frames is still saying
+/// everything this stream needs to hear.
+fn response_id_of(response: &Value) -> Result<&str, ProviderFailure> {
+    required_non_empty(&response["id"], "response id")
 }
 
 fn event_item_key(value: &Value) -> Result<ItemKey, ProviderFailure> {
@@ -454,7 +472,8 @@ fn add_content_part(
                 "refusal" => MessagePartKind::Refusal,
                 _ => return Err(protocol("message contained an unsupported content part")),
             };
-            let text = message_part_value(part, kind, "content part value")?.to_string();
+            let text = opening_part_text(&part[message_part_field(kind)], "content part value")?
+                .to_string();
             if parts
                 .insert(
                     index,
@@ -481,7 +500,7 @@ fn add_content_part(
             if required_str(&part["type"], "reasoning content part type")? != "reasoning_text" {
                 return Err(protocol("reasoning contained an unsupported content part"));
             }
-            let text = required_str(&part["text"], "reasoning part text")?.to_string();
+            let text = opening_part_text(&part["text"], "reasoning part text")?.to_string();
             if content
                 .insert(
                     index,
@@ -785,7 +804,7 @@ fn terminal_outcome(
     has_tool: bool,
     has_refusal: bool,
 ) -> Result<AssistantOutcome, ProviderFailure> {
-    let (_, status) = response_identity(response)?;
+    let status = required_str(&response["status"], "response status")?;
     match event {
         "response.completed" => {
             if status != "completed" {
@@ -870,7 +889,10 @@ pub(super) async fn stream(
                 // Their `status` is descriptive and never read: nothing below
                 // branches on it, and a relay that queues the request and says
                 // so has changed nothing about what we do. Checking it made a
-                // word choice upstream into a protocol violation down here.
+                // word choice upstream into a protocol violation down here —
+                // and requiring the *key* did the same to a gateway that simply
+                // does not send it on the opening frames (gw_cn's deepseek
+                // route), which is why only the id is read here.
                 //
                 // A *different* identity is the one thing that matters, and it
                 // means two things depending on when it lands. Before any output
@@ -881,7 +903,7 @@ pub(super) async fn stream(
                 // one: fail closed, naming both ids so the next reader does not
                 // have to guess which half moved.
                 "response.created" | "response.in_progress" => {
-                    let (id, _status) = response_identity(&value["response"])?;
+                    let id = response_id_of(&value["response"])?;
                     let adopt = match response_id.as_deref() {
                         None if event == "response.in_progress" => {
                             return Err(protocol("response.in_progress arrived before created"));
@@ -985,7 +1007,7 @@ pub(super) async fn stream(
                     {
                         return Err(protocol("reasoning summary part type was unsupported"));
                     }
-                    let text = required_str(&value["part"]["text"], "summary part text")?;
+                    let text = opening_part_text(&value["part"]["text"], "summary part text")?;
                     if summary.contains_key(&index) {
                         return Err(protocol("summary_index was added more than once"));
                     }
@@ -1176,7 +1198,7 @@ pub(super) async fn stream(
                     if !items.is_empty() {
                         return Err(protocol("terminal arrived with open output items"));
                     }
-                    let (id, _) = response_identity(&value["response"])?;
+                    let id = response_id_of(&value["response"])?;
                     if id != expected {
                         return Err(protocol("terminal response identity changed"));
                     }

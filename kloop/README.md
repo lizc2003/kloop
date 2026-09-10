@@ -3008,6 +3008,14 @@ cargo run -- --mock
 # message/function_call item status remains required. A reasoning item may omit
 # status on added/done (a production wire shape); when present it must still be
 # in_progress/completed respectively, and explicit null or another value fails.
+# The lifecycle frames (response.created/in_progress) are read for identity
+# only: their status is never consumed downstream, so a missing key or an
+# unfamiliar value there is not a violation, while the terminal frames still
+# require it to tell completed from incomplete. Part-opening frames
+# (*_part.added) may likewise omit their text/refusal field — an opening part
+# holds nothing yet, every character arrives as a delta — but the closing .done
+# twin still requires it, since that value is compared against the accumulated
+# deltas.
 # Optional Agent/Program/Workflow string controls likewise expose the same
 # non-empty ID/metadata constraints enforced by their strict runtime parsers;
 # nullable options use null for omission, while an empty identity remains invalid.

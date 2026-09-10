@@ -395,6 +395,196 @@ async fn a_queued_status_on_the_opening_frames_is_not_a_violation() {
     );
 }
 
+/// Some gateways omit `status` from the opening frames entirely (gw_cn's
+/// deepseek route sends `response.created` with id/model/usage metadata and no
+/// status key at all). Requiring the key was the same mistake as requiring a
+/// particular value: the field decides nothing here, so its absence must not
+/// kill the round.
+#[tokio::test]
+async fn opening_frames_without_a_status_key_are_accepted() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "object": "response"}}),
+            json!({"type": "response.in_progress", "response": {"id": "r", "object": "response"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "an opening frame without a status key must not fail the stream: {events:?}"
+    );
+}
+
+/// The same gateway opens its parts with `{"type": "summary_text"}` and no
+/// `text` key. An opening part holds nothing yet — every character arrives as a
+/// delta — so an absent key and `""` say the same thing, on reasoning summaries
+/// and message content alike.
+#[tokio::test]
+async fn opening_parts_without_a_text_key_are_empty() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress"
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "part": {"type": "summary_text"}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "delta": "thinking"}),
+            json!({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "text": "thinking"}),
+            json!({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0,
+                "part": {"type": "summary_text", "text": "thinking"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "completed",
+                "summary": [{"type": "summary_text", "text": "thinking"}]
+            }}),
+            json!({"type": "response.output_item.added", "output_index": 1, "item": {
+                "type": "message", "id": "m", "status": "in_progress", "role": "assistant"
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 1,
+                "item_id": "m", "content_index": 0, "part": {"type": "output_text"}}),
+            json!({"type": "response.output_text.delta", "output_index": 1,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 1,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 1,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 1, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r", "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "opening parts without a text key must not fail the stream: {events:?}"
+    );
+}
+
+/// The closing twin is where the text is actually consumed — it has to match
+/// what the deltas built — so a missing key there is a claim that cannot be
+/// checked, and stays fatal.
+#[tokio::test]
+async fn a_closing_part_without_a_text_key_still_fails() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress"
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "part": {"type": "summary_text"}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "delta": "thinking"}),
+            json!({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "text": "thinking"}),
+            json!({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "part": {"type": "summary_text"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("a closing part without a text must fail the stream");
+    assert!(!error.is_retryable());
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("missing or invalid summary part text"),
+        "{rendered}"
+    );
+}
+
+/// The terminal events are the one place `status` decides something — whether
+/// the turn ended or was cut short — so there it stays required.
+#[tokio::test]
+async fn a_terminal_frame_without_a_status_key_still_fails() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "r",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("a terminal frame without a status must fail the stream");
+    assert!(!error.is_retryable());
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("missing or invalid response status"),
+        "{rendered}"
+    );
+}
+
 /// A new identity before any output is an upstream restart — the relay retried
 /// and is now forwarding the real response. Nothing has been attributed yet, so
 /// following it is safe and keeps the turn alive.
