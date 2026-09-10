@@ -286,11 +286,14 @@ pub(crate) fn validate_timeline(
             None if receipt.revision == 1
                 && receipt.source == kloop_protocol::ProviderRouteSource::Initial => {}
             Some(previous)
-                if receipt.source == kloop_protocol::ProviderRouteSource::ExplicitSwitch
-                    && previous
-                        .revision
-                        .checked_add(1)
-                        .is_some_and(|revision| revision == receipt.revision)
+                if matches!(
+                    receipt.source,
+                    kloop_protocol::ProviderRouteSource::ExplicitSwitch
+                        | kloop_protocol::ProviderRouteSource::Recovered
+                ) && previous
+                    .revision
+                    .checked_add(1)
+                    .is_some_and(|revision| revision == receipt.revision)
                     && receipt.boundary > previous.boundary => {}
             _ => return Err(SwitchError::InvalidTimeline),
         }
@@ -384,9 +387,10 @@ impl SessionProviderState {
         timeline: &[kloop_protocol::ProviderRouteReceipt],
     ) -> Result<Self, SwitchError> {
         validate_timeline(timeline)?;
-        for receipt in timeline {
-            catalog.validate_receipt(receipt)?;
-        }
+        // Only the route the session continues on has to exist in today's
+        // catalog. The earlier receipts record what a past turn actually ran on;
+        // re-checking them against current configuration would make renaming a
+        // provider retroactively invalidate every session that ever used it.
         let latest = timeline.last().ok_or(SwitchError::InvalidTimeline)?;
         let route = catalog.restore_route(latest)?;
         let remembered_models = timeline
@@ -693,6 +697,15 @@ impl FrozenProviderRoute {
         ))
     }
 
+    /// The same route carrying a different reasoning continuity — how a route
+    /// change is finished once the projection has said what it costs.
+    pub fn with_reasoning_continuity(&self, continuity: ReasoningContinuity) -> Self {
+        Self {
+            continuity,
+            ..self.clone()
+        }
+    }
+
     pub fn provider_id(&self) -> &str {
         &self.route.provider_id
     }
@@ -884,6 +897,42 @@ pub enum SwitchOutcome {
     },
 }
 
+/// A resumed session whose recorded route no longer resolves, and the route it
+/// was moved onto instead. Carried back to whichever front-end opened the
+/// session so the hop is stated once, in words, rather than inferred later from
+/// a `recovered` receipt nobody was told about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteRecovery {
+    pub from_provider: String,
+    pub from_model: String,
+    pub to_provider: String,
+    pub to_model: String,
+    pub reason: SwitchError,
+    pub continuity: ReasoningContinuity,
+}
+
+impl fmt::Display for RouteRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            reason,
+            continuity,
+        } = self;
+        write!(
+            formatter,
+            "session was written on {from_provider}/{from_model}, which no longer \
+             resolves ({reason}); continuing on {to_provider}/{to_model}"
+        )?;
+        if *continuity == ReasoningContinuity::Filtered {
+            formatter.write_str(" — earlier reasoning is dropped from the request")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwitchError {
     UnknownProvider(String),
@@ -987,6 +1036,62 @@ mod tests {
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
+    }
+
+    /// A past revision names what a past turn ran on. Only the route the
+    /// session continues on has to exist today — otherwise renaming a provider
+    /// in configuration would retroactively lock every session that ever
+    /// touched it (plan 132).
+    #[test]
+    fn from_timeline_judges_only_the_route_the_session_continues_on() {
+        let catalog =
+            Arc::new(ProviderCatalog::new(vec![mock_entry("kept", "k1", &["k1"])]).unwrap());
+        let recovered = [
+            receipt(
+                1,
+                1,
+                kloop_protocol::ProviderRouteSource::Initial,
+                "gone",
+                "g1",
+            ),
+            receipt(
+                2,
+                4,
+                kloop_protocol::ProviderRouteSource::Recovered,
+                "kept",
+                "k1",
+            ),
+        ];
+        let state = SessionProviderState::from_timeline(Arc::clone(&catalog), &recovered).unwrap();
+        assert_eq!(state.active_route().revision, 2);
+        assert_eq!(state.active_route().provider_id, "kept");
+        assert_eq!(
+            state.remembered_models(),
+            BTreeMap::from([("gone".into(), "g1".into()), ("kept".into(), "k1".into())]),
+            "a model remembered for a provider that is gone is harmless: switching to it resolves"
+        );
+
+        // The last receipt is the one that still has to resolve.
+        let stranded = [
+            receipt(
+                1,
+                1,
+                kloop_protocol::ProviderRouteSource::Initial,
+                "kept",
+                "k1",
+            ),
+            receipt(
+                2,
+                4,
+                kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                "gone",
+                "g1",
+            ),
+        ];
+        assert_eq!(
+            SessionProviderState::from_timeline(catalog, &stranded).unwrap_err(),
+            SwitchError::UnknownProvider("gone".into())
+        );
     }
 
     #[test]

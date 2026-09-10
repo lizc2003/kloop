@@ -403,6 +403,43 @@ fn switch_factory(
     })
 }
 
+/// A catalog whose configured providers can change between server restarts —
+/// the shape of a user editing `~/.kloop/config.toml` between two sessions. An
+/// explicitly named provider must resolve (like the real factory); nothing else
+/// is assumed about what the thread was written on.
+fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> ConfigFactory {
+    let inner = factory(Vec::new(), offload, false);
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let requested = options.provider_id.clone();
+        let mut cfg = inner(options, catalog, approver, questioner, notify)?;
+        let ids = configured.lock().unwrap().clone();
+        let entries = ids
+            .iter()
+            .map(|id| kloop_core::provider_route::ProviderCatalogEntry {
+                id: id.clone(),
+                api_family: kloop_protocol::ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                default_model: "shared".into(),
+                models: vec!["shared".into()],
+                fallback_model: None,
+                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                default_effort: None,
+                factory: Arc::new(|| Ok(Provider::mock(vec![vec![text("answer")]]))),
+            })
+            .collect();
+        let catalog = Arc::new(
+            kloop_core::provider_route::ProviderCatalog::new(entries)
+                .map_err(anyhow::Error::msg)?,
+        );
+        let selected = requested.unwrap_or_else(|| ids[0].clone());
+        cfg.provider_route = catalog
+            .initial_route(&selected, None)
+            .map_err(anyhow::Error::new)?;
+        cfg.provider_catalog = catalog;
+        Ok(cfg)
+    })
+}
+
 fn real_switch_factory(offload: PathBuf) -> ConfigFactory {
     let inner = factory(Vec::new(), offload, false);
     Arc::new(move |options, catalog, approver, questioner, notify| {
@@ -1566,6 +1603,89 @@ async fn real_three_rail_route_switch_contract() {
         route_responses["continuity"].as_str().unwrap(),
         route_a["continuity"].as_str().unwrap(),
     );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// Plan 132. A resumed thread's recorded provider is a reference to what it ran
+/// on: still configured, it is re-adopted with the revision a `/provider` switch
+/// left behind (rebuilding it as a revision-1 initial route used to refuse the
+/// resume outright); gone from configuration, the thread opens anyway on today's
+/// default and records the hop instead of becoming unopenable.
+#[tokio::test]
+async fn resume_readopts_the_recorded_route_and_recovers_when_it_is_gone() {
+    let dirs = test_dirs("resume-route-recovery");
+    let configured = Arc::new(Mutex::new(vec!["a".to_string(), "b".to_string()]));
+    let build = renaming_factory(dirs.offload.clone(), Arc::clone(&configured));
+
+    let mut client = start_server(Arc::clone(&build), &dirs);
+    let thread_id = client.init_and_start().await;
+    client
+        .request("turn/start", json!({"threadId": thread_id, "input": "q1"}))
+        .await;
+    client
+        .recv_until(|message| message["method"] == "turn/completed")
+        .await;
+    let switch = client
+        .request(
+            "thread/provider/switch",
+            json!({
+                "threadId": thread_id,
+                "providerId": "b",
+                "expectedRouteRevision": 1,
+            }),
+        )
+        .await;
+    let switched = client.recv_until(|message| message["id"] == switch).await;
+    let switched = switched
+        .iter()
+        .find(|message| message["id"] == switch)
+        .unwrap();
+    assert_eq!(switched["result"]["route"]["revision"], 2);
+    client.shutdown().await;
+
+    // Same configuration: the session comes back on the provider it switched to,
+    // at the revision that switch committed.
+    let mut client = start_server(Arc::clone(&build), &dirs);
+    client.initialize().await;
+    let resume = client
+        .request("thread/resume", json!({"threadId": thread_id}))
+        .await;
+    let messages = client.recv_until(|message| message["id"] == resume).await;
+    let resumed = messages
+        .iter()
+        .find(|message| message["id"] == resume)
+        .unwrap();
+    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "b");
+    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 2);
+    client.shutdown().await;
+
+    // `b` is renamed out of the configuration between sessions.
+    *configured.lock().unwrap() = vec!["c".to_string()];
+    let mut client = start_server(build, &dirs);
+    client.initialize().await;
+    let resume = client
+        .request("thread/resume", json!({"threadId": thread_id}))
+        .await;
+    let messages = client.recv_until(|message| message["id"] == resume).await;
+    let resumed = messages
+        .iter()
+        .find(|message| message["id"] == resume)
+        .unwrap();
+    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "c");
+    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 3);
+    assert_eq!(resumed["result"]["messageCount"], 2);
+    let note = messages
+        .iter()
+        .find(|message| message["method"] == "note")
+        .unwrap_or_else(|| panic!("no recovery note: {messages:?}"));
+    let note = note["params"]["text"].as_str().unwrap();
+    assert!(
+        note.contains("session was written on b/shared")
+            && note.contains("unknown provider 'b'")
+            && note.contains("continuing on c/shared"),
+        "{note}"
+    );
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

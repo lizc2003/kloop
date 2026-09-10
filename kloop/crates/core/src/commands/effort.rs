@@ -57,7 +57,11 @@ pub fn run(
     // stretch of the session ran at instead of only how it opened.
     let committed = state.commit_effort(target, |next| {
         history
-            .append_provider_route_changed(next, next.continuity())
+            .append_provider_route_changed(
+                next,
+                kloop_protocol::ProviderRouteSource::ExplicitSwitch,
+                next.continuity(),
+            )
             .map(|_| ())
     });
     if let Err(error) = committed {

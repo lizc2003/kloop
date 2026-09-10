@@ -339,6 +339,19 @@ were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is
 migrated and safely resumable.
 
+A resumed or forked session continues on the route its last receipt names — the
+provider, model and revision it was written on, including one a `/provider`
+switch left behind. That receipt is a record of what ran, not a claim about what
+is configured now: when it no longer resolves (the provider renamed or dropped
+from `config.toml`, its endpoint or model allowlist edited underneath it) the
+session still opens, on the configured default, as a durable `recovered` route
+revision plus a note saying what moved and why. Editing configuration therefore
+cannot make past sessions unopenable. Earlier receipts are never re-checked
+against today's catalog at all — only the route the session continues on has to
+exist. Reasoning the new rail cannot replay is dropped from the request view
+(`continuity: filtered`), exactly as after an explicit switch, and the canonical
+transcript keeps it.
+
 ### Fork (and rewind)
 
 `--fork <id>#<seq>` branches a new session off an existing one at line
@@ -863,7 +876,7 @@ be used unescaped as a filename, an HTTP header value, and a log field.
 
 **Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | threadId?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
-Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable explicit switch may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
+Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable route change — an explicit switch, or the `recovered` revision a resume writes when its recorded provider is gone from configuration — may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. `thread/resume` and `thread/fork` adopt the recorded route rather than rebuilding it as a fresh initial one, so a session that switched providers comes back at the revision it left off; the recorded provider/model reach the config factory as a reference, and a factory that refuses them is retried without them. Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
 **Events** stream per active thread. Every public notification carries
 `threadId`, one opaque `eventGeneration`, and a decimal-string `seq`; `seq`
 starts at `"1"`, increases strictly across turns in that generation, and never

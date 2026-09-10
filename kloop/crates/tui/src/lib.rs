@@ -485,24 +485,17 @@ async fn agent_worker(
                 let event = match fork_here(&history, seq) {
                     Ok((session_id, resumed)) => {
                         let messages = resumed.messages.clone();
-                        let route = resumed
-                            .snapshot
-                            .provider_routes
-                            .last()
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "rewound session provider route timeline is missing",
-                                )
-                            })
-                            .and_then(|receipt| {
-                                cfg.provider_catalog
-                                    .restore_route(receipt)
-                                    .map_err(std::io::Error::other)
-                            });
-                        match route {
-                            Ok(route) => {
-                                history.rebase(resumed);
+                        history.rebase(resumed);
+                        // The cut's own route, or — when that provider is gone
+                        // from configuration — the one this session is running
+                        // on right now, recorded on the new branch. Unlike the
+                        // `fork_here` failure below, this runs after the rebase:
+                        // adopting writes to the forked rollout, so it needs the
+                        // branch already installed.
+                        let adopted = history
+                            .adopt_provider_route(&cfg.provider_catalog, &cfg.provider_route);
+                        match adopted {
+                            Ok((route, recovery)) => {
                                 cfg.reset_deferred_tool_capabilities();
                                 cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
                                 provider_state =
@@ -511,6 +504,10 @@ async fn agent_worker(
                                         history.provider_routes(),
                                     )
                                     .expect("rewound provider timeline was validated on recovery");
+                                if let Some(recovery) = recovery {
+                                    let _ = events
+                                        .send(AgentEvent::System(format!("rewind: {recovery}")));
+                                }
                                 AgentEvent::Forked {
                                     session_id,
                                     messages,
@@ -518,7 +515,8 @@ async fn agent_worker(
                                 }
                             }
                             Err(error) => AgentEvent::System(format!(
-                                "rewind failed: cannot restore provider route: {error}"
+                                "rewind landed on the new branch but its provider route \
+                                 could not be adopted: {error}"
                             )),
                         }
                     }

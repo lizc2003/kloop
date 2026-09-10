@@ -558,6 +558,13 @@ pub struct ProviderAttemptIdentity {
 pub enum ProviderRouteSource {
     Initial,
     ExplicitSwitch,
+    /// The session was resumed onto a different route because the one it was
+    /// written on no longer resolves against the running catalog — a provider
+    /// renamed or dropped from configuration, an endpoint or model allowlist
+    /// edited underneath it. Distinct from `ExplicitSwitch` because nobody
+    /// asked for this hop: reading it as a user's `/provider` months later
+    /// would be reading a decision that was never made.
+    Recovered,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

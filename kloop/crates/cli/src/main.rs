@@ -296,21 +296,22 @@ async fn main() -> Result<ExitCode> {
         }
         skills
     });
-    let (history, session_id) = open_history(
+    let (mut history, session_id) = open_history(
         &session_store,
         &session_dirs,
         &args.session,
         &provider.initial_route(),
     )?;
-    let session_route = provider
-        .catalog()
-        .restore_route(
-            history
-                .provider_routes()
-                .last()
-                .context("session provider route timeline is missing")?,
-        )
+    // A resumed session continues on the route it was written on — unless that
+    // route is gone from configuration, in which case it lands on today's
+    // default and says so. A fresh session's revision-1 receipt resolves and
+    // comes straight back.
+    let (session_route, route_recovery) = history
+        .adopt_provider_route(&provider.catalog(), &provider.initial_route())
         .map_err(anyhow::Error::new)?;
+    if let Some(recovery) = &route_recovery {
+        eprintln!("\x1b[2m[{recovery}]\x1b[0m");
+    }
 
     // `--image` files are read + validated once, up front, so a bad path fails
     // fast before any UI owns the terminal. They attach to the first user turn.

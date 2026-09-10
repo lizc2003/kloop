@@ -604,8 +604,15 @@ impl Rollout {
     pub fn append_provider_route_changed(
         &mut self,
         route: &FrozenProviderRoute,
+        source: ProviderRouteSource,
         continuity: ReasoningContinuity,
     ) -> io::Result<ProviderRouteReceipt> {
+        if source == ProviderRouteSource::Initial {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a route change cannot claim to be the initial route",
+            ));
+        }
         let previous = self.route_timeline.last().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -618,11 +625,7 @@ impl Rollout {
                 "provider route revision must advance by exactly one",
             ));
         }
-        let receipt = route.receipt(
-            self.next_seq,
-            ProviderRouteSource::ExplicitSwitch,
-            continuity,
-        );
+        let receipt = route.receipt(self.next_seq, source, continuity);
         self.append_line(RolloutLine::ProviderRouteChanged {
             meta: self.next_meta(),
             receipt: receipt.clone(),
@@ -828,17 +831,24 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
     let mut routes: Vec<ProviderRouteReceipt> = Vec::new();
     for line in lines {
-        let (meta, receipt, expected_source) = match line {
-            RolloutLine::ProviderRouteInitial { meta, receipt } => {
-                (meta, receipt, ProviderRouteSource::Initial)
-            }
-            RolloutLine::ProviderRouteChanged { meta, receipt } => {
-                (meta, receipt, ProviderRouteSource::ExplicitSwitch)
-            }
+        let (meta, receipt, source_matches_line) = match line {
+            RolloutLine::ProviderRouteInitial { meta, receipt } => (
+                meta,
+                receipt,
+                receipt.source == ProviderRouteSource::Initial,
+            ),
+            // Both change kinds ride the same line; which one it was lives in
+            // the receipt's own `source`, and `validate_timeline` decides
+            // whether that value is legal at this revision.
+            RolloutLine::ProviderRouteChanged { meta, receipt } => (
+                meta,
+                receipt,
+                receipt.source != ProviderRouteSource::Initial,
+            ),
             _ => continue,
         };
         let boundary = checked_seq_of(meta)?;
-        if receipt.boundary != boundary || receipt.source != expected_source {
+        if receipt.boundary != boundary || !source_matches_line {
             return Err(invalid(
                 "provider route receipt boundary/source does not match its line".into(),
             ));
