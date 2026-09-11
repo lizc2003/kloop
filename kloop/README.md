@@ -578,7 +578,8 @@ apart for a frontend that lays a prompt out over several lines.
 **Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
 (the default when the flag is omitted — ask for anything unvouched-for),
 `accept-edits` (file writes inside the working directory auto-pass), `bypass`
-(everything passes *except* deny rules and safety checks), or `plan` (read-only
+(everything passes *except* deny rules, safety checks, and a bash call that
+asked to leave the OS sandbox — see below), or `plan` (read-only
 until the plan is approved, below). `--mock` disables the gate entirely — nobody
 is at the keyboard. In the TUI, **shift+Tab** cycles the mode live (manual →
 accept-edits → plan → manual; the status bar shows the current one), while bypass
@@ -1946,7 +1947,15 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `auto_allow = false` reverts to pure containment (approve
   first, then run sandboxed). `--permission-mode bypass` bypasses approvals but
-  not the sandbox.
+  not the sandbox — and not a call that removes the sandbox itself: a bash call
+  carrying `disable_sandbox` still reaches you under bypass, because what the
+  mode trusts is what the model is *doing*, not its decision to take the
+  containment off first. (A read-only escaped command still auto-passes, and an
+  ordinary command on a host with no sandbox at all is unaffected — refusing
+  that one would retire the mode wherever there is no sandbox to begin with.)
+  Bypass does not vet the command itself: the destructive check is a blocklist
+  knowing only `rm` and `sudo`, so where there is no containment there is no
+  command-level net under bypass.
 
 On platforms without an OS shell sandbox, worktree separation still anchors
 ordinary relative paths and parallel edits, but it cannot contain a model that

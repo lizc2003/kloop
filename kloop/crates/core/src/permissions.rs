@@ -19,6 +19,14 @@
 //! whose yes would break the read-only promise. `exit_plan_mode` counts as
 //! read-only here (it only shows the plan and flips the mode), so it passes.
 //!
+//! Bypass mode ([`Mode::Bypass`]) waives the rule/ask layers but not the two
+//! things above it, and not a call that gave up containment itself: a bash
+//! call carrying `disable_sandbox` still reaches the user, because bypass
+//! trusts what the model is doing rather than its decision to remove the
+//! sandbox first. It does NOT vet the command — [`crate::shell::argv_is_dangerous`]
+//! is a blocklist knowing only `rm` and `sudo`, so on a host with no sandbox
+//! there is no command-level net under bypass. Containment is the net.
+//!
 //! The sandbox auto-allow layer (cc's `autoAllowBashIfSandboxed`) is the
 //! sandbox/approval coupling: a bash call the OS sandbox will contain needs
 //! no human sign-off — containment replaces the parse-level vetting of the
@@ -999,15 +1007,40 @@ impl Permissions {
             return Ok(None);
         }
 
-        // 7. Bypass mode — auto-run, but NOT an opaque bash script. Bypass
-        // waives the rule/ask layers, not the safety promise: an unparseable
-        // command (subshell, redirect, substitution…) could hide an `rm -rf`
-        // the destructive check never got to see, so it falls through to the
-        // user like everywhere else opaque scripts are refused an auto-verdict
-        // (deny/allow skip Opaque, and the cache below can only hold one the
-        // user already read and approved verbatim; the sandbox layer above may
-        // still auto-allow it because the sandbox *contains* it — this can't).
+        // 7. Bypass mode — auto-run, with two exceptions.
+        //
+        // NOT an opaque bash script. Bypass waives the rule/ask layers, not the
+        // safety promise: an unparseable command (subshell, redirect,
+        // substitution…) could hide an `rm -rf` the destructive check never got
+        // to see, so it falls through to the user like everywhere else opaque
+        // scripts are refused an auto-verdict (deny/allow skip Opaque, and the
+        // cache below can only hold one the user already read and approved
+        // verbatim; the sandbox layer above may still auto-allow it because the
+        // sandbox *contains* it — this can't).
+        //
+        // And NOT a call that gave up containment itself. A bash call reaches
+        // this layer for one of three reasons, and only the first is the
+        // model's own decision: it asked for `disable_sandbox`; the session has
+        // no sandbox at all (disabled, or an unsupported platform); or the
+        // policy set `auto_allow = false`. Bypass means "I trust what you are
+        // doing" — not "I trust you to remove the containment first", which is
+        // why `describe_parts` has always had a notice ready for it. The other
+        // two reasons stay auto-run: the second is every bash call on a host
+        // without a sandbox, so refusing it would retire the mode rather than
+        // close a hole, and the third is the user's own two settings
+        // disagreeing, which bypass is defined to win.
+        //
+        // A blocked call is not denied — it falls to the read-only self-verdict
+        // (an escaped `ls` is still harmless), then allow rules, the session
+        // cache, and finally the user.
+        //
+        // What this layer does NOT do is vet the command: `argv_is_dangerous`
+        // is a blocklist and knows only `rm` and `sudo`, so on a host with no
+        // sandbox at all, bypass has no command-level net to speak of. That is
+        // the accepted position, not an oversight — containment is the net, and
+        // where there is none the mode's name is the warning.
         if self.mode() == Mode::Bypass
+            && !call.escapes_sandbox
             && !matches!(
                 call.shell,
                 Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque)
@@ -1447,6 +1480,10 @@ struct CallFacts {
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     removing_worktree: bool,
+    /// This bash call asked to run outside the OS sandbox (`disable_sandbox`).
+    /// Kept as a fact of the call because bypass mode reads it: giving up
+    /// containment is the model's own decision, not a property of the command.
+    escapes_sandbox: bool,
     /// Present only when the bash analysis gave up: with no argv to key on, the
     /// script's own text is what rules and session memories are written about.
     opaque_script: Option<OpaqueScript>,
@@ -1504,12 +1541,13 @@ impl CallFacts {
                     }));
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
+        let escapes_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         let opaque_script = match (&shell, shell_command) {
             (Some(ShellFacts::Bash(BashAnalysis::Opaque)), Some(command)) => {
                 let command = command.trim();
                 (!command.is_empty()).then(|| OpaqueScript {
                     command: command.to_string(),
-                    no_sandbox: input["disable_sandbox"].as_bool().unwrap_or(false),
+                    no_sandbox: escapes_sandbox,
                 })
             }
             _ => None,
@@ -1524,6 +1562,7 @@ impl CallFacts {
                 && input.get("path").is_some_and(Value::is_string),
             removing_worktree: name == "exit_worktree"
                 && input["action"].as_str() == Some("remove"),
+            escapes_sandbox,
             opaque_script,
         }
     }
@@ -2935,6 +2974,62 @@ mod tests {
             "{error}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── bypass: what it is actually trusting ───────────────────────────
+
+    /// What lets bypass auto-run a bash call is that the call is still
+    /// contained — not that the command happens to miss `argv_is_dangerous`,
+    /// a blocklist that knows only `rm` and `sudo`. A call reaches this layer
+    /// for three reasons and only one of them is the model's own decision.
+    #[tokio::test]
+    async fn bypass_stops_at_a_call_that_gave_up_containment() {
+        let escaping = json!({"command": "make install", "disable_sandbox": true});
+
+        // The model asked to leave the sandbox: bypass no longer answers for it.
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let asked = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        assert!(!ok(&asked, "bash", escaping.clone()).await);
+        assert_eq!(approver.ask_count(), 1);
+        let notice = approver.asked()[0]
+            .notice
+            .clone()
+            .expect("an escaping call carries a notice");
+        assert!(notice.contains("no OS sandbox"), "{notice}");
+
+        // Same mode, same (sandbox-less) session: an ordinary command still
+        // runs untouched. Refusing this one would retire the mode on every
+        // host without a sandbox rather than close a hole.
+        let approver = ScriptedApprover::new(vec![]);
+        let running = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&running, "bash", bash("make install")).await);
+
+        // Escaping but read-only: the read-only self-verdict below still takes
+        // it. An `ls` outside the sandbox is not worth interrupting anyone for.
+        assert!(
+            ok(
+                &running,
+                "bash",
+                json!({"command": "ls -la", "disable_sandbox": true})
+            )
+            .await
+        );
+
+        // And a call the sandbox will contain never reaches this layer at all.
+        assert!(
+            running
+                .check_call("bash", &bash("make install"), 0, true)
+                .await
+                .is_ok()
+        );
+        assert_eq!(approver.ask_count(), 0);
+
+        // Outside bypass nothing changed: manual asks about this command
+        // whether or not it escapes.
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let manual = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&manual, "bash", escaping).await);
+        assert_eq!(approver.ask_count(), 1);
     }
 
     // ── layer 3: ask rules ──────────────────────────────────────────────
