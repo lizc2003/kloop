@@ -294,6 +294,14 @@ enum Rule {
         tokens: Vec<String>,
         wildcard: bool,
     },
+    /// Consent to run one *unparseable* bash script, matched on its exact text —
+    /// the only handle a script with no argv leaves. `no_sandbox` records which
+    /// run was consented to: the escaping form also covers a contained run of
+    /// the same text, the contained form never covers the escape.
+    BashScript {
+        command: String,
+        no_sandbox: bool,
+    },
 }
 
 impl Rule {
@@ -312,7 +320,9 @@ impl Rule {
                     argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
                 }
             }
-            Rule::PathGlob { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+            Rule::PathGlob { .. }
+            | Rule::SandboxEscalatePrefix { .. }
+            | Rule::BashScript { .. } => false,
         }
     }
 
@@ -329,7 +339,39 @@ impl Rule {
                     argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
                 }
             }
-            Rule::Tool(_) | Rule::BashPrefix { .. } | Rule::PathGlob { .. } => false,
+            Rule::Tool(_)
+            | Rule::BashPrefix { .. }
+            | Rule::PathGlob { .. }
+            | Rule::BashScript { .. } => false,
+        }
+    }
+
+    /// Whether this rule allows one unparseable script to run. A whole-tool
+    /// `bash` rule deliberately does not: it was written without anyone having
+    /// read this script, and nothing below it can vet the content.
+    fn allows_script(&self, script: &OpaqueScript) -> bool {
+        match self {
+            Rule::BashScript {
+                command,
+                no_sandbox,
+            } => command == &script.command && (*no_sandbox || !script.no_sandbox),
+            Rule::Tool(_)
+            | Rule::BashPrefix { .. }
+            | Rule::PathGlob { .. }
+            | Rule::SandboxEscalatePrefix { .. } => false,
+        }
+    }
+
+    /// Deny/ask direction: the text alone decides, because refusing the
+    /// contained run of a script while permitting its uncontained twin would be
+    /// the wrong way round.
+    fn hits_script(&self, script: &OpaqueScript) -> bool {
+        match self {
+            Rule::BashScript { command, .. } => command == &script.command,
+            Rule::Tool(_)
+            | Rule::BashPrefix { .. }
+            | Rule::PathGlob { .. }
+            | Rule::SandboxEscalatePrefix { .. } => false,
         }
     }
 
@@ -352,7 +394,9 @@ impl Rule {
                         || glob.is_match(&facts.normalized)
                         || glob.is_match(&facts.original))
             }
-            Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+            Rule::BashPrefix { .. }
+            | Rule::SandboxEscalatePrefix { .. }
+            | Rule::BashScript { .. } => false,
         }
     }
 }
@@ -386,6 +430,19 @@ fn parse_rule(entry: &str) -> Result<Rule> {
                     bail!("rule 'sandbox_escalate({inner})': empty command pattern");
                 }
                 Ok(Rule::SandboxEscalatePrefix { tokens, wildcard })
+            }
+            // The whole script, verbatim: the closing paren of the rule is the
+            // last character of the entry, so a command that itself contains
+            // parens round-trips unchanged.
+            "bash_script" | "bash_script_no_sandbox" => {
+                let command = inner.trim();
+                if command.is_empty() {
+                    bail!("rule '{entry}': empty command text");
+                }
+                Ok(Rule::BashScript {
+                    command: command.to_string(),
+                    no_sandbox: tool == "bash_script_no_sandbox",
+                })
             }
             "powershell" => {
                 bail!(
@@ -945,8 +1002,9 @@ impl Permissions {
         // command (subshell, redirect, substitution…) could hide an `rm -rf`
         // the destructive check never got to see, so it falls through to the
         // user like everywhere else opaque scripts are refused an auto-verdict
-        // (deny/allow/cache all skip Opaque; the sandbox layer above may still
-        // auto-allow it because the sandbox *contains* it — this layer can't).
+        // (deny/allow skip Opaque, and the cache below can only hold one the
+        // user already read and approved verbatim; the sandbox layer above may
+        // still auto-allow it because the sandbox *contains* it — this can't).
         if self.mode() == Mode::Bypass
             && !matches!(
                 call.shell,
@@ -1026,9 +1084,9 @@ impl Permissions {
             ));
         };
         let mut approval_scopes = vec![ApprovalScope::Once];
-        if remember.is_some() {
+        if let Some(remember) = &remember {
             approval_scopes.push(ApprovalScope::WorkspaceSession);
-            if self.project.can_persist() {
+            if remember.persistable() && self.project.can_persist() {
                 approval_scopes.push(ApprovalScope::Project);
             }
         }
@@ -1039,7 +1097,7 @@ impl Permissions {
             detail: Some(detail),
             notice,
             approval_scopes: approval_scopes.clone(),
-            remember_rules: remember.as_ref().map(|remember| remember.rules.clone()),
+            remember_rules: remember.as_ref().map(|remember| remember.echo.clone()),
             preview: crate::diff::file_change_preview_with_context(name, input, preview_context)
                 .await,
         };
@@ -1179,7 +1237,7 @@ impl Permissions {
             // to echo, and leaving it blank would read as "just this command".
             remember_rules: Some(remember.as_ref().map_or_else(
                 || vec![BLANKET_ESCALATION_RULE.to_string()],
-                |remember| remember.rules.clone(),
+                |remember| remember.echo.clone(),
             )),
             preview: None,
         };
@@ -1298,6 +1356,15 @@ fn describe_denial(denial: Option<&crate::sandbox::SandboxDenial>) -> String {
 /// outlive the sitting it was given in.
 const BLANKET_ESCALATION_SIGNATURE: &str = "sandbox_escalate:*";
 
+/// What the ordinary gate's prompt shows under the remembering choices for a
+/// script that can only be keyed on its own text. The rule itself (a
+/// `bash_script(...)` entry holding the whole command) is what gets stored, but
+/// echoing it would just reprint the command already on screen two lines up —
+/// so the echo states the granularity instead. Unlike the escalation blanket
+/// below it covers exactly one command text: the gate is the first door, so
+/// "every opaque script" would just be bypass mode by another name.
+const VERBATIM_REMEMBER_RULE: &str = "only this exact command text";
+
 /// What the prompt shows under the remembering choices when the script is too
 /// opaque to key on — the scope really is every escalation, and saying so is
 /// the difference between an informed yes and a misread one.
@@ -1337,11 +1404,7 @@ fn escalation_remember_payload(command: &str) -> Option<Remember> {
     if rules.is_empty() {
         return None;
     }
-    Some(Remember {
-        rules,
-        signatures,
-        argvs,
-    })
+    Some(Remember::echoing_rules(rules, signatures, argvs))
 }
 
 fn user_denial(name: &str) -> String {
@@ -1355,7 +1418,12 @@ fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) -> bool {
         (Some(ShellFacts::Bash(BashAnalysis::Commands(commands))), _) => commands
             .iter()
             .all(|argv| argv_is_readonly(argv) || allow.iter().any(|rule| rule.matches_argv(argv))),
-        (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
+        // Only a rule written about this exact script can vouch for it — see
+        // `Rule::allows_script`.
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => call
+            .opaque_script
+            .as_ref()
+            .is_some_and(|script| allow.iter().any(|rule| rule.allows_script(script))),
         (Some(ShellFacts::PowerShellOpaque), _) => allow.iter().any(|rule| rule.matches_tool(name)),
         (None, Some(path)) => allow.iter().any(|rule| rule.matches_path(name, path)),
         (None, None) => allow.iter().any(|rule| rule.matches_tool(name)),
@@ -1382,9 +1450,14 @@ fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts, strip_for_match: bool
                 .iter()
                 .any(|r| r.matches_argv(target) || r.matches_argv(argv))
         }),
-        // Opaque scripts cannot be inspected. Whole-tool deny/ask rules were
-        // handled above; content-level Bash/PowerShell rules never decide here.
-        (Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque), _) => false,
+        // Opaque scripts cannot be inspected, so content-level Bash/PowerShell
+        // rules never decide here — except one written about this exact script,
+        // which is as inspected as it gets. Whole-tool rules were handled above.
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => call
+            .opaque_script
+            .as_ref()
+            .is_some_and(|script| rules.iter().any(|rule| rule.hits_script(script))),
+        (Some(ShellFacts::PowerShellOpaque), _) => false,
         (None, Some(path)) => rules.iter().any(|r| r.matches_path(name, path)),
         (None, None) => false,
     }
@@ -1407,6 +1480,17 @@ struct CallFacts {
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     removing_worktree: bool,
+    /// Present only when the bash analysis gave up: with no argv to key on, the
+    /// script's own text is what rules and session memories are written about.
+    opaque_script: Option<OpaqueScript>,
+}
+
+/// An unparseable bash script kept whole. `no_sandbox` is the call's
+/// `disable_sandbox` flag, carried alongside the text because "may run" and
+/// "may run outside the sandbox" are different consents about the same words.
+struct OpaqueScript {
+    command: String,
+    no_sandbox: bool,
 }
 
 struct PathFacts {
@@ -1453,6 +1537,16 @@ impl CallFacts {
                     }));
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
+        let opaque_script = match (&shell, shell_command) {
+            (Some(ShellFacts::Bash(BashAnalysis::Opaque)), Some(command)) => {
+                let command = command.trim();
+                (!command.is_empty()).then(|| OpaqueScript {
+                    command: command.to_string(),
+                    no_sandbox: input["disable_sandbox"].as_bool().unwrap_or(false),
+                })
+            }
+            _ => None,
+        };
         CallFacts {
             shell,
             path,
@@ -1463,6 +1557,7 @@ impl CallFacts {
                 && input.get("path").is_some_and(Value::is_string),
             removing_worktree: name == "exit_worktree"
                 && input["action"].as_str() == Some("remove"),
+            opaque_script,
         }
     }
 
@@ -1936,7 +2031,12 @@ fn path_is_sensitive(normalized: &Path) -> bool {
 
 struct Remember {
     /// Suggested persistent rules (`bash(git commit *)`, `write_file(src/**)`).
+    /// Empty when nothing durable can be written down.
     rules: Vec<String>,
+    /// What the prompt echoes under the remembering choices. Usually the rules
+    /// themselves; a verbatim script rule is the command text the panel already
+    /// shows two lines up, so it states the granularity instead of repeating it.
+    echo: Vec<String>,
     /// Session-cache keys, one per non-covered segment / path scope.
     signatures: Vec<String>,
     /// The parsed argv of each remembered segment. Only the sandbox-escalation
@@ -1946,10 +2046,30 @@ struct Remember {
     argvs: Vec<Vec<String>>,
 }
 
+impl Remember {
+    /// Whether this memory can be written to the project store at all — the
+    /// difference between offering the durable scope and offering only the
+    /// session one.
+    fn persistable(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
+    /// The ordinary shape: what the prompt echoes is the rule itself.
+    fn echoing_rules(rules: Vec<String>, signatures: Vec<String>, argvs: Vec<Vec<String>>) -> Self {
+        Self {
+            echo: rules.clone(),
+            rules,
+            signatures,
+            argvs,
+        }
+    }
+}
+
 /// cc's "always allow" granularity: bash remembers a two-word command
 /// prefix per segment (`git push` never covers `git commit`); file writes
-/// remember the parent directory. `None` = not remember-able (opaque bash,
-/// or tokens that would corrupt a rule string).
+/// remember the parent directory; an unparseable script is remembered
+/// verbatim, session-only. `None` = not remember-able (a resource URI, or
+/// tokens that would corrupt a rule string).
 fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
     // Resource URIs are model-selected dynamic locators. Remembering the generic
     // tool name would let approval for one server/URI authorize every future
@@ -1982,13 +2102,35 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
             if rules.is_empty() {
                 return None;
             }
+            Some(Remember::echoing_rules(rules, signatures, Vec::new()))
+        }
+        // PowerShell stays unremember-able: bash at least gets parsed and only
+        // then gives up, while PowerShell has no analysis at all — so "every
+        // call asks" is the only safety net it has left.
+        (Some(ShellFacts::PowerShellOpaque), _) => None,
+        // No prefix to key on, so the script is keyed by its own text: only
+        // this exact command, re-offered in this same session, skips the
+        // question. Narrower than any rule — and never durable, because a rule
+        // the parser could not re-check on the next startup has no business
+        // outliving the sitting (plan 129's constraint, same reason).
+        (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => {
+            let script = call.opaque_script.as_ref()?;
+            // Escaping the sandbox is part of what the yes was given for, so it
+            // is spelled into both the rule and the session key: a contained
+            // run's approval must never cover an uncontained one.
+            let (tool, escape) = if script.no_sandbox {
+                ("bash_script_no_sandbox", "!no-sandbox")
+            } else {
+                ("bash_script", "")
+            };
+            let command = &script.command;
             Some(Remember {
-                rules,
-                signatures,
+                rules: vec![format!("{tool}({command})")],
+                echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
+                signatures: vec![format!("bash-script{escape}:{command}")],
                 argvs: Vec::new(),
             })
         }
-        (Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque), _) => None,
         (None, Some(path)) => {
             let scope = path
                 .relative
@@ -2002,17 +2144,17 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
             } else {
                 format!("{scope}/**")
             };
-            Some(Remember {
-                rules: vec![format!("{name}({pattern})")],
-                signatures: vec![format!("{name}:{scope}")],
-                argvs: Vec::new(),
-            })
+            Some(Remember::echoing_rules(
+                vec![format!("{name}({pattern})")],
+                vec![format!("{name}:{scope}")],
+                Vec::new(),
+            ))
         }
-        (None, None) => Some(Remember {
-            rules: vec![name.to_string()],
-            signatures: vec![name.to_string()],
-            argvs: Vec::new(),
-        }),
+        (None, None) => Some(Remember::echoing_rules(
+            vec![name.to_string()],
+            vec![name.to_string()],
+            Vec::new(),
+        )),
     }
 }
 
@@ -3011,23 +3153,143 @@ mod tests {
         assert_eq!(approver.ask_count(), 2);
     }
 
+    /// An unparseable script is remember-able too, keyed on its own text: the
+    /// identical command skips the second question, a different one still asks,
+    /// and the durable scope is never offered — there is no rule to write down.
+    /// Plan 129 fixed this on the escalation door; the ordinary gate is the
+    /// door the user actually met it at, with `2>&1` alone enough to make a
+    /// plain `go test` unkeyable.
     #[tokio::test]
-    async fn opaque_bash_is_never_cacheable() {
+    async fn opaque_bash_is_remembered_verbatim_for_the_session() {
         let approver = ScriptedApprover::new(vec![
             Decision::Allow(ApprovalScope::WorkspaceSession),
             Decision::Allow(ApprovalScope::Once),
         ]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(ok(&p, "bash", bash("cargo build")).await);
-        assert!(
-            ok(&p, "bash", bash("cargo $(evil)")).await,
-            "user may still grant it once"
+        let script = "cd sub && go test ./pkg -run X 2>&1";
+        assert!(ok(&p, "bash", bash(script)).await);
+        assert_eq!(
+            approver.asked()[0].approval_scopes,
+            vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession],
+            "this gate has no writable project store, so no durable scope"
         );
-        // the opaque grant must not have stuck
-        assert!(!ok(&p, "bash", bash("cargo $(evil)")).await);
+        assert_eq!(
+            approver.asked()[0].remember_rules,
+            Some(vec!["only this exact command text".to_string()]),
+            "the prompt states the real granularity"
+        );
+
+        assert!(ok(&p, "bash", bash(script)).await);
+        assert_eq!(approver.ask_count(), 1, "same text, not asked again");
+
+        // Escaping the sandbox is a different consent: the contained run's yes
+        // does not cover it, so it is asked (and granted Once here).
+        assert!(
+            ok(
+                &p,
+                "bash",
+                json!({"command": script, "disable_sandbox": true})
+            )
+            .await
+        );
+        assert_eq!(approver.ask_count(), 2);
+
+        // A different opaque script still asks — the approver is exhausted, so
+        // the prompt denies, which is what proves it asked.
+        assert!(!ok(&p, "bash", bash("cd sub && go test ./other 2>&1")).await);
         assert_eq!(approver.ask_count(), 3);
-        let asked = approver.asked();
-        assert_eq!(asked[1].remember_rules, None, "opaque offers no remember");
+    }
+
+    /// The durable half (user, 2026-09-11: 「只是对话级,还是不方便」): `p` on an
+    /// opaque script writes a `bash_script(...)` rule holding the whole command,
+    /// the store parses it back, and a later session never asks about it again.
+    /// The command text carries `(`, `)`, `|` and a redirect on purpose — a rule
+    /// that cannot survive its own round-trip is worse than no rule.
+    #[tokio::test]
+    async fn a_verbatim_grant_persists_as_a_bash_script_rule() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        let script = "cd sub && go test ./pkg -run 'X(Y)' -count=1 2>&1 | tail -15";
+        let escaping = json!({"command": script, "disable_sandbox": true});
+
+        assert!(p.check("bash", &escaping, 0).await.is_ok());
+        assert_eq!(
+            approver.asked()[0].approval_scopes,
+            vec![
+                ApprovalScope::Once,
+                ApprovalScope::WorkspaceSession,
+                ApprovalScope::Project
+            ],
+            "a writable store means the durable scope is on offer"
+        );
+        assert_eq!(
+            approver.asked()[0].remember_rules,
+            Some(vec!["only this exact command text".to_string()]),
+            "the echo states the granularity; the command itself is already on screen"
+        );
+        assert_eq!(
+            writer.calls.lock().unwrap().as_slice(),
+            [vec![format!("bash_script_no_sandbox({script})")]],
+            "the rule holds the whole command, verbatim"
+        );
+
+        // The next session: rules loaded from the store, nobody at the keyboard.
+        let stored = writer.snapshot.lock().unwrap().allow.raw().to_vec();
+        let stored: Vec<&str> = stored.iter().map(String::as_str).collect();
+        let approver = ScriptedApprover::new(vec![]);
+        let next = gate(Mode::Manual, rules(&stored, &[], &[]), approver.clone());
+        assert!(next.check("bash", &escaping, 0).await.is_ok());
+        assert!(
+            ok(&next, "bash", bash(script)).await,
+            "consent to escape the sandbox covers the contained run of the same text"
+        );
+        assert!(
+            !ok(&next, "bash", bash("cd sub && go test ./other 2>&1")).await,
+            "a different script still asks"
+        );
+        assert_eq!(approver.ask_count(), 1);
+    }
+
+    /// The rule is direction-aware: a contained grant is not consent to escape
+    /// the sandbox, a whole-tool `bash` allow still vouches for no opaque script
+    /// at all, and a deny written about the same text outranks both.
+    #[tokio::test]
+    async fn a_bash_script_rule_knows_which_run_was_consented_to() {
+        let script = "cat a.txt | tee b.txt 2>&1";
+        let contained = format!("bash_script({script})");
+        let escaping = json!({"command": script, "disable_sandbox": true});
+
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[&contained, "bash"], &[], &[]),
+            approver.clone(),
+        );
+        assert!(ok(&p, "bash", bash(script)).await);
+        assert_eq!(approver.ask_count(), 0);
+        assert!(
+            p.check("bash", &escaping, 0).await.is_err(),
+            "neither the contained rule nor whole-tool `bash` consents to the escape"
+        );
+        assert_eq!(approver.ask_count(), 1);
+
+        let approver = ScriptedApprover::new(vec![]);
+        let denied = gate(
+            Mode::Manual,
+            rules(
+                &[&format!("bash_script_no_sandbox({script})")],
+                &[&contained],
+                &[],
+            ),
+            approver.clone(),
+        );
+        assert!(denied.check("bash", &escaping, 0).await.is_err());
+        assert_eq!(
+            approver.ask_count(),
+            0,
+            "deny is about the text alone, and decides before anyone is asked"
+        );
     }
 
     #[tokio::test]

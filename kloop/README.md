@@ -504,7 +504,11 @@ each project.
 `tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
 leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
 per segment — in a chain every segment must be read-only or allowed, while a
-single denied segment poisons the whole chain; `write_file(<glob>)` /
+single denied segment poisons the whole chain;
+`bash_script(<command>)` / `bash_script_no_sandbox(<command>)` hold one whole
+*unparseable* script and match its text exactly (see **Asking** below — the
+rule's closing paren is the entry's last character, so a command containing
+parens round-trips unchanged); `write_file(<glob>)` /
 `edit_file(<glob>)` / `read_file(<glob>)` match the lexically-normalized
 `path`, while `notebook_edit(<glob>)` matches `notebook_path` (both also match
 their cwd-relative form), with `**` globs.
@@ -517,7 +521,26 @@ working directory never auto-pass in acceptEdits.
 **Asking**: `y` allows once. `a` allows for this session in the current
 workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
 approving `git commit` never covers `git rebase` — or parent directory for file
-writes). `p` allows for the current `ProjectId` across sessions and linked
+writes). A bash script the word-only parser cannot vouch for (a redirect, a
+substitution, an assignment — `go test … 2>&1` is enough) has no prefix to key
+on and is instead remembered **verbatim**: that exact command text, and only
+that one. Both remembering scopes are offered for it — `a` keys the session
+cache on the text, `p` writes a `bash_script(<the whole command>)` rule (or
+`bash_script_no_sandbox(...)`) that the same parser reads back at the
+next startup. The prompt echoes `only this exact command text` rather than
+reprinting the command already on screen. Which run was consented to is part of
+the key: a call carrying `disable_sandbox` stores the `_no_sandbox` form, which
+also covers a later contained run of the same text, while a contained grant
+never covers the escape — and a whole-tool `bash` allow vouches for no opaque
+script at all, since it was written without anyone having read this one. Two
+things stay out of reach of such a rule: the command text lands in
+`permissions.json` literally, so a script carrying a secret should get `y`, not
+`p`; and a script whose *raw text* mentions a sensitive path is caught by the
+safety layer above every rule, so it keeps asking however it was remembered.
+Opaque *PowerShell* is still remembered by nothing: bash is parsed and only then
+gives up, while PowerShell gets no analysis, so asking every time is the only net
+it has. `p`
+allows for the current `ProjectId` across sessions and linked
 worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
 `~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
 the current call runs and the UI says the grant was not saved. `n` denies. A
@@ -1959,8 +1982,13 @@ it only at the denial would save the question but still pay for the contained
 run — which is the expensive half, the one that compiles the test binary and
 binds the port before finding out it may not. It is deliberately not a `bash(...)` rule: *may run* and *may run
 uncontained* are different permissions, so neither form matches the other's
-check. Opaque scripts (pipes, redirection) offer no remember and are asked every
-time, as with the ordinary gate. Without this a test suite that binds a local
+check. An opaque script (an assignment, a substitution) cannot be keyed on at
+all here, so its `a` is blanket — *every* sandbox escalation for the rest of this
+workspace session, said in as many words on the prompt, session-only and never
+persisted. That is wider than the ordinary gate's verbatim memory on purpose:
+the gate is the first door and still asks about each new command, so this one
+only ever waives containment for commands that already got through it. Without
+this a test suite that binds a local
 port re-asked on every run — one measured review spent 20 minutes of its 63 on
 escalation round-trips, against 1 minute for the same review without them.
 
