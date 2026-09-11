@@ -1784,12 +1784,6 @@ fn finish_question(
     })
 }
 
-/// Replay a resumed session's history into transcript cells so `--resume`
-/// shows the conversation instead of a blank screen. Tool calls collapse to
-/// the same status rows the live path produces: paired result's `is_error`
-/// decides ✓/✗, and an unpaired call renders as failed (resume repair marks
-/// orphans as interrupted errors anyway). Tool-result blocks themselves are
-/// skipped — their content is history-internal.
 /// One line for an injected message: what it was, and which one — two
 /// reinjections in the same turn have to stay apart.
 fn injected_label(injected: &Injected) -> String {
@@ -1810,6 +1804,12 @@ fn injected_label(injected: &Injected) -> String {
     }
 }
 
+/// Replay a resumed session's history into transcript cells so `--resume`
+/// shows the conversation instead of a blank screen. Tool calls collapse to
+/// the same status rows the live path produces: paired result's `is_error`
+/// decides ✓/✗, and an unpaired call renders as failed (resume repair marks
+/// orphans as interrupted errors anyway). Tool-result blocks themselves are
+/// skipped — their content is history-internal.
 pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
     // Pair each tool_use with its result: the is_error decides ✓/✗ and the
     // (bounded) content becomes the preview under the row, same as the live path.

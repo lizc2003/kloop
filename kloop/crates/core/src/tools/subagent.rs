@@ -333,20 +333,10 @@ pub(crate) async fn structured_agent_admitted(
         let ui = ui.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
+            let mut history = match child_history(&sub_cfg, subagent_of.as_deref(), prompt) {
                 Ok(history) => history,
-                Err(error) => {
-                    return crate::agent::TurnOutcome {
-                        reason: crate::agent::EndReason::Error(
-                            format!("sub-agent route initialization failed: {error:#}").into(),
-                        ),
-                        final_text: String::new(),
-                        rounds: 0,
-                        structured_output: None,
-                    };
-                }
+                Err(outcome) => return outcome,
             };
-            history.record(Message::user_text(prompt));
 
             run_structured_turn_in_execution(
                 &sub_cfg,
@@ -611,20 +601,10 @@ async fn run_sub_agent_sync(
         let ui = ui.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
+            let mut history = match child_history(&sub_cfg, subagent_of.as_deref(), prompt) {
                 Ok(history) => history,
-                Err(error) => {
-                    return crate::agent::TurnOutcome {
-                        reason: crate::agent::EndReason::Error(
-                            format!("sub-agent route initialization failed: {error:#}").into(),
-                        ),
-                        final_text: String::new(),
-                        rounds: 0,
-                        structured_output: None,
-                    };
-                }
+                Err(outcome) => return outcome,
             };
-            history.record(Message::user_text(prompt));
 
             run_turn_in_execution(&sub_cfg, &mut history, &ui, &cancel, depth, execution).await
         }
@@ -812,20 +792,10 @@ async fn spawn_background(
         let ui = ui.clone();
         async move {
             let _lease = lease;
-            let mut history = match sub_history(&sub_cfg, subagent_of.as_deref()) {
+            let mut history = match child_history(&sub_cfg, subagent_of.as_deref(), prompt) {
                 Ok(history) => history,
-                Err(error) => {
-                    return crate::agent::TurnOutcome {
-                        reason: crate::agent::EndReason::Error(
-                            format!("sub-agent route initialization failed: {error:#}").into(),
-                        ),
-                        final_text: String::new(),
-                        rounds: 0,
-                        structured_output: None,
-                    };
-                }
+                Err(outcome) => return outcome,
             };
-            history.record(Message::user_text(prompt));
 
             run_turn_in_execution(&sub_cfg, &mut history, &ui, &own_cancel, depth, execution).await
         }
@@ -922,6 +892,28 @@ async fn spawn_background(
 /// transcript is auditable and separately resumable, yet kept out of the
 /// default resume picker. A parent with no session (mock, tests) or with a
 /// dropped rollout leaves the sub-agent in-memory, exactly as before.
+/// The opening move of every sub-agent worker: its own history, with the prompt
+/// already recorded. A route failure here ends the turn before any model call,
+/// and the `Err` is the ready-made outcome to hand back. All three spawn sites
+/// used to carry their own copy of this — fifteen lines each, differing only in
+/// which turn ran afterwards.
+fn child_history(
+    cfg: &Config,
+    subagent_of: Option<&str>,
+    prompt: String,
+) -> std::result::Result<History, crate::agent::TurnOutcome> {
+    let mut history = sub_history(cfg, subagent_of).map_err(|error| crate::agent::TurnOutcome {
+        reason: crate::agent::EndReason::Error(
+            format!("sub-agent route initialization failed: {error:#}").into(),
+        ),
+        final_text: String::new(),
+        rounds: 0,
+        structured_output: None,
+    })?;
+    history.record(Message::user_text(prompt));
+    Ok(history)
+}
+
 fn sub_history(cfg: &Config, subagent_of: Option<&str>) -> Result<History> {
     let mut history = History::new(cfg.offload_dir.clone());
     if let Some(parent_line) = subagent_of

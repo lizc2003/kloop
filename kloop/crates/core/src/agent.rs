@@ -985,9 +985,6 @@ fn text_content(blocks: &[ContentBlock]) -> String {
         .collect()
 }
 
-/// Cap on resuming a turn after a retryable mid-response stream failure. Bounds
-/// a flapping upstream: each resume costs a round, and a stream that keeps dying
-/// is a real outage the turn should surface rather than grind against.
 /// How one round decides the turn ends. Exists so the loop cannot build a
 /// `TurnOutcome` itself: there is exactly one place that does, and it is the
 /// place that knows what the turn produced. `text: None` means "hand back
@@ -1003,6 +1000,9 @@ struct Ending {
     structured: Option<serde_json::Value>,
 }
 
+/// Cap on resuming a turn after a retryable mid-response stream failure. Bounds
+/// a flapping upstream: each resume costs a round, and a stream that keeps dying
+/// is a real outage the turn should surface rather than grind against.
 const STREAM_RESUME_LIMIT: u32 = 3;
 const STREAM_RESUME_MSG: &str = "Your previous response was cut off by a transient \
 connection failure, not by you. Continue exactly where you left off.";

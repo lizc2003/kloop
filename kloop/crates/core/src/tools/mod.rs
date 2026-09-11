@@ -370,18 +370,12 @@ pub fn all_tool_defs(
     shell_programs: &ShellPrograms,
 ) -> Vec<ToolDef> {
     let mut defs = builtin_defs(depth, shell_programs);
-    let merged = merged_source_defs(sources);
-    let deferred = deferred_tool_defs(sources, defer_threshold, shell_programs);
-    let deferred_names: std::collections::HashSet<&str> =
-        deferred.iter().map(|def| def.name.as_str()).collect();
+    let (inline_sources, deferred) =
+        partition_source_defs(sources, defer_threshold, shell_programs);
     if !deferred.is_empty() {
         defs.push(tool_search::tool_search_def());
         defs.push(tool_search::call_tool_def());
     }
-    let inline_sources: Vec<ToolDef> = merged
-        .into_iter()
-        .filter(|def| !deferred_names.contains(def.name.as_str()))
-        .collect();
     defs.extend(inline_sources.iter().cloned());
     // run_program is depth-0 only (like run_agent). Now that sources are visible, its
     // TypeScript API can list them: full declarations for inline source tools
@@ -454,81 +448,97 @@ pub fn deferred_tool_defs(
     defer_threshold: usize,
     shell_programs: &ShellPrograms,
 ) -> Vec<ToolDef> {
+    partition_source_defs(sources, defer_threshold, shell_programs).1
+}
+
+/// The merged source catalog split into `(inline, deferred)`, in merge order.
+/// One walk: `all_tool_defs` needs both halves, and computing them as two
+/// independent calls merged the whole catalog twice and then subtracted one
+/// result from the other.
+fn partition_source_defs(
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    shell_programs: &ShellPrograms,
+) -> (Vec<ToolDef>, Vec<ToolDef>) {
     let merged = merged_source_defs(sources);
     if tool_defs(0, shell_programs).len() + merged.len() > defer_threshold {
-        return merged;
+        return (Vec::new(), merged);
     }
-    merged
-        .into_iter()
-        .filter(|def| {
-            find_source(sources, &def.name).is_some_and(|source| source.should_defer(&def.name))
-        })
-        .collect()
+    merged.into_iter().partition(|def| {
+        !find_source(sources, &def.name).is_some_and(|source| source.should_defer(&def.name))
+    })
 }
 
-fn reserve_surface_names(seen: &mut std::collections::HashSet<String>) {
-    seen.extend(
-        [
-            "skill",
-            "tool_search",
-            "call_tool",
-            "ask_user_question",
-            "enter_plan_mode",
-            "exit_plan_mode",
-            "workflow",
-            "stop_workflow",
-            "enter_worktree",
-            "exit_worktree",
-            "structured_output",
-            "cron_create",
-            "cron_delete",
-            "cron_list",
-            "schedule_wakeup",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-}
-
-fn reserved_builtin_names() -> std::collections::HashSet<String> {
-    let mut names: std::collections::HashSet<String> = tool_defs(
-        0,
-        &ShellPrograms {
-            bash: Some(crate::shell_programs::ShellProgram {
-                executable: "reserved-bash".into(),
-                flavor: crate::shell_programs::ShellFlavor::GitBash,
-            }),
-            powershell: Some(crate::shell_programs::ShellProgram {
-                executable: "reserved-powershell".into(),
-                flavor: crate::shell_programs::ShellFlavor::PowerShell7,
-            }),
-        },
-    )
-    .into_iter()
-    .map(|definition| definition.name)
-    .collect();
-    names.extend(
-        [
-            "bash",
-            "bash_output",
-            "stop_bash",
-            "powershell",
-            // Retired built-ins stay reserved so an MCP tool cannot impersonate an
-            // old call from resumed history before the migration error fires.
-            "task",
-            "wait",
-            "kill_bash",
-            "todo_write",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-    names
+/// Every name an external source may not claim: the built-in catalog (derived
+/// from [`tool_defs`], so it cannot drift from what is actually registered),
+/// the session-control surface, and the retired built-ins — kept reserved so an
+/// MCP tool cannot impersonate an old call replayed out of resumed history.
+///
+/// Derived once. The derivation is what keeps the list honest, but paying for
+/// it per lookup meant rebuilding a dozen `json!` schemas just to read their
+/// `name` — and `resolve_source` runs on every tool call.
+fn reserved_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(|| {
+            // Both shells claimed available, so the catalog is its widest: a
+            // name must stay reserved on a host where its tool is not offered.
+            let mut names: std::collections::HashSet<String> = tool_defs(
+                0,
+                &ShellPrograms {
+                    bash: Some(crate::shell_programs::ShellProgram {
+                        executable: "reserved-bash".into(),
+                        flavor: crate::shell_programs::ShellFlavor::GitBash,
+                    }),
+                    powershell: Some(crate::shell_programs::ShellProgram {
+                        executable: "reserved-powershell".into(),
+                        flavor: crate::shell_programs::ShellFlavor::PowerShell7,
+                    }),
+                },
+            )
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+            names.extend(
+                [
+                    "bash",
+                    "bash_output",
+                    "stop_bash",
+                    "powershell",
+                    // Retired built-ins stay reserved so an MCP tool cannot
+                    // impersonate an old call from resumed history before the
+                    // migration error fires.
+                    "task",
+                    "wait",
+                    "kill_bash",
+                    "todo_write",
+                    // Session-control surface: capability-gated per frontend, so
+                    // these are absent from the catalog above even at depth 0.
+                    "skill",
+                    "tool_search",
+                    "call_tool",
+                    "ask_user_question",
+                    "enter_plan_mode",
+                    "exit_plan_mode",
+                    "workflow",
+                    "stop_workflow",
+                    "enter_worktree",
+                    "exit_worktree",
+                    "structured_output",
+                    "cron_create",
+                    "cron_delete",
+                    "cron_list",
+                    "schedule_wakeup",
+                ]
+                .into_iter()
+                .map(String::from),
+            );
+            names
+        });
+    &NAMES
 }
 
 fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
-    let mut seen = reserved_builtin_names();
-    reserve_surface_names(&mut seen);
+    let mut seen = reserved_names().clone();
     let mut defs = Vec::new();
     for source in sources {
         let source_defs = source.defs();
@@ -550,8 +560,7 @@ pub fn tool_merge_warnings(
     shell_programs: &ShellPrograms,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut seen = reserved_builtin_names();
-    reserve_surface_names(&mut seen);
+    let mut seen = reserved_names().clone();
     for source in sources {
         let source_defs = source.defs();
         for def in source_defs.iter() {
@@ -576,9 +585,7 @@ fn find_source_slot<'a>(
     sources: &'a [Arc<dyn ToolSource>],
     name: &str,
 ) -> Option<(usize, &'a Arc<dyn ToolSource>)> {
-    let mut reserved = reserved_builtin_names();
-    reserve_surface_names(&mut reserved);
-    if reserved.contains(name) {
+    if reserved_names().contains(name) {
         return None;
     }
     // First source claiming the name wins, mirroring the merge order. The slot
@@ -607,9 +614,7 @@ enum SourceResolution {
 }
 
 fn resolve_source(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceResolution {
-    let mut reserved = reserved_builtin_names();
-    reserve_surface_names(&mut reserved);
-    if reserved.contains(name) {
+    if reserved_names().contains(name) {
         return SourceResolution::Missing;
     }
     let mut unavailable = None;
@@ -1167,6 +1172,13 @@ async fn run_one(
             }
             (false, expected_program_source)
         } else {
+            // Two samples, deliberately. A dynamic source publishes a new
+            // catalog between them, so a tool can be absent on the first look
+            // and deferred on the second — and a tool that appeared at any point
+            // during classification has never been through discovery. Either
+            // observation therefore gates it: `||`, not the single read the
+            // names invite. `catalog_appearance_during_classification_still_requires_discovery`
+            // fails if this collapses into one call.
             let deferred_before = tool_search::is_deferred(&name, &ctx.cfg);
             let deferred_after = tool_search::is_deferred(&name, &ctx.cfg);
             let discovery_gated = deferred_before || deferred_after;
@@ -1849,6 +1861,73 @@ pub(crate) mod testutil {
             panic!("expected tool result");
         };
         (content.as_text().into_owned(), is_error)
+    }
+}
+
+#[cfg(test)]
+mod reserved_name_tests {
+    use super::*;
+
+    /// The list used to be assembled per lookup from two halves — the catalog
+    /// walk and a hand-written surface list. Collapsing it into one cached set
+    /// is only safe if nothing fell out on the way, and a name that quietly
+    /// stops being reserved is a name an MCP server can take over.
+    #[test]
+    fn the_reserved_set_covers_the_catalog_the_surface_and_the_retired_names() {
+        let reserved = reserved_names();
+
+        // Every built-in in the widest catalog, on every host.
+        for definition in tool_defs(0, &ShellPrograms::native_posix()) {
+            assert!(
+                reserved.contains(&definition.name),
+                "built-in '{}' is not reserved",
+                definition.name
+            );
+        }
+
+        // The capability-gated session-control surface, absent from the
+        // catalog above precisely because a frontend may not enable it.
+        for name in [
+            "skill",
+            "tool_search",
+            "call_tool",
+            "ask_user_question",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "workflow",
+            "stop_workflow",
+            "enter_worktree",
+            "exit_worktree",
+            "structured_output",
+            "cron_create",
+            "cron_delete",
+            "cron_list",
+            "schedule_wakeup",
+        ] {
+            assert!(
+                reserved.contains(name),
+                "surface tool '{name}' is not reserved"
+            );
+        }
+
+        // Retired built-ins: a resumed transcript can still name them.
+        for name in ["task", "wait", "kill_bash", "todo_write"] {
+            assert!(
+                reserved.contains(name),
+                "retired tool '{name}' is not reserved"
+            );
+        }
+
+        // Both shells stay reserved even where the host offers neither.
+        for name in ["bash", "bash_output", "stop_bash", "powershell"] {
+            assert!(
+                reserved.contains(name),
+                "shell tool '{name}' is not reserved"
+            );
+        }
+
+        // A source tool's own name is not.
+        assert!(!reserved.contains("srv__x"));
     }
 }
 

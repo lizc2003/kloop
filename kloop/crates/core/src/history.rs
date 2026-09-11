@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use crate::provider_route::FrozenProviderAttempt;
 use crate::provider_route::FrozenProviderRoute;
+use crate::provider_route::ProvenanceMismatch;
 use crate::provider_route::RouteReopened;
 use crate::provider_route::SwitchError;
 use crate::rollout::ResumedSession;
@@ -455,8 +456,6 @@ impl History {
         self.usage_anchor = Some((self.items.len(), total_tokens));
     }
 
-    /// Current context size: the last real usage anchor plus a ~4 chars/token
-    /// estimate for everything recorded after it.
     /// The window to plan against: the configured value, lowered to anything the
     /// provider has actually rejected. Never raised — a rejection at N proves
     /// only that N is too big, never that anything is safe.
@@ -475,6 +474,8 @@ impl History {
         });
     }
 
+    /// Current context size: the last real usage anchor plus a ~4 chars/token
+    /// estimate for everything recorded after it.
     pub fn estimated_tokens(&self) -> u64 {
         let (anchored_len, anchored_tokens) = self.usage_anchor.unwrap_or((0, 0));
         let tail: u64 = self.items[anchored_len.min(self.items.len())..]
@@ -580,51 +581,37 @@ fn provider_request_view(
                 "reasoning history is missing provider route provenance",
             )
         })?;
-        let source_index = routes
-            .iter()
-            .position(|route| route.revision == source.route_revision)
-            .ok_or_else(|| {
-                kloop_provider::ProviderFailure::protocol(
-                    "reasoning history references an unknown provider route revision",
-                )
-            })?;
-        let source_route = &routes[source_index];
-        let interval_end = routes
-            .get(source_index + 1)
-            .map_or(u64::MAX, |next| next.boundary);
-        if source.origin_boundary <= source_route.boundary || source.origin_boundary >= interval_end
-        {
-            return Err(kloop_provider::ProviderFailure::protocol(
-                "reasoning history origin lies outside its provider route interval",
-            ));
-        }
-        let source_model_valid = match source.attempt_kind {
-            ProviderAttemptKind::Primary => source.model == source_route.primary_model,
-            ProviderAttemptKind::Fallback => {
-                source_route.fallback_model.as_deref() == Some(source.model.as_str())
-            }
-        };
-        if source.provider_id != source_route.provider_id
-            || source.api_family != source_route.api_family
-            || source.endpoint_fingerprint != source_route.endpoint_fingerprint
-            || !source_model_valid
-        {
-            return Err(kloop_provider::ProviderFailure::protocol(
-                "reasoning history provenance does not match its producing route",
-            ));
-        }
-
-        if source.api_family == ProviderApiFamily::OpenAiChatCompletions
-            || (source.api_family == ProviderApiFamily::OpenAiResponses
-                && message
-                    .content
-                    .iter()
-                    .any(ContentBlock::has_redacted_reasoning))
-        {
-            return Err(kloop_provider::ProviderFailure::protocol(
-                "reasoning history block shape does not match its producing API family",
-            ));
-        }
+        // Same five rules the rollout validator applies to the same provenance;
+        // only the wording is ours. A line boundary is not one of them here — a
+        // request view has no lines.
+        let source_index = crate::provider_route::validate_provenance(
+            source,
+            routes,
+            crate::provider_route::ReasoningShape::of(message),
+            /*origin_line_boundary*/ None,
+        )
+        .map_err(|mismatch| {
+            kloop_provider::ProviderFailure::protocol(match mismatch {
+                ProvenanceMismatch::UnknownRevision => {
+                    "reasoning history references an unknown provider route revision"
+                }
+                ProvenanceMismatch::OriginOutsideInterval => {
+                    "reasoning history origin lies outside its provider route interval"
+                }
+                // Not reachable while this caller passes no line boundary;
+                // spelled out rather than panicking, so a later caller that does
+                // pass one gets an error instead of an abort.
+                ProvenanceMismatch::OriginNotOnItsLine => {
+                    "reasoning history origin does not match its recorded line boundary"
+                }
+                ProvenanceMismatch::IdentityMismatch => {
+                    "reasoning history provenance does not match its producing route"
+                }
+                ProvenanceMismatch::BlockShapeMismatch => {
+                    "reasoning history block shape does not match its producing API family"
+                }
+            })
+        })?;
 
         let chat_target = attempt.identity().api_family == ProviderApiFamily::OpenAiChatCompletions;
         if !chat_target && source.exact_replay_compatible(attempt.identity()) {

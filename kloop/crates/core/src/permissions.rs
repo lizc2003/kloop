@@ -2,8 +2,9 @@
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
 //! deny rules → sensitive-read hard block → plan-mode read-only gate →
-//! safety checks → ask rules → sandbox auto-allow → bypass → read-only
-//! self-verdict → acceptEdits → allow rules → session cache → ask the user.
+//! safety checks → ask rules → session scheduler controls → sandbox
+//! auto-allow → bypass → read-only self-verdict → acceptEdits → allow rules
+//! → session cache → ask the user.
 //!
 //! Two invariants carried over from cc: **deny always beats allow**, and
 //! **safety checks (destructive commands, sensitive paths) are immune to
@@ -313,13 +314,7 @@ impl Rule {
     fn matches_argv(&self, argv: &[String]) -> bool {
         match self {
             Rule::Tool(t) => t == "bash",
-            Rule::BashPrefix { tokens, wildcard } => {
-                if *wildcard {
-                    argv.len() >= tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
-                } else {
-                    argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
-                }
-            }
+            Rule::BashPrefix { tokens, wildcard } => argv_has_prefix(tokens, *wildcard, argv),
             Rule::PathGlob { .. }
             | Rule::SandboxEscalatePrefix { .. }
             | Rule::BashScript { .. } => false,
@@ -333,11 +328,7 @@ impl Rule {
     fn matches_escalation_argv(&self, argv: &[String]) -> bool {
         match self {
             Rule::SandboxEscalatePrefix { tokens, wildcard } => {
-                if *wildcard {
-                    argv.len() >= tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
-                } else {
-                    argv.len() == tokens.len() && argv.iter().zip(tokens).all(|(a, t)| a == t)
-                }
+                argv_has_prefix(tokens, *wildcard, argv)
             }
             Rule::Tool(_)
             | Rule::BashPrefix { .. }
@@ -401,6 +392,33 @@ impl Rule {
     }
 }
 
+/// Whether `argv` matches an argv-prefix pattern: the whole command when the
+/// rule was written without a trailing `*`, just its head when it had one.
+/// `bash(...)` and `sandbox_escalate(...)` are the same shape over two
+/// different consents, so the shape itself lives in one place.
+fn argv_has_prefix(tokens: &[String], wildcard: bool, argv: &[String]) -> bool {
+    let length_matches = if wildcard {
+        argv.len() >= tokens.len()
+    } else {
+        argv.len() == tokens.len()
+    };
+    length_matches && argv.iter().zip(tokens).all(|(a, t)| a == t)
+}
+
+/// `<tokens…>` or `<tokens…> *` — the pattern both argv-prefix rules are
+/// written in. `tool` only names the rule in the error.
+fn parse_prefix_pattern(tool: &str, inner: &str) -> Result<(Vec<String>, bool)> {
+    let mut tokens: Vec<String> = inner.split_whitespace().map(str::to_string).collect();
+    let wildcard = tokens.last().is_some_and(|t| t == "*");
+    if wildcard {
+        tokens.pop();
+    }
+    if tokens.is_empty() {
+        bail!("rule '{tool}({inner})': empty command pattern");
+    }
+    Ok((tokens, wildcard))
+}
+
 fn parse_rule(entry: &str) -> Result<Rule> {
     if let Some((tool, inner)) = entry
         .split_once('(')
@@ -408,27 +426,11 @@ fn parse_rule(entry: &str) -> Result<Rule> {
     {
         match tool {
             "bash" => {
-                let mut tokens: Vec<String> =
-                    inner.split_whitespace().map(str::to_string).collect();
-                let wildcard = tokens.last().is_some_and(|t| t == "*");
-                if wildcard {
-                    tokens.pop();
-                }
-                if tokens.is_empty() {
-                    bail!("rule 'bash({inner})': empty command pattern");
-                }
+                let (tokens, wildcard) = parse_prefix_pattern(tool, inner)?;
                 Ok(Rule::BashPrefix { tokens, wildcard })
             }
             "sandbox_escalate" => {
-                let mut tokens: Vec<String> =
-                    inner.split_whitespace().map(str::to_string).collect();
-                let wildcard = tokens.last().is_some_and(|t| t == "*");
-                if wildcard {
-                    tokens.pop();
-                }
-                if tokens.is_empty() {
-                    bail!("rule 'sandbox_escalate({inner})': empty command pattern");
-                }
+                let (tokens, wildcard) = parse_prefix_pattern(tool, inner)?;
                 Ok(Rule::SandboxEscalatePrefix { tokens, wildcard })
             }
             // The whole script, verbatim: the closing paren of the rule is the
@@ -1055,11 +1057,11 @@ impl Permissions {
     }
 
     fn matches_deny(&self, name: &str, call: &CallFacts) -> bool {
-        rules_hit(&self.global.deny, name, call, /*strip_for_match*/ true)
+        rules_hit(&self.global.deny, name, call)
     }
 
     fn matches_ask(&self, name: &str, call: &CallFacts) -> bool {
-        rules_hit(&self.global.ask, name, call, /*strip_for_match*/ true)
+        rules_hit(&self.global.ask, name, call)
     }
 
     /// Allow is the strict direction: every bash argv must be read-only or
@@ -1114,18 +1116,7 @@ impl Permissions {
                 let Some(remember) = remember else {
                     return Err(user_denial(name));
                 };
-                let mut caches = self.session.cache.lock().unwrap();
-                let cache = caches
-                    .entry(self.identity.workspace_id().clone())
-                    .or_default();
-                let before = cache.signatures.len();
-                cache.signatures.extend(remember.signatures);
-                if cache.signatures.len() != before {
-                    advance_epoch(
-                        &mut cache.capability_epoch,
-                        "workspace permission capability",
-                    );
-                }
+                self.remember_in_session(remember.signatures);
                 Ok(None)
             }
             ApprovalScope::Project => {
@@ -1255,18 +1246,7 @@ impl Permissions {
                     || vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
                     |remember| remember.signatures,
                 );
-                let mut caches = self.session.cache.lock().unwrap();
-                let cache = caches
-                    .entry(self.identity.workspace_id().clone())
-                    .or_default();
-                let before = cache.signatures.len();
-                cache.signatures.extend(signatures);
-                if cache.signatures.len() != before {
-                    advance_epoch(
-                        &mut cache.capability_epoch,
-                        "workspace permission capability",
-                    );
-                }
+                self.remember_in_session(signatures);
                 EscalationOutcome::Approved
             }
             ApprovalScope::Project => {
@@ -1315,6 +1295,24 @@ impl Permissions {
         caches
             .get(self.identity.workspace_id())
             .is_some_and(|cache| cache.signatures.contains(BLANKET_ESCALATION_SIGNATURE))
+    }
+
+    /// Record consent for the rest of this workspace session. The epoch only
+    /// advances when something was actually added, so a repeated yes does not
+    /// invalidate deferred-tool receipts that are still good.
+    fn remember_in_session(&self, signatures: impl IntoIterator<Item = String>) {
+        let mut caches = self.session.cache.lock().unwrap();
+        let cache = caches
+            .entry(self.identity.workspace_id().clone())
+            .or_default();
+        let before = cache.signatures.len();
+        cache.signatures.extend(signatures);
+        if cache.signatures.len() != before {
+            advance_epoch(
+                &mut cache.capability_epoch,
+                "workspace permission capability",
+            );
+        }
     }
 
     /// Whether a durable project rule or this workspace's session cache already
@@ -1373,38 +1371,13 @@ const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this session";
 /// Escalation consent is remembered at the same granularity the ordinary gate
 /// uses for bash — a two-word command prefix per segment — but under its own
 /// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
-/// are different permissions. Read-only segments are *not* skipped the way
-/// `remember_payload` skips them: a read-only command still had to be denied to
-/// get here, so it is part of what is being consented to. `None` = opaque
-/// script or a token that would corrupt a rule string, i.e. not remember-able.
+/// are different permissions. `None` = opaque script or a token that would
+/// corrupt a rule string, i.e. not remember-able.
 fn escalation_remember_payload(command: &str) -> Option<Remember> {
     let BashAnalysis::Commands(cmds) = analyze_bash(command) else {
         return None;
     };
-    let mut rules = Vec::new();
-    let mut signatures = Vec::new();
-    let mut argvs = Vec::new();
-    for argv in cmds {
-        let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
-        if prefix.is_empty()
-            || prefix
-                .iter()
-                .any(|t| t.contains(['(', ')', ',']) || t.chars().any(char::is_whitespace))
-        {
-            return None;
-        }
-        let head = prefix.join(" ");
-        let rule = format!("sandbox_escalate({head} *)");
-        if !rules.contains(&rule) {
-            rules.push(rule);
-            signatures.push(format!("sandbox_escalate:{head}"));
-        }
-        argvs.push(argv);
-    }
-    if rules.is_empty() {
-        return None;
-    }
-    Some(Remember::echoing_rules(rules, signatures, argvs))
+    bash_prefix_memory(&cmds, "sandbox_escalate", ReadOnlySegments::Remember)
 }
 
 fn user_denial(name: &str) -> String {
@@ -1433,22 +1406,16 @@ fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) -> bool {
 /// Deny/ask matching is the aggressive direction: bash argv are matched
 /// after wrapper stripping so `sudo rm` / `env FOO=1 rm` cannot dodge a
 /// `bash(rm *)` rule, and any single matching segment hits.
-fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts, strip_for_match: bool) -> bool {
+fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
     if rules.iter().any(|r| r.matches_tool(name)) {
         return true;
     }
     match (&call.shell, &call.path) {
         (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => cmds.iter().any(|argv| {
-            let stripped;
-            let target: &[String] = if strip_for_match {
-                stripped = strip_wrappers(argv);
-                &stripped
-            } else {
-                argv
-            };
+            let stripped = strip_wrappers(argv);
             rules
                 .iter()
-                .any(|r| r.matches_argv(target) || r.matches_argv(argv))
+                .any(|r| r.matches_argv(&stripped) || r.matches_argv(argv))
         }),
         // Opaque scripts cannot be inspected, so content-level Bash/PowerShell
         // rules never decide here — except one written about this exact script,
@@ -1946,10 +1913,6 @@ fn fs_fold(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Paths where a write is privilege escalation, not editing: VCS internals
-/// (hooks run code), kloop's own state, key material, shell/git rc files
-/// (cc's `checkPathSafetyForAutoEdit` list, trimmed to this project's
-/// blast radius).
 /// Whether a normalized path ends in `offload/<spill file>` — the structural
 /// form of [`is_spill_file_name`], for callers that already have components.
 fn path_tail_is_spill(normalized: &Path) -> bool {
@@ -1966,6 +1929,10 @@ fn path_tail_is_spill(normalized: &Path) -> bool {
         .is_some_and(|parent| fs_fold(parent) == "offload")
 }
 
+/// Paths where a write is privilege escalation, not editing: VCS internals
+/// (hooks run code), kloop's own state, key material, shell/git rc files
+/// (cc's `checkPathSafetyForAutoEdit` list, trimmed to this project's
+/// blast radius).
 fn path_is_sensitive(normalized: &Path) -> bool {
     const SENSITIVE_DIRS: &[&str] = &[".git", ".kloop", ".ssh", ".gnupg", ".aws"];
     const SENSITIVE_FILES: &[&str] = &[
@@ -2065,6 +2032,65 @@ impl Remember {
     }
 }
 
+/// Whether a read-only segment needs remembering. The ordinary gate skips them
+/// — a read-only command was never going to be asked about, so there is nothing
+/// to remember. The escalation does not skip: a read-only command still had to
+/// be *denied inside the sandbox* to reach that prompt, so it is part of what
+/// the yes was given for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadOnlySegments {
+    Skip,
+    Remember,
+}
+
+/// One rule per distinct two-word command prefix, in `tool`'s own vocabulary:
+/// `bash(git commit *)` for the ordinary gate, `sandbox_escalate(git commit *)`
+/// for the escalation. The two consents are different permissions written at
+/// the same granularity, so only the vocabulary and [`ReadOnlySegments`] differ
+/// — everything else used to be a second copy of these twenty lines.
+///
+/// `None` = a token that would corrupt a rule string (a paren, a comma, or
+/// embedded whitespace), so nothing can be written down at all. An empty argv
+/// is rejected for the same reason: the parser never produces one, but a rule
+/// reading `bash( *)` would be worse than no memory.
+fn bash_prefix_memory(
+    cmds: &[Vec<String>],
+    tool: &str,
+    segments: ReadOnlySegments,
+) -> Option<Remember> {
+    let mut rules = Vec::new();
+    let mut signatures = Vec::new();
+    let mut argvs = Vec::new();
+    for argv in cmds {
+        if segments == ReadOnlySegments::Skip && argv_is_readonly(argv) {
+            continue;
+        }
+        let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
+        if prefix.is_empty()
+            || prefix
+                .iter()
+                .any(|t| t.contains(['(', ')', ',']) || t.chars().any(char::is_whitespace))
+        {
+            return None;
+        }
+        let head = prefix.join(" ");
+        let rule = format!("{tool}({head} *)");
+        if !rules.contains(&rule) {
+            rules.push(rule);
+            signatures.push(format!("{tool}:{head}"));
+        }
+        // Only a payload that remembered *every* segment may later stand in for
+        // the whole command; the skipping form hands back none on purpose.
+        if segments == ReadOnlySegments::Remember {
+            argvs.push(argv.clone());
+        }
+    }
+    if rules.is_empty() {
+        return None;
+    }
+    Some(Remember::echoing_rules(rules, signatures, argvs))
+}
+
 /// cc's "always allow" granularity: bash remembers a two-word command
 /// prefix per segment (`git push` never covers `git commit`); file writes
 /// remember the parent directory; an unparseable script is remembered
@@ -2079,30 +2105,7 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
     }
     match (&call.shell, &call.path) {
         (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => {
-            let mut rules = Vec::new();
-            let mut signatures = Vec::new();
-            for argv in cmds {
-                if argv_is_readonly(argv) {
-                    continue;
-                }
-                let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
-                if prefix
-                    .iter()
-                    .any(|t| t.contains(['(', ')', ',']) || t.chars().any(char::is_whitespace))
-                {
-                    return None;
-                }
-                let head = prefix.join(" ");
-                let rule = format!("bash({head} *)");
-                if !rules.contains(&rule) {
-                    rules.push(rule);
-                    signatures.push(format!("bash:{head}"));
-                }
-            }
-            if rules.is_empty() {
-                return None;
-            }
-            Some(Remember::echoing_rules(rules, signatures, Vec::new()))
+            bash_prefix_memory(cmds, "bash", ReadOnlySegments::Skip)
         }
         // PowerShell stays unremember-able: bash at least gets parsed and only
         // then gives up, while PowerShell has no analysis at all — so "every
@@ -2158,6 +2161,21 @@ fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember> {
     }
 }
 
+/// The one thing a gated call acts on: the command, the path, or — for a tool
+/// with neither — its whole input. Shared by the flat `description` and the
+/// multi-line parts so the two can never name different targets for the same
+/// approval.
+fn call_detail(name: &str, input: &Value) -> String {
+    match name {
+        "bash" | "powershell" => input["command"].as_str().unwrap_or("?").to_string(),
+        "write_file" | "edit_file" | "read_file" => {
+            input["path"].as_str().unwrap_or("?").to_string()
+        }
+        "notebook_edit" => input["notebook_path"].as_str().unwrap_or("?").to_string(),
+        _ => input.to_string(),
+    }
+}
+
 fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let hazard = hazard_tag.map_or(String::new(), |t| format!("[{t}] "));
@@ -2168,17 +2186,7 @@ fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> S
     } else {
         ""
     };
-    let detail: String = match name {
-        "bash" | "powershell" => input["command"].as_str().unwrap_or("?").to_string(),
-        "write_file" | "edit_file" | "read_file" => {
-            input["path"].as_str().unwrap_or("?").to_string()
-        }
-        "notebook_edit" => input["notebook_path"].as_str().unwrap_or("?").to_string(),
-        _ => input.to_string(),
-    }
-    .chars()
-    .take(200)
-    .collect();
+    let detail = clip(&call_detail(name, input));
     let shell_class = if name == "powershell" {
         "[unclassified PowerShell] "
     } else {
@@ -2209,14 +2217,7 @@ fn describe_parts(
     if name == "powershell" {
         notices.push("unclassified PowerShell".to_string());
     }
-    let detail = match name {
-        "bash" | "powershell" => input["command"].as_str().unwrap_or("?").to_string(),
-        "write_file" | "edit_file" | "read_file" => {
-            input["path"].as_str().unwrap_or("?").to_string()
-        }
-        "notebook_edit" => input["notebook_path"].as_str().unwrap_or("?").to_string(),
-        _ => input.to_string(),
-    };
+    let detail = call_detail(name, input);
     (
         tool_title(name).to_string(),
         clip(&detail),
@@ -2407,6 +2408,70 @@ mod tests {
 
     fn test_cwd() -> PathBuf {
         std::env::current_dir().expect("test process has a current directory")
+    }
+
+    /// The two bash memories are the same granularity in two vocabularies, and
+    /// they disagree about exactly one thing: whether a read-only segment is
+    /// part of what was approved. Writing them through one helper is only
+    /// correct while that disagreement survives — so it is asserted from both
+    /// ends of the same command.
+    #[test]
+    fn the_two_bash_memories_differ_only_in_vocabulary_and_read_only_segments() {
+        let command = "ls -la && git commit -m x";
+        let call = CallFacts::gather("bash", &json!({"command": command}), Path::new("/"), None);
+
+        // The ordinary gate never had to ask about `ls`, so it remembers only
+        // the segment that would have been asked about.
+        let ordinary = remember_payload("bash", &call).expect("a parsed command is remember-able");
+        assert_eq!(ordinary.rules, vec!["bash(git commit *)"]);
+        assert_eq!(ordinary.signatures, vec!["bash:git commit"]);
+        assert!(
+            ordinary.argvs.is_empty(),
+            "a payload that skipped a segment must not stand in for the whole command"
+        );
+
+        // The sandbox denied the whole line, `ls` included, so the escalation
+        // remembers both — under its own rule name.
+        let escalation = escalation_remember_payload(command).expect("same command, other door");
+        assert_eq!(
+            escalation.rules,
+            vec![
+                "sandbox_escalate(ls -la *)",
+                "sandbox_escalate(git commit *)"
+            ]
+        );
+        assert_eq!(
+            escalation.signatures,
+            vec!["sandbox_escalate:ls -la", "sandbox_escalate:git commit"]
+        );
+        assert_eq!(escalation.argvs.len(), 2);
+
+        // Read-only throughout: nothing the ordinary gate could write down,
+        // while the escalation still has two denied commands to consent to.
+        let read_only = CallFacts::gather(
+            "bash",
+            &json!({"command": "ls && pwd"}),
+            Path::new("/"),
+            None,
+        );
+        assert!(remember_payload("bash", &read_only).is_none());
+        assert_eq!(
+            escalation_remember_payload("ls && pwd").unwrap().rules,
+            vec!["sandbox_escalate(ls *)", "sandbox_escalate(pwd *)"]
+        );
+
+        // A prefix token that would corrupt a rule string stops both. The
+        // command still parses: one that does not takes the verbatim path
+        // (plan 135) instead, which is a different memory altogether.
+        let corrupt = r#"git "commit x" -m y"#;
+        let corrupt_call =
+            CallFacts::gather("bash", &json!({"command": corrupt}), Path::new("/"), None);
+        assert!(matches!(
+            corrupt_call.shell,
+            Some(ShellFacts::Bash(BashAnalysis::Commands(_)))
+        ));
+        assert!(remember_payload("bash", &corrupt_call).is_none());
+        assert!(escalation_remember_payload(corrupt).is_none());
     }
 
     fn gate(mode: Mode, r: PermissionRules, approver: Arc<ScriptedApprover>) -> Permissions {

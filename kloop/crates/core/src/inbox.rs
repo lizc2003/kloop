@@ -322,9 +322,21 @@ impl Inbox {
         self.local_pending.fetch_add(count, Ordering::Release);
     }
 
+    /// Saturating: an over-release must not wrap the counter. A wrapped value
+    /// leaves `is_empty()` false forever, and the TUI's idle autowake then
+    /// starts a delivery turn on every event — an agent that looks like it is
+    /// talking to itself, with no way back short of restarting the session.
+    ///
+    /// This used to be `fetch_sub` guarded by a `debug_assert`, which is the
+    /// one configuration the failure cannot occur in: the assert fires in tests
+    /// and the wrap happens in release. The counter saturates instead, so an
+    /// imbalance costs one undelivered wake rather than the session.
     pub(crate) fn remove_local_pending(&self, count: usize) {
-        let previous = self.local_pending.fetch_sub(count, Ordering::AcqRel);
-        debug_assert!(previous >= count);
+        let _ = self
+            .local_pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_sub(count))
+            });
     }
 
     #[cfg(test)]
@@ -343,6 +355,29 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An over-release used to wrap the counter, and a wrapped counter leaves
+    /// `is_empty()` false forever — the TUI's idle autowake then starts a
+    /// delivery turn on every event. The old `debug_assert` fired only in the
+    /// build where the wrap cannot happen, so it never protected anything.
+    #[test]
+    fn releasing_more_local_pending_than_was_added_saturates_at_empty() {
+        let inbox = Inbox::default();
+        inbox.add_local_pending(1);
+        assert!(!inbox.is_empty());
+
+        inbox.remove_local_pending(3);
+        assert_eq!(inbox.local_pending(), 0);
+        assert!(
+            inbox.is_empty(),
+            "an over-release must not wrap the counter"
+        );
+
+        // Still usable afterwards: the queue is not stuck non-empty.
+        inbox.add_local_pending(2);
+        inbox.remove_local_pending(2);
+        assert!(inbox.is_empty());
+    }
 
     /// The producer records what it made, so replay never has to read the
     /// framing prose — which is precisely the part that gets reworded.

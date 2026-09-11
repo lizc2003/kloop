@@ -625,35 +625,63 @@ impl Config {
         scheduler + tasks + shells
     }
 
+    /// One field of the workspace in effect right now. These used to go through
+    /// [`Config::effective_workspace`], which clones the whole generation —
+    /// identity, three Arcs, and the entire system prompt — to hand back a
+    /// single member; `effective_cwd` alone is read by every tool that resolves
+    /// a relative path.
+    fn effective_field<T>(
+        &self,
+        from_worktree: impl FnOnce(&crate::worktree::ActiveWorktree) -> T,
+        from_base: impl FnOnce(&Self) -> T,
+    ) -> T {
+        match self.active_worktree.read().unwrap().as_ref() {
+            Some(active) => from_worktree(active),
+            None => from_base(self),
+        }
+    }
+
     /// The working directory in effect for tool calls right now: the active
     /// worktree's if the session has entered one, else `cwd`. Every tool that
     /// resolves a relative path (or picks a git/search root) reads this, so
     /// `enter_worktree` takes effect immediately.
     pub fn effective_cwd(&self) -> PathBuf {
-        self.effective_workspace().cwd
+        self.effective_field(|active| active.cwd.clone(), |config| config.cwd.clone())
     }
 
     /// The permission gate in effect now — re-anchored at the active worktree
     /// when in one (so acceptEdits keys off the tree), else the base gate.
     pub fn effective_permissions(&self) -> Arc<Permissions> {
-        self.effective_workspace().permissions
+        self.effective_field(
+            |active| Arc::clone(&active.permissions),
+            |config| Arc::clone(&config.permissions),
+        )
     }
 
     /// File-observation state in effect now. An entered worktree starts fresh
     /// and does not inherit observations from the main checkout.
     pub fn effective_file_state(&self) -> Arc<FileState> {
-        self.effective_workspace().file_state
+        self.effective_field(
+            |active| Arc::clone(&active.file_state),
+            |config| Arc::clone(&config.file_state),
+        )
     }
 
     /// The OS sandbox policy in effect now — with the active worktree added as
     /// a writable root when in one, else the base policy.
     pub fn effective_sandbox(&self) -> Option<Arc<crate::sandbox::SandboxPolicy>> {
-        self.effective_workspace().sandbox
+        self.effective_field(
+            |active| active.sandbox.clone(),
+            |config| config.sandbox.clone(),
+        )
     }
 
     /// The system prompt in effect now — its working-directory line rewritten
     /// to the active worktree when in one, else the base system.
     pub fn effective_system(&self) -> String {
-        self.effective_workspace().system
+        self.effective_field(
+            |active| active.system.clone(),
+            |config| config.system.clone(),
+        )
     }
 }

@@ -120,9 +120,8 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
                 command_nodes.push(node);
             }
         } else {
-            if kind.chars().any(|c| "&;|".contains(c)) && !ALLOWED_PUNCT_TOKENS.contains(&kind) {
-                return None;
-            }
+            // One rule covers the operators too: a token containing `&;|` is never
+            // whitespace, so anything not on the punctuation allowlist rejects here.
             if !(ALLOWED_PUNCT_TOKENS.contains(&kind) || kind.trim().is_empty()) {
                 return None;
             }

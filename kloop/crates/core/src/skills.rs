@@ -292,7 +292,10 @@ impl Skill {
 /// Map a cc / Agent-Skills tool name to kloop's, so a downloaded skill's
 /// `allowed-tools: [Read, Bash]` restricts the right kloop tools. Unknown names
 /// pass through unchanged (kloop-native names like `read_file` and MCP names
-/// like `srv__x` already match). A cc scope qualifier (`Bash(git:*)`) is
+/// like `srv__x` already match) — but pass-through is only a safe default for
+/// names kloop does not have: every cc tool with a kloop counterpart must be
+/// listed here, or the skill's allowlist silently withholds that counterpart
+/// from the sub-agent. A cc scope qualifier (`Bash(git:*)`) is
 /// dropped to the bare tool — kloop scopes commands through permission rules,
 /// not the skill's tool list.
 fn map_tool_name(name: &str) -> String {
@@ -309,6 +312,9 @@ fn map_tool_name(name: &str) -> String {
         "Glob" => "glob",
         "WebFetch" => "web_fetch",
         "WebSearch" => "web_search",
+        "NotebookEdit" => "notebook_edit",
+        "AskUserQuestion" => "ask_user_question",
+        "ExitPlanMode" => "exit_plan_mode",
         "Task" => "run_agent",
         "Skill" => "skill",
         other => other,
@@ -401,7 +407,11 @@ pub fn expand_body(body: &str, skill_dir: &str, args: &str) -> String {
                 i = body.len() - r.len();
                 continue;
             }
-            if let Some(r) = rest.strip_prefix("ARGUMENTS") {
+            // `$ARGUMENTS` ends where the identifier ends: `$ARGUMENTS_EXTRA`
+            // is a different name, not the placeholder plus a suffix.
+            if let Some(r) = rest.strip_prefix("ARGUMENTS")
+                && !r.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
                 out.push_str(args);
                 used_args = true;
                 i = body.len() - r.len();
@@ -601,6 +611,50 @@ mod tests {
                 .unwrap()
                 .allowed_tools,
             None
+        );
+    }
+
+    /// Pass-through is the right default for a name kloop does not have; for a
+    /// name it *does* have it is a silent capability loss — the allowlist keeps
+    /// the cc spelling and the sub-agent never gets the tool. So every cc tool
+    /// with a kloop counterpart has to be in the table.
+    #[test]
+    fn every_cc_tool_with_a_kloop_counterpart_is_mapped() {
+        let mapped = |name: &str| {
+            Skill::parse(
+                "s",
+                "/s",
+                &format!("---\ndescription: d\nallowed-tools: [{name}]\n---\nb"),
+            )
+            .unwrap()
+            .allowed_tools
+            .unwrap()
+            .remove(0)
+        };
+        // The three that used to fall through to their cc spelling.
+        assert_eq!(mapped("NotebookEdit"), "notebook_edit");
+        assert_eq!(mapped("AskUserQuestion"), "ask_user_question");
+        assert_eq!(mapped("ExitPlanMode"), "exit_plan_mode");
+        // A name kloop genuinely does not have still passes through.
+        assert_eq!(mapped("MultiEdit"), "MultiEdit");
+    }
+
+    /// `$ARGUMENTS` ends where the identifier ends. Matching it as a bare
+    /// prefix rewrote `$ARGUMENTS_EXTRA` into `<args>_EXTRA`.
+    #[test]
+    fn arguments_placeholder_stops_at_the_identifier_boundary() {
+        assert_eq!(expand_body("$ARGUMENTS", "/s", "x"), "x");
+        assert_eq!(expand_body("[$ARGUMENTS]", "/s", "x"), "[x]");
+        assert_eq!(expand_body("$ARGUMENTS.", "/s", "x"), "x.");
+        // A longer identifier is a different name, not the placeholder plus a
+        // suffix — and with no placeholder used, the args are appended instead.
+        assert_eq!(
+            expand_body("$ARGUMENTS_EXTRA", "/s", "x"),
+            "$ARGUMENTS_EXTRA\n\nARGUMENTS: x"
+        );
+        assert_eq!(
+            expand_body("$ARGUMENTS2", "/s", "x"),
+            "$ARGUMENTS2\n\nARGUMENTS: x"
         );
     }
 

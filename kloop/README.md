@@ -443,8 +443,9 @@ pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
 global deny → sensitive-read hard block → plan-mode read-only gate → safety checks →
-global ask → sandbox auto-allow → bypass → read-only self-verdict → acceptEdits →
-project allow → WorkspaceId-scoped session cache → ask the user
+global ask → session scheduler controls → sandbox auto-allow → bypass →
+read-only self-verdict → acceptEdits → project allow → WorkspaceId-scoped session
+cache → ask the user
 ```
 
 Two invariants carried over from claude-code: **deny always beats allow**,

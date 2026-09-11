@@ -305,6 +305,103 @@ pub(crate) fn validate_timeline(
     Ok(())
 }
 
+/// What reasoning a message carries, which decides whether its block shape has
+/// to agree with the API family that produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningShape {
+    /// No reasoning blocks: there is no shape to disagree about.
+    None,
+    /// Reasoning, none of it redacted.
+    Plain,
+    /// Reasoning including at least one redacted block.
+    Redacted,
+}
+
+impl ReasoningShape {
+    pub fn of(message: &kloop_protocol::Message) -> Self {
+        if !message.has_reasoning() {
+            Self::None
+        } else if message
+            .content
+            .iter()
+            .any(kloop_protocol::ContentBlock::has_redacted_reasoning)
+        {
+            Self::Redacted
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+/// Why a recorded provenance does not line up with the route timeline it claims
+/// to have come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvenanceMismatch {
+    UnknownRevision,
+    OriginOutsideInterval,
+    OriginNotOnItsLine,
+    IdentityMismatch,
+    BlockShapeMismatch,
+}
+
+/// Check one provider response provenance against the timeline that should
+/// contain it; returns the index of the route it resolved to.
+///
+/// Two callers need exactly this, in exactly this order: the rollout validator
+/// reading a session off disk, and the request-view projection deciding whether
+/// reasoning may replay. Each used to spell the rules out for itself — same
+/// conditions, same order, different wording — so a change to one side was
+/// invisible to the other, while both decide whether opaque reasoning is safe to
+/// send back. What stays theirs is the wording, and `origin_line_boundary`:
+/// only the on-disk validator can say which line the provenance was read from,
+/// and only there does a message have to sit at the boundary it names.
+pub fn validate_provenance(
+    source: &ProviderResponseProvenance,
+    routes: &[kloop_protocol::ProviderRouteReceipt],
+    reasoning: ReasoningShape,
+    origin_line_boundary: Option<u64>,
+) -> Result<usize, ProvenanceMismatch> {
+    let index = routes
+        .iter()
+        .position(|route| route.revision == source.route_revision)
+        .ok_or(ProvenanceMismatch::UnknownRevision)?;
+    let route = &routes[index];
+    let interval_end = routes.get(index + 1).map_or(u64::MAX, |next| next.boundary);
+    if source.origin_boundary <= route.boundary || source.origin_boundary >= interval_end {
+        return Err(ProvenanceMismatch::OriginOutsideInterval);
+    }
+    if origin_line_boundary.is_some_and(|boundary| source.origin_boundary != boundary) {
+        return Err(ProvenanceMismatch::OriginNotOnItsLine);
+    }
+    let model_matches = match source.attempt_kind {
+        ProviderAttemptKind::Primary => source.model == route.primary_model,
+        ProviderAttemptKind::Fallback => {
+            route.fallback_model.as_deref() == Some(source.model.as_str())
+        }
+    };
+    if source.provider_id != route.provider_id
+        || source.api_family != route.api_family
+        || source.endpoint_fingerprint != route.endpoint_fingerprint
+        || !model_matches
+    {
+        return Err(ProvenanceMismatch::IdentityMismatch);
+    }
+    // Chat carries no reasoning at all; Responses carries it as an encrypted
+    // blob and never as a redacted block.
+    let shape_agrees = match reasoning {
+        ReasoningShape::None => true,
+        ReasoningShape::Plain => source.api_family != ProviderApiFamily::OpenAiChatCompletions,
+        ReasoningShape::Redacted => !matches!(
+            source.api_family,
+            ProviderApiFamily::OpenAiChatCompletions | ProviderApiFamily::OpenAiResponses
+        ),
+    };
+    if !shape_agrees {
+        return Err(ProvenanceMismatch::BlockShapeMismatch);
+    }
+    Ok(index)
+}
+
 fn checked_nonempty(value: &str, field: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {

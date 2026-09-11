@@ -29,6 +29,9 @@ use serde::Serialize;
 
 use crate::inbox::STEERING_PREFIX;
 use crate::provider_route::FrozenProviderRoute;
+use crate::provider_route::ProvenanceMismatch;
+use crate::provider_route::ReasoningShape;
+use crate::provider_route::validate_provenance;
 use crate::provider_route::validate_timeline;
 use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
@@ -931,9 +934,8 @@ fn validate_provider_message(
     original_line: bool,
 ) -> io::Result<()> {
     let invalid = |message: &'static str| io::Error::new(io::ErrorKind::InvalidData, message);
-    let has_reasoning = message.content.iter().any(rollout_block_has_reasoning);
     let Some(source) = message.provider_provenance.as_ref() else {
-        return if has_reasoning {
+        return if message.has_reasoning() {
             Err(invalid(
                 "reasoning history is missing provider route provenance",
             ))
@@ -946,85 +948,32 @@ fn validate_provider_message(
             "only provider assistant messages may carry provider provenance",
         ));
     }
-    let index = routes
-        .iter()
-        .position(|route| route.revision == source.route_revision)
-        .ok_or_else(|| invalid("provider provenance references an unknown route revision"))?;
-    let route = &routes[index];
-    let interval_end = routes.get(index + 1).map_or(u64::MAX, |next| next.boundary);
-    if source.origin_boundary <= route.boundary || source.origin_boundary >= interval_end {
-        return Err(invalid(
-            "provider provenance origin lies outside its route interval",
-        ));
-    }
-    if original_line && source.origin_boundary != line_boundary {
-        return Err(invalid(
-            "provider provenance origin does not match its message line boundary",
-        ));
-    }
-    let model_matches = match source.attempt_kind {
-        kloop_protocol::ProviderAttemptKind::Primary => source.model == route.primary_model,
-        kloop_protocol::ProviderAttemptKind::Fallback => {
-            route.fallback_model.as_deref() == Some(source.model.as_str())
-        }
-    };
-    if source.provider_id != route.provider_id
-        || source.api_family != route.api_family
-        || source.endpoint_fingerprint != route.endpoint_fingerprint
-        || !model_matches
-    {
-        return Err(invalid(
-            "provider provenance identity does not match its producing route",
-        ));
-    }
-    if has_reasoning
-        && (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiChatCompletions
-            || (source.api_family == kloop_protocol::ProviderApiFamily::OpenAiResponses
-                && message
-                    .content
-                    .iter()
-                    .any(rollout_block_has_redacted_reasoning)))
-    {
-        return Err(invalid(
-            "provider reasoning block shape does not match its producing API family",
-        ));
-    }
-    Ok(())
-}
-
-fn rollout_block_has_reasoning(block: &ContentBlock) -> bool {
-    match block {
-        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => true,
-        ContentBlock::ToolResult {
-            content: kloop_protocol::ToolResultContent::Blocks(blocks),
-            ..
-        } => blocks.iter().any(rollout_block_has_reasoning),
-        ContentBlock::Text { .. }
-        | ContentBlock::Image { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult {
-            content: kloop_protocol::ToolResultContent::Text(_),
-            ..
-        } => false,
-    }
-}
-
-fn rollout_block_has_redacted_reasoning(block: &ContentBlock) -> bool {
-    match block {
-        ContentBlock::RedactedThinking { .. } => true,
-        ContentBlock::ToolResult {
-            content: kloop_protocol::ToolResultContent::Blocks(blocks),
-            ..
-        } => blocks.iter().any(rollout_block_has_redacted_reasoning),
-        ContentBlock::Text { .. }
-        | ContentBlock::Image { .. }
-        | ContentBlock::Thinking { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult {
-            content: kloop_protocol::ToolResultContent::Text(_),
-            ..
-        } => false,
-    }
+    validate_provenance(
+        source,
+        routes,
+        ReasoningShape::of(message),
+        original_line.then_some(line_boundary),
+    )
+    .map(|_| ())
+    .map_err(|mismatch| {
+        invalid(match mismatch {
+            ProvenanceMismatch::UnknownRevision => {
+                "provider provenance references an unknown route revision"
+            }
+            ProvenanceMismatch::OriginOutsideInterval => {
+                "provider provenance origin lies outside its route interval"
+            }
+            ProvenanceMismatch::OriginNotOnItsLine => {
+                "provider provenance origin does not match its message line boundary"
+            }
+            ProvenanceMismatch::IdentityMismatch => {
+                "provider provenance identity does not match its producing route"
+            }
+            ProvenanceMismatch::BlockShapeMismatch => {
+                "provider reasoning block shape does not match its producing API family"
+            }
+        })
+    })
 }
 
 fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
@@ -1354,24 +1303,29 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
     }
 }
 
-/// Seqs after which the file may be cut: every line whose successor starts
-/// a fresh user turn, plus the last line.
-fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
+/// Every legal cut in file order as `(index, seq)`: a line whose successor
+/// opens a fresh user turn, plus the tip. The one place the boundary rule
+/// lives — `legal_cut_seqs` keeps just the seqs, `fork_points` also needs the
+/// index so it can read the turn that cutting there would drop.
+fn cut_points(lines: &[RolloutLine]) -> Vec<(usize, u64)> {
     let mut seen_user_turn = false;
-    let mut legal = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    let mut cuts = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
         if opens_user_turn(line) {
             seen_user_turn = true;
         }
-        let boundary = match lines.get(i + 1) {
-            Some(next) => opens_user_turn(next),
-            None => true,
-        };
+        let boundary = lines.get(index + 1).is_none_or(opens_user_turn);
         if seen_user_turn && boundary {
-            legal.push(seq_of(line.meta()));
+            cuts.push((index, seq_of(line.meta())));
         }
     }
-    legal
+    cuts
+}
+
+/// Seqs after which the file may be cut: every line whose successor starts
+/// a fresh user turn, plus the last line.
+fn legal_cut_seqs(lines: &[RolloutLine]) -> Vec<u64> {
+    cut_points(lines).into_iter().map(|(_, seq)| seq).collect()
 }
 
 /// A turn boundary a live session can rewind to: the cut `seq` plus a preview
@@ -1392,28 +1346,20 @@ pub struct ForkPoint {
 pub fn fork_points(path: &Path) -> io::Result<Vec<ForkPoint>> {
     let raw = std::fs::read(path)?;
     let (lines, _) = intact_lines(&raw)?;
-    let mut points = Vec::new();
-    let mut seen_user_turn = false;
-    for (i, line) in lines.iter().enumerate() {
-        if opens_user_turn(line) {
-            seen_user_turn = true;
-        }
-        // The tip has no successor: skip it (a no-op rewind).
-        let Some(next) = lines.get(i + 1) else {
-            continue;
-        };
-        if !seen_user_turn || !opens_user_turn(next) {
-            continue;
-        }
-        let RolloutLine::Message { message, .. } = next else {
-            continue;
-        };
-        points.push(ForkPoint {
-            seq: seq_of(line.meta()),
-            preview: user_turn_preview(message),
-        });
-    }
-    Ok(points)
+    Ok(cut_points(&lines)
+        .into_iter()
+        .filter_map(|(index, seq)| {
+            // The tip has no successor: skip it (a no-op rewind). Anything left
+            // opens a user turn, so the message pattern always matches.
+            let RolloutLine::Message { message, .. } = lines.get(index + 1)? else {
+                return None;
+            };
+            Some(ForkPoint {
+                seq,
+                preview: user_turn_preview(message),
+            })
+        })
+        .collect())
 }
 
 /// A one-line gist of a user turn's opening message for the rewind picker: the
