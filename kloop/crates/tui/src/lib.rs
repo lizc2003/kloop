@@ -486,16 +486,15 @@ async fn agent_worker(
                     Ok((session_id, resumed)) => {
                         let messages = resumed.messages.clone();
                         history.rebase(resumed);
-                        // The cut's own route, or — when that provider is gone
-                        // from configuration — the one this session is running
-                        // on right now, recorded on the new branch. Unlike the
-                        // `fork_here` failure below, this runs after the rebase:
-                        // adopting writes to the forked rollout, so it needs the
-                        // branch already installed.
-                        let adopted = history
-                            .adopt_provider_route(&cfg.provider_catalog, &cfg.provider_route);
+                        // A rewind does not end the session, so the route it
+                        // is running on right now — `/provider` included —
+                        // carries onto the branch, and the cut's own route is
+                        // not restored. Unlike the `fork_here` failure below,
+                        // this runs after the rebase: adopting writes to the
+                        // forked rollout, so it needs the branch installed.
+                        let adopted = history.adopt_provider_route(&cfg.provider_route);
                         match adopted {
-                            Ok((route, recovery)) => {
+                            Ok((route, reopened)) => {
                                 cfg.reset_deferred_tool_capabilities();
                                 cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
                                 provider_state =
@@ -504,9 +503,9 @@ async fn agent_worker(
                                         history.provider_routes(),
                                     )
                                     .expect("rewound provider timeline was validated on recovery");
-                                if let Some(recovery) = recovery {
+                                if let Some(reopened) = reopened {
                                     let _ = events
-                                        .send(AgentEvent::System(format!("rewind: {recovery}")));
+                                        .send(AgentEvent::System(format!("rewind: {reopened}")));
                                 }
                                 AgentEvent::Forked {
                                     session_id,

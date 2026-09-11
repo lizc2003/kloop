@@ -96,9 +96,10 @@ pub struct ThreadStartOptions {
 
 /// Builds one Config per thread. Called with the thread's resolved runtime
 /// choices, approver (routes to `approval/request`), and note sink, so cwd-bound
-/// policy and approval caches stay per-thread. A resumed thread may call this
-/// twice: its recorded provider/model are a reference to what the session ran
-/// on, and a build that refuses them is retried without them.
+/// policy and approval caches stay per-thread. `provider_id`/`model` are the
+/// client's own `thread/start` choice and must be honored or refused; a reopened
+/// thread carries neither, so it is built on the configured default and adopts
+/// that as its route.
 pub type ConfigFactory = Arc<
     dyn Fn(
             ThreadStartOptions,
@@ -1268,64 +1269,33 @@ impl Server {
         let questioner: Option<Arc<dyn Questioner>> = self
             .client_questions
             .then(|| ui.clone() as Arc<dyn Questioner>);
-        let build = |options: ThreadStartOptions| {
-            let note_ui = ui.clone();
-            (self.factory)(
-                options,
-                Arc::clone(&self.provider_catalog),
-                ui.clone(),
-                questioner.clone(),
-                Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
-            )
-        };
-        let mut cfg = match build(options.clone()) {
-            Ok(cfg) => cfg,
-            // A resumed thread's provider/model are a reference to what it ran
-            // on, not a request: configuration may have dropped that provider
-            // since, and a session must not become unopenable because a name in
-            // `~/.kloop/config.toml` changed. Build this thread's default route
-            // instead — `adopt_provider_route` below lands the session on it and
-            // records the hop. A fresh thread keeps failing loudly: there the
-            // provider id is the client's own explicit choice.
-            Err(error)
-                if recovery_source == RecoverySource::Resumed
-                    && (options.provider_id.is_some() || options.model.is_some()) =>
-            {
-                let defaulted = ThreadStartOptions {
-                    provider_id: None,
-                    model: None,
-                    ..options
-                };
-                build(defaulted).map_err(|_| {
-                    (
-                        wire::SERVER_ERROR,
-                        format!("cannot build config: {error:#}"),
-                    )
-                })?
-            }
-            Err(error) => {
-                return Err((
-                    wire::SERVER_ERROR,
-                    format!("cannot build config: {error:#}"),
-                ));
-            }
-        };
-        // A fresh thread opens its route timeline here. A resumed or forked one
-        // already has one and adopts its last route instead — rebuilding it as a
-        // revision-1 initial route would both lose every switch the session made
-        // and refuse the session outright once a provider leaves configuration.
+        let note_ui = ui.clone();
+        let mut cfg = (self.factory)(
+            options,
+            Arc::clone(&self.provider_catalog),
+            ui.clone(),
+            questioner,
+            Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
+        )
+        .map_err(|e| (wire::SERVER_ERROR, format!("cannot build config: {e:#}")))?;
+        // A fresh thread opens its route timeline here. A reopened one already
+        // has one, and starts on the route this thread was just built with — the
+        // configured default — recording the hop when the session was written on
+        // something else. Rebuilding that as a revision-1 initial route instead
+        // would refuse every session that ever switched providers.
         if history.has_provider_route() {
-            let (route, recovery) = history
-                .adopt_provider_route(&cfg.provider_catalog, &cfg.provider_route)
-                .map_err(|error| {
-                    (
-                        wire::SERVER_ERROR,
-                        format!("cannot adopt the session provider route: {error}"),
-                    )
-                })?;
+            let (route, reopened) =
+                history
+                    .adopt_provider_route(&cfg.provider_route)
+                    .map_err(|error| {
+                        (
+                            wire::SERVER_ERROR,
+                            format!("cannot adopt the session provider route: {error}"),
+                        )
+                    })?;
             cfg.provider_route = route;
-            if let Some(recovery) = recovery {
-                ui.emit(&Event::Note(recovery.to_string()));
+            if let Some(reopened) = reopened {
+                ui.emit(&Event::Note(reopened.to_string()));
             }
         } else {
             history
@@ -1563,17 +1533,12 @@ fn resume_options(
         wire::SERVER_ERROR,
         "session is missing runtime metadata".into(),
     ))?;
-    let route = snapshot.provider_routes.last().ok_or((
-        wire::SERVER_ERROR,
-        "session is missing its provider route timeline".into(),
-    ))?;
-    let mut options = options_from_runtime(runtime)?;
-    // A reference to what this session ran on, not a request to reproduce it:
-    // the provider may have left configuration since it was written, which
-    // `spawn_thread` handles by building the default instead.
-    options.provider_id = Some(route.provider_id.clone());
-    options.model = Some(route.primary_model.clone());
-    Ok(options)
+    // The recorded provider/model are deliberately not pinned onto the options:
+    // a reopened thread starts on the configured default, exactly like a new
+    // one, and `spawn_thread` records the hop when that differs from what the
+    // session was written on. A client that wants a specific route asks for it
+    // with `thread/provider/switch` once the thread is live.
+    options_from_runtime(runtime)
 }
 
 fn thread_runtime_json(

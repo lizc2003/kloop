@@ -410,6 +410,8 @@ fn switch_factory(
 fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> ConfigFactory {
     let inner = factory(Vec::new(), offload, false);
     Arc::new(move |options, catalog, approver, questioner, notify| {
+        // `thread/start`'s explicit choice, if any; a reopened thread carries
+        // none and takes the first configured provider — this fixture's default.
         let requested = options.provider_id.clone();
         let mut cfg = inner(options, catalog, approver, questioner, notify)?;
         let ids = configured.lock().unwrap().clone();
@@ -1606,14 +1608,15 @@ async fn real_three_rail_route_switch_contract() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// Plan 132. A resumed thread's recorded provider is a reference to what it ran
-/// on: still configured, it is re-adopted with the revision a `/provider` switch
-/// left behind (rebuilding it as a revision-1 initial route used to refuse the
-/// resume outright); gone from configuration, the thread opens anyway on today's
-/// default and records the hop instead of becoming unopenable.
+/// Plan 132. A thread reopens on the configured default, not on whatever it was
+/// written on: an in-session `/provider` belongs to the session that ran it.
+/// Rebuilding the recorded route as a revision-1 initial route used to refuse
+/// the resume outright, and a provider that has since left the configuration
+/// used to make the thread unopenable; both now land on today's default with the
+/// hop recorded and announced.
 #[tokio::test]
-async fn resume_readopts_the_recorded_route_and_recovers_when_it_is_gone() {
-    let dirs = test_dirs("resume-route-recovery");
+async fn reopening_a_thread_starts_on_the_configured_default() {
+    let dirs = test_dirs("resume-route-reopen");
     let configured = Arc::new(Mutex::new(vec!["a".to_string(), "b".to_string()]));
     let build = renaming_factory(dirs.offload.clone(), Arc::clone(&configured));
 
@@ -1643,8 +1646,8 @@ async fn resume_readopts_the_recorded_route_and_recovers_when_it_is_gone() {
     assert_eq!(switched["result"]["route"]["revision"], 2);
     client.shutdown().await;
 
-    // Same configuration: the session comes back on the provider it switched to,
-    // at the revision that switch committed.
+    // `b` is still configured, but the default is `a`: the switch does not
+    // outlive its session, and the hop off it is a recorded revision.
     let mut client = start_server(Arc::clone(&build), &dirs);
     client.initialize().await;
     let resume = client
@@ -1655,11 +1658,20 @@ async fn resume_readopts_the_recorded_route_and_recovers_when_it_is_gone() {
         .iter()
         .find(|message| message["id"] == resume)
         .unwrap();
-    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "b");
-    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 2);
+    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "a");
+    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 3);
+    assert_eq!(resumed["result"]["messageCount"], 2);
+    let note = messages
+        .iter()
+        .find(|message| message["method"] == "note")
+        .unwrap_or_else(|| panic!("no reopen note: {messages:?}"));
+    assert_eq!(
+        note["params"]["text"],
+        "session was written on b/shared; reopening on a/shared"
+    );
     client.shutdown().await;
 
-    // `b` is renamed out of the configuration between sessions.
+    // The same path carries a provider that has left the configuration entirely.
     *configured.lock().unwrap() = vec!["c".to_string()];
     let mut client = start_server(build, &dirs);
     client.initialize().await;
@@ -1672,19 +1684,7 @@ async fn resume_readopts_the_recorded_route_and_recovers_when_it_is_gone() {
         .find(|message| message["id"] == resume)
         .unwrap();
     assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "c");
-    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 3);
-    assert_eq!(resumed["result"]["messageCount"], 2);
-    let note = messages
-        .iter()
-        .find(|message| message["method"] == "note")
-        .unwrap_or_else(|| panic!("no recovery note: {messages:?}"));
-    let note = note["params"]["text"].as_str().unwrap();
-    assert!(
-        note.contains("session was written on b/shared")
-            && note.contains("unknown provider 'b'")
-            && note.contains("continuing on c/shared"),
-        "{note}"
-    );
+    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 4);
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
@@ -1796,18 +1796,27 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         &dirs,
     );
     client.initialize().await;
-    client
+    let resume = client
         .request("thread/resume", json!({"threadId": thread_id}))
         .await;
-    let resumed = client.recv().await;
+    let messages = client.recv_until(|message| message["id"] == resume).await;
+    let resumed = messages
+        .iter()
+        .find(|message| message["id"] == resume)
+        .unwrap();
     assert_eq!(resumed["result"]["thread"]["cwd"], project_text.as_str());
-    assert_eq!(resumed["result"]["thread"]["route"]["model"], "model-a");
+    // Reopening starts on the default route rather than the recorded one, and
+    // the options carry no provider/model for the factory to reproduce. This
+    // fixture's factory declares one model per thread, so the session that ran
+    // on `model-a` comes back on the default `mock` as a recorded hop.
+    assert_eq!(resumed["result"]["thread"]["route"]["model"], "mock");
+    assert_eq!(resumed["result"]["thread"]["route"]["revision"], 2);
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         &[ThreadStartOptions {
             cwd: project.clone(),
-            provider_id: Some("mock".into()),
-            model: Some("model-a".into()),
+            provider_id: None,
+            model: None,
         }]
     );
 
@@ -1820,7 +1829,10 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         .unwrap_or_else(|| panic!("fork response: {forked}"))
         .to_string();
     assert_eq!(forked["result"]["thread"]["cwd"], project_text.as_str());
-    assert_eq!(forked["result"]["thread"]["route"]["model"], "model-a");
+    // The fork branches off what the resumed thread is already on, so its route
+    // is adopted unchanged — no second hop, no new revision.
+    assert_eq!(forked["result"]["thread"]["route"]["model"], "mock");
+    assert_eq!(forked["result"]["thread"]["route"]["revision"], 2);
     client
         .request("thread/read", json!({"threadId": fork_id}))
         .await;

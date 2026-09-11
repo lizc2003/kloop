@@ -1,13 +1,11 @@
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::provider_route::FrozenProviderAttempt;
 use crate::provider_route::FrozenProviderRoute;
-use crate::provider_route::ProviderCatalog;
-use crate::provider_route::RouteRecovery;
+use crate::provider_route::RouteReopened;
 use crate::provider_route::SwitchError;
 use crate::rollout::ResumedSession;
 use crate::rollout::Rollout;
@@ -275,54 +273,77 @@ impl History {
         })
     }
 
-    /// Adopt the route this session was last written on. Almost always that
-    /// route is still in the catalog and comes back untouched, revision and all.
-    /// When it does not resolve — a provider renamed or dropped from
-    /// `~/.kloop/config.toml`, an endpoint or model allowlist edited underneath
-    /// it — the session moves onto `fallback` (the configured default) as a
-    /// recorded `Recovered` revision instead of refusing to open. A receipt
-    /// naming a provider that no longer exists is not a corrupt transcript: it
-    /// is an accurate record of a past turn, and editing configuration must not
-    /// retroactively delete the sessions that ran under the old one.
+    /// Start this session on `opening` — the route the front-end is opening it
+    /// with: today's configured default when a session is reopened from disk,
+    /// or the live session route when a running session rewinds onto a branch.
+    /// Returns the route plus, when it is not the one the session was last
+    /// written on, a receipt-backed [`RouteReopened`] for the front-end to say
+    /// out loud.
+    ///
+    /// A `/provider` switch is a decision about a running conversation, not a
+    /// standing preference: it lives as long as that session does. Reopening
+    /// starts where a brand-new session would start, so changing
+    /// `model_provider` in `~/.kloop/config.toml` moves every session that is
+    /// opened afterwards — including ones written on a provider that has since
+    /// left the file, which is what stops a config edit from making old
+    /// transcripts unopenable. The hop is a durable route revision like any
+    /// other, so the transcript says where each stretch of the session ran.
     pub fn adopt_provider_route(
         &mut self,
-        catalog: &Arc<ProviderCatalog>,
-        fallback: &FrozenProviderRoute,
-    ) -> Result<(FrozenProviderRoute, Option<RouteRecovery>), ProviderSwitchError> {
+        opening: &FrozenProviderRoute,
+    ) -> Result<(FrozenProviderRoute, Option<RouteReopened>), ProviderSwitchError> {
         let last = self.provider_routes.last().ok_or_else(|| {
             ProviderSwitchError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "history provider route timeline is missing",
             ))
         })?;
-        let reason = match catalog.restore_route(last) {
-            Ok(route) => return Ok((route, None)),
-            Err(reason) => reason,
+        // What the last receipt would look like had `opening` written it. The
+        // comparison is whole-object rather than a hand-listed set of identity
+        // fields, so a field added to the receipt later cannot quietly fall out
+        // of this decision; the ones taken from `last` are exactly the ones that
+        // are not route identity — boundary and source describe the recording,
+        // continuity is a consequence of a hop, and effort is session-local and
+        // re-seeds from configuration on every open.
+        let candidate = ProviderRouteReceipt {
+            revision: last.revision,
+            effort: last.effort,
+            ..opening.receipt(last.boundary, last.source, last.continuity)
         };
+        if candidate == *last {
+            // Reopening on what the session already recorded: nothing to write,
+            // and the receipt resolves by construction because `opening` came
+            // from the running catalog.
+            let route = opening
+                .at_revision_with_continuity(last.revision, last.continuity)
+                .map_err(ProviderSwitchError::Route)?;
+            return Ok((route, None));
+        }
         let from_provider = last.provider_id.clone();
         let from_model = last.primary_model.clone();
         let revision = last
             .revision
             .checked_add(1)
             .ok_or(ProviderSwitchError::Route(SwitchError::RevisionExhausted))?;
-        let next = fallback
+        let tentative = opening
             .at_revision(revision)
             .map_err(ProviderSwitchError::Route)?;
         let continuity = self
-            .projected_continuity(&next, ProviderRouteSource::Recovered)
+            .projected_continuity(&tentative, ProviderRouteSource::Reopened)
             .map_err(ProviderSwitchError::History)?;
-        let next = next.with_reasoning_continuity(continuity);
-        self.append_provider_route_changed(&next, ProviderRouteSource::Recovered, continuity)
+        let next = opening
+            .at_revision_with_continuity(revision, continuity)
+            .map_err(ProviderSwitchError::Route)?;
+        self.append_provider_route_changed(&next, ProviderRouteSource::Reopened, continuity)
             .map_err(ProviderSwitchError::Persistence)?;
-        let recovery = RouteRecovery {
+        let reopened = RouteReopened {
             from_provider,
             from_model,
             to_provider: next.provider_id().to_string(),
             to_model: next.primary_model().to_string(),
-            reason,
             continuity,
         };
-        Ok((next, Some(recovery)))
+        Ok((next, Some(reopened)))
     }
 
     pub fn switch_provider(
@@ -611,15 +632,16 @@ fn provider_request_view(
             continue;
         }
         // Either durable change kind authorizes the strip: a `/provider` the user
-        // typed, or a `Recovered` hop the session had no choice about. Both are
-        // recorded, both are visible in the transcript, and refusing the second
-        // would leave a recovered session able to open but unable to take a turn.
+        // typed, or the `Reopened` hop a session takes when it comes back on a
+        // different route. Both are recorded, both are visible in the
+        // transcript, and refusing the second would leave a reopened session
+        // able to open but unable to take a turn.
         let sanctioned_switch = attempt.identity().attempt_kind == ProviderAttemptKind::Primary
             && source.route_revision < active.revision
             && routes[source_index + 1..].iter().any(|route| {
                 matches!(
                     route.source,
-                    ProviderRouteSource::ExplicitSwitch | ProviderRouteSource::Recovered
+                    ProviderRouteSource::ExplicitSwitch | ProviderRouteSource::Reopened
                 )
             });
         if !chat_target && !sanctioned_switch {
@@ -1230,22 +1252,22 @@ mod tests {
         let _ = std::fs::remove_file(root);
     }
 
-    /// The dogfood failure of plan 132: `~/.kloop/config.toml` renames a
-    /// provider, and every session ever written on the old name refuses to
-    /// open. The recorded route is a reference to what ran, so a name that is
-    /// gone moves the session onto today's default and says so — on disk, as a
-    /// `recovered` revision, and in words to whoever resumed it.
+    /// The dogfood failure of plan 132, and the rule it settled on: a session
+    /// reopens on the route a brand-new session would open on. The provider it
+    /// was written on may be gone from configuration (the failure that started
+    /// this) or merely no longer the default (the rule) — either way the hop is
+    /// recorded, said out loud, and not repeated on the next open.
     #[test]
-    fn a_resumed_session_whose_provider_left_the_config_lands_on_the_default() {
+    fn a_reopened_session_starts_on_the_route_it_is_opened_with() {
         use std::sync::Arc;
 
         use crate::provider_route::ProviderCatalog;
         use crate::provider_route::ProviderCatalogEntry;
-        use crate::provider_route::SwitchError;
+        use crate::provider_route::SessionProviderState;
         use kloop_protocol::ProviderAvailabilityCode;
         use kloop_provider::Provider;
 
-        let dir = temp_dir("route-recovery");
+        let dir = temp_dir("route-reopen");
         let _ = std::fs::remove_dir_all(&dir);
         let session = dir.join("session.jsonl");
         let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
@@ -1283,20 +1305,17 @@ mod tests {
         );
         let canonical = history.messages().to_vec();
 
-        // Configuration has since dropped `gone` and declares `kept`.
+        // Configuration has since dropped `gone` and defaults to `kept`.
         let new_catalog = Arc::new(ProviderCatalog::new(vec![entry("kept")]).unwrap());
         let default_route = new_catalog.initial_route("kept", None).unwrap();
-        let (adopted, recovery) = history
-            .adopt_provider_route(&new_catalog, &default_route)
-            .unwrap();
+        let (adopted, reopened) = history.adopt_provider_route(&default_route).unwrap();
         assert_eq!(
-            recovery,
-            Some(crate::provider_route::RouteRecovery {
+            reopened,
+            Some(crate::provider_route::RouteReopened {
                 from_provider: "gone".into(),
                 from_model: "gone-model".into(),
                 to_provider: "kept".into(),
                 to_model: "kept-model".into(),
-                reason: SwitchError::UnknownProvider("gone".into()),
                 continuity: ReasoningContinuity::Filtered,
             })
         );
@@ -1304,7 +1323,7 @@ mod tests {
         assert_eq!(adopted.provider_id(), "kept");
 
         // The canonical transcript is untouched; only the request view drops the
-        // reasoning the new rail cannot replay — which the `recovered` receipt,
+        // reasoning the new rail cannot replay — which the `reopened` receipt,
         // like an explicit switch, is what authorizes.
         assert_eq!(history.messages(), canonical.as_slice());
         let view = history
@@ -1317,21 +1336,41 @@ mod tests {
             }]
         );
 
-        // Re-reading the file accepts what recovery wrote, and adopting again on
-        // the same catalog is a no-op: resuming twice must not stack revisions.
+        // Re-reading the file accepts what the hop wrote, a timeline whose first
+        // receipt names a provider no longer in the catalog restores anyway, and
+        // opening again on the same default writes nothing: reopening twice must
+        // not stack revisions.
         let reread = crate::rollout::resume_session(&session).unwrap();
         let timeline = reread.snapshot.provider_routes.clone();
         assert_eq!(timeline.len(), 2);
-        assert_eq!(timeline[1].source, ProviderRouteSource::Recovered);
+        assert_eq!(timeline[1].source, ProviderRouteSource::Reopened);
         assert_eq!(timeline[1].provider_id, "kept");
         assert_eq!(timeline[1].continuity, ReasoningContinuity::Filtered);
+        assert_eq!(
+            SessionProviderState::from_timeline(Arc::clone(&new_catalog), &timeline)
+                .unwrap()
+                .active_route()
+                .provider_id,
+            "kept"
+        );
         let mut resumed = History::resume(dir.clone(), reread);
-        let (again, recovery) = resumed
-            .adopt_provider_route(&new_catalog, &default_route)
-            .unwrap();
-        assert_eq!(recovery, None);
+        let (again, reopened) = resumed.adopt_provider_route(&default_route).unwrap();
+        assert_eq!(reopened, None);
         assert_eq!(again.revision(), 2);
+        assert_eq!(again.continuity(), ReasoningContinuity::Filtered);
         assert_eq!(resumed.provider_routes(), timeline.as_slice());
+
+        // And the rule the user settled on: the provider it was written on is
+        // still configured, but is no longer the default, so reopening moves —
+        // an in-session `/provider` does not outlive the session that ran it.
+        let both = Arc::new(ProviderCatalog::new(vec![entry("kept"), entry("other")]).unwrap());
+        let other_default = both.initial_route("other", None).unwrap();
+        let (moved, reopened) = resumed.adopt_provider_route(&other_default).unwrap();
+        assert_eq!(
+            reopened.map(|reopened| reopened.to_provider),
+            Some("other".to_string())
+        );
+        assert_eq!(moved.revision(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -302,15 +302,16 @@ async fn main() -> Result<ExitCode> {
         &args.session,
         &provider.initial_route(),
     )?;
-    // A resumed session continues on the route it was written on — unless that
-    // route is gone from configuration, in which case it lands on today's
-    // default and says so. A fresh session's revision-1 receipt resolves and
-    // comes straight back.
-    let (session_route, route_recovery) = history
-        .adopt_provider_route(&provider.catalog(), &provider.initial_route())
+    // Every session — fresh, resumed or forked — opens on the route a new
+    // session would open on: `model_provider`/`model` (and their env overrides)
+    // as they read right now. A `/provider` switch belongs to the conversation
+    // that ran it, not to the file it left behind, so reopening re-asserts the
+    // configured default and records the hop when it differs.
+    let (session_route, reopened) = history
+        .adopt_provider_route(&provider.initial_route())
         .map_err(anyhow::Error::new)?;
-    if let Some(recovery) = &route_recovery {
-        eprintln!("\x1b[2m[{recovery}]\x1b[0m");
+    if let Some(reopened) = &reopened {
+        eprintln!("\x1b[2m[{reopened}]\x1b[0m");
     }
 
     // `--image` files are read + validated once, up front, so a bad path fails

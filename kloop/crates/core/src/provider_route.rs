@@ -289,7 +289,7 @@ pub(crate) fn validate_timeline(
                 if matches!(
                     receipt.source,
                     kloop_protocol::ProviderRouteSource::ExplicitSwitch
-                        | kloop_protocol::ProviderRouteSource::Recovered
+                        | kloop_protocol::ProviderRouteSource::Reopened
                 ) && previous
                     .revision
                     .checked_add(1)
@@ -686,24 +686,26 @@ impl FrozenProviderRoute {
     }
 
     pub fn at_revision(&self, revision: u64) -> Result<Self, SwitchError> {
+        self.at_revision_with_continuity(revision, self.continuity)
+    }
+
+    /// The same route at a stated revision, carrying the reasoning continuity
+    /// the change is being recorded with — the shape a route change takes once
+    /// the projection has said what it costs.
+    pub fn at_revision_with_continuity(
+        &self,
+        revision: u64,
+        continuity: ReasoningContinuity,
+    ) -> Result<Self, SwitchError> {
         if revision == 0 {
             return Err(SwitchError::InvalidRevision);
         }
         Ok(Self::with_continuity(
             revision,
             self.route.clone(),
-            self.continuity,
+            continuity,
             self.effort,
         ))
-    }
-
-    /// The same route carrying a different reasoning continuity — how a route
-    /// change is finished once the projection has said what it costs.
-    pub fn with_reasoning_continuity(&self, continuity: ReasoningContinuity) -> Self {
-        Self {
-            continuity,
-            ..self.clone()
-        }
     }
 
     pub fn provider_id(&self) -> &str {
@@ -897,34 +899,32 @@ pub enum SwitchOutcome {
     },
 }
 
-/// A resumed session whose recorded route no longer resolves, and the route it
-/// was moved onto instead. Carried back to whichever front-end opened the
-/// session so the hop is stated once, in words, rather than inferred later from
-/// a `recovered` receipt nobody was told about.
+/// A session that opened on a different route than the one it was last written
+/// on, and where it went. Carried back to whichever front-end opened the session
+/// so the hop is stated once, in words, rather than left for the user to notice
+/// in a bill.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteRecovery {
+pub struct RouteReopened {
     pub from_provider: String,
     pub from_model: String,
     pub to_provider: String,
     pub to_model: String,
-    pub reason: SwitchError,
     pub continuity: ReasoningContinuity,
 }
 
-impl fmt::Display for RouteRecovery {
+impl fmt::Display for RouteReopened {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             from_provider,
             from_model,
             to_provider,
             to_model,
-            reason,
             continuity,
         } = self;
         write!(
             formatter,
-            "session was written on {from_provider}/{from_model}, which no longer \
-             resolves ({reason}); continuing on {to_provider}/{to_model}"
+            "session was written on {from_provider}/{from_model}; reopening on \
+             {to_provider}/{to_model}"
         )?;
         if *continuity == ReasoningContinuity::Filtered {
             formatter.write_str(" — earlier reasoning is dropped from the request")?;
@@ -1057,7 +1057,7 @@ mod tests {
             receipt(
                 2,
                 4,
-                kloop_protocol::ProviderRouteSource::Recovered,
+                kloop_protocol::ProviderRouteSource::Reopened,
                 "kept",
                 "k1",
             ),

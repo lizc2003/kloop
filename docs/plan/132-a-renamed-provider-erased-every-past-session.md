@@ -6,7 +6,8 @@
 >
 > 拍板:**自动落到当前默认 provider;不考虑兼容性。**开工中用户又补了一句定语义的话:
 > **「session 里存储的 provider,只需要做参考就行了吧」**——解析得了就接着用它,解析
-> 不了就换成当前默认,而不是"解析不了就拒绝开会话"。
+> 不了就换成当前默认,而不是"解析不了就拒绝开会话"。**这条后来又被 §六 推翻**:记录的
+> provider 连"参考"都不是,重开一律用当前默认。§一~§五 记的是第一版,最终落地看 §六 与 ✅。
 
 ## 一、根因:把「配置变了」当成了「时间线坏了」
 
@@ -83,62 +84,109 @@ base_url,或者从 models 里删掉一个不再用的旧模型,历史会话同�
 - **不放宽 fail-closed 的其余部分**:revision 倒退/重复、provenance 引用不存在的
   revision、origin boundary 不在区间内、usage 身份对不上——全部照旧拒绝。这次只把
   "今天的 catalog 里没有这个名字"从**损坏**降级为**改道**。
-- **不迁移旧文件**:`recovered` 是新写入的形状,历史文件一行不改。
+- **不迁移旧文件**:新 source(最终是 `reopened`)只出现在新写入的行里,历史文件一行不改。
 - **不做"记住上次用的 provider"之类的选择逻辑**:落点就是当前配置的默认 route,一个。
+
+## 六、追加拍板(同日):重开会话一律用当前默认
+
+第一版修完,用户接着问「如果我的 provider 还在,但 default 变了,启动旧会话,provider
+会变吗」。当时的答案是"不会"——而这正是 plan 92 明文写下的:
+
+> `docs/plan/92-session-provider-switching.md:56`:「resume 恢复最后 committed route 和
+> remembered models;fork/原地 rewind 按所选 canonical rollout boundary 恢复当时 route,
+> **而不是 process 当前默认**」
+
+用户给出的规则把这条推翻了:**「用 /provider 后的会话,就用 provider,但是这个会话退出后,
+又被恢复,这时候,就应该用 default。」**
+
+理由站得住:`model_provider` 就是"我现在要用哪家"的开关。你把默认从 A 换到 B,多半正是
+因为 A 慢了/贵了/坏了;结果昨天的会话一恢复还在打 A、还在给 A 计费,而且**不出声**——比
+"模型换了"更难发现。`/provider` 是对**那一次对话**做的决定,不是一条常驻偏好,它的寿命
+就该和那个会话一样长。
+
+落地后的规则一句话:**会话活着的时候用会话的 route(含 `/provider`);会话重新被打开时,
+用一次新会话会用的那条 route。**
+
+- `adopt_provider_route(opening)` 不再"先试记录的、不行再兜底",而是"就用 `opening`,
+  与最后一条 receipt 身份不同就记一跳"。身份比较照抄 `validate_receipt` 的那五项
+  (provider/api_family/fingerprint/primary_model/fallback_model);相同则零写入、revision
+  不动。**catalog 参数因此消失了**:`opening` 本来就是从当前 catalog 解析出来的。
+- 各前端传什么,就定义了"重开"的边界:CLI/server 传**配置默认 route**(等于一次新会话),
+  TUI 原地 rewind 传**会话当前正在跑的 route**(rewind 不是重开,`/provider` 继续有效)。
+- `ProviderRouteSource::Recovered` 改名 `Reopened`,并把"provider 没了"从**触发条件**降级
+  成一个**子情况**:重开时那条记录本来就不会被用,它还在不在配置里已经不重要了。
+  `RouteRecovery` 随之变成 `RouteReopened`,`reason` 字段删掉(不再有"失败原因"这回事)。
+- server 那条 hint 与 factory 重试**整段删掉**:`resume_options` 不再把记录里的
+  provider/model 塞进 options,`thread/resume` 也不接受自己的 provider/model——要指定路由,
+  等 thread 起来后用 `thread/provider/switch`。这比第一版少一整块代码。
+
+代价说清楚:默认与会话记录不同时,每次重开会写一条 receipt 并把旧 rail 的 reasoning 从
+request view 里剥掉(`continuity: filtered`)。写完就收敛——下次再开,最后一条就是默认,
+零写入。默认与记录相同(绝大多数情况)则完全无事发生,exact replay 一字不动。
 
 ## ✅ 已完成(2026-09-11;提交 SHA 以本条所在提交为准)
 
-- `crates/protocol`:`ProviderRouteSource` 新增 `Recovered`(wire 上是 `"recovered"`)。
-  route receipt 带 `#[serde(skip_serializing)]`,不出进程,所以这是纯内部 + rollout 形状。
+落地的是 §六 的规则(§四 是它的第一版,保留下来是因为 §六 的判据从那次收缩里来)。
+
+- `crates/protocol`:`ProviderRouteSource` 新增 `Reopened`(wire 上 `"reopened"`)。route
+  receipt 带 `#[serde(skip_serializing)]`,不出进程,所以这是纯内部 + rollout 形状。
 - `crates/core/src/provider_route.rs`:`validate_timeline` 在 revision > 1 处接受
-  `ExplicitSwitch | Recovered`;`from_timeline` 删掉逐条 `validate_receipt`(只留结构校验
-  与"最后一条必须 resolve");新增 `RouteRecovery`(from/to + reason + continuity,
-  `Display` 就是给用户看的那句话)与 `FrozenProviderRoute::with_reasoning_continuity`。
-- `crates/core/src/history.rs`:新增 `adopt_provider_route(catalog, fallback)`——resume/
-  fork/rewind 采用会话 route 的唯一入口;`switch_provider` 里的投影逻辑抽成
-  `projected_continuity(next, source)` 与它共用;`sanctioned_switch` 认 `Recovered`;
-  `append_provider_route_changed` 多收一个 `source`。
+  `ExplicitSwitch | Reopened`;`from_timeline` 删掉逐条 `validate_receipt`(只留结构校验
+  与"最后一条必须 resolve");新增 `RouteReopened`(from/to + continuity,`Display` 就是给
+  用户看的那句话)与 `at_revision_with_continuity`(`at_revision` 委托给它,只剩一条构造与
+  校验路径)。
+- `crates/core/src/history.rs`:新增 `adopt_provider_route(opening)`——resume/fork/rewind
+  采用 route 的唯一入口,身份相同则零写入(revision 与 continuity 原样带回),不同则记一条
+  `Reopened`;`switch_provider` 的投影逻辑抽成 `projected_continuity(next, source)` 与它
+  共用;`sanctioned_switch` 认 `Reopened`;`append_provider_route_changed` 多收一个 `source`。
+  **"身份是否相同"用整对象比较**:拿 `opening` 构造一条"如果是它写的,那条 receipt 会长什么
+  样"再与 `last` 整个比,只把**不属于路由身份**的字段从 `last` 取过来(boundary/source 描述
+  的是记录本身,continuity 是改道的结果,effort 是会话局部、每次打开都从配置重新播种)。
+  手写字段清单的写法会让以后新增的 receipt 字段悄悄掉出这个判断。
 - `crates/core/src/rollout.rs`:`append_provider_route_changed` 收 `source`(拒绝
   `Initial`);`validate_provider_routes` 对 `provider_route_changed` 行只要求"不是
   initial",具体哪种改道交给 `validate_timeline`。
-- `crates/cli/src/main.rs`:`restore_route(最后一条)` → `adopt_provider_route`,恢复时
-  按既有 warning 样式打一行 dim note(**stderr**,不污染 `--headless --json` 的 stdout)。
-- `crates/tui/src/lib.rs`:rewind(`WorkerMsg::Fork`)同样走 adopt,fallback 用会话当前
-  正在跑的 route;顺序改成先 `rebase` 后 adopt(adopt 要往新分支的 rollout 写)。
+- `crates/cli/src/main.rs`:`restore_route(最后一条)` → `adopt_provider_route(默认 route)`,
+  跳了就按既有 warning 样式打一行 dim note(**stderr**,不污染 `--headless --json` 的 stdout)。
+- `crates/tui/src/lib.rs`:rewind(`WorkerMsg::Fork`)传**会话当前在跑的 route**——rewind
+  不是重开,`/provider` 继续有效;顺序改成先 `rebase` 后 adopt(adopt 要往新分支的 rollout 写)。
 - `crates/server/src/lib.rs`:`spawn_thread` 按 `has_provider_route()` 分岔(新 thread
-  `ensure_initial_provider_route`,resume/fork `adopt_provider_route` 并把恢复发成
-  `note`);resume 时 factory 建不出来就去掉 provider/model 参考重建一次;`ConfigFactory`
-  文档写明"resumed thread 可能被调用两次"。
+  `ensure_initial_provider_route`,重开的 thread `adopt_provider_route(cfg.provider_route)`
+  并把跳发成 `note`);`resume_options` 不再把记录里的 provider/model 塞进 options,
+  `thread/resume`/`thread/fork` 因此不带 provider/model——要指定路由,等 thread 起来后用
+  `thread/provider/switch`;`resume_options` 里那句"session is missing its provider route
+  timeline"一并删掉——`validate_provider_routes` 在读盘时就拒绝空时间线,那是读不到的死代码。
 
 ### 测试
 
-- `history::tests::a_resumed_session_whose_provider_left_the_config_lands_on_the_default`:
-  真写一个 rollout 文件,provider `gone` 上跑一轮带 reasoning 的对话,换成只有 `kept` 的
-  catalog 后 adopt——整对象断言 `RouteRecovery`、revision 2、canonical 历史不变、request
-  view 里 reasoning 被剥掉、**重读文件**拿到 `source: recovered` / `continuity: filtered`,
-  以及**再 adopt 一次是 no-op**(resume 两次不能叠 revision)。
+- `history::tests::a_reopened_session_starts_on_the_route_it_is_opened_with`:真写一个
+  rollout 文件,在 provider `gone` 上跑一轮带 reasoning 的对话,然后分别用 ①只有 `kept` 的
+  catalog(provider 没了)与 ②`kept`+`other` 且默认是 `other`(provider 还在、只是不是默认)
+  打开——整对象断言 `RouteReopened`、revision 2/3、canonical 历史不变、request view 里
+  reasoning 被剥掉、**重读文件**拿到 `source: reopened` / `continuity: filtered`、
+  `from_timeline` 在首条指向已消失 provider 时照样恢复,以及**同一个默认再开一次是 no-op**
+  (重开两次不能叠 revision)。
 - `provider_route::tests::from_timeline_judges_only_the_route_the_session_continues_on`:
-  历史那条指向已消失的 provider 照样恢复;最后一条指向已消失的 provider 仍然
-  `UnknownProvider`。
-- `server.rs::resume_readopts_the_recorded_route_and_recovers_when_it_is_gone`:
-  一个 catalog 随重启变化的 factory——切到 `b` 后重启 resume 回到 `b`/revision 2(修掉
-  第三节),再把 `b` 改名成 `c` 后 resume 落到 `c`/revision 3 并发出 note。
+  历史那条指向已消失的 provider 照样恢复;最后一条指向已消失的 provider 仍然 `UnknownProvider`。
+- `server.rs::reopening_a_thread_starts_on_the_configured_default`:catalog 随重启变化的
+  factory——切到 `b` 后重启 resume 落回默认 `a`/revision 3 并发出逐字断言的 note(`b` 仍在
+  配置里,证的就是"`/provider` 不跨会话"),再把配置改成只有 `c` 后 resume 落到 `c`/revision 4。
+- `server.rs::thread_read_list_resume_and_fork_preserve_runtime`:原来断言"resume 保住
+  model-a",现在断言**重开落到默认**、options 不带 provider/model、fork 不再第二次跳。
 
 `cargo fmt` 干净;`clippy --workspace --all-targets -D warnings` 退出码 0;
 `cargo test --workspace` 退出码 0(2 个真实凭据测试照例 ignored)。
 
-**真实会话演练**(不动用户的项目分区):把用户那条 20 条消息的 `20260910-141535.jsonl`
-(首行 `provider_route_initial` 写着 `gw_cn`)复制进一个临时 git 仓库的分区,再用一个
-只声明 `polo` 的临时 HOME 配置跑 `kloop -r … --plain`:
+**真实会话演练**(临时 git 仓库 + 临时分区,跑完即删,不动用户的项目分区):把用户那条 20 条
+消息的 `20260910-141535.jsonl`(首行 `provider_route_initial` 写着 `gw_cn`)复制进去,用
+用户真实的 `~/.kloop/config.toml` 打开:
 
-```
-[resumed session 20260101-000000: 20 message(s)]
-[session was written on gw_cn/deepseek-v4-flash-0731, which no longer resolves
- (unknown provider 'gw_cn'); continuing on polo/gpt-5.6-sol — earlier reasoning
- is dropped from the request]
-{'type': 'provider_route_changed', 'revision': 2, 'source': 'recovered',
- 'providerId': 'polo', 'primaryModel': 'gpt-5.6-sol', 'continuity': 'filtered'}
-```
-
-第二次 resume 静默通过,文件里仍然只有 `initial` + `recovered` 两条 route 行。演练用的
-临时分区与临时 HOME 已删除。
+1. 默认就是 `gw_cn`(用户当前配置)→ **静默**,一行不写。
+2. `KLOOP_PROVIDER=gw_router KLOOP_MODEL=gpt-5.6-sol` 模拟改默认 → 打印
+   `[session was written on gw_cn/deepseek-v4-flash-0731; reopening on gw_router/gpt-5.6-sol
+   — earlier reasoning is dropped from the request]`,追加
+   `{"source":"reopened","revision":2,"providerId":"gw_router","continuity":"filtered"}`。
+3. 同一个默认再开一次 → 静默,不叠 revision。
+4. 默认换回 `gw_cn` → 跳回去(revision 3),而且**这次没有 "reasoning dropped"**:
+   revision 1 的 reasoning 回到原 rail 后可精确回放,plan 92 的 A→B→A byte-preserving
+   在新规则下仍然成立。
