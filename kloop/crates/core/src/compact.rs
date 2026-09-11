@@ -1455,6 +1455,23 @@ mod tests {
         );
     }
 
+    /// A turn reserves against the cap its own rail asks for, not a global
+    /// number: the OpenAI rails request four times what Anthropic does, and
+    /// that room has to be reserved before the round, not discovered after it.
+    #[test]
+    fn growth_follows_the_rail_cap() {
+        let growth =
+            |family: kloop_protocol::ProviderApiFamily| max_turn_growth(family.max_output_tokens());
+        assert_eq!(
+            growth(kloop_protocol::ProviderApiFamily::AnthropicMessages),
+            8_192 + TOOL_RESULT_GROWTH_ESTIMATE
+        );
+        assert_eq!(
+            growth(kloop_protocol::ProviderApiFamily::OpenAiResponses),
+            OUTPUT_GROWTH_CAP + TOOL_RESULT_GROWTH_ESTIMATE
+        );
+    }
+
     #[test]
     fn predicted_overflow_boundary_and_small_window_guard() {
         let growth = max_turn_growth(8_192); // 23_192

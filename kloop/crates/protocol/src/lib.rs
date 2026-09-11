@@ -421,6 +421,17 @@ impl ProviderApiFamily {
     pub fn requires_exact_reasoning_replay(self) -> bool {
         self != Self::OpenAiChatCompletions
     }
+
+    /// Output tokens this rail asks for per sampling call, and the single
+    /// source both the request bodies and the compaction growth estimate read.
+    /// Mock rides the Anthropic value: it sends no request, and keeping the
+    /// number stable keeps scripted-turn growth predictions unchanged.
+    pub const fn max_output_tokens(self) -> u64 {
+        match self {
+            Self::AnthropicMessages | Self::Mock => ANTHROPIC_MAX_OUTPUT_TOKENS,
+            Self::OpenAiChatCompletions | Self::OpenAiResponses => OPENAI_MAX_OUTPUT_TOKENS,
+        }
+    }
 }
 
 /// How hard the model is asked to think, as a kloop-owned bounded vocabulary.
@@ -807,9 +818,20 @@ impl Message {
     }
 }
 
-/// Maximum output tokens requested per sampling call; also feeds the
-/// per-round growth estimate used by predictive compaction.
-pub const MAX_OUTPUT_TOKENS: u64 = 8192;
+/// Output cap for one Anthropic Messages call. A thinking budget is added on
+/// top of it rather than taken out of it (see the Anthropic request body), so
+/// reasoning can never consume the room the answer needs.
+pub const ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 8_192;
+
+/// Output cap for one Responses or Chat Completions call. Deliberately four
+/// times the Anthropic one: on these rails reasoning tokens come out of the
+/// same budget as the answer — at xhigh, gw_cn's deepseek spends all 8,192 on
+/// reasoning alone and never reaches the text — and neither rail has a
+/// "retry the same request with a bigger cap" step to fall back on. Sending
+/// nothing at all is what codex does, but kloop's predictive compaction needs
+/// a number it can reserve against, so the cap is explicit and equal to the
+/// gateway default (32,768) we were otherwise cutting to a quarter.
+pub const OPENAI_MAX_OUTPUT_TOKENS: u64 = 32_768;
 
 /// Real token usage reported by the provider for one sampling call.
 /// `input_tokens` is only the uncached remainder: cached prompt tokens are
@@ -955,6 +977,23 @@ pub struct ToolDef {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Reasoning comes out of the answer's budget on the OpenAI rails and is
+    /// added on top of it on the Anthropic one, so the two caps are not the
+    /// same number — and Mock stays on the Anthropic value so scripted turns
+    /// keep predicting the same growth.
+    #[test]
+    fn output_caps_split_by_rail() {
+        assert_eq!(
+            [
+                ProviderApiFamily::AnthropicMessages.max_output_tokens(),
+                ProviderApiFamily::Mock.max_output_tokens(),
+                ProviderApiFamily::OpenAiResponses.max_output_tokens(),
+                ProviderApiFamily::OpenAiChatCompletions.max_output_tokens(),
+            ],
+            [8_192, 8_192, 32_768, 32_768]
+        );
+    }
 
     /// The wire-format contract with the Anthropic Messages API: exact JSON
     /// shapes, including tag names and the is_error omission rule.

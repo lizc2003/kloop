@@ -141,7 +141,7 @@ async fn request_body_is_stateless_with_reasoning_include() {
                 "description": "run a command",
                 "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
             }],
-            "max_output_tokens": 8192,
+            "max_output_tokens": 32768,
             "parallel_tool_calls": true,
             "store": false,
             "include": ["reasoning.encrypted_content"],

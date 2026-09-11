@@ -16,7 +16,6 @@ use crate::tools::dispatch_tools;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
-use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
 
 mod sampling;
@@ -396,7 +395,10 @@ async fn turn_rounds(
     // A sub-agent's text is its deliverable and returns via the tool result;
     // streaming it to the main UI would interleave with the parent's output.
     let stream_text = depth == 0;
-    let growth = compact::max_turn_growth(MAX_OUTPUT_TOKENS);
+    // Per rail, not per build: the Responses/Chat cap is four times the
+    // Anthropic one, and a round that may produce four times the output has to
+    // reserve for it.
+    let growth = compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens());
     // Overflow is recovered at most once per turn: compact, then retry. A
     // second overflow after a successful compaction surfaces as an error.
     let mut overflow_compact_attempted = false;

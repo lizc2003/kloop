@@ -75,6 +75,35 @@ fn openai(server: &MockServer) -> Provider {
     }
 }
 
+/// The chat rail asks for the same output cap as Responses, and for the same
+/// reason: reasoning tokens come out of this budget too, and there is no
+/// "retry with a bigger cap" step behind either rail. The Anthropic rail keeps
+/// its smaller cap because a thinking budget is added on top of it there.
+#[tokio::test]
+async fn chat_requests_carry_the_openai_output_cap() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 1}}),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let provider = Arc::new(openai(&server));
+    let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["max_tokens"], json!(32_768));
+}
+
 /// Text deltas, tool_calls accumulated across chunks by index, usage arriving
 /// AFTER finish_reason (the include_usage contract), then [DONE].
 #[tokio::test]

@@ -3015,6 +3015,16 @@ cargo run -- --mock
 # levels a model takes is the model's own contract, stated in its own error. KLOOP_FALLBACK_MODEL is not a runtime selector.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
+# Output caps are rail-local and not user config, because the rails disagree
+# about whose budget reasoning comes out of. Anthropic Messages asks for 8,192
+# output tokens and adds any thinking budget on top of that number, so reasoning
+# can never eat the answer's room. Responses and Chat Completions ask for 32,768:
+# there reasoning is spent from the same budget as the answer (at xhigh a model
+# can spend the whole of a small cap on reasoning and never reach the text), and
+# neither rail re-sends the request with a larger cap, so the room has to be
+# there from the start. Predictive compaction reserves against the cap of the
+# rail the session is actually on, not a build-wide constant.
+#
 # Stream guards are fixed provider-internal safety defaults, not user config:
 # 45s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
 # response, and 1 MiB per unfinished SSE frame. Anthropic requires message_stop;

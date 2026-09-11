@@ -32,10 +32,11 @@ use stream::spawn_stream;
 use sha2::Digest as _;
 use sha2::Sha256;
 
+use kloop_protocol::ANTHROPIC_MAX_OUTPUT_TOKENS;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
-use kloop_protocol::MAX_OUTPUT_TOKENS;
 use kloop_protocol::Message;
+use kloop_protocol::OPENAI_MAX_OUTPUT_TOKENS;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
 use kloop_protocol::ProviderAttemptKind;
@@ -506,7 +507,7 @@ impl Provider {
                 let key = key.clone();
                 let mut body = json!({
                     "model": model,
-                    "max_tokens": MAX_OUTPUT_TOKENS,
+                    "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
                     "system": anthropic::system_value(system, *cache),
                     "messages": anthropic::messages_value(messages, *cache),
                     "tools": anthropic::tools_value(tools, *cache),
@@ -532,7 +533,7 @@ impl Provider {
                     ThinkingMode::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
                     ThinkingMode::Budget(n) => {
                         body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
-                        body["max_tokens"] = json!(MAX_OUTPUT_TOKENS + n);
+                        body["max_tokens"] = json!(ANTHROPIC_MAX_OUTPUT_TOKENS + n);
                     }
                 }
                 let session = cache_key.map(str::to_string);
@@ -553,7 +554,7 @@ impl Provider {
                         "description": t.description,
                         "parameters": t.schema,
                     })).collect::<Vec<_>>(),
-                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                    "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                     "parallel_tool_calls": true,
                     "store": false,
                     "include": ["reasoning.encrypted_content"],
@@ -582,7 +583,7 @@ impl Provider {
                 };
                 let mut body = json!({
                     "model": model,
-                    "max_tokens": MAX_OUTPUT_TOKENS,
+                    "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                     "stream_options": {"include_usage": true},
                     "messages": messages,
                     "tools": tools.iter().map(|t| json!({
