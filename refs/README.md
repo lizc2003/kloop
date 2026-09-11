@@ -6,12 +6,12 @@ kloop 设计时对比研究过四个代码库。本文件是关于"别人代码"
 
 | 参考 | 位置 | 看什么 |
 |---|---|---|
-| **codex** | `refs/codex` | codex 生产级 fork。分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`tools/parallel.rs`;压缩全家桶:`compact*.rs`、`fork_proactive_trim.rs`;会话落盘:`rollout/`;扩展范式:`ext/worktree`;集成测试:`core/tests/suite`(mock SSE + wiremock 范式) |
-| **claude-code(逆向 TS 版)** | `~/work/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
+| **codex** | `refs/codex`(上游 openai/codex) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**fork 特有的东西不在上游**:`fork_*.rs`、`models-manager/models.json`、`core/src/rollout/`、`ext/worktree` 要回 `refs/codex` 看 |
+| **claude-code(逆向 TS 版)** | `refs/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
 | **claw-code（已退休）** | 历史快照 `claw-code@b71afddae100ced324457337925a694686b8fef2`（本地 clone 已移除） | **不可作底座**。只保留四项局部结论：① mock/request-capture 与 CLI output-contract 测试纪律；② OpenAI-compatible tool_calls 流式 reducer 的兼容边界；③ compact 不切开 tool_use/tool_result pair 的边界回归；④ typed lifecycle/degraded error 的阅读材料。kloop 已按自身协议和安全边界重实现，不复制 claw runtime。
-| **CodeWhale** | `./codewhale/`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
+| **CodeWhale** | `refs/codewhale`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
 
-`./codewhale/` 由根 `.gitignore` 排除，只作为本机只读参考，不随 kloop 提交；不得在其中开发或推送。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
+`refs/*` 由根 `.gitignore` 排除（只有 `refs/README.md` 和 `refs/claude-code-2.1.220/` 随 kloop 提交，后者是本仓库自己的 parity fixtures 而非克隆），其余都是本机只读参考；不得在其中开发或推送。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
 Plan 84 实际吸收了 claw 的四项局部测试/兼容纪律：真实 CLI stdout/stderr/NDJSON contract、wiremock request capture、OpenAI `tool_calls: null` 等同缺失但保持其他协议错误、以及 compaction tool pair boundary regression。未吸收 local placeholder auth、MCP failure phase、doctor 或第二套 registry。
 
@@ -102,7 +102,7 @@ output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 
 本轮也重新固定了三个架构参考的快照:
 
-- `~/work/claude-code` commit `<redacted>`;
+- `refs/claude-code`（当时在 `~/work/claude-code`）commit `<redacted>`;
 - `refs/codex` commit
   `bb21ed4b8d8f74567cd6fecb3c7d4fba795bc6e3`;
 - archived snapshot: `claw-code@4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d` (the local clone was later verified at `b71afddae100ced324457337925a694686b8fef2` before retirement).
