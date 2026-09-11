@@ -23,9 +23,11 @@
 //! things above it, and not a call that gave up containment itself: a bash
 //! call carrying `disable_sandbox` still reaches the user, because bypass
 //! trusts what the model is doing rather than its decision to remove the
-//! sandbox first. It does NOT vet the command — [`crate::shell::argv_is_dangerous`]
-//! is a blocklist knowing only `rm` and `sudo`, so on a host with no sandbox
-//! there is no command-level net under bypass. Containment is the net.
+//! sandbox first. Beyond the safety checks above it does NOT vet the command:
+//! [`crate::shell::argv_is_dangerous`] is a blocklist by construction, holding
+//! only what is irreversible and outside git's reach, so on a host with no
+//! sandbox that short list is the whole command-level net. Containment is the
+//! real one.
 //!
 //! The sandbox auto-allow layer (cc's `autoAllowBashIfSandboxed`) is the
 //! sandbox/approval coupling: a bash call the OS sandbox will contain needs
@@ -1034,11 +1036,12 @@ impl Permissions {
         // (an escaped `ls` is still harmless), then allow rules, the session
         // cache, and finally the user.
         //
-        // What this layer does NOT do is vet the command: `argv_is_dangerous`
-        // is a blocklist and knows only `rm` and `sudo`, so on a host with no
-        // sandbox at all, bypass has no command-level net to speak of. That is
-        // the accepted position, not an oversight — containment is the net, and
-        // where there is none the mode's name is the warning.
+        // What this layer does NOT do is vet the command. `argv_is_dangerous`
+        // (layer 4, above and bypass-immune) holds only what is irreversible
+        // and outside git's reach, so on a host with no sandbox at all that
+        // short list is the entire command-level net. That is the accepted
+        // position, not an oversight — containment is the real net, and where
+        // there is none the mode's name is the warning.
         if self.mode() == Mode::Bypass
             && !call.escapes_sandbox
             && !matches!(
@@ -2723,6 +2726,39 @@ mod tests {
 
         // second time: deny (script exhausted) → the call is refused
         assert!(!ok(&p, "bash", bash("rm -rf build")).await);
+    }
+
+    /// The destructive list is short on purpose — "irreversible, and git is not
+    /// the way back" — but everything on it has to reach this layer, which is
+    /// the one bypass cannot waive. The negative half matters just as much:
+    /// `git reset --hard` is how work gets recovered here, and turning it into
+    /// a prompt would be the blocklist growing by vibe.
+    #[tokio::test]
+    async fn irreversible_commands_reach_the_bypass_immune_layer() {
+        for command in [
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sdb1",
+            "shred secret.txt",
+            "sudo dd of=/dev/sda",
+        ] {
+            let approver = ScriptedApprover::new(vec![Decision::Deny]);
+            let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+            assert!(!ok(&p, "bash", bash(command)).await, "{command}");
+            assert_eq!(approver.ask_count(), 1, "{command}");
+            assert!(
+                approver.asked()[0].description.contains("[destructive]"),
+                "{command}"
+            );
+        }
+
+        // Reading without a destination, and the two git commands kloop itself
+        // reaches for: bypass runs them as before.
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        for command in ["dd if=/dev/urandom", "git clean -fdx", "git reset --hard"] {
+            assert!(ok(&p, "bash", bash(command)).await, "{command}");
+        }
+        assert_eq!(approver.ask_count(), 0);
     }
 
     /// An opaque bash script (here a redirect) can't be vetted by the deny or

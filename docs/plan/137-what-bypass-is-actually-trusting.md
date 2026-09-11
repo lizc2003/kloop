@@ -66,7 +66,32 @@ opaque 脚本原有的 `no_sandbox` 复用它,不再各算一遍。
   仍不在本轮修:动它要重新定义 bash 前缀规则的含义,与 plan 129/135 建立的
   `bash(...)` / `sandbox_escalate(...)` 之分是同一个题目,应该一起做。
 
-## 五、验收
+## 五、第二轮:那张表还是收了三个(第四节第一条被推翻)
+
+第一轮落地后用户问「argv_is_dangerous 去掉了吗」——没有,它在**第 4 层**(safety checks,
+bypass 免疫),而本轮换的是**第 7 层**的放行理由。两层方向相反:第 4 层命中就问,第 7 层
+不命中才放行。去掉它会让 bypass 下的 `rm -rf /` 直接跑,那是净损失。**不完备 ≠ 没用**:
+它覆盖到的那一小块是真的在挡,而且正是在最该挡的模式下挡。
+
+摆明这一点之后,扩表的成本已经变了:bypass 的主要放行理由换成了 containment,表的局限也
+写进了模块头和 README,所以"再往里加几个词"不再有"让人以为这表是穷尽的"的风险。用户
+**同意扩**,于是第四节第一条推翻。
+
+加什么由**一条规则**决定,不是由"这命令读起来多吓人"决定:
+
+> **不可逆,而且 git 不是回去的路。**
+
+按这条规则进来的:`dd` 带 `of=`(bytes 落在哪里,原来的就没了;不带 `of=` 只是读,和 `cat`
+一样无害)、`mkfs*`(每一种拼写都是格式化,与 flag 无关)、`shred`(就地覆写是它的用途)。
+按这条规则**留在外面**的:`git clean -fdx` 和 `git reset --hard`——在一个仓库里它们是恢复
+手段,kloop 自己就在用;把它们变成提示是"blocklist 靠感觉长大"的典型。`chmod -R` /
+`chown -R` 也没收:它们破坏的是权限而不是数据,而且改得回去。
+
+`… > /dev/sda` 这类**不需要**条目:重定向让整条脚本变成 `BashAnalysis::Opaque`,而 opaque
+在任何地方都拿不到自动裁决(第 7 层的另一半条件)。测试里把这一点也断言了,免得下一个人
+为它再加一行。
+
+## 六、验收
 
 - bypass + `disable_sandbox` + 非只读 bash → **问**,且 notice 含 `no OS sandbox`;
 - bypass + 普通 bash + 无沙箱环境(来路 B)→ 仍然直接放行,不回归;
@@ -95,13 +120,25 @@ notice 里带着 `no OS sandbox — full filesystem and network access`。其余
 
 ### 测试
 
-`bypass_stops_at_a_call_that_gave_up_containment` 一条走完第五节的五项验收:脱沙箱的
+`bypass_stops_at_a_call_that_gave_up_containment` 一条走完第六节的五项验收:脱沙箱的
 `make install` 被问到并带对 notice;同一模式同一(无沙箱)会话里普通 `make install` 照旧直接
 跑;脱沙箱但只读的 `ls -la` 由第 8 层放行;`check_call(..., sandbox_auto_allow = true)` 的
 `make install` 在第 6 层就过了、根本到不了这一层;manual 模式的行为与脱不脱沙箱无关。
 **反向验证过**:把 `!call.escapes_sandbox` 去掉,第一条断言立刻红。
 
+**第二轮(第五节)**:`crates/core/src/shell.rs` 的 `argv_is_dangerous` 收入 `dd of=`、
+`mkfs*`、`shred`,并把"不可逆且 git 不是回去的路"这条选择规则连同两个**反例**
+(`git clean -fdx` / `git reset --hard`)写进函数文档;`permissions.rs` 的模块头与第 7 层
+注释、README 的危险分类器段落同步。
+
+- `shell.rs` 一条:`the_danger_list_holds_only_irreversible_loss_git_cannot_undo`——三个新
+  条目的正例(含 `sudo dd of=`、`/sbin/mkfs.xfs` 这种带路径的拼写)、`dd if=` 不带目的地的
+  反例、两个 git 命令的反例,外加断言 `cat x > /dev/sda` 是 `Opaque`(所以不需要条目)。
+- `permissions.rs` 一条:`irreversible_commands_reach_the_bypass_immune_layer`——三个新条目
+  在 **bypass** 下都被问到且带 `[destructive]` 标记,而 `dd if=`、`git clean -fdx`、
+  `git reset --hard` 在同一模式下照旧直接跑。
+
 ### 验证
 
 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-`cargo test --workspace` 各自单独跑、当场取退出码,依次 0 / 0 / 0。
+`cargo test --workspace` 各自单独跑、当场取退出码,依次 0 / 0 / 0(两轮各跑一次)。

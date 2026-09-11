@@ -480,10 +480,16 @@ substitution, expansions, and variable-assignment prefixes make the script
 always goes to the human. The read-only classifier vets options, not just
 names (`find -delete`, `rg --pre`, `git -C`/`--git-dir`/`log --output`,
 `base64 -o`, `sed` beyond `-n Np` all disqualify), and the independent
-dangerous classifier (`rm -rf`, `sudo …`) forces a confirmation even when an
-allow rule or bypass mode would otherwise pass — wrappers (`sudo`, `env`,
-`timeout`, `nice`, `xargs`) are stripped before deny/danger matching so they
-can't smuggle a command past a rule.
+dangerous classifier forces a confirmation even when an allow rule or bypass
+mode would otherwise pass — wrappers (`sudo`, `env`, `timeout`, `nice`,
+`xargs`) are stripped before deny/danger matching so they can't smuggle a
+command past a rule. That classifier is a blocklist, so what it holds is chosen
+by one rule rather than by how alarming a command looks: **the damage is
+irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
+`shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`
+are deliberately absent: inside a repository those are the recovery path. A
+redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect makes
+the whole script opaque, and an opaque script never gets an automatic verdict.
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` and the
 comma-separated `KLOOP_DENY` / `KLOOP_ASK` env vars provide only process-wide
@@ -1953,9 +1959,9 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   containment off first. (A read-only escaped command still auto-passes, and an
   ordinary command on a host with no sandbox at all is unaffected — refusing
   that one would retire the mode wherever there is no sandbox to begin with.)
-  Bypass does not vet the command itself: the destructive check is a blocklist
-  knowing only `rm` and `sudo`, so where there is no containment there is no
-  command-level net under bypass.
+  Bypass does not vet the command itself beyond the destructive check above,
+  which is a short blocklist by construction — so where there is no containment,
+  what stands between the model and the filesystem is that list and nothing else.
 
 On platforms without an OS shell sandbox, worktree separation still anchors
 ordinary relative paths and parallel edits, but it cannot contain a model that

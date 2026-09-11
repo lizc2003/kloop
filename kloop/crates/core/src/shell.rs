@@ -263,17 +263,41 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
 /// deliberately independent from the read-only one: a command can be
 /// neither, and the middle ground is where "just ask" lives. Checked on the
 /// wrapper-stripped argv too, so `sudo rm -rf` and `env rm -rf` both hit.
+///
+/// This is a blocklist, and a blocklist is never complete — so what it holds is
+/// chosen by one rule rather than by how alarming a command looks: **the damage
+/// is irreversible and git is not the way back**. That admits `rm -rf`, `dd`
+/// writing to a destination, `mkfs*`, and `shred`; it deliberately leaves out
+/// `git clean -fdx` and `git reset --hard`, which inside a repository are the
+/// recovery path rather than the threat. Device clobbering through a redirect
+/// (`… > /dev/sda`) needs no entry either: a redirect makes the whole script
+/// [`BashAnalysis::Opaque`], which never gets an automatic verdict anywhere.
+///
+/// Because it is a blocklist, it is not the containment story — see the bypass
+/// layer in [`crate::permissions`]. It is the short list of things worth one
+/// question even when the user has said "stop asking".
 pub fn argv_is_dangerous(argv: &[String]) -> bool {
     let Some(cmd0) = argv.first() else {
         return false;
     };
-    match executable_name(cmd0) {
+    let name = executable_name(cmd0);
+    // mkfs, mkfs.ext4, mkfs.xfs, …: every spelling formats, whatever the flags.
+    if name.starts_with("mkfs") {
+        return true;
+    }
+    match name {
         "rm" => argv[1..].iter().any(|a| {
             matches!(a.as_str(), "--force" | "--recursive")
                 || (a.starts_with('-')
                     && !a.starts_with("--")
                     && a.chars().any(|c| c == 'r' || c == 'R' || c == 'f'))
         }),
+        // `of=` is where the bytes land, and what was there is gone. Without it
+        // dd only reads (to stdout or a pipe), which is no more dangerous than
+        // `cat`.
+        "dd" => argv[1..].iter().any(|a| a.starts_with("of=")),
+        // Overwrites in place by design; that is the whole point of the tool.
+        "shred" => true,
         "sudo" => argv.len() > 1 && argv_is_dangerous(&argv[1..]),
         _ => false,
     }
@@ -557,6 +581,42 @@ mod tests {
 
         assert!(!argv_is_dangerous(&argv(&["rm", "x"])));
         assert!(!argv_is_dangerous(&argv(&["cargo", "build"])));
+    }
+
+    /// The list is chosen by "irreversible, and git is not the way back" — not
+    /// by how alarming a command reads. Both halves of that rule are asserted
+    /// here, because the tempting failure is to keep adding words until the
+    /// blocklist feels complete, which it can never be.
+    #[test]
+    fn the_danger_list_holds_only_irreversible_loss_git_cannot_undo() {
+        // Destination given: the bytes that were there are gone.
+        assert!(argv_is_dangerous(&argv(&[
+            "dd",
+            "if=/dev/zero",
+            "of=/dev/sda"
+        ])));
+        assert!(argv_is_dangerous(&argv(&["dd", "of=disk.img"])));
+        assert!(argv_is_dangerous(&argv(&["sudo", "dd", "of=/dev/sda"])));
+        // No destination: dd is reading, which is no worse than `cat`.
+        assert!(!argv_is_dangerous(&argv(&["dd", "if=/dev/urandom"])));
+
+        // Every mkfs spelling formats, whatever the flags.
+        assert!(argv_is_dangerous(&argv(&["mkfs", "/dev/sdb1"])));
+        assert!(argv_is_dangerous(&argv(&["mkfs.ext4", "-F", "/dev/sdb1"])));
+        assert!(argv_is_dangerous(&argv(&["/sbin/mkfs.xfs", "/dev/sdb1"])));
+
+        // Overwriting in place is the tool's purpose.
+        assert!(argv_is_dangerous(&argv(&["shred", "secret.txt"])));
+
+        // Inside a repository these are the recovery path, not the threat —
+        // kloop reaches for them itself. Keeping them out is the rule working,
+        // not an omission.
+        assert!(!argv_is_dangerous(&argv(&["git", "clean", "-fdx"])));
+        assert!(!argv_is_dangerous(&argv(&["git", "reset", "--hard"])));
+
+        // A redirect onto a device needs no entry: it makes the whole script
+        // opaque, and an opaque script never gets an automatic verdict.
+        assert_eq!(analyze_bash("cat x > /dev/sda"), BashAnalysis::Opaque);
     }
 
     #[test]
