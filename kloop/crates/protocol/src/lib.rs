@@ -926,7 +926,7 @@ pub enum AssistantOutcome {
 }
 
 /// Events emitted by a provider while one sampling request streams.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     /// Incremental text for display only; the full text arrives via BlockDone.
     TextDelta(String),

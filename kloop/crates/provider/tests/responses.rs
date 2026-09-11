@@ -1031,6 +1031,297 @@ async fn incomplete_maps_to_length_stop_reason() {
     ));
 }
 
+/// The three shapes a truncated response actually takes on gw_cn's deepseek
+/// route (captured 2026-09-11 against ai-coding-sr-bj-direct). All three stamp
+/// `status: "incomplete"` on the items they did emit and close with
+/// `incomplete_details.reason: "length"`; every one of them used to die as a
+/// non-retryable protocol error, throwing away a full minute of work.
+///
+/// Shape one: xhigh reasoning eats the whole output budget on its own — the
+/// reasoning item closes incomplete and carries no encrypted_content, and no
+/// message item is ever opened.
+#[tokio::test]
+async fn reasoning_truncated_by_the_output_budget_becomes_an_output_limit() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress"
+            }}),
+            json!({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                "item_id": "rs", "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "delta": "counting primes"}),
+            json!({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0, "text": "counting primes"}),
+            json!({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                "item_id": "rs", "summary_index": 0,
+                "part": {"type": "summary_text", "text": "counting primes"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "incomplete",
+                "summary": [{"type": "summary_text", "text": "counting primes"}]
+            }}),
+            json!({"type": "response.incomplete", "response": {
+                "id": "r", "status": "incomplete",
+                "incomplete_details": {"reason": "length"},
+                "usage": {"input_tokens": 133, "output_tokens": 8192,
+                    "input_tokens_details": {"cached_tokens": 0}}
+            }}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert_eq!(
+        ok,
+        vec![
+            StreamEvent::ThinkingDelta("counting primes".into()),
+            StreamEvent::BlockDone(AssistantBlock::Thinking {
+                thinking: "counting primes".into(),
+                signature: String::new(),
+            }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::OutputLimit(OutputLimitKind::MaxOutputTokens),
+                usage: Some(Usage {
+                    input_tokens: 133,
+                    output_tokens: 8192,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
+/// Shape two: the answer itself is cut mid-sentence. Reasoning closed cleanly,
+/// the message item closes incomplete — and the partial text it did produce is
+/// exactly what the agent's truncation-continue recovery stitches together, so
+/// it must survive.
+#[tokio::test]
+async fn a_message_truncated_mid_text_keeps_the_partial_answer() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress"
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "completed",
+                "summary": [], "encrypted_content": "enc"
+            }}),
+            json!({"type": "response.output_item.added", "output_index": 1, "item": {
+                "type": "message", "id": "msg", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 1,
+                "item_id": "msg", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 1,
+                "item_id": "msg", "content_index": 0, "delta": "The printing press"}),
+            json!({"type": "response.output_text.done", "output_index": 1,
+                "item_id": "msg", "content_index": 0, "text": "The printing press"}),
+            json!({"type": "response.content_part.done", "output_index": 1,
+                "item_id": "msg", "content_index": 0,
+                "part": {"type": "output_text", "text": "The printing press"}}),
+            json!({"type": "response.output_item.done", "output_index": 1, "item": {
+                "type": "message", "id": "msg", "status": "incomplete", "role": "assistant",
+                "content": [{"type": "output_text", "text": "The printing press"}]
+            }}),
+            json!({"type": "response.incomplete", "response": {
+                "id": "r", "status": "incomplete",
+                "incomplete_details": {"reason": "length"},
+                "usage": {"input_tokens": 34, "output_tokens": 400,
+                    "input_tokens_details": {"cached_tokens": 0}}
+            }}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert_eq!(
+        ok,
+        vec![
+            StreamEvent::BlockDone(AssistantBlock::Thinking {
+                thinking: String::new(),
+                signature: "enc".into(),
+            }),
+            StreamEvent::TextDelta("The printing press".into()),
+            StreamEvent::BlockDone(AssistantBlock::Text {
+                text: "The printing press".into(),
+            }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::OutputLimit(OutputLimitKind::MaxOutputTokens),
+                usage: Some(Usage {
+                    input_tokens: 34,
+                    output_tokens: 400,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
+/// Shape three, and the reason item status cannot be read as "this item is
+/// damaged": the budget ran out between items, so the two function calls that
+/// did land are byte-complete — arguments done, valid JSON, final value equal
+/// to the deltas — and both are stamped `incomplete` anyway. They are the
+/// model's real next step, so the turn dispatches them instead of dying.
+#[tokio::test]
+async fn complete_function_calls_stamped_incomplete_are_still_dispatched() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_1", "status": "in_progress",
+                "call_id": "call_1", "name": "read_file", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_1", "delta": "{\"path\":\"a1.txt\"}"}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_1", "arguments": "{\"path\":\"a1.txt\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_1", "status": "incomplete",
+                "call_id": "call_1", "name": "read_file",
+                "arguments": "{\"path\":\"a1.txt\"}"
+            }}),
+            json!({"type": "response.output_item.added", "output_index": 1, "item": {
+                "type": "function_call", "id": "fc_2", "status": "in_progress",
+                "call_id": "call_2", "name": "read_file", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 1,
+                "item_id": "fc_2", "delta": "{\"path\":\"a2.txt\"}"}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 1,
+                "item_id": "fc_2", "arguments": "{\"path\":\"a2.txt\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 1, "item": {
+                "type": "function_call", "id": "fc_2", "status": "incomplete",
+                "call_id": "call_2", "name": "read_file",
+                "arguments": "{\"path\":\"a2.txt\"}"
+            }}),
+            json!({"type": "response.incomplete", "response": {
+                "id": "r", "status": "incomplete",
+                "incomplete_details": {"reason": "length"},
+                "usage": {"input_tokens": 200, "output_tokens": 700,
+                    "input_tokens_details": {"cached_tokens": 0}}
+            }}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert_eq!(
+        ok,
+        vec![
+            StreamEvent::BlockDone(AssistantBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "a1.txt"}),
+            }),
+            StreamEvent::BlockDone(AssistantBlock::ToolUse {
+                id: "call_2".into(),
+                name: "read_file".into(),
+                input: json!({"path": "a2.txt"}),
+            }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::ToolUse,
+                usage: Some(Usage {
+                    input_tokens: 200,
+                    output_tokens: 700,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
+/// The relaxation buys exactly one new statement — "the budget ran out" — and
+/// it must agree with the terminal. An item that says truncated under a
+/// response that says completed describes two different responses, and neither
+/// half can be trusted to pick.
+#[tokio::test]
+async fn a_truncated_item_under_a_completed_response_fails_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "in_progress"
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "status": "incomplete",
+                "summary": [], "encrypted_content": "enc"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "r", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let mut events = collect(responses(&server)).await;
+    let error = events.pop().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(
+        error
+            .to_string()
+            .contains("reported truncation but the response completed"),
+        "{error}"
+    );
+}
+
+/// Only `incomplete` was let in, and a rejected status now names itself: the
+/// report that started this plan said only "was not completed", which cost a
+/// round of guessing about what the wire had actually sent.
+#[tokio::test]
+async fn an_unknown_final_item_status_still_fails_and_names_itself() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "msg", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "msg", "status": "failed", "role": "assistant",
+                "content": []
+            }}),
+        ]),
+    )
+    .await;
+
+    let mut events = collect(responses(&server)).await;
+    let error = events.pop().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(
+        error
+            .to_string()
+            .contains(r#"message item status was "failed""#),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn failed_with_context_error_maps_to_overflow() {
     let server = MockServer::start().await;

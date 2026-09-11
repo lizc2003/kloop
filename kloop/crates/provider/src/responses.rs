@@ -388,23 +388,34 @@ enum ItemStatusPolicy {
     Optional,
 }
 
-fn check_item_status(
-    item: &Value,
+/// What an item's own status said at `output_item.done`. `Truncated` does not
+/// mean the item is damaged: a response that runs out of output budget stamps
+/// `incomplete` on *every* item it managed to emit — gw_cn's deepseek route
+/// stamps it on eleven function calls whose arguments are each complete JSON,
+/// when the twelfth never started at all. So the flag describes the response,
+/// the terminal frame carries the reason, and the item's own content is still
+/// validated exactly as strictly as before.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemCompletion {
+    Completed,
+    Truncated,
+}
+
+/// The item's `status`, or `None` when it carried none and the policy allows
+/// that. Handing back the value instead of comparing it lets each caller name
+/// the statuses it accepts — and say which one it actually got.
+fn item_status<'a>(
+    item: &'a Value,
     field: &str,
-    expected: &str,
     policy: ItemStatusPolicy,
-    mismatch: &str,
-) -> Result<(), ProviderFailure> {
-    let Some(status) = item.get("status") else {
-        return match policy {
-            ItemStatusPolicy::Required => required_str(&item["status"], field).map(|_| ()),
-            ItemStatusPolicy::Optional => Ok(()),
-        };
-    };
-    if required_str(status, field)? != expected {
-        return Err(protocol(mismatch));
+) -> Result<Option<&'a str>, ProviderFailure> {
+    match item.get("status") {
+        None => match policy {
+            ItemStatusPolicy::Required => required_str(&item["status"], field).map(Some),
+            ItemStatusPolicy::Optional => Ok(None),
+        },
+        Some(status) => required_str(status, field).map(Some),
     }
-    Ok(())
 }
 
 fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
@@ -414,13 +425,14 @@ fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
     } else {
         ItemStatusPolicy::Required
     };
-    check_item_status(
-        item,
-        "output item status",
-        "in_progress",
-        status_policy,
-        "added output item was not in_progress",
-    )?;
+    match item_status(item, "output item status", status_policy)? {
+        None | Some("in_progress") => {}
+        Some(other) => {
+            return Err(protocol(format!(
+                "added output {item_type} item status was {other:?}, not in_progress"
+            )));
+        }
+    }
     let kind = match item_type {
         "message" => {
             if required_str(&item["role"], "message role")? != "assistant" {
@@ -566,25 +578,28 @@ fn check_final_item_status(
     item: &Value,
     expected_type: &str,
     status_policy: ItemStatusPolicy,
-) -> Result<(), ProviderFailure> {
-    if required_str(&item["type"], "final output item type")? != expected_type {
-        return Err(protocol("final output item type changed"));
+) -> Result<ItemCompletion, ProviderFailure> {
+    let item_type = required_str(&item["type"], "final output item type")?;
+    if item_type != expected_type {
+        return Err(protocol(format!(
+            "final output item type changed from {expected_type} to {item_type}"
+        )));
     }
-    check_item_status(
-        item,
-        "final output item status",
-        "completed",
-        status_policy,
-        "final output item was not completed",
-    )
+    match item_status(item, "final output item status", status_policy)? {
+        None | Some("completed") => Ok(ItemCompletion::Completed),
+        Some("incomplete") => Ok(ItemCompletion::Truncated),
+        Some(other) => Err(protocol(format!(
+            "final output {item_type} item status was {other:?}, neither completed nor incomplete"
+        ))),
+    }
 }
 
 fn finish_message(
     state: ItemState,
     item: &Value,
     refusal_seen: &mut bool,
-) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "message", ItemStatusPolicy::Required)?;
+) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
+    let completion = check_final_item_status(item, "message", ItemStatusPolicy::Required)?;
     if required_str(&item["role"], "final message role")? != "assistant" {
         return Err(protocol("final output message role was not assistant"));
     }
@@ -628,10 +643,13 @@ fn finish_message(
             text.push_str(&part.text);
         }
     }
-    Ok((!text.is_empty())
-        .then_some(AssistantBlock::Text { text })
-        .into_iter()
-        .collect())
+    Ok((
+        (!text.is_empty())
+            .then_some(AssistantBlock::Text { text })
+            .into_iter()
+            .collect(),
+        completion,
+    ))
 }
 
 /// An absent parts array and an empty one say the same thing: this item carried
@@ -704,8 +722,8 @@ fn verify_reasoning_parts(
 fn finish_reasoning(
     state: ItemState,
     item: &Value,
-) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "reasoning", ItemStatusPolicy::Optional)?;
+) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
+    let completion = check_final_item_status(item, "reasoning", ItemStatusPolicy::Optional)?;
     let ItemKind::Reasoning { summary, content } = state.kind else {
         return Err(protocol("final reasoning referenced the wrong item type"));
     };
@@ -721,18 +739,21 @@ fn finish_reasoning(
         thinking: texts.concat(),
         signature,
     };
-    Ok(block
-        .has_semantic_payload()
-        .then_some(block)
-        .into_iter()
-        .collect())
+    Ok((
+        block
+            .has_semantic_payload()
+            .then_some(block)
+            .into_iter()
+            .collect(),
+        completion,
+    ))
 }
 
 fn finish_function_call(
     state: ItemState,
     item: &Value,
-) -> Result<Vec<AssistantBlock>, ProviderFailure> {
-    check_final_item_status(item, "function_call", ItemStatusPolicy::Required)?;
+) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
+    let completion = check_final_item_status(item, "function_call", ItemStatusPolicy::Required)?;
     let ItemKind::FunctionCall {
         call_id,
         name,
@@ -768,18 +789,21 @@ fn finish_function_call(
     let call_id = final_call_id.to_string();
     let name = final_name.to_string();
     let input = crate::parse_tool_input("openai-responses", &name, final_arguments)?;
-    Ok(vec![AssistantBlock::ToolUse {
-        id: call_id,
-        name,
-        input,
-    }])
+    Ok((
+        vec![AssistantBlock::ToolUse {
+            id: call_id,
+            name,
+            input,
+        }],
+        completion,
+    ))
 }
 
 fn finish_item(
     state: ItemState,
     item: &Value,
     refusal_seen: &mut bool,
-) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
     if matches!(&state.kind, ItemKind::Message { .. }) {
         finish_message(state, item, refusal_seen)
     } else if matches!(&state.kind, ItemKind::Reasoning { .. }) {
@@ -798,11 +822,21 @@ fn bounded_reason(reason: &str) -> String {
     bounded
 }
 
+/// What the item stream said about this response, read once at the terminal.
+/// Three booleans that only ever travel together, so they travel as one thing
+/// rather than as a positional argument list nobody can read at the call site.
+#[derive(Default)]
+struct OutputSummary {
+    has_tool: bool,
+    has_refusal: bool,
+    /// An `output_item.done` carried `status: "incomplete"`.
+    truncated: bool,
+}
+
 fn terminal_outcome(
     event: &str,
     response: &Value,
-    has_tool: bool,
-    has_refusal: bool,
+    output: &OutputSummary,
 ) -> Result<AssistantOutcome, ProviderFailure> {
     let status = required_str(&response["status"], "response status")?;
     match event {
@@ -810,7 +844,15 @@ fn terminal_outcome(
             if status != "completed" {
                 return Err(protocol("completed event carried a non-completed status"));
             }
-            match (has_tool, has_refusal) {
+            // An item said the budget ran out and the response says it ran to
+            // completion: the two describe different responses. Nothing below
+            // could pick the right one, so fail closed.
+            if output.truncated {
+                return Err(protocol(
+                    "an output item reported truncation but the response completed",
+                ));
+            }
+            match (output.has_tool, output.has_refusal) {
                 (true, true) => Err(protocol("response combined refusal with function calls")),
                 (true, false) => Ok(AssistantOutcome::ToolUse),
                 (false, true) => Ok(AssistantOutcome::Refused),
@@ -821,18 +863,41 @@ fn terminal_outcome(
             if status != "incomplete" {
                 return Err(protocol("incomplete event carried a non-incomplete status"));
             }
-            if has_tool || has_refusal {
-                return Err(protocol("incomplete response contained conflicting output"));
+            if output.has_tool && output.has_refusal {
+                return Err(protocol("response combined refusal with function calls"));
             }
             let reason = required_non_empty(
                 &response["incomplete_details"]["reason"],
                 "incomplete reason",
             )?;
+            // Filtering outranks everything: the response was stopped on
+            // content grounds, and whatever it had already emitted is not a
+            // decision to act on.
+            if reason == "content_filter" {
+                return Ok(AssistantOutcome::Filtered);
+            }
+            if output.has_refusal {
+                return Ok(AssistantOutcome::Refused);
+            }
+            // Truncation lands on item boundaries: every function call that
+            // reached `output_item.done` passed the full argument contract
+            // (arguments done, valid JSON object, final value equal to the
+            // accumulated deltas), and the one that did not fit sent no events
+            // at all. Those calls are the model's actual next step — dispatch
+            // them and the tool results bring it back to finish the rest.
+            // Killing the round instead throws away work that is already paid
+            // for, which is what `gw_cn`'s xhigh runs kept doing.
+            if output.has_tool {
+                return Ok(AssistantOutcome::ToolUse);
+            }
             match reason {
-                "max_output_tokens" => Ok(AssistantOutcome::OutputLimit(
+                // Same event, two spellings: OpenAI says `max_output_tokens`,
+                // ark (gw_cn's deepseek route) says `length`. Only this arm
+                // reaches the agent's bounded truncation-continue recovery, so
+                // a missing spelling here costs the whole round.
+                "max_output_tokens" | "length" => Ok(AssistantOutcome::OutputLimit(
                     OutputLimitKind::MaxOutputTokens,
                 )),
-                "content_filter" => Ok(AssistantOutcome::Filtered),
                 _ => Ok(AssistantOutcome::Incomplete(IncompleteReason::Provider(
                     bounded_reason(reason),
                 ))),
@@ -857,8 +922,7 @@ pub(super) async fn stream(
     let mut items: BTreeMap<ItemKey, ItemState> = BTreeMap::new();
     let mut seen_items = HashSet::new();
     let mut completed_blocks = Vec::new();
-    let mut has_tool = false;
-    let mut has_refusal = false;
+    let mut output = OutputSummary::default();
     let mut completion = None;
 
     loop {
@@ -953,7 +1017,7 @@ pub(super) async fn stream(
                         .get_mut(&key)
                         .ok_or_else(|| protocol("content part referenced an unknown item"))?;
                     let index = required_u64(&value["content_index"], "content_index")?;
-                    has_refusal |= add_content_part(state, index, &value["part"])?;
+                    output.has_refusal |= add_content_part(state, index, &value["part"])?;
                 }
                 "response.output_text.delta" | "response.refusal.delta" => {
                     let key = event_item_key(&value)?;
@@ -964,7 +1028,7 @@ pub(super) async fn stream(
                     let expected = if event == "response.output_text.delta" {
                         MessagePartKind::OutputText
                     } else {
-                        has_refusal = true;
+                        output.has_refusal = true;
                         MessagePartKind::Refusal
                     };
                     let part = text_part_mut(state, index, expected)?;
@@ -983,7 +1047,7 @@ pub(super) async fn stream(
                     let expected = if event == "response.output_text.done" {
                         MessagePartKind::OutputText
                     } else {
-                        has_refusal = true;
+                        output.has_refusal = true;
                         MessagePartKind::Refusal
                     };
                     let part = text_part_mut(state, index, expected)?;
@@ -1180,9 +1244,11 @@ pub(super) async fn stream(
                     let state = items
                         .remove(&key)
                         .ok_or_else(|| protocol("output item done referenced a non-open item"))?;
-                    let mut blocks = finish_item(state, &value["item"], &mut has_refusal)?;
+                    let (mut blocks, completion) =
+                        finish_item(state, &value["item"], &mut output.has_refusal)?;
+                    output.truncated |= completion == ItemCompletion::Truncated;
                     for block in &blocks {
-                        has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
+                        output.has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
                     }
                     for block in blocks.drain(..) {
                         if block.has_semantic_payload() {
@@ -1202,8 +1268,7 @@ pub(super) async fn stream(
                     if id != expected {
                         return Err(protocol("terminal response identity changed"));
                     }
-                    let outcome =
-                        terminal_outcome(event, &value["response"], has_tool, has_refusal)?;
+                    let outcome = terminal_outcome(event, &value["response"], &output)?;
                     crate::validate_assistant_output(
                         "openai-responses",
                         &outcome,

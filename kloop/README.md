@@ -3019,8 +3019,12 @@ cargo run -- --mock
 # UTF-8; malformed JSON, unknown semantic events, unclosed output items/parts,
 # missing final tool identity, and non-object arguments fail closed. Responses
 # message/function_call item status remains required. A reasoning item may omit
-# status on added/done (a production wire shape); when present it must still be
-# in_progress/completed respectively, and explicit null or another value fails.
+# status on added/done (a production wire shape); when present, added must still
+# say in_progress, while done accepts completed or incomplete: a response that
+# runs out of output budget stamps incomplete on every item it emitted, including
+# byte-complete function calls, so that status describes the response and not the
+# item. Explicit null or any other value fails and names what it got, and an item
+# reporting truncation under a completed response fails closed.
 # The lifecycle frames (response.created/in_progress) are read for identity
 # only: their status is never consumed downstream, so a missing key or an
 # unfamiliar value there is not a violation, while the terminal frames still
@@ -3042,9 +3046,14 @@ cargo run -- --mock
 # mandatory typed outcome. EndTurn, ToolUse, output limits, refusal, filtering,
 # and incomplete responses are distinct: only output limits enter bounded
 # continuation; refusal/filter/incomplete never retry, fallback, or dispatch a
-# tool. ToolUse must agree bidirectionally with unique, valid tool blocks. A
-# valid empty EndTurn creates no assistant history placeholder. Display items
-# with partial text close as failed on stream error, while completed blocks stay
+# tool. A truncated Responses terminal (incomplete_details.reason length or
+# max_output_tokens — one event, two vendor spellings) is an output limit, and
+# the complete tool calls such a response already emitted still dispatch as
+# ToolUse, since truncation lands on item boundaries and those calls carry the
+# whole argument contract; content_filter outranks them. ToolUse must agree
+# bidirectionally with unique, valid tool blocks. A valid empty EndTurn creates
+# no assistant history placeholder. Display items with partial text close as
+# failed on stream error, while completed blocks stay
 # completed; native protocol 2.0 keeps the existing item/completed method and
 # carries that distinction in the item's status field. Core turn errors retain
 # AssistantOutcome or ProviderFailure rather than recovering either from text.
