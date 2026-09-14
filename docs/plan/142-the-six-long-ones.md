@@ -84,3 +84,32 @@ root-only task 工具、agent_type allowlist、shell 可用性),以及 `execute_
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
 
 全部做完后,plan 136 第四节第 2 条(超长函数)销账;把结果写回 136 的 ✅ 节。
+
+## ✅ 已完成(2026-09-14)
+
+六个函数六次提交,顺序与提交号:
+
+| 函数 | 行数 | 提交 | 做法 |
+|---|---|---|---|
+| `cli/main.rs` `main` | 362 → **46** | `d03c763` | `ProcessState`(每进程一次)+ `SessionState`(单会话 cwd 绑定)两个 struct;`serve_config_factory` / `run_serve` / `run_headless_turn` / `run_plain` / `run_tui` 五个函数,`run_front_end` 挑一条;MCP 关闭从四处收成一处 |
+| `tui/app.rs` `App::apply_core` | 362 → **59** | `099f535` | 按事件族拆成 `apply_item_started` / `apply_item_delta` / `apply_item_completed`(内层按 `Item`/`Delta` 穷尽)/ `apply_background_task` / `apply_agent_message` / `apply_turn_ended` |
+| `tui/lib.rs` `ui_loop` | 230 → **84** | `9e024db` | `UiState` 收局部与句柄;`hud` / `on_input` / `on_command` / `on_agent_events` / `absorb` / `autowake`;分支返回 `ControlFlow<()>`,七处 `break Ok(())` 收成一处 |
+| `core/tools/mod.rs` `run_one` | 351 → **84** | `bb92665` | `reject_unavailable`(shell 那两条改读 `Builtin::gate()`)/ `classify_source`+`SourceGate` / `preflight_source` / `run_pre_tool_hook` / `recheck_source_after_hook` / `PreparedCall::{resolve,authorize}` / `run_post_tool_hook` / `run_gated` / `settle_execution`+`Aftermath` |
+| `provider/responses.rs` `stream` | 403 → **70** | `bf189b0` | `ResponseStream` 收六份状态,一个方法对一族 wire 事件;顺带收掉 `open_item`(十个调用点)与 `reasoning_index` |
+| `core/agent.rs` `turn_rounds` | 547 → **123** | `70a5447` | `Turn` 收跨轮状态 + `RoundStep::{Retry,Stop}`;`build_tools` / `compact_predictively` / `recover_from_overflow` / `resume_after_partial` / `settle_sample` / `absorb_round` / `classify_outcome` / `dispatch_round` / `keep_going_for_late_work` / `nudge_structured` |
+
+六个都过了第六节的验收:降到 150 行以下、相关测试文件 diff 为空、fmt + clippy(`-D warnings`)
++ `cargo test --workspace` 各自单独取退出码。plan 136 第五节"拆超长函数"一条已销账。
+
+### 与本 plan 第三节建议的两点出入
+
+1. **`turn_rounds` 做了第三节说"不要"做的事。** 第三节建议只抽 `recover_from_overflow` 与
+   `classify_outcome`、不要重写循环;但那两步加起来只减 120 行,离 150 行的验收线差得远
+   (547 − 120 = 427)。长度的真正来源不是这两段,是**十来个跨轮局部**和**每个退出点各拼
+   一遍 `Ending` 的四个字段**——不把状态收进一个 struct,任何一段都抽不动(抽出去就要传
+   十个 `&mut`)。所以改成 `Turn` + `RoundStep`。第三节的"不是规定"这句作数,第六节的
+   150 行是硬的。`ui_loop` 的 `UiState` 是同一副药,那一条本 plan 自己就写了。
+2. **第四节第 4 条担心的 `Send` 推断没有出现。** `turn_rounds` 和 `run_one` 都抽出了
+   `async fn`(`Turn::settle_sample`、`run_gated` 等),一次都没撞上共归纳盲区,没有加过
+   `Box::pin` 救火。原因是既有的类型擦除边界(`execute_tool`)本来就在递归环上,抽出来的
+   这些都在环外。

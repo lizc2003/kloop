@@ -111,8 +111,9 @@
   `tool_title`),漏改**不会编译报错**。这是本轮通读里最值得做的架构改动,但它要动工具层的
   形状,单独一条 plan。~~ ✅ **plan 138 已做**(`tools/builtin.rs` 的 `Builtin` 枚举;顺带
   查出 `reserved_names` 漏了 `run_program`/`stop_program`,整表改从枚举派生)。
-- **拆超长函数**(`turn_rounds` 548 / `responses::stream` 425 / `App::apply_core` 367 /
-  `main` 366 / `run_one` 349 / `ui_loop` 339)。
+- ~~**拆超长函数**(`turn_rounds` 548 / `responses::stream` 425 / `App::apply_core` 367 /
+  `main` 366 / `run_one` 349 / `ui_loop` 339)。~~ ✅ **plan 142 已做**(六个函数六次提交,
+  分别降到 123 / 70 / 59 / 46 / 84 / 84 行;每次的判据都是相关测试文件 diff 为空)。
 - ~~**SSE 驱动循环抽取**(三个 provider 适配器各写一遍 `send_checked → SseParser → GuardedBody`
   骨架)、**`fs.rs:atomic_replace` unix/windows 两份 80 行合并**~~ ✅ **plan 139 已做**
   (`provider/stream.rs` 的 `SseFrames` 拉取式读帧器;`atomic_replace` 一份骨架 + 三个
