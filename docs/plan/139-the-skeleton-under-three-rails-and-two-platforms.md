@@ -88,8 +88,10 @@ fn discard_temp(temp: &File, parent: &File, name: &OsStr);
 3. **`GuardedBody` 的 idle 计时在 `next()` 里重置**。抽出去之后这个语义不能变——
    `stream.rs` 已有 `body_distinguishes_idle_and_wall_timeouts` 锁着它,改完必须仍绿。
 4. **fs 那边的 `#[cfg(test)]` 故障注入**(`CommitFault::BeforeRename` / `ReplaceTempName`)
-   只有 unix 版有第二种。骨架统一后,windows 版会**获得**它——确认这对 windows 测试无害,
-   或者用 `#[cfg(all(test, unix))]` 保持原样。
+   只有 unix 版有第二种。骨架统一后 windows 版会**获得**它,这是对的:两个平台跑同一套
+   安全检查,就该能被同一套故障注入检验。`ReplaceTempName` 现在的实现用了
+   `std::fs::remove_file` + `std::fs::write`(按路径,不按 fd),在 windows 上要换成等价的
+   句柄操作。**不要**用 `#[cfg(all(test, unix))]` 把它按回原样——那是让统一只统一了一半。
 
 ## 四、非目标
 

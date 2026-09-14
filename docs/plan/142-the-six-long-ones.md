@@ -78,7 +78,8 @@ root-only task 工具、agent_type allowlist、shell 可用性),以及 `execute_
 ## 六、验收
 
 每个函数一条:
-- 目标函数降到 **150 行以下**(或在 plan 里写明为什么它不该降);
+- 目标函数降到 **150 行以下**。六个都能降——清单里已经排除了唯一一个"长是因为它是
+  数据"的(`builtin_defs`),所以这里没有例外可讲;
 - **相关测试文件的 diff 为空**;
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
 

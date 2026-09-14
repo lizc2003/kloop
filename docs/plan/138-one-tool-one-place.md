@@ -113,9 +113,18 @@ impl Builtin {
 `toolrow.rs` **不纳入 enum**。它把输入格式化成一行(`Read src/main.rs`、
 `Grep TODO in src`),对 MCP 工具也要工作,是货真价实的展示逻辑。
 
-但要给它加一个**守卫测试**:遍历 `Builtin::ALL`,断言每个变体要么有专门的一行形式,要么
-出现在一张显式的 `RENDERS_GENERICALLY` 列表里。这样第二节第 3 条那 15 个会被点名,实现者
-逐个裁决"补一行"还是"登记为通用渲染",而不是无人知晓。
+但要给它加一个**守卫测试**:遍历 `Builtin::ALL`,断言每个变体都有专门的一行形式。
+**不配豁免名单**——一张"这些暂时不管"的清单就是把今天的欠账写成明天的制度,而且它会
+一直长。所以第二节第 3 条那 15 个**本轮补齐**:
+
+`notebook_edit`、`send_message`、`list_agents`、`task_create/get/update/list/clear`、
+`cron_create/delete/list`、`schedule_wakeup`、`ask_user_question`、
+`enter_plan_mode`、`exit_plan_mode`、`enter_worktree`、`exit_worktree`。
+
+每个就是一行:动词 + 它作用的那个东西(`Task create "..."`、`Cron create 0 9 * * 1`、
+`Enter worktree feature-x`)。照着 `toolrow.rs` 里 `read_file`/`grep` 的现有形态写,
+测试也照着现有的写(那个文件的 `mod tests` 是逐条断言渲染文本的)。工作量大约是这条
+plan 的三分之一,**算进去**。
 
 ## 五、非目标
 
@@ -123,15 +132,15 @@ impl Builtin {
   穷尽 match,长度变化是副产品。
 - **不动 `ToolSource` 那一侧**。外部工具的 readonly/并发仍由 source 自己回答,本 plan 只
   改内置工具那一半。
-- **不改任何工具的现有行为**。第二节四条不一致里,只有 `run_program` 的并发语义可能要改
-  (见下节),其余三条本轮只要求"被点名并写下判断"。
+- **除了第二节那四条,不改任何工具的现有行为。** 收敛本身必须是零行为变化。
 
 ## 六、开工时问用户
 
-1. **`run_program` 的并发语义**:改成与 `workflow` 一致(可并发),还是保持串行并在
-   `concurrency_safe` 里写一句为什么?——这是唯一一处可能改变运行时行为的决定。
-2. **`toolrow` 那 15 个**:本轮就补展示,还是先全部登记进 `RENDERS_GENERICALLY`、另开一条
-   plan 补?(建议后者:本 plan 的价值是让它们**被看见**,补展示是 TUI 的活。)
+**只有一个**:`run_program` 的并发语义——改成与 `workflow` 一致(可并发),还是保持串行?
+这是这条 plan 里唯一会改变**运行时行为**的决定,所以值得停下来问。其余四条不一致按第二
+节处理,不必再问:`toolrow` 那 15 个补齐(第四节),`tool_title` 给内置工具补上人类名,
+四个会话状态工具在 `concurrency_safe` 里写下"串行"这个判断(行为不变,但从此是有人写的
+而不是默认掉进去的)。
 
 ## 七、验收
 
