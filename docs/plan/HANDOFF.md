@@ -11,14 +11,14 @@ plan 136 的全仓通读(12.5 万行)把当时不该混进清账的条目挂成�
 | plan | 做什么 | 规模 | 备注 |
 |---|---|---|---|
 | ~~**138** 一个工具,一个地方~~ ✅ | 内置工具的七处并行 `match` 收成一个 enum,让编译器点名 | 大 | 2026-09-14 完成(`tools/builtin.rs`);顺带修了 `reserved_names` 漏掉 `run_program`/`stop_program` 的真 bug,教训 131 |
-| **139** 骨架抄了三遍(和两遍) | 三条 rail 的 SSE 驱动 + `atomic_replace` 的 unix/windows | 中 | 两件事同一形状:差异淹没在重复骨架里 |
+| ~~**139** 骨架抄了三遍(和两遍)~~ ✅ | 三条 rail 的 SSE 驱动 + `atomic_replace` 的 unix/windows | 中 | 2026-09-14 完成(`provider/stream.rs` 的 `SseFrames` + `fs.rs` 的三个平台钩子);plan 给的 `AsyncFnMut` 形状在 stable 上编不过,改拉取式,教训 132 |
 | **140** 那张字段表,抄了七遍 | 五份测试 Config fixture + `config.rs` 两个手抄构造 | 小 | 有一个取舍要问用户 |
 | **141** 一个不睡觉的调度器 | 每秒一次磁盘轮询 + cron 逐分钟扫 52 万次 | 中 | 要动调度语义,先查 1 秒轮询的来历 |
 | **142** 那六个长家伙 | `turn_rounds` / `responses::stream` / `apply_core` / `main` / `run_one` / `ui_loop` | 大 | **`run_one` 那段等 138**,`responses::stream` 等 139 |
 
 依赖只有两条:142 的 `run_one` 在 138 之后(**138 已完成,解锁**),142 的
-`responses::stream` 在 139 之后。其余随便挑。做完一条就在该 plan 补 ✅ 节,并回 136
-第五节销账。
+`responses::stream` 在 139 之后(**139 已完成,解锁**)。其余随便挑。做完一条就在该 plan
+补 ✅ 节,并回 136 第五节销账。
 
 **这批的统一纪律(2026-09-14 用户拍板:「不需要考虑兼容性,要保持代码干净」)**:
 
@@ -885,3 +885,5 @@ hand_written` 的形状,漂移只会发生在手写那一半,而那一半正好�
 reserved"两条先跑,才轮到搬 `match`;那条测试不是收敛的产物,是收敛的第一个收益。
 与教训 126 同族(编译器不会说话的缺陷要配一条能跑的扫描),这条补的是它的上游:**扫描
 要扫的那份"全集",本身可能就不全。**
+
+132. 来自 Plan 139(骨架抄了三遍和两遍)。**plan 里写死的 API 形状是二手信息(教训 11 的又一个形状):抽公共骨架之前,先用一个十几行的最小复现确认编译器接受那个签名——尤其是把"回调"抽成 `AsyncFnMut` 的那一类,它在 stable Rust 上有一个和借用无关的硬墙。**plan 139 第二节给的是 `drive_sse(resp, on_frame)`,`F: AsyncFnMut(SseFrame) -> Result<ControlFlow<()>, ProviderFailure>`,并预判"卡住的话就把 rail 状态收进 struct"。实际卡点完全不在那里:`AsyncFnMut` 的调用 future 是高阶的(`for<'a> CallRefFuture<'a>`),auto trait 泄漏对高阶类型失效,于是 `spawn_stream` 那条 `tokio::spawn` 的 future **证不出 `Send`**(报错指着 `&'0 StreamSink`,"for any lifetime `'0`… but implemented for some specific lifetime `'1`")。唯一的正面修法是 `for<'a> F::CallRefFuture<'a>: Send`,而 `CallRefFuture` 至今 unstable(`async_fn_traits`);最小复现还顺带暴露第二个坑——加上那条约束,编译器会把闭包的捕获推成 `'static`,连捕获一个局部 `u32` 都报 "does not live long enough"。三条可复用判据:**(a) 在 async Rust 里,"把循环体抽成回调"和"把循环抽成迭代器"不是两种风格,是两种能不能编译。**推(push,`drive(resp, |frame| …)`)要求一个高阶 async 闭包;拉(pull,`while let Some(frame) = frames.next().await?`)只要求一个普通 `&mut self` 方法,没有 HRTB,也没有 Send 推断问题。**撞上 "Send is not general enough" 时,第一反应应该是换方向而不是加约束**——顺带,拉取式还让 rail 里的 `continue`/`break` 原样活着,而闭包会把它们全变成 `return Ok(...)`。**(b) 抽骨架时,"什么时候停"这件事的粒度必须逐字对齐,它往往不是你以为的那一层。**三条 rail 都在**一个 chunk 的所有帧处理完之后**才收尾,而不是在终止帧那一刻——因为三条 rail 各自都靠"终止之后还能看到同一 chunk 里的下一帧"来 fail closed(`semantic event arrived after message_stop` / `after response terminal` / `SSE frame arrived after [DONE]`)。把 `stop()` 实现成"立刻不再交付",这三条检查会永远打不响,而且**所有测试照样全绿**(没有测试会构造那种 chunk 边界)。同族的还有 `parser.finish()`:它只该跑在读到 EOF 那条路上,主动停下之后的残留是我们自己不读了。**(c) 两个平台的清理动作瞄的是不是同一个对象,只有在被攻击的路径上才看得出来。**`discard_temp` 在 unix 上删的是**名字**(`unlinkat`)、在 windows 上删的是**句柄**(`delete_file_handle`);正常失败路径上两者等价(名字还绑着我们那个 fd),而 `ReplaceTempName` 故障注入恰恰把名字换成了别的文件——于是 unix 删掉冒名者、留下原件(原件已被 rename 解绑,无害),windows 删掉原件、**留下冒名者**。解法不是给 windows 补一套按名字删的 NT API(本机连 windows target 都没装,写了也没有编译器背书),而是让注入**把自己造出来的那个句柄留到清理**,两个平台各按自己的方式把两个文件都收掉。判据:一个"best effort 清理"在两个平台上写法不同,就要问一句"它们指的是同一个东西吗",而答案只在异常路径上才不一样。

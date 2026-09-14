@@ -6,12 +6,11 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use serde_json::json;
 
-use super::GuardedBody;
 use super::ProviderFailure;
+use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
 use super::is_overflow_message;
-use super::sse::SseParser;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -406,8 +405,7 @@ pub(super) async fn stream(
     let req = crate::http_client().post(url).bearer_auth(key).json(body);
     let resp = crate::send_checked(req, "openai-compat", key).await?;
 
-    let mut parser = SseParser::default();
-    let mut byte_stream = GuardedBody::new(resp.bytes_stream());
+    let mut frames = SseFrames::new(resp.bytes_stream());
     let mut text = String::new();
     let mut display_text = String::new();
     let mut thinking = String::new();
@@ -418,117 +416,112 @@ pub(super) async fn stream(
     let mut usage = None;
     let mut transport_done = false;
 
-    while !transport_done {
-        let Some(chunk) = byte_stream.next().await? else {
-            break;
+    while let Some(frame) = frames.next().await? {
+        if transport_done {
+            return Err(protocol("SSE frame arrived after [DONE]"));
+        }
+        if !matches!(
+            frame.event.as_deref(),
+            None | Some("message") | Some("error")
+        ) {
+            return Err(protocol("returned an unknown SSE event name"));
+        }
+        if frame.data.trim() == "[DONE]" {
+            transport_done = true;
+            frames.stop();
+            continue;
+        }
+        let value = crate::parse_sse_json("openai-compat", &frame.data)?;
+        if !value["error"].is_null() {
+            if is_overflow_message(&value["error"].to_string()) {
+                return Err(ProviderFailure::context_overflow());
+            }
+            return Err(crate::stream_error(
+                "openai-compat",
+                crate::error_label(&value["error"]),
+                crate::error_detail(&value["error"], key),
+            ));
+        }
+
+        if let Some(raw_usage) = value.get("usage")
+            && !raw_usage.is_null()
+        {
+            if usage.is_some() {
+                return Err(protocol("received duplicate usage"));
+            }
+            usage = Some(parse_usage(raw_usage)?);
+        }
+
+        let choices = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol("frame was missing choices"))?;
+        if choices.is_empty() {
+            if value.get("usage").is_none_or(Value::is_null) {
+                return Err(protocol("empty choices frame did not contain usage"));
+            }
+            continue;
+        }
+        if choices.len() != 1 {
+            return Err(protocol("returned more than one logical choice"));
+        }
+        let choice = &choices[0];
+        let index = choice["index"]
+            .as_u64()
+            .ok_or_else(|| protocol("choice was missing its index"))?;
+        match choice_index {
+            Some(current) if current != index => {
+                return Err(protocol("choice index changed during streaming"));
+            }
+            None => choice_index = Some(index),
+            Some(_) => {}
+        }
+
+        let payload = match (choice.get("delta"), choice.get("message")) {
+            (Some(Value::Object(delta)), None) => delta,
+            (None, Some(Value::Object(message))) => message,
+            (Some(Value::Object(_)), Some(Value::Object(_))) => {
+                return Err(protocol("choice contained both delta and final message"));
+            }
+            _ => return Err(protocol("choice was missing a delta object")),
         };
-        for frame in parser.feed(&chunk)? {
-            if transport_done {
-                return Err(protocol("SSE frame arrived after [DONE]"));
-            }
-            if !matches!(
-                frame.event.as_deref(),
-                None | Some("message") | Some("error")
-            ) {
-                return Err(protocol("returned an unknown SSE event name"));
-            }
-            if frame.data.trim() == "[DONE]" {
-                transport_done = true;
-                continue;
-            }
-            let value = crate::parse_sse_json("openai-compat", &frame.data)?;
-            if !value["error"].is_null() {
-                if is_overflow_message(&value["error"].to_string()) {
-                    return Err(ProviderFailure::context_overflow());
-                }
-                return Err(crate::stream_error(
-                    "openai-compat",
-                    crate::error_label(&value["error"]),
-                    crate::error_detail(&value["error"], key),
-                ));
-            }
+        let semantic = apply_choice_payload(
+            payload,
+            &mut text,
+            &mut thinking,
+            &mut display_text,
+            &mut refusal_seen,
+            &mut calls,
+            sink,
+        )
+        .await?;
+        if outcome.is_some() && semantic {
+            return Err(protocol("semantic delta arrived after finish reason"));
+        }
 
-            if let Some(raw_usage) = value.get("usage")
-                && !raw_usage.is_null()
-            {
-                if usage.is_some() {
-                    return Err(protocol("received duplicate usage"));
-                }
-                usage = Some(parse_usage(raw_usage)?);
+        if let Some(reason) = choice.get("finish_reason")
+            && !reason.is_null()
+        {
+            let reason = reason
+                .as_str()
+                .ok_or_else(|| protocol("finish_reason was not a string"))?;
+            if outcome.is_some() {
+                return Err(protocol("received duplicate finish_reason"));
             }
-
-            let choices = value
-                .get("choices")
-                .and_then(Value::as_array)
-                .ok_or_else(|| protocol("frame was missing choices"))?;
-            if choices.is_empty() {
-                if value.get("usage").is_none_or(Value::is_null) {
-                    return Err(protocol("empty choices frame did not contain usage"));
-                }
-                continue;
-            }
-            if choices.len() != 1 {
-                return Err(protocol("returned more than one logical choice"));
-            }
-            let choice = &choices[0];
-            let index = choice["index"]
-                .as_u64()
-                .ok_or_else(|| protocol("choice was missing its index"))?;
-            match choice_index {
-                Some(current) if current != index => {
-                    return Err(protocol("choice index changed during streaming"));
-                }
-                None => choice_index = Some(index),
-                Some(_) => {}
-            }
-
-            let payload = match (choice.get("delta"), choice.get("message")) {
-                (Some(Value::Object(delta)), None) => delta,
-                (None, Some(Value::Object(message))) => message,
-                (Some(Value::Object(_)), Some(Value::Object(_))) => {
-                    return Err(protocol("choice contained both delta and final message"));
-                }
-                _ => return Err(protocol("choice was missing a delta object")),
-            };
-            let semantic = apply_choice_payload(
-                payload,
-                &mut text,
-                &mut thinking,
-                &mut display_text,
-                &mut refusal_seen,
-                &mut calls,
-                sink,
-            )
-            .await?;
-            if outcome.is_some() && semantic {
-                return Err(protocol("semantic delta arrived after finish reason"));
-            }
-
-            if let Some(reason) = choice.get("finish_reason")
-                && !reason.is_null()
-            {
-                let reason = reason
-                    .as_str()
-                    .ok_or_else(|| protocol("finish_reason was not a string"))?;
-                if outcome.is_some() {
-                    return Err(protocol("received duplicate finish_reason"));
-                }
-                let mapped = map_finish_reason(reason)?;
-                outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
-                    AssistantOutcome::Refused
-                } else {
-                    mapped
-                });
-            }
+            let mapped = map_finish_reason(reason)?;
+            outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
+                AssistantOutcome::Refused
+            } else {
+                mapped
+            });
         }
 
         if outcome.is_some() {
-            break;
+            frames.stop();
         }
     }
 
     let Some(outcome) = outcome else {
-        parser.finish()?;
         return Err(ProviderFailure::incomplete_protocol(
             "openai-compat stream ended before finish_reason",
         ));

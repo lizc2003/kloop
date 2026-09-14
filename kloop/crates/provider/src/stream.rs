@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,6 +18,8 @@ use tokio::time::Sleep;
 
 use crate::ProviderFailure;
 use crate::TimeoutStage;
+use crate::sse::SseFrame;
+use crate::sse::SseParser;
 
 /// How long to wait for response *headers*. Generous because on some proxies the
 /// headers do not arrive until the model starts producing, which folds thinking
@@ -249,6 +252,61 @@ impl<S> GuardedBody<S> {
             )));
         }
         Ok(Some(chunk))
+    }
+}
+
+/// One SSE response, read frame by frame. A rail keeps its own event state
+/// machine and nothing else: the guards around it — idle and wall timeouts, the
+/// response byte cap, the frame size cap, whole-frame UTF-8 decoding, and the
+/// EOF residue classification — live here once, for all three rails.
+pub(crate) struct SseFrames<S> {
+    parser: SseParser,
+    body: GuardedBody<S>,
+    /// Frames already parsed out of the chunk being drained.
+    ready: VecDeque<SseFrame>,
+    stopped: bool,
+}
+
+impl<S> SseFrames<S> {
+    pub(crate) fn new(stream: S) -> Self {
+        Self {
+            parser: SseParser::default(),
+            body: GuardedBody::new(stream),
+            ready: VecDeque::new(),
+            stopped: false,
+        }
+    }
+
+    /// The rail holds its terminal. What the current chunk still has is
+    /// delivered first — a rail fails closed on frames that follow its
+    /// terminal, and those frames have already been paid for — and reading
+    /// stops there.
+    pub(crate) fn stop(&mut self) {
+        self.stopped = true;
+    }
+
+    /// The next complete frame, or `None` once the rail has stopped or the body
+    /// reached EOF. `SseParser::finish` runs only on the EOF path: residue left
+    /// by a stream we deliberately stopped reading is not a protocol violation.
+    pub(crate) async fn next<T, E>(&mut self) -> Result<Option<SseFrame>, ProviderFailure>
+    where
+        S: Stream<Item = Result<T, E>> + Unpin,
+        T: AsRef<[u8]>,
+        E: fmt::Display,
+    {
+        loop {
+            if let Some(frame) = self.ready.pop_front() {
+                return Ok(Some(frame));
+            }
+            if self.stopped {
+                return Ok(None);
+            }
+            let Some(chunk) = self.body.next().await? else {
+                self.parser.finish()?;
+                return Ok(None);
+            };
+            self.ready.extend(self.parser.feed(chunk.as_ref())?);
+        }
     }
 }
 

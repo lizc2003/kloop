@@ -106,3 +106,116 @@ fn discard_temp(temp: &File, parent: &File, name: &OsStr);
 - `fs.rs` 的既有 mutation 测试全绿,同样不改;
 - 两处的行数净减(SSE 约 −60,fs 约 −70),且 `grep -c 'SseParser::default()' ` 从 3 变 1;
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
+
+---
+
+## ✅ 已完成(2026-09-14;提交 SHA 以本条所在提交为准)
+
+两处骨架各自收成一份。三条 rail 的事件状态机、`fs.rs` 的三个 `verify_*`,一行没动。
+
+### 一、SSE 驱动:`drive_sse` 的形状被 stable Rust 否了,改成 `SseFrames`
+
+plan 第二节给的签名(`drive_sse(resp, on_frame)`,`F: AsyncFnMut(SseFrame) -> …`)**在
+1.96.1 上编不过**,而且卡点不是 plan 预判的借用检查:
+
+```
+error: implementation of `Send` is not general enough
+   --> lib.rs:541  spawn_stream(move |sink| async move { anthropic::stream(…, &sink).await })
+   = note: `Send` would have to be implemented for `&'0 StreamSink`, for any lifetime `'0`…
+```
+
+`AsyncFnMut` 的调用 future 是高阶(`for<'a>`)的,auto trait 泄漏对它失效,于是整条
+`spawn_stream` 的 future 证不出 `Send`。唯一的修法是给调用 future 直接加 `Send` 约束
+(`for<'a> F::CallRefFuture<'a>: Send`),而 `CallRefFuture` 是 unstable
+(`async_fn_traits`);最小复现里它还顺带把捕获推成 `'static`,闭包连捕获局部变量都不行。
+plan 写的退路(把状态收进 struct 再传进去)治的是借用,治不了这个。
+
+改用**拉取式**:`stream.rs` 的 `SseFrames<S>`(`new` / `stop` / `next`),rail 侧从
+
+```rust
+loop { let Some(chunk) = byte_stream.next().await? else { break };
+       for frame in parser.feed(&chunk)? { … } 
+       if 收尾 { return } }
+parser.finish()?;
+```
+
+变成
+
+```rust
+while let Some(frame) = frames.next().await? { … if 收尾 { frames.stop(); } }
+```
+
+没有闭包就没有 HRTB,`continue` / `break` 也照常能用(openai 的 `[DONE]` 分支就是一个
+`continue`)。守卫——空闲/墙钟超时、响应字节上限、帧大小上限、整帧 UTF-8、EOF 残留分
+类——全部只剩 `SseFrames::next` 这一份。
+
+**两条语义被原样保住,都不是显然的**:
+
+1. **收尾之后,当前 chunk 剩下的帧仍然要交付。** 三条 rail 都靠这个 fail closed
+   (anthropic 的 `semantic event arrived after message_stop`、responses 的
+   `semantic event arrived after response terminal`、openai 的
+   `SSE frame arrived after [DONE]`)。所以 `stop()` 只标记,`next()` 先把 `ready` 里
+   已解析出来的帧发完,再返回 `None`。改成"立刻停止交付"会让这三条检查永远打不响。
+2. **`parser.finish()` 只跑在读到 EOF 那条路上。** 主动停下来之后 buffer 里的残留是我
+   们自己不读了,不是协议违规。
+
+唯一一处**刻意的**语义变化:openai 收到 `[DONE]` 却没收到 `finish_reason` 时,原来会
+再跑一次 `parser.finish()`,现在不跑(`[DONE]` 是主动停)。两条路的错误都是可重试的
+`incomplete_protocol`,`done_without_finish_reason_is_not_completion` 覆盖着它。
+
+### 二、`atomic_replace`:两份 80 行合成一份 + 四个平台钩子
+
+`#[cfg(any(unix, windows))] fn atomic_replace` 一份,平台只回答:
+
+| 钩子 | unix | windows |
+|---|---|---|
+| `create_temp(parent, name)` | `openat(O_CREAT\|O_EXCL\|O_NOFOLLOW)` | `windows::create_temp_file` |
+| `commit_rename(temp, parent, name, leaf, replace_existing)` | `renameat`(总是替换,忽略该参数) | `rename_file_relative`(要被告知) |
+| `discard_temp(temp, parent, name)` | `unlinkat` 按名字 | `delete_file_handle` 按句柄 |
+| `temp_name()` | 共用(pid + `TEMP_SEQUENCE`) | 同左 |
+
+`replace_existing` 按 plan 要求进签名(unix 没有可移植的"不替换"rename,所以它靠忽略
+参数来回答这个问题)。碰名重试从 `is_name_collision(&anyhow::Error)` 一处判定,两边都
+把平台错误保成 `io::Error` 再上抛。
+
+**windows 顺带拿到了两样它本来没有的**:
+
+1. **进循环前的 `verify_parent_binding`**。unix 版一直有,windows 版只有循环里那一次。
+2. **`CommitFault::ReplaceTempName`**。gate 从 `#[cfg(all(test, unix))]` 改成
+   `#[cfg(test)]`,`replaced_temporary_name_never_reaches_target` 上的 `#[cfg(unix)]`
+   一并去掉——按本批纪律(b),统一之后两个平台拿同一套测试钩子。
+
+注入实现换了形状:原来是 `std::fs::remove_file` + `std::fs::write`(**按路径**),现在是
+`rebind_temp_name()`——另建一个 temp、写进攻击者字节、`commit_rename` 盖到原名上。理由
+是 windows 删不掉一个还开着句柄的名字(unlink + create 那条路走不通),而 rename 两个
+平台都做得到;顺带 unix 那半也从"按路径"变成了"相对 parent fd",与这个文件里其余所有
+操作一致。被盖上去的那个 decoy 句柄**留到失败清理**(`decoy` 局部活过内层闭包),让
+失败路径在两个平台上都能把两个文件都收掉——否则 unix 按名字删掉的是 decoy、windows 按
+句柄删掉的是原件,各自漏一个。
+
+### 三、验收(各自单独跑,当场取退出码)
+
+- `crates/provider/tests/{anthropic,openai,responses,effort_probe}.rs` **一个字符没改**,
+  全绿——这是"骨架搬家没改语义"的唯一证据;
+- `fs.rs` 的 mutation 测试除了去掉一个 `#[cfg(unix)]` 之外没改,全绿;
+- `grep -c 'SseParser::default()'` 在 provider 生产代码里从 3 变 1(`stream.rs`),
+  `GuardedBody::new` 同样从 3 变 1;
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+  `cargo test --workspace` 三条分别跑,退出码 0。
+
+另外做了一次**反向验证**(教训 126):把 `verify_temp_binding` 那一行停掉再跑
+`replaced_temporary_name_never_reaches_target`,它当场变红(攻击者字节落到了 target 上,
+被后面的 "changed immediately after commit" 撞出来)——证明新的注入真的把那场竞态摆出来
+了,而不是靠别的检查顺手挡住。
+
+**行数**:plan 估的是 SSE −60 / fs −70,实际是 SSE 净 +31(三条 rail −27,`SseFrames`
++58,其中约 20 行是文档)、fs 净 +2。plan 的估算按"抽出去的是一个 20 行自由函数"算,
+而实际抽出去的是一个带文档的类型;真正的收益不在行数,在**那五道守卫从三份变一份**、
+**那三个 `verify_*` 的调用顺序从两份变一份**。
+
+### 四、没能验证的一处
+
+本机只装了 `aarch64-apple-darwin`,windows 分支既跑不了也**编译不了**(`rustup target
+list --installed` 只有一项)。所以上面"windows 拿到的两样"是按已有 helper 拼的(没有新
+写一行 NT API),但没有编译器背书。真要上 windows 时,第一件事是跑
+`replaced_temporary_name_never_reaches_target`——它现在会在那边跑起来了。

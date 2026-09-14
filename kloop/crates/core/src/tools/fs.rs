@@ -145,7 +145,7 @@ enum CommitFault {
     None,
     #[cfg(test)]
     BeforeRename,
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     ReplaceTempName,
 }
 
@@ -1379,7 +1379,111 @@ fn open_regular_target(
     bail!("safe file mutation is unsupported on this platform")
 }
 
+/// One unused `.kloop-write-*` name in the target directory. The pid keeps two
+/// kloop processes apart; the counter keeps two threads of one process apart.
+fn temp_name() -> OsString {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!(
+        ".kloop-write-{}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Create `name` under `parent`, failing if it already exists. The caller
+/// retries on [`std::io::ErrorKind::AlreadyExists`] and on nothing else, so the
+/// error has to survive the round trip as an `io::Error`.
 #[cfg(unix)]
+fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
+    use rustix::fs::Mode;
+    use rustix::fs::OFlags;
+
+    let fd = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(windows)]
+fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
+    windows::create_temp_file(parent, name)
+}
+
+/// Move the temp file onto `leaf`, both relative to `parent`.
+///
+/// `replace_existing` is the one genuine difference between the platforms:
+/// Windows has to be told, while `renameat` always replaces — there is no
+/// portable non-replacing rename, so unix answers the question by ignoring it.
+#[cfg(unix)]
+fn commit_rename(
+    _temp: &std::fs::File,
+    parent: &std::fs::File,
+    name: &OsStr,
+    leaf: &OsStr,
+    _replace_existing: bool,
+) -> Result<()> {
+    rustix::fs::renameat(parent, name, parent, leaf)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()).into())
+}
+
+#[cfg(windows)]
+fn commit_rename(
+    temp: &std::fs::File,
+    parent: &std::fs::File,
+    _name: &OsStr,
+    leaf: &OsStr,
+    replace_existing: bool,
+) -> Result<()> {
+    windows::rename_file_relative(temp, parent, leaf, replace_existing)
+}
+
+/// Best effort removal of a temp file a failed commit left behind. unix drops
+/// the name, Windows drops the open handle; both are unreachable from anywhere
+/// else, so a failure here has nothing left to report to.
+#[cfg(unix)]
+fn discard_temp(_temp: &std::fs::File, parent: &std::fs::File, name: &OsStr) {
+    let _ = rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty());
+}
+
+#[cfg(windows)]
+fn discard_temp(temp: &std::fs::File, _parent: &std::fs::File, _name: &OsStr) {
+    let _ = windows::delete_file_handle(temp);
+}
+
+/// Rebind `name` to a different file while the caller's handle stays open on
+/// the original — the race `verify_temp_binding` exists to catch. Staged with a
+/// rename rather than unlink + create because Windows cannot unlink a name
+/// whose file is still open, and the check being exercised has one copy now, so
+/// the injection that exercises it has to reach both platforms. The new file
+/// comes back so the failure path can drop it the same way on both.
+#[cfg(all(test, any(unix, windows)))]
+fn rebind_temp_name(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
+    let decoy_name = temp_name();
+    let mut decoy = create_temp(parent, &decoy_name)?;
+    decoy.write_all(b"attacker-controlled bytes")?;
+    commit_rename(
+        &decoy,
+        parent,
+        &decoy_name,
+        name,
+        /* replace_existing */ true,
+    )?;
+    Ok(decoy)
+}
+
+/// Did the platform refuse because that temp name is already taken? The retry
+/// loop turns on this and nothing else.
+#[cfg(any(unix, windows))]
+fn is_name_collision(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+#[cfg(any(unix, windows))]
 fn atomic_replace(
     target: CommitTarget<'_>,
     bytes: &[u8],
@@ -1394,36 +1498,27 @@ fn atomic_replace(
         display_path,
         tool,
     } = target;
-    use rustix::fs::AtFlags;
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
 
     verify_parent_binding(parent, parent_path, tool, display_path)?;
     let mut last_collision = None;
     for _ in 0..100 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = format!(".kloop-write-{}-{sequence}.tmp", std::process::id());
-        let fd = match rustix::fs::openat(
-            parent,
-            temp.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
-        ) {
-            Ok(fd) => fd,
-            Err(rustix::io::Errno::EXIST) => {
-                last_collision = Some(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "temporary file name collision",
-                ));
+        let temp = temp_name();
+        let mut file = match create_temp(parent, &temp) {
+            Ok(file) => file,
+            Err(error) if is_name_collision(&error) => {
+                last_collision = Some(error);
                 continue;
             }
             Err(error) => {
-                return Err(std::io::Error::from_raw_os_error(error.raw_os_error())).with_context(
-                    || format!("{tool}: cannot create temporary file for {display_path}"),
-                );
+                return Err(error).with_context(|| {
+                    format!("{tool}: cannot create temporary file for {display_path}")
+                });
             }
         };
-        let mut file = std::fs::File::from(fd);
+        // Held open past the verification so the failure path can drop it the
+        // same way on both platforms; see the `ReplaceTempName` arm below.
+        #[cfg(test)]
+        let mut decoy = None;
         let result = (|| -> Result<()> {
             file.write_all(bytes).with_context(|| {
                 format!("{tool}: cannot write temporary file for {display_path}")
@@ -1442,106 +1537,9 @@ fn atomic_replace(
             }
             #[cfg(test)]
             if matches!(fault, CommitFault::ReplaceTempName) {
-                std::fs::remove_file(parent_path.join(&temp)).with_context(|| {
+                decoy = Some(rebind_temp_name(parent, &temp).with_context(|| {
                     format!("{tool}: cannot inject temporary replacement for {display_path}")
-                })?;
-                std::fs::write(parent_path.join(&temp), b"attacker-controlled bytes")
-                    .with_context(|| {
-                        format!("{tool}: cannot inject temporary replacement for {display_path}")
-                    })?;
-            }
-            #[cfg(not(test))]
-            let _ = fault;
-            verify_target_unchanged(
-                parent,
-                parent_path,
-                leaf,
-                display_path,
-                tool,
-                expected_target,
-            )?;
-            verify_parent_binding(parent, parent_path, tool, display_path)?;
-            verify_temp_binding(
-                parent,
-                parent_path,
-                OsStr::new(&temp),
-                &file,
-                bytes,
-                display_path,
-                tool,
-            )?;
-            rustix::fs::renameat(parent, temp.as_str(), parent, leaf)
-                .with_context(|| format!("{tool}: cannot atomically replace {display_path}"))?;
-            sync_parent(parent, tool, display_path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = rustix::fs::unlinkat(parent, temp.as_str(), AtFlags::empty());
-        }
-        return result;
-    }
-    Err(last_collision.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "temporary file name collision",
-        )
-    }))
-    .with_context(|| format!("{tool}: cannot create temporary file for {display_path}"))
-}
-
-#[cfg(windows)]
-fn atomic_replace(
-    target: CommitTarget<'_>,
-    bytes: &[u8],
-    permissions: Option<std::fs::Permissions>,
-    expected_target: Option<&ExpectedTarget>,
-    fault: CommitFault,
-) -> Result<()> {
-    let CommitTarget {
-        parent,
-        parent_path,
-        leaf,
-        display_path,
-        tool,
-    } = target;
-    let mut last_collision = None;
-    for _ in 0..100 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = OsString::from(format!(
-            ".kloop-write-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut file = match windows::create_temp_file(parent, &temp) {
-            Ok(file) => file,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
-            {
-                last_collision = Some(error);
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("{tool}: cannot create temporary file for {display_path}")
-                });
-            }
-        };
-        let result = (|| -> Result<()> {
-            file.write_all(bytes).with_context(|| {
-                format!("{tool}: cannot write temporary file for {display_path}")
-            })?;
-            if let Some(permissions) = permissions.clone() {
-                file.set_permissions(permissions).with_context(|| {
-                    format!("{tool}: cannot preserve permissions for {display_path}")
-                })?;
-            }
-            file.sync_all().with_context(|| {
-                format!("{tool}: cannot sync temporary file for {display_path}")
-            })?;
-            #[cfg(test)]
-            if matches!(fault, CommitFault::BeforeRename) {
-                bail!("{tool}: injected failure before replacing {display_path}");
+                })?);
             }
             #[cfg(not(test))]
             let _ = fault;
@@ -1555,9 +1553,10 @@ fn atomic_replace(
             )?;
             verify_parent_binding(parent, parent_path, tool, display_path)?;
             verify_temp_binding(parent, parent_path, &temp, &file, bytes, display_path, tool)?;
-            windows::rename_file_relative(
+            commit_rename(
                 &file,
                 parent,
+                &temp,
                 leaf,
                 /* replace_existing */ expected_target.is_some(),
             )
@@ -1566,7 +1565,11 @@ fn atomic_replace(
             Ok(())
         })();
         if result.is_err() {
-            let _ = windows::delete_file_handle(&file);
+            discard_temp(&file, parent, &temp);
+            #[cfg(test)]
+            if let Some(decoy) = &decoy {
+                discard_temp(decoy, parent, &temp);
+            }
         }
         return result;
     }
@@ -2710,7 +2713,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn replaced_temporary_name_never_reaches_target() {
         let dir =

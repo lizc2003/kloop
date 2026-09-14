@@ -113,9 +113,12 @@
   查出 `reserved_names` 漏了 `run_program`/`stop_program`,整表改从枚举派生)。
 - **拆超长函数**(`turn_rounds` 548 / `responses::stream` 425 / `App::apply_core` 367 /
   `main` 366 / `run_one` 349 / `ui_loop` 339)。
-- **SSE 驱动循环抽取**(三个 provider 适配器各写一遍 `send_checked → SseParser → GuardedBody`
-  骨架)、**`fs.rs:atomic_replace` unix/windows 两份 80 行合并**、**测试 Config fixture 统一**
-  (5 份手抄 30+ 字段)、**Config 的两个克隆构造改 `Clone` + `..base`**。
+- ~~**SSE 驱动循环抽取**(三个 provider 适配器各写一遍 `send_checked → SseParser → GuardedBody`
+  骨架)、**`fs.rs:atomic_replace` unix/windows 两份 80 行合并**~~ ✅ **plan 139 已做**
+  (`provider/stream.rs` 的 `SseFrames` 拉取式读帧器;`atomic_replace` 一份骨架 + 三个
+  平台钩子,windows 顺带拿到 `verify_parent_binding` 的循环前那一次与 `ReplaceTempName`
+  故障注入)。仍未做:**测试 Config fixture 统一**(5 份手抄 30+ 字段)、**Config 的两个
+  克隆构造改 `Clone` + `..base`**(plan 140)。
 - **scheduler 两条性能账**:`CronSpec::next_after` 逐分钟扫 52 万次(一次 `cron_create` 最多
   跑三遍),以及有 durable store 时 worker **每秒**一次 flock+读盘+解析。两者都要动调度语义
   (跳跃式扫描的正确性、轮询间隔与跨进程可见性的权衡),不该混在清账里。

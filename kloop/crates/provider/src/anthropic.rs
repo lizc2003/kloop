@@ -6,13 +6,12 @@ use std::collections::HashSet;
 use serde_json::Value;
 use serde_json::json;
 
-use super::GuardedBody;
 use super::ProviderFailure;
+use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
 use super::is_overflow_message;
 use super::sse::SseFrame;
-use super::sse::SseParser;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::IncompleteReason;
@@ -266,8 +265,7 @@ pub(super) async fn stream(
     let req = req.json(body);
     let resp = crate::send_checked(req, "anthropic", key).await?;
 
-    let mut parser = SseParser::default();
-    let mut byte_stream = GuardedBody::new(resp.bytes_stream());
+    let mut frames = SseFrames::new(resp.bytes_stream());
     let mut started = false;
     let mut open: HashMap<u64, BlockAcc> = HashMap::new();
     let mut seen_indices = HashSet::new();
@@ -279,198 +277,194 @@ pub(super) async fn stream(
     let mut cache_read = 0;
     let mut cache_creation = 0;
 
-    loop {
-        let next = byte_stream.next().await?;
-        let Some(chunk) = next else {
-            break;
-        };
-        for frame in parser.feed(&chunk)? {
-            let value = crate::parse_sse_json("anthropic", &frame.data)?;
-            let event = event_type(&frame, &value)?;
-            if completion.is_some() && event != "ping" {
-                return Err(protocol("semantic event arrived after message_stop"));
+    while let Some(frame) = frames.next().await? {
+        let value = crate::parse_sse_json("anthropic", &frame.data)?;
+        let event = event_type(&frame, &value)?;
+        if completion.is_some() && event != "ping" {
+            return Err(protocol("semantic event arrived after message_stop"));
+        }
+        match event {
+            "message_start" => {
+                if started {
+                    return Err(protocol("received duplicate message_start"));
+                }
+                if outcome.is_some() || !open.is_empty() || !seen_indices.is_empty() {
+                    return Err(protocol("received message_start after message content"));
+                }
+                let usage = value["message"]["usage"]
+                    .as_object()
+                    .ok_or_else(|| protocol("message_start missing usage"))?;
+                input_tokens = Some(required_u64(
+                    &value["message"]["usage"]["input_tokens"],
+                    "input_tokens",
+                )?);
+                cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .map(|value| required_u64(value, "cache_read_input_tokens"))
+                    .transpose()?
+                    .unwrap_or(0);
+                cache_creation = usage
+                    .get("cache_creation_input_tokens")
+                    .map(|value| required_u64(value, "cache_creation_input_tokens"))
+                    .transpose()?
+                    .unwrap_or(0);
+                started = true;
             }
-            match event {
-                "message_start" => {
-                    if started {
-                        return Err(protocol("received duplicate message_start"));
-                    }
-                    if outcome.is_some() || !open.is_empty() || !seen_indices.is_empty() {
-                        return Err(protocol("received message_start after message content"));
-                    }
-                    let usage = value["message"]["usage"]
-                        .as_object()
-                        .ok_or_else(|| protocol("message_start missing usage"))?;
-                    input_tokens = Some(required_u64(
-                        &value["message"]["usage"]["input_tokens"],
-                        "input_tokens",
-                    )?);
-                    cache_read = usage
-                        .get("cache_read_input_tokens")
-                        .map(|value| required_u64(value, "cache_read_input_tokens"))
-                        .transpose()?
-                        .unwrap_or(0);
-                    cache_creation = usage
-                        .get("cache_creation_input_tokens")
-                        .map(|value| required_u64(value, "cache_creation_input_tokens"))
-                        .transpose()?
-                        .unwrap_or(0);
-                    started = true;
+            "content_block_start" => {
+                if !started {
+                    return Err(protocol("content block arrived before message_start"));
                 }
-                "content_block_start" => {
-                    if !started {
-                        return Err(protocol("content block arrived before message_start"));
-                    }
-                    if outcome.is_some() {
-                        return Err(protocol("content block arrived after message_delta"));
-                    }
-                    let index = required_u64(&value["index"], "content block index")?;
-                    if !seen_indices.insert(index) {
-                        return Err(protocol("content block index was started more than once"));
-                    }
-                    let content = value["content_block"]
-                        .as_object()
-                        .ok_or_else(|| protocol("content_block_start missing content_block"))?;
-                    let acc = start_block(&Value::Object(content.clone()))?;
-                    let display_kind_open = open.values().any(|current| {
-                        matches!(
-                            (&acc, current),
-                            (BlockAcc::Text { .. }, BlockAcc::Text { .. })
-                                | (BlockAcc::Thinking { .. }, BlockAcc::Thinking { .. })
-                        )
-                    });
-                    if display_kind_open {
-                        return Err(protocol(
-                            "concurrent display blocks had no canonical identity",
-                        ));
-                    }
-                    open.insert(index, acc);
+                if outcome.is_some() {
+                    return Err(protocol("content block arrived after message_delta"));
                 }
-                "content_block_delta" => {
-                    if !started {
-                        return Err(protocol("content delta arrived before message_start"));
-                    }
-                    if outcome.is_some() {
-                        return Err(protocol("content delta arrived after message_delta"));
-                    }
-                    let index = required_u64(&value["index"], "content block index")?;
-                    let acc = open
-                        .get_mut(&index)
-                        .ok_or_else(|| protocol("content delta referenced a non-open block"))?;
-                    let delta = value["delta"]
-                        .as_object()
-                        .ok_or_else(|| protocol("content delta missing delta object"))?;
-                    let delta = Value::Object(delta.clone());
-                    let kind = required_str(&delta["type"], "content delta type")?;
-                    match (kind, acc) {
-                        ("text_delta", BlockAcc::Text { text }) => {
-                            let piece = required_str(&delta["text"], "text delta text")?;
-                            text.push_str(piece);
-                            if !piece.is_empty() {
-                                sink.text_delta(piece.to_string()).await?;
-                            }
-                        }
-                        ("input_json_delta", BlockAcc::ToolUse { json, .. }) => {
-                            json.push_str(required_str(
-                                &delta["partial_json"],
-                                "tool input JSON delta",
-                            )?);
-                        }
-                        ("thinking_delta", BlockAcc::Thinking { thinking, .. }) => {
-                            let piece = required_str(&delta["thinking"], "thinking delta text")?;
-                            thinking.push_str(piece);
-                            if !piece.is_empty() {
-                                sink.thinking_delta(piece.to_string()).await?;
-                            }
-                        }
-                        ("signature_delta", BlockAcc::Thinking { signature, .. }) => {
-                            signature.push_str(required_str(
-                                &delta["signature"],
-                                "thinking signature delta",
-                            )?);
-                        }
-                        _ => return Err(protocol("content delta type did not match its block")),
-                    }
+                let index = required_u64(&value["index"], "content block index")?;
+                if !seen_indices.insert(index) {
+                    return Err(protocol("content block index was started more than once"));
                 }
-                "content_block_stop" => {
-                    if !started {
-                        return Err(protocol("content block stop arrived before message_start"));
-                    }
-                    if outcome.is_some() {
-                        return Err(protocol("content block stop arrived after message_delta"));
-                    }
-                    let index = required_u64(&value["index"], "content block index")?;
-                    let acc = open.remove(&index).ok_or_else(|| {
-                        protocol("content block stop referenced a non-open block")
-                    })?;
-                    let block = finish_block(acc)?;
-                    if block.has_semantic_payload() {
-                        completed.push(block.clone());
-                        sink.block_done(block).await?;
-                    }
-                }
-                "message_delta" => {
-                    if !started {
-                        return Err(protocol("message_delta arrived before message_start"));
-                    }
-                    if outcome.is_some() {
-                        return Err(protocol("received duplicate message_delta stop reason"));
-                    }
-                    if !open.is_empty() {
-                        return Err(protocol(
-                            "message_delta arrived with unfinished content blocks",
-                        ));
-                    }
-                    let reason =
-                        required_str(&value["delta"]["stop_reason"], "message stop reason")?;
-                    outcome = Some(map_stop_reason(reason)?);
-                    output_tokens = Some(required_u64(
-                        &value["usage"]["output_tokens"],
-                        "output_tokens",
-                    )?);
-                }
-                "message_stop" => {
-                    if !started {
-                        return Err(protocol("message_stop arrived before message_start"));
-                    }
-                    if !open.is_empty() {
-                        return Err(protocol(
-                            "message_stop arrived with unfinished content blocks",
-                        ));
-                    }
-                    let outcome = outcome
-                        .take()
-                        .ok_or_else(|| protocol("message_stop arrived before message_delta"))?;
-                    crate::validate_assistant_output("anthropic", &outcome, &completed)?;
-                    let usage = Some(Usage {
-                        input_tokens: input_tokens
-                            .ok_or_else(|| protocol("missing final input token usage"))?,
-                        output_tokens: output_tokens
-                            .ok_or_else(|| protocol("missing final output token usage"))?,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_creation,
-                    });
-                    completion = Some(StreamCompletion::new(outcome, usage));
-                }
-                "ping" => {}
-                "error" => {
-                    if is_overflow_message(&value["error"].to_string()) {
-                        return Err(ProviderFailure::context_overflow());
-                    }
-                    return Err(crate::stream_error(
-                        "anthropic",
-                        crate::error_label(&value["error"]),
-                        crate::error_detail(&value["error"], key),
+                let content = value["content_block"]
+                    .as_object()
+                    .ok_or_else(|| protocol("content_block_start missing content_block"))?;
+                let acc = start_block(&Value::Object(content.clone()))?;
+                let display_kind_open = open.values().any(|current| {
+                    matches!(
+                        (&acc, current),
+                        (BlockAcc::Text { .. }, BlockAcc::Text { .. })
+                            | (BlockAcc::Thinking { .. }, BlockAcc::Thinking { .. })
+                    )
+                });
+                if display_kind_open {
+                    return Err(protocol(
+                        "concurrent display blocks had no canonical identity",
                     ));
                 }
-                _ => return Err(protocol("returned an unknown semantic event")),
+                open.insert(index, acc);
             }
+            "content_block_delta" => {
+                if !started {
+                    return Err(protocol("content delta arrived before message_start"));
+                }
+                if outcome.is_some() {
+                    return Err(protocol("content delta arrived after message_delta"));
+                }
+                let index = required_u64(&value["index"], "content block index")?;
+                let acc = open
+                    .get_mut(&index)
+                    .ok_or_else(|| protocol("content delta referenced a non-open block"))?;
+                let delta = value["delta"]
+                    .as_object()
+                    .ok_or_else(|| protocol("content delta missing delta object"))?;
+                let delta = Value::Object(delta.clone());
+                let kind = required_str(&delta["type"], "content delta type")?;
+                match (kind, acc) {
+                    ("text_delta", BlockAcc::Text { text }) => {
+                        let piece = required_str(&delta["text"], "text delta text")?;
+                        text.push_str(piece);
+                        if !piece.is_empty() {
+                            sink.text_delta(piece.to_string()).await?;
+                        }
+                    }
+                    ("input_json_delta", BlockAcc::ToolUse { json, .. }) => {
+                        json.push_str(required_str(
+                            &delta["partial_json"],
+                            "tool input JSON delta",
+                        )?);
+                    }
+                    ("thinking_delta", BlockAcc::Thinking { thinking, .. }) => {
+                        let piece = required_str(&delta["thinking"], "thinking delta text")?;
+                        thinking.push_str(piece);
+                        if !piece.is_empty() {
+                            sink.thinking_delta(piece.to_string()).await?;
+                        }
+                    }
+                    ("signature_delta", BlockAcc::Thinking { signature, .. }) => {
+                        signature.push_str(required_str(
+                            &delta["signature"],
+                            "thinking signature delta",
+                        )?);
+                    }
+                    _ => return Err(protocol("content delta type did not match its block")),
+                }
+            }
+            "content_block_stop" => {
+                if !started {
+                    return Err(protocol("content block stop arrived before message_start"));
+                }
+                if outcome.is_some() {
+                    return Err(protocol("content block stop arrived after message_delta"));
+                }
+                let index = required_u64(&value["index"], "content block index")?;
+                let acc = open
+                    .remove(&index)
+                    .ok_or_else(|| protocol("content block stop referenced a non-open block"))?;
+                let block = finish_block(acc)?;
+                if block.has_semantic_payload() {
+                    completed.push(block.clone());
+                    sink.block_done(block).await?;
+                }
+            }
+            "message_delta" => {
+                if !started {
+                    return Err(protocol("message_delta arrived before message_start"));
+                }
+                if outcome.is_some() {
+                    return Err(protocol("received duplicate message_delta stop reason"));
+                }
+                if !open.is_empty() {
+                    return Err(protocol(
+                        "message_delta arrived with unfinished content blocks",
+                    ));
+                }
+                let reason = required_str(&value["delta"]["stop_reason"], "message stop reason")?;
+                outcome = Some(map_stop_reason(reason)?);
+                output_tokens = Some(required_u64(
+                    &value["usage"]["output_tokens"],
+                    "output_tokens",
+                )?);
+            }
+            "message_stop" => {
+                if !started {
+                    return Err(protocol("message_stop arrived before message_start"));
+                }
+                if !open.is_empty() {
+                    return Err(protocol(
+                        "message_stop arrived with unfinished content blocks",
+                    ));
+                }
+                let outcome = outcome
+                    .take()
+                    .ok_or_else(|| protocol("message_stop arrived before message_delta"))?;
+                crate::validate_assistant_output("anthropic", &outcome, &completed)?;
+                let usage = Some(Usage {
+                    input_tokens: input_tokens
+                        .ok_or_else(|| protocol("missing final input token usage"))?,
+                    output_tokens: output_tokens
+                        .ok_or_else(|| protocol("missing final output token usage"))?,
+                    cache_read_input_tokens: cache_read,
+                    cache_creation_input_tokens: cache_creation,
+                });
+                completion = Some(StreamCompletion::new(outcome, usage));
+            }
+            "ping" => {}
+            "error" => {
+                if is_overflow_message(&value["error"].to_string()) {
+                    return Err(ProviderFailure::context_overflow());
+                }
+                return Err(crate::stream_error(
+                    "anthropic",
+                    crate::error_label(&value["error"]),
+                    crate::error_detail(&value["error"], key),
+                ));
+            }
+            _ => return Err(protocol("returned an unknown semantic event")),
         }
-        if let Some(completion) = completion.take() {
-            return Ok(completion);
+        if completion.is_some() {
+            frames.stop();
         }
     }
-    parser.finish()?;
+
+    if let Some(completion) = completion {
+        return Ok(completion);
+    }
     Err(ProviderFailure::incomplete_protocol(
         "anthropic stream ended before message_stop",
     ))

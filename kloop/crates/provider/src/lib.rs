@@ -23,7 +23,7 @@ pub use failure::TimeoutStage;
 pub use stream::ProviderStream;
 pub use stream::StreamResult;
 
-pub(crate) use stream::GuardedBody;
+pub(crate) use stream::SseFrames;
 pub(crate) use stream::StreamCompletion;
 pub(crate) use stream::StreamSink;
 pub(crate) use stream::send_checked;
