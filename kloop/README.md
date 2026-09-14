@@ -475,10 +475,14 @@ autoAllowBashIfSandboxed).
 **Bash decisions run on a real parse tree** (`crates/core/src/shell.rs`,
 tree-sitter-bash): a script qualifies only when every node is a plain
 word-only command joined by `&&`/`||`/`;`/`|`/newline; `bash -c "…"` is
-unwrapped and analyzed recursively. Subshells, redirections, command/process
-substitution, expansions, and variable-assignment prefixes make the script
-*opaque* — never auto-approved, never allow-rule-matchable, never cached; it
-always goes to the human. The read-only classifier vets options, not just
+unwrapped and analyzed recursively. Subshells, command/process substitution,
+expansions, variable-assignment prefixes, and any redirect that reads or writes
+a file (`> f`, `< f`, heredocs) make the script *opaque* — never auto-approved,
+never allow-rule-matchable, never cached; it always goes to the human.
+Stream-only redirects are the exception: `2>&1`, `>&2` and `…>/dev/null` move a
+stream around without naming a file, so `go test ./x 2>&1 | tail -3` still
+decomposes into `go test` and `tail` and a `bash(go test *)` rule still covers
+it. The read-only classifier vets options, not just
 names (`find -delete`, `rg --pre`, `git -C`/`--git-dir`/`log --output`,
 `base64 -o`, `sed` beyond `-n Np` all disqualify), and the independent
 dangerous classifier forces a confirmation even when an allow rule or bypass
@@ -489,8 +493,9 @@ by one rule rather than by how alarming a command looks: **the damage is
 irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 `shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`
 are deliberately absent: inside a repository those are the recovery path. A
-redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect makes
-the whole script opaque, and an opaque script never gets an automatic verdict.
+redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect onto a
+file makes the whole script opaque, and an opaque script never gets an automatic
+verdict.
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` and the
 comma-separated `KLOOP_DENY` / `KLOOP_ASK` env vars provide only process-wide
@@ -529,9 +534,9 @@ working directory never auto-pass in acceptEdits.
 **Asking**: `y` allows once. `a` allows for this session in the current
 workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
 approving `git commit` never covers `git rebase` — or parent directory for file
-writes). A bash script the word-only parser cannot vouch for (a redirect, a
-substitution, an assignment — `go test … 2>&1` is enough) has no prefix to key
-on and is instead remembered **verbatim**: that exact command text, and only
+writes). A bash script the word-only parser cannot vouch for (a file redirect, a
+substitution, an assignment — `cat > probe.go <<'EOF'` is the usual shape) has
+no prefix to key on and is instead remembered **verbatim**: that exact command text, and only
 that one. Both remembering scopes are offered for it — `a` keys the session
 cache on the text, `p` writes a `bash_script(<the whole command>)` rule (or
 `bash_script_no_sandbox(...)`) that the same parser reads back at the
@@ -1577,7 +1582,7 @@ stubborn timeout is promoted to a background task and its running SIGINT path re
 rejection/abort; the isolated fixtures observe TERM-ignoring descendants still alive after both
 results. kloop keeps no-survivor foreground semantics, its native `timeout_ms`/result envelope,
 and the stricter permission/sandbox pipeline. Both implementations do agree on input-dependent
-batching: read-only calls may overlap, while opaque/redirection calls execute serially.
+batching: read-only calls may overlap, while opaque calls execute serially.
 
 ## Background bash (Phase 2, tenth slice)
 
@@ -1967,7 +1972,7 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
 - **Reads** are full-disk; **network** is off unless configured.
 - **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate —
-  opaque scripts (redirects, subshells) included, since OS containment
+  opaque scripts (substitutions, subshells) included, since OS containment
   replaces parse-level vetting. Deny rules, safety checks (a visible
   `rm -rf` still confirms) and explicit ask rules stay in force above it.
   The accepted trade-off: a contained command can still modify the workspace
@@ -3233,7 +3238,8 @@ Every session is saved and resumable — see Session persistence above.
   dispatch rejecting a tool outside the allowlist, `[agents.<name>]` parsing
   with malformed-field rejection); shell analysis contracts (word-only
   parsing, quote/concatenation
-  unwrapping, opaque-construct rejection, `bash -c` unwrap, read-only option
+  unwrapping, opaque-construct rejection, stream-only redirects kept parseable
+  while file redirects still sink the script, `bash -c` unwrap, read-only option
   vetting, git option-injection, dangerous-through-wrappers); permission
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
   safety checks, sensitive paths never cached, ask-rules-over-allow,

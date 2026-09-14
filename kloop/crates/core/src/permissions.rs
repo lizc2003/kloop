@@ -2740,12 +2740,14 @@ mod tests {
         assert_eq!(approver.ask_count(), 0);
     }
 
-    /// An opaque bash script (here a redirect) can't be vetted by the deny or
-    /// destructive-safety layers, so bypass mode must NOT auto-run it: it falls
-    /// through to the user like every other opaque call. A parseable command in
-    /// the same mode still auto-runs. Regression — a one-token redirect used to
-    /// slip `rm -rf …` past the deny rule, the destructive check, AND the bypass
-    /// short-circuit, running unprompted.
+    /// An opaque bash script (here a redirect onto a file) can't be vetted by
+    /// the deny or destructive-safety layers, so bypass mode must NOT auto-run
+    /// it: it falls through to the user like every other opaque call. A
+    /// parseable command in the same mode still auto-runs. Regression — a
+    /// one-token redirect used to slip `rm -rf …` past the deny rule, the
+    /// destructive check, AND the bypass short-circuit, running unprompted;
+    /// since plan 144 the stream-only half of that shape hides nothing, so it
+    /// is denied outright instead of merely reaching the user.
     #[tokio::test]
     async fn opaque_bash_is_not_auto_run_in_bypass() {
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
@@ -2754,13 +2756,21 @@ mod tests {
             rules(&[], &["bash(rm *)"], &[]),
             approver.clone(),
         );
-        // Redirect → Opaque: escapes deny + destructive, so it must still reach
-        // the user (here denied) rather than silently run.
-        assert!(!ok(&p, "bash", bash("rm -rf build > /dev/null")).await);
+        // A file target still means Opaque: it escapes deny + destructive, so
+        // it must reach the user (here denied) rather than silently run.
+        assert!(!ok(&p, "bash", bash("rm -rf build > cleanup.log")).await);
         assert_eq!(
             approver.ask_count(),
             1,
             "opaque bash must reach the user in bypass, not auto-run"
+        );
+        // Its stream-only twin is parsed, so the deny rule sees the `rm` itself
+        // and nobody is asked at all — the stricter end of the same story.
+        assert!(!ok(&p, "bash", bash("rm -rf build > /dev/null")).await);
+        assert_eq!(
+            approver.ask_count(),
+            1,
+            "a parsed `rm` is denied by the rule, without a question"
         );
         // A parseable, non-destructive command still auto-runs with no prompt.
         assert!(ok(&p, "bash", bash("ls -la")).await);
@@ -3328,12 +3338,62 @@ mod tests {
         assert_eq!(approver.ask_count(), 2);
     }
 
+    /// Plan 144 (user, 2026-09-14: 「加了很多的 bash_script_no_sandbox,都命不
+    /// 中,完全没意义了」). A trailing `2>&1` used to sink the whole script into
+    /// the verbatim path, so a project that had already allowed `go test` was
+    /// asked again on every test run — and the answer it wrote down was 200
+    /// bytes of one-off command text that never matched anything again. The
+    /// redirect moves a stream, not a file, so the argv is unchanged by it.
+    #[tokio::test]
+    async fn a_stream_only_redirect_keeps_the_prefix_rule_working() {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Manual,
+            rules(&["bash(go test *)"], &[], &[]),
+            approver.clone(),
+        );
+        assert!(
+            ok(
+                &p,
+                "bash",
+                bash("cd sub && go test ./pkg -count=1 2>&1 | tail -3")
+            )
+            .await
+        );
+        assert_eq!(
+            approver.ask_count(),
+            0,
+            "`cd` and `tail` are read-only segments; `go test` is what the rule is about"
+        );
+
+        // With no rule yet, what `p` writes is the reusable prefix — the same
+        // rule the same command without the redirect would have produced.
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        assert!(
+            ok(
+                &p,
+                "bash",
+                bash("cd sub && go test ./pkg -run 'X(Y)' 2>&1 | tail -3")
+            )
+            .await
+        );
+        assert_eq!(
+            writer.calls.lock().unwrap().as_slice(),
+            [vec!["bash(go test *)".to_string()]],
+            "one prefix rule, not the whole command"
+        );
+    }
+
     /// An unparseable script is remember-able too, keyed on its own text: the
     /// identical command skips the second question, a different one still asks,
     /// and the durable scope is never offered — there is no rule to write down.
     /// Plan 129 fixed this on the escalation door; the ordinary gate is the
-    /// door the user actually met it at, with `2>&1` alone enough to make a
-    /// plain `go test` unkeyable.
+    /// door the user actually met it at. The fixture writes a file on purpose:
+    /// `2>&1` used to be enough to land here, and plan 144 took it back, so
+    /// what is left on this path is a script that really does something the
+    /// argv cannot show.
     #[tokio::test]
     async fn opaque_bash_is_remembered_verbatim_for_the_session() {
         let approver = ScriptedApprover::new(vec![
@@ -3341,7 +3401,7 @@ mod tests {
             Decision::Allow(ApprovalScope::Once),
         ]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        let script = "cd sub && go test ./pkg -run X 2>&1";
+        let script = "cd sub && go test ./pkg -run X > out.log";
         assert!(ok(&p, "bash", bash(script)).await);
         assert_eq!(
             approver.asked()[0].approval_scopes,
@@ -3371,21 +3431,22 @@ mod tests {
 
         // A different opaque script still asks — the approver is exhausted, so
         // the prompt denies, which is what proves it asked.
-        assert!(!ok(&p, "bash", bash("cd sub && go test ./other 2>&1")).await);
+        assert!(!ok(&p, "bash", bash("cd sub && go test ./other > out.log")).await);
         assert_eq!(approver.ask_count(), 3);
     }
 
     /// The durable half (user, 2026-09-11: 「只是对话级,还是不方便」): `p` on an
     /// opaque script writes a `bash_script(...)` rule holding the whole command,
     /// the store parses it back, and a later session never asks about it again.
-    /// The command text carries `(`, `)`, `|` and a redirect on purpose — a rule
-    /// that cannot survive its own round-trip is worse than no rule.
+    /// The command text carries `(`, `)`, `|` and both kinds of redirect on
+    /// purpose — a rule that cannot survive its own round-trip is worse than no
+    /// rule, and the `> out.log` is what keeps the script opaque at all.
     #[tokio::test]
     async fn a_verbatim_grant_persists_as_a_bash_script_rule() {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
         let writer = ScriptedWriter::succeeding();
         let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
-        let script = "cd sub && go test ./pkg -run 'X(Y)' -count=1 2>&1 | tail -15";
+        let script = "cd sub && go test ./pkg -run 'X(Y)' -count=1 > out.log 2>&1 | tail -15";
         let escaping = json!({"command": script, "disable_sandbox": true});
 
         assert!(p.check("bash", &escaping, 0).await.is_ok());
@@ -3420,7 +3481,7 @@ mod tests {
             "consent to escape the sandbox covers the contained run of the same text"
         );
         assert!(
-            !ok(&next, "bash", bash("cd sub && go test ./other 2>&1")).await,
+            !ok(&next, "bash", bash("cd sub && go test ./other > out.log")).await,
             "a different script still asks"
         );
         assert_eq!(approver.ask_count(), 1);
@@ -3431,7 +3492,7 @@ mod tests {
     /// at all, and a deny written about the same text outranks both.
     #[tokio::test]
     async fn a_bash_script_rule_knows_which_run_was_consented_to() {
-        let script = "cat a.txt | tee b.txt 2>&1";
+        let script = "cat a.txt | tee b.txt > merged.log";
         let contained = format!("bash_script({script})");
         let escaping = json!({"command": script, "disable_sandbox": true});
 

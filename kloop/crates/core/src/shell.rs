@@ -6,10 +6,12 @@
 //! (permissions.rs). The core rule is a *whitelist walk*: a script is only
 //! [`BashAnalysis::Commands`] when every node in its parse tree is a plain
 //! word-only command joined by `&&`/`||`/`;`/`|`/newline. Anything else —
-//! subshells, redirections, command/process substitution, expansions,
-//! variable assignments, control flow — makes the whole script
-//! [`BashAnalysis::Opaque`]: no classifier can vouch for what it runs, so it
-//! can never be auto-approved.
+//! subshells, command/process substitution, expansions, variable assignments,
+//! control flow, and any redirect that reads or writes a file — makes the
+//! whole script [`BashAnalysis::Opaque`]: no classifier can vouch for what it
+//! runs, so it can never be auto-approved. Stream-only redirects (`2>&1`,
+//! `>/dev/null`) are the exception: they add nothing the argv does not
+//! already say ([`redirect_is_stream_only`]).
 
 use tree_sitter::Node;
 use tree_sitter::Parser;
@@ -103,6 +105,10 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
         "number",
         "concatenation",
         "comment",
+        // Only the wrapper: each `file_redirect` under it is vetted separately
+        // by `redirect_is_stream_only`, and a heredoc/herestring redirect is
+        // not on this list at all.
+        "redirected_statement",
     ];
     const ALLOWED_PUNCT_TOKENS: &[&str] = &["&&", "||", ";", "|", "\"", "'"];
 
@@ -113,6 +119,15 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
     while let Some(node) = stack.pop() {
         let kind = node.kind();
         if node.is_named() {
+            // A redirect is judged whole and never descended into: its operator
+            // tokens (`>`, `>&`, …) are not punctuation the rest of the walk
+            // should learn to accept, and its destination is not an argument.
+            if kind == "file_redirect" {
+                if !redirect_is_stream_only(node, src) {
+                    return None;
+                }
+                continue;
+            }
             if !ALLOWED_KINDS.contains(&kind) {
                 return None;
             }
@@ -139,6 +154,60 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
         commands.push(plain_command_argv(node, src)?);
     }
     Some(commands)
+}
+
+/// Whether one redirect only moves streams around, leaving the argv a complete
+/// account of the call. Two forms qualify — duplicating onto another descriptor
+/// (`2>&1`, `>&2`) and discarding into `/dev/null` — and both are how a shell
+/// command says "I do not want this output", not how it touches the filesystem.
+///
+/// Everything else sinks the whole script: `> f` and `>> f` write a file the
+/// argv never names, `< f` feeds one in, and a heredoc carries content no
+/// classifier reads. The shape alone cannot tell them apart — `foo > 1`
+/// parses with the same `destination: (number)` as `2>&1` — so the operator
+/// text is what decides.
+fn redirect_is_stream_only(node: Node, src: &str) -> bool {
+    /// `2>&1`, `>&2`: the destination must be a bare descriptor number.
+    const DUP_OPS: &[&str] = &[">&", "<&"];
+    /// `>/dev/null`, `2>/dev/null`, `&>/dev/null`: nothing is kept.
+    const DISCARD_OPS: &[&str] = &[">", ">>", "&>", "&>>"];
+    const DISCARD_TARGET: &str = "/dev/null";
+
+    let mut cursor = node.walk();
+    let mut pending_op: Option<&str> = None;
+    for child in node.children(&mut cursor) {
+        // An anonymous token is the operator; its kind is its own text.
+        if !child.is_named() {
+            if pending_op.replace(child.kind()).is_some() {
+                return false;
+            }
+            continue;
+        }
+        // The leading `2` of `2>&1`, before any operator has been seen.
+        if child.kind() == "file_descriptor" {
+            if pending_op.is_some() {
+                return false;
+            }
+            continue;
+        }
+        let Some(op) = pending_op.take() else {
+            return false;
+        };
+        let Ok(target) = child.utf8_text(src.as_bytes()) else {
+            return false;
+        };
+        let ok = if DUP_OPS.contains(&op) {
+            !target.is_empty() && target.chars().all(|c| c.is_ascii_digit())
+        } else {
+            DISCARD_OPS.contains(&op) && target == DISCARD_TARGET
+        };
+        if !ok {
+            return false;
+        }
+    }
+    // A trailing operator with nothing to pair it with (`3>&-` closes a
+    // descriptor, and the `-` is not a destination node).
+    pending_op.is_none()
 }
 
 fn plain_command_argv(cmd: Node, src: &str) -> Option<Vec<String>> {
@@ -270,8 +339,9 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
 /// writing to a destination, `mkfs*`, and `shred`; it deliberately leaves out
 /// `git clean -fdx` and `git reset --hard`, which inside a repository are the
 /// recovery path rather than the threat. Device clobbering through a redirect
-/// (`… > /dev/sda`) needs no entry either: a redirect makes the whole script
-/// [`BashAnalysis::Opaque`], which never gets an automatic verdict anywhere.
+/// (`… > /dev/sda`) needs no entry either: a redirect onto a file makes the
+/// whole script [`BashAnalysis::Opaque`], which never gets an automatic verdict
+/// anywhere.
 ///
 /// Because it is a blocklist, it is not the containment story — see the bypass
 /// layer in [`crate::permissions`]. It is the short list of things worth one
@@ -492,12 +562,59 @@ mod tests {
             "echo \"hi ${USER}\"",        // expansion inside quotes
             "rg -g\"$(pwd)\" pattern",    // substitution inside concatenation
             "(ls)",                       // subshell
-            "ls > out.txt",               // redirection
+            "ls > out.txt",               // redirection onto a file
             "echo hi & echo bye",         // background chaining
-            "sleep 60 >/dev/null 2>&1 &", // detached-from-pipes child
+            "sleep 60 >/dev/null 2>&1 &", // background `&` (the redirects are fine)
             "FOO=bar ls",                 // assignment prefix
             "for f in *; do rm $f; done", // control flow
             "ls &&",                      // parse error
+        ] {
+            assert_eq!(analyze_bash(script), BashAnalysis::Opaque, "{script}");
+        }
+    }
+
+    #[test]
+    fn stream_only_redirects_leave_the_script_parseable() {
+        // The shape every test run in this repo has: one `2>&1` used to sink the
+        // whole script, and with it a `go test` prefix rule nobody could write.
+        assert_eq!(
+            commands("cd sub && go test ./pkg -count=1 2>&1 | tail -3").unwrap(),
+            vec![
+                argv(&["cd", "sub"]),
+                argv(&["go", "test", "./pkg", "-count=1"]),
+                argv(&["tail", "-3"]),
+            ]
+        );
+        // The redirect is a sibling of the command, so it never reaches the argv.
+        assert_eq!(
+            commands("make >/dev/null 2>&1").unwrap(),
+            vec![argv(&["make"])]
+        );
+        assert_eq!(
+            commands("cd /tmp/x 2>/dev/null").unwrap(),
+            vec![argv(&["cd", "/tmp/x"])]
+        );
+        assert_eq!(
+            commands("echo hi >&2").unwrap(),
+            vec![argv(&["echo", "hi"])]
+        );
+        assert_eq!(
+            commands("cat log &>/dev/null").unwrap(),
+            vec![argv(&["cat", "log"])]
+        );
+    }
+
+    #[test]
+    fn a_redirect_that_touches_a_file_still_sinks_the_script() {
+        for script in [
+            "ls >> out.txt",          // append
+            "cat < in.txt",           // a file read the argv never names
+            "foo &> log",             // both streams, real file
+            "foo > 1",                // same parse shape as `2>&1`, a file named 1
+            "go test ./x 2>&1 > out", // one bad redirect among good ones
+            "foo 3>&-",               // operator with no destination
+            "cat <<EOF\nhi\nEOF",     // heredoc
+            "cat <<< hi",             // herestring
         ] {
             assert_eq!(analyze_bash(script), BashAnalysis::Opaque, "{script}");
         }
