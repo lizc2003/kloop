@@ -312,390 +312,497 @@ fn specialize_run_agent_def(
         .push_str(&crate::agent_type::agent_types_hint(agent_types));
 }
 
-async fn turn_rounds(
+/// Build this round's tool array and the program-tool manifest it was built
+/// from. Retried until one source snapshot survives the whole build: a dynamic
+/// source (MCP `list_changed`) may publish a new catalog mid-build, and a
+/// request assembled from two different catalogs is not a request either of
+/// them would have answered.
+fn build_tools(
     cfg: &Arc<Config>,
-    history: &mut History,
-    ui: &Arc<dyn Ui>,
-    cancel: &CancellationToken,
     depth: u8,
     options: &TurnOptions,
-    enclosing_execution: Option<&ExecutionRef>,
-) -> TurnOutcome {
-    let build_tools = ||
-     -> std::result::Result<
-        (
-            Vec<kloop_protocol::ToolDef>,
-            Arc<crate::tools::ProgramToolManifest>,
-        ),
-        String,
-    > {
-        for _ in 0..8 {
-            let before = crate::tools::capture_program_tool_manifest(
-                &cfg.tool_sources,
-                &cfg.shell_programs,
-            );
-            let mut tools = crate::tools::all_tool_defs(
-                depth,
-                &cfg.tool_sources,
-                cfg.defer_threshold,
-                cfg.surface,
-                &cfg.shell_programs,
-            );
-            let after = crate::tools::capture_program_tool_manifest(
-                &cfg.tool_sources,
-                &cfg.shell_programs,
-            );
-            if !before.is_consistent() || !after.is_consistent() || before != after {
-                continue;
-            }
-            // The `skill` tool exists only at depth 0 (like `task`) and only when a
-            // model-invocable skill is loaded — user commands (`SkillSource::Command`)
-            // are `/name`-only and don't warrant the tool on their own. Skills are a
-            // top-level orchestration feature: a sub-agent gets a focused task, not the
-            // whole skills catalog (which would otherwise ride every sub-agent request,
-            // and a `fork` skill's own sub-agent could re-trigger it). Added after
-            // all_tool_defs so it is not counted toward the defer threshold or exposed
-            // to run_program's API — it is a prompt-activation seam, not a source tool.
-            // Placed before the allowlist filter so a restricted agent type can gate it
-            // like any tool.
-            let has_model_skill = cfg.skills.iter().any(|s| s.source.model_invocable());
-            if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
-                tools.push(crate::tools::skill_tool_def());
-            }
-            // A custom agent type may restrict this sub-agent's tools; the main agent
-            // (None) keeps them all.
-            if cfg.tool_allowlist.is_some() {
-                let allow = cfg.tool_allowlist.as_deref();
-                tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
-            }
-            if let Some(schema) = &options.structured_schema {
-                // Appended after agent-type filtering: this is an internal completion
-                // protocol, never a user-configurable capability or ordinary tool.
-                tools.push(crate::structured_output::tool_def(schema));
-            }
-            if depth == 0 {
-                specialize_run_agent_def(&mut tools, &cfg.agent_types);
-            }
-            return Ok((tools, Arc::new(after)));
+) -> std::result::Result<
+    (
+        Vec<kloop_protocol::ToolDef>,
+        Arc<crate::tools::ProgramToolManifest>,
+    ),
+    String,
+> {
+    for _ in 0..8 {
+        let before =
+            crate::tools::capture_program_tool_manifest(&cfg.tool_sources, &cfg.shell_programs);
+        let mut tools = crate::tools::all_tool_defs(
+            depth,
+            &cfg.tool_sources,
+            cfg.defer_threshold,
+            cfg.surface,
+            &cfg.shell_programs,
+        );
+        let after =
+            crate::tools::capture_program_tool_manifest(&cfg.tool_sources, &cfg.shell_programs);
+        if !before.is_consistent() || !after.is_consistent() || before != after {
+            continue;
         }
-        Err("tool catalog changed repeatedly while building the provider request; retry the turn"
-            .into())
-    };
-    let (mut tools, mut program_tool_manifest) = match build_tools() {
-        Ok(built) => built,
-        Err(error) => {
-            return TurnOutcome {
+        // The `skill` tool exists only at depth 0 (like `task`) and only when a
+        // model-invocable skill is loaded — user commands (`SkillSource::Command`)
+        // are `/name`-only and don't warrant the tool on their own. Skills are a
+        // top-level orchestration feature: a sub-agent gets a focused task, not the
+        // whole skills catalog (which would otherwise ride every sub-agent request,
+        // and a `fork` skill's own sub-agent could re-trigger it). Added after
+        // all_tool_defs so it is not counted toward the defer threshold or exposed
+        // to run_program's API — it is a prompt-activation seam, not a source tool.
+        // Placed before the allowlist filter so a restricted agent type can gate it
+        // like any tool.
+        let has_model_skill = cfg.skills.iter().any(|s| s.source.model_invocable());
+        if depth == 0 && has_model_skill && !tools.iter().any(|t| t.name == "skill") {
+            tools.push(crate::tools::skill_tool_def());
+        }
+        // A custom agent type may restrict this sub-agent's tools; the main agent
+        // (None) keeps them all.
+        if cfg.tool_allowlist.is_some() {
+            let allow = cfg.tool_allowlist.as_deref();
+            tools.retain(|t| crate::agent_type::tool_available(allow, &t.name));
+        }
+        if let Some(schema) = &options.structured_schema {
+            // Appended after agent-type filtering: this is an internal completion
+            // protocol, never a user-configurable capability or ordinary tool.
+            tools.push(crate::structured_output::tool_def(schema));
+        }
+        if depth == 0 {
+            specialize_run_agent_def(&mut tools, &cfg.agent_types);
+        }
+        return Ok((tools, Arc::new(after)));
+    }
+    Err(
+        "tool catalog changed repeatedly while building the provider request; retry the turn"
+            .into(),
+    )
+}
+
+/// What a round phase decided about the rest of the turn.
+enum RoundStep {
+    /// Something was recorded that the model has to see; sample again.
+    Retry,
+    /// The turn is over.
+    Stop(Ending),
+}
+
+/// One turn's state across its rounds. Every phase below takes it as `&mut
+/// self` instead of a dozen positional borrows, and the loop in
+/// [`turn_rounds`] is then only the order the phases run in.
+struct Turn<'a> {
+    cfg: &'a Arc<Config>,
+    history: &'a mut History,
+    ui: &'a Arc<dyn Ui>,
+    cancel: &'a CancellationToken,
+    depth: u8,
+    options: &'a TurnOptions,
+    enclosing_execution: Option<&'a ExecutionRef>,
+    /// The complete route, frozen once. Every round, compaction and child
+    /// admission in this operation derives attempts from this same snapshot.
+    frozen_route: crate::provider_route::FrozenProviderRoute,
+    active_attempt: FrozenProviderAttempt,
+    /// Per rail, not per build: the Responses/Chat cap is four times the
+    /// Anthropic one, and a round that may produce four times the output has to
+    /// reserve for it.
+    growth: u64,
+    /// A sub-agent's text is its deliverable and returns via the tool result;
+    /// streaming it to the main UI would interleave with the parent's output.
+    stream_text: bool,
+    tools: Vec<kloop_protocol::ToolDef>,
+    program_tool_manifest: Arc<crate::tools::ProgramToolManifest>,
+    /// Overflow is recovered at most once per turn: compact, then retry. A
+    /// second overflow after a successful compaction surfaces as an error.
+    overflow_compact_attempted: bool,
+    truncation_recoveries: u32,
+    /// How many times a retryable stream error was resumed in this turn.
+    /// Bounded so a persistently failing upstream still terminates the turn.
+    stream_resumes: u32,
+    /// Cut-off text from truncated rounds, prepended to the final answer so a
+    /// truncated-then-continued turn returns the whole deliverable.
+    truncated_prefix: String,
+    /// Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
+    /// `reasoning-N`): owned here so ids don't reset each round.
+    item_seq: u64,
+    rounds: usize,
+    structured_failures: usize,
+    /// Everything the assistant said across the turn's rounds. Every exit inside
+    /// the loop hands this back, because the caller — a parent agent, most of all
+    /// — receives only `final_text`, and an empty string there is indistinguishable
+    /// from "produced nothing". History and the UI already hold the work; this is
+    /// the one channel that used to drop it. `MaxRounds` was the instance that got
+    /// measured; enumerating the exits found seven more of the same shape, so the
+    /// rule is now uniform: an early exit never spells its result `String::new()`.
+    /// (Exits *before* the loop legitimately do — nothing has been produced yet.)
+    produced_text: String,
+}
+
+impl Turn<'_> {
+    /// MCP list_changed publishes a new source generation between sampling
+    /// rounds. Never mutate an in-flight request; rebuild the next round from
+    /// one fresh source snapshot instead.
+    fn refresh_tools(&mut self) -> Result<(), Ending> {
+        match build_tools(self.cfg, self.depth, self.options) {
+            Ok((tools, manifest)) => {
+                self.tools = tools;
+                self.program_tool_manifest = manifest;
+                Ok(())
+            }
+            Err(error) => Err(Ending {
                 reason: EndReason::Error(error.into()),
-                final_text: String::new(),
-                rounds: 0,
-                structured_output: None,
-            };
-        }
-    };
-    // A sub-agent's text is its deliverable and returns via the tool result;
-    // streaming it to the main UI would interleave with the parent's output.
-    let stream_text = depth == 0;
-    // Per rail, not per build: the Responses/Chat cap is four times the
-    // Anthropic one, and a round that may produce four times the output has to
-    // reserve for it.
-    let growth = compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens());
-    // Overflow is recovered at most once per turn: compact, then retry. A
-    // second overflow after a successful compaction surfaces as an error.
-    let mut overflow_compact_attempted = false;
-    // Freeze the complete route once. Every round, compaction and child
-    // admission in this operation derives attempts from this same snapshot.
-    let frozen_route = cfg.provider_route.clone();
-    let mut active_attempt = frozen_route.primary_attempt();
-    let mut truncation_recoveries = 0u32;
-    // Cut-off text from truncated rounds, prepended to the final answer so a
-    // truncated-then-continued turn returns the whole deliverable.
-    let mut truncated_prefix = String::new();
-    // Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
-    // `reasoning-N`): owned here so ids don't reset each round.
-    let mut item_seq = 0u64;
-    let mut rounds = 0;
-    let mut structured_failures = 0usize;
-    // Everything the assistant said across the turn's rounds. Every exit inside
-    // the loop hands this back, because the caller — a parent agent, most of all
-    // — receives only `final_text`, and an empty string there is indistinguishable
-    // from "produced nothing". History and the UI already hold the work; this is
-    // the one channel that used to drop it. `MaxRounds` was the instance that got
-    // measured; enumerating the exits found seven more of the same shape, so the
-    // rule is now uniform: an early exit never spells its result `String::new()`.
-    // (Exits *before* the loop legitimately do — nothing has been produced yet.)
-    let mut produced_text = String::new();
-    // How many times a retryable stream error was resumed in this turn. Bounded
-    // so a persistently failing upstream still terminates the turn.
-    let mut stream_resumes = 0u32;
-    let ending = 'turn: loop {
-        if cfg.max_rounds.is_some_and(|limit| rounds >= limit) {
-            break 'turn Ending {
-                reason: EndReason::MaxRounds,
-                // The default is exactly right here: hand back what was produced.
                 text: None,
-                rounds,
+                rounds: self.rounds,
                 structured: None,
-            };
+            }),
         }
-        if rounds > 0 {
-            // MCP list_changed publishes a new source generation between
-            // sampling rounds. Never mutate an in-flight request; rebuild the
-            // next round from one fresh source snapshot instead.
-            match build_tools() {
-                Ok((next_tools, next_manifest)) => {
-                    tools = next_tools;
-                    program_tool_manifest = next_manifest;
-                }
-                Err(error) => {
-                    break 'turn Ending {
-                        reason: EndReason::Error(error.into()),
-                        text: None,
-                        rounds,
-                        structured: None,
-                    };
-                }
-            }
-        }
-        let round = rounds;
-        rounds += 1;
-        // Step-boundary steering: deliver anything the user typed during the
-        // previous round (tool execution / sampling) as a user message before
-        // this round's request. At round 0 the queue is empty (the turn just
-        // started) so this is a no-op. Never touches an in-flight request.
-        drain_inbox(&cfg.inbox, history, ui);
-        drain_local_mailbox(cfg, history, ui);
-        // The injected context is outside history and a dynamic MCP refresh may
-        // replace its deferred-tool notice between rounds, so account for the
-        // current version rather than pinning the turn's first estimate.
-        let workspace = cfg.effective_workspace();
-        let instructions_tokens =
-            injected_context(cfg, &workspace, depth).map_or(0, |s| s.len() as u64 / 4);
-        // Predictive: compact BEFORE sampling when this round's estimated
-        // growth would overflow the window — don't wait to be rejected.
-        if let Some(window) = cfg.context_window
-            && history.messages().len() >= 2
-            && compact::predicted_overflow(
-                history.estimated_tokens() + instructions_tokens,
-                growth,
+    }
+
+    /// Predictive: compact BEFORE sampling when this round's estimated growth
+    /// would overflow the window — don't wait to be rejected.
+    async fn compact_predictively(
+        &mut self,
+        instructions_tokens: u64,
+        round: usize,
+    ) -> Option<Ending> {
+        let window = self.cfg.context_window?;
+        if self.history.messages().len() < 2
+            || !compact::predicted_overflow(
+                self.history.estimated_tokens() + instructions_tokens,
+                self.growth,
                 // A configured window is a claim; a rejection already observed
                 // this session is a measurement, and it wins.
-                history.effective_window(window),
+                self.history.effective_window(window),
             )
         {
-            ui.emit(&Event::Note(
-                "predicted context overflow; compacting history".into(),
-            ));
-            let compaction = compact::compact_once(
-                cfg,
-                &active_attempt,
-                compact::CompactionTrigger::Predictive,
-                history,
-                cancel,
-            )
-            .await;
-            match compaction {
-                Ok(compact::CompactionOutcome::Applied(receipt)) => ui.emit(&Event::Note(format!(
+            return None;
+        }
+        self.ui.emit(&Event::Note(
+            "predicted context overflow; compacting history".into(),
+        ));
+        let compaction = compact::compact_once(
+            self.cfg,
+            &self.active_attempt,
+            compact::CompactionTrigger::Predictive,
+            self.history,
+            self.cancel,
+        )
+        .await;
+        match compaction {
+            Ok(compact::CompactionOutcome::Applied(receipt)) => {
+                self.ui.emit(&Event::Note(format!(
                     "history compacted: {} summarized, {} kept verbatim",
                     receipt.summarized, receipt.kept
-                ))),
-                Ok(compact::CompactionOutcome::NoOp(_)) => {}
-                Err(e) => {
-                    if cancel.is_cancelled() {
-                        break 'turn Ending {
-                            reason: EndReason::Aborted,
-                            text: None,
-                            rounds: round,
-                            structured: None,
-                        };
-                    }
-                    // Predictive failure is not fatal: fall through and let
-                    // the request itself succeed or overflow reactively.
-                    ui.emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
-                }
+                )));
+                None
             }
-        }
-
-        let SampleOk {
-            blocks,
-            usage,
-            outcome,
-        } = match sample_with_retry(
-            cfg,
-            &active_attempt,
-            history,
-            &tools,
-            ui,
-            cancel,
-            stream_text,
-            depth,
-            &workspace,
-            &mut item_seq,
-        )
-        .await
-        {
-            Sampled::Ok(ok) => ok,
-            Sampled::Overflow => {
-                if cfg.context_window.is_none() || overflow_compact_attempted {
-                    break 'turn Ending {
-                        reason: EndReason::Error(
-                            "context window exceeded (compaction unavailable or already tried)"
-                                .into(),
-                        ),
+            Ok(compact::CompactionOutcome::NoOp(_)) => None,
+            Err(e) => {
+                if self.cancel.is_cancelled() {
+                    return Some(Ending {
+                        reason: EndReason::Aborted,
                         text: None,
                         rounds: round,
                         structured: None,
-                    };
+                    });
                 }
-                overflow_compact_attempted = true;
-                ui.emit(&Event::Note(
-                    "context window exceeded; compacting and retrying".into(),
-                ));
-                let compaction = compact::compact_once(
-                    cfg,
-                    &active_attempt,
-                    compact::CompactionTrigger::Reactive,
-                    history,
-                    cancel,
-                )
-                .await;
-                match compaction {
-                    Ok(compact::CompactionOutcome::Applied(receipt)) => {
-                        ui.emit(&Event::Note(compact::describe(&receipt)));
-                        continue;
-                    }
-                    Ok(compact::CompactionOutcome::NoOp(_)) => {
-                        break 'turn Ending {
-                            reason: EndReason::Error("reactive compaction made no changes".into()),
-                            text: None,
-                            rounds: round,
-                            structured: None,
-                        };
-                    }
-                    Err(e) => {
-                        break 'turn Ending {
-                            reason: if cancel.is_cancelled() {
-                                EndReason::Aborted
-                            } else {
-                                EndReason::Error(
-                                    format!("reactive compaction failed: {e:#}").into(),
-                                )
-                            },
-                            text: None,
-                            rounds: round,
-                            structured: None,
-                        };
-                    }
-                }
+                // Predictive failure is not fatal: fall through and let
+                // the request itself succeed or overflow reactively.
+                self.ui
+                    .emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
+                None
             }
+        }
+    }
+
+    /// Reactive: the provider rejected the request for size. Compact once per
+    /// turn and retry; a second overflow is an error.
+    async fn recover_from_overflow(&mut self, round: usize) -> RoundStep {
+        if self.cfg.context_window.is_none() || self.overflow_compact_attempted {
+            return RoundStep::Stop(Ending {
+                reason: EndReason::Error(
+                    "context window exceeded (compaction unavailable or already tried)".into(),
+                ),
+                text: None,
+                rounds: round,
+                structured: None,
+            });
+        }
+        self.overflow_compact_attempted = true;
+        self.ui.emit(&Event::Note(
+            "context window exceeded; compacting and retrying".into(),
+        ));
+        let compaction = compact::compact_once(
+            self.cfg,
+            &self.active_attempt,
+            compact::CompactionTrigger::Reactive,
+            self.history,
+            self.cancel,
+        )
+        .await;
+        match compaction {
+            Ok(compact::CompactionOutcome::Applied(receipt)) => {
+                self.ui.emit(&Event::Note(compact::describe(&receipt)));
+                RoundStep::Retry
+            }
+            Ok(compact::CompactionOutcome::NoOp(_)) => RoundStep::Stop(Ending {
+                reason: EndReason::Error("reactive compaction made no changes".into()),
+                text: None,
+                rounds: round,
+                structured: None,
+            }),
+            Err(e) => RoundStep::Stop(Ending {
+                reason: if self.cancel.is_cancelled() {
+                    EndReason::Aborted
+                } else {
+                    EndReason::Error(format!("reactive compaction failed: {e:#}").into())
+                },
+                text: None,
+                rounds: round,
+                structured: None,
+            }),
+        }
+    }
+
+    /// The stream died mid-response after the model had already said something.
+    /// Sampling cannot retry that — replaying the same request would re-emit
+    /// what the user has seen — but continuing is a different move: `blocks` is
+    /// the replayable partial (no unsigned reasoning, no tool call), so what
+    /// just landed is a well-formed assistant turn, and the next request
+    /// carries it as context instead of repeating it. That costs one round
+    /// where ending the turn costs the whole turn. It also stays on the same
+    /// attempt: no fallback switch, nothing the user saw sent twice.
+    ///
+    /// Empty means nothing landed — a complete-but-undispatched tool call, say.
+    /// "Continue where you left off" with no assistant turn to continue from is
+    /// worse than ending here.
+    fn resume_after_partial(
+        &mut self,
+        error: kloop_provider::ProviderFailure,
+        blocks: Vec<ContentBlock>,
+        round: usize,
+    ) -> RoundStep {
+        let round_text = text_content(&blocks);
+        let partial_landed = !blocks.is_empty();
+        record_provider_assistant(self.history, &self.active_attempt, blocks);
+        append_produced(&mut self.produced_text, &round_text);
+        if partial_landed && error.is_retryable() && self.stream_resumes < STREAM_RESUME_LIMIT {
+            self.stream_resumes += 1;
+            let resumes = self.stream_resumes;
+            self.ui.emit(&Event::Note(format!(
+                "stream interrupted after partial output; continuing from it ({resumes}/{STREAM_RESUME_LIMIT}): {error}"
+            )));
+            // Same carry as a truncated round, and for the same reason:
+            // the model is told to continue where it stopped, so the next
+            // round returns only the remainder. Without this the resumed
+            // half is the whole answer the caller sees.
+            self.truncated_prefix.push_str(&round_text);
+            self.history.record(Message::user_text(STREAM_RESUME_MSG));
+            return RoundStep::Retry;
+        }
+        RoundStep::Stop(Ending {
+            reason: EndReason::Error(TurnError::ProviderFailure(error)),
+            text: Some(format!("{}{round_text}", self.truncated_prefix)),
+            rounds: round,
+            structured: None,
+        })
+    }
+
+    /// Turn a sampling verdict into this round's assistant output, or into the
+    /// decision that ends (or restarts) the round.
+    async fn settle_sample(
+        &mut self,
+        sampled: Sampled,
+        round: usize,
+    ) -> std::result::Result<SampleOk, RoundStep> {
+        match sampled {
+            Sampled::Ok(ok) => Ok(ok),
+            Sampled::Overflow => Err(self.recover_from_overflow(round).await),
             Sampled::Cancelled { partial } => {
                 let final_text = text_content(&partial);
-                record_provider_assistant(history, &active_attempt, partial);
-                break 'turn Ending {
+                record_provider_assistant(self.history, &self.active_attempt, partial);
+                Err(RoundStep::Stop(Ending {
                     reason: EndReason::Aborted,
                     text: Some(final_text),
                     rounds: round,
                     structured: None,
-                };
+                }))
             }
             Sampled::Partial { error, blocks } => {
-                let round_text = text_content(&blocks);
-                let partial_landed = !blocks.is_empty();
-                record_provider_assistant(history, &active_attempt, blocks);
-                append_produced(&mut produced_text, &round_text);
-                // The stream died mid-response after the model had already said
-                // something. Sampling cannot retry that — replaying the same
-                // request would re-emit what the user has seen — but continuing
-                // is a different move: `blocks` is the replayable partial (no
-                // unsigned reasoning, no tool call), so what just landed is a
-                // well-formed assistant turn, and the next request carries it as
-                // context instead of repeating it. That costs one round where
-                // ending the turn costs the whole turn. It also stays on the same
-                // attempt: no fallback switch, nothing the user saw sent twice.
-                //
-                // Empty means nothing landed — a complete-but-undispatched tool
-                // call, say. "Continue where you left off" with no assistant turn
-                // to continue from is worse than ending here.
-                if partial_landed && error.is_retryable() && stream_resumes < STREAM_RESUME_LIMIT {
-                    stream_resumes += 1;
-                    ui.emit(&Event::Note(format!(
-                        "stream interrupted after partial output; continuing from it ({stream_resumes}/{STREAM_RESUME_LIMIT}): {error}"
-                    )));
-                    // Same carry as a truncated round, and for the same reason:
-                    // the model is told to continue where it stopped, so the next
-                    // round returns only the remainder. Without this the resumed
-                    // half is the whole answer the caller sees.
-                    truncated_prefix.push_str(&round_text);
-                    history.record(Message::user_text(STREAM_RESUME_MSG));
-                    continue;
-                }
-                break 'turn Ending {
-                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    text: Some(format!("{truncated_prefix}{round_text}")),
-                    rounds: round,
-                    structured: None,
-                };
+                Err(self.resume_after_partial(error, blocks, round))
             }
-            Sampled::Terminal(error) => {
-                break 'turn Ending {
-                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    text: None,
-                    rounds: round,
-                    structured: None,
-                };
-            }
+            Sampled::Terminal(error) => Err(RoundStep::Stop(Ending {
+                reason: EndReason::Error(TurnError::ProviderFailure(error)),
+                text: None,
+                rounds: round,
+                structured: None,
+            })),
             Sampled::Failed(error) => {
-                if active_attempt.identity().attempt_kind
+                if self.active_attempt.identity().attempt_kind
                     == kloop_protocol::ProviderAttemptKind::Primary
-                    && let Some(fallback) = frozen_route.fallback_attempt()
+                    && let Some(fallback) = self.frozen_route.fallback_attempt()
                 {
-                    ui.emit(&Event::Note(format!(
+                    self.ui.emit(&Event::Note(format!(
                         "sampling failed on {}; switching to fallback model {}: {error}",
-                        active_attempt.model(),
+                        self.active_attempt.model(),
                         fallback.model()
                     )));
-                    active_attempt = fallback;
-                    continue;
+                    self.active_attempt = fallback;
+                    return Err(RoundStep::Retry);
                 }
-                break 'turn Ending {
+                Err(RoundStep::Stop(Ending {
                     reason: EndReason::Error(TurnError::ProviderFailure(error)),
                     text: None,
                     rounds: round,
                     structured: None,
-                };
+                }))
             }
-        };
-        if let Err(error) = validate_assistant_result(&outcome, &blocks) {
-            break 'turn Ending {
+        }
+    }
+
+    /// Record one accepted round: check the provider's own claim against what
+    /// it sent, ledger the usage, append the assistant message, and publish the
+    /// running context estimate.
+    fn absorb_round(
+        &mut self,
+        blocks: &[ContentBlock],
+        usage: Option<kloop_protocol::Usage>,
+        outcome: &AssistantOutcome,
+        round: usize,
+    ) -> Result<(), Ending> {
+        if let Err(error) = validate_assistant_result(outcome, blocks) {
+            return Err(Ending {
                 reason: EndReason::Error(error.into()),
                 text: None,
                 rounds: round + 1,
                 structured: None,
-            };
+            });
         }
         if let Some(usage) = usage {
-            history.record_provider_usage(ProviderUsageRecord::from_attempt(
-                active_attempt.identity(),
-                UsageOperation::Sampling,
-                usage,
-            ));
+            self.history
+                .record_provider_usage(ProviderUsageRecord::from_attempt(
+                    self.active_attempt.identity(),
+                    UsageOperation::Sampling,
+                    usage,
+                ));
         }
-        record_provider_assistant(history, &active_attempt, blocks.clone());
-        append_produced(&mut produced_text, &text_content(&blocks));
+        record_provider_assistant(self.history, &self.active_attempt, blocks.to_vec());
+        append_produced(&mut self.produced_text, &text_content(blocks));
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
             // recorded after this point.
-            history.note_usage(usage.total());
+            self.history.note_usage(usage.total());
         }
         // Publish the context size every round, not just at turn end: an
         // agentic turn runs for minutes and its gauge is watched while it runs
         // (a first turn would otherwise sit at the session's opening 0 the
         // whole time). A sub-agent's History is its own, so only the main
         // loop's estimate describes the session.
-        if depth == 0 {
-            ui.emit(&Event::Usage(history.estimated_tokens()));
+        if self.depth == 0 {
+            self.ui.emit(&Event::Usage(self.history.estimated_tokens()));
         }
+        Ok(())
+    }
 
+    /// What the provider said this round was. `None` means tool calls: the
+    /// round goes on to dispatch them.
+    fn classify_outcome(
+        &mut self,
+        outcome: &AssistantOutcome,
+        blocks: &[ContentBlock],
+        round: usize,
+    ) -> Option<RoundStep> {
+        match outcome {
+            AssistantOutcome::Refused
+            | AssistantOutcome::Filtered
+            | AssistantOutcome::Incomplete(_) => Some(RoundStep::Stop(Ending {
+                reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
+                text: Some(text_content(blocks)),
+                rounds: round + 1,
+                structured: None,
+            })),
+            AssistantOutcome::OutputLimit(_) => {
+                let round_text = text_content(blocks);
+                if self.truncation_recoveries < TRUNCATION_RECOVERY_LIMIT {
+                    self.truncation_recoveries += 1;
+                    self.truncated_prefix.push_str(&round_text);
+                    let recoveries = self.truncation_recoveries;
+                    self.ui.emit(&Event::Note(format!(
+                        "response truncated by output limit; asking the model to continue ({recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
+                    )));
+                    self.history
+                        .record(Message::user_text(TRUNCATION_CONTINUE_MSG));
+                    return Some(RoundStep::Retry);
+                }
+                Some(RoundStep::Stop(Ending {
+                    reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
+                    text: Some(format!("{}{round_text}", self.truncated_prefix)),
+                    rounds: round + 1,
+                    structured: None,
+                }))
+            }
+            AssistantOutcome::EndTurn => {
+                if self.options.structured_schema.is_some() {
+                    return Some(self.nudge_structured(
+                        "structured output was not produced after 3 attempts",
+                        round,
+                    ));
+                }
+                // The turn would end here — but a steer that landed during this
+                // final sampling must not be lost. Absorb it and keep going, so a
+                // late "wait, also do X" is answered instead of dropped. (Steers
+                // during tool execution are already delivered at the loop top.)
+                if let Some(step) = self.keep_going_for_late_work() {
+                    return Some(step);
+                }
+                let round_text = text_content(blocks);
+                let final_text = if self.truncated_prefix.is_empty() {
+                    round_text
+                } else {
+                    format!("{}{round_text}", self.truncated_prefix)
+                };
+                Some(RoundStep::Stop(Ending {
+                    reason: EndReason::Completed,
+                    text: Some(final_text),
+                    rounds: round + 1,
+                    structured: None,
+                }))
+            }
+            AssistantOutcome::ToolUse => None,
+        }
+    }
+
+    /// A steer that landed during this round, or a local agent that is not
+    /// allowed to finish on its own, both mean the turn is not over.
+    fn keep_going_for_late_work(&mut self) -> Option<RoundStep> {
+        if drain_inbox(&self.cfg.inbox, self.history, self.ui) {
+            return Some(RoundStep::Retry);
+        }
+        if !self.cfg.local_agent.can_finish_naturally() {
+            return Some(RoundStep::Retry);
+        }
+        None
+    }
+
+    /// A structured turn that produced no structured output: ask again, three
+    /// times, then give up with `failure`.
+    fn nudge_structured(&mut self, failure: &str, round: usize) -> RoundStep {
+        self.structured_failures += 1;
+        if self.structured_failures >= 3 {
+            return RoundStep::Stop(Ending {
+                reason: EndReason::Error(failure.into()),
+                text: None,
+                rounds: round + 1,
+                structured: None,
+            });
+        }
+        self.history
+            .record(Message::user_text(crate::structured_output::nudge()));
+        RoundStep::Retry
+    }
+
+    /// Run this round's tool calls and fold their results into history.
+    async fn dispatch_round(&mut self, blocks: &[ContentBlock], round: usize) -> RoundStep {
         let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()
             .filter_map(|block| match block {
@@ -709,141 +816,171 @@ async fn turn_rounds(
                 | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
-
-        match &outcome {
-            AssistantOutcome::Refused
-            | AssistantOutcome::Filtered
-            | AssistantOutcome::Incomplete(_) => {
-                break 'turn Ending {
-                    reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                    text: Some(text_content(&blocks)),
-                    rounds: round + 1,
-                    structured: None,
-                };
-            }
-            AssistantOutcome::OutputLimit(_) => {
-                let round_text = text_content(&blocks);
-                if truncation_recoveries < TRUNCATION_RECOVERY_LIMIT {
-                    truncation_recoveries += 1;
-                    truncated_prefix.push_str(&round_text);
-                    ui.emit(&Event::Note(format!(
-                        "response truncated by output limit; asking the model to continue ({truncation_recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
-                    )));
-                    history.record(Message::user_text(TRUNCATION_CONTINUE_MSG));
-                    continue;
-                }
-                let final_text = format!("{truncated_prefix}{round_text}");
-                break 'turn Ending {
-                    reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                    text: Some(final_text),
-                    rounds: round + 1,
-                    structured: None,
-                };
-            }
-            AssistantOutcome::EndTurn => {
-                if options.structured_schema.is_some() {
-                    structured_failures += 1;
-                    if structured_failures >= 3 {
-                        break 'turn Ending {
-                            reason: EndReason::Error(
-                                "structured output was not produced after 3 attempts".into(),
-                            ),
-                            text: None,
-                            rounds: round + 1,
-                            structured: None,
-                        };
-                    }
-                    history.record(Message::user_text(crate::structured_output::nudge()));
-                    continue;
-                }
-                // The turn would end here — but a steer that landed during this
-                // final sampling must not be lost. Absorb it and keep going, so a
-                // late "wait, also do X" is answered instead of dropped. (Steers
-                // during tool execution are already delivered at the loop top.)
-                if drain_inbox(&cfg.inbox, history, ui) {
-                    continue;
-                }
-                if !cfg.local_agent.can_finish_naturally() {
-                    continue;
-                }
-                let round_text = text_content(&blocks);
-                let final_text = if truncated_prefix.is_empty() {
-                    round_text
-                } else {
-                    format!("{truncated_prefix}{round_text}")
-                };
-                break 'turn Ending {
-                    reason: EndReason::Completed,
-                    text: Some(final_text),
-                    rounds: round + 1,
-                    structured: None,
-                };
-            }
-            AssistantOutcome::ToolUse => {}
-        }
         let ctx = ToolCtx {
-            cfg: cfg.clone(),
-            ui: ui.clone(),
-            cancel: cancel.clone(),
-            depth,
-            enclosing_execution: enclosing_execution.cloned(),
+            cfg: self.cfg.clone(),
+            ui: self.ui.clone(),
+            cancel: self.cancel.clone(),
+            depth: self.depth,
+            enclosing_execution: self.enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
             from_program: false,
-            program_tool_manifest: Some(Arc::clone(&program_tool_manifest)),
+            program_tool_manifest: Some(Arc::clone(&self.program_tool_manifest)),
             // The assistant message carrying these tool_uses was just recorded,
             // so this is the id of the turn that a spawned sub-agent descends
             // from.
-            parent_rollout_id: history.rollout_last_id().map(str::to_string),
+            parent_rollout_id: self.history.rollout_last_id().map(str::to_string),
             program_result: None,
         };
-        let (results, structured_output) = match &options.structured_schema {
+        let (results, structured_output) = match &self.options.structured_schema {
             Some(schema) => dispatch_structured_tools(tool_uses, &ctx, schema).await,
             None => (dispatch_tools(tool_uses, &ctx).await, None),
         };
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
-        history.record(Message::tool_results(results));
+        self.history.record(Message::tool_results(results));
         // Tool-hook stdout follows the results it commented on, as extra
         // user-message context.
         for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap_or_else(|e| e.into_inner()))
         {
-            history.record(Message::user_text(text));
+            self.history.record(Message::user_text(text));
         }
-        if cancel.is_cancelled() {
-            break 'turn Ending {
+        if self.cancel.is_cancelled() {
+            return RoundStep::Stop(Ending {
                 reason: EndReason::Aborted,
                 text: None,
                 rounds: round + 1,
                 structured: None,
-            };
+            });
         }
         if let Some(value) = structured_output {
-            if drain_inbox(&cfg.inbox, history, ui) {
-                continue;
+            if let Some(step) = self.keep_going_for_late_work() {
+                return step;
             }
-            if !cfg.local_agent.can_finish_naturally() {
-                continue;
-            }
-            break 'turn Ending {
+            return RoundStep::Stop(Ending {
                 reason: EndReason::Completed,
                 text: None,
                 rounds: round + 1,
                 structured: Some(value),
+            });
+        }
+        if self.options.structured_schema.is_some() {
+            return self.nudge_structured(
+                "valid structured output was not produced after 3 attempts",
+                round,
+            );
+        }
+        RoundStep::Retry
+    }
+}
+
+async fn turn_rounds(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    options: &TurnOptions,
+    enclosing_execution: Option<&ExecutionRef>,
+) -> TurnOutcome {
+    let (tools, program_tool_manifest) = match build_tools(cfg, depth, options) {
+        Ok(built) => built,
+        Err(error) => {
+            return TurnOutcome {
+                reason: EndReason::Error(error.into()),
+                final_text: String::new(),
+                rounds: 0,
+                structured_output: None,
             };
         }
-        if options.structured_schema.is_some() {
-            structured_failures += 1;
-            if structured_failures >= 3 {
-                break 'turn Ending {
-                    reason: EndReason::Error(
-                        "valid structured output was not produced after 3 attempts".into(),
-                    ),
-                    text: None,
-                    rounds: round + 1,
-                    structured: None,
-                };
-            }
-            history.record(Message::user_text(crate::structured_output::nudge()));
+    };
+    let frozen_route = cfg.provider_route.clone();
+    let mut turn = Turn {
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        options,
+        enclosing_execution,
+        active_attempt: frozen_route.primary_attempt(),
+        frozen_route,
+        growth: compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens()),
+        stream_text: depth == 0,
+        tools,
+        program_tool_manifest,
+        overflow_compact_attempted: false,
+        truncation_recoveries: 0,
+        stream_resumes: 0,
+        truncated_prefix: String::new(),
+        item_seq: 0,
+        rounds: 0,
+        structured_failures: 0,
+        produced_text: String::new(),
+    };
+    let ending = 'turn: loop {
+        if cfg.max_rounds.is_some_and(|limit| turn.rounds >= limit) {
+            break 'turn Ending {
+                reason: EndReason::MaxRounds,
+                // The default is exactly right here: hand back what was produced.
+                text: None,
+                rounds: turn.rounds,
+                structured: None,
+            };
+        }
+        if turn.rounds > 0
+            && let Err(ending) = turn.refresh_tools()
+        {
+            break 'turn ending;
+        }
+        let round = turn.rounds;
+        turn.rounds += 1;
+        // Step-boundary steering: deliver anything the user typed during the
+        // previous round (tool execution / sampling) as a user message before
+        // this round's request. At round 0 the queue is empty (the turn just
+        // started) so this is a no-op. Never touches an in-flight request.
+        drain_inbox(&cfg.inbox, turn.history, ui);
+        drain_local_mailbox(cfg, turn.history, ui);
+        // The injected context is outside history and a dynamic MCP refresh may
+        // replace its deferred-tool notice between rounds, so account for the
+        // current version rather than pinning the turn's first estimate.
+        let workspace = cfg.effective_workspace();
+        let instructions_tokens =
+            injected_context(cfg, &workspace, depth).map_or(0, |s| s.len() as u64 / 4);
+        if let Some(ending) = turn.compact_predictively(instructions_tokens, round).await {
+            break 'turn ending;
+        }
+        let sampled = sample_with_retry(
+            cfg,
+            &turn.active_attempt,
+            turn.history,
+            &turn.tools,
+            ui,
+            cancel,
+            turn.stream_text,
+            depth,
+            &workspace,
+            &mut turn.item_seq,
+        )
+        .await;
+        let SampleOk {
+            blocks,
+            usage,
+            outcome,
+        } = match turn.settle_sample(sampled, round).await {
+            Ok(ok) => ok,
+            Err(RoundStep::Retry) => continue,
+            Err(RoundStep::Stop(ending)) => break 'turn ending,
+        };
+        if let Err(ending) = turn.absorb_round(&blocks, usage, &outcome, round) {
+            break 'turn ending;
+        }
+        let step = match turn.classify_outcome(&outcome, &blocks, round) {
+            Some(step) => step,
+            None => turn.dispatch_round(&blocks, round).await,
+        };
+        match step {
+            RoundStep::Retry => continue,
+            RoundStep::Stop(ending) => break 'turn ending,
         }
     };
 
@@ -854,7 +991,7 @@ async fn turn_rounds(
     // has been produced yet, and there is nothing to lose.
     TurnOutcome {
         reason: ending.reason,
-        final_text: ending.text.unwrap_or(produced_text),
+        final_text: ending.text.unwrap_or(turn.produced_text),
         rounds: ending.rounds,
         structured_output: ending.structured,
     }
