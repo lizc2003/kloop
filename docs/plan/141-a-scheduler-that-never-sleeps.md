@@ -100,3 +100,81 @@ let deadline = if self.store.is_some() {
 - 若做了 mtime 短路:一个测试证明"store 未变 → 不读文件"(可以数
   `DurableStore::load` 的调用,或临时把文件权限设成不可读再断言 worker 不报错);
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
+
+## ✅ 已完成(2026-09-14;提交 SHA 以本条所在提交为准)
+
+只动 `crates/core/src/scheduler.rs` 一个文件与 README 的 Scheduler 段。
+
+### 一、每秒一次磁盘 → 只有真有 durable job 的会话才轮询
+
+`git log -S 'store_poll'` 只有一条提交(9824ab3,plan 58),plan 58 正文里那句
+「两个同 owner runtime 并存时,store claim 在跨进程锁内线性化,只投递一次。worker 每秒
+重读 durable store」——**前半句是契约,后半句只是当时的实现**。单次投递靠的是 flock +
+`transaction_if_changed`,与轮询间隔无关;轮询提供的只是"更早看到对方的 job"。
+
+于是这一节实际做了三件事,而不是 plan 预设的"三选一":
+
+1. **按需轮询。** 原来的条件是 `self.store.is_some()`,而 `startup.rs:934` 对每个非
+   `--mock` 启动都构造 store——于是一个从没建过 scheduled job、磁盘上那个 json 根本不
+   存在的会话,也整天每秒去看一次。新条件是**本会话确实持有 durable job**
+   (`Horizon::durable_jobs`)。没有的会话睡在 `notify_change` 上,**零磁盘 IO**。
+2. **间隔 1 秒 → 15 秒**,并且第一次给了它一个写得下来的上界:
+   `requires_missed_confirmation` 的 60 秒。durable 一次性 job 迟到 ≥ 60 秒才会被判成
+   missed、才要回头问用户确认,所以间隔只要明显小于 60 秒就没有用户可感知的出口
+   (cron 的分辨率本来就是分钟)。1 秒不是热路径,是一开始就多了 60 倍。
+3. `next_deadline` 换成 `horizon`,一次 `list()` 同时给出"何时醒"和"值不值得轮询"。
+
+**中途推翻的一版。** 先按 plan 建议做了 mtime 短路(`StoreFingerprint` + `StoreCache` +
+`STORE_SETTLE`,约 60 行),用户一句「代价这么大」问回来,重算这笔账:短路省下的是
+~1.5 秒 CPU/天,换的是 60 行代码加一个需要自己证明的静置窗口。而按需轮询直接把绝大多数
+会话的这项开销**降到零**,还净删代码。教训 134 记的是这个,不是那套缓存。
+
+**顺带,plan 第一节里的 mtime 方案本身也是错的**(即便采纳):它写着"同一秒内的两次写会
+漏掉一次,但下一次轮询会补上"——不会补上,fingerprint 不变,以后每次轮询都继续短路,
+那次写永久丢失。指纹短路的漏检不会自愈,这一条留在教训 134 里。
+
+### 二、逐分钟 → 按字段跳跃
+
+`next_after` 的 `for _ in 0..MAX_SCAN_MINUTES` 换成 `while candidate <= limit`,
+`MAX_SCAN_MINUTES` 从"循环次数"变成"时间窗口"(`limit = start + (MAX-1) * MINUTE_MS`,
+与原来检查的候选区间逐字节相同)。新增两个私有方法:
+
+- `skip_minutes(parts)` —— 给一个已经 `matches` 失败的候选,返回**可证明无匹配**的分钟数
+  (恒 ≥ 1):月或日不合格 → 推到本地次日 00:00;时不合格 → 推到下一个允许小时的 :00
+  (没有更大的允许值就推到 24:00);否则只能是分不合格 → 推到同小时下一个允许分钟。
+  **月不匹配也按天跳**,不单独跳月:日这一层本来就封顶 366 次迭代,为再省十几次而引入
+  年份字段和月长计算不划算。`matches` 里的 dom/dow 或语义拆成 `day_matches`,skip 与
+  match 用**同一个**判定,不存在"对 dom 单独跳"的机会。
+- `skip(timezone, candidate, parts)` —— 跳跃是按本地日历算的,只在本地时间与 UTC 同步
+  前进时成立。`LocalParts` 新增 `offset_seconds`;跳到目标后 offset 若变了,就把步长
+  **折半**重试,直到落回同一 offset 或退化成 +1 分钟。这是 Lord Howe(DST 只偏移 30 分钟)
+  这种时区的正确性前提,也让 DST 边界附近只多花十几次查询,而不是退化整段扫描。
+
+`Scheduler::create` 里那次"先 `next_after` 校验再 `next_cron_fire`"的重复调用删掉——
+`next_cron_fire` 返回 `None` 就是校验失败,错误信息本来就一样。最坏一次 `cron_create`
+从三遍降到两遍(recurring 要 nominal + following 算 period,省不掉)。
+
+### 三、验收
+
+- `scheduler` 的 14 条既有测试**一行没改**全绿,含 `timezone_scan_handles_dst_gap_and_fold`
+  (gap 跳过、fold 触发两次)、`month_end_and_leap_year_are_scanned`、
+  `dom_and_dow_use_cron_or_semantics`;
+- 新增 `never_matching_cron_is_rejected_without_walking_the_year`:`0 0 30 2 *` 的
+  `create` 在 recurring 两种取值下都 < 100ms 返回,且错误文案逐字不变;
+- 新增 `field_skipping_agrees_with_a_minute_by_minute_scan`:朴素逐分钟扫描作为
+  `#[cfg(test)]` oracle(生产路径上**没有**这条退路),在 UTC / America\_New\_York(春秋
+  两个转换)/ Australia\_Lord\_Howe(30 分钟 DST,春秋两个转换)五个 (时区, 起点) 上,对
+  `*/15 * * * *`、`0 9 * * 1-5`、`0 0 * * 0`、`30 3 1 * *`、`0 0 13 * 5` 连续求解并逐次
+  比对;再单独比对三个长扫描:`0 0 1 3 *`、`0 0 29 2 *`(闰年)、`0 0 30 2 *`(永不匹配);
+- 新增 `only_a_session_holding_durable_jobs_polls_the_store`:没有 durable job 时,
+  把 store 写成坏 JSON 再把时钟推 600 秒,inbox 里**一条 `SchedulerFailure` 都没有**
+  (worker 根本没醒);建一个 durable job 之后,同样的坏 store 在**一个 `STORE_POLL_MS`
+  之内**被读到并报 failure。两个方向都实测过会变红:退回 `self.store.is_some()` 第一段
+  红,完全去掉轮询第二段红;
+- `cargo fmt --all --check` = 0、`cargo clippy --workspace --all-targets -D warnings` = 0、
+  `cargo test --workspace` 全绿,各自单独取的退出码。
+
+### 四、非目标守住了
+
+`parse_field` 一行未动;jitter 三个常量与 `id_fraction` 未动;durable store 的格式、
+`transaction_if_changed` 的事务语义、`Clock` / `ManualClock` 全部未动。

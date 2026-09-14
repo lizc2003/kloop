@@ -120,9 +120,12 @@
   故障注入)。~~仍未做:**测试 Config fixture 统一**(5 份手抄 30+ 字段)、**Config 的两个
   克隆构造改 `Clone` + `..base`**(plan 140)。~~ ✅ **plan 140 已做**(core 内 7 份 fixture
   收成 `tools::testutil::TestConfig`;`Config` derive `Clone`,两个构造只列差异)。
-- **scheduler 两条性能账**:`CronSpec::next_after` 逐分钟扫 52 万次(一次 `cron_create` 最多
+- ~~**scheduler 两条性能账**:`CronSpec::next_after` 逐分钟扫 52 万次(一次 `cron_create` 最多
   跑三遍),以及有 durable store 时 worker **每秒**一次 flock+读盘+解析。两者都要动调度语义
-  (跳跃式扫描的正确性、轮询间隔与跨进程可见性的权衡),不该混在清账里。
+  (跳跃式扫描的正确性、轮询间隔与跨进程可见性的权衡),不该混在清账里。~~ ✅ **plan 141
+  已做**(`next_after` 按字段跳跃 + offset 折半守 DST;轮询改成只有真持有 durable job 的
+  会话才付——原条件 `self.store.is_some()` 对每个非 `--mock` 启动都成立——间隔 1s→15s,
+  上界取自 `requires_missed_confirmation` 的 60 秒)。
 - **`argv_is_dangerous` 只认 `rm` / `sudo`。** 模块头写明 safety checks 免疫 bypass,所以这是
   bypass 下唯一还会弹确认的一层;但 `dd of=/dev/...`、`mkfs`、`shred`、`git clean -fdx`、
   `git reset --hard`、`chmod -R 777 /` 全是 word-only,会静默直跑。**扩不扩表是安全策略决定

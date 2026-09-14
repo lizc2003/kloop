@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Datelike, Local, TimeZone as _, Timelike, Utc};
+use chrono::{Datelike, Local, Offset as _, TimeZone as _, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -26,6 +26,16 @@ const RECURRING_JITTER_CAP_MS: i64 = 15 * 60 * 1_000;
 const ONE_SHOT_JITTER_MAX_MS: i64 = 90 * 1_000;
 const STORE_VERSION: u32 = 1;
 const MAX_STORE_BYTES: u64 = 4 * 1024 * 1024;
+/// How long a durable job written by a second runtime of the same session may
+/// stay invisible here. Owners are session ids, so that means one session opened
+/// twice; claims stay single-delivery either way, because the store's own lock
+/// linearises them (plan 58) — this interval only bounds how soon the other
+/// runtime's jobs are noticed. The bound that matters is
+/// `requires_missed_confirmation`'s one minute: claiming later than that turns a
+/// due job into one the user has to confirm, so this stays well under it. Only a
+/// session actually holding durable jobs pays it; everyone else sleeps on
+/// `notify_change`.
+const STORE_POLL_MS: i64 = 15_000;
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub trait Clock: Send + Sync {
@@ -141,6 +151,7 @@ struct LocalParts {
     day_of_month: u8,
     month: u8,
     day_of_week: u8,
+    offset_seconds: i32,
 }
 
 impl LocalParts {
@@ -151,6 +162,7 @@ impl LocalParts {
             day_of_month: value.day() as u8,
             month: value.month() as u8,
             day_of_week: value.weekday().num_days_from_sunday() as u8,
+            offset_seconds: value.offset().fix().local_minus_utc(),
         }
     }
 }
@@ -187,18 +199,68 @@ impl CronSpec {
     }
 
     pub fn next_after(&self, after_ms: i64, timezone: SchedulerTimeZone) -> Option<i64> {
-        let mut candidate = after_ms
+        let start = after_ms
             .div_euclid(MINUTE_MS)
             .saturating_add(1)
             .saturating_mul(MINUTE_MS);
-        for _ in 0..MAX_SCAN_MINUTES {
+        let limit = start.saturating_add((MAX_SCAN_MINUTES - 1).saturating_mul(MINUTE_MS));
+        let mut candidate = start;
+        while candidate <= limit {
             let parts = timezone.local_parts(candidate).ok()?;
             if self.matches(parts) {
                 return Some(candidate);
             }
-            candidate = candidate.saturating_add(MINUTE_MS);
+            candidate = self.skip(timezone, candidate, parts)?;
         }
         None
+    }
+
+    /// Advance past a candidate that does not match, by whole calendar fields
+    /// rather than a minute at a time, so a legal expression that never matches
+    /// (`0 0 30 2 *`) exhausts the year in hundreds of steps instead of half a
+    /// million timezone conversions.
+    ///
+    /// A skip is measured in local calendar fields, so it only holds while local
+    /// time advances in lockstep with UTC. Across a DST transition the step is
+    /// halved until it lands on the offset it started from; that costs a handful
+    /// of lookups near the transition instead of degrading the whole scan.
+    fn skip(&self, timezone: SchedulerTimeZone, candidate: i64, parts: LocalParts) -> Option<i64> {
+        let mut minutes = self.skip_minutes(parts);
+        while minutes > 1 {
+            let target = candidate.saturating_add(minutes.saturating_mul(MINUTE_MS));
+            if timezone.local_parts(target).ok()?.offset_seconds == parts.offset_seconds {
+                return Some(target);
+            }
+            minutes /= 2;
+        }
+        Some(candidate.saturating_add(MINUTE_MS))
+    }
+
+    /// Minutes that provably hold no match, given the local fields of a
+    /// candidate that already failed `matches`. Always at least one.
+    fn skip_minutes(&self, parts: LocalParts) -> i64 {
+        let into_day = i64::from(parts.hour) * 60 + i64::from(parts.minute);
+        if !self.month.contains(&parts.month) || !self.day_matches(parts) {
+            // dom and dow are an OR, which makes a whole day the atom here: a
+            // skip by dom alone would step over days the dow half accepts.
+            return 24 * 60 - into_day;
+        }
+        if !self.hour.contains(&parts.hour) {
+            let next = self
+                .hour
+                .iter()
+                .copied()
+                .find(|hour| *hour > parts.hour)
+                .map_or(24, i64::from);
+            return next * 60 - into_day;
+        }
+        let next = self
+            .minute
+            .iter()
+            .copied()
+            .find(|minute| *minute > parts.minute)
+            .map_or(60, i64::from);
+        next - i64::from(parts.minute)
     }
 
     pub fn human_schedule(&self, timezone: SchedulerTimeZone) -> String {
@@ -241,12 +303,15 @@ impl CronSpec {
     }
 
     fn matches(&self, parts: LocalParts) -> bool {
-        if !self.minute.contains(&parts.minute)
-            || !self.hour.contains(&parts.hour)
-            || !self.month.contains(&parts.month)
-        {
-            return false;
-        }
+        self.minute.contains(&parts.minute)
+            && self.hour.contains(&parts.hour)
+            && self.month.contains(&parts.month)
+            && self.day_matches(parts)
+    }
+
+    /// Vixie cron's day rule: two unrestricted fields match every day, one
+    /// unrestricted field defers to the other, two restricted fields are an OR.
+    fn day_matches(&self, parts: LocalParts) -> bool {
         let dom_all = self.day_of_month.len() == 31;
         let dow_all = self.day_of_week.len() == 7;
         let dom = self.day_of_month.contains(&parts.day_of_month);
@@ -642,6 +707,14 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What one worker tick needs to know about the two registries: when to wake, and
+/// whether any durable job makes the store worth polling at all.
+#[derive(Default)]
+struct Horizon {
+    deadline: Option<i64>,
+    durable_jobs: bool,
+}
+
 struct SchedulerState {
     owner: Option<String>,
     session_jobs: Vec<ScheduledJob>,
@@ -757,9 +830,6 @@ impl Scheduler {
         }
         let spec = CronSpec::parse(cron)?;
         let now = self.clock.now_ms();
-        if spec.next_after(now, self.timezone).is_none() {
-            bail!("Cron expression '{cron}' does not match any calendar date in the next year.");
-        }
         if self.list()?.len() >= MAX_JOBS {
             bail!("Too many scheduled jobs (max 50). Cancel one first.");
         }
@@ -1022,8 +1092,8 @@ impl Scheduler {
                     missed,
                 });
             }
-            let deadline = match self.next_deadline() {
-                Ok(deadline) => deadline,
+            let horizon = match self.horizon(now) {
+                Ok(horizon) => horizon,
                 Err(error) => {
                     let next = format!("scheduler store failed closed: {error:#}");
                     match &mut failure {
@@ -1033,7 +1103,7 @@ impl Scheduler {
                         }
                         None => failure = Some(next),
                     }
-                    None
+                    Horizon::default()
                 }
             };
             if failure != last_failure {
@@ -1044,11 +1114,18 @@ impl Scheduler {
                 }
                 last_failure = failure;
             }
-            let deadline = if self.store.is_some() {
-                let store_poll = now.saturating_add(1_000);
-                Some(deadline.map_or(store_poll, |job| job.min(store_poll)))
+            // A session with no durable job has nothing another runtime could be
+            // writing on its behalf, so it sleeps on `notify_change` alone and
+            // never touches the disk.
+            let deadline = if horizon.durable_jobs {
+                let store_poll = now.saturating_add(STORE_POLL_MS);
+                Some(
+                    horizon
+                        .deadline
+                        .map_or(store_poll, |job| job.min(store_poll)),
+                )
             } else {
-                deadline
+                horizon.deadline
             };
             let Some(deadline) = deadline else {
                 if changes.changed().await.is_err() {
@@ -1067,15 +1144,17 @@ impl Scheduler {
         }
     }
 
-    fn next_deadline(&self) -> Result<Option<i64>> {
-        let now = self.clock.now_ms();
+    fn horizon(&self, now: i64) -> Result<Horizon> {
         let confirmation_available = self.state.lock().unwrap().missed_confirmation_available;
-        Ok(self
-            .list()?
-            .iter()
-            .filter(|job| confirmation_available || !requires_missed_confirmation(job, now))
-            .map(|job| job.next_fire_at_ms)
-            .min())
+        let jobs = self.list()?;
+        Ok(Horizon {
+            deadline: jobs
+                .iter()
+                .filter(|job| confirmation_available || !requires_missed_confirmation(job, now))
+                .map(|job| job.next_fire_at_ms)
+                .min(),
+            durable_jobs: jobs.iter().any(|job| job.durable),
+        })
     }
 
     fn claim_due(&self, now: i64) -> Result<(Vec<ScheduledJob>, Option<String>)> {
@@ -1270,6 +1349,177 @@ mod tests {
         let second = fold.next_after(first, tz).unwrap();
         assert_eq!(first, utc_ms(2026, 11, 1, 5, 30));
         assert_eq!(second, utc_ms(2026, 11, 1, 6, 30));
+    }
+
+    /// The oracle the skipping scan has to agree with: the minute-by-minute walk
+    /// `next_after` used to be. Test-only — the production path has no fallback.
+    fn naive_next_after(
+        spec: &CronSpec,
+        after_ms: i64,
+        timezone: SchedulerTimeZone,
+    ) -> Option<i64> {
+        let mut candidate = after_ms
+            .div_euclid(MINUTE_MS)
+            .saturating_add(1)
+            .saturating_mul(MINUTE_MS);
+        for _ in 0..MAX_SCAN_MINUTES {
+            if spec.matches(timezone.local_parts(candidate).ok()?) {
+                return Some(candidate);
+            }
+            candidate = candidate.saturating_add(MINUTE_MS);
+        }
+        None
+    }
+
+    #[test]
+    fn field_skipping_agrees_with_a_minute_by_minute_scan() {
+        // Each zone is paired with its own transitions: New York shifts a whole
+        // hour, Lord Howe only thirty minutes, which is what a skip measured in
+        // local fields gets wrong if it ignores the offset.
+        let anchors = [
+            (
+                SchedulerTimeZone::Named(Tz::UTC),
+                utc_ms(2026, 6, 17, 9, 12),
+            ),
+            (
+                SchedulerTimeZone::named("America/New_York").unwrap(),
+                utc_ms(2026, 3, 8, 4, 0),
+            ),
+            (
+                SchedulerTimeZone::named("America/New_York").unwrap(),
+                utc_ms(2026, 11, 1, 3, 0),
+            ),
+            (
+                SchedulerTimeZone::named("Australia/Lord_Howe").unwrap(),
+                utc_ms(2026, 4, 4, 14, 0),
+            ),
+            (
+                SchedulerTimeZone::named("Australia/Lord_Howe").unwrap(),
+                utc_ms(2026, 10, 3, 14, 0),
+            ),
+        ];
+        let cases = [
+            ("*/15 * * * *", 40),
+            ("0 9 * * 1-5", 8),
+            ("0 0 * * 0", 3),
+            ("30 3 1 * *", 2),
+            ("0 0 13 * 5", 6),
+        ];
+        for (timezone, anchor) in anchors {
+            for (source, rounds) in cases {
+                let spec = CronSpec::parse(source).unwrap();
+                let mut after = anchor;
+                for _ in 0..rounds {
+                    let expected = naive_next_after(&spec, after, timezone);
+                    assert_eq!(
+                        spec.next_after(after, timezone),
+                        expected,
+                        "{source} after {after} in {timezone:?}"
+                    );
+                    let Some(next) = expected else { break };
+                    after = next;
+                }
+            }
+        }
+
+        // Scans that span most of the window, including one that never matches.
+        let timezone = SchedulerTimeZone::Named(Tz::UTC);
+        for (source, after) in [
+            ("0 0 1 3 *", utc_ms(2026, 1, 15, 0, 0)),
+            ("0 0 29 2 *", utc_ms(2027, 3, 1, 0, 0)),
+            ("0 0 30 2 *", utc_ms(2026, 1, 1, 0, 0)),
+        ] {
+            let spec = CronSpec::parse(source).unwrap();
+            assert_eq!(
+                spec.next_after(after, timezone),
+                naive_next_after(&spec, after, timezone),
+                "{source} after {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn never_matching_cron_is_rejected_without_walking_the_year() {
+        let clock = ManualClock::new(utc_ms(2026, 8, 3, 12, 0));
+        let scheduler = Scheduler::with_clock(
+            Arc::new(Inbox::default()),
+            None,
+            clock,
+            SchedulerTimeZone::Named(Tz::UTC),
+        );
+        scheduler.bind_owner("owner-a").unwrap();
+        for recurring in [false, true] {
+            let started = std::time::Instant::now();
+            let error = scheduler
+                .create("0 0 30 2 *", "never", recurring, false)
+                .unwrap_err()
+                .to_string();
+            let elapsed = started.elapsed();
+            assert_eq!(
+                error,
+                "Cron expression '0 0 30 2 *' does not match any calendar date in the next year."
+            );
+            assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_session_holding_durable_jobs_polls_the_store() {
+        let root = std::env::temp_dir().join(format!(
+            "kloop-scheduler-poll-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("scheduled_tasks.json");
+        let clock = ManualClock::new(utc_ms(2026, 8, 3, 12, 0));
+        let inbox = Arc::new(Inbox::default());
+        let scheduler = Scheduler::with_clock(
+            Arc::clone(&inbox),
+            Some(DurableStore::new(path.clone(), "project-a".into())),
+            clock.clone(),
+            SchedulerTimeZone::Named(Tz::UTC),
+        );
+        scheduler.bind_owner("owner-a").unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(inbox.drain().is_empty());
+
+        // No durable job: the worker is parked on `notify_change`, so a store it
+        // could not even parse goes unnoticed however far the clock moves.
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"{bad json").unwrap();
+        clock.advance(Duration::from_secs(600));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(inbox.drain().is_empty());
+
+        // One durable job later, the same corrupt store is read within a poll.
+        fs::remove_file(&path).unwrap();
+        scheduler
+            .create("0 13 * * *", "durable", true, true)
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        inbox.drain();
+        fs::write(&path, b"{bad json").unwrap();
+        let mut activity = inbox.subscribe_activity();
+        clock.advance(Duration::from_millis(STORE_POLL_MS as u64));
+        tokio::time::timeout(Duration::from_secs(1), activity.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            inbox
+                .drain()
+                .iter()
+                .any(|item| matches!(item, InboxItem::SchedulerFailure { .. }))
+        );
+
+        scheduler.shutdown().await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

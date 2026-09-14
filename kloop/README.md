@@ -1726,6 +1726,22 @@ deliver only once. A late durable one-shot remains pending in a headless run or 
 server session without question capability until that owner resumes through a
 questions-capable interactive frontend.
 
+`CronSpec::next_after` walks candidates by whole calendar fields rather than one
+minute at a time. A day is the atom there, because the dom/dow OR rule makes it
+one, so an expression that is legal but never fires (`0 0 30 2 *`) exhausts its
+one-year window in hundreds of steps instead of 527,040 timezone conversions. A
+step is only taken as far as the UTC offset is known to be constant and halves
+toward the transition otherwise, which keeps a DST gap firing once and a DST fold
+firing twice.
+
+The worker polls the durable store only while this session actually holds a
+durable job; a session with none sleeps on in-process change notifications and
+never touches the disk. When it does poll, the interval is fifteen seconds, which
+bounds only how soon a job written by a second runtime of the same session is
+noticed — single delivery is the store lock's job, not the interval's — and stays
+well under the one minute past which a claim would count as missed and need the
+user's confirmation.
+
 Due work enters the typed Inbox rather than mutating an in-flight provider request. The
 TUI sends one idle `Wake`; the plain frontend selects between stdin and Inbox activity; and
 the server allocates a real increasing turn id for a single-flight delivery turn. Headless
