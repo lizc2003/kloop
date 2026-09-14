@@ -1377,47 +1377,110 @@ pub(crate) mod testutil {
         fn emit(&self, _: &Event) {}
     }
 
-    pub(crate) fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
-        test_ctx_with_sources(depth, tag, Vec::new())
+    /// The one test Config. A test names the handful of fields it actually
+    /// cares about through the builder; the other two dozen get the same
+    /// permissive defaults every hand-copied literal used to spell out.
+    pub(crate) struct TestConfig {
+        tag: String,
+        provider: Provider,
+        primary_model: String,
+        allowed_models: Vec<String>,
+        max_rounds: Option<usize>,
+        context_window: Option<u64>,
+        tool_sources: Vec<Arc<dyn ToolSource>>,
+        dirs: Option<std::path::PathBuf>,
     }
 
-    pub(crate) fn test_ctx_with_sources(
-        depth: u8,
-        tag: &str,
-        sources: Vec<Arc<dyn ToolSource>>,
-    ) -> ToolCtx {
-        let (provider_catalog, provider_route) =
-            crate::provider_route::ProviderCatalog::from_provider(
-                "test",
-                Provider::mock(vec![]),
-                "mock",
-                vec!["mock".into()],
-                None,
-            )
-            .unwrap();
-        let inbox = Arc::new(crate::inbox::Inbox::default());
-        ToolCtx {
-            cfg: Arc::new(Config {
+    impl TestConfig {
+        /// `tag` keeps one test's offload and session files off every other
+        /// test's — it becomes the `kloop-{tag}` / `kloop-{tag}-sessions`
+        /// directory pair under the system temp dir, so it must be unique
+        /// across the crate.
+        pub(crate) fn new(tag: &str) -> Self {
+            Self {
+                tag: tag.to_string(),
+                provider: Provider::mock(vec![]),
+                primary_model: "mock".into(),
+                allowed_models: vec!["mock".into()],
+                max_rounds: Some(5),
+                context_window: None,
+                tool_sources: Vec::new(),
+                dirs: None,
+            }
+        }
+
+        pub(crate) fn provider(mut self, provider: Provider) -> Self {
+            self.provider = provider;
+            self
+        }
+
+        /// Override the route's model names — for tests that read a model name
+        /// back out, or that switch the route to a second allowed model.
+        pub(crate) fn models(mut self, primary: &str, allowed: &[&str]) -> Self {
+            self.primary_model = primary.to_string();
+            self.allowed_models = allowed.iter().map(|m| (*m).to_string()).collect();
+            self
+        }
+
+        pub(crate) fn max_rounds(mut self, max_rounds: Option<usize>) -> Self {
+            self.max_rounds = max_rounds;
+            self
+        }
+
+        pub(crate) fn context_window(mut self, context_window: Option<u64>) -> Self {
+            self.context_window = context_window;
+            self
+        }
+
+        pub(crate) fn tool_sources(mut self, tool_sources: Vec<Arc<dyn ToolSource>>) -> Self {
+            self.tool_sources = tool_sources;
+            self
+        }
+
+        /// Put offload and session files in one caller-owned directory instead
+        /// of the tag-derived pair — for tests that reopen the session file.
+        pub(crate) fn dirs(mut self, dir: &std::path::Path) -> Self {
+            self.dirs = Some(dir.to_path_buf());
+            self
+        }
+
+        pub(crate) fn build(self) -> Arc<Config> {
+            let (provider_catalog, provider_route) =
+                crate::provider_route::ProviderCatalog::from_provider(
+                    "test",
+                    self.provider,
+                    self.primary_model,
+                    self.allowed_models,
+                    None,
+                )
+                .expect("test provider route is valid");
+            let (offload_dir, sessions_dir) = match self.dirs {
+                Some(dir) => (dir.clone(), dir),
+                None => (
+                    std::env::temp_dir().join(format!("kloop-{}", self.tag)),
+                    std::env::temp_dir().join(format!("kloop-{}-sessions", self.tag)),
+                ),
+            };
+            let inbox = Arc::new(crate::inbox::Inbox::default());
+            Arc::new(Config {
                 provider_catalog,
                 provider_route,
                 system: "test".into(),
                 project_instructions: None,
-                max_rounds: Some(5),
+                max_rounds: self.max_rounds,
                 cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                offload_dir: std::env::temp_dir().join(format!("kloop-tools-{tag}")),
-                sessions_dir: std::env::temp_dir().join(format!("kloop-tools-sessions-{tag}")),
-                context_window: None,
+                offload_dir,
+                sessions_dir,
+                context_window: self.context_window,
                 permissions: Arc::new(crate::permissions::Permissions::allow_all()),
                 questioner: None,
                 file_state: Default::default(),
-                tool_sources: sources,
+                tool_sources: self.tool_sources,
                 session_id: String::new(),
                 local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
+                hooks: Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
-                shell_programs: std::sync::Arc::new(
-                    crate::shell_programs::ShellPrograms::test_fixture(),
-                ),
+                shell_programs: Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
                 powershell_execution_gate: Default::default(),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),
@@ -1430,11 +1493,25 @@ pub(crate) mod testutil {
                 background_executions: Default::default(),
                 program_limits: Default::default(),
                 skills: Default::default(),
-                active_worktree: std::sync::Arc::new(
-                    crate::worktree::ActiveWorktreeState::default(),
-                ),
+                active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
                 surface: Default::default(),
-            }),
+            })
+        }
+    }
+
+    pub(crate) fn test_ctx(depth: u8, tag: &str) -> ToolCtx {
+        test_ctx_with_sources(depth, tag, Vec::new())
+    }
+
+    pub(crate) fn test_ctx_with_sources(
+        depth: u8,
+        tag: &str,
+        sources: Vec<Arc<dyn ToolSource>>,
+    ) -> ToolCtx {
+        ToolCtx {
+            cfg: TestConfig::new(&format!("tools-{tag}"))
+                .tool_sources(sources)
+                .build(),
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,
@@ -3421,64 +3498,15 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_dispatch_patches_every_tool_use() {
-        use kloop_provider::Provider;
-
         struct NullUi;
         impl Ui for NullUi {
             fn emit(&self, _: &Event) {}
         }
 
-        let (provider_catalog, provider_route) =
-            crate::provider_route::ProviderCatalog::from_provider(
-                "test",
-                Provider::mock(vec![]),
-                "mock",
-                vec!["mock".into()],
-                None,
-            )
-            .unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let inbox = Arc::new(crate::inbox::Inbox::default());
         let ctx = ToolCtx {
-            cfg: Arc::new(Config {
-                provider_catalog,
-                provider_route,
-                system: "test".into(),
-                project_instructions: None,
-                max_rounds: Some(5),
-                cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                offload_dir: std::env::temp_dir().join("kloop-test-cancel"),
-                sessions_dir: std::env::temp_dir().join("kloop-test-cancel-sessions"),
-                context_window: None,
-                permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-                questioner: None,
-                file_state: Default::default(),
-                tool_sources: Vec::new(),
-                session_id: String::new(),
-                local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
-                background_shells: BackgroundShells::new(),
-                shell_programs: std::sync::Arc::new(
-                    crate::shell_programs::ShellPrograms::test_fixture(),
-                ),
-                powershell_execution_gate: Default::default(),
-                sandbox: None,
-                agent_types: Arc::new(Vec::new()),
-                tool_allowlist: None,
-                defer_threshold: 30,
-                unlocked_tools: Default::default(),
-                tasks: Default::default(),
-                inbox: Arc::clone(&inbox),
-                scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-                background_executions: Default::default(),
-                program_limits: Default::default(),
-                skills: Default::default(),
-                active_worktree: std::sync::Arc::new(
-                    crate::worktree::ActiveWorktreeState::default(),
-                ),
-                surface: Default::default(),
-            }),
+            cfg: testutil::TestConfig::new("test-cancel").build(),
             ui: Arc::new(NullUi),
             cancel,
             depth: 0,

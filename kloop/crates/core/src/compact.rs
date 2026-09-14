@@ -588,56 +588,11 @@ mod tests {
     use serde_json::json;
 
     fn compact_test_cfg(provider: kloop_provider::Provider, tag: &str) -> Arc<Config> {
-        let (provider_catalog, provider_route) =
-            crate::provider_route::ProviderCatalog::from_provider(
-                "test",
-                provider,
-                "mock",
-                vec![
-                    "mock".into(),
-                    "actual-model".into(),
-                    "fallback-model".into(),
-                ],
-                None,
-            )
-            .unwrap();
-        let inbox = Arc::new(crate::inbox::Inbox::default());
-        Arc::new(Config {
-            provider_catalog,
-            provider_route,
-            system: "test".into(),
-            project_instructions: None,
-            max_rounds: Some(5),
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            offload_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}")),
-            sessions_dir: std::env::temp_dir().join(format!("kloop-compact-{tag}-sessions")),
-            context_window: Some(200_000),
-            permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-            questioner: None,
-            file_state: Default::default(),
-            tool_sources: Vec::new(),
-            session_id: String::new(),
-            local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-            hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
-            background_shells: crate::tools::BackgroundShells::new(),
-            shell_programs: std::sync::Arc::new(
-                crate::shell_programs::ShellPrograms::test_fixture(),
-            ),
-            powershell_execution_gate: Default::default(),
-            sandbox: None,
-            agent_types: Arc::new(Vec::new()),
-            tool_allowlist: None,
-            defer_threshold: 30,
-            unlocked_tools: Default::default(),
-            tasks: Default::default(),
-            inbox: Arc::clone(&inbox),
-            scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-            background_executions: Default::default(),
-            program_limits: Default::default(),
-            skills: Default::default(),
-            active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
-            surface: Default::default(),
-        })
+        crate::tools::testutil::TestConfig::new(&format!("compact-{tag}"))
+            .provider(provider)
+            .models("mock", &["mock", "actual-model", "fallback-model"])
+            .context_window(Some(200_000))
+            .build()
     }
 
     fn usage(input_tokens: u64) -> Usage {

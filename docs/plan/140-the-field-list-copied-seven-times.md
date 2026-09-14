@@ -117,3 +117,56 @@ pub(crate) fn subagent_from(&self, workspace: &EffectiveWorkspace, max_rounds, a
 - 子 agent 的四个"必须是新实例"字段有 `Arc::ptr_eq` 断言;
 - 全量测试逐条不变地通过(fixture 搬家不该改任何测试的断言);
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
+
+## 六、✅ 已完成(2026-09-14,提交 PENDING)
+
+**一、fixture**:`crates/core/src/tools/mod.rs` 的 `testutil` 里立了 `TestConfig` builder
+(`new(tag)` / `provider` / `models` / `max_rounds` / `context_window` / `tool_sources` /
+`dirs` / `build() -> Arc<Config>`)。默认值就是七份手抄共有的那套。
+
+plan 只点了五处,实际 core 里是**七处**——`agent/tests.rs` 另有两份(`mock_end_to_end_three_rounds`
+的内联字面量、`compaction_cfg`)。七处全部搬完,`grep -c 'powershell_execution_gate: Default::default()'`
+在 core 内 **7 → 1**。逐处搬、逐处跑该模块测试,没有改动任何断言。
+
+builder 比 plan 的签名多了两个方法,都是搬家过程中真实差异逼出来的,不是预留:
+
+- `models(primary, allowed)`:`commands/mod.rs` 的测试断言输出里的 `model: test-model`,
+  `compact.rs` 需要 `actual-model`/`fallback-model` 两个额外 allowed model 才能换路由;
+- `dirs(&Path)`:`rollout.rs` 的重启测试要 offload 与 sessions **指向同一个**调用方临时目录。
+
+`surface()` 没加——七处都用 `Default::default()`,加了就是死代码。
+
+各处 tag 按原目录名取,offload/sessions 路径逐字不变;唯一变的是 `test_ctx` 的 sessions 目录
+(`kloop-tools-sessions-{tag}` → `kloop-tools-{tag}-sessions`),没有测试依赖这个名字。
+
+**二、两份生产字段表**:`Config` 直接 `#[derive(Clone)]` ——plan 写"不能 derive",但 32 个
+字段全都 Clone(`Arc<dyn …>` 无条件 Clone),derive 编得过,手写体没有任何额外信息。
+`clone_with_provider_route` 收成 3 行,`subagent_from` 的字面量从 32 项降到 14 项(plan 估 13,
+差的那项是 `provider_route`,它本来就是显式的 `child_route`)。两个构造合计从 ~60 行代码降到
+~20 行。`test_clone` 留着并改成 `self.clone()`:测试手里拿的是 `Arc<Config>`,`ctx.cfg.clone()`
+会克隆 Arc 而不是 Config,一个不会混淆的名字比 121 处 `(*ctx.cfg).clone()` 干净。
+
+**三、契约测试放在 `config.rs` 而不是 plan 说的 `agent/tests.rs`**:`subagent_from` 的
+"哪些字段不继承"清单跟构造体住同一个文件,加字段的人读完函数就看到测试。新增
+`mod subagent_contract_tests` 五个测试:
+
+- `subagent_gets_fresh_agent_local_state` —— `file_state` / `unlocked_tools` / `inbox` /
+  `active_worktree` 四个 `!Arc::ptr_eq`(plan 点名的那四个);
+- `subagent_resets_its_own_identity_and_surface` —— session_id 派生、agent_id/parent、
+  max_rounds、questioner=None、surface 重置、system/cwd/permissions/sandbox 取自传入的
+  workspace 世代而非 `self`;
+- `subagent_of_an_unbound_session_stays_unbound` —— 空 session_id 不派生假会话;
+- `subagent_inherits_every_shared_service_and_setting` —— 11 个共享服务 `Arc::ptr_eq` +
+  7 个按值继承的设置。**这条就是"新字段默认被继承"这个取舍的落点**:哪天有个新字段不该继承,
+  它会先在这里变红。
+- `provider_route_clone_changes_only_the_route` —— `/model` 中途换路由不该换掉 inbox/file_state。
+
+**未收的四处**(不在 core 内,`#[cfg(test)] testutil` 跨不过 crate 边界):
+`crates/cli/src/headless.rs` 的 `mock_provider_config`、`crates/server/tests/server.rs` 的两处、
+以及 `crates/cli/src/startup.rs:config_from_settings`(那是**生产**构造器,本来就该有一份
+完整字段表)。要收前三处得把 `testutil` 变成 `test-support` feature 下的 `pub`,超出本 plan
+范围,也不是本批"不留豁免名单"针对的判定分叉——是语言可见性限制。
+
+**验证**(各自单独跑、当场取退出码):`cargo fmt --all -- --check` 0;
+`cargo clippy --workspace --all-targets -- -D warnings` 0;`cargo test --workspace` 0
+(822 + 各 crate,全绿)。

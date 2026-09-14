@@ -529,49 +529,10 @@ async fn mock_end_to_end_three_rounds() {
             text: "all done".into(),
         }],
     ]);
-    let (provider_catalog, provider_route) = crate::provider_route::ProviderCatalog::from_provider(
-        "test",
-        provider,
-        "mock",
-        vec!["mock".into()],
-        None,
-    )
-    .unwrap();
-    let inbox = Arc::new(crate::inbox::Inbox::default());
-    let cfg = Arc::new(Config {
-        provider_catalog,
-        provider_route,
-        system: "test".into(),
-        project_instructions: None,
-        max_rounds: Some(10),
-        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        offload_dir: std::env::temp_dir().join("kloop-test-e2e"),
-        sessions_dir: std::env::temp_dir().join("kloop-test-e2e-sessions"),
-        context_window: None,
-        permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-        questioner: None,
-        file_state: Default::default(),
-        tool_sources: Vec::new(),
-        session_id: String::new(),
-        local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-        hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
-        background_shells: crate::tools::BackgroundShells::new(),
-        shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
-        powershell_execution_gate: Default::default(),
-        sandbox: None,
-        agent_types: Arc::new(Vec::new()),
-        tool_allowlist: None,
-        defer_threshold: 30,
-        unlocked_tools: Default::default(),
-        tasks: Default::default(),
-        inbox: Arc::clone(&inbox),
-        scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-        background_executions: Default::default(),
-        program_limits: Default::default(),
-        skills: Default::default(),
-        active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
-        surface: Default::default(),
-    });
+    let cfg = crate::tools::testutil::TestConfig::new("test-e2e")
+        .provider(provider)
+        .max_rounds(Some(10))
+        .build();
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let cancel = CancellationToken::new();
     let mut history = History::new(cfg.offload_dir.clone());
@@ -719,49 +680,11 @@ async fn subagent_turn_routes_to_subagent_hooks() {
 }
 
 fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
-    let (provider_catalog, provider_route) = crate::provider_route::ProviderCatalog::from_provider(
-        "test",
-        provider,
-        "mock",
-        vec!["mock".into()],
-        None,
-    )
-    .unwrap();
-    let inbox = Arc::new(crate::inbox::Inbox::default());
-    Arc::new(Config {
-        provider_catalog,
-        provider_route,
-        system: "test".into(),
-        project_instructions: None,
-        max_rounds: Some(10),
-        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        offload_dir: std::env::temp_dir().join(format!("kloop-test-{tag}")),
-        sessions_dir: std::env::temp_dir().join(format!("kloop-test-{tag}-sessions")),
-        context_window: Some(window),
-        permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-        questioner: None,
-        file_state: Default::default(),
-        tool_sources: Vec::new(),
-        session_id: String::new(),
-        local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-        hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
-        background_shells: crate::tools::BackgroundShells::new(),
-        shell_programs: std::sync::Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
-        powershell_execution_gate: Default::default(),
-        sandbox: None,
-        agent_types: Arc::new(Vec::new()),
-        tool_allowlist: None,
-        defer_threshold: 30,
-        unlocked_tools: Default::default(),
-        tasks: Default::default(),
-        inbox: Arc::clone(&inbox),
-        scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-        background_executions: Default::default(),
-        program_limits: Default::default(),
-        skills: Default::default(),
-        active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
-        surface: Default::default(),
-    })
+    crate::tools::testutil::TestConfig::new(&format!("test-{tag}"))
+        .provider(provider)
+        .max_rounds(Some(10))
+        .context_window(Some(window))
+        .build()
 }
 
 /// Predictive: a fat history under a small (but > growth reserve) window

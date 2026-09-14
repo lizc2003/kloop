@@ -282,52 +282,11 @@ mod tests {
     /// A Config wired to the given provider; only the fields the commands read
     /// (provider route/context_window/tasks/inbox) matter here.
     fn test_cfg(provider: kloop_provider::Provider, window: Option<u64>) -> Arc<Config> {
-        let (provider_catalog, provider_route) =
-            crate::provider_route::ProviderCatalog::from_provider(
-                "test",
-                provider,
-                "test-model",
-                vec!["test-model".into()],
-                None,
-            )
-            .unwrap();
-        let inbox = Arc::new(crate::inbox::Inbox::default());
-        Arc::new(Config {
-            provider_catalog,
-            provider_route,
-            system: "test".into(),
-            project_instructions: None,
-            max_rounds: Some(5),
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            offload_dir: std::env::temp_dir().join("kloop-cmd-test"),
-            sessions_dir: std::env::temp_dir().join("kloop-cmd-test-sessions"),
-            context_window: window,
-            permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-            questioner: None,
-            file_state: Default::default(),
-            tool_sources: Vec::new(),
-            session_id: String::new(),
-            local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-            hooks: Arc::new(crate::hooks::Hooks::none()),
-            background_shells: crate::tools::BackgroundShells::new(),
-            shell_programs: std::sync::Arc::new(
-                crate::shell_programs::ShellPrograms::test_fixture(),
-            ),
-            powershell_execution_gate: Default::default(),
-            sandbox: None,
-            agent_types: Arc::new(Vec::new()),
-            tool_allowlist: None,
-            defer_threshold: 30,
-            unlocked_tools: Default::default(),
-            tasks: Default::default(),
-            inbox: Arc::clone(&inbox),
-            scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-            background_executions: Default::default(),
-            program_limits: Default::default(),
-            skills: Default::default(),
-            active_worktree: std::sync::Arc::new(crate::worktree::ActiveWorktreeState::default()),
-            surface: Default::default(),
-        })
+        crate::tools::testutil::TestConfig::new("cmd-test")
+            .provider(provider)
+            .models("test-model", &["test-model"])
+            .context_window(window)
+            .build()
     }
 
     #[test]

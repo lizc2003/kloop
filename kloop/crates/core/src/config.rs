@@ -265,6 +265,13 @@ pub struct EffectiveWorkspace {
 
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
+///
+/// `Clone` is a plain field-by-field copy: every shared service stays shared
+/// (the `Arc`s are cloned, not rebuilt), so a clone belongs to the same session
+/// as its source. The two constructors below start from a clone and then list
+/// only what differs — see [`Config::subagent_from`] for the fields a child
+/// agent must NOT share.
+#[derive(Clone)]
 pub struct Config {
     /// Immutable catalog shared by session supervisors and child admission.
     pub provider_catalog: Arc<ProviderCatalog>,
@@ -469,6 +476,12 @@ impl Config {
     /// Build one child agent from a single parent workspace generation. Runtime
     /// and session services remain shared; agent-local and workspace-mutable state
     /// starts fresh.
+    ///
+    /// The body below is the whole list of what a child does NOT share with its
+    /// parent — everything else is inherited by `..self.clone()`. That is also
+    /// the default for a field added later: inherited unless someone names it
+    /// here. `subagent_contract_tests` at the bottom of this file is where that
+    /// decision gets written down, field by field.
     pub(crate) fn subagent_from(
         &self,
         workspace: &EffectiveWorkspace,
@@ -476,22 +489,16 @@ impl Config {
         agent_id: kloop_protocol::LocalAgentId,
     ) -> Self {
         Self {
-            provider_catalog: Arc::clone(&self.provider_catalog),
             provider_route: self
                 .provider_route
                 .child_route(None)
                 .expect("inherited provider model remains allowlisted"),
             system: workspace.system.clone(),
             cwd: workspace.cwd.clone(),
-            project_instructions: self.project_instructions.clone(),
             max_rounds,
-            offload_dir: self.offload_dir.clone(),
-            sessions_dir: self.sessions_dir.clone(),
-            context_window: self.context_window,
             permissions: Arc::clone(&workspace.permissions),
             questioner: None,
             file_state: Arc::new(FileState::default()),
-            tool_sources: self.tool_sources.clone(),
             // The child's own cache identity, not the parent's. `prompt_cache_key`
             // exists so requests that share a prefix route together; a sub-agent's
             // prefix (its own system scope, a fresh history) has nothing in common
@@ -505,66 +512,29 @@ impl Config {
                 format!("{}-{}", self.session_id, agent_id)
             },
             local_agent: self.local_agent.child(agent_id),
-            hooks: Arc::clone(&self.hooks),
-            background_shells: Arc::clone(&self.background_shells),
-            shell_programs: Arc::clone(&self.shell_programs),
-            powershell_execution_gate: Arc::clone(&self.powershell_execution_gate),
             sandbox: workspace.sandbox.clone(),
-            agent_types: Arc::clone(&self.agent_types),
-            tool_allowlist: self.tool_allowlist.clone(),
-            defer_threshold: self.defer_threshold,
             unlocked_tools: Arc::new(DeferredToolUnlocks::default()),
-            tasks: Arc::clone(&self.tasks),
             inbox: Arc::new(Inbox::default()),
-            scheduler: Arc::clone(&self.scheduler),
-            background_executions: Arc::clone(&self.background_executions),
-            program_limits: self.program_limits,
-            skills: Arc::clone(&self.skills),
             active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
             surface: SurfaceCapabilities::default(),
+            ..self.clone()
         }
     }
 
     pub fn clone_with_provider_route(&self, provider_route: FrozenProviderRoute) -> Self {
         Self {
-            provider_catalog: Arc::clone(&self.provider_catalog),
             provider_route,
-            system: self.system.clone(),
-            cwd: self.cwd.clone(),
-            project_instructions: self.project_instructions.clone(),
-            max_rounds: self.max_rounds,
-            offload_dir: self.offload_dir.clone(),
-            sessions_dir: self.sessions_dir.clone(),
-            context_window: self.context_window,
-            permissions: Arc::clone(&self.permissions),
-            questioner: self.questioner.clone(),
-            file_state: Arc::clone(&self.file_state),
-            tool_sources: self.tool_sources.clone(),
-            session_id: self.session_id.clone(),
-            local_agent: self.local_agent.clone(),
-            hooks: Arc::clone(&self.hooks),
-            background_shells: Arc::clone(&self.background_shells),
-            shell_programs: Arc::clone(&self.shell_programs),
-            powershell_execution_gate: Arc::clone(&self.powershell_execution_gate),
-            sandbox: self.sandbox.clone(),
-            agent_types: Arc::clone(&self.agent_types),
-            tool_allowlist: self.tool_allowlist.clone(),
-            defer_threshold: self.defer_threshold,
-            unlocked_tools: Arc::clone(&self.unlocked_tools),
-            tasks: Arc::clone(&self.tasks),
-            inbox: Arc::clone(&self.inbox),
-            scheduler: Arc::clone(&self.scheduler),
-            background_executions: Arc::clone(&self.background_executions),
-            program_limits: self.program_limits,
-            skills: Arc::clone(&self.skills),
-            active_worktree: Arc::clone(&self.active_worktree),
-            surface: self.surface,
+            ..self.clone()
         }
     }
 
+    /// `Config::clone` under a name that cannot be confused with cloning the
+    /// `Arc<Config>` a test usually holds — `ctx.cfg.clone()` would hand back
+    /// another handle to the same Config, which is never what a test that is
+    /// about to tweak one field wants.
     #[cfg(test)]
     pub(crate) fn test_clone(&self) -> Self {
-        self.clone_with_provider_route(self.provider_route.clone())
+        self.clone()
     }
 
     #[cfg(test)]
@@ -683,5 +653,165 @@ impl Config {
             |active| active.system.clone(),
             |config| config.system.clone(),
         )
+    }
+}
+
+/// `subagent_from` inherits by default (`..self.clone()`), so what a child does
+/// NOT share is a short explicit list — and this is where that list is written
+/// down. A field added to `Config` later is inherited silently; if it is
+/// agent-local state, the assertion that says so belongs here.
+#[cfg(test)]
+mod subagent_contract_tests {
+    use super::*;
+    use crate::interaction::QuestionOutcome;
+    use crate::interaction::QuestionRequest;
+    use crate::interaction::Questioner;
+    use std::pin::Pin;
+
+    struct NeverAsked;
+    impl Questioner for NeverAsked {
+        fn ask(
+            &self,
+            _: QuestionRequest,
+        ) -> Pin<Box<dyn Future<Output = QuestionOutcome> + Send + '_>> {
+            unreachable!("the contract test never asks")
+        }
+    }
+
+    /// A parent whose every resettable field is visibly non-default, so a child
+    /// that wrongly inherited one would differ from the expected value rather
+    /// than happen to match it.
+    fn parent() -> Config {
+        let mut cfg = crate::tools::testutil::TestConfig::new("config-subagent-contract")
+            .context_window(Some(123_456))
+            .build()
+            .test_clone();
+        cfg.session_id = "sess-1".into();
+        cfg.questioner = Some(Arc::new(NeverAsked));
+        cfg.project_instructions = Some("parent instructions".into());
+        cfg.defer_threshold = 7;
+        cfg.surface = SurfaceCapabilities {
+            questions: true,
+            plan_control: true,
+            program: true,
+            workflow: true,
+            worktree: true,
+            scheduler: true,
+        };
+        cfg
+    }
+
+    /// The four carriers of "a child must not pollute its parent": each has to
+    /// be a NEW instance, not a shared handle.
+    #[test]
+    fn subagent_gets_fresh_agent_local_state() {
+        let parent = parent();
+        let child = parent.subagent_from(&parent.effective_workspace(), None, agent_id());
+
+        assert!(!Arc::ptr_eq(&parent.file_state, &child.file_state));
+        assert!(!Arc::ptr_eq(&parent.unlocked_tools, &child.unlocked_tools));
+        assert!(!Arc::ptr_eq(&parent.inbox, &child.inbox));
+        assert!(!Arc::ptr_eq(
+            &parent.active_worktree,
+            &child.active_worktree
+        ));
+    }
+
+    /// Everything else the child resets, by value.
+    #[test]
+    fn subagent_resets_its_own_identity_and_surface() {
+        let parent = parent();
+        let workspace = parent.effective_workspace();
+        let child = parent.subagent_from(&workspace, Some(3), agent_id());
+
+        assert_eq!(child.session_id, "sess-1-agent-7");
+        assert_eq!(child.agent_id().to_string(), "agent-7");
+        assert_eq!(child.parent_agent_id(), Some(parent.agent_id()));
+        assert_eq!(child.max_rounds, Some(3));
+        assert!(child.questioner.is_none());
+        assert_eq!(child.surface, SurfaceCapabilities::default());
+        assert_ne!(parent.surface, SurfaceCapabilities::default());
+        // The child is pinned to the ONE workspace generation the parent chose,
+        // not to whatever `self` reads at call time.
+        assert_eq!(child.system, workspace.system);
+        assert_eq!(child.cwd, workspace.cwd);
+        assert!(Arc::ptr_eq(&child.permissions, &workspace.permissions));
+        assert_eq!(
+            child.sandbox.as_ref().map(Arc::as_ptr),
+            workspace.sandbox.as_ref().map(Arc::as_ptr)
+        );
+        // Its route is its own child route, not the parent's frozen one.
+        assert_eq!(child.provider_route.primary_model(), "mock");
+    }
+
+    /// An ephemeral parent has no session file, so its child gets no derived id
+    /// either — `{parent}-{agent}` off an empty parent would be a fake session.
+    #[test]
+    fn subagent_of_an_unbound_session_stays_unbound() {
+        let mut parent = parent();
+        parent.session_id = String::new();
+        let child = parent.subagent_from(&parent.effective_workspace(), None, agent_id());
+        assert_eq!(child.session_id, "");
+        assert_eq!(child.cache_key(), None);
+    }
+
+    /// The default direction for a field nobody thought about: inherited. These
+    /// are the session services and settings a child is meant to share.
+    #[test]
+    fn subagent_inherits_every_shared_service_and_setting() {
+        let parent = parent();
+        let child = parent.subagent_from(&parent.effective_workspace(), None, agent_id());
+
+        assert!(Arc::ptr_eq(
+            &parent.provider_catalog,
+            &child.provider_catalog
+        ));
+        assert!(Arc::ptr_eq(&parent.permissions, &child.permissions));
+        assert!(Arc::ptr_eq(&parent.hooks, &child.hooks));
+        assert!(Arc::ptr_eq(
+            &parent.background_shells,
+            &child.background_shells
+        ));
+        assert!(Arc::ptr_eq(&parent.shell_programs, &child.shell_programs));
+        assert!(Arc::ptr_eq(
+            &parent.powershell_execution_gate,
+            &child.powershell_execution_gate
+        ));
+        assert!(Arc::ptr_eq(&parent.agent_types, &child.agent_types));
+        assert!(Arc::ptr_eq(&parent.tasks, &child.tasks));
+        assert!(Arc::ptr_eq(&parent.scheduler, &child.scheduler));
+        assert!(Arc::ptr_eq(
+            &parent.background_executions,
+            &child.background_executions
+        ));
+        assert!(Arc::ptr_eq(&parent.skills, &child.skills));
+
+        assert_eq!(child.project_instructions, parent.project_instructions);
+        assert_eq!(child.offload_dir, parent.offload_dir);
+        assert_eq!(child.sessions_dir, parent.sessions_dir);
+        assert_eq!(child.context_window, parent.context_window);
+        assert_eq!(child.defer_threshold, parent.defer_threshold);
+        assert_eq!(child.tool_allowlist, parent.tool_allowlist);
+        assert_eq!(child.tool_sources.len(), parent.tool_sources.len());
+    }
+
+    /// A route swap changes exactly one field and shares everything else — a
+    /// `/model` mid-session must not hand the session a new inbox or file state.
+    #[test]
+    fn provider_route_clone_changes_only_the_route() {
+        let cfg = parent();
+        let swapped = cfg.clone_with_provider_route(cfg.provider_route.clone());
+
+        assert!(Arc::ptr_eq(&cfg.file_state, &swapped.file_state));
+        assert!(Arc::ptr_eq(&cfg.inbox, &swapped.inbox));
+        assert!(Arc::ptr_eq(&cfg.unlocked_tools, &swapped.unlocked_tools));
+        assert!(Arc::ptr_eq(&cfg.active_worktree, &swapped.active_worktree));
+        assert_eq!(swapped.session_id, cfg.session_id);
+        assert_eq!(swapped.surface, cfg.surface);
+        assert!(swapped.questioner.is_some());
+    }
+
+    fn agent_id() -> kloop_protocol::LocalAgentId {
+        "agent-7".parse().unwrap()
     }
 }

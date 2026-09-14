@@ -2153,7 +2153,6 @@ mod tests {
     /// restart (drop + reload), and a second turn appending to the same file.
     #[tokio::test]
     async fn agent_turn_resumes_across_a_restart() {
-        use crate::Config;
         use crate::agent::{EndReason, Ui, run_turn};
         use crate::history::History;
         use kloop_provider::Provider;
@@ -2165,54 +2164,10 @@ mod tests {
             fn emit(&self, _: &crate::event::Event) {}
         }
         let cfg_with = |provider: Provider, dir: &Path| {
-            let (provider_catalog, provider_route) =
-                crate::provider_route::ProviderCatalog::from_provider(
-                    "test",
-                    provider,
-                    "mock",
-                    vec!["mock".into()],
-                    None,
-                )
-                .unwrap();
-            let inbox = Arc::new(crate::inbox::Inbox::default());
-            Arc::new(Config {
-                provider_catalog,
-                provider_route,
-                system: "test".into(),
-                project_instructions: None,
-                max_rounds: Some(5),
-                cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                offload_dir: dir.to_path_buf(),
-                sessions_dir: dir.to_path_buf(),
-                context_window: None,
-                permissions: Arc::new(crate::permissions::Permissions::allow_all()),
-                questioner: None,
-                file_state: Default::default(),
-                tool_sources: Vec::new(),
-                session_id: String::new(),
-                local_agent: crate::agent_mailbox::LocalAgentContext::root(Arc::clone(&inbox)),
-                hooks: std::sync::Arc::new(crate::hooks::Hooks::none()),
-                background_shells: crate::tools::BackgroundShells::new(),
-                shell_programs: std::sync::Arc::new(
-                    crate::shell_programs::ShellPrograms::test_fixture(),
-                ),
-                powershell_execution_gate: Default::default(),
-                sandbox: None,
-                agent_types: Arc::new(Vec::new()),
-                tool_allowlist: None,
-                defer_threshold: 30,
-                unlocked_tools: Default::default(),
-                tasks: Default::default(),
-                inbox: Arc::clone(&inbox),
-                scheduler: crate::scheduler::Scheduler::in_memory(inbox),
-                background_executions: Default::default(),
-                program_limits: Default::default(),
-                skills: Default::default(),
-                active_worktree: std::sync::Arc::new(
-                    crate::worktree::ActiveWorktreeState::default(),
-                ),
-                surface: Default::default(),
-            })
+            crate::tools::testutil::TestConfig::new("rollout-restart")
+                .provider(provider)
+                .dirs(dir)
+                .build()
         };
         let path = temp_file("restart");
         let dir = path.parent().unwrap().to_path_buf();
