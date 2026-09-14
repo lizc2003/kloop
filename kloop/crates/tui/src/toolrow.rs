@@ -81,10 +81,10 @@ fn tool_mark(status: ToolStatus) -> (&'static str, Color) {
     }
 }
 
-/// Map a tool call to a human verb and a one-line argument detail. Well-known
-/// tools get a friendly verb and their key argument; anything else (MCP
-/// `server__tool`, less common builtins) keeps its raw name with the input
-/// compacted to one line.
+/// Map a tool call to a human verb and a one-line argument detail. Every
+/// built-in has an arm (`every_builtin_tool_has_a_row_of_its_own` guards that);
+/// the fallback is for source tools — an MCP `server__tool` keeps the name the
+/// user configured, with its input compacted to one line.
 fn tool_label(name: &str, input: &str) -> (String, String) {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -112,6 +112,17 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
             ("Write".into(), format!("{} ({n} lines)", path_of(&v)))
         }
         "edit_file" => ("Edit".into(), path_of(&v)),
+        "notebook_edit" => {
+            let mode = v
+                .get("edit_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("replace");
+            let path = v
+                .get("notebook_path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            ("Notebook".into(), format!("{path} ({mode})"))
+        }
         "grep" => {
             let pat = s("pattern");
             match v.get("path").and_then(Value::as_str) {
@@ -157,6 +168,61 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "stop_workflow" => ("Stop Workflow".into(), s("workflow_id")),
         "tool_search" => ("ToolSearch".into(), s("query")),
         "skill" => ("Skill".into(), s("name")),
+        // The mailbox: who it goes to, and the summary the sender wrote for
+        // exactly this kind of one-line preview.
+        "send_message" => {
+            let to = s("to");
+            let summary = s("summary");
+            let detail = if summary.is_empty() {
+                to
+            } else {
+                format!("{to}  {summary}")
+            };
+            ("Message".into(), detail)
+        }
+        "list_agents" => ("List Agents".into(), String::new()),
+        "task_create" => ("Task create".into(), s("subject")),
+        "task_get" => ("Task get".into(), s("task_id")),
+        "task_update" => ("Task update".into(), s("task_id")),
+        "task_list" => ("Task list".into(), String::new()),
+        "task_clear" => ("Task clear".into(), String::new()),
+        "cron_create" => ("Cron create".into(), s("cron")),
+        "cron_delete" => ("Cron delete".into(), s("id")),
+        "cron_list" => ("Cron list".into(), String::new()),
+        "schedule_wakeup" => {
+            let detail = if v.get("stop").and_then(Value::as_bool).unwrap_or(false) {
+                "stop".into()
+            } else {
+                let delay = v
+                    .get("delay_seconds")
+                    .and_then(Value::as_f64)
+                    .map(|seconds| format!("{}s", seconds.round() as i64))
+                    .unwrap_or_default();
+                format!("{delay}  {}", s("reason")).trim().to_string()
+            };
+            ("Schedule wakeup".into(), detail)
+        }
+        // The first question is the one the user is about to read; the rest of
+        // the panel is not a transcript row's job.
+        "ask_user_question" => {
+            let first = v
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|questions| questions.first())
+                .and_then(|question| question.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ("Ask".into(), first.to_string())
+        }
+        "enter_plan_mode" => ("Enter plan mode".into(), String::new()),
+        // The plan itself is the result preview under the row, not the detail.
+        "exit_plan_mode" => ("Exit plan mode".into(), String::new()),
+        "enter_worktree" => {
+            let name = s("name");
+            let detail = if name.is_empty() { s("path") } else { name };
+            ("Enter worktree".into(), detail)
+        }
+        "exit_worktree" => ("Exit worktree".into(), s("action")),
         // call_tool wraps a real tool name; show that so the row reads as the
         // tool it actually runs.
         "call_tool" => {
@@ -528,6 +594,108 @@ mod tests {
         for (name, input, expected) in rows {
             let lines = tool_cell_lines(name, input, ToolStatus::Ok, None, 80);
             assert_eq!(text(&lines[0]), expected);
+        }
+    }
+
+    /// The rows that used to fall through to the raw-name fallback: a session
+    /// tool rendered as `task_create {"subject":"…","description":"…"}` told the
+    /// user less than its own name would have.
+    #[test]
+    fn session_tools_render_as_a_verb_and_the_thing_they_act_on() {
+        let rows = [
+            (
+                "notebook_edit",
+                r#"{"notebook_path":"analysis.ipynb","cell_id":"c1","new_source":"1+1"}"#,
+                "✓ Notebook analysis.ipynb (replace)",
+            ),
+            (
+                "notebook_edit",
+                r#"{"notebook_path":"analysis.ipynb","edit_mode":"insert","cell_type":"code","new_source":"1+1"}"#,
+                "✓ Notebook analysis.ipynb (insert)",
+            ),
+            (
+                "send_message",
+                r#"{"to":"agent-2","summary":"close race","message":"the long body"}"#,
+                "✓ Message agent-2  close race",
+            ),
+            (
+                "send_message",
+                r#"{"to":"main","message":"the long body"}"#,
+                "✓ Message main",
+            ),
+            ("list_agents", "{}", "✓ List Agents"),
+            (
+                "task_create",
+                r#"{"subject":"drain the queue","description":"the long instructions"}"#,
+                "✓ Task create drain the queue",
+            ),
+            ("task_get", r#"{"task_id":"3"}"#, "✓ Task get 3"),
+            (
+                "task_update",
+                r#"{"task_id":"3","status":"completed"}"#,
+                "✓ Task update 3",
+            ),
+            ("task_list", "{}", "✓ Task list"),
+            ("task_clear", "{}", "✓ Task clear"),
+            (
+                "cron_create",
+                r#"{"cron":"0 9 * * 1","prompt":"weekly sweep"}"#,
+                "✓ Cron create 0 9 * * 1",
+            ),
+            ("cron_delete", r#"{"id":"cron-2"}"#, "✓ Cron delete cron-2"),
+            ("cron_list", "{}", "✓ Cron list"),
+            (
+                "schedule_wakeup",
+                r#"{"delay_seconds":1200,"reason":"watching CI","prompt":"/loop check"}"#,
+                "✓ Schedule wakeup 1200s  watching CI",
+            ),
+            (
+                "schedule_wakeup",
+                r#"{"stop":true}"#,
+                "✓ Schedule wakeup stop",
+            ),
+            (
+                "ask_user_question",
+                r#"{"questions":[{"question":"Which rail?","header":"Rail","options":[]}]}"#,
+                "✓ Ask Which rail?",
+            ),
+            ("enter_plan_mode", "{}", "✓ Enter plan mode"),
+            (
+                "exit_plan_mode",
+                r#"{"plan":"a very long markdown plan"}"#,
+                "✓ Exit plan mode",
+            ),
+            (
+                "enter_worktree",
+                r#"{"name":"feature-x"}"#,
+                "✓ Enter worktree feature-x",
+            ),
+            (
+                "enter_worktree",
+                r#"{"path":".kloop/worktrees/old"}"#,
+                "✓ Enter worktree .kloop/worktrees/old",
+            ),
+            (
+                "exit_worktree",
+                r#"{"action":"remove","discard_changes":true}"#,
+                "✓ Exit worktree remove",
+            ),
+        ];
+        for (name, input, expected) in rows {
+            let lines = tool_cell_lines(name, input, ToolStatus::Ok, None, 80);
+            assert_eq!(text(&lines[0]), expected, "{name}");
+        }
+    }
+
+    /// The fallback arm — raw name plus compacted JSON — is right for an MCP
+    /// tool the user named themselves and wrong for every built-in. Nothing
+    /// here is exempt: the guard walks the catalog, so a built-in added later
+    /// fails this test until it has a row of its own.
+    #[test]
+    fn every_builtin_tool_has_a_row_of_its_own() {
+        for name in kloop_core::tools::builtin_tool_names() {
+            let (verb, _) = tool_label(name, "{}");
+            assert_ne!(verb, name, "{name} renders as its raw name");
         }
     }
 

@@ -150,3 +150,54 @@ plan 的三分之一,**算进去**。
 - `toolrow` 守卫测试通过;
 - `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
   `cargo test --workspace` 三条各自单独跑、当场取退出码(HANDOFF 111(b2))。
+
+---
+
+## ✅ 已完成(2026-09-14;提交 SHA 以本条所在提交为准)
+
+新增 `crates/core/src/tools/builtin.rs`(905 行):`Builtin` 枚举 36 个变体 + `ALL`(wire
+顺序)+ `from_name`/`name`/`gate`/`in_catalog`/`in_surface`/`def`/`concurrency_safe`/
+`readonly`/`title`。七处并行 `match` 收敛成:
+
+| 原位置 | 现在 |
+|---|---|
+| `builtin_defs` 的 `vec![…]` + `retain` + depth 分支 | 遍历 `ALL`,按 `Gate` 过滤;def 字面量搬进 `builtin.rs`(shell 门成 `Gate::Shell`,windows bash 补丁进 `bash_def()`) |
+| `all_tool_defs` 的六段 `if surface.x { push… }` | 遍历 `ALL`,按 `Gate::Surface` 过滤 |
+| `is_concurrency_safe` 的名字 `match` | `Builtin::concurrency_safe`,未命中才走 source |
+| `CallFacts::is_readonly` 的名字 `match` | `Builtin::readonly(&CallFacts)`;`permissions.rs` 只剩 `list_mcp_resources` 一句 |
+| `execute_tool` 的名字 `match` | 对 `Builtin` 穷尽 `match`,`unknown tool` 只剩非内置那一支 |
+| `tool_title` 的 8 个名字 | `Builtin::title()`(36 个全有人类名),`permissions.rs` 只剩两个 web 工具 |
+| `toolrow.rs` | 不入 enum(展示逻辑要服务 MCP),补齐 17 个缺失行 + 守卫测试 |
+
+**第二节四条不一致的归宿**:
+
+1. `run_program` 并发 —— 开工时问用户,拍板**与 `workflow` 一致(可并发)**。这是本 plan
+   唯一的运行时行为变化。
+2. 四个会话状态工具 —— `concurrency_safe` 里显式 `false`,附理由("两个在同一批次里会
+   争这一轮剩下部分跑在哪个模式/哪个 worktree 里")。行为不变,但从此是写下来的判断。
+3. `toolrow` 缺 17 行 —— 全部补齐(`notebook_edit`、`send_message`、`list_agents`、
+   `task_*`×5、`cron_*`×3、`schedule_wakeup`、`ask_user_question`、`enter/exit_plan_mode`、
+   `enter/exit_worktree`),无豁免名单;`every_builtin_tool_has_a_row_of_its_own` 守卫。
+4. `tool_title` 只覆盖 8 个 —— 36 个内置全部有人类名;MCP 透传保持不变,
+   `web_fetch`/`web_search` 作为 kloop 自己命名的 source 工具保留显式条目。
+
+**顺带查出并修掉的真 bug(不在原 plan 内)**:`reserved_names()` 里**没有
+`run_program` / `stop_program`**。它原本 = `tool_defs(0)` 派生 + 一张手写的 surface 清
+单,而 plan 113 把这两个工具从目录挪进 surface 尾巴时没人动那张手写清单 —— 于是一个
+MCP server 可以注册名为 `run_program` 的工具,`merged_source_defs` 会把它合进目录(同名
+两份定义),`find_source_slot` 也会把它认成 source。新写的完备性测试当场撞红。修法不是
+补两个名字,是**整张表改从 `builtin::ALL` 派生**,手写的那一半连同"两个 shell 都假装可
+用"的构造 hack 一起删掉。
+
+**验收**:
+- `builtin_all_is_complete`(长度 36 + 往返 + 去重)、`every_definition_names_its_own_variant`、
+  `every_builtin_has_a_human_title`;
+- `the_tool_array_keeps_its_wire_order`:depth 0 全开 / depth 1 / depth 0 全关三条 name
+  序列逐字锁定。改造前另外 dump 过**完整** ToolDef(name + description + schema pretty),
+  改造后 `diff` 逐字节相同 —— prompt cache 的字节契约没动;
+- `session_tools_render_as_a_verb_and_the_thing_they_act_on`(21 条)+
+  `every_builtin_tool_has_a_row_of_its_own`;
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+  `cargo test --workspace` 三条各自单独跑,退出码 0。
+
+**非目标照旧未做**:没拆 `run_one`/`turn_rounds`(plan 142),没动 `ToolSource` 那一侧。

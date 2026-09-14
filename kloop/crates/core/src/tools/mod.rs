@@ -6,6 +6,7 @@
 mod agent_message;
 mod background_executions;
 mod bash;
+mod builtin;
 mod codemode;
 mod fs;
 mod inject;
@@ -44,6 +45,8 @@ mod worktree_tool;
 pub use background_executions::BackgroundExecutions;
 pub use background_executions::ExecutionStatus;
 pub use bash::BackgroundShells;
+pub(crate) use builtin::Builtin;
+pub use builtin::builtin_tool_names;
 pub(crate) use codemode::ProgramToolManifest;
 pub(crate) use codemode::capture_program_tool_manifest;
 pub use tool_search::DeferredToolUnlocks;
@@ -73,7 +76,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use serde_json::Value;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Ui;
@@ -377,54 +379,36 @@ pub fn all_tool_defs(
         defs.push(tool_search::call_tool_def());
     }
     defs.extend(inline_sources.iter().cloned());
-    // run_program is depth-0 only (like run_agent). Now that sources are visible, its
-    // TypeScript API can list them: full declarations for inline source tools
-    // (typed `Promise<CallToolResult>`), or a compact manifest for deferred
-    // ones — both callable at runtime.
+    // The surface-gated block is depth-0 only (like run_agent) and rides on
+    // what the front-end enables. It is appended after the source defs because
+    // run_program's generated TypeScript API lists them: full declarations for
+    // inline source tools (typed `Promise<CallToolResult>`), a compact manifest
+    // for deferred ones — both callable at runtime.
+    //
+    // Walking `builtin::ALL` rather than pushing group by group is what keeps
+    // this honest: a new surface-gated tool is offered because it declared a
+    // gate, not because someone remembered to add a `push` here. The walk order
+    // is `ALL`'s order, which is the wire order — see [`builtin::ALL`].
     if depth == 0 {
-        // The QuickJS engine keeps one model-facing door, and by default that is
-        // `workflow`. `run_program` returns only when this capability is enabled,
-        // and `stop_program` rides with it because it has nothing to stop without
-        // it. Nothing is deleted: the engine, `CoreBridge` and the journal are
-        // untouched, so flipping the flag restores the previous surface exactly.
-        if surface.program {
-            defs.push(codemode::run_program_def(
-                &builtin_defs(0, shell_programs),
-                &inline_sources,
-                &deferred,
-            ));
-            defs.push(stop_program_def());
-        }
-        if surface.scheduler {
-            defs.push(scheduler::cron_create_def());
-            defs.push(scheduler::cron_delete_def());
-            defs.push(scheduler::cron_list_def());
-            defs.push(scheduler::schedule_wakeup_def());
-        }
-        // General questions are a user-interaction surface, not a permission
-        // prompt. Kept out of run_program's tools API and limited to depth 0.
-        if surface.questions {
-            defs.push(question::ask_user_question_def());
-        }
-        // Plan controls are advertised together so the request's tool array stays
-        // byte-stable while the session mode changes. Both are depth-0 only and
-        // intentionally absent from run_program's generated TypeScript API.
-        if surface.plan_control {
-            defs.push(plan_mode::enter_plan_mode_def());
-            defs.push(plan_mode::exit_plan_mode_def());
-        }
-        if surface.workflow {
-            defs.push(workflow::workflow_def());
-            defs.push(workflow::stop_workflow_def());
-        }
-        // Session worktree tools (plan 35 slice 2): only when the front-end
-        // enables worktree mode (CLI/TUI/plain — not server threads or --mock),
-        // and only top-level (a sub-agent isolates via run_agent {isolation}). Kept
-        // out of run_program's TS API and the deferral count on purpose.
-        if surface.worktree {
-            defs.push(worktree_tool::enter_worktree_def());
-            defs.push(worktree_tool::exit_worktree_def());
-        }
+        // Only run_program's definition reads the catalogs, and that surface is
+        // off by default — rebuilding three dozen schemas for a request that
+        // does not offer it would be pure waste.
+        let program_builtins = if surface.program {
+            builtin_defs(0, shell_programs)
+        } else {
+            Vec::new()
+        };
+        let cx = builtin::DefCx {
+            builtins: &program_builtins,
+            inline_sources: &inline_sources,
+            deferred_sources: &deferred,
+        };
+        defs.extend(
+            builtin::ALL
+                .iter()
+                .filter(|tool| tool.in_surface(surface))
+                .map(|tool| tool.def(&cx)),
+        );
     }
     defs
 }
@@ -469,10 +453,12 @@ fn partition_source_defs(
     })
 }
 
-/// Every name an external source may not claim: the built-in catalog (derived
-/// from [`tool_defs`], so it cannot drift from what is actually registered),
-/// the session-control surface, and the retired built-ins — kept reserved so an
-/// MCP tool cannot impersonate an old call replayed out of resumed history.
+/// Every name an external source may not claim: every built-in ([`builtin::ALL`],
+/// so it cannot drift from what is actually offered — including the
+/// surface-gated ones a host may not enable and the shells a host may not
+/// have), the structured-output protocol tool, and the retired built-ins, kept
+/// reserved so an MCP tool cannot impersonate an old call replayed out of
+/// resumed history.
 ///
 /// Derived once. The derivation is what keeps the list honest, but paying for
 /// it per lookup meant rebuilding a dozen `json!` schemas just to read their
@@ -480,59 +466,26 @@ fn partition_source_defs(
 fn reserved_names() -> &'static std::collections::HashSet<String> {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
         std::sync::LazyLock::new(|| {
-            // Both shells claimed available, so the catalog is its widest: a
-            // name must stay reserved on a host where its tool is not offered.
-            let mut names: std::collections::HashSet<String> = tool_defs(
-                0,
-                &ShellPrograms {
-                    bash: Some(crate::shell_programs::ShellProgram {
-                        executable: "reserved-bash".into(),
-                        flavor: crate::shell_programs::ShellFlavor::GitBash,
-                    }),
-                    powershell: Some(crate::shell_programs::ShellProgram {
-                        executable: "reserved-powershell".into(),
-                        flavor: crate::shell_programs::ShellFlavor::PowerShell7,
-                    }),
-                },
-            )
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
-            names.extend(
-                [
-                    "bash",
-                    "bash_output",
-                    "stop_bash",
-                    "powershell",
-                    // Retired built-ins stay reserved so an MCP tool cannot
-                    // impersonate an old call from resumed history before the
-                    // migration error fires.
-                    "task",
-                    "wait",
-                    "kill_bash",
-                    "todo_write",
-                    // Session-control surface: capability-gated per frontend, so
-                    // these are absent from the catalog above even at depth 0.
-                    "skill",
-                    "tool_search",
-                    "call_tool",
-                    "ask_user_question",
-                    "enter_plan_mode",
-                    "exit_plan_mode",
-                    "workflow",
-                    "stop_workflow",
-                    "enter_worktree",
-                    "exit_worktree",
-                    "structured_output",
-                    "cron_create",
-                    "cron_delete",
-                    "cron_list",
-                    "schedule_wakeup",
-                ]
-                .into_iter()
-                .map(String::from),
-            );
-            names
+            builtin::ALL
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .chain(
+                    [
+                        // An internal completion protocol, appended past every
+                        // catalog and filter — never a configurable tool.
+                        "structured_output",
+                        // Retired built-ins stay reserved so an MCP tool cannot
+                        // impersonate an old call from resumed history before
+                        // the migration error fires.
+                        "task",
+                        "wait",
+                        "kill_bash",
+                        "todo_write",
+                    ]
+                    .into_iter()
+                    .map(String::from),
+                )
+                .collect()
         });
     &NAMES
 }
@@ -683,253 +636,19 @@ fn source_route_state(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceRout
 }
 
 /// The built-in tool defs (bash, file, search, and — at depth 0 — tasks plus
-/// `run_agent`). This is the set `run_program` derives its TypeScript API from, so
-/// it deliberately excludes `run_program` itself: no self-reference, and no
-/// throwaway description regeneration when only counting is needed.
+/// `run_agent`): every [`builtin::Builtin`] whose gate puts it in the catalog.
+/// This is the set `run_program` derives its TypeScript API from, so it
+/// excludes `run_program` itself — structurally, because that tool's gate is a
+/// surface capability, not by a hand-kept omission that could rot: no
+/// self-reference, and no throwaway description regeneration when only counting
+/// is needed.
 fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
-    let mut defs = vec![
-        ToolDef {
-            name: "bash".into(),
-            description: "Run a shell command with `sh -lc`. Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-N id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network access; a failure that looks sandbox-caused is annotated in the result.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The command to run"},
-                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
-                    "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-N id and output file path (default false)"},
-                    "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "bash_output".into(),
-            description: "Retrieve the status and output of a background bash command. Blocks until it finishes by default (up to timeout_ms); pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"},
-                    "block": {"type": "boolean", "description": "Wait for completion (default true)"},
-                    "timeout_ms": {"type": "integer", "description": "Max wait when blocking (default 30000, max 600000)"}
-                },
-                "required": ["bash_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "stop_bash".into(),
-            description: "Stop a running background bash command by its bg-N id; terminates the whole owned process tree. Any other resource id is rejected with a directed correction.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"}
-                },
-                "required": ["bash_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "powershell".into(),
-            description: "Run a foreground PowerShell command on native Windows with a fixed non-interactive, no-profile encoded invocation. PowerShell is treated as opaque and normally requires approval. Default timeout 60s; background execution and Windows shell sandboxing are unavailable.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The original PowerShell script to run"},
-                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000)"}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "read_file".into(),
-            description: "Read a file. Raw input is limited to 5 MiB for text and images, or 10 MiB for lowercase `.ipynb` notebooks. Text files return numbered lines formatted as `{n}\\t{line}` with a bounded character budget; use offset/limit to page. Jupyter notebooks return cell-aware `<cell id=\"…\">` content and code outputs, including image blocks. Empty files and offsets past EOF return explicit warnings. Image files (png, jpeg, gif, webp) are returned as an image you can see — offset/limit do not apply. PDFs return an explicit unsupported error.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Line number to start from (default 1; 0 is accepted for compatibility)"},
-                    "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return (omit or pass 0 for all lines within the character budget)"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDef {
-            name: "write_file".into(),
-            description: "Write the provided full content to a file. A new file safely creates missing parent directories only after approval. Overwriting an existing file requires a complete, fresh read in this session, then replaces it atomically with the provided content exactly as given.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolDef {
-            name: "edit_file".into(),
-            description: "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The entire file must have been freshly read in this session. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
-                },
-                "required": ["path", "old_string", "new_string"]
-            }),
-        },
-        ToolDef {
-            name: "notebook_edit".into(),
-            description: "Replaces, inserts, or deletes a single cell in a Jupyter notebook (.ipynb file).\n\nUsage:\n- You must use the read_file tool on the notebook in this conversation before editing — this tool will fail otherwise.\n- `notebook_path` must be an absolute path.\n- `cell_id` is the `id` attribute shown in the read_file tool's `<cell id=\"...\">` output. It is required for `replace` and `delete`.\n- `edit_mode` defaults to `replace`. Use `insert` to add a new cell after the cell with the given `cell_id` (or at the beginning of the notebook if `cell_id` is omitted) — `cell_type` is required when inserting. Use `delete` to remove the cell.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "notebook_path": {
-                        "type": "string",
-                        "description": "The absolute path to the Jupyter notebook file to edit (must be absolute, not relative)"
-                    },
-                    "cell_id": {
-                        "type": "string",
-                        "description": "The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID, or at the beginning if not specified."
-                    },
-                    "new_source": {
-                        "type": "string",
-                        "description": "The new source for the cell"
-                    },
-                    "cell_type": {
-                        "type": "string",
-                        "enum": ["code", "markdown"],
-                        "description": "The type of the cell (code or markdown). If not specified, it defaults to the current cell type. If using edit_mode=insert, this is required."
-                    },
-                    "edit_mode": {
-                        "type": "string",
-                        "enum": ["replace", "insert", "delete"],
-                        "description": "The type of edit to make (replace, insert, delete). Defaults to replace."
-                    }
-                },
-                "required": ["notebook_path", "new_source"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "grep".into(),
-            description: "Search file contents with a regular expression (ripgrep-style; Rust regex syntax, no backreferences/lookaround). Respects .gitignore, searches hidden files, skips binary files; prefer this over grep/rg in bash. Results cap at head_limit; page with offset.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regular expression to search for"},
-                    "path": {"type": "string", "description": "File or directory to search (default: current directory)"},
-                    "glob": {"type": "string", "description": "Filter files with a glob, e.g. \"*.rs\" or \"*.{ts,tsx}\""},
-                    "type": {"type": "string", "description": "Filter by file type, e.g. rust, js, py, go"},
-                    "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"], "description": "files_with_matches: file paths newest-first (default); content: matching lines as path:line:text; count: per-file match counts"},
-                    "-i": {"type": "boolean", "description": "Case-insensitive (default false)"},
-                    "-n": {"type": "boolean", "description": "Show line numbers in content mode (default true)"},
-                    "-A": {"type": "integer", "minimum": 0, "description": "Lines shown after each match (content mode only)"},
-                    "-B": {"type": "integer", "minimum": 0, "description": "Lines shown before each match (content mode only)"},
-                    "-C": {"type": "integer", "minimum": 0, "description": "Lines shown before and after each match (content mode only; overrides -A/-B)"},
-                    "-o": {"type": "boolean", "description": "Print only matched non-empty text (content mode only; default false)"},
-                    "head_limit": {"type": "integer", "minimum": 0, "description": "Max results returned (default 250, 0 = unlimited)"},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Skip this many results before head_limit applies (default 0)"},
-                    "multiline": {"type": "boolean", "description": "Patterns may span lines and . matches newlines (default false)"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDef {
-            name: "glob".into(),
-            description: "Find files by glob pattern, e.g. \"**/*.rs\", \"src/*.ts\" or \"*.{js,json}\" (gitignore-style: a bare name matches at any depth). Respects .gitignore. Returns paths sorted by modification time, newest first, capped at 100.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern to match file paths against"},
-                    "path": {"type": "string", "description": "Directory to search in (default: current directory)"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-    ];
-    defs.retain(|definition| match definition.name.as_str() {
-        "bash" | "bash_output" | "stop_bash" => shell_programs.bash_available(),
-        "powershell" => cfg!(windows) && shell_programs.powershell_available(),
-        _ => true,
-    });
-    #[cfg(windows)]
-    if let Some(bash) = defs.iter_mut().find(|definition| definition.name == "bash") {
-        bash.description = "Run a command with the validated Git for Windows `bash.exe -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands set background=true. Windows Job Object containment owns the full process tree; filesystem/network sandboxing is not implemented. Prefer forward slashes inside Bash commands.".into();
-        bash.schema["properties"]
-            .as_object_mut()
-            .expect("bash properties are an object")
-            .remove("disable_sandbox");
-    }
-    // Local Agent mailbox tools remain available at every depth. The session
-    // task graph is root-owned even though child Configs retain the same Arc.
-    if depth == 0 {
-        defs.extend(task::tool_defs());
-    }
-    defs.extend(agent_message::tool_defs());
-    if depth == 0 {
-        defs.push(ToolDef {
-            name: "run_agent".into(),
-            description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Dispatch one only when the user, an AGENTS.md file, or a skill asks for delegation, and give it the part you are not doing yourself: a sub-agent that restates your own task costs several times what doing it yourself costs and returns little you would not have found. Use bash for fixed tool/code batching (a shell one-liner or `python3 -c` beats a wrapper), and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes the prompt or result."},
-                    "prompt": {"type": "string", "description": "Complete standalone work description"},
-                    "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
-                    "model": {"type": ["string", "null"], "minLength": 1, "pattern": ".*\\S.*", "description": "Optional model override on this sub-agent's inherited frozen provider; it must be in that provider's model allowlist"},
-                    "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
-                    "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}
-                },
-                "required": ["prompt"],
-                "additionalProperties": false
-            }),
-        });
-        defs.push(ToolDef {
-            name: "wait_for_activity".into(),
-            description: "Wait once for any background shell, Agent, Program, or Workflow activity when the caller truly needs to block. Pending inbox input also wakes it. Takes no resource ID and never reads or drains a result; results are delivered automatically at the next step/final/idle boundary even if this tool is never called. A timeout is not a background failure and consumes nothing. Do not call repeatedly as a status/output polling loop.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "timeout_ms": {"type": "integer", "description": "Max wait (default 30000, min 10000, max 3600000)"}
-                },
-                "additionalProperties": false
-            }),
-        });
-        defs.push(ToolDef {
-            name: "stop_agent".into(),
-            description: "Stop a running background agent by its agent-N id. It ends without reporting a result. Use stop_program for program-N, stop_workflow for workflow-N, or stop_bash for bg-N.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {"type": "string", "description": "The agent-N id from run_agent with background=true"}
-                },
-                "required": ["agent_id"],
-                "additionalProperties": false
-            }),
-        });
-    }
-    defs
-}
-
-/// Kept out of [`builtin_defs`] so it rides the same surface flag as
-/// `run_program`: without that tool there is no `program-N` to stop.
-fn stop_program_def() -> ToolDef {
-    ToolDef {
-        name: "stop_program".into(),
-        description: "Stop a running background code-mode program by its program-N id. It ends without reporting a result. Use stop_agent for agent-N, stop_workflow for workflow-N, or stop_bash for bg-N; this is not a durable run_id.".into(),
-        schema: json!({
-            "type": "object",
-            "properties": {
-                "program_id": {"type": "string", "description": "The program-N id from run_program with background=true"}
-            },
-            "required": ["program_id"],
-            "additionalProperties": false
-        }),
-    }
+    let cx = builtin::DefCx::default();
+    builtin::ALL
+        .iter()
+        .filter(|tool| tool.in_catalog(depth, shell_programs))
+        .map(|tool| tool.def(&cx))
+        .collect()
 }
 
 /// What tool-counting (`defer_active`, `tool_merge_warnings`) sees: the built-ins
@@ -944,49 +663,15 @@ pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
     builtin_defs(depth, shell_programs)
 }
 
-/// Concurrency safety by name AND input: read-only tools are always safe,
-/// bash is safe only when the parsed command sequence is word-only and every
-/// argv is a known read-only command (same analysis the permission gate
-/// uses — safe-to-parallelize and safe-to-run are two verdicts over one
-/// decomposition). External tools are safe only when their source marks them
-/// read-only; built-in names shadow sources here exactly as they do in
-/// dispatch.
+/// Concurrency safety by name AND input. Built-ins answer for themselves
+/// ([`Builtin::concurrency_safe`]); external tools are safe only when their
+/// source marks them read-only. Built-in names shadow sources here exactly as
+/// they do in dispatch — a source cannot claim a reserved name in the first
+/// place.
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
-    match name {
-        "read_file" | "grep" | "glob" => true,
-        // These inspect or signal resources already created by a gated call.
-        "bash_output" | "stop_bash" => true,
-        // tool_search grows the capability store. Keep it as an ordering barrier
-        // so a following read-only deferred call deterministically observes the
-        // receipt while a preceding call deterministically remains locked.
-        "tool_search" => false,
-        // skill only reads a skill file and returns its expanded body — pure,
-        // no shared-state races (side effects come from tools the returned
-        // instructions later prompt, gated individually).
-        "skill" => true,
-        "bash" => {
-            input["command"]
-                .as_str()
-                .is_some_and(|cmd| match crate::shell::analyze_bash(cmd) {
-                    crate::shell::BashAnalysis::Commands(cmds) => {
-                        !cmds.is_empty() && cmds.iter().all(|c| crate::shell::argv_is_readonly(c))
-                    }
-                    crate::shell::BashAnalysis::Opaque => false,
-                })
-        }
-        "ask_user_question" | "workflow" | "cron_list" | "list_agents" | "task_get"
-        | "task_list" => true,
-        "send_message" | "cron_create" | "cron_delete" | "schedule_wakeup" | "task_create"
-        | "task_update" | "task_clear" => false,
-        // Consecutive run_agent calls may run in parallel; child tool calls are
-        // still gated independently.
-        "run_agent" => true,
-        // Resource-specific stops only signal an owned cancellation token.
-        // wait_for_activity blocks, so it must run alone.
-        "stop_agent" | "stop_program" | "stop_workflow" => true,
-        "wait_for_activity" => false,
-        "powershell" | "write_file" | "edit_file" | "notebook_edit" => false,
-        other => find_source(sources, other).is_some_and(|s| s.is_readonly(other)),
+    match Builtin::from_name(name) {
+        Some(builtin) => builtin.concurrency_safe(input),
+        None => find_source(sources, name).is_some_and(|source| source.is_readonly(name)),
     }
 }
 
@@ -1451,53 +1136,14 @@ fn execute_tool<'a>(
     workspace: &'a EffectiveWorkspace,
 ) -> Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>> {
     Box::pin(async move {
-        // read_file is the sole BUILT-IN that can return non-text: on an image
-        // file it returns an image block (ToolResultContent::Blocks).
-        if name == "read_file" {
-            let Some(prepared) = prepared.read else {
-                return ToolExecution::from_result(Err(anyhow!(
-                    "read_file: target was not prepared"
-                )));
+        let Some(builtin) = Builtin::from_name(name) else {
+            // Not a built-in, so it is an external source tool — which may also
+            // return images, hence the same non-text path the file reads take.
+            // A source can never claim a built-in name (`reserved_names`), so
+            // this branch and the match below cannot both be right for one call.
+            let Some(binding) = prepared.source else {
+                return ToolExecution::from_result(Err(anyhow!("unknown tool: {name}")));
             };
-            let state = Arc::clone(&workspace.file_state);
-            return match fs::read_file_tool(input, prepared).await {
-                Ok(output) => ToolExecution {
-                    result: Ok(output.content),
-                    file_state_update: Some((state, output.state_update)),
-                    path_lock: None,
-                },
-                Err(error) => ToolExecution::from_result(Err(error)),
-            };
-        }
-        if matches!(name, "write_file" | "edit_file" | "notebook_edit") {
-            let Some(prepared_mutation) = prepared.mutation else {
-                return ToolExecution::from_result(Err(anyhow!(
-                    "{name}: mutation target was not prepared"
-                )));
-            };
-            let state = Arc::clone(&workspace.file_state);
-            let output = match name {
-                "write_file" => fs::write_file_tool(input, prepared_mutation, ctx, workspace).await,
-                "edit_file" => fs::edit_file_tool(input, prepared_mutation, ctx, workspace).await,
-                "notebook_edit" => {
-                    fs::notebook_edit_tool(input, prepared_mutation, ctx, workspace).await
-                }
-                _ => unreachable!("matched file mutation tool"),
-            };
-            return match output {
-                Ok(output) => ToolExecution {
-                    result: Ok(ToolResultContent::Text(output.content)),
-                    file_state_update: Some((state, output.state_update)),
-                    path_lock: Some(output.path_lock),
-                },
-                Err(error) => ToolExecution::from_result(Err(error)),
-            };
-        }
-
-        // External source tools can also return images — handle them before the
-        // text-returning built-ins so their result can be Text OR Blocks. A
-        // program still gets the structured form via the sink.
-        if let Some(binding) = prepared.source {
             let Some(source) = ctx.cfg.tool_sources.get(binding.source_slot) else {
                 return ToolExecution::from_result(Err(anyhow!(
                     "source binding for tool '{name}' is no longer registered"
@@ -1515,18 +1161,65 @@ fn execute_tool<'a>(
                 }
                 Err(error) => ToolExecution::from_result(Err(error)),
             };
-        }
-        let text: Result<String> = match name {
-            "bash" => bash::bash_tool(input, ctx, workspace).await,
-            "powershell" => powershell::powershell_tool(input, ctx, workspace).await,
-            "bash_output" => bash::bash_output_tool(input, ctx).await,
-            "stop_bash" => bash::stop_bash_tool(input, ctx).await,
-            "grep" => {
+        };
+        // Exhaustive on purpose: a new built-in that reaches dispatch without an
+        // arm here is a compile error, not an `unknown tool` at runtime.
+        let text: Result<String> = match builtin {
+            // read_file is the sole BUILT-IN that can return non-text: on an
+            // image file it returns an image block (ToolResultContent::Blocks).
+            Builtin::ReadFile => {
+                let Some(prepared) = prepared.read else {
+                    return ToolExecution::from_result(Err(anyhow!(
+                        "read_file: target was not prepared"
+                    )));
+                };
+                let state = Arc::clone(&workspace.file_state);
+                return match fs::read_file_tool(input, prepared).await {
+                    Ok(output) => ToolExecution {
+                        result: Ok(output.content),
+                        file_state_update: Some((state, output.state_update)),
+                        path_lock: None,
+                    },
+                    Err(error) => ToolExecution::from_result(Err(error)),
+                };
+            }
+            // The file mutations carry a state update and a path lock back out,
+            // so they also return before the text path.
+            Builtin::WriteFile | Builtin::EditFile | Builtin::NotebookEdit => {
+                let Some(prepared_mutation) = prepared.mutation else {
+                    return ToolExecution::from_result(Err(anyhow!(
+                        "{name}: mutation target was not prepared"
+                    )));
+                };
+                let state = Arc::clone(&workspace.file_state);
+                let output = match builtin {
+                    Builtin::WriteFile => {
+                        fs::write_file_tool(input, prepared_mutation, ctx, workspace).await
+                    }
+                    Builtin::EditFile => {
+                        fs::edit_file_tool(input, prepared_mutation, ctx, workspace).await
+                    }
+                    _ => fs::notebook_edit_tool(input, prepared_mutation, ctx, workspace).await,
+                };
+                return match output {
+                    Ok(output) => ToolExecution {
+                        result: Ok(ToolResultContent::Text(output.content)),
+                        file_state_update: Some((state, output.state_update)),
+                        path_lock: Some(output.path_lock),
+                    },
+                    Err(error) => ToolExecution::from_result(Err(error)),
+                };
+            }
+            Builtin::Bash => bash::bash_tool(input, ctx, workspace).await,
+            Builtin::PowerShell => powershell::powershell_tool(input, ctx, workspace).await,
+            Builtin::BashOutput => bash::bash_output_tool(input, ctx).await,
+            Builtin::StopBash => bash::stop_bash_tool(input, ctx).await,
+            Builtin::Grep => {
                 search::grep_tool(input, &workspace.cwd, Arc::clone(&workspace.permissions)).await
             }
             // glob hands a program its path list as a string[] (built-ins are
             // otherwise strings); the model-facing text is unchanged.
-            "glob" => {
+            Builtin::Glob => {
                 search::glob_tool(
                     input,
                     &workspace.cwd,
@@ -1535,44 +1228,44 @@ fn execute_tool<'a>(
                 )
                 .await
             }
-            "task_create" => task::task_create_tool(input, ctx),
-            "task_get" => task::task_get_tool(input, ctx),
-            "task_update" => task::task_update_tool(input, ctx),
-            "task_list" => task::task_list_tool(input, ctx),
-            "task_clear" => task::task_clear_tool(input, ctx),
-            "skill" => skill::skill_tool(input, ctx, workspace).await,
-            "tool_search" => tool_search::tool_search_tool(input, ctx, workspace).await,
+            Builtin::TaskCreate => task::task_create_tool(input, ctx),
+            Builtin::TaskGet => task::task_get_tool(input, ctx),
+            Builtin::TaskUpdate => task::task_update_tool(input, ctx),
+            Builtin::TaskList => task::task_list_tool(input, ctx),
+            Builtin::TaskClear => task::task_clear_tool(input, ctx),
+            Builtin::Skill => skill::skill_tool(input, ctx, workspace).await,
+            Builtin::ToolSearch => tool_search::tool_search_tool(input, ctx, workspace).await,
             // Only malformed envelopes reach this arm — well-formed ones were
             // rewritten to the inner call at dispatch entry.
-            "call_tool" => Err(anyhow!(
+            Builtin::CallTool => Err(anyhow!(
                 "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
             )),
-            "run_agent" => subagent::run_agent_tool(input, ctx, workspace).await,
-            "send_message" => {
+            Builtin::RunAgent => subagent::run_agent_tool(input, ctx, workspace).await,
+            Builtin::SendMessage => {
                 let result = agent_message::send_message_tool(input, ctx);
                 if result.is_ok() {
                     prepared.local_send_committed.store(true, Ordering::Release);
                 }
                 result
             }
-            "list_agents" => agent_message::list_agents_tool(input, ctx),
-            "ask_user_question" => question::ask_user_question_tool(input, ctx).await,
-            "enter_plan_mode" => plan_mode::enter_plan_mode_tool(input, ctx, workspace).await,
-            "exit_plan_mode" => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
-            "enter_worktree" => worktree_tool::enter_worktree_tool(input, ctx).await,
-            "exit_worktree" => worktree_tool::exit_worktree_tool(input, ctx).await,
-            "wait_for_activity" => background_executions::wait_for_activity_tool(input, ctx).await,
-            "stop_agent" => background_executions::stop_agent_tool(input, ctx).await,
-            "stop_program" => background_executions::stop_program_tool(input, ctx).await,
-            "stop_workflow" => background_executions::stop_workflow_tool(input, ctx).await,
-            "cron_create" => scheduler::cron_create_tool(input, ctx).await,
-            "cron_delete" => scheduler::cron_delete_tool(input, ctx).await,
-            "cron_list" => scheduler::cron_list_tool(input, ctx).await,
-            "schedule_wakeup" => scheduler::schedule_wakeup_tool(input, ctx).await,
-            "run_program" => codemode::run_program_tool(input, ctx, workspace).await,
-            "workflow" => workflow::workflow_tool_in_workspace(input, ctx, workspace).await,
-            // Source tools were already handled above (they may return images); anything reaching here is an unknown tool name.
-            other => Err(anyhow!("unknown tool: {other}")),
+            Builtin::ListAgents => agent_message::list_agents_tool(input, ctx),
+            Builtin::AskUserQuestion => question::ask_user_question_tool(input, ctx).await,
+            Builtin::EnterPlanMode => plan_mode::enter_plan_mode_tool(input, ctx, workspace).await,
+            Builtin::ExitPlanMode => plan_mode::exit_plan_mode_tool(input, ctx, workspace).await,
+            Builtin::EnterWorktree => worktree_tool::enter_worktree_tool(input, ctx).await,
+            Builtin::ExitWorktree => worktree_tool::exit_worktree_tool(input, ctx).await,
+            Builtin::WaitForActivity => {
+                background_executions::wait_for_activity_tool(input, ctx).await
+            }
+            Builtin::StopAgent => background_executions::stop_agent_tool(input, ctx).await,
+            Builtin::StopProgram => background_executions::stop_program_tool(input, ctx).await,
+            Builtin::StopWorkflow => background_executions::stop_workflow_tool(input, ctx).await,
+            Builtin::CronCreate => scheduler::cron_create_tool(input, ctx).await,
+            Builtin::CronDelete => scheduler::cron_delete_tool(input, ctx).await,
+            Builtin::CronList => scheduler::cron_list_tool(input, ctx).await,
+            Builtin::ScheduleWakeup => scheduler::schedule_wakeup_tool(input, ctx).await,
+            Builtin::RunProgram => codemode::run_program_tool(input, ctx, workspace).await,
+            Builtin::Workflow => workflow::workflow_tool_in_workspace(input, ctx, workspace).await,
         };
         ToolExecution::from_result(text.map(ToolResultContent::Text))
     })
@@ -1650,6 +1343,8 @@ pub(crate) fn resolve_path(cwd: &std::path::Path, raw: &str) -> std::path::PathB
 /// a dispatch-path runner, so every tool test exercises the real gate.
 #[cfg(test)]
 pub(crate) mod testutil {
+    use serde_json::json;
+
     use super::*;
     use kloop_provider::Provider;
 
@@ -1868,10 +1563,9 @@ pub(crate) mod testutil {
 mod reserved_name_tests {
     use super::*;
 
-    /// The list used to be assembled per lookup from two halves — the catalog
-    /// walk and a hand-written surface list. Collapsing it into one cached set
-    /// is only safe if nothing fell out on the way, and a name that quietly
-    /// stops being reserved is a name an MCP server can take over.
+    /// The set is derived from `builtin::ALL`, so what needs pinning is what is
+    /// NOT derived: a catalog tool that somehow is not a variant, the names no
+    /// longer offered at all, and the fact that a source tool's name stays free.
     #[test]
     fn the_reserved_set_covers_the_catalog_the_surface_and_the_retired_names() {
         let reserved = reserved_names();
@@ -1896,6 +1590,8 @@ mod reserved_name_tests {
             "exit_plan_mode",
             "workflow",
             "stop_workflow",
+            "run_program",
+            "stop_program",
             "enter_worktree",
             "exit_worktree",
             "structured_output",
@@ -1933,6 +1629,8 @@ mod reserved_name_tests {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::testutil::*;
     use super::*;
 
@@ -2429,6 +2127,109 @@ mod tests {
             assert!(names.iter().any(|name| name == "call_tool"));
             assert!(!names.iter().any(|name| name.starts_with("snapshot__")));
         }
+    }
+
+    /// The order of the tool array is part of the provider request's bytes, and
+    /// the prompt cache keys on those bytes: a reshuffle that changes nothing
+    /// semantically still invalidates every cached prefix. Since the catalog is
+    /// now walked from `builtin::ALL` rather than pushed group by group, this
+    /// pins the walk's output against the sequence the hand-written pushes
+    /// produced.
+    #[test]
+    fn the_tool_array_keeps_its_wire_order() {
+        let names = |depth, surface| {
+            all_tool_defs(depth, &[], 200, surface, &ShellPrograms::native_posix())
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        };
+        let everything = crate::config::SurfaceCapabilities {
+            questions: true,
+            plan_control: true,
+            program: true,
+            workflow: true,
+            worktree: true,
+            scheduler: true,
+        };
+        assert_eq!(
+            names(0, everything),
+            [
+                "bash",
+                "bash_output",
+                "stop_bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "notebook_edit",
+                "grep",
+                "glob",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
+                "task_clear",
+                "send_message",
+                "list_agents",
+                "run_agent",
+                "wait_for_activity",
+                "stop_agent",
+                "run_program",
+                "stop_program",
+                "cron_create",
+                "cron_delete",
+                "cron_list",
+                "schedule_wakeup",
+                "ask_user_question",
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "workflow",
+                "stop_workflow",
+                "enter_worktree",
+                "exit_worktree",
+            ]
+        );
+        // A sub-agent sees the depth-gated block drop out, and nothing else move.
+        assert_eq!(
+            names(1, everything),
+            [
+                "bash",
+                "bash_output",
+                "stop_bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "notebook_edit",
+                "grep",
+                "glob",
+                "send_message",
+                "list_agents",
+            ]
+        );
+        // Every surface off: the depth-0 tail goes with them, the rest stays put.
+        assert_eq!(
+            names(0, crate::config::SurfaceCapabilities::default()),
+            [
+                "bash",
+                "bash_output",
+                "stop_bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "notebook_edit",
+                "grep",
+                "glob",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
+                "task_clear",
+                "send_message",
+                "list_agents",
+                "run_agent",
+                "wait_for_activity",
+                "stop_agent",
+            ]
+        );
     }
 
     #[test]

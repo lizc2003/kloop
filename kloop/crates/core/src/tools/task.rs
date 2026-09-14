@@ -390,67 +390,77 @@ struct TaskPatch {
     blocked_by: Option<Vec<u64>>,
 }
 
-pub(super) fn tool_defs() -> [ToolDef; 5] {
-    [
-        ToolDef {
-            name: "task_create".into(),
-            description: "Create one pending task in the root-owned task graph for this live session. Returns a stable opaque task ID. subject and description are required; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, assign work, claim a mailbox, persist across resume, or create a background execution.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS, "description": "Short single-line task title"},
-                    "description": {"type": "string", "description": "Complete task instructions"},
-                    "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Existing task IDs that must complete first"}
-                },
-                "required": ["subject", "description"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "task_get".into(),
-            description: "Get one task from this live session's root-owned task graph by its stable ID. Returns subject, description, status, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {"task_id": {"type": "string", "description": "Stable task ID returned by task_create"}},
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "task_update".into(),
-            description: "Atomically patch one task in this live session's root-owned task graph. Omitted fields stay unchanged; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "Stable task ID returned by task_create"},
-                    "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS},
-                    "description": {"type": "string"},
-                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                    "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Complete replacement dependency list; [] clears it"}
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "task_list".into(),
-            description: "List all tasks in this live session's root-owned task graph, ordered by numeric task ID. Returns compact records with subject, status, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "task_clear".into(),
-            description: "Clear every task from this live session's root-owned task graph and start a new task epoch. Keeps the stable task ID high-water mark and does not clear the conversation or stop any Agent, Program, Workflow, or Bash execution. Use only when the root agent is explicitly abandoning or replacing an unfinished graph.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        },
-    ]
+pub(super) fn task_create_def() -> ToolDef {
+    ToolDef {
+        name: "task_create".into(),
+        description: "Create one pending task in the root-owned task graph for this live session. Returns a stable opaque task ID. subject and description are required; blocked_by may reference existing task IDs. This records work only — it does not start an Agent, assign work, claim a mailbox, persist across resume, or create a background execution.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS, "description": "Short single-line task title"},
+                "description": {"type": "string", "description": "Complete task instructions"},
+                "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Existing task IDs that must complete first"}
+            },
+            "required": ["subject", "description"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn task_get_def() -> ToolDef {
+    ToolDef {
+        name: "task_get".into(),
+        description: "Get one task from this live session's root-owned task graph by its stable ID. Returns subject, description, status, direct blocked_by dependencies, and the computed reverse blocks projection.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Stable task ID returned by task_create"}},
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn task_update_def() -> ToolDef {
+    ToolDef {
+        name: "task_update".into(),
+        description: "Atomically patch one task in this live session's root-owned task graph. Omitted fields stay unchanged; blocked_by replaces the complete dependency list. Status may move forward from pending to in_progress or completed, or from in_progress to completed, but never backward. A task cannot enter a non-pending state until every blocker is completed. Missing dependencies, duplicate dependencies, self-dependencies, and cycles are rejected without changing the graph.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Stable task ID returned by task_create"},
+                "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS},
+                "description": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                "blocked_by": {"type": "array", "maxItems": MAX_BLOCKERS, "items": {"type": "string"}, "description": "Complete replacement dependency list; [] clears it"}
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn task_list_def() -> ToolDef {
+    ToolDef {
+        name: "task_list".into(),
+        description: "List all tasks in this live session's root-owned task graph, ordered by numeric task ID. Returns compact records with subject, status, blocked_by, and computed blocks; use task_get for a task's full description. Takes no filters or pagination arguments.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn task_clear_def() -> ToolDef {
+    ToolDef {
+        name: "task_clear".into(),
+        description: "Clear every task from this live session's root-owned task graph and start a new task epoch. Keeps the stable task ID high-water mark and does not clear the conversation or stop any Agent, Program, Workflow, or Bash execution. Use only when the root agent is explicitly abandoning or replacing an unfinished graph.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
 }
 
 pub(super) fn task_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
@@ -1505,7 +1515,13 @@ mod tests {
 
     #[test]
     fn definitions_are_strict_and_root_only() {
-        let defs = tool_defs();
+        let defs = [
+            task_create_def(),
+            task_get_def(),
+            task_update_def(),
+            task_list_def(),
+            task_clear_def(),
+        ];
         let task_names = defs
             .iter()
             .map(|definition| definition.name.as_str())

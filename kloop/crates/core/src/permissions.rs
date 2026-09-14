@@ -67,6 +67,7 @@ use crate::shell::analyze_bash;
 use crate::shell::argv_is_dangerous;
 use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
+use crate::tools::Builtin;
 
 /// The scope a human may grant to one approval request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1475,14 +1476,18 @@ enum ShellFacts {
     PowerShellOpaque,
 }
 
-struct CallFacts {
+/// The decomposition one tool call is judged on, gathered once per call. Two
+/// built-ins answer [`Builtin::readonly`] from the call rather than the name,
+/// so exactly those two facts are visible to the crate; the rest belong to this
+/// module's gate.
+pub(crate) struct CallFacts {
     shell: Option<ShellFacts>,
     path: Option<PathFacts>,
     path_key: Option<&'static str>,
     sensitive_read: bool,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
-    removing_worktree: bool,
+    pub(crate) removing_worktree: bool,
     /// This bash call asked to run outside the OS sandbox (`disable_sandbox`).
     /// Kept as a fact of the call because bypass mode reads it: giving up
     /// containment is the model's own decision, not a property of the command.
@@ -1601,52 +1606,28 @@ impl CallFacts {
         None
     }
 
+    /// Whether this shell call decomposes into nothing but known read-only
+    /// commands. Safe-to-run and safe-to-parallelize are two verdicts over this
+    /// one decomposition, so `Builtin::concurrency_safe` asks the same question
+    /// of its own copy of the analysis.
+    pub(crate) fn bash_is_readonly(&self) -> bool {
+        matches!(&self.shell, Some(ShellFacts::Bash(BashAnalysis::Commands(cmds)))
+            if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c)))
+    }
+
+    /// Read-only in the permission sense: nothing on the user's system to sign
+    /// off on. Built-ins answer for themselves ([`Builtin::readonly`]) — the
+    /// verdict is one of the facts a built-in owns, not a second table here.
     fn is_readonly(&self, name: &str) -> bool {
-        match name {
-            "read_file" | "grep" | "glob" => true,
-            // bash_output reads registry state; stop_bash only signals
-            // processes the agent itself started via bash — neither can
-            // touch anything the original bash call wasn't already gated on.
-            "bash_output" | "stop_bash" => true,
-            // run_agent itself touches nothing; every child tool call passes
-            // through this same gate.
-            "run_agent" | "send_message" | "list_agents" => true,
-            // Creating a managed tree and keeping one are session controls. An
-            // existing-path Enter and remove action are intercepted as hazards
-            // above; remove is also mutating for the plan-mode gate.
-            "enter_worktree" => true,
-            "exit_worktree" => !self.removing_worktree,
-            // exit_plan_mode only shows the plan and flips the session mode —
-            // no system side effect. Read-only here so it passes the plan-mode
-            // gate above and does its own approval (Permissions::confirm_exit_plan).
-            "ask_user_question" | "enter_plan_mode" | "exit_plan_mode" => true,
-            // Waiting only blocks; resource-specific stops only signal owned
-            // cancellation tokens. None bypasses the stopped work's own gates.
-            "wait_for_activity" | "stop_agent" | "stop_program" | "stop_workflow" => true,
-            // run_program (code-mode) itself touches nothing; every tools.<name>()
-            // and agent() call the program makes re-enters this same gate.
-            "run_program" | "workflow" => true,
-            // tool_search only reads tool definitions and marks them
-            // unlocked; the unlocked tool's own calls still pass this gate.
-            "tool_search" | "cron_list" => true,
-            // The task graph mutates only session memory — nothing on the
-            // user's system to sign off on. Dispatcher concurrency still
-            // serializes create/update independently of this permission fact.
-            "task_create" | "task_get" | "task_update" | "task_list" | "task_clear" => true,
-            // skill only loads a local skill file's instructions into the
-            // conversation — no system side effect (cc never prompts to
-            // activate one); tools those instructions later prompt are gated
-            // on their own.
-            // Listing only discloses the catalog a configured MCP server
-            // advertises. Reading a model-selected URI still requires the
-            // normal external-tool approval; read-only here would bypass it.
-            "list_mcp_resources" => true,
-            "skill" => true,
-            "powershell" => false,
-            "bash" => matches!(&self.shell, Some(ShellFacts::Bash(BashAnalysis::Commands(cmds)))
-                if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c))),
-            _ => false,
+        if let Some(builtin) = Builtin::from_name(name) {
+            return builtin.readonly(self);
         }
+        // Listing only discloses the catalog a configured MCP server
+        // advertises. Reading a model-selected URI still requires the normal
+        // external-tool approval; read-only here would bypass it. Every other
+        // source tool is judged not read-only: its source's own claim governs
+        // batching, never whether the user is asked.
+        name == "list_mcp_resources"
     }
 }
 
@@ -2268,18 +2249,16 @@ fn describe_parts(
 }
 
 /// A human name for the action a tool performs, for the panel's header row.
-/// Unknown tools (MCP, deferred) keep their own name — it is what the user
-/// configured and recognizes.
+/// Built-ins all have one ([`Builtin::title`]); so do the two web tools, which
+/// kloop names itself even though they arrive through the source seam. An MCP
+/// tool keeps its own name — that is what the user configured and recognizes.
 fn tool_title(name: &str) -> &str {
+    if let Some(builtin) = Builtin::from_name(name) {
+        return builtin.title();
+    }
     match name {
-        "bash" => "Bash command",
-        "powershell" => "PowerShell command",
-        "read_file" => "Read file",
-        "write_file" => "Write file",
-        "edit_file" => "Edit file",
-        "notebook_edit" => "Edit notebook",
-        "web_fetch" => "Fetch a URL",
-        "web_search" => "Web search",
+        crate::tools::web::WEB_FETCH => "Fetch a URL",
+        crate::tools::web::WEB_SEARCH => "Web search",
         other => other,
     }
 }

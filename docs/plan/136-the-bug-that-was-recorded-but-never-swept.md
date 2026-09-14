@@ -106,10 +106,11 @@
 
 ## 五、非目标(留后续 plan)
 
-- **工具中心注册表。** 一个工具的事实散在 5+ 处并行 match(`builtin_defs` / `is_concurrency_safe`
+- ~~**工具中心注册表。** 一个工具的事实散在 5+ 处并行 match(`builtin_defs` / `is_concurrency_safe`
   / `CallFacts::is_readonly` / `execute_tool` / 两张保留名表,外加 `toolrow.rs` 显示名与
   `tool_title`),漏改**不会编译报错**。这是本轮通读里最值得做的架构改动,但它要动工具层的
-  形状,单独一条 plan。
+  形状,单独一条 plan。~~ ✅ **plan 138 已做**(`tools/builtin.rs` 的 `Builtin` 枚举;顺带
+  查出 `reserved_names` 漏了 `run_program`/`stop_program`,整表改从枚举派生)。
 - **拆超长函数**(`turn_rounds` 548 / `responses::stream` 425 / `App::apply_core` 367 /
   `main` 366 / `run_one` 349 / `ui_loop` 339)。
 - **SSE 驱动循环抽取**(三个 provider 适配器各写一遍 `send_checked → SseParser → GuardedBody`

@@ -53,7 +53,8 @@ validate five architectural bets before committing to a larger agent design.
 3. **Concurrency safety decided per call, by name AND input.**
    `is_concurrency_safe(name, input)` parses bash commands for read-onlyness;
    consecutive safe calls run as one concurrent batch, everything else runs
-   sequentially.
+   sequentially. Built-ins answer from the one `Builtin` enum (below), so the
+   verdict is a written judgement rather than whatever the default arm was.
 4. **Sub-agents recurse into the same `run_turn` loop** (depth capped at 1;
    `Pin<Box<dyn Future>>` breaks the type recursion).
 5. **Provider seam.** Internals speak Anthropic Messages shape only; adapters
@@ -632,18 +633,22 @@ directly (the UI keeps no scroll of its own). Tool calls render as
 human-readable rows (plan 38 slice 2, `crates/tui/src/toolrow.rs`): a
 status-marked verb and its key argument — `● Bash $ ls -la` (running, cyan),
 `✓ Read src/main.rs`, `✓ Grep TODO in src`, `✗ Write notes.txt` (failed, red),
-an MCP `server__tool` verbatim — over a few lines of the result indented under a
-`└` gutter (double-limited by lines and chars, control chars sanitized, the rest
-left in history/offload). `edit_file` shows a one-line `- old` / `+ new` diff
-from its input instead. Permission prompts, model questions, and the provider and
-rewind pickers all render through one **inline choice panel** (plan 104,
+`✓ Enter worktree feature-x`, an MCP `server__tool` verbatim — over a few lines
+of the result indented under a `└` gutter (double-limited by lines and chars,
+control chars sanitized, the rest left in history/offload). Every built-in has a
+row of its own; the raw-name-plus-JSON fallback is for source tools, and a guard
+test over the catalog keeps it that way. `edit_file` shows a one-line `- old` /
+`+ new` diff from its input instead. Permission prompts, model questions, and the
+provider and rewind pickers all render through one **inline choice panel** (plan 104,
 `crates/tui/src/choice.rs`) that sits directly on the composer's top rule —
 not a popup centered over the viewport, so the conversation that led to the
 prompt stays on screen instead of being cleared out from under it. A panel is a
-brand-accented header (`▌ Bash command`), the pinned subject it acts on, a
-yellow one-line notice when something warrants a pause (a hazard, a sub-agent,
-no OS sandbox), the scrollable preview, and numbered answers: `↑↓` (or `j`/`k`)
-moves, `1`–`9` picks a row directly, Enter takes the cursor row, and Esc is
+brand-accented header (`▌ Bash command` — every built-in has a human name;
+only an MCP tool keeps the raw name, because that is the one the user
+configured), the pinned subject it acts on, a yellow one-line notice when
+something warrants a pause (a hazard, a sub-agent, no OS sandbox), the
+scrollable preview, and numbered answers: `↑↓` (or `j`/`k`) moves, `1`–`9`
+picks a row directly, Enter takes the cursor row, and Esc is
 always the last row — deny, or cancel. Approvals keep their `y`/`a`/`p`/`n`
 letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
 summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
@@ -2331,7 +2336,9 @@ calls back through a `HostBridge` trait, which `core/src/tools/codemode.rs`
 implements over the gate — that inversion avoids a crate cycle. `run_program`
 itself is auto-allowed (like `run_agent`): it touches nothing directly.
 `Promise.all` tool calls retain the normal concurrency rule (read-only calls
-batch, writes take an exclusive lock).
+batch, writes take an exclusive lock). Consecutive `run_program` calls batch
+concurrently for the same reason `workflow` does — the outer call touches
+nothing, and every op the program makes re-enters the whole gate.
 
 **Resource limits** (`Limits`, per Program/Workflow run) are two layers. Engine
 limits guard the interpreter: a QuickJS heap cap, a stack cap, and an interrupt
@@ -3402,9 +3409,12 @@ crates/core/        kloop-core — the agent, network-free
     windows.rs      suspended CreateProcessW, stdio handle list, Job Object RAII
   src/shell_programs.rs frozen shell identities and Windows trusted discovery
   src/tools/        the tool seam and the built-in tools
-    mod.rs          tool defs, concurrency-safety classification, batched
-                    dispatch with hook+permission gating; ToolSource seam
-                    for external (MCP) tools
+    mod.rs          catalog assembly, batched dispatch with hook+permission
+                    gating; ToolSource seam for external (MCP) tools
+    builtin.rs      the Builtin enum: every built-in tool once, with the
+                    definition, gate, concurrency and read-only verdicts,
+                    dispatch arm and panel title the compiler makes you
+                    write for a new variant
     bash.rs         foreground + background Bash execution, the
                     BackgroundShells registry, bash_output/stop_bash
     powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
