@@ -23,6 +23,7 @@ mod text_layout;
 mod toolrow;
 
 use std::io::Write as _;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -941,6 +942,201 @@ fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
     }
 }
 
+/// What the event loop owns next to the pure [`App`]: the handles a key command
+/// acts on, the cancel token of whatever is in flight, and the wall clocks the
+/// animated HUD reads (the `App` has no clock of its own).
+struct UiState {
+    app: App,
+    cwd: std::path::PathBuf,
+    msgs: mpsc::UnboundedSender<WorkerMsg>,
+    inbox: Arc<Inbox>,
+    permissions: Arc<kloop_core::permissions::Permissions>,
+    current_cancel: Option<CancellationToken>,
+    turn_started: Option<Instant>,
+    thinking_started: Option<Instant>,
+}
+
+impl UiState {
+    /// Reconcile the turn clock with the app's running state (it starts on the
+    /// first frame of a turn and clears when the turn ends), then read both
+    /// clocks into this frame's HUD.
+    fn hud(&mut self, reduced_motion: bool) -> render::Hud {
+        if self.app.running {
+            self.turn_started.get_or_insert_with(Instant::now);
+        } else {
+            self.turn_started = None;
+            self.thinking_started = None;
+        }
+        let elapsed = self.turn_started.map(|t| t.elapsed());
+        render::Hud {
+            elapsed,
+            thinking: self.thinking_started.map(|t| t.elapsed()),
+            phase: elapsed
+                .map(|d| (d.as_millis() as u64 / anim::STEP_MS) as usize)
+                .unwrap_or(0),
+            reduced_motion,
+        }
+    }
+
+    /// Autowake (plan 26): a background sub-agent left a result in the inbox
+    /// while the agent sits idle. Start a turn to deliver it without waiting for
+    /// the user. The readiness guard also catches the race where a reinjection
+    /// lands just after a turn ends.
+    fn autowake(&mut self) {
+        if let Some(cancel) = dispatch_autowake(&mut self.app, &self.inbox, &self.msgs) {
+            self.current_cancel = Some(cancel);
+        }
+    }
+
+    /// One terminal input event. `Break` ends the loop (the input channel died).
+    async fn on_input(&mut self, input: Option<Event>, viewport_width: usize) -> ControlFlow<()> {
+        match input {
+            Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                let command = self.app.on_key(viewport_width, k);
+                self.on_command(command).await
+            }
+            // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
+            // path attaches as an image, anything else goes to the composer
+            // (a large paste collapses to a placeholder there).
+            Some(Event::Paste(s)) if self.app.question_editor_active() => {
+                let _ = self.app.paste_text(&s);
+                ControlFlow::Continue(())
+            }
+            Some(Event::Paste(s)) => {
+                match load_image_paste(&s) {
+                    Some((label, block)) => self.app.attach_image(label, block),
+                    None => {
+                        if let Command::SearchFiles(target) = self.app.paste_text(&s) {
+                            let paths = search_files(&self.cwd, &target).await;
+                            self.app.set_file_results(target, paths);
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+            // Resize repositions the viewport (handled by the autoresize at
+            // the top of the loop); any other event just needs a redraw.
+            Some(_) => ControlFlow::Continue(()),
+            None => ControlFlow::Break(()),
+        }
+    }
+
+    /// One command the key handler produced. `Break` ends the loop.
+    async fn on_command(&mut self, command: Command) -> ControlFlow<()> {
+        match command {
+            Command::Submit(text) => {
+                let cancel = CancellationToken::new();
+                self.current_cancel = Some(cancel.clone());
+                // Attachments live on the App (ContentBlock isn't Eq, so they
+                // can't ride the Command); take them here.
+                let images = self.app.take_submit_images();
+                let _ = self.msgs.send(WorkerMsg::Turn(Turn {
+                    text,
+                    images,
+                    cancel,
+                }));
+            }
+            Command::Slash(line) => {
+                // Runs on the worker (owns History); its cancel lets
+                // Ctrl+C interrupt a slow /compact like a turn.
+                let cancel = CancellationToken::new();
+                self.current_cancel = Some(cancel.clone());
+                let _ = self.msgs.send(WorkerMsg::Command { line, cancel });
+            }
+            Command::Steer(text) => {
+                // Enqueue for the running turn; the agent loop drains it at the
+                // next round boundary. The user's raw text already showed as a
+                // User cell.
+                self.inbox.push(InboxItem::Steer(text));
+            }
+            Command::SetMode(mode) => {
+                // shift+Tab: apply the new mode to the shared gate; subsequent
+                // tool calls read it live. The badge is already updated in the
+                // App.
+                self.permissions.set_mode(mode);
+            }
+            Command::RequestForkPoints => {
+                // The worker owns the rollout path; it reads the fork targets
+                // and replies with a ForkPoints event.
+                let _ = self.msgs.send(WorkerMsg::ListForkPoints);
+            }
+            Command::Fork(seq) => {
+                let _ = self.msgs.send(WorkerMsg::Fork { seq });
+            }
+            Command::Interrupt => {
+                if let Some(cancel) = &self.current_cancel {
+                    cancel.cancel();
+                }
+            }
+            Command::PasteClipboardImage => {
+                // Read the OS clipboard here (a side effect); attach an image,
+                // or note why there was none.
+                match clipboard::clipboard_image() {
+                    Ok((label, block)) => self.app.attach_image(label, block),
+                    Err(e) => self.app.apply(AgentEvent::Core(CoreEvent::Note(e))),
+                }
+            }
+            Command::SearchFiles(target) => {
+                let paths = search_files(&self.cwd, &target).await;
+                self.app.set_file_results(target, paths);
+            }
+            Command::Quit => return ControlFlow::Break(()),
+            Command::None => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// One agent event plus whatever else already arrived (streaming deltas come
+    /// in bursts), so the loop redraws once per batch and not per token.
+    fn on_agent_events(
+        &mut self,
+        first: AgentEvent,
+        events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    ) -> ControlFlow<()> {
+        // Snapshot before applying: a thinking block that was streaming and is
+        // no longer gets its elapsed stamped into the sealed cell.
+        let was_thinking = self.app.streaming_thinking();
+        let mut quit = self.absorb(first);
+        while let Ok(event) = events.try_recv() {
+            quit |= self.absorb(event);
+        }
+        if quit {
+            return ControlFlow::Break(());
+        }
+        // Time the thinking block: start the clock when it opens, seal the cell
+        // with its final elapsed when it closes.
+        if self.app.streaming_thinking() {
+            self.thinking_started.get_or_insert_with(Instant::now);
+        } else if was_thinking && let Some(t) = self.thinking_started.take() {
+            self.app.seal_thinking(t.elapsed().as_secs());
+        }
+        // Same for the turn itself: stamp its elapsed onto the transcript the
+        // moment it stops running — the top of the loop drops the clock on the
+        // next iteration, and by then the time is gone.
+        if !self.app.running
+            && let Some(t) = self.turn_started.take()
+        {
+            self.app.seal_turn(t.elapsed().as_secs());
+        }
+        self.autowake();
+        ControlFlow::Continue(())
+    }
+
+    /// Project one agent event onto the app. `true` means it was `/exit`'s quit
+    /// marker, which ends the loop and is never applied — the caller restores
+    /// the terminal.
+    fn absorb(&mut self, event: AgentEvent) -> bool {
+        if matches!(event, AgentEvent::Quit) {
+            return true;
+        }
+        if let Some(next_cwd) = event_cwd(&event) {
+            self.cwd = next_cwd;
+        }
+        self.app.apply(event);
+        false
+    }
+}
+
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
@@ -948,7 +1144,7 @@ async fn ui_loop(
     inbox: Arc<Inbox>,
     permissions: Arc<kloop_core::permissions::Permissions>,
     mut app: App,
-    mut cwd: std::path::PathBuf,
+    cwd: std::path::PathBuf,
 ) -> Result<()> {
     // Seed the status-bar badge from the real starting mode (e.g. plan). The
     // App is built in `run` (transcript replay + `/` menu catalog); a resumed
@@ -963,37 +1159,25 @@ async fn ui_loop(
     let stop = Arc::new(AtomicBool::new(false));
     let input_thread = spawn_input_thread(input_tx, stop.clone());
 
-    let mut current_cancel: Option<CancellationToken> = None;
     let mut inbox_activity = inbox.subscribe_activity();
-    // Wall-clock timing for the animated HUD (plan 38 slice 5). The pure `App`
-    // has no clock, so the loop owns it: the turn clock runs while `app.running`,
-    // the thinking clock while a thinking block streams.
+    // Wall-clock timing for the animated HUD (plan 38 slice 5).
     let reduced_motion = anim::reduced_motion();
-    let mut turn_started: Option<Instant> = None;
-    let mut thinking_started: Option<Instant> = None;
+    let mut state = UiState {
+        app,
+        cwd,
+        msgs,
+        inbox,
+        permissions,
+        current_cancel: None,
+        turn_started: None,
+        thinking_started: None,
+    };
     let outcome = loop {
-        // Reconcile the turn clock with the app's running state (starts on the
-        // first frame of a turn, clears when it ends).
-        if app.running {
-            turn_started.get_or_insert_with(Instant::now);
-        } else {
-            turn_started = None;
-            thinking_started = None;
-        }
-        let elapsed = turn_started.map(|t| t.elapsed());
-        let hud = render::Hud {
-            elapsed,
-            thinking: thinking_started.map(|t| t.elapsed()),
-            phase: elapsed
-                .map(|d| (d.as_millis() as u64 / anim::STEP_MS) as usize)
-                .unwrap_or(0),
-            reduced_motion,
-        };
-
+        let hud = state.hud(reduced_motion);
         // Ratatui's draw owns autoresize. Commit only from the viewport of that
         // completed frame; if a commit clears it, `draw_frame` immediately
         // repaints and returns the final geometry used by key navigation.
-        let viewport = match draw_frame(terminal, &mut app, &hud) {
+        let viewport = match draw_frame(terminal, &mut state.app, &hud) {
             Ok(viewport) => viewport,
             Err(error) => break Err(error),
         };
@@ -1001,167 +1185,33 @@ async fn ui_loop(
         // screen), a frame tick wakes the loop to advance the spinner/elapsed;
         // idle, the tick is disabled so `select` blocks with zero CPU (the
         // FrameRequester role, played by tokio, plan 38 slice 5).
-        let animating = app.running
-            && app.interactions.is_empty()
-            && app.fork_picker.is_none()
-            && app.popup.is_none();
+        let animating = state.app.running
+            && state.app.interactions.is_empty()
+            && state.app.fork_picker.is_none()
+            && state.app.popup.is_none();
         let tick_ms = if reduced_motion { 1000 } else { anim::STEP_MS };
-        tokio::select! {
-            input = input_rx.recv() => match input {
-                Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    match app.on_key(usize::from(viewport.width), k) {
-                        Command::Submit(text) => {
-                            let cancel = CancellationToken::new();
-                            current_cancel = Some(cancel.clone());
-                            // Attachments live on the App (ContentBlock isn't Eq,
-                            // so they can't ride the Command); take them here.
-                            let images = app.take_submit_images();
-                            let _ = msgs.send(WorkerMsg::Turn(Turn {
-                                text,
-                                images,
-                                cancel,
-                            }));
-                        }
-                        Command::Slash(line) => {
-                            // Runs on the worker (owns History); its cancel lets
-                            // Ctrl+C interrupt a slow /compact like a turn.
-                            let cancel = CancellationToken::new();
-                            current_cancel = Some(cancel.clone());
-                            let _ = msgs.send(WorkerMsg::Command { line, cancel });
-                        }
-                        Command::Steer(text) => {
-                            // Enqueue for the running turn; the agent loop
-                            // drains it at the next round boundary. The user's
-                            // raw text already showed as a User cell.
-                            inbox.push(InboxItem::Steer(text));
-                        }
-                        Command::SetMode(mode) => {
-                            // shift+Tab: apply the new mode to the shared gate;
-                            // subsequent tool calls read it live. The badge is
-                            // already updated in the App.
-                            permissions.set_mode(mode);
-                        }
-                        Command::RequestForkPoints => {
-                            // The worker owns the rollout path; it reads the
-                            // fork targets and replies with a ForkPoints event.
-                            let _ = msgs.send(WorkerMsg::ListForkPoints);
-                        }
-                        Command::Fork(seq) => {
-                            let _ = msgs.send(WorkerMsg::Fork { seq });
-                        }
-                        Command::Interrupt => {
-                            if let Some(cancel) = &current_cancel {
-                                cancel.cancel();
-                            }
-                        }
-                        Command::PasteClipboardImage => {
-                            // Read the OS clipboard here (a side effect); attach
-                            // an image, or note why there was none.
-                            match clipboard::clipboard_image() {
-                                Ok((label, block)) => app.attach_image(label, block),
-                                Err(e) => app.apply(AgentEvent::Core(CoreEvent::Note(e))),
-                            }
-                        }
-                        Command::SearchFiles(target) => {
-                            let paths = search_files(&cwd, &target).await;
-                            app.set_file_results(target, paths);
-                        }
-                        Command::Quit => break Ok(()),
-                        Command::None => {}
-                    }
-                }
-                // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
-                // path attaches as an image, anything else goes to the composer
-                // (a large paste collapses to a placeholder there).
-                Some(Event::Paste(s)) if app.question_editor_active() => {
-                    let _ = app.paste_text(&s);
-                }
-                Some(Event::Paste(s)) => match load_image_paste(&s) {
-                    Some((label, block)) => app.attach_image(label, block),
-                    None => {
-                        if let Command::SearchFiles(target) = app.paste_text(&s) {
-                            let paths = search_files(&cwd, &target).await;
-                            app.set_file_results(target, paths);
-                        }
-                    }
-                },
-                // Resize repositions the viewport (handled by the autoresize at
-                // the top of the loop); any other event just needs a redraw.
-                Some(_) => {}
-                None => break Ok(()),
-            },
+        let flow = tokio::select! {
+            input = input_rx.recv() => state.on_input(input, usize::from(viewport.width)).await,
             activity = inbox_activity.changed() => {
                 if activity.is_err() {
-                    break Ok(());
-                }
-                let autowake = dispatch_autowake(&mut app, &inbox, &msgs);
-                if let Some(cancel) = autowake {
-                    current_cancel = Some(cancel);
-                }
-            }
-            event = events.recv() => {
-                let Some(event) = event else { break Ok(()) };
-                // Snapshot before applying: a thinking block that was streaming
-                // and is no longer gets its elapsed stamped into the sealed cell.
-                let was_thinking = app.streaming_thinking();
-                // `/exit` (AgentEvent::Quit) ends the loop; the caller restores
-                // the terminal. Filter it out of the batch so app.apply never
-                // sees it.
-                let mut quit = matches!(event, AgentEvent::Quit);
-                if !quit {
-                    if let Some(next_cwd) = event_cwd(&event) {
-                        cwd = next_cwd;
-                    }
-                    app.apply(event);
-                }
-                // Drain whatever else already arrived (streaming deltas come
-                // in bursts) so we redraw once per batch, not per token.
-                loop {
-                    let next = events.try_recv();
-                    let Ok(event) = next else {
-                        break;
-                    };
-                    if matches!(event, AgentEvent::Quit) {
-                        quit = true;
-                    } else {
-                        if let Some(next_cwd) = event_cwd(&event) {
-                            cwd = next_cwd;
-                        }
-                        app.apply(event);
-                    }
-                }
-                if quit {
-                    break Ok(());
-                }
-                // Time the thinking block: start the clock when it opens, seal the
-                // cell with its final elapsed when it closes.
-                if app.streaming_thinking() {
-                    thinking_started.get_or_insert_with(Instant::now);
-                } else if was_thinking
-                    && let Some(t) = thinking_started.take() {
-                        app.seal_thinking(t.elapsed().as_secs());
-                    }
-                // Same for the turn itself: stamp its elapsed onto the transcript
-                // the moment it stops running — the top of the loop drops the
-                // clock on the next iteration, and by then the time is gone.
-                if !app.running
-                    && let Some(t) = turn_started.take()
-                {
-                    app.seal_turn(t.elapsed().as_secs());
-                }
-                // Autowake (plan 26): a background sub-agent finished (its
-                // agent_end woke this select) and left a result in the inbox
-                // while the agent sits idle. Start a turn to deliver it without
-                // waiting for the user. The guard also catches the race where a
-                // reinjection lands just after a turn ends.
-                let autowake = dispatch_autowake(&mut app, &inbox, &msgs);
-                if let Some(cancel) = autowake {
-                    current_cancel = Some(cancel);
+                    ControlFlow::Break(())
+                } else {
+                    state.autowake();
+                    ControlFlow::Continue(())
                 }
             }
+            event = events.recv() => match event {
+                Some(event) => state.on_agent_events(event, &mut events),
+                None => ControlFlow::Break(()),
+            },
             // Frame tick: only armed while animating, so an idle loop never wakes
             // here. Firing just redraws (elapsed/spinner advance at the top).
-            _ = tokio::time::sleep(Duration::from_millis(tick_ms)), if animating => {}
+            _ = tokio::time::sleep(Duration::from_millis(tick_ms)), if animating => {
+                ControlFlow::Continue(())
+            }
+        };
+        if flow.is_break() {
+            break Ok(());
         }
     };
     // Stop the input thread (it wakes within one poll interval) before the
