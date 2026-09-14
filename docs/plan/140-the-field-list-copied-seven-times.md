@@ -118,7 +118,7 @@ pub(crate) fn subagent_from(&self, workspace: &EffectiveWorkspace, max_rounds, a
 - 全量测试逐条不变地通过(fixture 搬家不该改任何测试的断言);
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码。
 
-## 六、✅ 已完成(2026-09-14,提交 PENDING)
+## 六、✅ 已完成(2026-09-14,提交 2e58bca)
 
 **一、fixture**:`crates/core/src/tools/mod.rs` 的 `testutil` 里立了 `TestConfig` builder
 (`new(tag)` / `provider` / `models` / `max_rounds` / `context_window` / `tool_sources` /
