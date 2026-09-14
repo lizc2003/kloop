@@ -92,6 +92,158 @@ fn server_skills_reader(args: &CliArgs) -> SkillsReader {
     }
 }
 
+/// Process-global state: resolved once, before any front-end owns the terminal,
+/// and shared by every session — server mode's threads included. The MCP
+/// lifecycle owner rides alongside rather than inside, because it outlives the
+/// front-end these are handed to and must bring the transports down last.
+struct ProcessState {
+    provider: Arc<ResolvedProviderSettings>,
+    runtime: Arc<RuntimeSettings>,
+    tool_sources: Vec<Arc<dyn ToolSource>>,
+    mcp_statuses: Vec<kloop_server::McpServerStatus>,
+}
+
+impl ProcessState {
+    async fn load(args: &CliArgs) -> Result<(Self, mcp::McpLifecycleOwner)> {
+        // Parse the one user config once, then resolve every process-global piece
+        // from that snapshot. --mock stays hermetic: UserConfig neither resolves
+        // HOME nor reads config/provider environment variables.
+        let user_config = user_config::UserConfig::load(args.mock)?;
+        let provider = Arc::new(provider_config::load(args.mock, user_config.table())?);
+        let runtime = Arc::new(RuntimeSettings::load(&user_config, args.mock)?);
+        for warning in runtime.shell_warnings() {
+            eprintln!("\x1b[2m[{warning}]\x1b[0m");
+        }
+        // MCP servers connect once per process (before any UI owns the terminal)
+        // and are shared into every Config — including all server-mode threads.
+        // --mock stays hermetic: no child processes or web-key reads.
+        let (tool_sources, mcp_statuses, mcp_lifecycle) = if args.mock {
+            (Vec::new(), Vec::new(), mcp::McpLifecycleOwner::default())
+        } else {
+            let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+            // Web tools ride the same ToolSource seam, registered before MCP so
+            // a colliding MCP tool name loses (and is warned about).
+            let web_cfg = web::load_web_config(user_config.table())?;
+            let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+            sources.extend(web::build_web_source(&web_cfg, &warn));
+            let servers = mcp::load_mcp_servers(user_config.table())?;
+            let mcp::McpConnections {
+                sources: mcp_sources,
+                statuses,
+                lifecycle,
+            } = mcp::connect_servers(servers, &warn).await?;
+            sources.extend(mcp_sources);
+            for warning in tool_merge_warnings(
+                &sources,
+                runtime.defer_threshold(),
+                runtime.shell_programs(),
+            ) {
+                warn(&warning);
+            }
+            (sources, statuses, lifecycle)
+        };
+        Ok((
+            Self {
+                provider,
+                runtime,
+                tool_sources,
+                mcp_statuses,
+            },
+            mcp_lifecycle,
+        ))
+    }
+}
+
+/// The cwd-bound state a single-session front-end needs, built once. Server mode
+/// never reaches here: it does the same work per thread, against that thread's
+/// own cwd, inside [`serve_config_factory`].
+struct SessionState {
+    project: context::GatheredContext,
+    sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
+    skills: Arc<Vec<Skill>>,
+    history: History,
+    session_id: String,
+    session_route: kloop_core::provider_route::FrozenProviderRoute,
+    session_dirs: SessionDirs,
+    pending_images: Vec<ContentBlock>,
+}
+
+impl SessionState {
+    fn open(
+        args: &CliArgs,
+        cwd: &std::path::Path,
+        process: &ProcessState,
+        session_store: &SessionStore,
+    ) -> Result<Self> {
+        let project = if args.mock {
+            context::mock(cwd)
+        } else {
+            context::gather(cwd)
+        };
+        for warning in &project.warnings {
+            eprintln!("\x1b[2m[{warning}]\x1b[0m");
+        }
+        // Ahead of the sandbox: the policy carves this project's offload directory
+        // back out of the otherwise denied private state root.
+        let session_dirs = session_store
+            .ensure(cwd)
+            .context("cannot create the session directory")?;
+        let sandbox = build_sandbox(
+            args,
+            cwd,
+            &process.runtime,
+            &session_dirs.offload,
+            |warning| eprintln!("\x1b[2m[{warning}]\x1b[0m"),
+        )?;
+        let skills = Arc::new(if args.mock {
+            kloop_core::skills::builtin()
+        } else {
+            let (skills, warnings) = load_skills(cwd);
+            for warning in &warnings {
+                eprintln!("\x1b[2m[{warning}]\x1b[0m");
+            }
+            skills
+        });
+        let (mut history, session_id) = open_history(
+            session_store,
+            &session_dirs,
+            &args.session,
+            &process.provider.initial_route(),
+        )?;
+        // Every session — fresh, resumed or forked — opens on the route a new
+        // session would open on: `model_provider`/`model` (and their env overrides)
+        // as they read right now. A `/provider` switch belongs to the conversation
+        // that ran it, not to the file it left behind, so reopening re-asserts the
+        // configured default and records the hop when it differs.
+        let (session_route, reopened) = history
+            .adopt_provider_route(&process.provider.initial_route())
+            .map_err(anyhow::Error::new)?;
+        if let Some(reopened) = &reopened {
+            eprintln!("\x1b[2m[{reopened}]\x1b[0m");
+        }
+        // `--image` files are read + validated once, up front, so a bad path fails
+        // fast before any UI owns the terminal. They attach to the first user turn.
+        let pending_images = if args.mock {
+            if !args.images.is_empty() {
+                eprintln!("\x1b[2m[--image ignored with --mock]\x1b[0m");
+            }
+            Vec::new()
+        } else {
+            image::load_images(&args.images)?
+        };
+        Ok(Self {
+            project,
+            sandbox,
+            skills,
+            history,
+            session_id,
+            session_route,
+            session_dirs,
+            pending_images,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
@@ -132,316 +284,280 @@ async fn main() -> Result<ExitCode> {
     if args.worktree.is_some() && (args.serve || args.mock) {
         anyhow::bail!("--worktree is not supported with --serve or --mock");
     }
-    // Parse the one user config once, then resolve every process-global piece
-    // from that snapshot. --mock stays hermetic: UserConfig neither resolves
-    // HOME nor reads config/provider environment variables.
-    let user_config = user_config::UserConfig::load(args.mock)?;
-    let provider = Arc::new(provider_config::load(args.mock, user_config.table())?);
-    let runtime = Arc::new(RuntimeSettings::load(&user_config, args.mock)?);
-    for warning in runtime.shell_warnings() {
-        eprintln!("\x1b[2m[{warning}]\x1b[0m");
-    }
-    // MCP servers connect once per process (before any UI owns the terminal)
-    // and are shared into every Config — including all server-mode threads.
-    // --mock stays hermetic: no child processes or web-key reads.
-    let (tool_sources, mcp_statuses, mcp_lifecycle) = if args.mock {
-        (Vec::new(), Vec::new(), mcp::McpLifecycleOwner::default())
-    } else {
-        let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
-        // Web tools ride the same ToolSource seam, registered before MCP so
-        // a colliding MCP tool name loses (and is warned about).
-        let web_cfg = web::load_web_config(user_config.table())?;
-        let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
-        sources.extend(web::build_web_source(&web_cfg, &warn));
-        let servers = mcp::load_mcp_servers(user_config.table())?;
-        let mcp::McpConnections {
-            sources: mcp_sources,
-            statuses,
-            lifecycle,
-        } = mcp::connect_servers(servers, &warn).await?;
-        sources.extend(mcp_sources);
-        for warning in tool_merge_warnings(
-            &sources,
-            runtime.defer_threshold(),
-            runtime.shell_programs(),
-        ) {
-            warn(&warning);
-        }
-        (sources, statuses, lifecycle)
-    };
+    let (process, mcp_lifecycle) = ProcessState::load(&args).await?;
+    // One dispatch, one teardown: whichever front-end ran, the MCP transports
+    // come down after it and before its result is propagated.
+    let result = run_front_end(args, process, session_store, cwd).await;
+    mcp_lifecycle.shutdown().await;
+    result
+}
+
+/// Pick the front-end the flags asked for and run it to completion.
+async fn run_front_end(
+    args: CliArgs,
+    process: ProcessState,
+    session_store: SessionStore,
+    cwd: std::path::PathBuf,
+) -> Result<ExitCode> {
     if args.serve {
-        if !args.images.is_empty() {
-            eprintln!(
-                "\x1b[2m[--image ignored with --serve; send images via the RPC client]\x1b[0m"
-            );
-        }
-        // Multi-session JSON-RPC server on stdio. Process-wide transports and
-        // policy stay shared, while each thread rebuilds cwd-bound context,
-        // skills, permission anchors, and its sandbox workspace root.
-        let factory: kloop_server::ConfigFactory = {
-            let args = args.clone();
-            let provider = provider.clone();
-            let runtime = runtime.clone();
-            let factory_store = session_store.clone();
-            Arc::new(move |options, catalog, approver, questioner, notify| {
-                let project = if args.mock {
-                    context::mock(&options.cwd)
-                } else {
-                    context::gather(&options.cwd)
-                };
-                for warning in &project.warnings {
-                    notify(warning);
-                }
-                // Each thread pins its own cwd, so each resolves its own
-                // project partition rather than inheriting the process one.
-                // Resolved before the sandbox because the policy carves the
-                // partition's offload directory back out of the denied store.
-                let session_dirs = factory_store.ensure(&options.cwd)?;
-                let sandbox = build_sandbox(
-                    &args,
-                    &options.cwd,
-                    &runtime,
-                    &session_dirs.offload,
-                    |warning| notify(warning),
-                )?;
-                // `--mock` skips disk discovery (hermetic) but keeps the
-                // builtins, which are compiled in and touch no filesystem.
-                let skills = Arc::new(if args.mock {
-                    kloop_core::skills::builtin()
-                } else {
-                    let (skills, warnings) = load_skills(&options.cwd);
-                    for warning in &warnings {
-                        notify(warning);
-                    }
-                    skills
-                });
-                let mut cfg = config_from_settings(
-                    &args,
-                    &provider,
-                    &runtime,
-                    approver,
-                    questioner,
-                    notify,
-                    &tool_sources,
-                    &project,
-                    sandbox,
-                    skills,
-                    &options.cwd,
-                    &session_dirs,
-                )?;
-                let current_provider = cfg.provider_route.provider_id().to_string();
-                let current_model = cfg.provider_route.primary_model().to_string();
-                cfg.provider_catalog = Arc::clone(&catalog);
-                if options.provider_id.is_some() || options.model.is_some() {
-                    let provider_id = options
-                        .provider_id
-                        .as_deref()
-                        .unwrap_or_else(|| provider.initial_provider());
-                    cfg.provider_route = catalog
-                        .initial_route(provider_id, options.model.as_deref())
-                        .map_err(anyhow::Error::new)?;
-                } else {
-                    cfg.provider_route = catalog
-                        .initial_route(&current_provider, Some(&current_model))
-                        .map_err(anyhow::Error::new)?;
-                }
-                Ok(cfg)
-            })
-        };
-        let read_args = args.clone();
-        let mut server = kloop_server::ServerConfig::new(
-            factory,
-            kloop_server::ServerPaths {
-                store: session_store,
-            },
-        );
-        server.provider_catalog = provider.catalog();
-        server.mcp_servers = mcp_statuses;
-        let config_provider = provider.clone();
-        let config_runtime = runtime.clone();
-        server.config_reader = Arc::new(move |cwd| {
-            server_config_snapshot(&read_args, cwd, &config_provider, &config_runtime)
-        });
-        server.skills_reader = server_skills_reader(&args);
-        let server_result = kloop_server::serve_stdio(server).await;
-        mcp_lifecycle.shutdown().await;
-        server_result?;
-        return Ok(ExitCode::SUCCESS);
+        return run_serve(args, process, session_store).await;
     }
-
-    // Single-session frontends build their cwd-bound state once. Server mode
-    // returned above and performs the same work independently per thread.
-    let project = if args.mock {
-        context::mock(&cwd)
-    } else {
-        context::gather(&cwd)
-    };
-    for warning in &project.warnings {
-        eprintln!("\x1b[2m[{warning}]\x1b[0m");
-    }
-    // Ahead of the sandbox: the policy carves this project's offload directory
-    // back out of the otherwise denied private state root.
-    let session_dirs = session_store
-        .ensure(&cwd)
-        .context("cannot create the session directory")?;
-    let sandbox = build_sandbox(&args, &cwd, &runtime, &session_dirs.offload, |warning| {
-        eprintln!("\x1b[2m[{warning}]\x1b[0m")
-    })?;
-    let skills = Arc::new(if args.mock {
-        kloop_core::skills::builtin()
-    } else {
-        let (skills, warnings) = load_skills(&cwd);
-        for warning in &warnings {
-            eprintln!("\x1b[2m[{warning}]\x1b[0m");
-        }
-        skills
-    });
-    let (mut history, session_id) = open_history(
-        &session_store,
-        &session_dirs,
-        &args.session,
-        &provider.initial_route(),
-    )?;
-    // Every session — fresh, resumed or forked — opens on the route a new
-    // session would open on: `model_provider`/`model` (and their env overrides)
-    // as they read right now. A `/provider` switch belongs to the conversation
-    // that ran it, not to the file it left behind, so reopening re-asserts the
-    // configured default and records the hop when it differs.
-    let (session_route, reopened) = history
-        .adopt_provider_route(&provider.initial_route())
-        .map_err(anyhow::Error::new)?;
-    if let Some(reopened) = &reopened {
-        eprintln!("\x1b[2m[{reopened}]\x1b[0m");
-    }
-
-    // `--image` files are read + validated once, up front, so a bad path fails
-    // fast before any UI owns the terminal. They attach to the first user turn.
-    let pending_images = if args.mock {
-        if !args.images.is_empty() {
-            eprintln!("\x1b[2m[--image ignored with --mock]\x1b[0m");
-        }
-        Vec::new()
-    } else {
-        image::load_images(&args.images)?
-    };
-
+    let session = SessionState::open(&args, &cwd, &process, &session_store)?;
     // Headless (`--headless`) takes precedence over the interactive
     // front-ends — including --mock, so `--mock --headless` is a hermetic
     // end-to-end run for CI. One turn, print the result, exit by outcome.
     if args.headless {
-        let prompt = if args.mock {
-            // The scripted demo needs no real prompt; the trigger is fixed.
-            "run the demo".to_string()
+        return run_headless_turn(args, process, session, &cwd).await;
+    }
+    // The TUI is the default entry point; --plain keeps the line-based REPL,
+    // and --mock's scripted demo stays on plain output where it is readable.
+    if args.mock || args.plain {
+        return run_plain(args, process, session).await;
+    }
+    run_tui(args, process, session, cwd).await
+}
+
+/// Server mode's per-thread `Config` builder. Process-wide transports and policy
+/// stay shared, while each thread rebuilds cwd-bound context, skills, permission
+/// anchors, and its sandbox workspace root.
+fn serve_config_factory(
+    args: CliArgs,
+    process: &ProcessState,
+    session_store: SessionStore,
+) -> kloop_server::ConfigFactory {
+    let provider = process.provider.clone();
+    let runtime = process.runtime.clone();
+    let tool_sources = process.tool_sources.clone();
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let project = if args.mock {
+            context::mock(&options.cwd)
         } else {
-            let piped = read_stdin_if_piped().await?;
-            headless::assemble_prompt(args.prompt.as_deref(), piped.as_deref())?
+            context::gather(&options.cwd)
         };
-        let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+        for warning in &project.warnings {
+            notify(warning);
+        }
+        // Each thread pins its own cwd, so each resolves its own
+        // project partition rather than inheriting the process one.
+        // Resolved before the sandbox because the policy carves the
+        // partition's offload directory back out of the denied store.
+        let session_dirs = session_store.ensure(&options.cwd)?;
+        let sandbox = build_sandbox(
+            &args,
+            &options.cwd,
+            &runtime,
+            &session_dirs.offload,
+            |warning| notify(warning),
+        )?;
+        // `--mock` skips disk discovery (hermetic) but keeps the
+        // builtins, which are compiled in and touch no filesystem.
+        let skills = Arc::new(if args.mock {
+            kloop_core::skills::builtin()
+        } else {
+            let (skills, warnings) = load_skills(&options.cwd);
+            for warning in &warnings {
+                notify(warning);
+            }
+            skills
+        });
         let mut cfg = config_from_settings(
             &args,
             &provider,
             &runtime,
-            Arc::new(headless::DenyApprover),
-            None,
+            approver,
+            questioner,
             notify,
             &tool_sources,
             &project,
             sandbox,
             skills,
-            &cwd,
+            &options.cwd,
             &session_dirs,
         )?;
-        cfg.provider_route = if args.mock {
-            cfg.provider_route
-                .at_revision(session_route.revision())
-                .map_err(anyhow::Error::new)?
+        let current_provider = cfg.provider_route.provider_id().to_string();
+        let current_model = cfg.provider_route.primary_model().to_string();
+        cfg.provider_catalog = Arc::clone(&catalog);
+        if options.provider_id.is_some() || options.model.is_some() {
+            let provider_id = options
+                .provider_id
+                .as_deref()
+                .unwrap_or_else(|| provider.initial_provider());
+            cfg.provider_route = catalog
+                .initial_route(provider_id, options.model.as_deref())
+                .map_err(anyhow::Error::new)?;
         } else {
-            session_route.clone()
-        };
-        cfg.bind_session(session_id.clone())?;
-        // An explicit headless runaway guardrail enables the otherwise-absent cap.
-        if let Some(max_rounds) = args.max_rounds {
-            cfg.set_max_rounds(Some(max_rounds));
+            cfg.provider_route = catalog
+                .initial_route(&current_provider, Some(&current_model))
+                .map_err(anyhow::Error::new)?;
         }
-        let cfg = Arc::new(cfg);
-        // `--worktree`: run this headless turn inside an isolated tree (plan 35
-        // slice 2). Fail-closed — abort if it can't be created.
-        if let Some(name) = &args.worktree
-            && let Err(e) = kloop_core::worktree::enter(&cfg, name).await
-        {
-            eprintln!("worktree: {e:#}");
-            mcp_lifecycle.shutdown().await;
-            return Ok(ExitCode::FAILURE);
-        }
-        let cancel = CancellationToken::new();
-        let watcher = spawn_ctrl_c(cancel.clone());
-        let result = headless::run_headless(
-            cfg.clone(),
-            history,
-            session_id,
-            prompt,
-            pending_images,
-            args.json,
-            Arc::new(Mutex::new(std::io::stdout())),
-            cancel,
-        )
-        .await;
-        watcher.abort();
-        let remaining = cfg.shutdown_background_work(&result.ui).await;
-        if remaining > 0 {
-            eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
-        }
-        // Tear down the worktree (dirty kept on its branch, clean removed).
-        if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
-            eprintln!("{}", note.trim());
-        }
-        mcp_lifecycle.shutdown().await;
-        return Ok(ExitCode::from(result.code as u8));
-    }
+        Ok(cfg)
+    })
+}
 
-    // The TUI is the default entry point; --plain keeps the line-based REPL,
-    // and --mock's scripted demo stays on plain output where it is readable.
-    if args.mock || args.plain {
-        let plain_result = plain_main(
-            args,
-            provider,
-            session_route.clone(),
-            runtime,
-            history,
-            session_id,
-            tool_sources,
-            project,
-            sandbox,
-            skills,
-            pending_images,
-            session_dirs,
-        )
-        .await;
-        mcp_lifecycle.shutdown().await;
-        plain_result?;
-        return Ok(ExitCode::SUCCESS);
+/// `--serve`: the multi-session JSON-RPC server on stdio.
+async fn run_serve(
+    args: CliArgs,
+    process: ProcessState,
+    session_store: SessionStore,
+) -> Result<ExitCode> {
+    if !args.images.is_empty() {
+        eprintln!("\x1b[2m[--image ignored with --serve; send images via the RPC client]\x1b[0m");
     }
+    let factory = serve_config_factory(args.clone(), &process, session_store.clone());
+    let read_args = args.clone();
+    let mut server = kloop_server::ServerConfig::new(
+        factory,
+        kloop_server::ServerPaths {
+            store: session_store,
+        },
+    );
+    server.provider_catalog = process.provider.catalog();
+    server.mcp_servers = process.mcp_statuses;
+    let config_provider = process.provider.clone();
+    let config_runtime = process.runtime.clone();
+    server.config_reader = Arc::new(move |cwd| {
+        server_config_snapshot(&read_args, cwd, &config_provider, &config_runtime)
+    });
+    server.skills_reader = server_skills_reader(&args);
+    kloop_server::serve_stdio(server).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--headless`: one turn, print the result, exit by outcome.
+async fn run_headless_turn(
+    args: CliArgs,
+    process: ProcessState,
+    session: SessionState,
+    cwd: &std::path::Path,
+) -> Result<ExitCode> {
+    let prompt = if args.mock {
+        // The scripted demo needs no real prompt; the trigger is fixed.
+        "run the demo".to_string()
+    } else {
+        let piped = read_stdin_if_piped().await?;
+        headless::assemble_prompt(args.prompt.as_deref(), piped.as_deref())?
+    };
+    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+    let mut cfg = config_from_settings(
+        &args,
+        &process.provider,
+        &process.runtime,
+        Arc::new(headless::DenyApprover),
+        None,
+        notify,
+        &process.tool_sources,
+        &session.project,
+        session.sandbox,
+        session.skills,
+        cwd,
+        &session.session_dirs,
+    )?;
+    cfg.provider_route = if args.mock {
+        cfg.provider_route
+            .at_revision(session.session_route.revision())
+            .map_err(anyhow::Error::new)?
+    } else {
+        session.session_route.clone()
+    };
+    cfg.bind_session(session.session_id.clone())?;
+    // An explicit headless runaway guardrail enables the otherwise-absent cap.
+    if let Some(max_rounds) = args.max_rounds {
+        cfg.set_max_rounds(Some(max_rounds));
+    }
+    let cfg = Arc::new(cfg);
+    // `--worktree`: run this headless turn inside an isolated tree (plan 35
+    // slice 2). Fail-closed — abort if it can't be created.
+    if let Some(name) = &args.worktree
+        && let Err(e) = kloop_core::worktree::enter(&cfg, name).await
+    {
+        eprintln!("worktree: {e:#}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let cancel = CancellationToken::new();
+    let watcher = spawn_ctrl_c(cancel.clone());
+    let result = headless::run_headless(
+        cfg.clone(),
+        session.history,
+        session.session_id,
+        prompt,
+        session.pending_images,
+        args.json,
+        Arc::new(Mutex::new(std::io::stdout())),
+        cancel,
+    )
+    .await;
+    watcher.abort();
+    let remaining = cfg.shutdown_background_work(&result.ui).await;
+    if remaining > 0 {
+        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    }
+    // Tear down the worktree (dirty kept on its branch, clean removed).
+    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+        eprintln!("{}", note.trim());
+    }
+    Ok(ExitCode::from(result.code as u8))
+}
+
+/// `--plain` (and `--mock`): the line-based REPL.
+async fn run_plain(
+    args: CliArgs,
+    process: ProcessState,
+    session: SessionState,
+) -> Result<ExitCode> {
+    plain_main(
+        args,
+        process.provider,
+        session.session_route,
+        process.runtime,
+        session.history,
+        session.session_id,
+        process.tool_sources,
+        session.project,
+        session.sandbox,
+        session.skills,
+        session.pending_images,
+        session.session_dirs,
+    )
+    .await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The default front-end.
+async fn run_tui(
+    args: CliArgs,
+    process: ProcessState,
+    session: SessionState,
+    cwd: std::path::PathBuf,
+) -> Result<ExitCode> {
+    let SessionState {
+        project,
+        sandbox,
+        skills,
+        history,
+        session_id,
+        session_route,
+        session_dirs,
+        pending_images,
+    } = session;
     let factory_session_id = session_id.clone();
-    let tui_session_route = session_route.clone();
-    let tui_session_dirs = session_dirs.clone();
     let worktree = args.worktree.clone();
-    let tui_result = kloop_tui::run(
+    kloop_tui::run(
         move |approver, questioner, notify| {
             let mut cfg = config_from_settings(
                 &args,
-                &provider,
-                &runtime,
+                &process.provider,
+                &process.runtime,
                 approver,
                 Some(questioner),
                 notify,
-                &tool_sources,
+                &process.tool_sources,
                 &project,
                 sandbox.clone(),
                 skills.clone(),
                 &cwd,
-                &tui_session_dirs,
+                &session_dirs,
             )?;
-            cfg.provider_route = tui_session_route.clone();
+            cfg.provider_route = session_route.clone();
             cfg.bind_session(factory_session_id.clone())?;
             Ok(cfg)
         },
@@ -450,9 +566,7 @@ async fn main() -> Result<ExitCode> {
         pending_images,
         worktree,
     )
-    .await;
-    mcp_lifecycle.shutdown().await;
-    tui_result?;
+    .await?;
     Ok(ExitCode::SUCCESS)
 }
 
