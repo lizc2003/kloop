@@ -652,118 +652,11 @@ impl App {
     /// rows.
     fn apply_core(&mut self, ev: Event) {
         match ev {
-            Event::ItemStarted {
-                id,
-                item: Item::AssistantMessage { text, .. },
-            } => {
-                if let Some(&index) = self.assistant_cells.get(&id) {
-                    if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
-                        *current = text;
-                    }
-                } else {
-                    self.assistant_cells.insert(id, self.cells.len());
-                    self.cells.push(Cell::Assistant(text));
-                }
-                self.refresh_display_streaming();
-            }
-            Event::ItemDelta {
-                id,
-                delta: Delta::Text(text),
-            } => {
-                let index = match self.assistant_cells.get(&id).copied() {
-                    Some(index) => index,
-                    None => {
-                        let index = self.cells.len();
-                        self.assistant_cells.insert(id, index);
-                        self.cells.push(Cell::Assistant(String::new()));
-                        index
-                    }
-                };
-                if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
-                    current.push_str(&text);
-                }
-                self.refresh_display_streaming();
-            }
-            Event::ItemCompleted {
-                id,
-                item: Item::AssistantMessage { text, .. },
-            } => {
-                match self.assistant_cells.remove(&id) {
-                    Some(index) => {
-                        if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
-                            *current = text;
-                        }
-                    }
-                    None if !text.is_empty() => self.cells.push(Cell::Assistant(text)),
-                    None => {}
-                }
-                self.refresh_display_streaming();
-            }
-            Event::ItemStarted {
-                id,
-                item: Item::Reasoning { text, .. },
-            } => {
-                if let Some(&index) = self.reasoning_cells.get(&id) {
-                    if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
-                        *current = text;
-                    }
-                } else {
-                    self.reasoning_cells.insert(id, self.cells.len());
-                    self.cells.push(Cell::Thinking {
-                        text,
-                        seconds: None,
-                    });
-                }
-                self.refresh_display_streaming();
-            }
-            Event::ItemDelta {
-                id,
-                delta: Delta::Reasoning(text),
-            } => {
-                let index = match self.reasoning_cells.get(&id).copied() {
-                    Some(index) => index,
-                    None => {
-                        let index = self.cells.len();
-                        self.reasoning_cells.insert(id, index);
-                        self.cells.push(Cell::Thinking {
-                            text: String::new(),
-                            seconds: None,
-                        });
-                        index
-                    }
-                };
-                if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
-                    current.push_str(&text);
-                }
-                self.refresh_display_streaming();
-            }
-            Event::ItemCompleted {
-                id,
-                item: Item::Reasoning { text, .. },
-            } => {
-                match self.reasoning_cells.remove(&id) {
-                    Some(index) => {
-                        if let Some(Cell::Thinking { text: current, .. }) =
-                            self.cells.get_mut(index)
-                        {
-                            *current = text;
-                        }
-                    }
-                    None if !text.is_empty() => self.cells.push(Cell::Thinking {
-                        text,
-                        seconds: None,
-                    }),
-                    None => {}
-                }
-                self.refresh_display_streaming();
-            }
-            // Program output and the turn bracket have no dedicated transcript
-            // cell.
-            Event::ItemDelta {
-                delta: Delta::Output(_),
-                ..
-            }
-            | Event::TurnStarted => {}
+            Event::ItemStarted { id, item } => self.apply_item_started(id, item),
+            Event::ItemDelta { id, delta } => self.apply_item_delta(id, delta),
+            Event::ItemCompleted { id, item } => self.apply_item_completed(id, item),
+            // The turn bracket has no dedicated transcript cell.
+            Event::TurnStarted => {}
             Event::TaskGraphUpdated(snapshot) => {
                 let accept = self
                     .task_graph
@@ -774,167 +667,8 @@ impl App {
                     self.task_panel_retired = false;
                 }
             }
-            Event::ItemStarted {
-                id,
-                item: Item::ToolCall {
-                    agent, name, input, ..
-                },
-            } => {
-                let input = input.to_string();
-                // A one-line "verb detail" preview used by the note stream and
-                // the folded sub-agent row (the full cell is formatted at render).
-                let preview = crate::toolrow::tool_preview(&name, &input);
-                if !agent.is_empty() {
-                    // A sub-agent's call folds into its Agent row: bump the
-                    // counter, refresh the preview. No per-call cell, so
-                    // parallel agents cannot interleave.
-                    self.last_note = Some(format!("{agent} · {preview}"));
-                    if let Some(Cell::Agent {
-                        tools, last_tool, ..
-                    }) = self.agent_cell(&agent)
-                    {
-                        *tools += 1;
-                        *last_tool = preview;
-                    }
-                    return;
-                }
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = Some(preview);
-                self.tool_cells.insert(id, self.cells.len());
-                self.cells.push(Cell::Tool {
-                    name,
-                    input,
-                    status: ToolStatus::Running,
-                    output: None,
-                });
-            }
-            Event::ItemCompleted {
-                id,
-                item:
-                    Item::ToolCall {
-                        agent,
-                        status,
-                        output,
-                        ..
-                    },
-            } => {
-                // Sub-agent calls have no cell of their own; their agent's
-                // row is resolved by its own completion.
-                if !agent.is_empty() {
-                    return;
-                }
-                if let Some(&i) = self.tool_cells.get(&id)
-                    && let Some(Cell::Tool {
-                        status: cell_status,
-                        output: out,
-                        ..
-                    }) = self.cells.get_mut(i)
-                {
-                    *cell_status = if status == ItemStatus::Completed {
-                        ToolStatus::Ok
-                    } else {
-                        ToolStatus::Failed
-                    };
-                    // Keep the preview for the transcript; empty output
-                    // leaves the row a single line.
-                    if let Some(text) = output {
-                        *out = Some(text);
-                    }
-                }
-            }
-            Event::ItemStarted {
-                item: Item::SubAgent { label, task, .. },
-                ..
-            } => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = Some(format!("{label} started: {task}"));
-                self.agent_cells.insert(label.clone(), self.cells.len());
-                self.cells.push(Cell::Agent {
-                    agent: label,
-                    task,
-                    status: ToolStatus::Running,
-                    tools: 0,
-                    last_tool: String::new(),
-                });
-            }
-            Event::ItemCompleted {
-                item: Item::SubAgent { label, status, .. },
-                ..
-            } => {
-                if let Some(Cell::Agent { status: cell, .. }) = self.agent_cell(&label) {
-                    *cell = if status == ItemStatus::Completed {
-                        ToolStatus::Ok
-                    } else {
-                        ToolStatus::Failed
-                    };
-                }
-            }
-            Event::BackgroundTaskUpdated(task) => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                if let Some(note) = Event::BackgroundTaskUpdated(task.clone()).as_note() {
-                    self.last_note = Some(note);
-                }
-                let terminal = task.status != BackgroundTaskStatus::Running;
-                if let Some(index) = self.background_task_cells.get(&task.id).copied() {
-                    if matches!(self.cells.get(index), Some(Cell::BackgroundTask(_))) {
-                        self.cells[index] = Cell::BackgroundTask(task.clone());
-                        if terminal {
-                            self.background_task_cells.remove(&task.id);
-                        }
-                        return;
-                    }
-                    self.background_task_cells.remove(&task.id);
-                }
-                if self.frozen_background_tasks.contains(&task.id) {
-                    if !terminal {
-                        return;
-                    }
-                    self.frozen_background_tasks.remove(&task.id);
-                    self.cells.push(Cell::BackgroundTask(task));
-                    return;
-                }
-                let id = task.id.clone();
-                let index = self.cells.len();
-                self.cells.push(Cell::BackgroundTask(task));
-                if !terminal {
-                    self.background_task_cells.insert(id, index);
-                }
-            }
-            Event::AgentMessageUpdated(message) => {
-                self.assistant_open = false;
-                self.thinking_open = false;
-                if let Some(note) = Event::AgentMessageUpdated(message.clone()).as_note() {
-                    self.last_note = Some(note);
-                }
-                let id = message.id.to_string();
-                let terminal = message.status != AgentMessageStatus::Queued;
-                if let Some(index) = self.agent_message_cells.get(&id).copied() {
-                    if matches!(self.cells.get(index), Some(Cell::AgentMessage(_))) {
-                        self.cells[index] = Cell::AgentMessage(message.clone());
-                        if terminal {
-                            self.agent_message_cells.remove(&id);
-                        }
-                        return;
-                    }
-                    self.agent_message_cells.remove(&id);
-                }
-                if self.frozen_agent_messages.contains(&id) {
-                    if !terminal {
-                        return;
-                    }
-                    self.frozen_agent_messages.remove(&id);
-                    self.cells.push(Cell::AgentMessage(message));
-                    return;
-                }
-                let index = self.cells.len();
-                self.cells.push(Cell::AgentMessage(message));
-                if !terminal {
-                    self.agent_message_cells.insert(id, index);
-                }
-            }
+            Event::BackgroundTaskUpdated(task) => self.apply_background_task(task),
+            Event::AgentMessageUpdated(message) => self.apply_agent_message(message),
             Event::ScheduledTaskUpdated(task) => {
                 let event = Event::ScheduledTaskUpdated(task);
                 if let Some(note) = event.as_note() {
@@ -972,44 +706,310 @@ impl App {
                 // it against the (static) window.
                 self.context_used = used;
             }
-            Event::TurnEnded(reason) => {
-                self.running = false;
-                self.clear_frozen_route();
+            Event::TurnEnded(reason) => self.apply_turn_ended(reason),
+        }
+    }
+
+    /// An item opened. Message/reasoning items claim a cell to stream into; a
+    /// tool call or sub-agent gets its status row.
+    fn apply_item_started(&mut self, id: String, item: Item) {
+        match item {
+            Item::AssistantMessage { text, .. } => {
+                if let Some(&index) = self.assistant_cells.get(&id) {
+                    if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                        *current = text;
+                    }
+                } else {
+                    self.assistant_cells.insert(id, self.cells.len());
+                    self.cells.push(Cell::Assistant(text));
+                }
+                self.refresh_display_streaming();
+            }
+            Item::Reasoning { text, .. } => {
+                if let Some(&index) = self.reasoning_cells.get(&id) {
+                    if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
+                        *current = text;
+                    }
+                } else {
+                    self.reasoning_cells.insert(id, self.cells.len());
+                    self.cells.push(Cell::Thinking {
+                        text,
+                        seconds: None,
+                    });
+                }
+                self.refresh_display_streaming();
+            }
+            Item::ToolCall {
+                agent, name, input, ..
+            } => {
+                let input = input.to_string();
+                // A one-line "verb detail" preview used by the note stream and
+                // the folded sub-agent row (the full cell is formatted at render).
+                let preview = crate::toolrow::tool_preview(&name, &input);
+                if !agent.is_empty() {
+                    // A sub-agent's call folds into its Agent row: bump the
+                    // counter, refresh the preview. No per-call cell, so
+                    // parallel agents cannot interleave.
+                    self.last_note = Some(format!("{agent} · {preview}"));
+                    if let Some(Cell::Agent {
+                        tools, last_tool, ..
+                    }) = self.agent_cell(&agent)
+                    {
+                        *tools += 1;
+                        *last_tool = preview;
+                    }
+                    return;
+                }
                 self.assistant_open = false;
                 self.thinking_open = false;
-                self.assistant_cells.clear();
-                self.reasoning_cells.clear();
-                self.last_note = None;
-                // Any prompt still queued belongs to the turn that just died;
-                // dropping the senders resolves them as Deny.
-                self.interactions.clear();
-                self.panel_scroll = 0;
-                // The panel tracks a turn in flight, not a standing checklist:
-                // it leaves the composer with the turn that raised it, finished
-                // or not. Keeping an unfinished graph pinned there was the
-                // common case — a model that has delivered its answer rarely
-                // goes back to tick its own boxes — and between turns it read as
-                // work still running. The next task update brings it back.
-                self.task_panel_retired = true;
-                // An interrupted turn drops task futures mid-await, so a
-                // sub-agent's completion may never arrive: no row may outlive
-                // its turn still spinning.
-                for cell in &mut self.cells {
-                    if let Cell::Agent { status, .. } = cell
-                        && *status == ToolStatus::Running
-                    {
-                        *status = ToolStatus::Failed;
+                self.last_note = Some(preview);
+                self.tool_cells.insert(id, self.cells.len());
+                self.cells.push(Cell::Tool {
+                    name,
+                    input,
+                    status: ToolStatus::Running,
+                    output: None,
+                });
+            }
+            Item::SubAgent { label, task, .. } => {
+                self.assistant_open = false;
+                self.thinking_open = false;
+                self.last_note = Some(format!("{label} started: {task}"));
+                self.agent_cells.insert(label.clone(), self.cells.len());
+                self.cells.push(Cell::Agent {
+                    agent: label,
+                    task,
+                    status: ToolStatus::Running,
+                    tools: 0,
+                    last_tool: String::new(),
+                });
+            }
+        }
+    }
+
+    /// Streamed content for an open item. A delta may arrive before its
+    /// `ItemStarted` (a resumed stream, a provider that only deltas), so each
+    /// branch opens the cell it needs rather than assuming one is there.
+    fn apply_item_delta(&mut self, id: String, delta: Delta) {
+        match delta {
+            Delta::Text(text) => {
+                let index = match self.assistant_cells.get(&id).copied() {
+                    Some(index) => index,
+                    None => {
+                        let index = self.cells.len();
+                        self.assistant_cells.insert(id, index);
+                        self.cells.push(Cell::Assistant(String::new()));
+                        index
                     }
+                };
+                if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                    current.push_str(&text);
                 }
-                match reason {
-                    EndReason::Completed => {}
-                    EndReason::MaxRounds => {
-                        self.cells.push(Cell::Note("stopped: max rounds".into()))
+                self.refresh_display_streaming();
+            }
+            Delta::Reasoning(text) => {
+                let index = match self.reasoning_cells.get(&id).copied() {
+                    Some(index) => index,
+                    None => {
+                        let index = self.cells.len();
+                        self.reasoning_cells.insert(id, index);
+                        self.cells.push(Cell::Thinking {
+                            text: String::new(),
+                            seconds: None,
+                        });
+                        index
                     }
-                    EndReason::Aborted => self.cells.push(Cell::Note("interrupted".into())),
-                    EndReason::Error(e) => self.cells.push(Cell::Note(format!("error: {e}"))),
+                };
+                if let Some(Cell::Thinking { text: current, .. }) = self.cells.get_mut(index) {
+                    current.push_str(&text);
+                }
+                self.refresh_display_streaming();
+            }
+            // Program output has no dedicated transcript cell.
+            Delta::Output(_) => {}
+        }
+    }
+
+    /// An item sealed: the completed payload replaces whatever the deltas built,
+    /// and the cell index is released.
+    fn apply_item_completed(&mut self, id: String, item: Item) {
+        match item {
+            Item::AssistantMessage { text, .. } => {
+                match self.assistant_cells.remove(&id) {
+                    Some(index) => {
+                        if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+                            *current = text;
+                        }
+                    }
+                    None if !text.is_empty() => self.cells.push(Cell::Assistant(text)),
+                    None => {}
+                }
+                self.refresh_display_streaming();
+            }
+            Item::Reasoning { text, .. } => {
+                match self.reasoning_cells.remove(&id) {
+                    Some(index) => {
+                        if let Some(Cell::Thinking { text: current, .. }) =
+                            self.cells.get_mut(index)
+                        {
+                            *current = text;
+                        }
+                    }
+                    None if !text.is_empty() => self.cells.push(Cell::Thinking {
+                        text,
+                        seconds: None,
+                    }),
+                    None => {}
+                }
+                self.refresh_display_streaming();
+            }
+            Item::ToolCall {
+                agent,
+                status,
+                output,
+                ..
+            } => {
+                // Sub-agent calls have no cell of their own; their agent's
+                // row is resolved by its own completion.
+                if !agent.is_empty() {
+                    return;
+                }
+                if let Some(&i) = self.tool_cells.get(&id)
+                    && let Some(Cell::Tool {
+                        status: cell_status,
+                        output: out,
+                        ..
+                    }) = self.cells.get_mut(i)
+                {
+                    *cell_status = if status == ItemStatus::Completed {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Failed
+                    };
+                    // Keep the preview for the transcript; empty output
+                    // leaves the row a single line.
+                    if let Some(text) = output {
+                        *out = Some(text);
+                    }
                 }
             }
+            Item::SubAgent { label, status, .. } => {
+                if let Some(Cell::Agent { status: cell, .. }) = self.agent_cell(&label) {
+                    *cell = if status == ItemStatus::Completed {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Failed
+                    };
+                }
+            }
+        }
+    }
+
+    /// A background task's row: one cell per task, replaced in place while it
+    /// runs and released once it reaches a terminal status.
+    fn apply_background_task(&mut self, task: BackgroundTask) {
+        self.assistant_open = false;
+        self.thinking_open = false;
+        if let Some(note) = Event::BackgroundTaskUpdated(task.clone()).as_note() {
+            self.last_note = Some(note);
+        }
+        let terminal = task.status != BackgroundTaskStatus::Running;
+        if let Some(index) = self.background_task_cells.get(&task.id).copied() {
+            if matches!(self.cells.get(index), Some(Cell::BackgroundTask(_))) {
+                self.cells[index] = Cell::BackgroundTask(task.clone());
+                if terminal {
+                    self.background_task_cells.remove(&task.id);
+                }
+                return;
+            }
+            self.background_task_cells.remove(&task.id);
+        }
+        if self.frozen_background_tasks.contains(&task.id) {
+            if !terminal {
+                return;
+            }
+            self.frozen_background_tasks.remove(&task.id);
+            self.cells.push(Cell::BackgroundTask(task));
+            return;
+        }
+        let id = task.id.clone();
+        let index = self.cells.len();
+        self.cells.push(Cell::BackgroundTask(task));
+        if !terminal {
+            self.background_task_cells.insert(id, index);
+        }
+    }
+
+    /// A peer message's row, on the same in-place-until-terminal rule as a
+    /// background task.
+    fn apply_agent_message(&mut self, message: AgentMessageUpdate) {
+        self.assistant_open = false;
+        self.thinking_open = false;
+        if let Some(note) = Event::AgentMessageUpdated(message.clone()).as_note() {
+            self.last_note = Some(note);
+        }
+        let id = message.id.to_string();
+        let terminal = message.status != AgentMessageStatus::Queued;
+        if let Some(index) = self.agent_message_cells.get(&id).copied() {
+            if matches!(self.cells.get(index), Some(Cell::AgentMessage(_))) {
+                self.cells[index] = Cell::AgentMessage(message.clone());
+                if terminal {
+                    self.agent_message_cells.remove(&id);
+                }
+                return;
+            }
+            self.agent_message_cells.remove(&id);
+        }
+        if self.frozen_agent_messages.contains(&id) {
+            if !terminal {
+                return;
+            }
+            self.frozen_agent_messages.remove(&id);
+            self.cells.push(Cell::AgentMessage(message));
+            return;
+        }
+        let index = self.cells.len();
+        self.cells.push(Cell::AgentMessage(message));
+        if !terminal {
+            self.agent_message_cells.insert(id, index);
+        }
+    }
+
+    /// The turn closed: drop everything that belonged to it, then note why.
+    fn apply_turn_ended(&mut self, reason: EndReason) {
+        self.running = false;
+        self.clear_frozen_route();
+        self.assistant_open = false;
+        self.thinking_open = false;
+        self.assistant_cells.clear();
+        self.reasoning_cells.clear();
+        self.last_note = None;
+        // Any prompt still queued belongs to the turn that just died;
+        // dropping the senders resolves them as Deny.
+        self.interactions.clear();
+        self.panel_scroll = 0;
+        // The panel tracks a turn in flight, not a standing checklist:
+        // it leaves the composer with the turn that raised it, finished
+        // or not. Keeping an unfinished graph pinned there was the
+        // common case — a model that has delivered its answer rarely
+        // goes back to tick its own boxes — and between turns it read as
+        // work still running. The next task update brings it back.
+        self.task_panel_retired = true;
+        // An interrupted turn drops task futures mid-await, so a
+        // sub-agent's completion may never arrive: no row may outlive
+        // its turn still spinning.
+        for cell in &mut self.cells {
+            if let Cell::Agent { status, .. } = cell
+                && *status == ToolStatus::Running
+            {
+                *status = ToolStatus::Failed;
+            }
+        }
+        match reason {
+            EndReason::Completed => {}
+            EndReason::MaxRounds => self.cells.push(Cell::Note("stopped: max rounds".into())),
+            EndReason::Aborted => self.cells.push(Cell::Note("interrupted".into())),
+            EndReason::Error(e) => self.cells.push(Cell::Note(format!("error: {e}"))),
         }
     }
 
