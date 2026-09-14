@@ -906,6 +906,419 @@ fn terminal_outcome(
     }
 }
 
+/// `response.failed` / `error`: the two shapes a Responses stream reports a
+/// failure in. Either may carry a context-overflow message, which the agent
+/// recovers from by compacting instead of failing the turn.
+fn stream_failure(event: &str, value: &Value, key: &str) -> ProviderFailure {
+    if event == "response.failed" {
+        let error = &value["response"]["error"];
+        if is_overflow_message(&error.to_string()) {
+            return ProviderFailure::context_overflow();
+        }
+        return crate::stream_error(
+            "openai-responses",
+            crate::error_label(error),
+            crate::error_detail(error, key),
+        );
+    }
+    if is_overflow_message(&value.to_string()) {
+        return ProviderFailure::context_overflow();
+    }
+    // The `error` event's own `type` is the envelope ("error"), so only its
+    // `code` names the failure here.
+    let label = value["code"].as_str().unwrap_or("unknown");
+    crate::stream_error("openai-responses", label, crate::error_detail(value, key))
+}
+
+/// Everything one Responses stream accumulates: the response identity it
+/// adopted, the output items still open, the blocks already handed to the sink,
+/// and the terminal once one lands. One method per wire event family, so the
+/// grouping the event names already declare (`response.output_item.*`,
+/// `response.function_call_arguments.*`, …) is the grouping of the code too.
+#[derive(Default)]
+struct ResponseStream {
+    response_id: Option<String>,
+    items: BTreeMap<ItemKey, ItemState>,
+    seen_items: HashSet<ItemKey>,
+    completed_blocks: Vec<AssistantBlock>,
+    output: OutputSummary,
+    completion: Option<StreamCompletion>,
+}
+
+impl ResponseStream {
+    /// The open item this event names. `what` names the event for the failure
+    /// message, which is all that distinguishes the ten call sites.
+    fn open_item(&mut self, value: &Value, what: &str) -> Result<&mut ItemState, ProviderFailure> {
+        let key = event_item_key(value)?;
+        self.items
+            .get_mut(&key)
+            .ok_or_else(|| protocol(format!("{what} referenced an unknown item")))
+    }
+
+    /// `response.created` and `response.in_progress` are pure lifecycle
+    /// metadata: they open the response and say nothing a later frame does not
+    /// repeat. A relay that re-sends one — after an internal retry, or when
+    /// merging an upstream stream — has told us nothing new, and killing the
+    /// turn over it costs the whole round.
+    ///
+    /// Their `status` is descriptive and never read: nothing below branches on
+    /// it, and a relay that queues the request and says so has changed nothing
+    /// about what we do. Checking it made a word choice upstream into a
+    /// protocol violation down here — and requiring the *key* did the same to a
+    /// gateway that simply does not send it on the opening frames (gw_cn's
+    /// deepseek route), which is why only the id is read here.
+    ///
+    /// A *different* identity is the one thing that matters, and it means two
+    /// things depending on when it lands. Before any output item, it is an
+    /// upstream restart — the relay retried and is now forwarding the real
+    /// response, and nothing has been attributed yet, so follow it. After
+    /// output, it is two responses sharing one stream, and everything from here
+    /// would land on the wrong one: fail closed, naming both ids so the next
+    /// reader does not have to guess which half moved.
+    fn on_lifecycle(&mut self, event: &str, value: &Value) -> Result<(), ProviderFailure> {
+        let id = response_id_of(&value["response"])?;
+        let adopt = match self.response_id.as_deref() {
+            None if event == "response.in_progress" => {
+                return Err(protocol("response.in_progress arrived before created"));
+            }
+            None => true,
+            Some(seen) if seen == id => false,
+            Some(seen) => {
+                if !self.seen_items.is_empty() || !self.completed_blocks.is_empty() {
+                    return Err(protocol(format!(
+                        "response identity changed from {seen} to {id} after output \
+                             had landed"
+                    )));
+                }
+                true
+            }
+        };
+        if adopt {
+            self.response_id = Some(id.to_string());
+        }
+        Ok(())
+    }
+
+    /// `response.output_item.added`: an item opens.
+    fn on_item_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        if self.response_id.is_none() {
+            return Err(protocol("output item arrived before response.created"));
+        }
+        let key = item_key(value)?;
+        if !self.seen_items.insert(key.clone()) {
+            return Err(protocol("output item identity was added more than once"));
+        }
+        let state = start_item(&value["item"])?;
+        let display_kind_open = self.items.values().any(|current| {
+            matches!(
+                (&state.kind, &current.kind),
+                (ItemKind::Message { .. }, ItemKind::Message { .. })
+                    | (ItemKind::Reasoning { .. }, ItemKind::Reasoning { .. })
+            )
+        });
+        if display_kind_open {
+            return Err(protocol(
+                "concurrent display items had no canonical identity",
+            ));
+        }
+        self.items.insert(key, state);
+        Ok(())
+    }
+
+    /// `response.output_item.done`: the item seals into assistant blocks.
+    async fn on_item_done(
+        &mut self,
+        value: &Value,
+        sink: &StreamSink,
+    ) -> Result<(), ProviderFailure> {
+        let key = item_key(value)?;
+        let state = self
+            .items
+            .remove(&key)
+            .ok_or_else(|| protocol("output item done referenced a non-open item"))?;
+        let (mut blocks, completion) =
+            finish_item(state, &value["item"], &mut self.output.has_refusal)?;
+        self.output.truncated |= completion == ItemCompletion::Truncated;
+        for block in &blocks {
+            self.output.has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
+        }
+        for block in blocks.drain(..) {
+            if block.has_semantic_payload() {
+                self.completed_blocks.push(block.clone());
+                sink.block_done(block).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `response.content_part.added`: a message part opens.
+    fn on_content_part_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "content part")?;
+        let index = required_u64(&value["content_index"], "content_index")?;
+        let refusal = add_content_part(state, index, &value["part"])?;
+        self.output.has_refusal |= refusal;
+        Ok(())
+    }
+
+    /// `response.content_part.done`: a message or reasoning-content part
+    /// closes, and its final value has to be the one the deltas built.
+    fn on_content_part_done(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "content part done")?;
+        let index = required_u64(&value["content_index"], "content_index")?;
+        match &mut state.kind {
+            ItemKind::Message { parts } => {
+                let part = parts
+                    .get_mut(&index)
+                    .ok_or_else(|| protocol("content part done referenced an unknown part"))?;
+                if !part.field_done || part.part_closed {
+                    return Err(protocol("content part closed out of order"));
+                }
+                let expected = match part.kind {
+                    MessagePartKind::OutputText => "output_text",
+                    MessagePartKind::Refusal => "refusal",
+                };
+                if required_str(&value["part"]["type"], "content part type")? != expected
+                    || message_part_value(&value["part"], part.kind, "content part value")?
+                        != part.text
+                {
+                    return Err(protocol("content part final value changed"));
+                }
+                part.part_closed = true;
+            }
+            ItemKind::Reasoning { content, .. } => {
+                let part = content
+                    .get_mut(&index)
+                    .ok_or_else(|| protocol("reasoning content done referenced an unknown part"))?;
+                if !part.field_done || part.part_closed {
+                    return Err(protocol("reasoning content part closed out of order"));
+                }
+                if required_str(&value["part"]["type"], "reasoning content part type")?
+                    != "reasoning_text"
+                    || required_str(&value["part"]["text"], "reasoning content text")? != part.text
+                {
+                    return Err(protocol("reasoning content final value changed"));
+                }
+                part.part_closed = true;
+            }
+            ItemKind::FunctionCall { .. } => {
+                return Err(protocol("function call received content_part.done"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `response.output_text.delta` / `response.refusal.delta`: streamed
+    /// message text. The refusal spelling is the same channel with a different
+    /// part kind, and it also decides the turn's outcome.
+    async fn on_message_text_delta(
+        &mut self,
+        event: &str,
+        value: &Value,
+        sink: &StreamSink,
+    ) -> Result<(), ProviderFailure> {
+        let expected = self.message_part_kind(event, "response.output_text.delta");
+        let state = self.open_item(value, "text delta")?;
+        let index = required_u64(&value["content_index"], "content_index")?;
+        let part = text_part_mut(state, index, expected)?;
+        let delta = required_str(&value["delta"], "text delta")?;
+        part.text.push_str(delta);
+        if !delta.is_empty() {
+            sink.text_delta(delta.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// `response.output_text.done` / `response.refusal.done`.
+    fn on_message_text_done(&mut self, event: &str, value: &Value) -> Result<(), ProviderFailure> {
+        let expected = self.message_part_kind(event, "response.output_text.done");
+        let state = self.open_item(value, "text done")?;
+        let index = required_u64(&value["content_index"], "content_index")?;
+        let part = text_part_mut(state, index, expected)?;
+        if message_part_value(value, expected, "final text value")? != part.text {
+            return Err(protocol("text done did not match accumulated delta"));
+        }
+        part.field_done = true;
+        Ok(())
+    }
+
+    /// Which message part an `output_text`/`refusal` pair is addressing. A
+    /// refusal on either channel decides the turn's outcome, so it is recorded
+    /// here rather than at each of the two call sites.
+    fn message_part_kind(&mut self, event: &str, text_event: &str) -> MessagePartKind {
+        if event == text_event {
+            MessagePartKind::OutputText
+        } else {
+            self.output.has_refusal = true;
+            MessagePartKind::Refusal
+        }
+    }
+
+    /// `response.reasoning_summary_part.added`.
+    fn on_reasoning_part_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "reasoning part")?;
+        let index = required_u64(&value["summary_index"], "summary_index")?;
+        let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
+            return Err(protocol("reasoning part referenced the wrong item type"));
+        };
+        // Opening a part while earlier ones are still open is the
+        // norm on this wire, not a violation — see `add_content_part`.
+        if required_str(&value["part"]["type"], "summary part type")? != "summary_text" {
+            return Err(protocol("reasoning summary part type was unsupported"));
+        }
+        let text = opening_part_text(&value["part"]["text"], "summary part text")?;
+        if summary.contains_key(&index) {
+            return Err(protocol("summary_index was added more than once"));
+        }
+        summary.insert(
+            index,
+            ReasoningPart {
+                text: text.to_string(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// `response.reasoning_summary_part.done`.
+    fn on_reasoning_part_done(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "reasoning part done")?;
+        let index = required_u64(&value["summary_index"], "summary_index")?;
+        let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
+            return Err(protocol(
+                "reasoning part done referenced the wrong item type",
+            ));
+        };
+        let part = summary
+            .get_mut(&index)
+            .ok_or_else(|| protocol("reasoning part done referenced an unknown part"))?;
+        if !part.field_done || part.part_closed {
+            return Err(protocol("reasoning summary part closed out of order"));
+        }
+        if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
+            || required_str(&value["part"]["text"], "summary part text")? != part.text
+        {
+            return Err(protocol("reasoning summary part final value changed"));
+        }
+        part.part_closed = true;
+        Ok(())
+    }
+
+    /// `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`:
+    /// the summary and the raw-content channels, indexed by different fields.
+    async fn on_reasoning_text_delta(
+        &mut self,
+        event: &str,
+        value: &Value,
+        sink: &StreamSink,
+    ) -> Result<(), ProviderFailure> {
+        let summary = event == "response.reasoning_summary_text.delta";
+        let state = self.open_item(value, "reasoning delta")?;
+        let index = reasoning_index(value, summary)?;
+        let part = reasoning_part_mut(state, index, summary)?;
+        let delta = required_str(&value["delta"], "reasoning delta")?;
+        part.text.push_str(delta);
+        if !delta.is_empty() {
+            sink.thinking_delta(delta.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// `response.reasoning_summary_text.done` / `response.reasoning_text.done`.
+    fn on_reasoning_text_done(
+        &mut self,
+        event: &str,
+        value: &Value,
+    ) -> Result<(), ProviderFailure> {
+        let summary = event == "response.reasoning_summary_text.done";
+        let state = self.open_item(value, "reasoning done")?;
+        let index = reasoning_index(value, summary)?;
+        let part = reasoning_part_mut(state, index, summary)?;
+        if required_str(&value["text"], "final reasoning text")? != part.text {
+            return Err(protocol("reasoning done did not match accumulated delta"));
+        }
+        part.field_done = true;
+        Ok(())
+    }
+
+    /// `response.function_call_arguments.delta`.
+    fn on_arguments_delta(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "arguments delta")?;
+        let ItemKind::FunctionCall {
+            arguments,
+            arguments_started,
+            arguments_done,
+            ..
+        } = &mut state.kind
+        else {
+            return Err(protocol("arguments delta referenced a non-function item"));
+        };
+        if *arguments_done {
+            return Err(protocol("arguments delta arrived after arguments done"));
+        }
+        *arguments_started = true;
+        arguments.push_str(required_str(&value["delta"], "arguments delta")?);
+        Ok(())
+    }
+
+    /// `response.function_call_arguments.done`.
+    fn on_arguments_done(&mut self, value: &Value) -> Result<(), ProviderFailure> {
+        let state = self.open_item(value, "arguments done")?;
+        let ItemKind::FunctionCall {
+            arguments,
+            arguments_started,
+            arguments_done,
+            ..
+        } = &mut state.kind
+        else {
+            return Err(protocol("arguments done referenced a non-function item"));
+        };
+        if *arguments_done {
+            return Err(protocol("received duplicate arguments done"));
+        }
+        *arguments_started = true;
+        if !arguments_agree(
+            required_str(&value["arguments"], "final arguments")?,
+            arguments.as_str(),
+        ) {
+            return Err(protocol("arguments done did not match accumulated delta"));
+        }
+        *arguments_done = true;
+        Ok(())
+    }
+
+    /// `response.completed` / `response.incomplete`: the semantic terminal.
+    fn on_terminal(&mut self, event: &str, value: &Value) -> Result<(), ProviderFailure> {
+        let expected = self
+            .response_id
+            .as_deref()
+            .ok_or_else(|| protocol("terminal arrived before response.created"))?;
+        if !self.items.is_empty() {
+            return Err(protocol("terminal arrived with open output items"));
+        }
+        let id = response_id_of(&value["response"])?;
+        if id != expected {
+            return Err(protocol("terminal response identity changed"));
+        }
+        let outcome = terminal_outcome(event, &value["response"], &self.output)?;
+        crate::validate_assistant_output("openai-responses", &outcome, &self.completed_blocks)?;
+        self.completion = Some(StreamCompletion::new(
+            outcome,
+            usage_from(&value["response"])?,
+        ));
+        Ok(())
+    }
+}
+
+/// The summary channel indexes by `summary_index`, the raw-content channel by
+/// `content_index`.
+fn reasoning_index(value: &Value, summary: bool) -> Result<u64, ProviderFailure> {
+    if summary {
+        required_u64(&value["summary_index"], "summary_index")
+    } else {
+        required_u64(&value["content_index"], "content_index")
+    }
+}
+
 pub(super) async fn stream(
     url: &str,
     key: &str,
@@ -916,377 +1329,44 @@ pub(super) async fn stream(
     let resp = crate::send_checked(req, "openai-responses", key).await?;
 
     let mut frames = SseFrames::new(resp.bytes_stream());
-    let mut response_id: Option<String> = None;
-    let mut items: BTreeMap<ItemKey, ItemState> = BTreeMap::new();
-    let mut seen_items = HashSet::new();
-    let mut completed_blocks = Vec::new();
-    let mut output = OutputSummary::default();
-    let mut completion = None;
+    let mut state = ResponseStream::default();
 
     while let Some(frame) = frames.next().await? {
         if frame.data.trim() == "[DONE]" {
-            if completion.is_some() {
+            if state.completion.is_some() {
                 continue;
             }
             return Err(protocol("[DONE] arrived before a semantic terminal"));
         }
         let value = crate::parse_sse_json("openai-responses", &frame.data)?;
         let event = event_type(&frame, &value)?;
-        if completion.is_some() && !is_out_of_band(event) {
+        if state.completion.is_some() && !is_out_of_band(event) {
             return Err(protocol("semantic event arrived after response terminal"));
         }
         match event {
-            // `response.created` and `response.in_progress` are pure
-            // lifecycle metadata: they open the response and say nothing a
-            // later frame does not repeat. A relay that re-sends one — after
-            // an internal retry, or when merging an upstream stream — has
-            // told us nothing new, and killing the turn over it costs the
-            // whole round.
-            //
-            // Their `status` is descriptive and never read: nothing below
-            // branches on it, and a relay that queues the request and says
-            // so has changed nothing about what we do. Checking it made a
-            // word choice upstream into a protocol violation down here —
-            // and requiring the *key* did the same to a gateway that simply
-            // does not send it on the opening frames (gw_cn's deepseek
-            // route), which is why only the id is read here.
-            //
-            // A *different* identity is the one thing that matters, and it
-            // means two things depending on when it lands. Before any output
-            // item, it is an upstream restart — the relay retried and is now
-            // forwarding the real response, and nothing has been attributed
-            // yet, so follow it. After output, it is two responses sharing
-            // one stream, and everything from here would land on the wrong
-            // one: fail closed, naming both ids so the next reader does not
-            // have to guess which half moved.
-            "response.created" | "response.in_progress" => {
-                let id = response_id_of(&value["response"])?;
-                let adopt = match response_id.as_deref() {
-                    None if event == "response.in_progress" => {
-                        return Err(protocol("response.in_progress arrived before created"));
-                    }
-                    None => true,
-                    Some(seen) if seen == id => false,
-                    Some(seen) => {
-                        if !seen_items.is_empty() || !completed_blocks.is_empty() {
-                            return Err(protocol(format!(
-                                "response identity changed from {seen} to {id} after output \
-                                     had landed"
-                            )));
-                        }
-                        true
-                    }
-                };
-                if adopt {
-                    response_id = Some(id.to_string());
-                }
-            }
-            "response.output_item.added" => {
-                if response_id.is_none() {
-                    return Err(protocol("output item arrived before response.created"));
-                }
-                let key = item_key(&value)?;
-                if !seen_items.insert(key.clone()) {
-                    return Err(protocol("output item identity was added more than once"));
-                }
-                let state = start_item(&value["item"])?;
-                let display_kind_open = items.values().any(|current| {
-                    matches!(
-                        (&state.kind, &current.kind),
-                        (ItemKind::Message { .. }, ItemKind::Message { .. })
-                            | (ItemKind::Reasoning { .. }, ItemKind::Reasoning { .. })
-                    )
-                });
-                if display_kind_open {
-                    return Err(protocol(
-                        "concurrent display items had no canonical identity",
-                    ));
-                }
-                items.insert(key, state);
-            }
-            "response.content_part.added" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("content part referenced an unknown item"))?;
-                let index = required_u64(&value["content_index"], "content_index")?;
-                output.has_refusal |= add_content_part(state, index, &value["part"])?;
-            }
+            "response.created" | "response.in_progress" => state.on_lifecycle(event, &value)?,
+            "response.output_item.added" => state.on_item_added(&value)?,
+            "response.content_part.added" => state.on_content_part_added(&value)?,
             "response.output_text.delta" | "response.refusal.delta" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("text delta referenced an unknown item"))?;
-                let index = required_u64(&value["content_index"], "content_index")?;
-                let expected = if event == "response.output_text.delta" {
-                    MessagePartKind::OutputText
-                } else {
-                    output.has_refusal = true;
-                    MessagePartKind::Refusal
-                };
-                let part = text_part_mut(state, index, expected)?;
-                let delta = required_str(&value["delta"], "text delta")?;
-                part.text.push_str(delta);
-                if !delta.is_empty() {
-                    sink.text_delta(delta.to_string()).await?;
-                }
+                state.on_message_text_delta(event, &value, sink).await?
             }
             "response.output_text.done" | "response.refusal.done" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("text done referenced an unknown item"))?;
-                let index = required_u64(&value["content_index"], "content_index")?;
-                let expected = if event == "response.output_text.done" {
-                    MessagePartKind::OutputText
-                } else {
-                    output.has_refusal = true;
-                    MessagePartKind::Refusal
-                };
-                let part = text_part_mut(state, index, expected)?;
-                if message_part_value(&value, expected, "final text value")? != part.text {
-                    return Err(protocol("text done did not match accumulated delta"));
-                }
-                part.field_done = true;
+                state.on_message_text_done(event, &value)?
             }
-            "response.reasoning_summary_part.added" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("reasoning part referenced an unknown item"))?;
-                let index = required_u64(&value["summary_index"], "summary_index")?;
-                let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
-                    return Err(protocol("reasoning part referenced the wrong item type"));
-                };
-                // Opening a part while earlier ones are still open is the
-                // norm on this wire, not a violation — see `add_content_part`.
-                if required_str(&value["part"]["type"], "summary part type")? != "summary_text" {
-                    return Err(protocol("reasoning summary part type was unsupported"));
-                }
-                let text = opening_part_text(&value["part"]["text"], "summary part text")?;
-                if summary.contains_key(&index) {
-                    return Err(protocol("summary_index was added more than once"));
-                }
-                summary.insert(
-                    index,
-                    ReasoningPart {
-                        text: text.to_string(),
-                        ..Default::default()
-                    },
-                );
-            }
+            "response.reasoning_summary_part.added" => state.on_reasoning_part_added(&value)?,
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("reasoning delta referenced an unknown item"))?;
-                let summary = event == "response.reasoning_summary_text.delta";
-                let index = if summary {
-                    required_u64(&value["summary_index"], "summary_index")?
-                } else {
-                    required_u64(&value["content_index"], "content_index")?
-                };
-                let part = reasoning_part_mut(state, index, summary)?;
-                let delta = required_str(&value["delta"], "reasoning delta")?;
-                part.text.push_str(delta);
-                if !delta.is_empty() {
-                    sink.thinking_delta(delta.to_string()).await?;
-                }
+                state.on_reasoning_text_delta(event, &value, sink).await?
             }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("reasoning done referenced an unknown item"))?;
-                let summary = event == "response.reasoning_summary_text.done";
-                let index = if summary {
-                    required_u64(&value["summary_index"], "summary_index")?
-                } else {
-                    required_u64(&value["content_index"], "content_index")?
-                };
-                let part = reasoning_part_mut(state, index, summary)?;
-                if required_str(&value["text"], "final reasoning text")? != part.text {
-                    return Err(protocol("reasoning done did not match accumulated delta"));
-                }
-                part.field_done = true;
+                state.on_reasoning_text_done(event, &value)?
             }
-            "response.reasoning_summary_part.done" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("reasoning part done referenced an unknown item"))?;
-                let index = required_u64(&value["summary_index"], "summary_index")?;
-                let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
-                    return Err(protocol(
-                        "reasoning part done referenced the wrong item type",
-                    ));
-                };
-                let part = summary
-                    .get_mut(&index)
-                    .ok_or_else(|| protocol("reasoning part done referenced an unknown part"))?;
-                if !part.field_done || part.part_closed {
-                    return Err(protocol("reasoning summary part closed out of order"));
-                }
-                if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
-                    || required_str(&value["part"]["text"], "summary part text")? != part.text
-                {
-                    return Err(protocol("reasoning summary part final value changed"));
-                }
-                part.part_closed = true;
-            }
-            "response.content_part.done" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("content part done referenced an unknown item"))?;
-                let index = required_u64(&value["content_index"], "content_index")?;
-                match &mut state.kind {
-                    ItemKind::Message { parts } => {
-                        let part = parts.get_mut(&index).ok_or_else(|| {
-                            protocol("content part done referenced an unknown part")
-                        })?;
-                        if !part.field_done || part.part_closed {
-                            return Err(protocol("content part closed out of order"));
-                        }
-                        let expected = match part.kind {
-                            MessagePartKind::OutputText => "output_text",
-                            MessagePartKind::Refusal => "refusal",
-                        };
-                        if required_str(&value["part"]["type"], "content part type")? != expected
-                            || message_part_value(&value["part"], part.kind, "content part value")?
-                                != part.text
-                        {
-                            return Err(protocol("content part final value changed"));
-                        }
-                        part.part_closed = true;
-                    }
-                    ItemKind::Reasoning { content, .. } => {
-                        let part = content.get_mut(&index).ok_or_else(|| {
-                            protocol("reasoning content done referenced an unknown part")
-                        })?;
-                        if !part.field_done || part.part_closed {
-                            return Err(protocol("reasoning content part closed out of order"));
-                        }
-                        if required_str(&value["part"]["type"], "reasoning content part type")?
-                            != "reasoning_text"
-                            || required_str(&value["part"]["text"], "reasoning content text")?
-                                != part.text
-                        {
-                            return Err(protocol("reasoning content final value changed"));
-                        }
-                        part.part_closed = true;
-                    }
-                    ItemKind::FunctionCall { .. } => {
-                        return Err(protocol("function call received content_part.done"));
-                    }
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("arguments delta referenced an unknown item"))?;
-                let ItemKind::FunctionCall {
-                    arguments,
-                    arguments_started,
-                    arguments_done,
-                    ..
-                } = &mut state.kind
-                else {
-                    return Err(protocol("arguments delta referenced a non-function item"));
-                };
-                if *arguments_done {
-                    return Err(protocol("arguments delta arrived after arguments done"));
-                }
-                *arguments_started = true;
-                arguments.push_str(required_str(&value["delta"], "arguments delta")?);
-            }
-            "response.function_call_arguments.done" => {
-                let key = event_item_key(&value)?;
-                let state = items
-                    .get_mut(&key)
-                    .ok_or_else(|| protocol("arguments done referenced an unknown item"))?;
-                let ItemKind::FunctionCall {
-                    arguments,
-                    arguments_started,
-                    arguments_done,
-                    ..
-                } = &mut state.kind
-                else {
-                    return Err(protocol("arguments done referenced a non-function item"));
-                };
-                if *arguments_done {
-                    return Err(protocol("received duplicate arguments done"));
-                }
-                *arguments_started = true;
-                if !arguments_agree(
-                    required_str(&value["arguments"], "final arguments")?,
-                    arguments.as_str(),
-                ) {
-                    return Err(protocol("arguments done did not match accumulated delta"));
-                }
-                *arguments_done = true;
-            }
-            "response.output_item.done" => {
-                let key = item_key(&value)?;
-                let state = items
-                    .remove(&key)
-                    .ok_or_else(|| protocol("output item done referenced a non-open item"))?;
-                let (mut blocks, completion) =
-                    finish_item(state, &value["item"], &mut output.has_refusal)?;
-                output.truncated |= completion == ItemCompletion::Truncated;
-                for block in &blocks {
-                    output.has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
-                }
-                for block in blocks.drain(..) {
-                    if block.has_semantic_payload() {
-                        completed_blocks.push(block.clone());
-                        sink.block_done(block).await?;
-                    }
-                }
-            }
-            "response.completed" | "response.incomplete" => {
-                let expected = response_id
-                    .as_deref()
-                    .ok_or_else(|| protocol("terminal arrived before response.created"))?;
-                if !items.is_empty() {
-                    return Err(protocol("terminal arrived with open output items"));
-                }
-                let id = response_id_of(&value["response"])?;
-                if id != expected {
-                    return Err(protocol("terminal response identity changed"));
-                }
-                let outcome = terminal_outcome(event, &value["response"], &output)?;
-                crate::validate_assistant_output("openai-responses", &outcome, &completed_blocks)?;
-                completion = Some(StreamCompletion::new(
-                    outcome,
-                    usage_from(&value["response"])?,
-                ));
-            }
-            "response.failed" => {
-                let error = &value["response"]["error"];
-                if is_overflow_message(&error.to_string()) {
-                    return Err(ProviderFailure::context_overflow());
-                }
-                return Err(crate::stream_error(
-                    "openai-responses",
-                    crate::error_label(error),
-                    crate::error_detail(error, key),
-                ));
-            }
-            "error" => {
-                if is_overflow_message(&value.to_string()) {
-                    return Err(ProviderFailure::context_overflow());
-                }
-                // The `error` event's own `type` is the envelope ("error"),
-                // so only its `code` names the failure here.
-                let label = value["code"].as_str().unwrap_or("unknown");
-                return Err(crate::stream_error(
-                    "openai-responses",
-                    label,
-                    crate::error_detail(&value, key),
-                ));
-            }
+            "response.reasoning_summary_part.done" => state.on_reasoning_part_done(&value)?,
+            "response.content_part.done" => state.on_content_part_done(&value)?,
+            "response.function_call_arguments.delta" => state.on_arguments_delta(&value)?,
+            "response.function_call_arguments.done" => state.on_arguments_done(&value)?,
+            "response.output_item.done" => state.on_item_done(&value, sink).await?,
+            "response.completed" | "response.incomplete" => state.on_terminal(event, &value)?,
+            "response.failed" | "error" => return Err(stream_failure(event, &value, key)),
             _ if is_out_of_band(event) => {}
             // Name the offender: without it a new vendor event costs an SSE
             // capture to identify (how `keepalive` was found).
@@ -1297,12 +1377,12 @@ pub(super) async fn stream(
                 )));
             }
         }
-        if completion.is_some() {
+        if state.completion.is_some() {
             frames.stop();
         }
     }
 
-    if let Some(completion) = completion {
+    if let Some(completion) = state.completion {
         return Ok(completion);
     }
     Err(ProviderFailure::incomplete_protocol(
