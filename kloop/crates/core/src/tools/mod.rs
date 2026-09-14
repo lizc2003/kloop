@@ -772,6 +772,408 @@ fn is_root_task_tool(name: &str) -> bool {
     )
 }
 
+/// A call to a tool that cannot run at all — a retired name, a capability this
+/// agent was not given, a shell this host has none of. Rejected before hooks,
+/// the permission gate or the registry handler can observe it: none of them has
+/// anything to decide about a call that was never legal.
+fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
+    match name {
+        "task" => bail!(
+            "tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"
+        ),
+        "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
+        "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
+        _ => {}
+    }
+    if name == "bash" && input.get("run_in_background").is_some() {
+        bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
+    }
+    // The catalog hides Task tools from child Agents, but stale context or a
+    // forged call must fail before allowlists, hooks, permissions, or the
+    // registry handler can observe it.
+    if ctx.depth > 0 && is_root_task_tool(name) {
+        bail!("tool '{name}' is only available to the root agent");
+    }
+    // A custom agent type's tool allowlist is a capability gate: the tool
+    // is filtered out of this sub-agent's defs, so a call to it is a
+    // hallucination — reject before hooks or the human are consulted.
+    // (The main agent has no allowlist, so this never fires for it.)
+    if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), name) {
+        bail!("tool '{name}' is not available to this agent type");
+    }
+    // The same gate table the catalog was built from: a shell tool this host
+    // could not resolve an interpreter for was never advertised.
+    match Builtin::from_name(name).map(Builtin::gate) {
+        Some(builtin::Gate::Shell(builtin::ShellKind::Bash))
+            if !ctx.cfg.shell_programs.bash_available() =>
+        {
+            bail!(
+                "tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session"
+            )
+        }
+        Some(builtin::Gate::Shell(builtin::ShellKind::PowerShell))
+            if !cfg!(windows) || !ctx.cfg.shell_programs.powershell_available() =>
+        {
+            bail!(
+                "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
+            )
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Which source this call is bound to, frozen before hooks run. Every later
+/// re-check compares against this: a source that changes underneath a call is a
+/// discovery error, never a silently re-routed execution.
+struct SourceGate {
+    /// The tool came through the deferred-capability gate, so it also has to
+    /// still be unlocked after the hook.
+    discovery_gated: bool,
+    /// The binding the call must execute against.
+    expected: Option<SourceCallBinding>,
+    /// The binding as it read before the hook ran.
+    before: Option<SourceCallBinding>,
+}
+
+/// Resolve the call's source and its deferred-capability standing.
+fn classify_source(
+    name: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+    expected_program_source: Option<SourceCallBinding>,
+) -> Result<SourceGate> {
+    let before = match tool_search::current_source_route(name, &ctx.cfg) {
+        SourceRouteState::Missing => None,
+        SourceRouteState::Available(binding) => Some(binding),
+        SourceRouteState::Unavailable(reason) => bail!(reason.clone()),
+    };
+    if ctx.from_program {
+        if before != expected_program_source {
+            bail!(
+                "tool '{name}' source changed after this Program API was generated; run the Program again from a fresh sampling round"
+            );
+        }
+        return Ok(SourceGate {
+            discovery_gated: false,
+            expected: expected_program_source,
+            before,
+        });
+    }
+    // Two samples, deliberately. A dynamic source publishes a new
+    // catalog between them, so a tool can be absent on the first look
+    // and deferred on the second — and a tool that appeared at any point
+    // during classification has never been through discovery. Either
+    // observation therefore gates it: `||`, not the single read the
+    // names invite. `catalog_appearance_during_classification_still_requires_discovery`
+    // fails if this collapses into one call.
+    let deferred_before = tool_search::is_deferred(name, &ctx.cfg);
+    let deferred_after = tool_search::is_deferred(name, &ctx.cfg);
+    let discovery_gated = deferred_before || deferred_after;
+    if !discovery_gated {
+        return Ok(SourceGate {
+            discovery_gated,
+            expected: before,
+            before,
+        });
+    }
+    let source = match tool_search::unlocked_source_for_dispatch(name, ctx, workspace) {
+        Some(source) => source,
+        None => match tool_search::current_source_route(name, &ctx.cfg) {
+            SourceRouteState::Unavailable(reason) => bail!(reason),
+            SourceRouteState::Missing | SourceRouteState::Available(_) => {
+                bail!(
+                    "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
+                )
+            }
+        },
+    };
+    if Some(source) != before {
+        bail!(
+            "tool '{name}' source changed while its deferred capability was classified; call tool_search with query \"select:{name}\" to load its definition again, then retry"
+        );
+    }
+    Ok(SourceGate {
+        discovery_gated,
+        expected: Some(source),
+        before,
+    })
+}
+
+/// Let the owning source inspect the call before it runs. Asked twice — once on
+/// the frozen binding, once after the pre-tool hook — because a hook may have
+/// changed what the source would say.
+fn preflight_source(gate: &SourceGate, name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
+    let Some(binding) = gate.expected else {
+        return Ok(());
+    };
+    let source = ctx
+        .cfg
+        .tool_sources
+        .get(binding.source_slot)
+        .context("source preflight binding is no longer registered")?;
+    source.preflight(name, input)
+}
+
+/// pre_tool hooks run BEFORE the permission gate: hooks are automation policy,
+/// permissions are the human's last word — a hook block means there is nothing
+/// left to ask about.
+async fn run_pre_tool_hook(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
+    match ctx
+        .cfg
+        .hooks
+        .pre_tool(
+            &ctx.cfg.session_id,
+            ctx.cfg.agent_label(),
+            name,
+            input,
+            ctx.ui.as_ref(),
+        )
+        .await
+    {
+        crate::hooks::HookDecision::Block { reason } => bail!("blocked by hook: {reason}"),
+        crate::hooks::HookDecision::Allow { context } => {
+            ctx.hook_context.lock().unwrap().extend(context);
+            Ok(())
+        }
+    }
+}
+
+/// A hook runs arbitrary code, and a source may republish while it does. The
+/// call executes against the binding it was classified on or not at all.
+fn recheck_source_after_hook(
+    gate: &SourceGate,
+    name: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<()> {
+    let after = match tool_search::current_source_route(name, &ctx.cfg) {
+        SourceRouteState::Missing => None,
+        SourceRouteState::Available(binding) => Some(binding),
+        SourceRouteState::Unavailable(reason) => bail!(reason),
+    };
+    if after != gate.before {
+        let guidance = if gate.discovery_gated {
+            format!(
+                "call tool_search with query \"select:{name}\" to load its definition again, then retry"
+            )
+        } else if ctx.from_program {
+            "run the Program again from a fresh sampling round".to_string()
+        } else {
+            "retry from a fresh sampling round".to_string()
+        };
+        bail!("tool '{name}' source changed while its pre-tool hook ran; {guidance}");
+    }
+    if gate.discovery_gated
+        && tool_search::unlocked_source_for_dispatch(name, ctx, workspace) != gate.expected
+    {
+        bail!(
+            "tool '{name}' capability changed while its pre-tool hook ran; call tool_search with query \"select:{name}\" to load its definition again, then retry"
+        );
+    }
+    Ok(())
+}
+
+/// What `prepare` resolved for this call. Prepared after pre-hooks but before
+/// permission, so the gate sees the canonical effective target while the
+/// executor retains an open parent directory handle across any approval wait.
+struct PreparedCall {
+    mutation: Option<fs::PreparedMutation>,
+    read: Option<fs::PreparedRead>,
+}
+
+impl PreparedCall {
+    async fn resolve(name: &str, input: &Value, workspace: &EffectiveWorkspace) -> Result<Self> {
+        if name == "notebook_edit" {
+            notebook::request_from_input(input)?;
+        }
+        let mutation = if matches!(name, "write_file" | "edit_file" | "notebook_edit") {
+            Some(if name == "notebook_edit" {
+                fs::prepare_notebook_mutation_input(input, workspace).await?
+            } else {
+                fs::prepare_mutation_input(name, input, workspace).await?
+            })
+        } else {
+            None
+        };
+        let read = if name == "read_file" {
+            Some(fs::prepare_read(input, workspace).await?)
+        } else {
+            None
+        };
+        Ok(Self { mutation, read })
+    }
+
+    /// The human's last word on this call, against the resolved target.
+    async fn authorize(
+        &self,
+        name: &str,
+        input: &Value,
+        ctx: &ToolCtx,
+        workspace: &EffectiveWorkspace,
+    ) -> Result<()> {
+        let preview_context = self
+            .mutation
+            .as_ref()
+            .and_then(fs::PreparedMutation::preview_context);
+        let sandbox_auto_allow = bash::sandbox_auto_allowed(name, input, workspace);
+        let permission = workspace
+            .permissions
+            .check_call_with_resolved_path(
+                name,
+                input,
+                self.mutation
+                    .as_ref()
+                    .map(fs::PreparedMutation::resolved_path)
+                    .or(self.read.as_ref().map(fs::PreparedRead::resolved_path)),
+                preview_context.as_ref(),
+                ctx.depth,
+                sandbox_auto_allow,
+            )
+            .await;
+        match permission {
+            Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
+            Ok(None) => {}
+            Err(reason) => bail!(reason),
+        }
+        Ok(())
+    }
+}
+
+/// post_tool hooks (and other text-only surfaces) see the flattened text; an
+/// image result renders as an `[image: <media_type>]` tag.
+async fn run_post_tool_hook(name: &str, input: &Value, execution: &ToolExecution, ctx: &ToolCtx) {
+    let (text, is_error) = match &execution.result {
+        Ok(content) => (content.as_text().into_owned(), false),
+        Err(e) => (format!("{e:#}"), true),
+    };
+    let context = ctx
+        .cfg
+        .hooks
+        .post_tool(
+            &ctx.cfg.session_id,
+            ctx.cfg.agent_label(),
+            name,
+            input,
+            &text,
+            is_error,
+            ctx.ui.as_ref(),
+        )
+        .await;
+    ctx.hook_context.lock().unwrap().extend(context);
+}
+
+/// Everything a cancelled turn is allowed to drop: the checks, the hooks, the
+/// permission wait and the execution itself. Cancellation kills this future
+/// outright unless one of the two flags says an irreversible commit is already
+/// under way, in which case [`run_one`] lets it finish.
+async fn run_gated(
+    name: &str,
+    input: &Value,
+    ctx: &ToolCtx,
+    expected_program_source: Option<SourceCallBinding>,
+    foreground_shell_started: &AtomicBool,
+    local_send_committed: &AtomicBool,
+) -> Result<ToolExecution> {
+    reject_unavailable(name, input, ctx)?;
+    // Freeze the workspace before validating a deferred capability. A stale
+    // call is a discovery error, so neither hooks nor the human permission
+    // gate should observe it. The same workspace snapshot is then used for
+    // prepare, permission, sandbox and execution.
+    let workspace = ctx.cfg.effective_workspace();
+    let gate = classify_source(name, ctx, &workspace, expected_program_source)?;
+    preflight_source(&gate, name, input, ctx)?;
+    run_pre_tool_hook(name, input, ctx).await?;
+    recheck_source_after_hook(&gate, name, ctx, &workspace)?;
+    preflight_source(&gate, name, input, ctx)?;
+    let prepared = PreparedCall::resolve(name, input, &workspace).await?;
+    prepared.authorize(name, input, ctx, &workspace).await?;
+    let powershell_guard = if name == "powershell" {
+        Some(ctx.cfg.powershell_execution_gate.lock().await)
+    } else {
+        None
+    };
+    #[cfg(all(test, windows))]
+    let powershell_executor_probe = match &powershell_guard {
+        Some(guard) => Some(guard.enter_executor().await),
+        None => None,
+    };
+    let foreground_shell =
+        name == "powershell" || (name == "bash" && !input["background"].as_bool().unwrap_or(false));
+    if foreground_shell {
+        foreground_shell_started.store(true, Ordering::Release);
+    }
+    let execution = execute_tool(
+        name,
+        input,
+        PreparedExecution {
+            read: prepared.read.as_ref(),
+            mutation: prepared.mutation.as_ref(),
+            source: gate.expected,
+            local_send_committed,
+        },
+        ctx,
+        &workspace,
+    )
+    .await;
+    if foreground_shell {
+        foreground_shell_started.store(false, Ordering::Release);
+    }
+    #[cfg(all(test, windows))]
+    drop(powershell_executor_probe);
+    drop(powershell_guard);
+    run_post_tool_hook(name, input, &execution, ctx).await;
+    Ok(execution)
+}
+
+/// What a finished call leaves for its caller to release once the final
+/// `tool_result` exists: the write authority it earned and the path lock it
+/// held. A cancelled or failed call leaves neither.
+#[derive(Default)]
+struct Aftermath {
+    file_state_update: Option<(
+        Arc<crate::file_state::FileState>,
+        crate::file_state::FileStateUpdate,
+    )>,
+    path_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// The gated run's verdict as the turn's `tool_result`. `None` is a
+/// cancellation that nothing irreversible had started.
+fn settle_execution(id: &str, gated: Option<Result<ToolExecution>>) -> (ContentBlock, Aftermath) {
+    let error_result = |e: anyhow::Error| ContentBlock::ToolResult {
+        tool_use_id: id.into(),
+        content: format!("{e:#}").into(),
+        is_error: true,
+    };
+    match gated {
+        None => (interrupted(id), Aftermath::default()),
+        Some(Ok(execution)) => {
+            let ToolExecution {
+                result,
+                file_state_update,
+                path_lock,
+            } = execution;
+            let result = match result {
+                Ok(content) => ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content,
+                    is_error: false,
+                },
+                Err(e) => error_result(e),
+            };
+            (
+                result,
+                Aftermath {
+                    file_state_update,
+                    path_lock,
+                },
+            )
+        }
+        Some(Err(e)) => (error_result(e), Aftermath::default()),
+    }
+}
+
 async fn run_one(
     id: String,
     name: String,
@@ -799,250 +1201,14 @@ async fn run_one(
     // during a post-hook, finish the paired queued result instead of reporting
     // `interrupted` after the recipient mailbox already changed.
     let local_send_committed = AtomicBool::new(false);
-    let gated = async {
-        match name.as_str() {
-            "task" => bail!(
-                "tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"
-            ),
-            "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
-            "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
-            _ => {}
-        }
-        if name == "bash" && input.get("run_in_background").is_some() {
-            bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
-        }
-        // The catalog hides Task tools from child Agents, but stale context or a
-        // forged call must fail before allowlists, hooks, permissions, or the
-        // registry handler can observe it.
-        if ctx.depth > 0 && is_root_task_tool(&name) {
-            bail!("tool '{name}' is only available to the root agent");
-        }
-        // A custom agent type's tool allowlist is a capability gate: the tool
-        // is filtered out of this sub-agent's defs, so a call to it is a
-        // hallucination — reject before hooks or the human are consulted.
-        // (The main agent has no allowlist, so this never fires for it.)
-        if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), &name) {
-            bail!("tool '{name}' is not available to this agent type");
-        }
-        if matches!(name.as_str(), "bash" | "bash_output" | "stop_bash")
-            && !ctx.cfg.shell_programs.bash_available()
-        {
-            bail!(
-                "tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session"
-            );
-        }
-        if name == "powershell"
-            && (!cfg!(windows) || !ctx.cfg.shell_programs.powershell_available())
-        {
-            bail!(
-                "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
-            );
-        }
-        let route_before = tool_search::current_source_route(&name, &ctx.cfg);
-        let source_before = match &route_before {
-            SourceRouteState::Missing => None,
-            SourceRouteState::Available(binding) => Some(*binding),
-            SourceRouteState::Unavailable(reason) => bail!(reason.clone()),
-        };
-        // Freeze the workspace before validating a deferred capability. A stale
-        // call is a discovery error, so neither hooks nor the human permission
-        // gate should observe it. The same workspace snapshot is then used for
-        // prepare, permission, sandbox and execution.
-        let workspace = ctx.cfg.effective_workspace();
-        let (discovery_gated, expected_source) = if ctx.from_program {
-            if source_before != expected_program_source {
-                bail!(
-                    "tool '{name}' source changed after this Program API was generated; run the Program again from a fresh sampling round"
-                );
-            }
-            (false, expected_program_source)
-        } else {
-            // Two samples, deliberately. A dynamic source publishes a new
-            // catalog between them, so a tool can be absent on the first look
-            // and deferred on the second — and a tool that appeared at any point
-            // during classification has never been through discovery. Either
-            // observation therefore gates it: `||`, not the single read the
-            // names invite. `catalog_appearance_during_classification_still_requires_discovery`
-            // fails if this collapses into one call.
-            let deferred_before = tool_search::is_deferred(&name, &ctx.cfg);
-            let deferred_after = tool_search::is_deferred(&name, &ctx.cfg);
-            let discovery_gated = deferred_before || deferred_after;
-            let expected_source = if discovery_gated {
-                let source = match tool_search::unlocked_source_for_dispatch(
-                    &name, &ctx, &workspace,
-                ) {
-                    Some(source) => source,
-                    None => match tool_search::current_source_route(&name, &ctx.cfg) {
-                        SourceRouteState::Unavailable(reason) => bail!(reason),
-                        SourceRouteState::Missing | SourceRouteState::Available(_) => {
-                            bail!(
-                                "tool '{name}' is deferred and not loaded yet; call tool_search with query \"select:{name}\" to load its definition, then retry"
-                            )
-                        }
-                    },
-                };
-                if Some(source) != source_before {
-                    bail!(
-                        "tool '{name}' source changed while its deferred capability was classified; call tool_search with query \"select:{name}\" to load its definition again, then retry"
-                    );
-                }
-                Some(source)
-            } else {
-                source_before
-            };
-            (discovery_gated, expected_source)
-        };
-        if let Some(binding) = expected_source {
-            let source = ctx
-                .cfg
-                .tool_sources
-                .get(binding.source_slot)
-                .context("source preflight binding is no longer registered")?;
-            source.preflight(&name, &input)?;
-        };
-        // pre_tool hooks run BEFORE the permission gate: hooks are automation
-        // policy, permissions are the human's last word — a hook block means
-        // there is nothing left to ask about.
-        let hooks = &ctx.cfg.hooks;
-        let session_id = &ctx.cfg.session_id;
-        let agent = ctx.cfg.agent_label();
-        match hooks
-            .pre_tool(session_id, agent, &name, &input, ctx.ui.as_ref())
-            .await
-        {
-            crate::hooks::HookDecision::Block { reason } => {
-                bail!("blocked by hook: {reason}")
-            }
-            crate::hooks::HookDecision::Allow { context } => {
-                ctx.hook_context.lock().unwrap().extend(context);
-            }
-        }
-        let source_after = match tool_search::current_source_route(&name, &ctx.cfg) {
-            SourceRouteState::Missing => None,
-            SourceRouteState::Available(binding) => Some(binding),
-            SourceRouteState::Unavailable(reason) => bail!(reason),
-        };
-        if source_after != source_before {
-            let guidance = if discovery_gated {
-                format!(
-                    "call tool_search with query \"select:{name}\" to load its definition again, then retry"
-                )
-            } else if ctx.from_program {
-                "run the Program again from a fresh sampling round".to_string()
-            } else {
-                "retry from a fresh sampling round".to_string()
-            };
-            bail!("tool '{name}' source changed while its pre-tool hook ran; {guidance}");
-        }
-        if discovery_gated
-            && tool_search::unlocked_source_for_dispatch(&name, &ctx, &workspace) != expected_source
-        {
-            bail!(
-                "tool '{name}' capability changed while its pre-tool hook ran; call tool_search with query \"select:{name}\" to load its definition again, then retry"
-            );
-        }
-        if let Some(binding) = expected_source {
-            let source = ctx
-                .cfg
-                .tool_sources
-                .get(binding.source_slot)
-                .context("source preflight binding is no longer registered")?;
-            source.preflight(&name, &input)?;
-        }
-        // Prepare mutations after pre-hooks but before permission. The gate sees
-        // the canonical effective target, while the executor retains an open
-        // parent directory handle across any approval wait.
-        let input = input;
-        if name == "notebook_edit" {
-            notebook::request_from_input(&input)?;
-        }
-        let prepared_mutation =
-            if matches!(name.as_str(), "write_file" | "edit_file" | "notebook_edit") {
-                Some(if name == "notebook_edit" {
-                    fs::prepare_notebook_mutation_input(&input, &workspace).await?
-                } else {
-                    fs::prepare_mutation_input(&name, &input, &workspace).await?
-                })
-            } else {
-                None
-            };
-        let prepared_read = if name == "read_file" {
-            Some(fs::prepare_read(&input, &workspace).await?)
-        } else {
-            None
-        };
-        let mutation_preview_context = prepared_mutation
-            .as_ref()
-            .and_then(fs::PreparedMutation::preview_context);
-        let sandbox_auto_allow = bash::sandbox_auto_allowed(&name, &input, &workspace);
-        let permission = workspace
-            .permissions
-            .check_call_with_resolved_path(
-                &name,
-                &input,
-                prepared_mutation
-                    .as_ref()
-                    .map(fs::PreparedMutation::resolved_path)
-                    .or(prepared_read.as_ref().map(fs::PreparedRead::resolved_path)),
-                mutation_preview_context.as_ref(),
-                ctx.depth,
-                sandbox_auto_allow,
-            )
-            .await;
-        match permission {
-            Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
-            Ok(None) => {}
-            Err(reason) => bail!(reason),
-        }
-        let powershell_guard = if name == "powershell" {
-            Some(ctx.cfg.powershell_execution_gate.lock().await)
-        } else {
-            None
-        };
-        #[cfg(all(test, windows))]
-        let powershell_executor_probe = match &powershell_guard {
-            Some(guard) => Some(guard.enter_executor().await),
-            None => None,
-        };
-        let foreground_shell = name == "powershell"
-            || (name == "bash" && !input["background"].as_bool().unwrap_or(false));
-        if foreground_shell {
-            foreground_shell_started.store(true, Ordering::Release);
-        }
-        let prepared = PreparedExecution {
-            read: prepared_read.as_ref(),
-            mutation: prepared_mutation.as_ref(),
-            source: expected_source,
-            local_send_committed: &local_send_committed,
-        };
-        let execution = execute_tool(&name, &input, prepared, &ctx, &workspace).await;
-        if foreground_shell {
-            foreground_shell_started.store(false, Ordering::Release);
-        }
-        #[cfg(all(test, windows))]
-        drop(powershell_executor_probe);
-        drop(powershell_guard);
-        // post_tool hooks (and other text-only surfaces) see the flattened
-        // text; an image result renders as an `[image: <media_type>]` tag.
-        let (text, is_error) = match &execution.result {
-            Ok(content) => (content.as_text().into_owned(), false),
-            Err(e) => (format!("{e:#}"), true),
-        };
-        let context = hooks
-            .post_tool(
-                session_id,
-                agent,
-                &name,
-                &input,
-                &text,
-                is_error,
-                ctx.ui.as_ref(),
-            )
-            .await;
-        ctx.hook_context.lock().unwrap().extend(context);
-        Ok::<ToolExecution, anyhow::Error>(execution)
-    };
-    let mut gated = Box::pin(gated);
+    let mut gated = Box::pin(run_gated(
+        &name,
+        &input,
+        &ctx,
+        expected_program_source,
+        &foreground_shell_started,
+        &local_send_committed,
+    ));
     let gated_result = tokio::select! {
         _ = ctx.cancel.cancelled() => {
             if foreground_shell_started.load(Ordering::Acquire)
@@ -1055,46 +1221,15 @@ async fn run_one(
         }
         result = &mut gated => Some(result),
     };
-    let (result, file_state_update, path_lock) = match gated_result {
-        None => (interrupted(&id), None, None),
-        Some(Ok(execution)) => {
-            let ToolExecution {
-                result,
-                file_state_update,
-                path_lock,
-            } = execution;
-            let result = match result {
-                Ok(content) => ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content,
-                    is_error: false,
-                },
-                Err(e) => ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: format!("{e:#}").into(),
-                    is_error: true,
-                },
-            };
-            (result, file_state_update, path_lock)
-        }
-        Some(Err(e)) => (
-            ContentBlock::ToolResult {
-                tool_use_id: id.clone(),
-                content: format!("{e:#}").into(),
-                is_error: true,
-            },
-            None,
-            None,
-        ),
-    };
+    let (result, aftermath) = settle_execution(&id, gated_result);
     // The model has a successful Read/Write/Edit only once the final tool_result
     // exists. Executor-local reads and work canceled while a post-hook runs do
     // not create write authority. Mutation executors clear authority before
     // touching disk, so an interrupted commit remains conservative.
-    if let Some((state, update)) = file_state_update {
+    if let Some((state, update)) = aftermath.file_state_update {
         state.apply(update);
     }
-    drop(path_lock);
+    drop(aftermath.path_lock);
     let ContentBlock::ToolResult {
         tool_use_id,
         is_error,
