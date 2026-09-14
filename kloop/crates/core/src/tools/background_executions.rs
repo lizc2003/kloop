@@ -751,6 +751,56 @@ mod tests {
         assert!(ctx.cfg.inbox.is_empty());
     }
 
+    /// The two root-only background controls the door's old five-name list did
+    /// not cover, and why each one mattered. The registry is ONE Arc for the
+    /// whole session — a child Config keeps its parent's — so a sub-agent that
+    /// reached `request_stop` could cancel work it does not own: the id is all
+    /// the tool checks. `wait_for_activity` counts that same shared registry
+    /// but sleeps on the inbox a child gets a private copy of, so it could only
+    /// ever run out the clock — up to the hour the model itself is free to ask
+    /// for.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_cannot_stop_or_wait_on_the_session_wide_background_registry() {
+        let root = test_ctx(0, "child-background-controls");
+        let cancel = CancellationToken::new();
+        root.cfg
+            .background_executions
+            .register(
+                ExecutionKind::Agent,
+                "agent-99",
+                "root's work",
+                cancel.clone(),
+            )
+            .unwrap();
+        let child = ToolCtx {
+            depth: 1,
+            ..root.clone()
+        };
+
+        let (stopped, is_error) =
+            run_tool("stop_agent", json!({"agent_id": "agent-99"}), &child).await;
+        assert!(is_error, "{stopped}");
+        assert_eq!(
+            stopped,
+            "tool 'stop_agent' is only available to the root agent"
+        );
+        assert!(!cancel.is_cancelled(), "a child cancelled the root's work");
+
+        let (waited, is_error) = run_tool("wait_for_activity", json!({}), &child).await;
+        assert!(is_error, "{waited}");
+        assert_eq!(
+            waited,
+            "tool 'wait_for_activity' is only available to the root agent"
+        );
+
+        // The same call from the root does reach the registry, so what stopped
+        // the child was the door — not a registry it could not have seen.
+        let (stopped, is_error) =
+            run_tool("stop_agent", json!({"agent_id": "agent-99"}), &root).await;
+        assert!(!is_error, "{stopped}");
+        assert!(cancel.is_cancelled(), "{stopped}");
+    }
+
     #[tokio::test]
     async fn wait_rejects_resource_ids_and_wrong_timeout_types() {
         let ctx = test_ctx(0, "wait-strict-input");

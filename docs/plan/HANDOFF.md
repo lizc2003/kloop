@@ -20,11 +20,13 @@ plan 136 的全仓通读(12.5 万行)把当时不该混进清账的条目挂成�
 `responses::stream` 在 139 之后(**139 已完成,解锁**)。其余随便挑。做完一条就在该 plan
 补 ✅ 节,并回 136 第五节销账。
 
-**这批已全部完成(2026-09-14)。** 派生出一条待做的:**plan 143 目录藏起来了,门上没人查**
-—— 142 抽 `reject_unavailable` 时发现它与 `Builtin::gate()` 在说同一件事而成员不一致,
-执行前的兜底漏了 `wait_for_activity` / `stop_agent`(`run_agent` 有自己的守卫,没事)。
-子 agent 能取消 root 持有的后台执行,`wait_for_activity` 则会空转到超时(最长一小时)。
-规模小:一处判定改写 + 五条测试;开工时要问用户 `Gate::Surface` 要不要一起管。
+**这批已全部完成(2026-09-14)。** 派生出的 **~~plan 143 目录藏起来了,门上没人查~~ ✅**
+也已完成(2026-09-14):`reject_unavailable` 里那张手写的五个 `task_*` 名字换成
+`Builtin::unoffered`,定义成 `all_tool_defs` 两个块的**补集**,门与构建器按定义不会漂移。
+用户拍板 `Gate::Surface` **一起**管,所以 surface 尾巴那 13 个也进了同一道门。修掉两个真
+bug(子 agent 能取消 root 持有的后台执行;`wait_for_activity` 空转到超时,最长一小时)。
+顺带把 `TestConfig` 的 surface 默认从全关改成全开——44 条测试原本在演一个不可能发生的
+会话。教训 136。
 
 **这批的统一纪律(2026-09-14 用户拍板:「不需要考虑兼容性,要保持代码干净」)**:
 
@@ -900,3 +902,49 @@ reserved"两条先跑,才轮到搬 `match`;那条测试不是收敛的产物,是
 
 
 135. 来自 Plan 142(那六个长家伙)。**一条 plan 里"建议的做法"和"验收的硬指标"可能互相矛盾,遇到时按指标算账,别按建议照做。**142 第三节对 `turn_rounds`(547 行)写着"只做两件事,**不要**试图重写循环",第六节的验收却是"降到 150 行以下,没有例外可讲"。照第三节做完是 427 行——建议是写 plan 时目测的,指标是写 plan 时算过的。**判据:动手前把建议的两三步各自能减多少行加起来,对一遍验收线;对不上就说明建议没找到长度的真正来源。**`turn_rounds` 的长度不在那两段分支里,在**十来个跨轮局部**(`active_attempt` / `truncated_prefix` / `item_seq` / 三个计数器 / `produced_text` ……)和**每个退出点各拼一遍 `Ending` 的四个字段**:不把状态收进一个 struct,任何一段都抽不出去(抽出去就要传十个 `&mut`)。同一副药 142 自己给 `ui_loop` 开了(`UiState`),只是没意识到 `turn_rounds` 是同一个病。**(b) 长函数拆到哪一步算够,看的是"新增一种情况时编译器会不会点名",不是行数。**`apply_core` 原先一个 `match` 同时摊 `Event` 和 `Item` 两层模式(`Event::ItemStarted { item: Item::AssistantMessage { .. } }`),新增一种 item 时编译器不会点名;拆成外层按 `Event`、内层按 `Item` 穷尽之后会。行数只是这件事的副作用。**(c) 把"下一步做什么"做成返回值,散落的 `break`/`continue` 就能收口。**`turn_rounds` 二十处 `continue` / `break 'turn Ending {...}` 收成 `RoundStep::{Retry,Stop}`,循环里只剩四处;`ui_loop` 七处 `break Ok(())` 收成 `ControlFlow<()>` 的一处。这不是风格偏好——退出点越多,"每个退出点都要记得做 X"的约定就越容易漏,而 `turn_rounds` 那条 X(早退不能把 `final_text` 写成空串)已经漏过一次。**(d) 教训 1 的 Send 盲区没有在这次出现,原因值得记:抽出来的 async fn 都在递归环外。**`execute_tool` 的类型擦除本来就在环上(execute_tool → run_agent → run_turn → dispatch_tools → execute_tool),`Turn::settle_sample` / `run_gated` 这些都在环外,rustc 一次都没卡住,没加过一个 `Box::pin`。下次再抽 async fn,先看它在不在那个环上:在环上才需要担心。**(e) 重构提交别和别的 cargo 进程抢 target 锁。**这次有一次 `cargo test --workspace` 报 101,原因是它跑到一半时另一条命令 `cargo build` 改了源码并抢 build 目录锁;单独重跑就绿。后台跑测试期间不要再动仓库文件或跑 cargo,否则拿到的退出码不作数。
+
+
+136. 来自 Plan 143(目录藏起来了,门上没人查)。**当一道门的职责是"拒绝构建器没发出去的
+东西",就把门定义成构建器的补集,别在门上把条件再写一遍——后者看起来也是"读同一张表",
+其实是第二张表,只不过从一串名字换成了一段 `match`。**143 第三节给的做法是把
+`reject_unavailable` 里那五个手写的 `task_*` 名字换成 `matches!(Builtin::gate(), Depth0)`;
+只做 `Depth0` 时这两种写法差别不大,一旦把 `Surface` 也收进来(用户拍板"一起"),门就要
+自己再判一次 depth + `cfg.surface` + `shell_programs`,而这三个条件正是 `in_catalog` /
+`in_surface` 已经在判的。改成 `if in_catalog(..) || (depth == 0 && in_surface(..)) { return
+None }`、`gate()` 只用来回答"为什么没提供",两个构建器一个字没动,漂移在类型上就不可能
+发生。判据:**看到"A 决定发什么、B 决定拒什么",先问 B 能不能直接写成 `!A`;能的话,B 里
+就不该出现任何一个 A 的条件。**剩下那部分(给出理由的 `match`)只影响措辞,写错了是句子
+难看,不是安全洞。同族的还有教训 131 的"derived ∪ hand_written",这条是它的正面解法。
+
+**(b) 门的价值不在于"拒绝",在于"在哪一步拒绝";执行器里那道一模一样的守卫不能算数。**
+本次之前,`enter_plan_mode` / `cron_*` / `enter_worktree` / `workflow` 四处执行器各自都写着
+depth + surface 的守卫(三种不同措辞),所以"子 agent 调 cron_create 会被拒"这句话是真的
+——但它被拒的位置在 **pre-tool hook 跑完、权限弹窗问完之后**。`reject_unavailable` 的文档
+注释早就写明了这一点("Rejected before hooks, the permission gate or the registry handler
+can observe it"),只是没人把它和那四处守卫对上。判据:**评估"这个洞已经有别的地方挡了吗"
+时,要看的不是"挡没挡住",是"挡在第几步"**;一个跑在 hook 之后的守卫,对"这个调用不该被
+任何人观察到"这类要求是零分。这四处守卫本次全部保留(它们还伺候直接调用者,`scheduler.rs`
+那道另外管着门不知道的条件),但注释里点明了它们现在是第二道。
+
+**(c) 一份"全默认关"的测试 fixture,会在加门的那天集体变红,而在那之前一直在演不可能
+发生的会话。**`TestConfig` 的 `surface` 原先是 `Default::default()`(六个能力全关),而
+codemode / plan_mode / question / background_executions 的 44 条测试都在调只有开着的前端才
+会发出去的工具——门一上全红。**正确的修法是让 fixture 说实话,不是给门开豁免**(教训
+130(a)):fixture 模拟的是"前端",测试想要的那个前端是全功能的,要测"这个能力没开"的用
+`with_surface` 明说。判据:**一个 fixture 字段如果所有测试都不管它,它的默认值就是在替
+它们做一个没人检查过的断言**;当这个字段后来变成一道门的输入,那个断言会一次性全部到期。
+反过来看,44 条红是这次改动最有用的信号——它们量化了"目录不发但执行器照跑"这个洞的
+实际覆盖面。
+
+**(d) 子 agent 的报错该说 depth,不该说它改不了的那个条件。**`Config::subagent_from` 把
+`surface` 重置成全关,于是一个子 agent 调 `cron_create` 时,"depth > 0"和"前端没开"同时
+成立,门先判哪个决定了它看到哪句话。选 depth:前端有没有开是它父亲那边的事,它既看不见
+也改不了,拿这个回答等于把它指向一条走不通的路。判据:同一次拒绝有多个成立的原因时,
+报**调用者能据以改变行为的那一个**。
+
+**(e) `cargo test --workspace` 的"卡住"多半是在编译,不是在跑。**本次前后有三次以为撞上
+死锁(400 秒没输出),实际是 workspace 里 tui_pty / real_agent_program_workflow 那批集成
+测试的**冷编译**加上 libtest 管道输出的块缓冲;`kloop-core --lib` 单跑 13 秒、全量 33 个
+target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Running tests/xxx` 还是
+`Compiling`,再用 `--list` 的全集 diff 一遍真正没报告的那条——凭 `tail` 看不出区别,因为
+输出是块缓冲的。

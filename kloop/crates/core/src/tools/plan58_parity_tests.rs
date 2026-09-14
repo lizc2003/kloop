@@ -572,7 +572,11 @@ async fn guard_report() -> Value {
     let mut depth = base.clone();
     depth.depth = 1;
     let (depth_text, depth_error) = run_tool("cron_list", json!({}), &depth).await;
-    assert!(depth_error && depth_text.contains("top-level"));
+    assert!(depth_error);
+    assert_eq!(
+        depth_text,
+        "tool 'cron_list' is only available to the root agent"
+    );
     let mut agent = base.clone();
     let mut agent_config = agent.cfg.test_clone();
     agent_config.local_agent = agent_config.local_agent.child("agent-1".parse().unwrap());
@@ -584,7 +588,11 @@ async fn guard_report() -> Value {
     disabled_config.surface.scheduler = false;
     disabled.cfg = Arc::new(disabled_config);
     let (surface_text, surface_error) = run_tool("cron_list", json!({}), &disabled).await;
-    assert!(surface_error && surface_text.contains("frontend surface"));
+    assert!(surface_error);
+    assert_eq!(
+        surface_text,
+        "tool 'cron_list' is unavailable because this session's front-end does not enable the 'scheduler' surface"
+    );
 
     assert!(is_concurrency_safe("cron_list", &json!({}), &[]));
     for name in ["cron_create", "cron_delete", "schedule_wakeup"] {

@@ -1167,12 +1167,15 @@ mod tests {
         );
     }
 
+    /// Dispatch refuses it at the door, with the one message every root-only
+    /// tool gets — the executor's own guard below stays for the callers that
+    /// do not pass through dispatch (a Program's `agent()`, a workflow step).
     #[tokio::test]
     async fn run_agent_is_refused_at_depth_one() {
         let ctx = test_ctx(1, "depth");
         let (out, is_error) = run_tool("run_agent", json!({"prompt": "recurse"}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("cannot spawn"));
+        assert_eq!(out, "tool 'run_agent' is only available to the root agent");
     }
 
     /// The cap is fixed in code. `deny_unknown_fields` makes a caller that thinks

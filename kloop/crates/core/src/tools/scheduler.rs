@@ -230,6 +230,10 @@ fn bind(ctx: &ToolCtx) -> Result<()> {
     ctx.cfg.scheduler.bind_owner(ctx.cfg.session_id.clone())
 }
 
+/// Dispatch already refuses the depth and the surface for every gated built-in
+/// ([`crate::tools::builtin::Builtin::unoffered`]); this stays as the tool's own
+/// precondition, and owns the one condition the door does not know about — that
+/// a depth-0 Agent can still be someone's child.
 fn require_top_level(ctx: &ToolCtx, tool: &str) -> Result<()> {
     if ctx.depth != 0 || !ctx.cfg.agent_label().is_empty() {
         bail!("{tool} is available only to the top-level session owner");

@@ -208,12 +208,17 @@ mod tests {
         assert_eq!(ctx.cfg.permissions.mode(), Mode::AcceptEdits);
     }
 
+    /// The depth guard below is reached only off the dispatch path now: a
+    /// sub-agent is never sent the surface block, so the call dies at the door.
     #[tokio::test]
     async fn subagent_cannot_enter_plan_mode() {
         let ctx = test_ctx(1, "planentersub");
         let (out, is_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("top-level"), "{out}");
+        assert_eq!(
+            out,
+            "tool 'enter_plan_mode' is only available to the root agent"
+        );
     }
 
     /// Approve: plan mode turns off (restores manual), the result confirms it,
@@ -286,6 +291,9 @@ mod tests {
         let ctx = plan_ctx(test_ctx(1, "plansub"), approver);
         let (out, is_error) = run_tool("exit_plan_mode", json!({"plan": "x"}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("top-level"), "{out}");
+        assert_eq!(
+            out,
+            "tool 'exit_plan_mode' is only available to the root agent"
+        );
     }
 }

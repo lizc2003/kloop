@@ -146,6 +146,53 @@ impl SurfaceGate {
             Self::Worktree => surface.worktree,
         }
     }
+
+    /// The [`SurfaceCapabilities`] field this gate reads, spelled as the config
+    /// spells it: a rejected call names what would have to be turned on.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Program => "program",
+            Self::Scheduler => "scheduler",
+            Self::Questions => "questions",
+            Self::PlanControl => "plan_control",
+            Self::Workflow => "workflow",
+            Self::Worktree => "worktree",
+        }
+    }
+}
+
+/// Why a request does not offer a built-in. Carries what the message has to
+/// name, so the door that rejects a call says which condition failed rather
+/// than one flat "unavailable".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unoffered {
+    /// A root-owned session control a sub-agent must not re-enter.
+    RootOnly,
+    /// The front-end did not enable the capability this tool rides on.
+    Surface(SurfaceGate),
+    /// This host resolved no interpreter for that shell.
+    Shell(ShellKind),
+}
+
+impl Unoffered {
+    /// The tool_result text a call to `name` is rejected with.
+    pub(crate) fn message(self, name: &str) -> String {
+        match self {
+            Self::RootOnly => format!("tool '{name}' is only available to the root agent"),
+            Self::Surface(gate) => {
+                let field = gate.field();
+                format!(
+                    "tool '{name}' is unavailable because this session's front-end does not enable the '{field}' surface"
+                )
+            }
+            Self::Shell(ShellKind::Bash) => format!(
+                "tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session"
+            ),
+            Self::Shell(ShellKind::PowerShell) => format!(
+                "tool '{name}' is unavailable because no trusted PowerShell executable was resolved for this session"
+            ),
+        }
+    }
 }
 
 /// Where a built-in's definition is emitted, and what has to hold for it to be
@@ -330,6 +377,39 @@ impl Builtin {
     /// Whether this tool is appended to a depth-0 request for `surface`.
     pub(crate) fn in_surface(self, surface: SurfaceCapabilities) -> bool {
         matches!(self.gate(), Gate::Surface(gate) if gate.enabled(surface))
+    }
+
+    /// Why this request does not offer `self`, or `None` when it does.
+    ///
+    /// Defined as the complement of the two blocks [`super::all_tool_defs`]
+    /// emits — the catalog, then the depth-0 surface block — so the door that
+    /// rejects a call reads the same table the tool array was built from and
+    /// the two cannot drift. Absent from the array is not the same as
+    /// uncallable: stale context from before a compaction, a resumed rollout
+    /// and a forged call all arrive at dispatch without ever passing a builder.
+    ///
+    /// [`Gate::Elsewhere`] answers `None` because this table does not own its
+    /// condition: `tool_search`/`call_tool` ride on deferral and `skill` on
+    /// what is loaded, each re-checked by its own owner.
+    pub(crate) fn unoffered(
+        self,
+        depth: u8,
+        surface: SurfaceCapabilities,
+        shell_programs: &ShellPrograms,
+    ) -> Option<Unoffered> {
+        if self.in_catalog(depth, shell_programs) || (depth == 0 && self.in_surface(surface)) {
+            return None;
+        }
+        Some(match self.gate() {
+            Gate::Depth0 => Unoffered::RootOnly,
+            Gate::Shell(kind) => Unoffered::Shell(kind),
+            // A sub-agent is never sent the surface block at all, whatever its
+            // Config happens to say — naming the depth tells it more than
+            // naming a capability its parent's front-end may well have.
+            Gate::Surface(_) if depth > 0 => Unoffered::RootOnly,
+            Gate::Surface(gate) => Unoffered::Surface(gate),
+            Gate::Always | Gate::Elsewhere => return None,
+        })
     }
 
     /// The human name for the action, for the approval panel's header row.

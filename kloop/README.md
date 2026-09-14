@@ -2608,7 +2608,7 @@ second turn against it. Headless one-shot execution remains bounded and does not
 expose this idle session surface; its teardown nevertheless reuses the selected
 text/NDJSON UI sink, so a queued mailbox event still receives its shutdown
 `undeliverable` terminal on the same stream.
-Sub-agents cannot spawn further sub-agents, so background dispatch stays depth-0.
+Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does the Task tools and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
 
 ### Local Agent Mailbox (Plan 70)
 

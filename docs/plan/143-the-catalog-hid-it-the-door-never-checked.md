@@ -143,3 +143,89 @@ if ctx.depth > 0
 - `run_agent_is_refused_at_depth_one` 的断言已更新,提交信息里点名说明为什么;
 - fmt / clippy(`-D warnings`) / `cargo test --workspace` 各自单独跑、当场取退出码;
 - 行为变更同步 README(若 README 有提到子 agent 可用工具面的话;没提就不用)。
+
+## ✅ 已完成(2026-09-14)
+
+一次提交。**第五节那个问题用户答"一起"**,所以 `Gate::Surface` 和 `Gate::Depth0` 一起收进
+同一道门,本 plan 的"建议"(先只做 Depth0)没有采纳。
+
+### 做法与第三节的出入
+
+第三节写的是"`reject_unavailable` 里那行换成读 `Builtin::gate()`",即在门上**重新写一遍**
+`matches!(gate(), Depth0)`。带上 Surface 之后这条路会要求门自己再判一次 depth + surface +
+shell,那仍然是两张表——只是第二张从"五个名字"变成"一段 match"。改成把门定义成构建器的
+**补集**:
+
+```rust
+pub(crate) fn unoffered(self, depth, surface, shell_programs) -> Option<Unoffered> {
+    if self.in_catalog(depth, shell_programs) || (depth == 0 && self.in_surface(surface)) {
+        return None;
+    }
+    Some(match self.gate() { … })   // 只用来给出"为什么没提供"
+}
+```
+
+`in_catalog` / `in_surface` 一个字没动,`all_tool_defs` 也没动。门读的就是构建器读的那两个
+谓词,两者**按定义**不可能漂移;`gate()` 只剩下一个职责——把"没提供"翻译成一句话。
+`Gate::Elsewhere`(`tool_search` / `call_tool` / `skill`)答 `None`,它们的条件归各自的
+owner,门不插手,这正是第五节担心的那条"不能一刀切"。
+
+删掉 `is_root_task_tool`;原来单独一段的 shell 判定(在 allowlist **之后**)也并进这一处,
+所以 shell 不可用的报错现在排在 agent-type allowlist 之前——没有测试锁过这个顺序。
+
+### 报错措辞(第五节留的第二个问题)
+
+- 子 agent:一律 `tool '<name>' is only available to the root agent`。Surface 工具在
+  depth > 0 上也走这句,**不报"前端没开"** —— 子 agent 的 `Config.surface` 被
+  `subagent_from` 重置成全关,报前端等于拿一个它无法改变、也不是真正原因的条件搪塞它。
+- depth 0 前端没开:`tool '<name>' is unavailable because this session's front-end does not
+  enable the '<字段>' surface`,字段名按 `SurfaceCapabilities` 的拼法给(`plan_control`、
+  `scheduler`…),这样报错自己说出了要打开什么。
+
+### 两个真 bug 与第二节的核实一致
+
+`stop_agent` 确实能让子 agent 取消 root 的后台执行(`background_executions` 全会话一个
+Arc,`request_stop` 只看 id 形状);`wait_for_activity` 确实只会空转到超时(inbox 父子不
+共享)。`run_agent` 确实无碍。三处执行器自己的守卫(`subagent.rs`、`scheduler.rs`、
+`worktree_tool.rs`、`workflow.rs`)全部保留并加了注释说明它们现在是第二道——
+`scheduler.rs` 那道还管着门不知道的一个条件(depth 0 的 Agent 也可能是别人的孩子)。
+
+**门的意义不在于拒绝,在于在 hook、权限弹窗和 handler 之前拒绝。**没有门的时候,这三处
+执行器守卫都跑在 pre-tool hook 和权限门之后。
+
+### 第四节五条测试,外加 surface 的对应覆盖
+
+1. + 2. + 3. `a_child_cannot_stop_or_wait_on_the_session_wide_background_registry`
+   (`background_executions.rs`):注册一个 root 持有的执行,depth 1 调 `stop_agent` 拒绝且
+   取消令牌**未触发**,`wait_for_activity` 拒绝;末尾 root 侧同一调用**打到注册表**当对照,
+   证明拦住子 agent 的是门而不是"它看不见注册表"。两条都走 `run_tool`。
+4. `tool_defs_expose_root_controls_only_at_depth_zero` 补上 `wait_for_activity` /
+   `stop_agent`,八个名字一个循环。
+5. `the_door_refuses_every_builtin_the_catalog_would_have_withheld`(`mod.rs`):遍历
+   `builtin::ALL`,`Depth0` 与 `Surface` 在 depth 1 全拒、`Surface` 在 depth 0 前端全关时
+   全拒,末尾 `assert_eq!(checked, 8 + 13 * 2)` 防"表空了也全绿"。**按第七节当场验过**:
+   往 `unoffered` 顶上塞 `if matches!(self, Self::StopAgent | Self::CronCreate) { return None }`,
+   Depth0 那侧红在 `"stop_agent: missing required string argument 'agent_id'"`(说明调用
+   已经穿过门跑到执行器),Surface 那侧红在 `"cron_create is available only to the
+   top-level session owner"`(说明只剩执行器那道第二线),改回后绿。
+
+### 改到的既有测试(行为变更,不是重构)
+
+`run_agent_is_refused_at_depth_one` 从 `contains("cannot spawn")` 改成统一措辞的整串相等;
+plan_mode 两条子 agent 用例、plan53 的 `ask_user_question`、plan58 的 `cron_list` 两条、
+worktree 的 `worktree_tools_gated_by_mode` 同理(后者改成 `with_surface(..., 全关)` 才拿得
+到"前端没开"那条)。
+
+**外加 44 条本来就不该绿的。** `TestConfig` 的 surface 原先是 `Default::default()`(全关),
+而 codemode / plan_mode / question / background_executions 的一大批测试都在调只有开着的前端
+才会发出去的工具——门一上,它们全红。改法不是给门开豁免,是让 fixture 说实话:`TestConfig`
+的 surface 默认全开(一个测试 ctx 模拟的是前端),要测"这个能力没开"的用新增的
+`testutil::with_surface` 明说。
+
+### 验收
+
+- `is_root_task_tool` 已删,`reject_unavailable` 里不再有任何手写名字表;
+- 第四节 5 条齐全,第 5 条的"故意漏一个就变红"当场验过(见上);
+- fmt(0)/ clippy `--workspace --all-targets -- -D warnings`(0)/ `cargo test --workspace`
+  (33 个 test result 全 ok,1488 passed,0 failed),各自单独跑取退出码;
+- README 的后台调度那段改成"整个后台面 + 前端 surface 块,目录与门同源"。

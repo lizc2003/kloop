@@ -335,7 +335,11 @@ async fn question_report() -> Value {
     depth_one.depth = 1;
     let (blocked, blocked_error) =
         run_tool("ask_user_question", question_input(), &depth_one).await;
-    assert!(blocked_error && blocked.contains("top-level"));
+    assert!(blocked_error);
+    assert_eq!(
+        blocked,
+        "tool 'ask_user_question' is only available to the root agent"
+    );
     assert!(is_concurrency_safe(
         "ask_user_question",
         &question_input(),

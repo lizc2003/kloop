@@ -765,17 +765,11 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     }
 }
 
-fn is_root_task_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "task_create" | "task_get" | "task_update" | "task_list" | "task_clear"
-    )
-}
-
-/// A call to a tool that cannot run at all — a retired name, a capability this
-/// agent was not given, a shell this host has none of. Rejected before hooks,
-/// the permission gate or the registry handler can observe it: none of them has
-/// anything to decide about a call that was never legal.
+/// A call to a tool that cannot run at all — a retired name, a control this
+/// depth is not given, a capability this front-end does not offer, a shell this
+/// host has none of. Rejected before hooks, the permission gate or the registry
+/// handler can observe it: none of them has anything to decide about a call
+/// that was never legal.
 fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
     match name {
         "task" => bail!(
@@ -788,11 +782,17 @@ fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
     if name == "bash" && input.get("run_in_background").is_some() {
         bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
     }
-    // The catalog hides Task tools from child Agents, but stale context or a
-    // forged call must fail before allowlists, hooks, permissions, or the
-    // registry handler can observe it.
-    if ctx.depth > 0 && is_root_task_tool(name) {
-        bail!("tool '{name}' is only available to the root agent");
+    // The same gate table the request's tool array was built from: root-owned
+    // controls a sub-agent is not sent, front-end capabilities this session did
+    // not enable, a shell this host resolved no interpreter for. The catalog
+    // hides all three, but hiding is not refusing — stale context from before a
+    // compaction, a resumed rollout and a forged call all reach dispatch
+    // without passing a builder, and must fail before allowlists, hooks,
+    // permissions or the registry handler can observe them.
+    if let Some(reason) = Builtin::from_name(name)
+        .and_then(|tool| tool.unoffered(ctx.depth, ctx.cfg.surface, &ctx.cfg.shell_programs))
+    {
+        bail!(reason.message(name));
     }
     // A custom agent type's tool allowlist is a capability gate: the tool
     // is filtered out of this sub-agent's defs, so a call to it is a
@@ -800,25 +800,6 @@ fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
     // (The main agent has no allowlist, so this never fires for it.)
     if !crate::agent_type::tool_available(ctx.cfg.tool_allowlist.as_deref(), name) {
         bail!("tool '{name}' is not available to this agent type");
-    }
-    // The same gate table the catalog was built from: a shell tool this host
-    // could not resolve an interpreter for was never advertised.
-    match Builtin::from_name(name).map(Builtin::gate) {
-        Some(builtin::Gate::Shell(builtin::ShellKind::Bash))
-            if !ctx.cfg.shell_programs.bash_available() =>
-        {
-            bail!(
-                "tool '{name}' is unavailable because no validated Git for Windows Bash was resolved for this session"
-            )
-        }
-        Some(builtin::Gate::Shell(builtin::ShellKind::PowerShell))
-            if !cfg!(windows) || !ctx.cfg.shell_programs.powershell_available() =>
-        {
-            bail!(
-                "tool 'powershell' is unavailable because no trusted PowerShell executable was resolved for this session"
-            )
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -1524,6 +1505,7 @@ pub(crate) mod testutil {
         context_window: Option<u64>,
         tool_sources: Vec<Arc<dyn ToolSource>>,
         dirs: Option<std::path::PathBuf>,
+        surface: crate::config::SurfaceCapabilities,
     }
 
     impl TestConfig {
@@ -1541,6 +1523,19 @@ pub(crate) mod testutil {
                 context_window: None,
                 tool_sources: Vec::new(),
                 dirs: None,
+                // A test ctx models a front-end, and the one the tests want is
+                // the fully-featured one: a tool whose surface is off is not
+                // offered, so dispatch refuses it before the executor under
+                // test ever runs. Tests of an *absent* capability say so with
+                // [`with_surface`].
+                surface: crate::config::SurfaceCapabilities {
+                    questions: true,
+                    plan_control: true,
+                    program: true,
+                    workflow: true,
+                    worktree: true,
+                    scheduler: true,
+                },
             }
         }
 
@@ -1629,7 +1624,7 @@ pub(crate) mod testutil {
                 program_limits: Default::default(),
                 skills: Default::default(),
                 active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
-                surface: Default::default(),
+                surface: self.surface,
             })
         }
     }
@@ -1668,6 +1663,19 @@ pub(crate) mod testutil {
         cfg.powershell_execution_gate = Arc::new(gate);
         ctx.cfg = Arc::new(cfg);
         (ctx, controller)
+    }
+
+    /// Rebuild the ctx for a front-end that offers a different surface — for
+    /// the tests that pin what a session WITHOUT a capability does, against
+    /// the fully-featured front-end [`TestConfig`] hands out by default.
+    pub(crate) fn with_surface(
+        mut ctx: ToolCtx,
+        surface: crate::config::SurfaceCapabilities,
+    ) -> ToolCtx {
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.surface = surface;
+        ctx.cfg = Arc::new(cfg);
+        ctx
     }
 
     /// Rebuild the ctx with a different defer threshold (Config is behind an
@@ -2454,17 +2462,21 @@ mod tests {
         };
         let root = names(0);
         let child = names(1);
-        assert!(root.iter().any(|name| name == "run_agent"));
-        assert!(!child.iter().any(|name| name == "run_agent"));
-        for task_tool in [
+        // The whole background-agent surface, not just its spawn tool: listing
+        // only `run_agent` here is how `stop_agent` and `wait_for_activity`
+        // went unnoticed on the execution side for as long as they did.
+        for root_only in [
+            "run_agent",
+            "wait_for_activity",
+            "stop_agent",
             "task_create",
             "task_get",
             "task_update",
             "task_list",
             "task_clear",
         ] {
-            assert!(root.iter().any(|name| name == task_tool), "{task_tool}");
-            assert!(!child.iter().any(|name| name == task_tool), "{task_tool}");
+            assert!(root.iter().any(|name| name == root_only), "{root_only}");
+            assert!(!child.iter().any(|name| name == root_only), "{root_only}");
         }
     }
 
@@ -3234,6 +3246,57 @@ mod tests {
         assert!(!is_error, "{listed}");
         let listed: Value = serde_json::from_str(&listed).unwrap();
         assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    /// The recurrence guard. Whatever a builder would leave out of the request,
+    /// the door has to refuse — walked from `builtin::ALL` rather than from a
+    /// list, because a hand-kept list is exactly what let `stop_agent` and
+    /// `wait_for_activity` fall out of the door while staying out of the
+    /// catalog. Add a `Depth0` or `Surface` variant and this test covers it the
+    /// moment it exists.
+    #[tokio::test]
+    async fn the_door_refuses_every_builtin_the_catalog_would_have_withheld() {
+        let root = with_surface(test_ctx(0, "gate-parity"), Default::default());
+        let child = ToolCtx {
+            depth: 1,
+            ..root.clone()
+        };
+        let mut checked = 0;
+        for tool in builtin::ALL {
+            let name = tool.name();
+            match tool.gate() {
+                // A sub-agent is sent neither the root-only controls nor the
+                // surface block, whatever its own Config says about the latter.
+                builtin::Gate::Depth0 | builtin::Gate::Surface(_) => {
+                    let (out, is_error) = run_tool(name, json!({}), &child).await;
+                    assert!(is_error, "{name}: {out}");
+                    assert_eq!(
+                        out,
+                        format!("tool '{name}' is only available to the root agent")
+                    );
+                    checked += 1;
+                }
+                builtin::Gate::Always | builtin::Gate::Shell(_) | builtin::Gate::Elsewhere => {}
+            }
+            // And at depth 0 a surface tool is still refused when the front-end
+            // this session runs against does not enable it — `root` above runs
+            // against one that enables nothing.
+            if matches!(tool.gate(), builtin::Gate::Surface(_)) {
+                let (out, is_error) = run_tool(name, json!({}), &root).await;
+                assert!(is_error, "{name}: {out}");
+                assert!(
+                    out.starts_with(&format!(
+                        "tool '{name}' is unavailable because this session's front-end"
+                    )),
+                    "{name}: {out}"
+                );
+                checked += 1;
+            }
+        }
+        // 8 root-only controls, plus 13 surface-gated tools refused twice —
+        // once for the depth, once for the front-end. A gate table that stopped
+        // naming them would pass every assertion above without running one.
+        assert_eq!(checked, 8 + 13 * 2);
     }
 
     #[cfg(unix)]

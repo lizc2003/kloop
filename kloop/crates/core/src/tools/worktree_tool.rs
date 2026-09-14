@@ -95,6 +95,9 @@ pub(super) async fn exit_worktree_tool(input: &Value, ctx: &ToolCtx) -> Result<S
     Ok(message)
 }
 
+/// Dispatch refuses both of these first
+/// ([`crate::tools::builtin::Builtin::unoffered`]); they stay as the tool's own
+/// precondition, with the wording a direct caller gets.
 fn guard(ctx: &ToolCtx, tool: &str) -> Result<()> {
     if ctx.depth >= 1 {
         bail!("{tool}: only the top-level agent manages the session worktree");
@@ -288,11 +291,16 @@ mod tests {
         );
         assert!(!off.iter().any(|d| d.name == "enter_worktree"));
 
-        // Even if a model somehow calls it, a mode-off session refuses.
-        let ctx = test_ctx(0, "gated"); // testutil default: worktree_enabled = false
+        // Even if a model somehow calls it, a mode-off session refuses — at
+        // the door, before the tool's own guard, because the definition was
+        // never sent.
+        let ctx = with_surface(test_ctx(0, "gated"), Default::default());
         let (out, is_error) = run_tool("enter_worktree", json!({"name": "x"}), &ctx).await;
         assert!(is_error);
-        assert!(out.contains("not enabled"), "{out}");
+        assert_eq!(
+            out,
+            "tool 'enter_worktree' is unavailable because this session's front-end does not enable the 'worktree' surface"
+        );
     }
 
     /// exit_worktree with discard_changes throws away even a dirty tree.

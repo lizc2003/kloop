@@ -116,6 +116,9 @@ pub(super) async fn workflow_tool_in_workspace(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
+    // Dispatch refuses both of these first
+    // ([`crate::tools::builtin::Builtin::unoffered`]); this stays as the tool's
+    // own precondition, and is what the direct callers in tests see.
     if ctx.depth != 0 || !ctx.cfg.surface.workflow {
         bail!("workflow: only an enabled top-level session can launch workflows");
     }
