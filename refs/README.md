@@ -1,15 +1,17 @@
 # refs — 参考资料与调研结论
 
-kloop 设计时对比研究过四个代码库。本文件是关于"别人代码"的全部知识:导读 + 调研结论 + 可移植设计参考。项目自身的状态与教训见 docs/plan/HANDOFF.md。
+kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"的全部知识:导读 + 调研结论 + 可移植设计参考。项目自身的状态与教训见 docs/plan/HANDOFF.md。
 
 ## 导读
 
 | 参考 | 位置 | 看什么 |
 |---|---|---|
-| **codex** | `refs/codex`(上游 openai/codex) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**fork 特有的东西不在上游**:`fork_*.rs`、`models-manager/models.json`、`core/src/rollout/`、`ext/worktree` 要回 `refs/codex` 看 |
+| **codex** | `refs/codex`(上游 openai/codex,固定 `02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**系统面(2026-09-15 补:此前一直只当"循环与压缩的参考",用窄了)**:沙箱三平台 `linux-sandbox`(landlock + seccompiler + bwrap,1.03 万行)/`windows-sandbox-rs`(CreateRestrictedToken + 私有 desktop + JobObject + ConPTY,2.43 万行原生)/`core/src/sandboxing`(seatbelt);原生协议 `app-server*`(server 17.5 万 + protocol 3.45 万 + transport 1.8 万 + daemon 6668 行);`hooks`(1.57 万行,9 类事件 + hook 可以是 MCP tool + `output_spill`);工具执行策略 `execpolicy` + `shell-escalation`。**fork 特有的东西不在上游**:`fork_*.rs`、`models-manager/models.json`、`core/src/rollout/`、`ext/worktree` 要回 `refs/codex` 看 |
 | **claude-code(逆向 TS 版)** | `refs/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
 | **claw-code（已退休）** | 历史快照 `claw-code@b71afddae100ced324457337925a694686b8fef2`（本地 clone 已移除） | **不可作底座**。只保留四项局部结论：① mock/request-capture 与 CLI output-contract 测试纪律；② OpenAI-compatible tool_calls 流式 reducer 的兼容边界；③ compact 不切开 tool_use/tool_result pair 的边界回归；④ typed lifecycle/degraded error 的阅读材料。kloop 已按自身协议和安全边界重实现，不复制 claw runtime。
 | **CodeWhale** | `refs/codewhale`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
+| **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
+| **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
 
 `refs/*` 由根 `.gitignore` 排除（只有 `refs/README.md` 和 `refs/claude-code-2.1.220/` 随 kloop 提交，后者是本仓库自己的 parity fixtures 而非克隆），其余都是本机只读参考；不得在其中开发或推送。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -78,6 +80,81 @@ Task graph 和各 execution registry 为各自唯一真值。
 Plan 81 的参考基线固定为 `earendil-works/pi@2e4d23959485279aa2da1a45103de2ea22d46395`。Pi 将逐响应 usage record、append-only log、reducer 与 session storage 分层，证明“provider 返回的一次 usage 是历史事实，而当前 context estimate 是可失效预测状态”这一切法可独立落地。kloop 只重实现这个机制：沿既有 canonical `Usage`、rollout replay/fork/torn-tail 与 `History` owner，记录 validated sampling 和 accepted compaction 的实际 model/operation，并让 `/cost` 聚合当前 transcript 四个 token 分类。
 
 Pi 不成为依赖或架构上游；未复制源码、第三方资产、extension 信任模型、remote runtime、失败 attempt 推测、价格表、全局归因或 parent 汇总 child。kloop 也不因 ledger 放宽 permission/sandbox 边界，且不把它塞入 Plan 77 的 public event/snapshot projection。
+
+## grok-build / deepseek-harness 固定源码调研（2026-09-15）
+
+本轮基线固定为 `xai-org/grok-build@37949780c144e37df692e3d669051a21fec24f20`（2026-09-09，
+175 万行 Rust，Apache-2.0）与 `deepseek-ai/deepseek-harness@0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`
+（2026-09-15，79 万行 TS，MIT）；对照基线是同时核过的
+`openai/codex@02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`（2026-09-11，172.5 万行 Rust）。三者的
+参考序位是 **codex（系统面首选）> grok-build（TUI 深度与 codex 没有的工程件）> deepseek-harness
+（设计边界的对照，唯一非 Rust）**。
+
+**本轮最重要的结论是关于 codex 而不是两个新库**：codex 一直被当成"循环与压缩的参考"，
+导读表此前只列了循环、工具注册、并行锁、compact、Responses 线路与集成测试六项，
+**沙箱、app-server、hooks 一项都没列**——而这三项恰好是 kloop 缺口最大的地方。导读表已补。
+具体：
+
+- **沙箱**。`docs/capability-report.md` 的"平台 1/3"缺口首选对着 codex 补，不是引第三方封装。
+  Linux 是 `linux-sandbox`（landlock 管文件 + seccompiler 管系统调用 + bwrap 管命名空间，
+  另有 fd_mount 与 network-proxy）；Windows 是 `windows-sandbox-rs` 2.43 万行原生实现
+  （CreateRestrictedToken + 私有 desktop 的 SetSecurityInfo + JobObject + ConPTY，
+  配 `windows-sandbox-service`）；macOS 走 `core/src/sandboxing` 的 seatbelt。grok 的
+  `nono`（crates.io 公开 crate）是 unix-only 的单层封装、**没有 Windows**，只作薄依赖备选；
+  它在 grok 的 `Cargo.toml` 里留了两个坑值得先知道：版本必须 `=0.53.0` 锁死，因为 macOS
+  Seatbelt 的 deny 优先级依赖 nono 的规则发射顺序，bump 会悄悄重开 `mv x y && cat y` 绕过
+  而 `is_applied()` 仍返回 true；以及 Cargo 没有 target-conditional feature 表，跨平台的
+  `enforce` feature 不能引用 `dep:nono`，否则 Windows 构建的 feature 解析直接崩。
+  dsh 的 Windows ACL 后端是浅版，自己标注保证只是 partial（进程启动期保留 Everyone 访问、
+  NTFS 硬链接可从另一路径暴露同一文件）——补 Windows 沙箱前该先读这份边界。
+- **原生协议**。codex `app-server` 全家约 23.6 万行（server 17.5 万 + protocol 3.45 万 +
+  transport 1.8 万 + daemon 6668），kloop 的 `protocol` 1611 行 + `server` 7798 行。
+  让 kloop 引擎替换 旧引擎二进制 二进制、让 Tauri 前端接原生协议，这是最直接的底本。
+- **hooks**。kloop 776 行 6 事件；codex 1.57 万行 9 类（session_start/end、user_prompt_submit、
+  pre/post_tool_use、permission_request、compact、interrupt、stop），特色是 hook 可以是一个
+  MCP tool，并有 `output_spill` 处理 hook 输出溢出；grok 1.25 万行 16 事件，用 macro 表驱动，
+  每事件带 `(gate, matcher, hub_forward)` 三元 trait。两边互补：codex 给形态，grok 给覆盖面与写法。
+
+**grok-build 值得单独回源的（逐项核过 codex 没有对应物）**：`xai-codebase-graph` 的 tree-sitter
+符号索引 + 增量重建 + mmap（codex 的 tree-sitter 只用于 `apply-patch`/`shell-command` 解析，
+`file-search` 只有文件名模糊搜索，没有符号图）；`xai-hunk-tracker` 的 agent/外部改动归因 actor
+（codex `git-utils` 只有 status/baseline/fsmonitor）；PTY harness 比 codex 高一层——grok 是真
+PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务，分层 L1 pty / L2a screen /
+L2b timing / L3 content，同一套 API 同时服务回归、benchmark 与手工复现，codex 的 TUI 测试是
+in-process vt100 + insta 快照（`vt100_history`/`vt100_live_commit`/`resize_reflow`）；
+`xai-fast-worktree` 的 CoW 克隆 + Linux BTRFS O(1) 快照；compaction 分 intra/inter/code 三种风格
+并用 trait seam 解耦（`ItemTokenCounter`/`CompactionSampler`/观察者），kloop `compact.rs` 是单一风格。
+还有两条纯知识：`xai-sqlite-journal` 记录了 `$HOME` 挂 NFS 多机共享时 WAL 的 `-shm` 被对端重建会让
+下次 wal-index 读 **SIGBUS**，该挂载须改 rollback journal + per-host DB 文件；grok memory 用
+`blake3(cwd)[..16]` 分桶，反证 kloop plan 105 用 git common dir 派生的 ProjectId 是更好的解
+（主仓与所有 linked worktree 天然归一个桶，路径 hash 做不到）。permission 的
+`bash_command_splitting`/`exec_risk`/`managed_policy`/`claude_settings` 该与 codex 的 `execpolicy` +
+`shell-escalation` 三方对照，不是单选——kloop `permissions.rs` 4176 行目前没有 bash 命令拆分。
+
+**deepseek-harness 可吸收的是边界语义，语言无关，按规格重实现即可**：沙箱 fail-closed——强制不了就报
+`SANDBOX_UNAVAILABLE`，绝不静默裸跑，上报 `full`/`partial` 强制等级，区分"策略拒绝"与"runner 故障"，
+被拒后模型可申请**严格更宽一档**交人审批；spill（对应 kloop 的 offload）切成契约/存储/策略三层，
+**spill 失败就保留内联、不让工具失败**，文件名不可预测、防 symlink 重定向、按 session 分组并带启动清理
+保留期；guard 两件低成本的事——同参数重复调用同一工具在第 3/5/8 次插 advisory 提醒（从不阻断、按 agent
+分别计数、新用户消息清零），以及每工具 cooperative 超时并诚实承认不能硬停下游；session-query 让模型搜索
+历史会话，跨会话授权规则是**目标会话 cwd 与调用者完全相同**，用 SQLite FTS5 建派生索引、不碰持久化存储；
+session 日志格式迁移用 `session.vN.jsonl`、header-only `stat` 选最高代、相邻迁移链一次性组合、
+发布式 successor 不动原文件，配一条运行期不变式 **model-visible means logged**。另两项作阅读材料：
+subagent 后端矩阵（spawn / fork（父"已完成 turn"的一次性快照，看不到在飞的那轮）/ ACP 子进程 /
+SDK 子进程 / 真 Codex / 真 Claude Code，加 continuable child 的 send_message、interrupt_agent、
+list_agents），以及 hooks 不发明自己的协议、直接跑 Claude Code 与 Codex 的 `hooks.json` 并共享一份
+hook-protocol 的做法。
+
+**明确不抄**：dsh 的 Cordis「万物皆插件」与 profile/bundle/patch 三层组合——kloop 是单体 Rust，
+走这条等于把编译期检查换成运行期装配；grok 的 hub/computer-hub 远程 workspace 面、
+plugin-marketplace、voice/announcements/mixpanel 遥测；两者的多套协议面（kloop 只保自己的
+canonical protocol）。**也不复制源码**：grok 是 Apache-2.0、dsh 是 MIT，都允许借鉴但要求保留声明，
+kloop 沿用对 claw/Prime/Pi 的既有惯例——只重实现机制与边界，唯一可直接取用的是 crates.io 上的公开
+crate，而按上面的判断 `nono` 并不是首选。
+
+**ACP 作为战略输入记一笔，不在本轮立项**：grok（`xai-acp-lib`）和 dsh（`packages/acp`，还把 ACP
+同时当服务端与子 agent 传输）都实现了标准 Agent Client Protocol。kloop 自研原生协议接 Tauri 的决定
+不变，但 ACP 是"被编辑器直接接入"的行业口子，将来要不要另开一个面，需要单独拍板。
 
 
 Plan 48 将工具对齐目标钉死在本机精确二进制,不再拿滚动产品文档或旧逆向源码补实现:
