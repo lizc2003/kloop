@@ -129,7 +129,11 @@ in-process vt100 + insta 快照（`vt100_history`/`vt100_live_commit`/`resize_re
 `blake3(cwd)[..16]` 分桶，反证 kloop plan 105 用 git common dir 派生的 ProjectId 是更好的解
 （主仓与所有 linked worktree 天然归一个桶，路径 hash 做不到）。permission 的
 `bash_command_splitting`/`exec_risk`/`managed_policy`/`claude_settings` 该与 codex 的 `execpolicy` +
-`shell-escalation` 三方对照，不是单选——kloop `permissions.rs` 4176 行目前没有 bash 命令拆分。
+`shell-escalation` 三方对照，不是单选。kloop 这块的现状要说准：bash 拆分**已经有**，在
+`core/src/shell.rs`（753 行，tree-sitter-bash，`BashAnalysis::Commands` 把一条 bash 拆成多条
+argv，`permissions.rs` 直接消费 `analyze_bash`/`argv_is_dangerous`/`argv_is_readonly`/
+`strip_wrappers`，连 `2>&1` 的操作符配对与重定向整体判断都覆盖，plan 144 刚修过这块）；缺的是
+`argv_is_dangerous` 这种二值黑名单之上的**风险分级**，以及企业下发策略那一层。
 
 **deepseek-harness 可吸收的是边界语义，语言无关，按规格重实现即可**：沙箱 fail-closed——强制不了就报
 `SANDBOX_UNAVAILABLE`，绝不静默裸跑，上报 `full`/`partial` 强制等级，区分"策略拒绝"与"runner 故障"，
