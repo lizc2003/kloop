@@ -149,6 +149,25 @@ SDK 子进程 / 真 Codex / 真 Claude Code，加 continuable child 的 send_mes
 list_agents），以及 hooks 不发明自己的协议、直接跑 Claude Code 与 Codex 的 `hooks.json` 并共享一份
 hook-protocol 的做法。
 
+**`present` 工具:看过,当前不做,条件记在这里**(2026-09-15 追记)。dsh 的
+`packages/fs/tool-present` 让模型在写完文件后、最终回复前声明交付物:
+`present({files: [{path, description?}]})`,只记路径与描述、**不复制内容**,做 metadata
+检查而不读内容,上限 8 个,成功后追加一个 durable 的 `deliverables/presented` session 事件,
+Web 端渲染成卡片、用户点开用默认应用打开**当前源文件**。两处细节看得出它踩过坑:schema 里
+写死了 "Mentioning its path in your reply does not replace this call"(模型天然倾向于在回复里
+提一句路径就算交付),以及子 agent 创建的文件必须由**父 agent 自己**调 present(交付归属
+调用方 session,不从子 agent 冒泡)。它的价值在于表达**意图**而非事实——区别于"过程中碰过的
+一堆文件"。kloop 没有等价物:`file_state.rs` 是事实层的文件观察与指纹(服务 stale-read 检测
+与原子 mutation),`execution_provenance.rs` 是执行溯源,都不是交付物声明。
+
+**当前不做的理由不是它轻,是主场不对**:kloop 每天在 git 仓库里改源码,交付物就是 diff,
+`git status` 已经回答了这个问题;present 真正解决的是**仓库外的非源码产物**——dsh 文档举的
+例子是 `/tmp`、Downloads、shell 命令创建的文件,那类东西 git 看不见,才需要有人指一下。
+另外它是为 Web 卡片设计的,"点一下用默认应用打开"在终端里本来就不存在这个动作,kloop 三个
+前端里只有 server/Tauri 那条线的语境对得上。**重启条件(两个同时成立)**:Tauri 前端接上来,
+且 kloop 确实开始产出仓库外的东西(导出、报告、生成物)。到那时它不是装饰,而是唯一能让那些
+文件被看见的机制。
+
 **明确不抄**：dsh 的 Cordis「万物皆插件」与 profile/bundle/patch 三层组合——kloop 是单体 Rust，
 走这条等于把编译期检查换成运行期装配；grok 的 hub/computer-hub 远程 workspace 面、
 plugin-marketplace、voice/announcements/mixpanel 遥测；两者的多套协议面（kloop 只保自己的
