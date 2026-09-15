@@ -517,11 +517,8 @@ each project.
 `tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
 leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
 per segment — in a chain every segment must be read-only or allowed, while a
-single denied segment poisons the whole chain;
-`bash_script(<command>)` / `bash_script_no_sandbox(<command>)` hold one whole
-*unparseable* script and match its text exactly (see **Asking** below — the
-rule's closing paren is the entry's last character, so a command containing
-parens round-trips unchanged); `write_file(<glob>)` /
+single denied segment poisons the whole chain; an *unparseable* script has no
+rule form at all (see **Asking** below); `write_file(<glob>)` /
 `edit_file(<glob>)` / `read_file(<glob>)` match the lexically-normalized
 `path`, while `notebook_edit(<glob>)` matches `notebook_path` (both also match
 their cwd-relative form), with `**` globs.
@@ -536,23 +533,20 @@ workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
 approving `git commit` never covers `git rebase` — or parent directory for file
 writes). A bash script the word-only parser cannot vouch for (a file redirect, a
 substitution, an assignment — `cat > probe.go <<'EOF'` is the usual shape) has
-no prefix to key on and is instead remembered **verbatim**: that exact command text, and only
-that one. Both remembering scopes are offered for it — `a` keys the session
-cache on the text, `p` writes a `bash_script(<the whole command>)` rule (or
-`bash_script_no_sandbox(...)`) that the same parser reads back at the
-next startup. The prompt echoes `only this exact command text` rather than
-reprinting the command already on screen. Which run was consented to is part of
-the key: a call carrying `disable_sandbox` stores the `_no_sandbox` form, which
-also covers a later contained run of the same text, while a contained grant
-never covers the escape — and a whole-tool `bash` allow vouches for no opaque
-script at all, since it was written without anyone having read this one. Two
-things stay out of reach of such a rule: the command text lands in
-`permissions.json` literally, so a script carrying a secret should get `y`, not
-`p`; and a script whose *raw text* mentions a sensitive path is caught by the
-safety layer above every rule, so it keeps asking however it was remembered.
-Opaque *PowerShell* is still remembered by nothing: bash is parsed and only then
-gives up, while PowerShell gets no analysis, so asking every time is the only net
-it has. `p`
+no prefix to key on and is instead remembered **verbatim**, for this session
+only: that exact command text, and only that one. `p` is not offered for it —
+the key is the whole command, so a stored copy could only ever match a
+byte-identical re-run, and a real command carries this run's own test filter and
+package list (measured on one project: 38 such rules on disk, 0 hits between
+them). The prompt echoes `only this exact command text` rather than reprinting
+the command already on screen. Which run was consented to is part of the key: a
+call carrying `disable_sandbox` is a separate entry, so a contained grant never
+covers the escape; and a whole-tool `bash` allow vouches for no opaque script at
+all, since it was written without anyone having read this one. A script whose
+*raw text* mentions a sensitive path is caught by the safety layer above every
+rule, so it keeps asking however it was remembered. Opaque *PowerShell* is
+remembered by nothing at all: bash is parsed and only then gives up, while
+PowerShell gets no analysis, so asking every time is the only net it has. `p`
 allows for the current `ProjectId` across sessions and linked
 worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
 `~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
@@ -3245,7 +3239,8 @@ Every session is saved and resumable — see Session persistence above.
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, WorkspaceId-partitioned session cache,
   ProjectId identity and durable ProjectStore publication/RMW, legacy
-  `[permissions].allow`/`KLOOP_ALLOW` rejection, opaque never cacheable, `ConfirmRequest.preview` carrying an
+  `[permissions].allow`/`KLOOP_ALLOW` rejection, opaque scripts cacheable for the
+  session but never durable, `ConfirmRequest.preview` carrying an
   edit/write diff while other calls carry none); Windows shell contracts
   (Git for Windows layout discovery, conditional catalog, CreateProcessW
   suspended→Job assignment→resume fail-closed ordering, leader-exit/inherited-
