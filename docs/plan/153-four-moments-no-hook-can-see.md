@@ -73,3 +73,28 @@
 - **不做 hook-as-MCP-tool**(codex 有)。那要把 MCP 客户端接进 hook 执行路径,是另一个量级。
 - **不做 `output_spill`**(codex 有)。hook 输出溢出目前没有观察到问题。
 - 不动现有六个事件的 payload 字节。
+
+## 七、验收
+
+**前置**:第五节的建议是只做第三节那笔旧账。以下分两段,按实际拍板的范围取。
+
+### 若只做旧账(建议)
+
+1. `HookDef.matcher` 能按 `agent_type` 筛子 agent 事件,有测试:两种类型的子 agent,
+   matcher 指定其一,另一种不触发。
+2. **现有六个事件的 payload 字节不变**——尤其主 agent 的 payload 要与改动前逐字节相同
+   (`hooks.rs:138` 那条刻意保持的约束)。用整对象断言锁住。
+
+### 若连四个新挂点一起做
+
+3. 四个挂点各有触发测试。
+4. **`session_end` 的出口全覆盖**:正常退出、Ctrl-C、致命错误、server 端 thread 关闭
+   四条路各有测试;做不到就只实现正常退出,并在 `README` 与 hook 文档里**明写它不覆盖
+   哪几条路**。一个"有时候不触发"的挂点比没有更糟。
+5. `pre_compact` / `post_compact` **不能阻断**:构造一个返回退出码 2 的 hook,断言压缩
+   照常进行(走 `unreachable!` 那条 post 语义,不是让会话卡死)。
+6. `permission_denied` 触发的是最终拒绝,不是每一次询问的否定分支——有测试区分这两者。
+7. 新事件的 payload 字段在注释里写明"这是 kloop 自己的,不对齐 cc",防止下一个人拿 cc
+   的 schema 来"修"。
+
+8. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自取退出码)。

@@ -102,3 +102,16 @@ AGENTS.md 明写"**测试整对象断言优先**"。这块是全仓最该整对�
 - **不动 `tui` crate 的渲染代码**。本 plan 只加测试能力;基线红了要修渲染,那是下一个 plan。
 - **不引 grok 那套 scenarios/YAML 与 scroll matrix**(4 万行)。现在的规模不需要场景 DSL。
 - **不动上面表里那 9 个测试的既有断言**,只做加法。
+
+## 七、验收
+
+1. `tui_pty.rs` 原有 7 个 + `plain_pty.rs` 2 个测试**全部仍绿**,且断言一条未删。
+2. 至少 4 个场景有整屏基线:`two_turn_overflow_commits…`、`resize_keeps_cpr…`(缩放前后
+   各一张)、一条带列表和代码块的 markdown 回复、一行工具调用 + 结果。每张基线绑定
+   明确的 `rows×cols`。
+3. **同一条命令连跑三次,基线零 diff**。跑不稳就是规范化没做干净(端口、临时路径、
+   时间、spinner),回第三节第 2 条。
+4. **negative control**:把 `tui/src/markdown.rs` 里一处缩进常量改掉,至少一张基线变红;
+   改回来即绿。红不了说明规范化把有效信息也抹掉了,基线是废的。
+5. 仓库完成标准照旧:`cargo fmt --all --check`、`cargo clippy --workspace --all-targets
+   --all-features -D warnings`、`cargo test --workspace` 各自单独取退出码,全为 0。

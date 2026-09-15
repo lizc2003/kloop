@@ -65,3 +65,18 @@ macOS 用,`clonefile` 这一条就够。
   是 2026-08-31 那次回退的结论,见 HANDOFF plan 35 修正条)。
 - **不做并行度调优与分片**(grok 有 hash 分片)。先让 CoW 这条路通,快多少再说。
 - 不碰 `finish`/`enter`/`enter_existing` 的语义。
+
+## 七、验收
+
+**前置**:第五节那个问题必须先有答案。答案是"以 HEAD 为准"则本 plan 撤销,不要往下做。
+
+1. **等价性**:同一个仓库,用 CoW 路径与原 `git worktree add` 路径各建一个工作树,
+   两者的 `git status --porcelain` 输出**逐字节相同**。这是本 plan 唯一不能让步的一条。
+2. `.git` 文件正确:新工作树里的 `.git` 仍是 `git worktree add` 写的那个 linked 指针,
+   不是主工作区 `.git` 的克隆。`git rev-parse --git-common-dir` 在新工作树里指回主仓。
+3. **回退路径真的被走过**:构造一个非 APFS 目标(或直接让 `clonefile` 返回错误)的测试,
+   断言 worktree 仍然创建成功。不能只在 happy path 上有测试。
+4. 可执行位与符号链接在两条路径下一致。
+5. 提速有数:记一次两条路径的耗时对比进 plan 的 ✅ 节。**没有提速就不要合**——本 plan
+   除了速度没有别的收益,不快就是净增复杂度。
+6. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自取退出码)。
