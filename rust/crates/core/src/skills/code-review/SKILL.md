@@ -64,8 +64,13 @@ see is the list that survives.
 Before writing the report, each one is exactly one of:
 
 - **confirmed** — report it.
-- **downgraded** — real, but smaller than it first looked. Report it at its true
-  severity and say what reduced it.
+- **downgraded** — real, but smaller than it first looked. It is still a defect,
+  so it goes **in the findings list** at the severity you settled on, with one
+  line on what reduced it. **Downgraded is not a softer word for excluded.**
+  Parked in the tail section it becomes a defect someone has to act on sitting
+  inside a list whose every other line says "checked, not a defect", and it gets
+  read as one of them. If nobody has to act on it, the verdict was excluded, not
+  downgraded.
 - **excluded** — one of the cases above, or otherwise not a defect. One line,
   with the reason. **The change's own words are not that reason.** "The commit
   message says it only touches the background path", "the new doc says the
@@ -79,12 +84,11 @@ Before writing the report, each one is exactly one of:
   the path to its caller usually shows that. Spend the experiments on what you
   are going to report.
 
-The report ends with the downgraded and excluded ones. That section is not
-filler: "I checked X, it is fine because Y" is what tells the reader X was
-covered, and it is the only thing standing between an investigated candidate and
-silent disappearance. **A candidate you thought about across several tool calls
-and then dropped without a line is the exact failure this skill exists to
-prevent.**
+The report ends with the excluded ones. That section is not filler: "I checked
+X, it is fine because Y" is what tells the reader X was covered, and it is the
+only thing standing between an investigated candidate and silent disappearance.
+**A candidate you thought about across several tool calls and then dropped
+without a line is the exact failure this skill exists to prevent.**
 
 ## Verifying
 
@@ -182,8 +186,9 @@ report. Those run separately, and when project instructions require them before
 
 ## The report
 
-Confirmed findings first, worst first. Then downgraded and excluded. Then one or
-two lines on what you ran and what you did not.
+Findings first, worst first — the downgraded ones among them, at the severity
+you settled on, not below the fold. Then the excluded list. Then one or two
+lines on what you ran and what you did not.
 
 - Lead with the defect. Bold marks what is wrong — never "no problems found".
 - Severity by blast radius: breaks a caller, misleads the next person to touch

@@ -957,6 +957,12 @@ mod tests {
             // round 16; the run that took the same diff a few files at a time
             // reached that ceiling at round 31.
             "at a time rather than in one piece",
+            // Plan 148: the contract said both "report it at its true severity"
+            // and "the report ends with the downgraded and excluded ones", so
+            // every review resolved it the same way — one combined tail section
+            // where a real defect (a doc the change made untrue) sat among
+            // "checked, not a defect" lines and read as one of them.
+            "not a softer word for excluded",
         ] {
             assert!(
                 body.contains(clause),

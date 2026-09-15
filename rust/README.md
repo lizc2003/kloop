@@ -2728,10 +2728,13 @@ warning, never an error.
 of kloop still gets them: `code-review` (plan 119), an inline skill carrying the
 review contract — a finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
-(confirmed / downgraded / excluded) so none disappears silently, written down as
-it occurs in the turn's visible text because reasoning is not somewhere the
-model can read back from, and never excluded on what the change's own commit
-message or doc claims about itself; evidence comes from the repository under
+(confirmed / downgraded / excluded) so none disappears silently — a downgraded
+candidate is still a defect someone acts on, so it rides in the findings list at
+its true severity instead of the excluded tail, where a reader takes it for one
+more "checked, it is fine" line (plan 148) — written down as it occurs in the
+turn's visible text because reasoning is not somewhere the model can read back
+from, and never excluded on what the change's own commit message or doc claims
+about itself; evidence comes from the repository under
 review, so a question that seems to need an outside fact is re-asked as "what
 does this code do with that input" and settled locally rather than by searching
 an upstream's docs — the few facts only the user has (what is deployed there,
