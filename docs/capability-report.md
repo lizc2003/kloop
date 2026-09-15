@@ -66,6 +66,17 @@ Plan 91 的 Plan 87–90 先行验收只增加 conformance evidence，不新增�
 | Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；所有 Bash/PowerShell 走 per-process initial-breakpoint debug admission；admission/terminate 同锁；bounded cleanup | corrective 原生 Windows 已复跑通过；filesystem/network sandbox 未销账 |
 | Windows filesystem/network sandbox（restricted token/AppContainer） | cc 单家 | plan 19 更后；Job containment 不销此账 | 有 Windows sandbox 需求 |
 
+**补齐来源(2026-09-15 定位)**:上面两行未销的账,现成实现都在 `refs/codex` 上游
+(固定 `02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`),不必另起炉灶——Linux 看
+`codex-rs/linux-sandbox`(1.03 万行:landlock 管文件 + seccompiler 管系统调用 +
+bwrap 管命名空间,另有 fd_mount 与 network-proxy),与 plan 19 余片已定的
+`bwrap+seccomp` 设计同向;Windows filesystem/network 看 `codex-rs/windows-sandbox-rs`
+(2.43 万行原生:CreateRestrictedToken + 私有 desktop 的 SetSecurityInfo + JobObject +
+ConPTY,配 `windows-sandbox-service`),它走的是 restricted token 一路;macOS 对照在
+`codex-rs/core/src/sandboxing`。开工前先读 `refs/README.md` 的 2026-09-15 调研节:那里记了
+为什么 grok 的 `nono`(unix-only 薄封装、无 Windows)只作备选,以及 dsh 的 Windows ACL 后端
+自标 partial 的边界(启动期保留 Everyone 访问、NTFS 硬链接可从另一路径暴露同一文件)。
+
 ### 4. 工具面——🟡 主干齐；固定条件下通过 Plan 59 受限行为兼容验收
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
