@@ -48,7 +48,16 @@ SHA 以本条所在提交为准):用户看着自己项目的 `permissions.json` 
 rust-cache key、`verify.py` 的 `KLOOP_WORKSPACE`、static-evidence 的 54 条 `location`),
 教训 138。**顺带暴露一条既有欠账**:`verify.py --corpus-only` 的 `Plan 52 native … surface drift` 早就红了(与改名无关,本次 `.rs` 内容改动为 0)——
 fixture 的期望停在 plan 52(`a42f1b8`),而 `max_rounds` 在 plan 108(`d1f4f31`)被移出 `run_agent` schema、`model` 在 plan 92(`2e70f22`)加入,`stop_program` 也不在 depth-0
-名单里。要修得先判哪边是对的,是独立的一个 plan。
+名单里。**已由 plan 147 修完**(同一会话,用户改口「解决报红」)。
+
+**~~plan 147 一道在第一个「不」上就停下的门~~ ✅**(2026-09-15):`verify.py --corpus-only`
+从 **2026-08-19(plan 92,`2e70f22`)起就是红的**,而 `require` 一红就抛,所以它后面的
+Plan 56/57/58 native、scripted provider、sensitive information **将近四周一次都没跑到过**。
+修掉 Plan 52 那条,第二条立刻露出来:Plan 56 的 fixture 还期望 `.claude/worktrees/` +
+`worktree-serial`,而那是 **2026-08-31 回退**(上方 plan 35 修正条)换成 `.kloop/worktrees/` +
+`kloop-worktree-` 的。三处漂移全部是实现侧有据可查的主动决定,没有一条是 bug,`.rs` 一行没
+动;改的只有 `verify.py` 里针对 kloop 自己那份 `surface:"kloop-native"` 报告的断言,
+`fixtures/normalized/` 的 cc 字面值原样保留。现在 corpus 基线绿。教训 139、140。
 
 **这批的统一纪律(2026-09-14 用户拍板:「不需要考虑兼容性,要保持代码干净」)**:
 
@@ -1013,3 +1022,7 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
 节点类型承载多种语义**时必须下沉到 token 文本,否则白名单看起来很严,实际按语义是漏的。
 
 138. 来自 Plan 146(一个把自己名字说了两遍的目录)。**改目录名的风险不在 `git grep` 数得出来的那堆文档路径,在那几处被程序读的路径常量——它们数量少、藏得深,而且一律沉默地失败。**本次 470 处引用里绝大多数是文档(改错了只是链接坏),真正会让 CI 变红或悄悄失效的只有四处:`.gitignore`(不改就把 207G `target/` 抖进 `git status`)、CI 的 `working-directory` 与 rust-cache 的 `workspaces` key(后者不报错,只是从此永远不命中缓存)、`verify.py` 的 `KLOOP_WORKSPACE`,以及 `static-evidence.jsonl` 里 54 条 `location`——那不是死文本,`verify_repo_location` 会逐条 open 文件**并校验行号落在文件范围内**。判据:改任何路径形状之前,先把引用按"谁在读"分成**程序读**和**人读**两堆,程序读的那堆逐个确认;`git grep` 的计数只描述后一堆的规模,完全不描述前一堆的风险。附带一条:批量替换前先把**同形非目标**排干净——本次 `kloop/` 有三种(git 分支名 `kloop/worktree/`、User-Agent `kloop/0.1`、app 仓自己的 `kloop/` 目录),盲 sed 会把它们一起改掉,而这三种改错**没有任何东西会报错**。
+
+139. 来自 Plan 147(一道在第一个"不"上就停下的门)。**一条 fail-fast 的断言红了,它后面的所有检查就等于不存在——而在 CI 日志里,"红了"和"从没跑过"长得一模一样。**`verify.py` 的 `require` 一红就抛;Plan 52 那条从 2026-08-19(plan 92)起就红,于是 Plan 56/57/58 native、scripted provider、sensitive information 将近四周没被执行过一次。修掉第一条之后第二条(plan 56 的 worktree 路径,2026-08-31 回退留下的)立刻露出来,它同样在那四周里无人可见。判据:遇到一道长期红的门,先问**它后面还有几级**;把第一条修绿不是终点,是开始逐级解冻,必须一路重跑到真正的绿为止,别把"那条修好了"当成"这道门是通的"。附带一条工具:报错只说"drift"而断言是一条 39 分句的 `and` 链时,用 `ast` 取出该 `require` 的每个 operand 单独 eval,比人眼二分快一个数量级。
+
+140. 来自 Plan 147(同上)。**给参考实现做的 fixture,凡是有意偏离参考值的地方,理由必须写在断言旁边——否则下一个人把它"修"回去是完全合理的动作。**本次三处漂移全部是实现侧有据可查的决定(plan 92 给 `run_agent` 加 `model`、plan 106/108 把 `max_rounds` 移出 schema、plan 113 默认关掉 program surface、2026-08-31 把托管 worktree 搬回 `.kloop/`),但 `verify.py` 里只有一串裸字面量,没有一个字说明它们该是什么、为什么。更危险的是同一个仓库里 `fixtures/normalized/` 保留的**正是** cc 的字面值(`.claude/worktrees/`)——那是 cc 的真实录制,本来就不该动;两者摆在一起,不写注释就等于给后人埋了一个"看起来像漏改"的陷阱。判据:parity fixture 里每一处"我们和参考不一样"都要带一句出处(哪个 plan、哪天、为什么),这段注释不是装饰,是把"这是有意偏离而非漏改"钉在唯一会被读到的地方。
