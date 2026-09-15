@@ -34,9 +34,9 @@
 
 ## 关键文件
 
-- `kloop/crates/tui/src/lib.rs` — 新增 `SCROLLBACK_BATCH_ROWS` + `coalesce_scrollback_batches`;`insert_scrollback_blocks` 改按批 `insert_before`。
-- `kloop/crates/tui/src/lib.rs`(tests)— 纯函数单测(N 个短 cell → 批数 = ceil(总行/上限),展平内容与顺序不变;超高单 cell 自成一批);计数 backend 集成测试:满屏 inline viewport + 大量短 cell,断言 `clear_region` 次数 = 批数(O(批)),不随 cell 数线性增长;沿用 `scrollback_insert_clears_viewport_without_clearing_history` 证内容正确。
-- `kloop/README.md` — overflow/resume 段补一句:首帧提交按批合并(每 cell 一次 `insert_before` → 分批一次),避免长历史 resume 逐格清屏重绘。
+- `rust/crates/tui/src/lib.rs` — 新增 `SCROLLBACK_BATCH_ROWS` + `coalesce_scrollback_batches`;`insert_scrollback_blocks` 改按批 `insert_before`。
+- `rust/crates/tui/src/lib.rs`(tests)— 纯函数单测(N 个短 cell → 批数 = ceil(总行/上限),展平内容与顺序不变;超高单 cell 自成一批);计数 backend 集成测试:满屏 inline viewport + 大量短 cell,断言 `clear_region` 次数 = 批数(O(批)),不随 cell 数线性增长;沿用 `scrollback_insert_clears_viewport_without_clearing_history` 证内容正确。
+- `rust/README.md` — overflow/resume 段补一句:首帧提交按批合并(每 cell 一次 `insert_before` → 分批一次),避免长历史 resume 逐格清屏重绘。
 
 ## 非目标
 
@@ -59,7 +59,7 @@
 
 ## 完成记录
 
-- 实现:`kloop/crates/tui/src/lib.rs`
+- 实现:`rust/crates/tui/src/lib.rs`
   - 新增常量 `SCROLLBACK_BATCH_ROWS = 512` 与纯函数 `coalesce_scrollback_batches(blocks, max_rows)`:丢空块、按行数上限把逐 cell 的 blocks 合并成批次(单块永不跨批切;单块超上限自成一批),顺序与内容不变。
   - `insert_scrollback_blocks` 由 `for lines in blocks` 改为 `for lines in coalesce_scrollback_batches(blocks, SCROLLBACK_BATCH_ROWS)`;每批仍一次 `insert_before`,收尾一次 `terminal.clear()`。提交/溢出判定(`commit_count`、reserve)未动。
 - 测试(`lib.rs` tests):

@@ -49,7 +49,7 @@ Plan 46 删除仓库内项目 TOML 是正确的信任边界：仓库内容不能
 
 ## 1. Project、Workspace 与身份解析
 
-新增 `kloop/crates/core/src/project.rs`，定义不可混用的强类型：
+新增 `rust/crates/core/src/project.rs`，定义不可混用的强类型：
 
 ```rust
 pub struct ProjectId(/* private opaque digest */);
@@ -499,30 +499,30 @@ pub enum Decision {
 
 新增：
 
-- `kloop/crates/core/src/project.rs`
-- `kloop/crates/cli/src/private_store.rs`
-- `kloop/crates/cli/src/project_store.rs`
+- `rust/crates/core/src/project.rs`
+- `rust/crates/cli/src/private_store.rs`
+- `rust/crates/cli/src/project_store.rs`
 
 核心修改：
 
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/core/src/permissions.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/tools/task.rs`
-- `kloop/crates/core/src/worktree.rs`
-- `kloop/crates/core/src/sandbox/mod.rs`
-- `kloop/crates/cli/src/startup.rs`
-- `kloop/crates/cli/src/user_config.rs`
-- `kloop/crates/cli/src/main.rs`
-- `kloop/crates/cli/src/ui.rs`
-- `kloop/crates/tui/src/{app.rs,render.rs,lib.rs}`
-- `kloop/crates/server/src/{lib.rs,wire.rs}` 与 server tests
+- `rust/crates/core/src/config.rs`
+- `rust/crates/core/src/permissions.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/task.rs`
+- `rust/crates/core/src/worktree.rs`
+- `rust/crates/core/src/sandbox/mod.rs`
+- `rust/crates/cli/src/startup.rs`
+- `rust/crates/cli/src/user_config.rs`
+- `rust/crates/cli/src/main.rs`
+- `rust/crates/cli/src/ui.rs`
+- `rust/crates/tui/src/{app.rs,render.rs,lib.rs}`
+- `rust/crates/server/src/{lib.rs,wire.rs}` 与 server tests
 - 受 Config literal/clone影响的统一 test builders与模块测试
 - `~/work/桌面前端仓库/app` 的 kloop专用分支 adapter（实施阶段）
 
 文档：
 
-- `kloop/README.md`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `docs/plan/46-global-user-config.md` 只补 supersession note，不改写历史记录

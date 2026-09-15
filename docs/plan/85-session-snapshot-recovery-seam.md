@@ -12,7 +12,7 @@
 
 近期只读审计的 CodeWhale 当前参考库为 `refs/codewhale` HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`；旧 Plan 60 的 `b494236` 只是历史基线。最适合 kloop 直接吸收的机制是提交 `c0e69f4ab`（2026-08-12）确立的 session snapshot 只读语义与显式 crash recovery 语义分离：普通检查不能把仍在运行的 tool call 误判为崩溃，明确 resume 才能 repair，并返回可审计统计。
 
-kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 的 durable provider usage ledger，但 `kloop/crates/core/src/rollout.rs` 当前仍让 `load_session_snapshot` 和 `resume_session` 共同调用 `repair_pairing`；`resume_session` 同时负责 torn-tail 物理截断。需要把“只读解析、内存配对归一化、显式恢复修复、物理截断”边界写成可验证契约，避免 server 的 list/read/spawn seed 路径产生恢复副作用。
+kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 的 durable provider usage ledger，但 `rust/crates/core/src/rollout.rs` 当前仍让 `load_session_snapshot` 和 `resume_session` 共同调用 `repair_pairing`；`resume_session` 同时负责 torn-tail 物理截断。需要把“只读解析、内存配对归一化、显式恢复修复、物理截断”边界写成可验证契约，避免 server 的 list/read/spawn seed 路径产生恢复副作用。
 
 本计划只落这一条持久化边界，不把近期 CodeWhale 的 route receipt、opaque reasoning、usage stream receipt、deferred activation cache 或具体 provider 接入混入同一个机制切片。
 
@@ -46,7 +46,7 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 
 ### 1. 审计并拆分 rollout seam
 
-- 复核 `kloop/crates/core/src/rollout.rs` 的 `ParsedSession`、`parse_session`、`load_session`、`load_session_snapshot`、`resume_session` 与 `repair_pairing`。
+- 复核 `rust/crates/core/src/rollout.rs` 的 `ParsedSession`、`parse_session`、`load_session`、`load_session_snapshot`、`resume_session` 与 `repair_pairing`。
 - 为 `RolloutLine` 增加仅供 rollout replay 的 additive `repaired` variant，并在 `parse_session`、fork copy/remeta、metadata/sequence exhaustive matches 中处理；该 variant 只承载 canonical replacement messages，不进入 `SessionSnapshot`、native JSON-RPC 或 provider request。
 - `parse_session` 遇到 `repaired` marker 时替换 effective messages，但保留当前文件中的 runtime、terminals、provider_usage、lineage 和 sequence；一次 recovery 最多写一份 canonical marker，marker 本身完整写入后才算 repair 持久化成功。
 - 对 legacy 文件没有 marker 的 pairing normalization 也可以在 snapshot/list/read 中纯内存执行，以保持现有展示和 provider seed 语义；但只丢弃内部统计，不 truncate、append 或补 repair marker。显式 recovery 才能把 normalization 持久化。
@@ -60,7 +60,7 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 
 ### 3. 迁移调用方并锁定负契约
 
-- `kloop/crates/server/src/lib.rs` 的 thread resume/fork 使用显式 recovery；list/read/spawn seed 和 `thread/events/sync` 继续使用只读 snapshot。
+- `rust/crates/server/src/lib.rs` 的 thread resume/fork 使用显式 recovery；list/read/spawn seed 和 `thread/events/sync` 继续使用只读 snapshot。
 - CLI、TUI、History resume 的机械调用点改用结构化恢复结果，保持现有 runtime/cwd migration、generation replacement 和 fork 语义；`--list-sessions` 与 picker 继续只读，是否展示 repair stats 不在本计划扩展为新的 CLI public 文案。
 - 保持 `load_session` 的既有兼容行为或提供窄兼容委托，但新只读调用方不得继续走兼容 recovery 委托。
 
@@ -74,7 +74,7 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 
 ### 5. 同步文档与证据边界
 
-- 更新 `kloop/README.md` 的 session/recovery 说明、`docs/plan/HANDOFF.md` 顶部完成事实与教训、`docs/capability-report.md` 的对应路线销账，以及 `refs/README.md` 的 CodeWhale 当前 HEAD/借鉴范围。
+- 更新 `rust/README.md` 的 session/recovery 说明、`docs/plan/HANDOFF.md` 顶部完成事实与教训、`docs/capability-report.md` 的对应路线销账，以及 `refs/README.md` 的 CodeWhale 当前 HEAD/借鉴范围。
 - 保留 CodeWhale 固定 HEAD、提交 `c0e69f4ab` 和只读审计边界；不要把候选设计写成已实现能力。
 
 ## 必须复用的现有 seam
@@ -91,25 +91,25 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 ## 关键文件
 
 - `docs/plan/85-session-snapshot-recovery-seam.md`（本计划）
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/core/src/history.rs`
-- `kloop/crates/core/src/agent.rs` 及其 resume/turn 测试
-- `kloop/crates/server/src/lib.rs`
-- `kloop/crates/server/tests/server.rs`
-- `kloop/crates/cli/src/args.rs`
-- `kloop/crates/tui/src/lib.rs`
-- `kloop/README.md`
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/core/src/history.rs`
+- `rust/crates/core/src/agent.rs` 及其 resume/turn 测试
+- `rust/crates/server/src/lib.rs`
+- `rust/crates/server/tests/server.rs`
+- `rust/crates/cli/src/args.rs`
+- `rust/crates/tui/src/lib.rs`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`
 
-预计不修改：`kloop/crates/provider/src/{anthropic,openai,responses,sse}.rs`、`kloop/crates/server/src/{events,wire}.rs`、Desktop 仓库、Cargo manifests、`Cargo.lock`。如果调用方迁移确实触及其中任一文件，完成记录必须解释原因，且不得突破本计划的 public protocol 和无新增依赖边界。
+预计不修改：`rust/crates/provider/src/{anthropic,openai,responses,sse}.rs`、`rust/crates/server/src/{events,wire}.rs`、Desktop 仓库、Cargo manifests、`Cargo.lock`。如果调用方迁移确实触及其中任一文件，完成记录必须解释原因，且不得突破本计划的 public protocol 和无新增依赖边界。
 
 ## 验证
 
 ### 定向契约与生命周期
 
-从 `<repo>/kloop` 执行：
+从 `<repo>/rust` 执行：
 
 ```bash
 cargo test --locked -p kloop-core rollout

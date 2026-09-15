@@ -65,11 +65,11 @@ CC 侧可重放 corpus、generated pair contract 与 kloop executable report 已
 
 kloop 侧优先复用：
 
-- `kloop/crates/core/src/tools/fs.rs` 的文件参数解析和现有工具测试；
-- `kloop/crates/core/src/tools/search.rs` 的 Rust 原生搜索、过滤、排序、分页和预算；
-- `kloop/crates/core/src/tools/mod.rs` 的 `builtin_defs`、`all_tool_defs`、`is_concurrency_safe`、`dispatch_tools`、`run_one`、`str_arg` 和 `resolve_path`；
-- `kloop/crates/core/src/permissions.rs` 的权限顺序、敏感路径和 read deny 过滤；
-- `kloop/crates/cli/src/user_config.rs` 的 temp → sync → rename → parent sync → cleanup 原子替换模式，只借设计，不跨 crate 调用私有实现。
+- `rust/crates/core/src/tools/fs.rs` 的文件参数解析和现有工具测试；
+- `rust/crates/core/src/tools/search.rs` 的 Rust 原生搜索、过滤、排序、分页和预算；
+- `rust/crates/core/src/tools/mod.rs` 的 `builtin_defs`、`all_tool_defs`、`is_concurrency_safe`、`dispatch_tools`、`run_one`、`str_arg` 和 `resolve_path`；
+- `rust/crates/core/src/permissions.rs` 的权限顺序、敏感路径和 read deny 过滤；
+- `rust/crates/cli/src/user_config.rs` 的 temp → sync → rename → parent sync → cleanup 原子替换模式，只借设计，不跨 crate 调用私有实现。
 
 ## 目标
 
@@ -158,7 +158,7 @@ kloop 侧优先复用：
 
 ### 4. Session-scoped 文件观察状态
 
-新增 `kloop/crates/core/src/file_state.rs`，并在 `config.rs`/`lib.rs` 接入有界 session state：
+新增 `rust/crates/core/src/file_state.rs`，并在 `config.rs`/`lib.rs` 接入有界 session state：
 
 - 以 `resolve_path` 锚定并规范化的绝对路径为 key，记录文件身份/元数据、内容指纹、Read 范围及是否完整。
 - 容量和内存设硬上限，并使用确定性淘汰。
@@ -193,7 +193,7 @@ kloop 侧优先复用：
 - 覆盖 observation 容量/淘汰、partial/full read、取消、写后刷新、同路径竞争和 sub-agent fresh state。
 - 更新 `build_matrix.py`、`tool-matrix.json`、`paired-parity.json` 和 `verify.py`：每个非 `unknown`/`n/a` 单元引用 exact evidence；`same` 必须引用覆盖该精确 cell 的 generated `pair:` contract，并执行比较 CC fixture projection 与 kloop real-dispatch report。
 - 新增 Read/Write/Edit/Grep 静态 anchor 完整性检查；禁止手工修改生成物绕过 generator。
-- 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`kloop/README.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
+- 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`rust/README.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
 
 ## 最终裁决的有意差异
 

@@ -30,7 +30,7 @@
 2. 复用 `crates/provider/tests/anthropic.rs` 的 wiremock 体系和既有 request capture，确认真实 Anthropic request body/header 契约；不引入 claw mock 服务。
 3. 在 `crates/provider/src/openai.rs` 的 `apply_choice_payload` 将 `Value::Null` 与缺失字段合并处理，在 `crates/provider/tests/openai.rs` 覆盖 null 成功和 object/string/number 失败。
 4. 只在 `crates/core/src/compact.rs` 强化 oversized、多 ToolUse/ToolResult 和 compaction replacement 的边界测试，不改生产算法。
-5. 更新根 `CLAUDE.md`、`refs/README.md`、`kloop/README.md` 与 `docs/plan/HANDOFF.md`，将 claw 改为固定 commit 的历史调研来源；保留 parity fixture 的 historical provenance。
+5. 更新根 `CLAUDE.md`、`refs/README.md`、`rust/README.md` 与 `docs/plan/HANDOFF.md`，将 claw 改为固定 commit 的历史调研来源；保留 parity fixture 的 historical provenance。
 
 ## 验证结果
 

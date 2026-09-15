@@ -13,7 +13,7 @@
 
 ## Context
 
-kloop 当前的 `BASE_SYSTEM`（`kloop/crates/core/src/context.rs:13`）只有一行：
+kloop 当前的 `BASE_SYSTEM`（`rust/crates/core/src/context.rs:13`）只有一行：
 
 ```
 You are a coding agent working in a CLI. Use the provided tools to inspect and modify files and run commands; keep answers short.
@@ -160,7 +160,7 @@ task; prefer URLs the user or local files provide.
 
 ## 待开工时定
 
-1. **`mock()` 的拼接**（`kloop/crates/cli/src/context.rs:61`）：现为 `format!("{BASE_SYSTEM} Current working directory: {}", cwd)`，把新多段常量拼一行 cwd 尾巴读起来别扭但仍 hermetic、无断言。
+1. **`mock()` 的拼接**（`rust/crates/cli/src/context.rs:61`）：现为 `format!("{BASE_SYSTEM} Current working directory: {}", cwd)`，把新多段常量拼一行 cwd 尾巴读起来别扭但仍 hermetic、无断言。
    - 方案 A（推荐，最小改动）：保持现状，仅接受尾部多一行 cwd。
    - 方案 B：mock 也走 `assemble_system` + 固定 mock env（无 git），与真实路径同构、更整洁；代价是改动 mock 输出形状。
    开工时二选一，默认 A。
@@ -168,9 +168,9 @@ task; prefer URLs the user or local files provide.
 
 ## 关键文件
 
-- `kloop/crates/core/src/context.rs` — 替换 `BASE_SYSTEM` 常量（唯一实质改动）。
-- `kloop/crates/cli/src/context.rs` — `mock()` 拼接如选方案 B 才改；`gather()` 无需改（已走 `assemble_system(BASE_SYSTEM, …)`）。
-- `kloop/README.md` — 行为变更同步：一句说明系统提示词从一行升级为分节方针。
+- `rust/crates/core/src/context.rs` — 替换 `BASE_SYSTEM` 常量（唯一实质改动）。
+- `rust/crates/cli/src/context.rs` — `mock()` 拼接如选方案 B 才改；`gather()` 无需改（已走 `assemble_system(BASE_SYSTEM, …)`）。
+- `rust/README.md` — 行为变更同步：一句说明系统提示词从一行升级为分节方针。
 - `docs/plan/HANDOFF.md` — 补进度与教训（如「base 只写方针、工具说明留在 tool def」）。
 
 ## 非目标
@@ -207,7 +207,7 @@ task; prefer URLs the user or local files provide.
 
 ## 完成记录（2026-08-24）
 
-- `kloop/crates/core/src/context.rs` 的 `BASE_SYSTEM` 已从单行替换为 provider 中立、分节方针文本（identity + `# System` / `# Doing tasks` / `# Acting with care` / `# Using your tools` / `# Communication style`），用 `r#"…"#` 承载；文档注释补明"方针进 base、工具用法留在 tool def、provider 中立"。`assemble_system` 逻辑与 `# Environment`/git 装配一字未改，输出 = 新 base + 环境块 + git 快照，节序连续。
+- `rust/crates/core/src/context.rs` 的 `BASE_SYSTEM` 已从单行替换为 provider 中立、分节方针文本（identity + `# System` / `# Doing tasks` / `# Acting with care` / `# Using your tools` / `# Communication style`），用 `r#"…"#` 承载；文档注释补明"方针进 base、工具用法留在 tool def、provider 中立"。`assemble_system` 逻辑与 `# Environment`/git 装配一字未改，输出 = 新 base + 环境块 + git 快照，节序连续。
 - **决策**（对应"待开工时定"）：#1 `mock()` 取**方案 A**——保持 `format!("{BASE_SYSTEM} Current working directory: {}", cwd)` 现状,不改输出形状；#2 不新增 headless 紧凑变体。
 - `BASE_SYSTEM` 仅两处消费（`gather` via `assemble_system`、`mock` 拼接），无测试断言其内容；`context.rs` 现有单测用字面量 `"Base."`,与常量解耦、无需改。
 - 验证:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings` 全绿;`cargo test`（workspace）1305 passed / 0 failed;`cargo run -p kloop -- --mock --headless --json "say hi"` 脚本化 mock 整轮跑完、退出 0,证明新常量装配无误。真实 key 主观回归本次未跑（可选项,如需再问用户要代理/key）。

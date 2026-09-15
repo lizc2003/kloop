@@ -22,10 +22,10 @@ CodeWhale 的可吸收原则是：incomplete 不是成功答案，已报告 usag
 
 ## 关键文件
 
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/provider/src/{lib.rs,failure.rs,stream.rs,anthropic.rs,openai.rs,responses.rs}`
-- `kloop/crates/core/src/{agent.rs,agent/sampling.rs,compact.rs,history.rs,rollout.rs,usage.rs}`
-- `kloop/crates/server/src/events.rs`
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/provider/src/{lib.rs,failure.rs,stream.rs,anthropic.rs,openai.rs,responses.rs}`
+- `rust/crates/core/src/{agent.rs,agent/sampling.rs,compact.rs,history.rs,rollout.rs,usage.rs}`
+- `rust/crates/server/src/events.rs`
 - provider/core lifecycle and reasoning/tool-pair tests
 
 ## 非目标

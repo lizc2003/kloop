@@ -35,10 +35,10 @@ Plan 48 已证明强制 defer profile 下 ToolSearch、`select:`、关键词搜�
 
 优先复用：
 
-- `kloop/crates/core/src/tools/tool_search.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/mcp/src/lib.rs`
-- `kloop/crates/mcp/tests/client.rs`
+- `rust/crates/core/src/tools/tool_search.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/mcp/src/lib.rs`
+- `rust/crates/mcp/tests/client.rs`
 - 现有 skill loader、deferred tool registry 和 `call_tool` 测试
 - Plan 48 的 `local_mcp.py` 与 fake provider
 

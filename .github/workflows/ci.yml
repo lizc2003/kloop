@@ -15,8 +15,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        # 仓库根不是 workspace 根,workspace 在 kloop/ 下
-        working-directory: kloop
+        # 仓库根不是 workspace 根,workspace 在 rust/ 下
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,7 +27,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: kloop
+          workspaces: rust
       - run: cargo +stable fmt --all -- --check
       - run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings
       - if: runner.os == 'Windows'
@@ -53,13 +53,13 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: kloop
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.1
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: kloop
+          workspaces: rust
       - run: rustc +1.96.1 -Vv
       - run: cargo +1.96.1 -V
       - run: cargo +1.96.1 check --locked --workspace --all-targets --all-features

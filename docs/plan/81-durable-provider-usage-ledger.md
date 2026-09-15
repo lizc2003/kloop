@@ -113,9 +113,9 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 修改：
 
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/core/src/lib.rs`
-- `kloop/crates/core/src/usage.rs`（新增）
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/core/src/lib.rs`
+- `rust/crates/core/src/usage.rs`（新增）
 
 工作：
 
@@ -127,11 +127,11 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 修改：
 
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/core/src/history.rs`
-- `kloop/crates/cli/src/args.rs`
-- `kloop/crates/tui/src/lib.rs`
-- `kloop/crates/server/src/lib.rs`
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/core/src/history.rs`
+- `rust/crates/cli/src/args.rs`
+- `rust/crates/tui/src/lib.rs`
+- `rust/crates/server/src/lib.rs`
 
 工作：
 
@@ -145,10 +145,10 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 修改：
 
-- `kloop/crates/provider/src/lib.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/agent/tests.rs`
-- `kloop/crates/core/src/compact.rs`
+- `rust/crates/provider/src/lib.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/agent/tests.rs`
+- `rust/crates/core/src/compact.rs`
 
 工作：
 
@@ -161,9 +161,9 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 修改：
 
-- `kloop/crates/core/src/commands/cost.rs`
-- `kloop/crates/core/src/commands/mod.rs`
-- `kloop/README.md`
+- `rust/crates/core/src/commands/cost.rs`
+- `rust/crates/core/src/commands/mod.rs`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`
@@ -212,16 +212,16 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 ## 关键文件
 
 - `docs/plan/81-durable-provider-usage-ledger.md`
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/core/src/usage.rs`（新增）
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/core/src/history.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/compact.rs`
-- `kloop/crates/core/src/commands/cost.rs`
-- `kloop/crates/provider/src/lib.rs`
-- resume signature 的机械调用点：`kloop/crates/{cli/src/args.rs,tui/src/lib.rs,server/src/lib.rs}`
-- `kloop/README.md`、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`refs/README.md`
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/core/src/usage.rs`（新增）
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/core/src/history.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/compact.rs`
+- `rust/crates/core/src/commands/cost.rs`
+- `rust/crates/provider/src/lib.rs`
+- resume signature 的机械调用点：`rust/crates/{cli/src/args.rs,tui/src/lib.rs,server/src/lib.rs}`
+- `rust/README.md`、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`refs/README.md`
 
 预计不修改三个真实 provider adapter、`core/src/event.rs`、`server/src/events.rs`、`server/src/wire.rs`、Desktop 仓库、Cargo manifests 或 `Cargo.lock`。若最终 diff 触及这些文件，完成记录必须逐项解释，且不得突破本计划的 public/security/无新增依赖边界。
 
@@ -265,7 +265,7 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 ### 总质量门
 
-从 `kloop/` 运行：
+从 `rust/` 运行：
 
 ```bash
 cargo fmt --all -- --check

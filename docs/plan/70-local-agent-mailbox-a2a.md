@@ -204,11 +204,11 @@ LiveEntry {
 
 修改代表文件：
 
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/tools/subagent.rs`
-- `kloop/crates/core/src/tools/background_executions.rs`
-- 新增 `kloop/crates/core/src/agent_mailbox.rs`
+- `rust/crates/core/src/config.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/subagent.rs`
+- `rust/crates/core/src/tools/background_executions.rs`
+- 新增 `rust/crates/core/src/agent_mailbox.rs`
 
 内容：
 
@@ -222,11 +222,11 @@ LiveEntry {
 
 修改：
 
-- `kloop/crates/core/src/inbox.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/tools/codemode.rs`
-- `kloop/crates/core/src/permissions.rs`
+- `rust/crates/core/src/inbox.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/codemode.rs`
+- `rust/crates/core/src/permissions.rs`
 
 内容：
 
@@ -240,13 +240,13 @@ LiveEntry {
 
 修改：
 
-- `kloop/crates/core/src/event.rs`
-- `kloop/crates/cli/src/ui.rs`
-- `kloop/crates/cli/src/main.rs`
-- `kloop/crates/tui/src/app.rs`
-- `kloop/crates/tui/src/render.rs`
-- `kloop/crates/server/src/wire.rs`
-- `kloop/crates/server/src/lib.rs`
+- `rust/crates/core/src/event.rs`
+- `rust/crates/cli/src/ui.rs`
+- `rust/crates/cli/src/main.rs`
+- `rust/crates/tui/src/app.rs`
+- `rust/crates/tui/src/render.rs`
+- `rust/crates/server/src/wire.rs`
+- `rust/crates/server/src/lib.rs`
 
 新增 typed lifecycle：
 
@@ -269,7 +269,7 @@ AgentMessageUpdated {
 
 ### Slice 4：A2A adapter seam 与文档
 
-- 在 `kloop/crates/protocol` 定义 transport-neutral Local Agent envelope，不复用 provider chat `Message`，并为未来 A2A adapter 保留显式转换边界。
+- 在 `rust/crates/protocol` 定义 transport-neutral Local Agent envelope，不复用 provider chat `Message`，并为未来 A2A adapter 保留显式转换边界。
 - 加入 A2A 1.0 contract fixtures，证明：
   - local `to` 是 transport address，不被序列化进标准 A2A Message；
   - local text body 可无损映射为 A2A text Part；

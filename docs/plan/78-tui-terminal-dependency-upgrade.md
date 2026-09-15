@@ -21,7 +21,7 @@ Plan 76 已在基线 `1ab5d7e` 建立 terminal correctness 契约和分层回归
 
 `portable-pty 0.9`（lock 0.9.0）、`tempfile 3`（lock 3.27.0）和 `wiremock 0.6`（lock 0.6.5）已是当前稳定版本，保持声明与代码不变。Ratatui 0.30.2 的精确 crate metadata 要求 Rust 1.88；不能沿用 0.30.0/highlights 的 1.86 作为最终 patch 的 MSRV。
 
-实施前有一个硬前置门：工作树必须没有不属于 Plan 78 的重叠修改。此前由 Plan 77 持有的 Plan 39/server、`kloop/Cargo.lock`、`refs/README.md` 和独立 Plan 77 文件已经随 `ca8d532` 完成；开工前仍须重新检查 status/diff，若出现新的重叠修改，不得 stash、reset、覆盖或捎带提交这些内容，尤其 `Cargo.lock` 重叠时应先等其所有者完成或恢复干净。
+实施前有一个硬前置门：工作树必须没有不属于 Plan 78 的重叠修改。此前由 Plan 77 持有的 Plan 39/server、`rust/Cargo.lock`、`refs/README.md` 和独立 Plan 77 文件已经随 `ca8d532` 完成；开工前仍须重新检查 status/diff，若出现新的重叠修改，不得 stash、reset、覆盖或捎带提交这些内容，尤其 `Cargo.lock` 重叠时应先等其所有者完成或恢复干净。
 
 ## 产品契约
 
@@ -38,19 +38,19 @@ Plan 76 已在基线 `1ab5d7e` 建立 terminal correctness 契约和分层回归
 
 ### 1. 建立 MSRV 与受控 dependency set
 
-- 在 `kloop/Cargo.toml` 的 `[workspace.package]` 增加 `rust-version = "1.88"`；所有 workspace member package 通过 `rust-version.workspace = true` 继承，`kloop-codemode` 保留现有显式 version/edition 但也继承 rust-version。不要增加 `rust-toolchain.toml`，也不要切换 edition。
+- 在 `rust/Cargo.toml` 的 `[workspace.package]` 增加 `rust-version = "1.88"`；所有 workspace member package 通过 `rust-version.workspace = true` 继承，`kloop-codemode` 保留现有显式 version/edition 但也继承 rust-version。不要增加 `rust-toolchain.toml`，也不要切换 edition。
 - 更新 workspace dependencies：
   - `crossterm = { version = "0.29.0", features = ["event-stream"] }`；
   - `ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }`；
   - `unicode-width = "0.2.2"`；
   - `unicode-segmentation = "1.13.3"`；
   - `vt100 = "0.16.2"`。
-- 保留 Ratatui 默认 features；不要用 `default-features = false`，以免无关地关闭 macros、layout cache、underline-color 等默认能力。`kloop/crates/tui/Cargo.toml` 继续在消费点启用 `scrolling-regions`，Cargo feature union 同时得到 `crossterm_0_29`。
+- 保留 Ratatui 默认 features；不要用 `default-features = false`，以免无关地关闭 macros、layout cache、underline-color 等默认能力。`rust/crates/tui/Cargo.toml` 继续在消费点启用 `scrolling-regions`，Cargo feature union 同时得到 `crossterm_0_29`。
 - 保持 portable-pty/tempfile/wiremock 的 manifest 不变。用 targeted Cargo update 生成 lock diff，只接受目标 crate 和它们被迫变化的 transitive edges；不运行无边界的全 workspace `cargo update`。
 
 ### 2. 迁移 Ratatui 0.30 `Backend::Error`
 
-集中修改 `kloop/crates/tui/src/lib.rs`，保持 terminal transaction 算法不变：
+集中修改 `rust/crates/tui/src/lib.rs`，保持 terminal transaction 算法不变：
 
 - `PinnedBackend<B>` 的 `Backend` 实现增加 `type Error = B::Error`；`draw`、`append_lines`、cursor、clear、size/window-size、flush、scroll-region 等方法统一返回 `Result<_, Self::Error>`，继续完整委托。`append_lines` 在 0.30.2 仍是 provided trait method，不删除。
 - `pin_current_size()` 返回底层 backend error；pin/unpin 的作用域、`window_size.columns_rows` 覆盖和 resize fence 不变。
@@ -96,11 +96,11 @@ Plan 76 已在基线 `1ab5d7e` 建立 terminal correctness 契约和分层回归
 
 ## 关键文件
 
-- `kloop/Cargo.toml`、`kloop/Cargo.lock`、`kloop/crates/*/Cargo.toml`：版本、Ratatui feature、MSRV inheritance 和 Unix dev boundary。
-- `kloop/crates/tui/src/lib.rs`：`PinnedBackend`/`StagedSizeBackend` associated error、inline terminal、size-pin commit transaction。
-- `kloop/crates/tui/src/{text_layout.rs,composer.rs,render.rs,markdown.rs,toolrow.rs}`：Unicode 行为回归；原则上只在确认的数据语义变化时改测试/实现。
-- `kloop/crates/cli/tests/{tui_pty.rs,tui_pty_support/mod.rs}`：vt100 compatibility 与 real-binary terminal gates。
-- `.github/workflows/ci.yml`、`kloop/README.md`、`docs/capability-report.md`、`docs/plan/{78-tui-terminal-dependency-upgrade.md,HANDOFF.md}`：MSRV、CI、契约与完成记录。
+- `rust/Cargo.toml`、`rust/Cargo.lock`、`rust/crates/*/Cargo.toml`：版本、Ratatui feature、MSRV inheritance 和 Unix dev boundary。
+- `rust/crates/tui/src/lib.rs`：`PinnedBackend`/`StagedSizeBackend` associated error、inline terminal、size-pin commit transaction。
+- `rust/crates/tui/src/{text_layout.rs,composer.rs,render.rs,markdown.rs,toolrow.rs}`：Unicode 行为回归；原则上只在确认的数据语义变化时改测试/实现。
+- `rust/crates/cli/tests/{tui_pty.rs,tui_pty_support/mod.rs}`：vt100 compatibility 与 real-binary terminal gates。
+- `.github/workflows/ci.yml`、`rust/README.md`、`docs/capability-report.md`、`docs/plan/{78-tui-terminal-dependency-upgrade.md,HANDOFF.md}`：MSRV、CI、契约与完成记录。
 
 ## 完成记录
 
@@ -114,7 +114,7 @@ Plan 76 已在基线 `1ab5d7e` 建立 terminal correctness 契约和分层回归
 
 ## 验证
 
-从 `kloop/` 运行：
+从 `rust/` 运行：
 
 ```bash
 cargo +1.88.0 check --locked --workspace --all-targets --all-features

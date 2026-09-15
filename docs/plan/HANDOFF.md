@@ -40,6 +40,16 @@ SHA 以本条所在提交为准):用户看着自己项目的 `permissions.json` 
 教训 137(b) 把逐字规则退回会话级,净删 60 行;动手前先核了磁盘——7 个项目桶里
 `bash_script` 规则 0 条,所以删掉解析分支不会让谁的 policy 整份 fail-closed。
 
+**~~plan 146 一个把自己名字说了两遍的目录~~ ✅**(2026-09-15):workspace 目录 `kloop/` →
+`rust/`,仓库根与工作区不再重名(绝对路径不再是 `.../kloop/kloop`)。我推荐过 `engine/`、
+也提过"不进非 Rust 代码就该拉平到仓库根",用户拍板 `rust/`;**拉平那条仍然挂着**,动之前
+得先定这仓库会不会进非 Rust 代码。crate 名、`.kloop/` 运行期目录、`kloop-worktree-` 分支
+前缀都没动。真正会断的是四处被程序读的路径常量(`.gitignore`、CI 的 `working-directory` +
+rust-cache key、`verify.py` 的 `KLOOP_WORKSPACE`、static-evidence 的 54 条 `location`),
+教训 138。**顺带暴露一条既有欠账**:`verify.py --corpus-only` 的 `Plan 52 native … surface drift` 早就红了(与改名无关,本次 `.rs` 内容改动为 0)——
+fixture 的期望停在 plan 52(`a42f1b8`),而 `max_rounds` 在 plan 108(`d1f4f31`)被移出 `run_agent` schema、`model` 在 plan 92(`2e70f22`)加入,`stop_program` 也不在 depth-0
+名单里。要修得先判哪边是对的,是独立的一个 plan。
+
 **这批的统一纪律(2026-09-14 用户拍板:「不需要考虑兼容性,要保持代码干净」)**:
 
 - **不留豁免名单。** 收敛一处判定时,不要配一张"这些暂时不管"的清单——那是把今天的
@@ -483,7 +493,7 @@ SHA 以本条所在提交为准):用户看着自己项目的 `permissions.json` 
 > 与 sleep 猜测进程是否重叠；handle leak 回归应在隔离 test process 中逐轮观察 cleanup/drop 后趋势，不能
 > 等 30 秒 settle 后只看一个终值。
 
-**结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `kloop/README.md` Layout 节):
+**结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `rust/README.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
 
 **能力**(全部真实 API 验证过,除注明):
@@ -796,7 +806,7 @@ SHA 以本条所在提交为准):用户看着自己项目的 `permissions.json` 
 > focused core/provider tests、fmt、Clippy、workspace tests全绿。Anthropic Sonnet 4.6 新 evaluator 114.97s通过；OpenAI Responses gpt-5.5 连续三次通过（88.26s/109.54s/125.91s），每次 foreground Agent 1、Program 2、Program child 1、background Agent/Program各1、Workflow 1、后台 terminal 3、automatic delivery 3。Chat 本轮上游502→503未通过；未打印或提交 credentials、Authorization、private endpoint、raw response或完整 transcript。
 
 
-**Plan 79（2026-08-12，Rust 1.96.1 / Edition 2024）**：workspace 已迁移到 edition 2024、MSRV 1.96，并以 `kloop/rust-toolchain.toml` pin 1.96.1；实际 workspace 是 10 个 package，根 manifest 不是 package。Rust 2024 compatibility Clippy 必须以 compiler diagnostics 为准：host 真实命中 `tail-expr-drop-order`、mcp 测试全局 env mutation 与 Windows-only `file_from_handle` inner unsafe；RPIT、match、`gen`、unsafe attributes/extern 等静态候选未命中，不预防性重写。环境读取测试应注入 closure，避免 Rust 2024 unsafe `set_var/remove_var` 与全局并发竞态；HANDLE ownership transfer 保留窄 `unsafe fn` 契约。tail drop 修复要按 stream/body、future、process、lease、guard、writer、validator 的真实生命周期逐点决定；named local 只是明确 drop 点，不自动复刻所有 2021 相对顺序。host 可验证不等于 Windows native，Darwin cross-target 缺 Windows std/MSVC C toolchain 时必须如实记为未完成；Windows CI/workstation focused tests 才是原生句柄/进程生命周期证据。CI stable 命令显式 `+stable`，MSRV 命令显式 `+1.96.1`，Cargo.lock 保持不变。
+**Plan 79（2026-08-12，Rust 1.96.1 / Edition 2024）**：workspace 已迁移到 edition 2024、MSRV 1.96，并以 `rust/rust-toolchain.toml` pin 1.96.1；实际 workspace 是 10 个 package，根 manifest 不是 package。Rust 2024 compatibility Clippy 必须以 compiler diagnostics 为准：host 真实命中 `tail-expr-drop-order`、mcp 测试全局 env mutation 与 Windows-only `file_from_handle` inner unsafe；RPIT、match、`gen`、unsafe attributes/extern 等静态候选未命中，不预防性重写。环境读取测试应注入 closure，避免 Rust 2024 unsafe `set_var/remove_var` 与全局并发竞态；HANDLE ownership transfer 保留窄 `unsafe fn` 契约。tail drop 修复要按 stream/body、future、process、lease、guard、writer、validator 的真实生命周期逐点决定；named local 只是明确 drop 点，不自动复刻所有 2021 相对顺序。host 可验证不等于 Windows native，Darwin cross-target 缺 Windows std/MSVC C toolchain 时必须如实记为未完成；Windows CI/workstation focused tests 才是原生句柄/进程生命周期证据。CI stable 命令显式 `+stable`，MSRV 命令显式 `+1.96.1`，Cargo.lock 保持不变。
 85. 来自 Plan 103(TUI 提交时黑屏闪烁)。**终端 UI 的"闪"不是玄学,它精确等于「屏幕处于中间态的那段时间」;要修就得按 write/flush 边界诊断,而最贵的一种是把同步阻塞调用夹在"已清屏、未重画"之间。**链条:ratatui `insert_before`(scrolling-regions 关)末尾 `Terminal::clear()` 清满屏视口,而 ratatui-crossterm 的 `clear_region`/`set_cursor_position`/`show_cursor` 全用 `execute!`(= queue + **flush**),于是"清屏"独占一次 write 立刻可见,"重画"要等下一次 draw;kloop 又多调了一次 `terminal.clear()`,而 `Terminal::clear()` 的第一步是 `get_cursor_position()` → crossterm `ESC[6n` 同步等应答,要抢内部 event reader 锁,而输入线程正握着它做 `poll(200ms)`(plan 38 切片 0 刻意选的形态)——**一次纯粹多余的调用,把黑屏从"一帧"放大成 205–335 ms**。四条可复用判据:**(a) 先量再修:给 PTY 脚手架加"每个 read chunk 后判一次整屏是否全空 + 给关键转义打时间戳"的探针,拿到"空屏 541 ms / 空屏起点与 CPR 差 8 µs"这种读数,根因就不用猜**;时间戳对齐比读源码更早锁定元凶,修完再跑同一探针即是验收(0 次 / 0 ms)。**(b) 库在哪里替你 flush,你的帧边界就在哪里裂开**——用 `execute!` 而非 `queue!` 的每个后端方法都是一道裂缝;对策是在自己控制的收口(这里 `FrameWriter` + `PinnedBackend::commit_frame`)把中途 flush 全吞掉,一帧一次 write,再用同步输出(DEC 2026)让支持的终端连"画到一半"都不呈现。**(c) 阻塞式终端查询(CPR/DA/OSC 应答)要当作稀缺资源管:每次都可能等一个输入线程 poll 周期,所以只在真正需要真值的地方发(视口初始化、resize 锚点),在"值只用来把光标放回去、而下一步本来就要重设光标"的地方用自己记的值。**判断依据是"这个答案的消费者是谁",不是"查一下便宜"。**(d) 冗余调用在无副作用时看着人畜无害,但它常常顺带触发同步等待**——删 kloop 那次多余的 clear 本身就砍掉一半黑屏,而它当初被写下来的理由("reset diff buffer")上游已经做过了:**包一层上游原语时,要逐条核对它末尾已经替你做了什么,别照着注释里的意图重做一遍**。与教训 82/83 同源(都出自 dogfood + 读 ratatui-core 0.1.2 源码坐实同一条 `insert_before` 路径):82 是那条路径的固定开销、83 是它丢掉的正确性动作、85 是它的 flush 边界。
 
 86. 来自 Plan 104(交互界面从居中浮窗改内联选择器)。**「浮窗 vs 内联」不是审美问题:一个 `Clear` 掉底下内容的居中浮窗,恰好在用户最需要上下文的那一刻把上下文拿走;而一旦改成内联,面板就从 overlay 变成布局的一部分,必须进同一份高度预算,否则 scrollback 提交会把它算丢。**四条可复用判据:**(a) 「要用户决定」的界面,信息优先级必须显式排序,并在最小终端上实测。**第一版把「被批准的命令」和 diff 一起放进可滚 `body`,40×16 的终端上预算按 hint → 选项 → header → prompt 分配完,`body` 拿到 0 行——屏幕上只剩「Do you want to proceed? / 1. Yes」,即**让用户批准一个看不见的东西**。改成 `subject`(命令/路径 + 警示,pinned)与 `body`(diff/plan,可滚)两层后才对。判据:每给一个块加上"可裁剪"属性,就问一次「裁到 0 行时这个界面还成立吗」;不成立就说明它根本不属于可裁剪那一层。同理,12 项的 picker 在 9 行预算里把 header/prompt 全吃掉、只剩一排没有标题的答案——**列表也要先给标题和主体各扣一行再分配**。**(b) 渲染模型和键盘映射必须来自同一个列表。**`confirm_choices(req)` 一处生成,既喂渲染(label/detail)又喂按键(decision/快捷字母),否则"第 3 项是什么"在两处各算一次,`approval_scopes` 一变就错位;而它从 `approval_scopes` 派生,顺带保证前端渲染不出 core 会拒绝的答案(旧代码是渲染完再在按键处补一次 `advertised` 校验)。**(c) overlay 改 inline,先找「谁在算高度」。**kloop 的 `live_chrome_layout.reserved_rows()` 是 `draw` 与 scrollback 提交共用的唯一预算源(plan 99/100/103 已经在这条线上踩过三次);面板只要不进这份预算,提交时就会被当成 transcript 的一部分冻进 scrollback。判据:**凡是"画在 viewport 里但不属于 transcript"的常驻行,一律进同一个 `reserved_rows`,不许各算各的。** 顺带一条:面板自带 hint 行之后,footer 里那份措辞不一致的重复提示(`↑↓ scroll` vs `↑↓ choose`)就该删掉——同一件事在两处说,迟早说成两个样。**(d) 给多行前端加结构,不要让前端去解析扁平字符串。**`describe()` 产出的 `[sub-agent][hazard][no sandbox] bash: cmd` 是 core 自己拼的、格式稳定,TUI 完全"可以"反解——但那是把 core 的内部格式变成跨 crate 契约。正解是同一份输入再产一份结构化的 `title`/`detail`/`notice`,与扁平 `description` 并存(server wire、`--plain` 继续用后者),两者同源所以不会互相说谎;`ConfirmRequest` 加 `#[derive(Default)]`,十几处测试构造点补 `..Default::default()` 即可,新增可选字段的成本远低于一个字符串解析器。
@@ -1001,3 +1011,5 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
 `destination: (word)`。分辨它们唯一的位置是那个匿名 token(`>` / `>&` / `<`),而匿名节点的
 `kind()` 就是它自己的文本。同族的判据:任何"按 CST 节点类型白名单放行"的走法,遇到**一个
 节点类型承载多种语义**时必须下沉到 token 文本,否则白名单看起来很严,实际按语义是漏的。
+
+138. 来自 Plan 146(一个把自己名字说了两遍的目录)。**改目录名的风险不在 `git grep` 数得出来的那堆文档路径,在那几处被程序读的路径常量——它们数量少、藏得深,而且一律沉默地失败。**本次 470 处引用里绝大多数是文档(改错了只是链接坏),真正会让 CI 变红或悄悄失效的只有四处:`.gitignore`(不改就把 207G `target/` 抖进 `git status`)、CI 的 `working-directory` 与 rust-cache 的 `workspaces` key(后者不报错,只是从此永远不命中缓存)、`verify.py` 的 `KLOOP_WORKSPACE`,以及 `static-evidence.jsonl` 里 54 条 `location`——那不是死文本,`verify_repo_location` 会逐条 open 文件**并校验行号落在文件范围内**。判据:改任何路径形状之前,先把引用按"谁在读"分成**程序读**和**人读**两堆,程序读的那堆逐个确认;`git grep` 的计数只描述后一堆的规模,完全不描述前一堆的风险。附带一条:批量替换前先把**同形非目标**排干净——本次 `kloop/` 有三种(git 分支名 `kloop/worktree/`、User-Agent `kloop/0.1`、app 仓自己的 `kloop/` 目录),盲 sed 会把它们一起改掉,而这三种改错**没有任何东西会报错**。

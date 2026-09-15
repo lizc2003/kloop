@@ -20,18 +20,18 @@ kloop 已有 Agent、Program、Workflow、local mailbox、Task graph、rollout l
 
 ## 关键文件
 
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/core/src/agent_mailbox.rs`
-- `kloop/crates/core/src/tools/subagent.rs`
-- `kloop/crates/core/src/tools/codemode.rs`
-- `kloop/crates/core/src/tools/workflow.rs`
-- `kloop/crates/core/src/tools/background_executions.rs`
-- `kloop/crates/core/src/inbox.rs`
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/core/src/event.rs`
-- `kloop/crates/server/src/events.rs`
-- `kloop/crates/server/src/wire.rs`
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/core/src/config.rs`
+- `rust/crates/core/src/agent_mailbox.rs`
+- `rust/crates/core/src/tools/subagent.rs`
+- `rust/crates/core/src/tools/codemode.rs`
+- `rust/crates/core/src/tools/workflow.rs`
+- `rust/crates/core/src/tools/background_executions.rs`
+- `rust/crates/core/src/inbox.rs`
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/core/src/event.rs`
+- `rust/crates/server/src/events.rs`
+- `rust/crates/server/src/wire.rs`
 - CLI/TUI/headless projection tests
 
 ## 非目标

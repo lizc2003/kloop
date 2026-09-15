@@ -106,7 +106,7 @@ Inbox 注入使用稳定来源 framing：
 
 ### 1. 统一 description 输入与展示来源
 
-- 修改 `kloop/crates/core/src/tools/subagent.rs`、`tools/codemode.rs`、`tools/workflow.rs`、`tools/mod.rs`。
+- 修改 `rust/crates/core/src/tools/subagent.rs`、`tools/codemode.rs`、`tools/workflow.rs`、`tools/mod.rs`。
 - 给 `RunAgentInput`、`RunProgramInput` 和 JSON Schema 增加 optional `description`，执行器仍 `deny_unknown_fields` 并独立验证类型、非空、长度和单行控制字符。
 - Agent 缺省回退 `agent_preview(prompt)`；Program 缺省回退 `program_preview(source)`；显式 description 只传给展示和 lifecycle event。
 - Workflow 始终从 `PreparedWorkflow.meta.description` 取值；顶层 ignored 字段不能覆盖。
@@ -115,7 +115,7 @@ Inbox 注入使用稳定来源 framing：
 
 ### 2. 补齐 typed lifecycle 投影
 
-- 修改 `kloop/crates/core/src/event.rs`、`inbox.rs`、`tools/background_executions.rs`、`tools/subagent.rs`、`tools/codemode.rs`、`tools/workflow.rs` 与 `kloop/crates/server/src/wire.rs`。
+- 修改 `rust/crates/core/src/event.rs`、`inbox.rs`、`tools/background_executions.rs`、`tools/subagent.rs`、`tools/codemode.rs`、`tools/workflow.rs` 与 `rust/crates/server/src/wire.rs`。
 - `BackgroundTask` 明确：Agent/Shell 无 durable run ID；Program 使用 `run-*`；Workflow 使用 `wf_*`。
 - Program 的 running/terminal event 都携带同一个 `run-*`；唯一 terminal 和 stop/shutdown 仲裁不变。
 - `InboxItem::ProgramResult` 保留 durable run ID；三种结果统一使用“产品类型 + execution ID + optional durable ID” framing。
@@ -124,7 +124,7 @@ Inbox 注入使用稳定来源 framing：
 
 ### 3. 将 TUI 生命周期从 Note 升级为结构化 row
 
-- 修改 `kloop/crates/tui/src/app.rs`、`render.rs`、必要时新增小型 presentation module；不复用前台 `Cell::Agent`。
+- 修改 `rust/crates/tui/src/app.rs`、`render.rs`、必要时新增小型 presentation module；不复用前台 `Cell::Agent`。
 - 增加 `BackgroundTask` 专用 cell，以 `task.id` 建立 live-tail 索引。
 - 同一 ID 的 Running → phase/detail → Completed/Failed/Cancelled 在仍可变的 live tail 中原位 upsert，显示 kind、description、execution ID、optional durable ID、status、detail、output path。
 - 已经进入不可变 scrollback 的 running row不回写历史；晚到 terminal 追加一张明确关联同一 ID 的 terminal row。
@@ -140,7 +140,7 @@ Inbox 注入使用稳定来源 framing：
 
 ### 5. 文档与真实 dogfood
 
-- 同步 `kloop/README.md`、`docs/capability-report.md` 和完成时的 `docs/plan/HANDOFF.md`。
+- 同步 `rust/README.md`、`docs/capability-report.md` 和完成时的 `docs/plan/HANDOFF.md`。
 - 文档分别列出 wire tool name、UI product name、execution ID、durable ID 和 stop/resume 用途。
 - 用真实 Anthropic 与 OpenAI Chat 各运行一组后台 Agent、后台 Program 和 Workflow：模型可正确生成 `description`/`background`，无需 `TaskOutput`，协议事件与自动 delivery 完成闭环。
 - dogfood 只记录脱敏后的资源类型、计数、状态和 ID 形状；不记录 key、endpoint、raw provider response 或 transcript。

@@ -227,11 +227,11 @@ clean profile 连跑两次，normalized 结果必须完全一致。
 
 从现有代码登记，不因“已有测试”自动判 parity：
 
-- `kloop/crates/core/src/tools/mod.rs`：`all_tool_defs`、`builtin_defs`、
+- `rust/crates/core/src/tools/mod.rs`：`all_tool_defs`、`builtin_defs`、
   `is_concurrency_safe`、`dispatch_tools`、`run_one`；
-- `kloop/crates/core/src/permissions.rs`：`Permissions::check_call`；
-- `kloop/crates/core/src/tools/bash.rs` 与 `background_tasks.rs`：两类后台生命周期；
-- `kloop/crates/core/src/tools/task.rs`：同步/后台子 agent；
+- `rust/crates/core/src/permissions.rs`：`Permissions::check_call`；
+- `rust/crates/core/src/tools/bash.rs` 与 `background_tasks.rs`：两类后台生命周期；
+- `rust/crates/core/src/tools/task.rs`：同步/后台子 agent；
 - 各具体工具 parser/executor 与现有测试。
 
 ## 后续编号计划
@@ -266,7 +266,7 @@ clean profile 连跑两次，normalized 结果必须完全一致。
 
 Plan 48 不做：
 
-- 不修改 `kloop/crates/core/src/tools/*.rs`、权限、TUI/server/native protocol 行为；
+- 不修改 `rust/crates/core/src/tools/*.rs`、权限、TUI/server/native protocol 行为；
 - 不实现或重写任何产品工具；
 - 不逐字节复刻 UI 文案和 prompt；
 - 不研究其他 Claude Code 版本；
@@ -286,7 +286,7 @@ Plan 48 不做：
 - 所有已知工具进入 registration matrix；六个 anchor 的完整行为链有明确证据。
 - 每个 `missing`、`compatible`、`unknown` 都映射到后续计划或明确排除理由。
 - kloop-only 工具单列，不计入 CC 缺口。
-- `refs/README.md`、`docs/plan/HANDOFF.md` 与 `kloop/README.md` 同步基线结论；在完成前不得
+- `refs/README.md`、`docs/plan/HANDOFF.md` 与 `rust/README.md` 同步基线结论；在完成前不得
   使用“全工具已对齐”或“可替换 Claude Code”的表述。
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`

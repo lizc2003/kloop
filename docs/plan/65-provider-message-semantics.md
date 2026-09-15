@@ -543,28 +543,28 @@ response remained truncated after <N> continuation attempts
 
 核心修改：
 
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/provider/src/{lib.rs,stream.rs,sse.rs,failure.rs}`
-- `kloop/crates/provider/src/{anthropic.rs,openai.rs,responses.rs}`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/agent/sampling.rs`
-- `kloop/crates/core/src/event.rs`
-- `kloop/crates/core/src/history.rs`
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/server/src/{lib.rs,wire.rs}`
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/provider/src/{lib.rs,stream.rs,sse.rs,failure.rs}`
+- `rust/crates/provider/src/{anthropic.rs,openai.rs,responses.rs}`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/agent/sampling.rs`
+- `rust/crates/core/src/event.rs`
+- `rust/crates/core/src/history.rs`
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/server/src/{lib.rs,wire.rs}`
 
 测试：
 
-- `kloop/crates/provider/tests/{anthropic.rs,openai.rs,responses.rs,stream_guard.rs}`及同模块unit tests
-- `kloop/crates/core/src/agent/tests.rs`
-- `kloop/crates/core/src/rollout.rs` tests
-- `kloop/crates/server/tests/server.rs`
+- `rust/crates/provider/tests/{anthropic.rs,openai.rs,responses.rs,stream_guard.rs}`及同模块unit tests
+- `rust/crates/core/src/agent/tests.rs`
+- `rust/crates/core/src/rollout.rs` tests
+- `rust/crates/server/tests/server.rs`
 - plain/TUI受item terminal status影响的render tests
 - 如受影响，`~/work/桌面前端仓库/app` kloop专用分支的adapter/contract tests
 
 文档：
 
-- `kloop/README.md`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - 本计划完成记录
 

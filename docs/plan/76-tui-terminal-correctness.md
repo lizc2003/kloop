@@ -32,7 +32,7 @@ Composer 仍以 `String + char-index cursor + char goal column` 建模：Left/Ri
 
 ### 1. 建立 Unix-only 的真实 binary PTY/ANSI harness
 
-在 `kloop/crates/cli/tests/tui_pty.rs` 及同目录 support module 增加 test-only harness；从 `refs/codewhale` 借鉴 `PtySession`、`Frame`、raw keys 和 deadline wait 的形状，但针对 kloop inline viewport 补 CPR responder：
+在 `rust/crates/cli/tests/tui_pty.rs` 及同目录 support module 增加 test-only harness；从 `refs/codewhale` 借鉴 `PtySession`、`Frame`、raw keys 和 deadline wait 的形状，但针对 kloop inline viewport 补 CPR responder：
 
 - 通过 `env!("CARGO_BIN_EXE_kloop")` 启动默认 TUI，不传 `--mock`/`--plain`。
 - 在 workspace/CLI 的 Unix dev-dependencies 中加入 `portable-pty 0.9`、`vt100 0.15.2`、`tempfile` 和现有 `wiremock`；它们不得进入 production dependency 或 Windows build graph。Ratatui 0.29 锁定 `unicode-width 0.2.0`，不能与要求 `unicode-width ^0.2.1` 的 vt100 0.16 统一，故保留 API 等价的 0.15.2。
@@ -52,7 +52,7 @@ Composer 仍以 `String + char-index cursor + char goal column` 建模：Left/Ri
 
 ### 2. 收敛 grapheme-aware text primitives
 
-新增 `kloop/crates/tui/src/text_layout.rs`，直接依赖当前 lock 已有的 `unicode-segmentation 1.13`，集中提供：
+新增 `rust/crates/tui/src/text_layout.rs`，直接依赖当前 lock 已有的 `unicode-segmentation 1.13`，集中提供：
 
 - `ByteOffset`、`TextRange` 及 boundary invariant；
 - previous/next/snap grapheme boundary；
@@ -112,14 +112,14 @@ helper 测试覆盖 combining mark、ZWJ family/technologist、skin tone、flag�
 
 ## 关键文件
 
-- `kloop/crates/tui/src/{text_layout.rs,composer.rs,menu.rs,app.rs,render.rs,lib.rs}`：统一 offset/layout、visual navigation 及 terminal geometry。
-- `kloop/crates/cli/tests/{tui_pty.rs,tui_pty_support/*}`：真实 binary PTY、CPR、ANSI frame 和本地 SSE fixture。
-- `kloop/{Cargo.toml,crates/tui/Cargo.toml,crates/cli/Cargo.toml}`：Unicode 与 Unix-only dev 依赖。
-- `kloop/README.md`、`docs/plan/{76-tui-terminal-correctness.md,HANDOFF.md}`、`docs/capability-report.md`：当前契约和完成记录。
+- `rust/crates/tui/src/{text_layout.rs,composer.rs,menu.rs,app.rs,render.rs,lib.rs}`：统一 offset/layout、visual navigation 及 terminal geometry。
+- `rust/crates/cli/tests/{tui_pty.rs,tui_pty_support/*}`：真实 binary PTY、CPR、ANSI frame 和本地 SSE fixture。
+- `rust/{Cargo.toml,crates/tui/Cargo.toml,crates/cli/Cargo.toml}`：Unicode 与 Unix-only dev 依赖。
+- `rust/README.md`、`docs/plan/{76-tui-terminal-correctness.md,HANDOFF.md}`、`docs/capability-report.md`：当前契约和完成记录。
 
 ## 验证
 
-从 `kloop/` 运行：
+从 `rust/` 运行：
 
 ```bash
 cargo test -p kloop-tui

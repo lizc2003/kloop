@@ -53,12 +53,12 @@ cpr marks (us): [1291114, 1326642, 1498297, 1777043, 1905814]
 
 ## 关键文件
 
-- `kloop/crates/tui/src/terminal/frame_writer.rs` — 新增 `FrameWriter`(+ 单测:中途 flush 只缓冲、release 后一次同步写、空帧不写)。
-- `kloop/crates/tui/src/terminal/pinned_backend.rs` — `with_frames`/`begin_commit`/`end_commit`/`commit_frame`;`set_cursor_position` 记位置,`get_cursor_position` 提交期走缓存、窗口外先交帧再查。
-- `kloop/crates/tui/src/terminal/scrollback.rs` — 删末尾 `terminal.clear()`;签名收紧成 `Terminal<PinnedBackend<B>>` 并在函数内开合提交窗口(调用方想漏都漏不掉);`ClearCountingBackend` 加数光标查询,断言提交 = 1 次 clear + **0 次** CPR。
-- `kloop/crates/tui/src/lib.rs` — `FrameWriter` 接进 `setup_terminal`/`Terminal` 别名;新 `draw_and_hand_over`(draw + 交帧)取代三处裸 `terminal.draw`;`TerminalSession::restore` 先交帧再还原终端。
-- `kloop/crates/cli/tests/tui_pty.rs` — 溢出提交测试补断言:回合中**不出现** `ESC[6n`;clear 落在一对同步输出之内,且重画在同一对之内。
-- `kloop/README.md` — inline/scrollback 段补这三条。
+- `rust/crates/tui/src/terminal/frame_writer.rs` — 新增 `FrameWriter`(+ 单测:中途 flush 只缓冲、release 后一次同步写、空帧不写)。
+- `rust/crates/tui/src/terminal/pinned_backend.rs` — `with_frames`/`begin_commit`/`end_commit`/`commit_frame`;`set_cursor_position` 记位置,`get_cursor_position` 提交期走缓存、窗口外先交帧再查。
+- `rust/crates/tui/src/terminal/scrollback.rs` — 删末尾 `terminal.clear()`;签名收紧成 `Terminal<PinnedBackend<B>>` 并在函数内开合提交窗口(调用方想漏都漏不掉);`ClearCountingBackend` 加数光标查询,断言提交 = 1 次 clear + **0 次** CPR。
+- `rust/crates/tui/src/lib.rs` — `FrameWriter` 接进 `setup_terminal`/`Terminal` 别名;新 `draw_and_hand_over`(draw + 交帧)取代三处裸 `terminal.draw`;`TerminalSession::restore` 先交帧再还原终端。
+- `rust/crates/cli/tests/tui_pty.rs` — 溢出提交测试补断言:回合中**不出现** `ESC[6n`;clear 落在一对同步输出之内,且重画在同一对之内。
+- `rust/README.md` — inline/scrollback 段补这三条。
 
 ## 非目标
 

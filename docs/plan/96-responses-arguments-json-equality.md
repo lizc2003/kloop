@@ -22,7 +22,7 @@ codex-rs 不做这种交叉校验:它直接把 `output_item.done` 的完整 item
 
 ## 根因(单一,两处触发)
 
-`kloop/crates/provider/src/responses.rs` 对函数参数做了两处**字节相等**校验,真实代理的 pretty/compact 差异会先后触发:
+`rust/crates/provider/src/responses.rs` 对函数参数做了两处**字节相等**校验,真实代理的 pretty/compact 差异会先后触发:
 
 1. `responses.rs:1078`(`response.function_call_arguments.done`):`event["arguments"]`(pretty) != 累积 delta(compact)→ `arguments done did not match accumulated delta`。真实轮先命中这处。
 2. `responses.rs:689`(`finish_item` 处理 `response.output_item.done`):累积 delta != `item["arguments"]`(pretty)→ `final function arguments did not match streamed arguments`。即便只修第 1 处,这处会以同样空白差紧接着 fail-close。**且最终 tool input 正是用 `final_arguments`(= `item["arguments"]`)经 `parse_tool_input` 得到**(`responses.rs:696`),pretty/compact 对解析结果无影响。
@@ -64,9 +64,9 @@ fn arguments_agree(a: &str, b: &str) -> bool {
 
 ## 关键文件
 
-- `kloop/crates/provider/src/responses.rs` — 唯一实质改动:加 `arguments_agree`;`:1078` 与 `:689` 两处比对改调用它。
-- `kloop/crates/provider/tests/responses.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
-- `kloop/README.md` — Provider seam 一句补充(若合适):Responses 函数参数按 JSON 值比对,容忍代理的 pretty/compact 差异;开工看现状定要不要加。
+- `rust/crates/provider/src/responses.rs` — 唯一实质改动:加 `arguments_agree`;`:1078` 与 `:689` 两处比对改调用它。
+- `rust/crates/provider/tests/responses.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
+- `rust/README.md` — Provider seam 一句补充(若合适):Responses 函数参数按 JSON 值比对,容忍代理的 pretty/compact 差异;开工看现状定要不要加。
 - `docs/plan/HANDOFF.md` — 补一条教训(严格解析器对"结构化字段"应比语义值、对"逐字文本"才比字节;真实代理的 pretty/compact 差异;以 codex 取 done 为权威作对照)。
 
 ## 非目标
@@ -78,7 +78,7 @@ fn arguments_agree(a: &str, b: &str) -> bool {
 
 ## 测试 / 验证
 
-新增于 `kloop/crates/provider/tests/responses.rs`:
+新增于 `rust/crates/provider/tests/responses.rs`:
 
 1. `function_arguments_agree_across_pretty_and_compact`:整轮 fixture,delta 发 compact 片段拼成 `{"limit":3,"offset":1,"path":"README.md"}`,`function_call_arguments.done` 与 `output_item.done` 的 `arguments` 都发 pretty `{"limit": 3, "offset": 1, "path": "README.md"}`(即真实抓到的字节)。断言产出正确的 `AssistantBlock::ToolUse{ input == json!({"limit":3,"offset":1,"path":"README.md"}) }` 与 `Terminal(ToolUse)`,无错误。
 2. `function_arguments_differing_values_still_fail_closed`:delta 拼成 `{"a":1}`,done 发 `{"a":2}`。断言 `ProviderFailureKind::Protocol`、不可重试——锁定"仅空白放宽、值差仍 fail-closed"。

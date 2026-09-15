@@ -92,15 +92,15 @@ CodeWhale 已提供目标 UX：`/provider` 打开 picker，`/provider <name>` �
 
 ## 关键文件
 
-- `kloop/crates/protocol/src/lib.rs`
-- `kloop/crates/provider/src/{lib.rs,anthropic.rs,openai.rs,responses.rs}`
-- `kloop/crates/core/src/{config.rs,agent.rs,agent/sampling.rs,history.rs,rollout.rs,compact.rs,usage.rs,commands/}`
-- `kloop/crates/cli/src/{provider_config.rs,startup.rs,main.rs,args.rs}` 的 registry、initial route、standalone resume 与 server factory
-- `kloop/crates/core/src/{agent_type.rs,skills.rs,tools/subagent.rs}` 的 child model/route override
-- `kloop/crates/tui/src/` 的 slash routing、picker、status/header 与 idle worker
-- `kloop/crates/server/src/{lib.rs,events.rs,wire.rs}`
+- `rust/crates/protocol/src/lib.rs`
+- `rust/crates/provider/src/{lib.rs,anthropic.rs,openai.rs,responses.rs}`
+- `rust/crates/core/src/{config.rs,agent.rs,agent/sampling.rs,history.rs,rollout.rs,compact.rs,usage.rs,commands/}`
+- `rust/crates/cli/src/{provider_config.rs,startup.rs,main.rs,args.rs}` 的 registry、initial route、standalone resume 与 server factory
+- `rust/crates/core/src/{agent_type.rs,skills.rs,tools/subagent.rs}` 的 child model/route override
+- `rust/crates/tui/src/` 的 slash routing、picker、status/header 与 idle worker
+- `rust/crates/server/src/{lib.rs,events.rs,wire.rs}`
 - CLI/TUI/server/provider/core 的 route lifecycle、request capture、resume/fork/rewind/compaction tests
-- `kloop/README.md`、`docs/plan/HANDOFF.md`、Plan 91 acceptance matrix
+- `rust/README.md`、`docs/plan/HANDOFF.md`、Plan 91 acceptance matrix
 
 ## 非目标
 

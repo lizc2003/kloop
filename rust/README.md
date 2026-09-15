@@ -1031,7 +1031,7 @@ advertised Once / Workspace session / Project actions, sends
 ```sh
 cargo build -p kloop
 cd /path/to/桌面前端仓库/app
-ENGINE_BIN=/path/to/kloop-repo/kloop/target/debug/kloop bun run app
+ENGINE_BIN=/path/to/kloop-repo/rust/target/debug/kloop bun run app
 ```
 
 That branch gets provider credentials from the process-global
@@ -3020,7 +3020,7 @@ snapshot is not a runtime dependency.
 ## Running
 
 Building the workspace requires Rust 1.96 or newer and uses Rust edition
-2024. The repository's `kloop/rust-toolchain.toml` pins local development to
+2024. The repository's `rust/rust-toolchain.toml` pins local development to
 Rust 1.96.1 with rustfmt and clippy; CI's stable matrix explicitly invokes
 `+stable` so it remains independent from that local pin. The terminal stack is
 Ratatui 0.30.2 with its explicit `crossterm_0_29` integration, Crossterm 0.29.0

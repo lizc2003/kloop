@@ -37,7 +37,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 ### 1. 参数校验与文件分流
 
-修改 `kloop/crates/core/src/tools/mod.rs` 与 `kloop/crates/core/src/tools/fs.rs`：
+修改 `rust/crates/core/src/tools/mod.rs` 与 `rust/crates/core/src/tools/fs.rs`：
 
 1. 在公开 ToolDef 和 `PreparedRead` 中加入 `pages`，保持 schema 与 runtime parser 同构。
 2. `prepare_read` 在任何文件打开前拒绝未知字段、错误类型和非法分页语法。
@@ -46,7 +46,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 ### 2. 纯 Rust 渲染适配层
 
-新增 `kloop/crates/core/src/pdf.rs` 并在 `kloop/crates/core/src/lib.rs` 注册。该模块是唯一接触 Hayro 的窄边界；`fs.rs` 只负责稳定快照、格式分流、参数关系和 staged file-state update。
+新增 `rust/crates/core/src/pdf.rs` 并在 `rust/crates/core/src/lib.rs` 注册。该模块是唯一接触 Hayro 的窄边界；`fs.rs` 只负责稳定快照、格式分流、参数关系和 staged file-state update。
 
 - 精确依赖 `hayro = "=0.7.1"`，保留默认嵌入字体 / CMap feature，不直接依赖 `hayro-syntax`。
 - 使用公开的 `Pdf::new`、页集合、`render_dimensions`、`render` 与 `Pixmap::into_png`；同一文档复用一个 `RenderCache`。
@@ -76,7 +76,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 ### 3. 多页图片的预测性上下文估算
 
-修改 `kloop/crates/core/src/history.rs`。当前 `estimate_message_tokens` 按完整 JSON 字节数 `/4`，会把结构化图片的 base64 当文本 token；多页 PDF 可能在第一次模型可见前被错误判为超过默认 context。
+修改 `rust/crates/core/src/history.rs`。当前 `estimate_message_tokens` 按完整 JSON 字节数 `/4`，会把结构化图片的 base64 当文本 token；多页 PDF 可能在第一次模型可见前被错误判为超过默认 context。
 
 - 改为按 block 估算：非图片内容继续沿用 serialized-byte heuristic；图片忽略 base64 payload 长度，按命名常量保守计 `6,000` tokens / 张，并计入结构元数据。
 - 这只是 provider-neutral overflow 预测上界；真实 provider usage 返回后仍由既有 usage anchor 接管。
@@ -100,7 +100,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 ## Fixtures 与测试
 
-在 `kloop/crates/core/tests/fixtures/pdf/` 加仓库自制、无第三方字体或图片的最小 fixtures，并附 README 说明生成方式：
+在 `rust/crates/core/tests/fixtures/pdf/` 加仓库自制、无第三方字体或图片的最小 fixtures，并附 README 说明生成方式：
 
 - 一页 Base-14 文本 PDF；
 - 两页红 / 蓝矢量 PDF；
@@ -124,7 +124,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 同步更新：
 
-- `kloop/README.md`
+- `rust/README.md`
 - `docs/capability-report.md`
 - `docs/plan/HANDOFF.md`
 - `refs/README.md`

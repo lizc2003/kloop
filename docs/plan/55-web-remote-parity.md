@@ -34,9 +34,9 @@ Plan 48 对 WebFetch 的本地 URL case 只取得权限顺序负证据：2.1.220
 
 优先复用：
 
-- `kloop/crates/web/src/fetch.rs`
+- `rust/crates/web/src/fetch.rs`
 - kloop WebSearch backend/CLI/fetch 接线
-- `kloop/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/mod.rs`
 - Plan 48 的 `local_web.py`、fake provider 和零请求断言
 - Plan 54 已稳定的本地扩展/MCP 边界
 

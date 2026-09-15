@@ -40,7 +40,7 @@ data: {"error":{"message":"Upstream service temporarily unavailable","type":"ups
 
 ## 根因(单一,双重后果)
 
-`kloop/crates/provider/src/openai.rs:429` 的事件名守卫只放行 `None`/`message`,在读 `data` 之前就把任何具名事件判死:
+`rust/crates/provider/src/openai.rs:429` 的事件名守卫只放行 `None`/`message`,在读 `data` 之前就把任何具名事件判死:
 
 ```rust
 if !matches!(frame.event.as_deref(), None | Some("message")) {
@@ -62,7 +62,7 @@ if !value["error"].is_null() {                                     // ← 已有
 
 ## 已拍板设计(窄口)
 
-`kloop/crates/provider/src/openai.rs`,三点改动,均在 `stream()` 的帧循环内:
+`rust/crates/provider/src/openai.rs`,三点改动,均在 `stream()` 的帧循环内:
 
 1. **放行 `error` 帧名**:守卫改为
    ```rust
@@ -127,9 +127,9 @@ if !value["error"].is_null() {                                     // ← 已有
 
 ## 关键文件
 
-- `kloop/crates/provider/src/openai.rs` — 唯一实质改动:守卫放行 `error` 帧名;加 `stream_error`/`is_transient_stream_error`;`data.error` 处理改调 `stream_error`。
-- `kloop/crates/provider/tests/openai.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`collect`;`mount_sse` 收原始 body,可直接塞 `event: error\ndata: {...}\n\n`)。
-- `kloop/README.md` — Provider seam 若有 SSE 行为描述则补一句“Chat rail 识别具名 `event: error` 帧、如实报错、瞬时上游错误可重试”;开工看现状定要不要加。
+- `rust/crates/provider/src/openai.rs` — 唯一实质改动:守卫放行 `error` 帧名;加 `stream_error`/`is_transient_stream_error`;`data.error` 处理改调 `stream_error`。
+- `rust/crates/provider/tests/openai.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`collect`;`mount_sse` 收原始 body,可直接塞 `event: error\ndata: {...}\n\n`)。
+- `rust/README.md` — Provider seam 若有 SSE 行为描述则补一句“Chat rail 识别具名 `event: error` 帧、如实报错、瞬时上游错误可重试”;开工看现状定要不要加。
 - `docs/plan/HANDOFF.md` — 补一条教训(严格 SSE 解析对“错误帧”应先如实报错再谈严格;事件名守卫别挡在错误处理之前;瞬时 vs 致命的显式白名单;以 Responses `error` 事件与 `incomplete_protocol` 为对照)。
 
 ## 非目标
@@ -141,7 +141,7 @@ if !value["error"].is_null() {                                     // ← 已有
 
 ## 测试 / 验证
 
-新增于 `kloop/crates/provider/tests/openai.rs`:
+新增于 `rust/crates/provider/tests/openai.rs`:
 
 1. `named_error_event_surfaces_upstream_error_and_is_retryable`:mount 原始 body 含正常文本 delta 后接 `event: error\ndata: {"error":{"message":"Upstream service temporarily unavailable","type":"upstream_error"}}\n\n`(即真实抓到的帧)。断言最终 `StreamResult` 为 `ProviderFailureKind::Protocol`、`is_retryable() == true`、`message()` 含 `upstream_error`(不再是 `unknown SSE event name`)。
 2. `named_error_event_with_fatal_type_stays_fatal`:同上但 `type` 用一个不在白名单的值(如 `invalid_request_error`)。断言 `Protocol`、`is_retryable() == false`、message 含该 type。

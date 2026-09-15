@@ -27,7 +27,7 @@ Plan 94 真实回归时,Anthropic rail(claude-sonnet-4-6)一轮里模型用 `bas
 
 ## 关键文件
 
-- `kloop/crates/core/src/tools/mod.rs` — 唯一实质改动:`bash` 的 `description` 字符串补重定向句;就近在已有 bash-def 测试里加断言锁定这句(grep/glob/read_file/edit_file/"reserve bash" 五个子串)。
+- `rust/crates/core/src/tools/mod.rs` — 唯一实质改动:`bash` 的 `description` 字符串补重定向句;就近在已有 bash-def 测试里加断言锁定这句(grep/glob/read_file/edit_file/"reserve bash" 五个子串)。
 - README:无「优先专用工具」类行为描述,不需同步(改动在工具描述层)。
 - HANDOFF:补一条教训(软引导要补在**决策点**——bash 描述,不只在 base 方针与目标工具描述里)。
 
@@ -51,7 +51,7 @@ Plan 94 真实回归时,Anthropic rail(claude-sonnet-4-6)一轮里模型用 `bas
 
 ## 完成记录(2026-08-25)
 
-- `kloop/crates/core/src/tools/mod.rs`:`bash` 描述句首加入重定向句(grep/glob/read_file/edit_file + "reserve bash for real shell work");就近在 `all_tool_defs` 的 bash-def 测试里加断言,锁定五个重定向子串,防回归。
+- `rust/crates/core/src/tools/mod.rs`:`bash` 描述句首加入重定向句(grep/glob/read_file/edit_file + "reserve bash for real shell work");就近在 `all_tool_defs` 的 bash-def 测试里加断言,锁定五个重定向子串,防回归。
 - 决策:采软方案,不做硬拦截(见非目标)。README 无需同步。
 - 验证:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings` 全绿;`cargo test` 全绿(含新断言)。真实合规率提升属软引导、未设硬门槛。
 

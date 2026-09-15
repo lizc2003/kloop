@@ -94,8 +94,8 @@ kloop 已有 `crates/core/src/compact.rs` 的 predictive/reactive 压缩、`Hist
 ### 5. 同步文档与证据边界
 
 - 实施完成时回填本文件状态、实际日期、commit SHA、focused/workspace 验证结果和未执行环境；不在规划阶段宣称已实现能力。
-- 更新 `kloop/README.md` 的 Compaction 段，说明 predictive/reactive/manual 共用 seam、replacement/no-op、ToolUse/ToolResult boundary、pressure 不等于 billing、失败不改 history。
-- 在 `kloop/docs/plan/HANDOFF.md` 顶部补完成事实与教训，明确 Plan 81 ledger 与 context estimate 的分层；只在 `docs/capability-report.md` 已有 compaction 条目时做最小销账，不宣称 server-side compaction。
+- 更新 `rust/README.md` 的 Compaction 段，说明 predictive/reactive/manual 共用 seam、replacement/no-op、ToolUse/ToolResult boundary、pressure 不等于 billing、失败不改 history。
+- 在 `docs/plan/HANDOFF.md` 顶部补完成事实与教训，明确 Plan 81 ledger 与 context estimate 的分层；只在 `docs/capability-report.md` 已有 compaction 条目时做最小销账，不宣称 server-side compaction。
 - 如需更新 `refs/README.md`，只补 CodeWhale 当前观察 HEAD/固定证据边界，不把候选设计写成 CodeWhale 或 kloop 已实现的更大能力。
 
 ## 必须复用的现有 seam
@@ -112,20 +112,20 @@ kloop 已有 `crates/core/src/compact.rs` 的 predictive/reactive 压缩、`Hist
 
 预计修改：
 
-- `kloop/crates/core/src/compact.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/commands/compact.rs`
-- `kloop/crates/core/src/agent/tests.rs`（若当前测试布局需要补 lifecycle coverage）
-- `kloop/README.md`
-- `kloop/docs/plan/86-cache-stable-agent-compaction.md`
-- `kloop/docs/plan/HANDOFF.md`
-- 必要时 `kloop/docs/capability-report.md`、`refs/README.md`
+- `rust/crates/core/src/compact.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/commands/compact.rs`
+- `rust/crates/core/src/agent/tests.rs`（若当前测试布局需要补 lifecycle coverage）
+- `rust/README.md`
+- `docs/plan/86-cache-stable-agent-compaction.md`
+- `docs/plan/HANDOFF.md`
+- 必要时 `docs/capability-report.md`、`refs/README.md`
 
-仅在生产调用点要求时窄修改：`kloop/crates/core/src/history.rs`、`kloop/crates/core/src/usage.rs`、`kloop/crates/core/src/rollout.rs`。不修改 provider adapters、server wire/events、Cargo manifests、Cargo.lock 或 Desktop 仓库；若实际触及，完成记录必须解释原因且不得突破 public protocol/无新增依赖边界。
+仅在生产调用点要求时窄修改：`rust/crates/core/src/history.rs`、`rust/crates/core/src/usage.rs`、`rust/crates/core/src/rollout.rs`。不修改 provider adapters、server wire/events、Cargo manifests、Cargo.lock 或 Desktop 仓库；若实际触及，完成记录必须解释原因且不得突破 public protocol/无新增依赖边界。
 
 ## 验证
 
-从 `<repo>/kloop` 执行：
+从 `<repo>/rust` 执行：
 
 ### 定向
 

@@ -38,7 +38,7 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
 
 ### 1. 原子 full snapshot 与 revision
 
-修改 `kloop/crates/core/src/tools/task.rs`：
+修改 `rust/crates/core/src/tools/task.rs`：
 
 - 在 `TaskRegistryState` 增加单调 display revision；初始空图为 revision 0。
 - 提炼 typed `TaskGraphSnapshot { revision, tasks }` 与紧凑 `TaskGraphTask`，复用现有 `task_summary`/BTreeMap 顺序和 reverse `blocks` 计算；`task_list` 也复用同一投影 helper，避免两套图算法。
@@ -56,18 +56,18 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
 
 ### 2. Typed core event，非公开 wire
 
-修改 `kloop/crates/core/src/event.rs`、`tools/task.rs` 与 `tools/mod.rs`：
+修改 `rust/crates/core/src/event.rs`、`tools/task.rs` 与 `tools/mod.rs`：
 
 - 注册 strict `task_clear {}`，纳入现有 root-only catalog/runtime gate、pure session-memory permission、create/update 同一串行 mutation 分类和 Program/Workflow/child 排除；不做旧名 alias。
 - 新增 `Event::TaskGraphUpdated(TaskGraphSnapshot)`。
 - 仅成功且产生 snapshot 的 create/update/clear 调用 `ctx.ui.emit`；事件顺序自然是：
   `ItemStarted → TaskGraphUpdated → ItemCompleted`。
 - `Event::as_note()` 对它返回 `None`，避免 plain 每次 mutation 倾倒整张图。
-- `kloop/crates/server/src/wire.rs` 显式把该 event 投影为 `None`，锁定 server/headless 无新 public wire；Task tool rows 仍是普通 started/completed pair。
+- `rust/crates/server/src/wire.rs` 显式把该 event 投影为 `None`，锁定 server/headless 无新 public wire；Task tool rows 仍是普通 started/completed pair。
 
 ### 3. `/clear` 与启动顺序
 
-修改 `kloop/crates/core/src/commands/{mod.rs,clear.rs}` 与 `kloop/crates/tui/src/lib.rs`：
+修改 `rust/crates/core/src/commands/{mod.rs,clear.rs}` 与 `rust/crates/tui/src/lib.rs`：
 
 - 给内部 `SlashResult` 增加可选 Task graph snapshot；只有 `/clear` 携带 registry 返回的 empty snapshot，其他命令为 None。该字段不序列化为 server 协议。
 - TUI worker 对 `/clear` 严格发送：
@@ -80,14 +80,14 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
 
 ### 4. 独立 live panel，而非 transcript Cell
 
-修改 `kloop/crates/tui/src/app.rs`：
+修改 `rust/crates/tui/src/app.rs`：
 
 - `App` 增加当前 `TaskGraphSnapshot`（初始可为 None）和纯显示开关 `show_task_graph`（默认 true）；`apply_core` 只接受严格更高 revision 并全量替换，重复/较旧事件 no-op。
 - `Ctrl+T` 在 graph 非空时切换 panel 显隐；它不修改 snapshot、revision 或 registry，跨 turn/fork 保留。footer 按状态显示 `ctrl+t to hide tasks` / `ctrl+t to show tasks`，并复用现有宽度预算避免挤掉 mode/context。
 - Task graph 不新增 `Cell::TaskGraph`：普通 Cell 会被 `commit_overflow` 写入 native scrollback 并冻结，无法继续安全更新。
 - graph event 不创建 transcript row，不修改 activity、assistant/thinking stream 或 `last_note`；`TurnEnded` 也不清它。
 
-修改 `kloop/crates/tui/src/render.rs`：
+修改 `rust/crates/tui/src/render.rs`：
 
 - Task lines 作为**非 Cell 的 live chrome**追加到当前 `transcript_area` 的 bottom-anchored tail：顺序固定为历史 transcript → 现有 activity line → Task checklist → input 上边界 → composer。这样只要 panel 可见，它就始终紧贴输入区上方，与截图一致；不做右侧栏，也不会随历史滚入 native scrollback。
 - `draw` 与 native-scrollback `commit_overflow` 共用同一个 live-chrome 高度 helper，activity + Task lines 都从可提交高度中扣除，避免屏幕保留高度和冻结预算分叉。
@@ -126,11 +126,11 @@ kloop 采纳“完成一轮后开启新 Task epoch”的产品语义，但不复
 
 ## 关键文件
 
-- `kloop/crates/core/src/tools/task.rs`：revision、原子 mutation snapshot、clear fence。
-- `kloop/crates/core/src/event.rs`：typed internal projection event。
-- `kloop/crates/core/src/commands/{mod.rs,clear.rs}`：精确 empty snapshot 交接。
-- `kloop/crates/tui/src/{app.rs,render.rs,lib.rs}`：snapshot state、panel、布局与启动/clear/fork 顺序。
-- `kloop/crates/server/src/wire.rs`、`kloop/crates/server/tests/server.rs`：锁定无新公开 wire 和普通 ToolCall。
+- `rust/crates/core/src/tools/task.rs`：revision、原子 mutation snapshot、clear fence。
+- `rust/crates/core/src/event.rs`：typed internal projection event。
+- `rust/crates/core/src/commands/{mod.rs,clear.rs}`：精确 empty snapshot 交接。
+- `rust/crates/tui/src/{app.rs,render.rs,lib.rs}`：snapshot state、panel、布局与启动/clear/fork 顺序。
+- `rust/crates/server/src/wire.rs`、`rust/crates/server/tests/server.rs`：锁定无新公开 wire 和普通 ToolCall。
 - `docs/plan/74-task-graph-tui.md`、README/HANDOFF/capability/refs 当前说明。
 
 ## 验证

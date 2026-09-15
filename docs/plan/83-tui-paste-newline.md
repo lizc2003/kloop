@@ -20,7 +20,7 @@
 
 ## 实施
 
-- `kloop/crates/tui/src/app.rs` 新增 `canonicalize_paste_newlines`，由 `App::paste_text` 在 Composer/question 分流前统一调用。
+- `rust/crates/tui/src/app.rs` 新增 `canonicalize_paste_newlines`，由 `App::paste_text` 在 Composer/question 分流前统一调用。
 - App unit 锁定 LF、CRLF、CR、空格和尾随 LF；提交断言使用 canonical LF。
 - Composer 现有 paste atom 展开不变，通过 App ingress 回归验证 canonical payload。
 - Unix PTY 增加 bracketed `ESC[200~abc\r\ndefESC[201~` + Enter 场景，断言 mock provider 收到 `abc\ndef`；不把裸 CR burst 混入该测试。
@@ -29,7 +29,7 @@
 
 README、Plan 38 多行 composer 记录和 HANDOFF 必须说明：exact payload 指 canonicalized payload，provider/core 不负责终端 EOL 修复；Plan 38 的非-bracketed PasteBurst 不做结论保持不变。
 
-从 `kloop/` 执行：
+从 `rust/` 执行：
 
 ```bash
 cargo fmt --all -- --check
@@ -54,9 +54,9 @@ git diff --check
 
 ## 关键文件
 
-- `kloop/crates/tui/src/app.rs`
-- `kloop/crates/cli/tests/tui_pty.rs`
-- `kloop/README.md`
+- `rust/crates/tui/src/app.rs`
+- `rust/crates/cli/tests/tui_pty.rs`
+- `rust/README.md`
 - `docs/plan/38-tui-cc-parity.md`
 - `docs/plan/HANDOFF.md`
 

@@ -27,10 +27,10 @@
 
 ## 实施
 
-1. 在 `kloop/crates/provider/tests/responses.rs` 先加入真实 reasoning 缺 status 的成功 fixture，并加入 message/function_call 缺 status与 reasoning 错误 status 的负向矩阵。
-2. 在 `kloop/crates/provider/src/responses.rs` 按 item type 区分 status policy；仅 reasoning 使用“缺失可接受、存在则严格”的校验。
+1. 在 `rust/crates/provider/tests/responses.rs` 先加入真实 reasoning 缺 status 的成功 fixture，并加入 message/function_call 缺 status与 reasoning 错误 status 的负向矩阵。
+2. 在 `rust/crates/provider/src/responses.rs` 按 item type 区分 status policy；仅 reasoning 使用“缺失可接受、存在则严格”的校验。
 3. 对齐 `run_agent`、`run_program`、`workflow` 的 optional control schema 与既有 strict parser：可保留的 display/path 明示非空，durable Program ID 明示 `run-*` pattern，可省略的 identity/round cap 使用 nullable schema；运行时按当前 Config 删除无可用类型的 `run_agent.agent_type`，或以 `null | 配置名称` enum 约束；不再向模型广告未实现的 Workflow `name`，补 exact schema tests，不把空字符串归一为省略。
-4. 在 `kloop/crates/cli/tests/real_agent_program_workflow.rs` 放开三原语 evaluator 的 Responses rail gate、更新 ignore 说明并转发 `KLOOP_EFFORT`；mailbox evaluator 不在本计划扩 rail。
+4. 在 `rust/crates/cli/tests/real_agent_program_workflow.rs` 放开三原语 evaluator 的 Responses rail gate、更新 ignore 说明并转发 `KLOOP_EFFORT`；mailbox evaluator 不在本计划扩 rail。
 5. README 记录 Responses reasoning item 的 provider 兼容边界、strict optional schema 与真实 evaluator 入口；HANDOFF 记录根因、修复和新教训。
 
 ## 验证

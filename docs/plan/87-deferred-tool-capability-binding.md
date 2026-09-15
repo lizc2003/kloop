@@ -22,16 +22,16 @@ kloop 已完成 Plan 16/54 的 deferred ToolSearch、ToolSource immutable snapsh
 
 ## 关键文件
 
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/tools/tool_search.rs`
-- `kloop/crates/core/src/tools/codemode.rs`
-- `kloop/crates/core/src/tools/subagent.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/permissions.rs`
-- `kloop/crates/core/src/worktree.rs`
-- `kloop/crates/protocol/src/lib.rs`（仅必要的内部/非 public receipt 类型）
-- `kloop/crates/provider/src/anthropic.rs` 与 provider tests（只做 request stability evidence）
+- `rust/crates/core/src/config.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/tool_search.rs`
+- `rust/crates/core/src/tools/codemode.rs`
+- `rust/crates/core/src/tools/subagent.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/permissions.rs`
+- `rust/crates/core/src/worktree.rs`
+- `rust/crates/protocol/src/lib.rs`（仅必要的内部/非 public receipt 类型）
+- `rust/crates/provider/src/anthropic.rs` 与 provider tests（只做 request stability evidence）
 
 ## 非目标
 

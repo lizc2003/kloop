@@ -99,7 +99,7 @@ Anthropic 的 ⚠️ 是代理限流,不是档位被拒:该代理会隔一个请
 - `crates/cli/src/user_config.rs` — 根键改名 `effort` 并真读出来。
 - `crates/tui/src/lib.rs` / `crates/server/src/lib.rs` / `crates/cli/src/main.rs` — `route_changed` 更名。
 - `crates/tui/src/render.rs` — 页脚 `provider / model · r1 · high · 12% ctx`(effort 为 None 时不加这一段)。
-- `kloop/README.md` — provider 配置段、slash 命令段、wire 段同步。
+- `rust/README.md` — provider 配置段、slash 命令段、wire 段同步。
 
 ## 非目标
 

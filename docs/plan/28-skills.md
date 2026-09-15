@@ -154,7 +154,7 @@ discover 门的语义边界)。
 公开规范字段——真·下载来的 skill 只有 `name`+`description`,**`description` 才是模型匹配
 信号**(既是"做什么"又是"何时用")。渐进披露常驻的因此是 `description`,不是 `when_to_use`。
 
-**落地(片 1 全绿,`kloop/` 下 `cargo fmt+clippy+test` 383 测试通过)**:
+**落地(片 1 全绿,`rust/` 下 `cargo fmt+clippy+test` 383 测试通过)**:
 
 - **core `skills.rs`**(纯半,仿 `context.rs`——CLI 做 IO、这里纯解析/组装/展开):`Skill`
   {name,description,body,dir};`Skill::parse`(`split_frontmatter` 认 `---…---` 栅栏 + serde_yaml_ng
@@ -200,9 +200,9 @@ catalog 里也列着 haiku、它把"写 haiku 请求"正式"激活"一遍,冗余
    (catalog 搭 `injected_context`、会话稳定 cache 友好),触发另起一个专用 `skill` 工具、
    回灌**展开后的正文**(tool_result)而非 tool def。inline 执行不需要新注入机制——tool_result
    进上下文续跑即可,比 cc 的 user-message 注入更省。
-4. **运行期 cwd 陷阱(验收踩)**:skills 按进程 cwd 发现;真机 workspace 在 `kloop/` 子目录、
+4. **运行期 cwd 陷阱(验收踩)**:skills 按进程 cwd 发现;真机 workspace 在 `rust/` 子目录、
    env.local+样例 skill 在仓库根,`cd kloop` 后 cwd 变了 skill 就找不到。直接跑
-   `./kloop/target/debug/kloop`(cwd=仓库根)才对齐。
+   `./rust/target/debug/kloop`(cwd=仓库根)才对齐。
 
 **片 1 挂账**(按 plan「不做」节 + 片 2/3):`context: fork` 走 task 子 agent;`allowed-tools`
 注入权限、`model`/`effort` 覆盖;bundled 编译期打包 + 懒解压;`paths` 条件激活;使用频率衰减

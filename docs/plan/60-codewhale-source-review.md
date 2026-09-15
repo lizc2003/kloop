@@ -111,10 +111,10 @@ CodeWhale 的 provider identity 很多，但底层只有三类 wire：
 
 这一点与 kloop 当前三 adapter 结构一致。kloop 已有成熟 translation，不应重写：
 
-- `kloop/crates/provider/src/anthropic.rs`
-- `kloop/crates/provider/src/openai.rs`
-- `kloop/crates/provider/src/responses.rs`
-- `kloop/crates/provider/src/sse.rs`
+- `rust/crates/provider/src/anthropic.rs`
+- `rust/crates/provider/src/openai.rs`
+- `rust/crates/provider/src/responses.rs`
+- `rust/crates/provider/src/sse.rs`
 
 CodeWhale 值得借鉴的是 guard 组合：
 
@@ -142,8 +142,8 @@ CodeWhale 值得借鉴的是 guard 组合：
 
 kloop 当前最明显的缺口在：
 
-- `kloop/crates/core/src/agent/sampling.rs:59-279`
-- `kloop/crates/provider/src/lib.rs:181-343`
+- `rust/crates/core/src/agent/sampling.rs:59-279`
+- `rust/crates/provider/src/lib.rs:181-343`
 
 借鉴时应先固定不变量，而不是复制常量：
 
@@ -214,7 +214,7 @@ extra
 
 kloop 当前 canonical JSON-RPC item protocol 已经更适合作为唯一协议所有权，但 event 没有稳定 replay cursor：
 
-- `kloop/crates/server/src/wire.rs:55-203`
+- `rust/crates/server/src/wire.rs:55-203`
 
 值得借鉴的是 additive event `seq`，不是把 kloop 改成 CodeWhale HTTP API。
 
@@ -251,7 +251,7 @@ machine-readable outcome 区分：
 
 kloop 当前用 `is_concurrency_safe` 做安全布尔分类，结构简单且已形成稳定主链：
 
-- `kloop/crates/core/src/tools/mod.rs:101-117,474-710`
+- `rust/crates/core/src/tools/mod.rs:101-117,474-710`
 
 可做一个窄原型：
 
@@ -305,8 +305,8 @@ additionalContext
 
 但 kloop 当前 permission 主链更强，已经明确：deny、安全检查、mode、allow/cache/approver 的顺序与 bypass 免疫。不能用 CodeWhale execpolicy 替换：
 
-- `kloop/crates/core/src/permissions.rs:108-994`
-- `kloop/crates/core/src/hooks.rs:24-364`
+- `rust/crates/core/src/permissions.rs:108-994`
+- `rust/crates/core/src/hooks.rs:24-364`
 
 可借鉴的最小数据形状：
 
@@ -343,7 +343,7 @@ CodeWhale 的 instruction discovery 会：
 
 kloop 已有 instruction layering、import 和 project boundary：
 
-- `kloop/crates/cli/src/context.rs:19-250`
+- `rust/crates/cli/src/context.rs:19-250`
 
 近期可补 leaf-file no-follow，不应改掉已有 canonical/project-boundary 语义。测试至少覆盖：
 
@@ -373,8 +373,8 @@ CodeWhale session snapshot 使用 temp + fsync + rename，并有 async persisten
 
 kloop 的 append-only rollout 更适合作为 source of truth：
 
-- `kloop/crates/core/src/rollout.rs:34-478`
-- `kloop/crates/core/src/history.rs:75-182`
+- `rust/crates/core/src/rollout.rs:34-478`
+- `rust/crates/core/src/history.rs:75-182`
 
 它已经有 lineage、fork、compaction marker 和 torn-tail repair，不应退化为单 JSON snapshot。
 
@@ -420,8 +420,8 @@ CodeWhale 的进程内 subagent 主路径较成熟，但实现集中在约 1.2 �
 
 kloop 当前位置：
 
-- `kloop/crates/core/src/tools/task.rs:39-460`
-- `kloop/crates/core/src/tools/background_tasks.rs:30-220`
+- `rust/crates/core/src/tools/task.rs:39-460`
+- `rust/crates/core/src/tools/background_tasks.rs:30-220`
 
 CodeWhale 的成熟度边界必须保留：
 
@@ -747,21 +747,21 @@ CodeWhale 快照可能更新，开工前应重新确认目标 commit。优先回
 
 kloop 对照入口：
 
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/agent/sampling.rs`
-- `kloop/crates/provider/src/lib.rs`
-- `kloop/crates/server/src/wire.rs`
-- `kloop/crates/core/src/rollout.rs`
-- `kloop/crates/core/src/history.rs`
-- `kloop/crates/cli/src/context.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/permissions.rs`
-- `kloop/crates/core/src/hooks.rs`
-- `kloop/crates/core/src/tools/task.rs`
-- `kloop/crates/core/src/tools/background_tasks.rs`
-- `kloop/crates/core/src/skills.rs`
-- `kloop/crates/mcp/src/lib.rs`
-- `kloop/crates/cli/src/mcp.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/agent/sampling.rs`
+- `rust/crates/provider/src/lib.rs`
+- `rust/crates/server/src/wire.rs`
+- `rust/crates/core/src/rollout.rs`
+- `rust/crates/core/src/history.rs`
+- `rust/crates/cli/src/context.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/permissions.rs`
+- `rust/crates/core/src/hooks.rs`
+- `rust/crates/core/src/tools/task.rs`
+- `rust/crates/core/src/tools/background_tasks.rs`
+- `rust/crates/core/src/skills.rs`
+- `rust/crates/mcp/src/lib.rs`
+- `rust/crates/cli/src/mcp.rs`
 
 回源纪律：
 

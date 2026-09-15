@@ -26,7 +26,7 @@ TUI 的 `Composer` 已有完整多行文档模型：`ComposerLayout` 统一硬�
 
 ### 1. Terminal keyboard enhancement lifecycle
 
-修改 `kloop/crates/tui/src/lib.rs`：
+修改 `rust/crates/tui/src/lib.rs`：
 
 - raw mode 与 bracketed paste 建立后、inline viewport CPR 和输入 poll thread 启动前，在 Unix 上写入 `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`。
 - 只启用 disambiguation，不启用 event types、alternate keys 或 all-keys，避免引入 release/repeat 或普通字符 keycode 变化。
@@ -37,7 +37,7 @@ TUI 的 `Composer` 已有完整多行文档模型：`ComposerLayout` 统一硬�
 
 ### 2. App key priority
 
-修改 `kloop/crates/tui/src/app.rs`：
+修改 `rust/crates/tui/src/app.rs`：
 
 - 抽出纯 `is_composer_newline_key`，沿用 `KeyModifiers::contains`。
 - 顺序固定为：全局键 → modal interaction → rewind picker → composer newline → completion popup → 普通编辑/裸 Enter。
@@ -58,10 +58,10 @@ TUI 的 `Composer` 已有完整多行文档模型：`ComposerLayout` 统一硬�
 
 ## 关键文件
 
-- `kloop/crates/tui/src/lib.rs`
-- `kloop/crates/tui/src/app.rs`
-- `kloop/crates/cli/tests/tui_pty.rs`
-- `kloop/README.md`
+- `rust/crates/tui/src/lib.rs`
+- `rust/crates/tui/src/app.rs`
+- `rust/crates/cli/tests/tui_pty.rs`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 
 ## 验证

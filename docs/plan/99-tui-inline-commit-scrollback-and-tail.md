@@ -42,11 +42,11 @@
 
 ## 关键文件
 
-- `kloop/crates/tui/Cargo.toml` — 去掉 `scrolling-regions` feature + 注释。
-- `kloop/crates/tui/src/lib.rs` — 删 `PinnedBackend` 与 mock 的 `scroll_region_*` 转发/记录;`insert_scrollback_blocks` 注释改述;两个测试改断 `cells.len()`。
-- `kloop/crates/tui/src/render.rs` — `commit_count` 加一屏守卫 + 新回归测试 `commit_keeps_a_tall_final_message_live_instead_of_a_blank_pad`。
-- `kloop/crates/cli/tests/tui_pty.rs` — PTY 测试改名 `two_turn_overflow_commits_without_scroll_regions_then_repaints`,断言**不出现** scroll-region 转义(`\x1b[1;1r`/`\x1b[1S`)+ clear→first-tail→second-tail 顺序。
-- `kloop/README.md` — overflow-commit 段补两点:提交只冻结"留活尾巴 ≥ 一屏"的前缀(高尾消息在 `-c` resume 不被空白挤走)+ 刻意关 `scrolling-regions`(append_lines LF 滚动 vs DECSTBM iTerm2 串行)。
+- `rust/crates/tui/Cargo.toml` — 去掉 `scrolling-regions` feature + 注释。
+- `rust/crates/tui/src/lib.rs` — 删 `PinnedBackend` 与 mock 的 `scroll_region_*` 转发/记录;`insert_scrollback_blocks` 注释改述;两个测试改断 `cells.len()`。
+- `rust/crates/tui/src/render.rs` — `commit_count` 加一屏守卫 + 新回归测试 `commit_keeps_a_tall_final_message_live_instead_of_a_blank_pad`。
+- `rust/crates/cli/tests/tui_pty.rs` — PTY 测试改名 `two_turn_overflow_commits_without_scroll_regions_then_repaints`,断言**不出现** scroll-region 转义(`\x1b[1;1r`/`\x1b[1S`)+ clear→first-tail→second-tail 顺序。
+- `rust/README.md` — overflow-commit 段补两点:提交只冻结"留活尾巴 ≥ 一屏"的前缀(高尾消息在 `-c` resume 不被空白挤走)+ 刻意关 `scrolling-regions`(append_lines LF 滚动 vs DECSTBM iTerm2 串行)。
 
 ## 非目标
 

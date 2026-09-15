@@ -98,7 +98,7 @@
 
 ## 跨工具链验收
 
-入口：`kloop/crates/core/src/tools/plan59_acceptance_tests.rs`。报告由 `KLOOP_PLAN59_ACCEPTANCE_REPORT` 以 create-new 写出，full/corpus verifier 各运行两次并比较原始 bytes，再执行 exact object/type/literal/order 校验和 tamper-negative 检查。报告 scope 分开记录 `target_entrypoint=local-cli` 与 `kloop_entrypoint=core-dispatch-test-harness`：前者是 CC corpus 的验收入口，后者诚实描述 Rust report 的执行路径；该 report 不冒充真实 CLI startup/registry wiring 验收。
+入口：`rust/crates/core/src/tools/plan59_acceptance_tests.rs`。报告由 `KLOOP_PLAN59_ACCEPTANCE_REPORT` 以 create-new 写出，full/corpus verifier 各运行两次并比较原始 bytes，再执行 exact object/type/literal/order 校验和 tamper-negative 检查。报告 scope 分开记录 `target_entrypoint=local-cli` 与 `kloop_entrypoint=core-dispatch-test-harness`：前者是 CC corpus 的验收入口，后者诚实描述 Rust report 的执行路径；该 report 不冒充真实 CLI startup/registry wiring 验收。
 
 1. **file/search → Bash → Worktree**（`full`）：真实 Read/Edit/Glob/Grep/Bash；临时 HOME/XDG/Git config，worktree 的 production Git subprocess 也经 test-only per-repo seam `env_clear`，并用 hostile `.gitconfig` sentinel 证明 global/system/config injection 不可见；fresh worktree FileState；stale-read 拒绝；退出后 cwd/FileState 恢复；branch/path 清理。
 2. **background Bash → Agent/Task → scheduler**（`surface-gate`）：完成通知经真实 `run_turn` step boundary 回灌；按各自 framing 精确计数一次并固定 shell→agent→wakeup 完整顺序；Bash timeout；live agent/shell/wakeup 在 session shutdown 时取消并清零。Monitor 在本 profile 无原生注册，不伪造执行。
@@ -129,7 +129,7 @@ Verifier 明确拒绝：
 - `refs/claude-code-2.1.220/profile-bridges.json`
 - `refs/claude-code-2.1.220/README.md`
 - Plan 53/59 Rust reports及 `tools/mod.rs` test registration
-- 本 plan、`HANDOFF.md`、`refs/README.md`、`kloop/README.md`、`docs/capability-report.md`
+- 本 plan、`HANDOFF.md`、`refs/README.md`、`rust/README.md`、`docs/capability-report.md`
 
 ## 验证
 

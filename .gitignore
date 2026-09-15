@@ -1,9 +1,9 @@
 # Rust build artifacts
-kloop/target/
+rust/target/
 
 # agent runtime offload output
 .kloop/
-kloop/.kloop/
+rust/.kloop/
 
 # reference material (local copies of other repos, not ours to version) —
 # keep only our own guide and the pinned Claude Code parity fixtures

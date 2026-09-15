@@ -22,7 +22,7 @@ codex 自己不靠这个 SSE 事件取限流:它从 HTTP header 解析(`parse_al
 
 ## 根因(单一)
 
-`kloop/crates/provider/src/responses.rs` 的 SSE 事件循环对 `codex.rate_limits` 无对应分支,落进 `responses.rs:1130` 的 `_ => return Err(protocol("returned an unknown semantic event"))`,致命化整轮。
+`rust/crates/provider/src/responses.rs` 的 SSE 事件循环对 `codex.rate_limits` 无对应分支,落进 `responses.rs:1130` 的 `_ => return Err(protocol("returned an unknown semantic event"))`,致命化整轮。
 
 ## 已拍板设计(窄口)
 
@@ -60,9 +60,9 @@ fn is_out_of_band(event: &str) -> bool {
 
 ## 关键文件
 
-- `kloop/crates/provider/src/responses.rs` — 唯一实质改动:加 `is_out_of_band`;上移两行解析并改 terminal 后守卫;match 加带外守卫臂。
-- `kloop/crates/provider/tests/responses.rs` — 新增 wiremock 契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
-- `kloop/README.md` — 若有"provider/SSE 行为"描述则补一句"Responses 放行 `codex.*` 厂商带外遥测事件";无则不加(避免为内部细节新增段落,开工时看 README 现状定)。
+- `rust/crates/provider/src/responses.rs` — 唯一实质改动:加 `is_out_of_band`;上移两行解析并改 terminal 后守卫;match 加带外守卫臂。
+- `rust/crates/provider/tests/responses.rs` — 新增 wiremock 契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
+- `rust/README.md` — 若有"provider/SSE 行为"描述则补一句"Responses 放行 `codex.*` 厂商带外遥测事件";无则不加(避免为内部细节新增段落,开工时看 README 现状定)。
 - `docs/plan/HANDOFF.md` — 补一条教训(带外遥测 vs 语义流的分层、窄口放行前缀、两处拒绝点须一致、以另一 rail 的既有先例为模板);编号取所在教训列表的下一个。
 
 ## 非目标
@@ -74,7 +74,7 @@ fn is_out_of_band(event: &str) -> bool {
 
 ## 测试 / 验证
 
-新增于 `kloop/crates/provider/tests/responses.rs`(参照 `streams_reasoning_text_and_function_call` 的整轮 fixture):
+新增于 `rust/crates/provider/tests/responses.rs`(参照 `streams_reasoning_text_and_function_call` 的整轮 fixture):
 
 1. `out_of_band_codex_event_is_ignored_mid_stream`:`created → in_progress → codex.rate_limits(带真实字段的 payload) → output_item(text) → completed`。断言产出正常的 `TextDelta/BlockDone/Terminal(EndTurn)` 序列,`codex.rate_limits` 不产生任何 `StreamEvent`,无错误。
 2. `out_of_band_codex_event_after_terminal_is_ignored`:`created → completed → codex.rate_limits`(流随后结束,无 `[DONE]`)。断言恰好一个 `Terminal`、无错误——验证 terminal 后守卫豁免(与 anthropic `ping` 同形)。

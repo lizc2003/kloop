@@ -30,10 +30,10 @@ Plan 48 已采集 Bash 的成功、失败、坏输入、timeout、显式后台�
 
 kloop 侧优先复用：
 
-- `kloop/crates/core/src/tools/bash.rs`
-- `kloop/crates/core/src/shell.rs`
-- `kloop/crates/core/src/permissions.rs`
-- `kloop/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/bash.rs`
+- `rust/crates/core/src/shell.rs`
+- `rust/crates/core/src/permissions.rs`
+- `rust/crates/core/src/tools/mod.rs`
 - 对应 parser、进程组、取消、权限和工具并发测试
 
 ## 目标

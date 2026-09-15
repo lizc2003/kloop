@@ -22,11 +22,11 @@ kloop 已有 MCP startup handshake、stdio/HTTP transport、ToolSource catalog/g
 
 ## 关键文件
 
-- `kloop/crates/mcp/src/{lib.rs,http.rs,sse.rs,oauth.rs}`
-- `kloop/crates/mcp/tests/`
-- `kloop/crates/core/src/{config.rs,tools/mod.rs,tools/tool_search.rs,permissions.rs}`
-- `kloop/crates/cli/src/{startup.rs,mcp.rs}`
-- `kloop/crates/server/src/{lib.rs,events.rs,wire.rs}`
+- `rust/crates/mcp/src/{lib.rs,http.rs,sse.rs,oauth.rs}`
+- `rust/crates/mcp/tests/`
+- `rust/crates/core/src/{config.rs,tools/mod.rs,tools/tool_search.rs,permissions.rs}`
+- `rust/crates/cli/src/{startup.rs,mcp.rs}`
+- `rust/crates/server/src/{lib.rs,events.rs,wire.rs}`
 - MCP/core/server lifecycle and availability tests
 
 ## 非目标

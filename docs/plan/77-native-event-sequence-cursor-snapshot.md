@@ -20,7 +20,7 @@ Plan 77 只实现 native app-server 的 generation/sequence/cursor/snapshot proj
 
 ### 1. 直接收敛 native protocol 1.0 当前契约
 
-修改 `kloop/crates/server/src/lib.rs` 的 initialize 与通知契约：
+修改 `rust/crates/server/src/lib.rs` 的 initialize 与通知契约：
 
 - 按当前项目没有外部协议用户的既有纪律，直接更新 native protocol `"1.0"` 的唯一实现；不保留旧 notification shape、双向 opt-in、兼容 adapter、fallback 或双栈。kloop 与 Desktop 专用 `kloop` 分支必须同步升级。
 - server 固定广告并要求 `events:{sequence:true,sync:true,snapshot:true}`；Desktop initialize 对缺失或错误 capability hard-fail。该 capability 是当前协议的必备能力声明，不是兼容开关。
@@ -132,7 +132,7 @@ Desktop 必须在 sync request pending 时缓存该 thread 的 sequenced notific
 
 ### 5. Retention 与资源边界
 
-在 `kloop/crates/server/src/events.rs` 使用 `VecDeque<PublicEventEnvelope>`：
+在 `rust/crates/server/src/events.rs` 使用 `VecDeque<PublicEventEnvelope>`：
 
 - 每个 active thread 最多保留 4,096 条或 16 MiB encoded event tail，先达到哪个阈值就从最旧端淘汰。
 - ring 淘汰只影响 replay；materialized snapshot state仍完整。
@@ -143,7 +143,7 @@ Desktop 必须在 sync request pending 时缓存该 thread 的 sequenced notific
 
 ### 1. 建立 projection 模块
 
-- 新增 `kloop/crates/server/src/events.rs`：
+- 新增 `rust/crates/server/src/events.rs`：
   - `EventCursor` strict serde DTO；
   - `PublicEventEnvelope`、`ProjectionSync`、snapshot v1 DTO；
   - `ThreadProjection` mutex state、checked seq allocator、materializing reducer；
@@ -153,7 +153,7 @@ Desktop 必须在 sync request pending 时缓存该 thread 的 sequenced notific
 
 ### 2. 接入 server 的唯一 public notification 出口
 
-修改 `kloop/crates/server/src/lib.rs`、`wire.rs`：
+修改 `rust/crates/server/src/lib.rs`、`wire.rs`：
 
 - `Server` 固定启用 event projection；initialize 广告必备 events capability，不维护 client opt-in 状态。
 - `ThreadHandle`/`ThreadUi` 持有同一个 `Arc<ThreadProjection>`；`srv_seq` 重命名，明确 reverse request和event seq所有权分离。
@@ -176,7 +176,7 @@ Desktop 必须在 sync request pending 时缓存该 thread 的 sequenced notific
 
 ### 4. 文档同步
 
-- 更新 `kloop/README.md` native protocol：协商规则、notification sequence、typed eventCursor、sync replay/snapshot、retention、restart generation、client handoff和非恢复边界。
+- 更新 `rust/README.md` native protocol：协商规则、notification sequence、typed eventCursor、sync replay/snapshot、retention、restart generation、client handoff和非恢复边界。
 - 更新 `docs/plan/HANDOFF.md`：区分 rollout/provider history、public display projection和execution state；记录“generation + snapshot基线优先于伪造durable replay”的教训。
 - 在 `refs/README.md` 追加 Prime Agent固定 SHA `e9ef5777409001faf91382227b12bf09496078fa` 的相关取舍：借 daemon sequence/cursor/snapshot，不照搬无沙箱执行或弱持久化；不要求本计划克隆/vendoring该仓库。
 - `docs/plan/39-native-protocol.md` 只追加当前演进指针，不重写历史完成事实。仅在 capability report存在已失真的活跃 claim时做最小同步；不改 fixed parity fixture来伪造外部协议事实。
@@ -193,11 +193,11 @@ Desktop 必须在 sync request pending 时缓存该 thread 的 sequenced notific
 ## 关键文件
 
 - `docs/plan/77-native-event-sequence-cursor-snapshot.md`
-- `kloop/crates/server/src/events.rs`（新增）
-- `kloop/crates/server/src/lib.rs`
-- `kloop/crates/server/src/wire.rs`
-- `kloop/crates/server/tests/server.rs`
-- `kloop/README.md`
+- `rust/crates/server/src/events.rs`（新增）
+- `rust/crates/server/src/lib.rs`
+- `rust/crates/server/src/wire.rs`
+- `rust/crates/server/tests/server.rs`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - `refs/README.md`
 - Desktop 专用分支：`src-tauri/src/worker.rs`、`src/kloop/{dto,capabilities,chatIngest,normalize}.ts`及相应 tests

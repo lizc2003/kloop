@@ -23,19 +23,19 @@ Plan 92 后真实 provider 复测确认：Anthropic Sonnet 4.6 的完整 Agent/P
 
 ## 实施
 
-- `kloop/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/tools/mod.rs`
   - `run_agent.description` 改为 `string | null`，增加 non-whitespace pattern。
   - `optional_display_description` 将 `null` 解释为 omission，保留所有非法字符串拒绝。
   - schema/parser exact tests覆盖 nullable、pattern、null omission与空白负向。
-- `kloop/crates/core/src/tools/codemode.rs`
+- `rust/crates/core/src/tools/codemode.rs`
   - `run_program.description` 同步 nullable + non-whitespace pattern。
   - resume hint 增加稳定 Durable Run ID；工具说明强调下一次显式调用、same source、真实 ID。
-- `kloop/crates/core/src/tools/{subagent.rs,codemode/tests.rs}`
+- `rust/crates/core/src/tools/{subagent.rs,codemode/tests.rs}`
   - null description 使用既有 preview fallback并成功执行；空白继续零副作用拒绝。
   - journal failure hint 与显式 resume仍证明只启动一次 child。
-- `kloop/crates/provider/tests/responses.rs`
+- `rust/crates/provider/tests/responses.rs`
   - 固定 reasoning + run_program call + error function output 的请求重放，逐字保留 failure sentinel、Durable Run ID和resume key。
-- `kloop/crates/cli/tests/real_agent_program_workflow.rs`
+- `rust/crates/cli/tests/real_agent_program_workflow.rs`
   - Program首次与resume拆为两个真实 turn，合并后保留全部强断言。
   - optional control只接受 omission/null、语义默认值或合法非空description；空白仍失败。
   - Responses默认900秒watchdog，可由 `KLOOP_REAL_EVALUATOR_TIMEOUT_SECS=60..3600` 覆盖。

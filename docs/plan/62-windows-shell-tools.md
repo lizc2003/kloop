@@ -37,11 +37,11 @@ Plan 62 开工前 kloop 只有 `bash`，执行器固定为 `sh -lc`；Unix 前�
 
 关键文件：
 
-- 新增 `kloop/crates/core/src/process_tree/{mod.rs,unix.rs,windows.rs}`
-- 新增 `kloop/crates/process-spawn`，给所有生产 child creation 共用进程级 gate
-- 重构 `kloop/crates/core/src/tools/bash.rs`
-- 调整 `kloop/crates/core/src/tools/mod.rs`
-- target-specific 依赖：`kloop/Cargo.toml`、`kloop/crates/core/Cargo.toml`
+- 新增 `rust/crates/core/src/process_tree/{mod.rs,unix.rs,windows.rs}`
+- 新增 `rust/crates/process-spawn`，给所有生产 child creation 共用进程级 gate
+- 重构 `rust/crates/core/src/tools/bash.rs`
+- 调整 `rust/crates/core/src/tools/mod.rs`
+- target-specific 依赖：`rust/Cargo.toml`、`rust/crates/core/Cargo.toml`
 
 固定设计：
 
@@ -64,9 +64,9 @@ Plan 62 开工前 kloop 只有 `bash`，执行器固定为 `sh -lc`；Unix 前�
 
 关键文件：
 
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/cli/src/user_config.rs`
-- `kloop/crates/cli/src/startup.rs`
+- `rust/crates/core/src/config.rs`
+- `rust/crates/cli/src/user_config.rs`
+- `rust/crates/cli/src/startup.rs`
 - 相关 Config test builders
 
 新增全局配置，不加 CLI flag：
@@ -88,9 +88,9 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'  # optional
 
 关键文件：
 
-- `kloop/crates/core/src/tools/bash.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/sandbox/mod.rs`
+- `rust/crates/core/src/tools/bash.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/sandbox/mod.rs`
 
 - Unix/macOS 保持现有 shell/Seatbelt 行为；把 Seatbelt wrapper 从“自己硬编码 `sh -lc`”改为包装已构造的 program + argv，现有 profile 与测试除真实 executable 参数外不漂移。
 - Windows 使用冻结的 Git Bash `bash.exe -lc <command>` 和 `current_dir`；不重写用户 command 中的反斜杠或 quoting，工具描述明确 shell 内优先使用正斜杠。
@@ -104,10 +104,10 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'  # optional
 
 关键文件：
 
-- 新增 `kloop/crates/core/src/tools/powershell.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/skills.rs`
-- `kloop/crates/tui/src/toolrow.rs`
+- 新增 `rust/crates/core/src/tools/powershell.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/skills.rs`
+- `rust/crates/tui/src/toolrow.rs`
 
 Windows-only schema：
 
@@ -129,8 +129,8 @@ Windows-only schema：
 
 关键文件：
 
-- `kloop/crates/core/src/permissions.rs`
-- `kloop/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/permissions.rs`
+- `rust/crates/core/src/tools/mod.rs`
 
 将 `CallFacts` 的 Bash-only 事实扩成明确 shell facts，例如 `ShellFacts::Bash(BashAnalysis)` 与 `ShellFacts::PowerShellOpaque`；后者绝不调用 `shell.rs`/tree-sitter-bash。PowerShell v1 不做 cmdlet 黑名单、空格 split、regex pipeline parser 或假的 read-only 分类。
 
@@ -199,7 +199,7 @@ Windows-only schema：
 关键文件：
 
 - `.github/workflows/ci.yml`
-- `kloop/README.md`
+- `rust/README.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`

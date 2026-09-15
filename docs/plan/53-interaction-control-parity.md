@@ -81,7 +81,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 refs/claude-code-2.1.220/verify.py
 
 ### Slice 1 — Shared interaction contract 与工具注册能力
 
-新增 `kloop/crates/core/src/interaction.rs`：
+新增 `rust/crates/core/src/interaction.rs`：
 
 - `QuestionRequest`、`Question`、`QuestionOption`。
 - `QuestionAnswer`：按输入 index/顺序保存 selected labels、Other、preview、notes。
@@ -99,15 +99,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 refs/claude-code-2.1.220/verify.py
 
 关键文件：
 
-- `kloop/crates/core/src/config.rs`
-- `kloop/crates/core/src/lib.rs`
-- `kloop/crates/core/src/tools/mod.rs`
-- `kloop/crates/core/src/agent.rs`
-- `kloop/crates/core/src/agent_type.rs`
+- `rust/crates/core/src/config.rs`
+- `rust/crates/core/src/lib.rs`
+- `rust/crates/core/src/tools/mod.rs`
+- `rust/crates/core/src/agent.rs`
+- `rust/crates/core/src/agent_type.rs`
 
 ### Slice 2 — AskUserQuestion core tool
 
-新增 `kloop/crates/core/src/tools/question.rs`：
+新增 `rust/crates/core/src/tools/question.rs`：
 
 - ToolDef 使用冻结 fixture 的 question/options/multiSelect/preview/metadata contract。
 - depth-0 guard、严格 parser、Questioner 调用和结果序列化。
@@ -122,7 +122,7 @@ Core 测试：完整 schema object、边界和坏类型、Answered/Cancelled/Una
 
 ### Slice 3 — Enter/Exit Plan 状态机
 
-扩展 `kloop/crates/core/src/tools/plan_mode.rs` 与 `permissions.rs`：
+扩展 `rust/crates/core/src/tools/plan_mode.rs` 与 `permissions.rs`：
 
 - 把分离的 `mode`/`pre_plan` 原子操作收口为共享 `ModeState` 临界区，提供 `enter_plan()` 和批准后的 `exit_plan()`，避免 TUI shift+Tab、Enter、Exit 的恢复态竞态。
 - `enter_plan_mode` 使用空 object schema，depth-0 only。
@@ -138,11 +138,11 @@ Core 测试：完整 schema object、边界和坏类型、Answered/Cancelled/Una
 
 #### Plain
 
-在 `kloop/crates/cli/src/ui.rs` 将 approval/question 组装到共享 terminal interaction object；同时实现 `Approver` 与 `Questioner`，共用一个 async mutex，避免并发 prompt 交错。支持编号单选、逗号多选、Other、preview、notes、cancel 和 EOF；坏输入在本问题内重试，EOF 返回 Unavailable。
+在 `rust/crates/cli/src/ui.rs` 将 approval/question 组装到共享 terminal interaction object；同时实现 `Approver` 与 `Questioner`，共用一个 async mutex，避免并发 prompt 交错。支持编号单选、逗号多选、Other、preview、notes、cancel 和 EOF；坏输入在本问题内重试，EOF 返回 Unavailable。
 
 #### TUI
 
-在 `kloop/crates/tui/src/events.rs`、`app.rs`、`render.rs`（必要时新增 `question.rs`）把 confirm-only queue 提升为单一 typed modal queue：
+在 `rust/crates/tui/src/events.rs`、`app.rs`、`render.rs`（必要时新增 `question.rs`）把 confirm-only queue 提升为单一 typed modal queue：
 
 - `AgentEvent::Question` + oneshot `QuestionOutcome`。
 - 纯 App 状态机管理 question index、cursor、multi toggle、Other editor、preview/notes。
@@ -151,7 +151,7 @@ Core 测试：完整 schema object、边界和坏类型、Answered/Cancelled/Una
 
 #### Server
 
-在 `kloop/crates/server/src/lib.rs`、`wire.rs`、`tests/server.rs` 增加独立 `question/request` reverse RPC：
+在 `rust/crates/server/src/lib.rs`、`wire.rs`、`tests/server.rs` 增加独立 `question/request` reverse RPC：
 
 - initialize 报告 questions capability并读取 client capability；不支持时 thread 不安装 Questioner。
 - request 带 threadId、turnId、question index 和完整 options；response 明确 answered/cancelled。
@@ -161,20 +161,20 @@ Core 测试：完整 schema object、边界和坏类型、Answered/Cancelled/Una
 
 #### Headless
 
-`kloop/crates/cli/src/headless.rs` 保留 `DenyApprover`，不安装 Questioner，也不注册 Ask/Enter/detached Workflow；不得读 stdin 等答案或输出假答案。server/headless 共享 event projector 后续支持 Workflow background kind。
+`rust/crates/cli/src/headless.rs` 保留 `DenyApprover`，不安装 Questioner，也不注册 Ask/Enter/detached Workflow；不得读 stdin 等答案或输出假答案。server/headless 共享 event projector 后续支持 Workflow background kind。
 
 前端测试覆盖 answered/cancelled/unavailable、plain parsing/EOF、TUI modal keyboard/queue、server exact JSON/malformed/unknown/disconnect/thread isolation、headless 不阻塞。
 
 ### Slice 5 — 安全 RunStore 与 code-mode runtime profile
 
-新增共享 `RunId`/`RunStore`（代表路径 `kloop/crates/core/src/tools/run_store.rs`）：
+新增共享 `RunId`/`RunStore`（代表路径 `rust/crates/core/src/tools/run_store.rs`）：
 
 - run id 只允许受限 ASCII component；拒绝 absolute、`..`、separator 和 symlink escape。
 - 受控 `.kloop/{program-runs,workflow-runs}/` 下 create-new/atomic replace；manifest/script/args/journal/result/error 有 format version。
 - 迁移 `run_program` 的 `resume_from_run_id`，修复当前直接 `.join(run_id)` 可把只读 orchestration tool 变成任意路径写入的风险。
 - journal result 从 `String` 升级为 `serde_json::Value`，旧 string entry 继续读；key 纳入 schema、isolation、agent_type/max_rounds 等影响结果的 canonical opts。
 
-在 `kloop/crates/codemode/src/lib.rs` 抽共享 runtime profile：
+在 `rust/crates/codemode/src/lib.rs` 抽共享 runtime profile：
 
 - `run_program` 保持现有 `tools`/`__call_tool`、agent/log/parallel/pipeline、前台/可选后台 contract。
 - `run_workflow` 只安装 args、agent、log、phase、parallel、pipeline；引擎层不注册 `__call_tool`，`tools` 和动态隐藏访问均为 undefined。
@@ -186,15 +186,15 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 
 关键文件：
 
-- `kloop/Cargo.toml`
-- `kloop/crates/codemode/src/lib.rs`
-- `kloop/crates/codemode/src/tests.rs`
-- `kloop/crates/core/src/tools/codemode.rs`
-- `kloop/crates/core/src/tools/codemode/journal.rs`
+- `rust/Cargo.toml`
+- `rust/crates/codemode/src/lib.rs`
+- `rust/crates/codemode/src/tests.rs`
+- `rust/crates/core/src/tools/codemode.rs`
+- `rust/crates/core/src/tools/codemode/journal.rs`
 
 ### Slice 6 — 独立、始终后台的 Workflow
 
-新增 `kloop/crates/core/src/tools/workflow.rs`：
+新增 `rust/crates/core/src/tools/workflow.rs`：
 
 - schema 支持 inline `script`、任意 JSON `args`、受控 `script_path`、`resume_from_run_id`；新运行要求 script，resume 可读取/编辑持久化 script。未知字段与非法组合 fail closed。
 - 首版不实现 named registry、嵌套 workflow、budget；这些明确记为 intentional differences。
@@ -230,7 +230,7 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 
 - 本文件：完成记录、测试和提交号。
 - `docs/plan/HANDOFF.md`：Questioner/Approver 分离、ModeState、Workflow profile、`structured_output`、RunStore 安全教训。
-- `kloop/README.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal `structured_output`、headless 降级。
+- `rust/README.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal `structured_output`、headless 降级。
 - `refs/README.md`、`docs/capability-report.md`、server native protocol 文档。
 - `refs/claude-code-2.1.220/{static-evidence.jsonl,tool-matrix.json,verify.py}` 和生成产物；保留本会话新增 fixtures。
 

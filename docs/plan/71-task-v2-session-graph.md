@@ -61,7 +61,7 @@ Task 字段为 `id/subject/description/status/owner/blocked_by`；读取时计�
 
 ## 实施
 
-1. 新增 `kloop/crates/core/src/tools/task.rs`：`RwLock<BTreeMap>` registry、单调 allocator、四工具、strict parser、候选图防环、状态门和预算。
+1. 新增 `rust/crates/core/src/tools/task.rs`：`RwLock<BTreeMap>` registry、单调 allocator、四工具、strict parser、候选图防环、状态门和预算。
 2. `Config` 用共享 `Arc<TaskRegistry>` 替换 per-Agent todos；所有 Config 构造点同步，`subagent_from`/`test_clone` clone Arc。
 3. 在 `tools/mod.rs`、`permissions.rs`、`codemode.rs`、`commands/clear.rs` 接入注册、dispatch、并发、权限、Program 排除和 clear 语义。
 4. 删除 `tools/todo.rs`、`Item::Todo`、TUI `Cell::Todo`、plain checklist、native `type:"todo"`、历史 checklist replay、Skill TodoWrite 映射和旧测试；`todo_write` 只保留 reserved name，防 external ToolSource 冒充，不提供执行兼容。

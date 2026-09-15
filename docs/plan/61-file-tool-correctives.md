@@ -90,14 +90,14 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 ### 3. Mutation 版本与内容验证分层
 
-重构 `kloop/crates/core/src/tools/fs.rs` 中当前由 `read_regular_target` 混合承担的职责：
+重构 `rust/crates/core/src/tools/fs.rs` 中当前由 `read_regular_target` 混合承担的职责：
 
 - descriptor-bound metadata/identity 检查；
 - chunked SHA-256，构造或比较 `FileVersion`；
 - 仅 Edit 需要的 5 MiB bounded bytes；
 - 已知 expected bytes 的 chunked equality verification。
 
-`kloop/crates/core/src/file_state.rs::FileVersion` 增加从预计算 fingerprint + metadata 构造/比较的 crate-private 窄接口，继续使用现有 len/mtime/ctime/readonly/dev/inode/mode/SHA-256 版本定义，不改变 coverage。
+`rust/crates/core/src/file_state.rs::FileVersion` 增加从预计算 fingerprint + metadata 构造/比较的 crate-private 窄接口，继续使用现有 len/mtime/ctime/readonly/dev/inode/mode/SHA-256 版本定义，不改变 coverage。
 
 具体结果：
 
@@ -109,7 +109,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 ### 4. CRLF-aware Edit：raw exact 优先
 
-新增纯 helper `kloop/crates/core/src/text_edit.rs`，由 executor 与 `diff.rs` 共用。固定规则如下：
+新增纯 helper `rust/crates/core/src/text_edit.rs`，由 executor 与 `diff.rs` 共用。固定规则如下：
 
 1. **raw exact match 优先**：当前原始文本能直接命中 `old_string` 时，完全维持现有 count、unique、`replace_all` 和 raw `new_string` 语义。
 2. 只有 raw match 数为 0 时才进入 newline fallback。fallback 只把 `\r\n` 视为逻辑 `\n`；孤立 `\r` 是普通内容。
@@ -126,7 +126,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 ### 5. Approval preview 有界且与执行一致
 
-修改 `kloop/crates/core/src/diff.rs`：
+修改 `rust/crates/core/src/diff.rs`：
 
 - existing Write preview 先 metadata-check 1 MiB；超限直接返回现有 overwrite summary，再用 `cap + 1` 防增长竞态。
 - Edit preview 同样 bounded read；超限、不可读、非 UTF-8或真实 Edit 会失败时，继续退化为 old/new 两字符串 diff。
@@ -151,7 +151,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 ### 7. 模型可见工具定义
 
-修改 `kloop/crates/core/src/tools/mod.rs::builtin_defs`：
+修改 `rust/crates/core/src/tools/mod.rs::builtin_defs`：
 
 - Read：明确单文件 raw limit 为 5 MiB，并保留 text/image/PDF 行为说明。
 - Write：明确新建 leaf 时会在批准后安全创建缺失父目录；existing file 需要完整 fresh Read 后按模型输入整体覆盖。
@@ -244,7 +244,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 实现完成后更新：
 
-- `kloop/README.md`：raw Read/Edit 上限、Read 的 LF 逻辑展示、Edit exact-first newline fallback、Write 原样整体替换、批准后安全创建缺失父目录，以及 Unix/Windows 在 ACL/mode 与 crash-durability 上的真实边界。
+- `rust/README.md`：raw Read/Edit 上限、Read 的 LF 逻辑展示、Edit exact-first newline fallback、Write 原样整体替换、批准后安全创建缺失父目录，以及 Unix/Windows 在 ACL/mode 与 crash-durability 上的真实边界。
 - `docs/capability-report.md`：把 Plan 61 记为 Plan 49 后续 correctness/resource corrective，不改写历史 parity 结论。
 - `docs/plan/HANDOFF.md`：记录“模型输出预算不等于 I/O 预算”、CRLF logical-match/raw-preservation 规则与完成状态。
 - 本文件：补实际裁决、验证结果、日期、提交号和 `✅`。

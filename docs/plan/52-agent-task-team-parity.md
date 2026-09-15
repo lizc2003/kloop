@@ -57,11 +57,11 @@ kloop 的 `task`、`todo`、`wait`、`stop_agent` 与 CC 的 Agent、TaskCreate/
 
 优先复用：
 
-- `kloop/crates/core/src/tools/task.rs`
-- `kloop/crates/core/src/agent_type.rs`
-- `kloop/crates/core/src/tools/todo.rs`
-- `kloop/crates/core/src/agent.rs` 的 inbox/steering seam
-- `kloop/crates/core/src/tools/mod.rs` 注册和并发分批
+- `rust/crates/core/src/tools/task.rs`
+- `rust/crates/core/src/agent_type.rs`
+- `rust/crates/core/src/tools/todo.rs`
+- `rust/crates/core/src/agent.rs` 的 inbox/steering seam
+- `rust/crates/core/src/tools/mod.rs` 注册和并发分批
 - 对应 task、todo、取消、事件与回灌测试
 
 ## 目标

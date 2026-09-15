@@ -22,20 +22,20 @@ plain 是传统 line-based REPL，不需要复制 TUI 的 raw-key composer。按
 
 ## 实施
 
-- `kloop/crates/cli/src/main.rs`
+- `rust/crates/cli/src/main.rs`
   - plain session 启动时创建一个覆盖整个 REPL 生命周期的 Tokio SIGINT stream；stdin 改由唯一 request-driven dedicated blocking thread 读行并送 channel，idle event loop 同时等待 stdin、Inbox 和 SIGINT，turn 内 interaction 不与预读线程争 stdin。
   - 抽取 `run_plain_operation`：同时 poll 当前业务 future 和 SIGINT；SIGINT 到达后 cancel token、等待业务 future 完成，并返回 exit intent。
   - turn、slash command、scheduled delivery 都通过该 helper，去掉各自短命 watcher；运行中 Ctrl+C 的终态文案明确 history 已修补并正在退出。
   - 启动提示改为只广告 `exit` 和 Ctrl+C，不提 Ctrl+D。
-- `kloop/crates/cli/tests/plain_pty.rs` 与 `tui_pty_support/mod.rs`
+- `rust/crates/cli/tests/plain_pty.rs` 与 `tui_pty_support/mod.rs`
   - 泛化现有 hermetic PTY harness 以传入 `--plain`。
   - 真 binary 覆盖 idle 单次 Ctrl+C 退出、运行中 Ctrl+C cancel→history patch→退出、banner 不再广告 Ctrl+D。
-- `kloop/README.md`、`docs/plan/HANDOFF.md`
+- `rust/README.md`、`docs/plan/HANDOFF.md`
   - 同步 plain 与 TUI 的有意差异，以及 Ctrl+D 是 canonical EOF 而非应用快捷键的分层。
 
 ## 验证
 
-从 `kloop/` 运行：
+从 `rust/` 运行：
 
 ```bash
 cargo fmt --all -- --check

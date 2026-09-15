@@ -52,7 +52,7 @@ Team、assignment、claim、权限、路由或 Task↔execution identity binding
 
 ### 1. Registry、parser 与 schema
 
-`kloop/crates/core/src/tools/task.rs`：
+`rust/crates/core/src/tools/task.rs`：
 
 - 删除 `MAX_OWNER_CHARS`。
 - 删除 `StoredTask`、`TaskView`、`TaskSummary`、`TaskCreateInput`、`TaskPatch`
