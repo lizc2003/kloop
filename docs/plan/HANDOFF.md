@@ -2,7 +2,34 @@
 
 > 全局约束(定位、工作方式、风格、偏好)在根目录 CLAUDE.md(自动加载)。本文件是细节:读完即可开工,无需重新调研。参考库知识在 `refs/README.md`;与 cc/codex 的能力差距与补齐路线在 `docs/capability-report.md`(补能力前对着挑项,完成后销账)。
 
-## 〇、待做的一批:plan 138–142(2026-09-11 排定)
+## 〇、待做的一批:plan 149–153(2026-09-15 排定)
+
+来源是一次借鉴项目调研(`refs/grok-build` + `refs/deepseek-harness`,结论见 `refs/README.md`
+的 2026-09-15 节),收尾时用户问"kloop 主要在 macOS 上用,该提高哪些能力",按 **macOS-only**
+前提重排出来的五条。每条都是一个会话任务,plan 文件里写够了开工所需的一切;
+**五条互相独立、可任意顺序**:
+
+| plan | 做什么 | 规模 | 建议 |
+|---|---|---|---|
+| **149** 二十一次抽查,没有一次整屏 | TUI 测试从点断言升到整屏基线 | 中 | **先做这条**。开工前定:基线用 `insta` 还是自写 fixture |
+| **150** git 在逐字节抄,APFS 本可以一次克隆 | worktree 改 `--no-checkout` + `clonefile` CoW | 中 | 开工前必须先定"新工作树以当前文件还是 HEAD 为准"——答案若是 HEAD,**此 plan 应直接撤销** |
+| **151** 模型在原地打转,没有人发现 | 重复工具调用 advisory + 每工具 cooperative 超时 | 小 | 两件事语义无关,可能该拆成两次提交 |
+| **152** grep 找得到那个词,找不到那个定义 | tree-sitter 符号索引(新 crate) | 大 | **建议挂着**。唯一新增子系统,收益最不确定;等一次"模型因为找不到定义而改错地方"的真实案例 |
+| **153** 四个挂点看不见的时刻 | hooks 补 `permission_denied`/`pre_compact`/`post_compact`/`session_end` | 小 | **建议只做其中那笔旧账**(subagent 的 `agent_type` matcher);四个新挂点是从别人项目倒推的,不是从使用里长出来的 |
+
+**同一轮调研里查过但不立 plan 的一条**:grok 记录了 macOS Seatbelt 的 `mv x y && cat y`
+绕过(deny 按路径,文件被移出被 deny 的路径就绕过了)。查下来 kloop **已经防住**——
+`cli/src/startup.rs:804-805` 对同一个 `private_state_root` 同时设了 deny read 和 deny write,
+源目录不可写就 mv 不走,`with_allowed_read_path` 的注释("Read-only: the write deny on that
+ancestor is untouched")说明这个配对是有意的。**唯一值得补的是把这个配对固化成测试**,
+免得将来有人只加 read deny 就留洞;太小,顺手做掉即可,不占一个 plan。
+
+**本轮调研里我两次下错结论,都是按单个文件名判断、没往下看一层**:先说"kloop 没有 bash
+命令拆分"(实际在 `core/src/shell.rs`,不在 `permissions.rs`;已由 `9ae424d` 更正 `refs/README.md`),
+再说"TUI 测试没有虚拟终端解析"(实际在 `tui_pty_support/mod.rs`,不在 `tui_pty.rs`)。
+接手 149-153 时**不要按文件名推断现状**,plan 里写的行号都是读完文件之后记的。
+
+## 〇之二、上一批:plan 138–142(2026-09-11 排定,已全部完成)
 
 plan 136 的全仓通读(12.5 万行)把当时不该混进清账的条目挂成非目标;用户要求把它们排成
 计划。五条**互相独立、可任意顺序**,每条都是一个会话任务,plan 文件里写够了开工所需的
