@@ -1,4 +1,7 @@
-# Plan 150 — git 在逐字节抄,APFS 本可以一次克隆
+# Plan 150 — git 在逐字节抄,APFS 本可以一次克隆 ⛔ 已撤销
+
+> **2026-09-16 撤销,不要实施。**理由见文末「⛔ 撤销」一节;第五节那个前置问题有答案了,
+> 答案正是该节写明会导致撤销的那一个。
 
 > 来源:2026-09-15,借鉴项目调研后按 macOS-only 前提重排的第二条(第一条是 plan 149)。
 > 参考 `refs/grok-build` 的 `xai-fast-worktree`(见 `refs/README.md` 2026-09-15 节)。
@@ -80,3 +83,36 @@ macOS 用,`clonefile` 这一条就够。
 5. 提速有数:记一次两条路径的耗时对比进 plan 的 ✅ 节。**没有提速就不要合**——本 plan
    除了速度没有别的收益,不快就是净增复杂度。
 6. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自取退出码)。
+
+## ⛔ 撤销(2026-09-16)
+
+第五节的前置问题——"新工作树的内容,以主工作区的当前文件为准,还是以 HEAD 为准?"——
+用户一句「工作树可能是基于某个提交做出来的」点明了,而代码本来就写着答案:
+
+```rust
+// core/src/worktree.rs:290-293
+BasePolicy::Head  => git rev-parse HEAD                    // task isolation
+BasePolicy::Fresh => origin/HEAD(或 origin/<当前分支>)      // session tree,:478
+```
+
+**两种 base 都是提交,没有"以当前文件为准"这一档。**按第五节和第七节前置条件的约定,
+本 plan 到此撤销。
+
+而且 `BasePolicy::Fresh` 比"HEAD"更彻底地否掉它:session tree 的 base 是 `origin/HEAD`,
+与本地工作区可以差任意多个提交。从当前文件 CoW 克隆过去,那些差异会**全部表现为未提交
+改动**——而 plan 56 把 base commit 钉进了 provenance 验证(`56-worktree-parity.md:70`)和
+删除判定(`:62`,"tracked/staged/unstaged/untracked/ignored 变化或 base 后 commit 均阻止
+默认 remove")。第七节第 1 条"两条路径 `git status --porcelain` 逐字节相同"必然失败,
+而那条是本 plan 明说不能让步的。
+
+**成本是真的,只是这条路不对。**kloop 仓库 790 个 tracked 文件、147 MB,其中 **139 MB 是
+`refs/claude-code-2.1.220/fixtures`**——每建一个托管工作树,git 都要把这堆 parity fixture
+重新写一遍,而绝大多数任务碰都不碰它。要省这笔,两条方向都与 CoW-from-dirty-tree 无关:
+
+- **sparse-checkout**:`--no-checkout` 之后用 sparse 规则把 fixtures 排除掉再 checkout。
+  几行、无平台代码、不改 base 语义,`git status` 也不受影响(skip-worktree 不报脏)。
+  代价是工作树里跑不了 `verify.py --corpus-only`,要先确认没人在托管树里跑它。
+- **从提交固定的源 CoW**:克隆源不是脏的主工作区,而是一个已经在该 commit 上的兄弟工作树
+  或一次性模板。语义正确,但复杂度远高于上一条,而且收益要先量。
+
+真要做,做第一条,并且**重新立 plan**——它和本 plan 的机制、风险、验收都不是一回事。
