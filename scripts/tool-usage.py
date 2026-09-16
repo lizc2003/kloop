@@ -41,7 +41,8 @@ rollout 是 append-only 的 jsonl，一行一条 `message`，`tool_use` 和 `too
   区间重叠         `--overlap`：这次读的行区间与本会话已读区间相交吗？相交 ⟹ 那些行
                    还在上下文里，这次是冗余重读。**压缩边界会清空**，因为压缩把旧结果
                    换走了，此时重读正当——不清空，31.1% 里有一半是冤枉的（真值 13.8%）。
-                   plan 151 的判定就是这一栏。
+                   plan 151 的判定就是这一栏，它下面那栏是提醒真正会响几次——
+                   重叠 234 次只对应 15 次提醒，别把这两个数当成一个。
 
 **必读的陷阱**：语料是本机 dogfood，几乎总是偏向最近那几次任务。脚本会打印项目桶
 分布——一个桶占九成以上时，结论只对那一类工作负载成立，别当成通用结论。
@@ -140,14 +141,16 @@ def report_overlap(tool: str, since: str | None) -> None:
     相交 ⟹ 那些行**还在模型的上下文里**，这次读是冗余的。三分之一的读取落在这
     一档，但其中约一半由压缩解释得通（压缩把旧结果换走了，重读是正当的），所以
     压缩边界必须清空区间集合——不清空会把正当行为算成打转。plan 151 的判定就是
-    这一栏，它的验收也拿这个数复算。
+    这一栏；提醒真正响几次由 [`report_advisory`] 另算。
     """
     fresh = paged = overlap = 0
     worst: collections.Counter = collections.Counter()
+    runs: list[int] = []
     for path in sorted(ROLLOUTS.glob("*/sessions/*.jsonl")):
         if since and path.stem[:8] <= since:
             continue
         seen: dict[str, list[tuple[int, int]]] = collections.defaultdict(list)
+        streak: collections.Counter = collections.Counter()
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
@@ -158,7 +161,9 @@ def report_overlap(tool: str, since: str | None) -> None:
             except ValueError:
                 continue
             if item.get("type") == "compacted":
+                runs += [n for n in streak.values() if n]
                 seen.clear()
+                streak.clear()
                 continue
             if item.get("type") != "message":
                 continue
@@ -178,9 +183,11 @@ def report_overlap(tool: str, since: str | None) -> None:
                 elif any(start < r[1] and r[0] < end for r in before):
                     overlap += 1
                     worst[target] += 1
+                    streak[target] += 1
                 else:
                     paged += 1
                 before.append((start, end))
+        runs += [n for n in streak.values() if n]
     total = fresh + paged + overlap
     if not total:
         print(f"\n区间重叠: 语料里没有带 path 的 {tool} 调用")
@@ -191,6 +198,24 @@ def report_overlap(tool: str, since: str | None) -> None:
     print(f"  **重读已读过的** : {overlap} ({overlap * 100 / total:.1f}%)")
     for target, count in worst.most_common(5):
         print(f"    {count:>4}  {target}")
+    report_advisory(runs)
+
+
+def report_advisory(runs: list[int]) -> None:
+    """重叠**次数**不是提醒**次数**——plan 151 的验收原本把这两个混成了一个。
+
+    提醒按周期响（第 3 次重读、之后每 3 次），所以一条重叠 4 次的序列只响 1 次，
+    而一条重叠 1 次的一次都不响。两个数差一个数量级：234 次重叠 → 15 次提醒。
+    实现（`REREAD_ADVISORY_EVERY`）要复算的是这一栏，不是上面那栏。
+    一条"序列"= 一个（文件，压缩窗口）。
+    """
+    every = 3
+    fires = sum(count // every for count in runs)
+    print(f"\n提醒会响几次（第 {every} 次重读、之后每 {every} 次）: {fires}")
+    print(f"  {len(runs)} 条重叠序列，总重叠 {sum(runs)}")
+    dist = collections.Counter(runs)
+    spread = "  ".join(f"{k}次:{dist[k]}条" for k in sorted(dist))
+    print(f"  每条序列的长度: {spread}")
 
 
 def count_lines(text: str) -> int:

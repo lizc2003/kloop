@@ -443,6 +443,11 @@ pub(crate) async fn compact_once(
         ));
     }
     history.replace_all(items);
+    // The folded tool results are gone from the context, so the file lines they
+    // carried are not in front of the model either — reading those lines again
+    // is legitimate, not going in circles. Part of the reread judgement, not an
+    // optimization: without it the advisory fires on correct behavior.
+    cfg.effective_file_state().forget_context_reads();
     Ok(CompactionOutcome::Applied(CompactionReceipt {
         summarized: request_plan.summarized,
         kept: request_plan.kept,

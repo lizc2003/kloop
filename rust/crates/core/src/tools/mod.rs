@@ -12,6 +12,8 @@ mod fs;
 mod inject;
 pub(crate) mod notebook;
 #[cfg(test)]
+mod plan151_acceptance_tests;
+#[cfg(test)]
 mod plan49_parity_tests;
 #[cfg(test)]
 mod plan50_parity_tests;
@@ -1187,6 +1189,24 @@ fn settle_execution(id: &str, gated: Option<Result<ToolExecution>>) -> (ContentB
     }
 }
 
+/// Append a model-visible notice to a finished tool result. Appending to the
+/// result rather than recording a history entry of its own is what keeps it
+/// ordered against the round's other results and replayable from a rollout.
+fn append_notice(result: &mut ContentBlock, notice: &str) {
+    let ContentBlock::ToolResult { content, .. } = result else {
+        return;
+    };
+    match content {
+        ToolResultContent::Text(text) => {
+            text.push('\n');
+            text.push_str(notice);
+        }
+        ToolResultContent::Blocks(blocks) => blocks.push(ContentBlock::Text {
+            text: notice.to_string(),
+        }),
+    }
+}
+
 async fn run_one(
     id: String,
     name: String,
@@ -1234,12 +1254,18 @@ async fn run_one(
         }
         result = &mut gated => Some(result),
     };
-    let (result, aftermath) = settle_execution(&id, gated_result);
+    let (mut result, aftermath) = settle_execution(&id, gated_result);
     // The model has a successful Read/Write/Edit only once the final tool_result
     // exists. Executor-local reads and work canceled while a post-hook runs do
     // not create write authority. Mutation executors clear authority before
     // touching disk, so an interrupted commit remains conservative.
+    //
+    // The reread advisory hangs off the same condition for the same reason: a
+    // read whose result the model never sees must not count as one it has.
     if let Some((state, update)) = aftermath.file_state_update {
+        if let Some(advisory) = fs::reread_advisory(&state, &update) {
+            append_notice(&mut result, &advisory);
+        }
         state.apply(update);
     }
     drop(aftermath.path_lock);
@@ -1670,10 +1696,20 @@ pub(crate) mod testutil {
         tag: &str,
         sources: Vec<Arc<dyn ToolSource>>,
     ) -> ToolCtx {
-        ToolCtx {
-            cfg: TestConfig::new(&format!("tools-{tag}"))
+        test_ctx_with_cfg(
+            depth,
+            TestConfig::new(&format!("tools-{tag}"))
                 .tool_sources(sources)
                 .build(),
+        )
+    }
+
+    /// A ctx over a Config the test built itself — for tests that must hold the
+    /// same session state (file observations, history) that the ctx dispatches
+    /// against, or that need a second ctx on a sub-agent's Config.
+    pub(crate) fn test_ctx_with_cfg(depth: u8, cfg: Arc<Config>) -> ToolCtx {
+        ToolCtx {
+            cfg,
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             depth,

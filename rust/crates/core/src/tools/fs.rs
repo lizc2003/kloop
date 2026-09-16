@@ -27,6 +27,7 @@ use crate::file_io::fingerprint_file;
 use crate::file_io::read_bounded;
 use crate::file_state::FileIdentity;
 use crate::file_state::FileObservation;
+use crate::file_state::FileState;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
 use crate::file_state::normalize_absolute_path;
@@ -34,6 +35,44 @@ use crate::image::MAX_IMAGE_BYTES;
 use crate::image::detect_media_type;
 use crate::image::image_block_from_bytes;
 use crate::text_edit::apply_text_edit;
+
+/// How many redundant rereads of one path pass between advisories.
+///
+/// Measured rather than picked: replaying 1 691 real `read_file` calls, 234
+/// (13.8%) read over lines still in context, spread across 172 runs whose
+/// longest reached 7. A 3/5/8 ladder therefore fired 15 times — 14 of them at
+/// the 3, once at the 5, never at the 8. One period says the same thing with
+/// one constant. `scripts/tool-usage.py read_file --since 20260903 --overlap`
+/// recomputes the input; the corpus is 98.5% one project, so the rate is a
+/// floor for that workload, not a universal one.
+const REREAD_ADVISORY_EVERY: u32 = 3;
+
+/// Tell the model it just re-read lines it already has, if this is the read to
+/// say it on. Advisory only: the read ran, and the result it rides on is whole.
+///
+/// It rides on the tool result rather than a history entry of its own so that a
+/// replayed rollout reproduces it in the same place, and it costs ~350 chars
+/// against the 2 000 that separate `READ_CONTENT_CHARS` from `OFFLOAD_CAP_CHARS`.
+///
+/// Reached through the state update because `Observe` is `read_file`'s alone —
+/// the writes carry `Replace`/`Clear`, and no other tool records an observation.
+pub(super) fn reread_advisory(state: &FileState, update: &FileStateUpdate) -> Option<String> {
+    let FileStateUpdate::Observe { path, observation } = update else {
+        return None;
+    };
+    let rereads = state.note_context_read(path, observation)?;
+    if rereads % REREAD_ADVISORY_EVERY != 0 {
+        return None;
+    }
+    Some(format!(
+        "<system-reminder>That read covered lines of {} you already have in this conversation; \
+         {rereads} reads of this file have now done that. Those lines are still above — look back \
+         at the earlier result instead of reading again. If re-reading is not getting you what you \
+         need, change approach: widen the range, grep for what you are after, or look somewhere \
+         else.</system-reminder>",
+        path.display()
+    ))
+}
 
 pub(super) struct ReadFileOutput {
     pub content: ToolResultContent,

@@ -1399,7 +1399,7 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   `.ipynb` keeps its 10 MiB Notebook limit. Each bounded read checks the opened
   handle's length before allocation, reads at most limit + 1, and verifies metadata,
   object identity, and content version afterward. Text lines are scanned without a
-  whole-file line index, numbered, and capped at 7,000 model-visible characters;
+  whole-file line index, numbered, and capped at `READ_CONTENT_CHARS` model-visible characters;
   `offset`/`limit`, trailing empty lines, PDF/non-UTF-8 errors, and structured
   PNG/JPEG/GIF/WebP blocks retain their prior behavior. CRLF is shown as logical LF,
   while an isolated `\r` remains content. On Unix, regular files with multiple hard
@@ -1461,6 +1461,32 @@ real-dispatch kloop report; generated contracts in
 `refs/claude-code-2.1.220/paired-parity.json` compare call/event/result/order/workspace
 projections and require exact-bundle bridges for cross-profile cells. Detailed
 policy differences remain in `tool-matrix.json`.
+
+### Reread advisory (Plan 151)
+
+A `read_file` whose line range intersects one this agent already put in front of
+the model is redundant: those lines are still in the conversation. Every third
+such read appends a `<system-reminder>` to the result naming the file. It is
+advisory only — the read runs, the result is whole, nothing is blocked or
+delayed — and it rides on the tool result rather than a history entry of its own,
+so a replayed rollout reproduces it in place.
+
+Only a *strict* intersection counts, so paging forward (`offset=1,limit=100`
+then `offset=101,limit=100`) never triggers it, and the range recorded is the one
+that actually reached the model, not the one requested. Two resets keep the count
+honest: compaction clears every range (the folded results left the context, so
+reading those lines again is correct), and a file whose version changed starts
+over (the lines in context no longer describe it). Keying that second reset on
+the file version rather than on which tool wrote is what makes an out-of-band
+edit — a `bash` heredoc, another process — count. Counts are per agent, falling
+out of the fresh `FileState` a sub-agent already receives.
+
+The period is measured, not chosen: replaying 1 691 real `read_file` calls,
+13.8% read over lines still in context, in 172 runs whose longest reached 7. A
+3/5/8 ladder would have fired 15 times, 14 of them at the 3.
+`scripts/tool-usage.py read_file --since 20260903 --overlap` recomputes it.
+`grep` has no equivalent rule — the same pattern against a different path is a
+new result, not a reread — and deliberately gets none.
 
 ### Notebook cells (Plan 57)
 

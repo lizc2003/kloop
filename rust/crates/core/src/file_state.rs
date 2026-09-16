@@ -24,6 +24,8 @@ pub struct FileState {
 
 struct Inner {
     observations: BTreeMap<PathBuf, Entry>,
+    /// Keyed like `observations` but with its own lifetime — see [`ContextReads`].
+    context_reads: BTreeMap<PathBuf, ContextReads>,
     locks: BTreeMap<PathBuf, Weak<AsyncMutex<()>>>,
     sequence: u64,
 }
@@ -75,6 +77,23 @@ pub(crate) struct FileVersion {
     fingerprint: [u8; 32],
 }
 
+/// Which lines of one path this session has already put in front of the model.
+///
+/// Deliberately not [`ReadCoverage`]: that answers "has the model seen enough
+/// of the CURRENT bytes to be allowed to edit them", so it survives compaction
+/// and dies when the bytes change. This answers "are those lines still in the
+/// conversation", which dies at compaction — and also when the bytes change,
+/// because re-reading a file something else rewrote is not going in circles.
+/// Keying the reset on the file version rather than on which tool wrote is what
+/// makes an out-of-band edit (a `bash` heredoc, another process) count too.
+#[derive(Default)]
+struct ContextReads {
+    version: Option<FileVersion>,
+    ranges: Vec<Range<u64>>,
+    rereads: u32,
+    last_updated: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadCoverage {
     total_units: u64,
@@ -111,6 +130,7 @@ impl FileState {
         Self {
             inner: Mutex::new(Inner {
                 observations: BTreeMap::new(),
+                context_reads: BTreeMap::new(),
                 locks: BTreeMap::new(),
                 sequence: 0,
             }),
@@ -166,6 +186,75 @@ impl FileState {
             }
         }
         self.evict_to_limits(&mut inner);
+    }
+
+    /// Record that `observation`'s lines just reached the model, and answer how
+    /// many times this path has now been read over lines the model already had.
+    ///
+    /// `None` means this read was not redundant: a first read, a fresh page, or
+    /// one that landed past EOF. Only a strict intersection counts, so paging
+    /// forward (`1..101`, then `101..201`) never does — that negative is half of
+    /// what makes the count mean anything. The other half is the version reset
+    /// above: rereading bytes that changed since is legitimate.
+    pub(crate) fn note_context_read(
+        &self,
+        path: &Path,
+        observation: &FileObservation,
+    ) -> Option<u32> {
+        let range = observation.read_range()?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.sequence = inner.sequence.wrapping_add(1);
+        let sequence = inner.sequence;
+        let max_ranges = self.max_ranges;
+        let entry = inner.context_reads.entry(path.to_path_buf()).or_default();
+        if entry.version.as_ref() != Some(observation.version()) {
+            *entry = ContextReads {
+                version: Some(observation.version().clone()),
+                ..ContextReads::default()
+            };
+        }
+        entry.last_updated = sequence;
+        let overlapped = entry
+            .ranges
+            .iter()
+            .any(|seen| range.start < seen.end && seen.start < range.end);
+        entry.ranges.push(range);
+        coalesce(&mut entry.ranges, max_ranges);
+        let rereads = overlapped.then(|| {
+            entry.rereads = entry.rereads.saturating_add(1);
+            entry.rereads
+        });
+        self.evict_context_reads(&mut inner);
+        rereads
+    }
+
+    /// Forget every context-residency range: compaction folded the tool results
+    /// away, so the lines they carried are no longer in front of the model.
+    ///
+    /// Blunt on purpose. Compaction keeps a tail, so some results do survive and
+    /// this under-counts them — the safe direction, since the failure mode worth
+    /// avoiding is telling the model it already has lines it no longer has.
+    pub(crate) fn forget_context_reads(&self) {
+        self.inner.lock().unwrap().context_reads.clear();
+    }
+
+    /// Same LRU bound as [`Self::evict_to_limits`], on the map that call does not
+    /// reach. Ordinary sessions never come near it: the map is emptied at every
+    /// compaction, so only a session with compaction disabled can grow one.
+    fn evict_context_reads(&self, inner: &mut Inner) {
+        while inner.context_reads.len() > self.max_observations {
+            let Some(path) = inner
+                .context_reads
+                .iter()
+                .min_by(|(path_a, entry_a), (path_b, entry_b)| {
+                    (entry_a.last_updated, *path_a).cmp(&(entry_b.last_updated, *path_b))
+                })
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            inner.context_reads.remove(&path);
+        }
     }
 
     pub(crate) fn observation(&self, path: &Path) -> Option<FileObservation> {
@@ -299,6 +388,16 @@ impl FileObservation {
     pub(crate) fn is_complete(&self) -> bool {
         self.coverage.complete
     }
+
+    /// The one range THIS read established, before any merge with what the
+    /// session already knew — a fresh observation carries either that or, for a
+    /// read that landed past EOF, nothing at all.
+    pub(crate) fn read_range(&self) -> Option<Range<u64>> {
+        match self.coverage.ranges.as_slice() {
+            [range] => Some(range.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -396,20 +495,7 @@ impl ReadCoverage {
     fn merge(&mut self, older: &Self, max_ranges: usize) {
         self.complete |= older.complete;
         self.ranges.extend(older.ranges.iter().cloned());
-        self.ranges.sort_by_key(|range| (range.start, range.end));
-        let mut merged: Vec<Range<u64>> = Vec::new();
-        for range in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut()
-                && range.start <= last.end
-            {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-            if merged.len() < max_ranges {
-                merged.push(range);
-            }
-        }
-        self.ranges = merged;
+        coalesce(&mut self.ranges, max_ranges);
         self.recompute_complete();
     }
 
@@ -417,6 +503,31 @@ impl ReadCoverage {
         self.complete |= self.total_units == 0
             || matches!(self.ranges.as_slice(), [range] if range.start == 0 && range.end >= self.total_units);
     }
+}
+
+/// Normalize a range set in place: sort it and join everything that touches.
+/// Touching is enough to join (`1..101` and `101..201` become `1..201`), which
+/// is why a *strict* intersection is what the reread count tests for: a merged
+/// set must not turn tomorrow's fresh page into a reread.
+///
+/// Past `max_ranges` the set stops growing and the highest ranges are dropped.
+/// That can make a later read look fresh when it was not — under-counting, the
+/// same safe direction the coverage set already accepts.
+fn coalesce(ranges: &mut Vec<Range<u64>>, max_ranges: usize) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<u64>> = Vec::new();
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        if merged.len() < max_ranges {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
 }
 
 fn observation_memory_bytes(observations: &BTreeMap<PathBuf, Entry>) -> usize {
