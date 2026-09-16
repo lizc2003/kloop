@@ -46,7 +46,8 @@ Plan 91 的 Plan 87–90 先行验收只增加 conformance evidence，不新增�
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
 | 压缩后重注入最近读过的 ≤5 文件 | cc 单家 | 未立 | dogfood 出现"压缩后失忆"痛感 |
-| microcompaction / 工具结果分档预算(200k/50k) | cc 单家 | 未立(offload 已覆盖大头) | 超长工具输出场景痛感 |
+| 工具结果分档预算(200k/50k) | cc 单家 | **✅ Plan 154(2026-09-16)**:`ROUND_OFFLOAD_CAP_CHARS` = 4 × 单条 cap = 128000,一轮结果超预算按大小降序贪心 spill,落盘失败回退内联(cc 同款取舍) | 已完成 |
+| microcompaction | cc 单家 | 未立(offload + 轮预算已覆盖大头) | 超长工具输出场景痛感 |
 | autocompact 警告带(剩 20k 提醒) | cc 单家 | 未立,小件 | 顺手做 |
 
 ### 2. 权限系统——✅ Project/Session/Workspace 归属已纠偏
@@ -322,7 +323,7 @@ D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/t
 | send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **✅ Plan 70（2026-08-10）**：同 session `main ↔ agent-N` 与 sibling，typed local identity、严格有界 FIFO、safe-boundary delivery、独立 lifecycle；A2A 1.0 aligned 但不是 A2A endpoint/support | 已完成 |
 | ListAgents / local live roster | CC exact bundle 有 descriptor/gate；远程/team profile 不权威 | **✅ Plan 70（2026-08-10）**：严格 `list_agents {}` 只列同 directory Open peers；不做 remote discovery、Agent Card 或团队持久态 | 已完成 |
 | child/background execution provenance | CodeWhale receipt 思路 + kloop 分型生命周期 | **✅ Plan 88（2026-08-15）**：core-private 2 KiB typed receipt 冻结 execution parent、Agent-only mailbox、transient/durable、rollout、workspace 与 terminal owner；现有 registries 持 receipt/typed handle；Program/Workflow bounded `provenance.json` 与 journal v3 保存审计 evidence，v1/v2 不兼容 replay，public wire/Task/billing 不变 | 已完成 |
-| Agent 并发上限 | exact 2.1.220 当前 profile 未测出统一 cap | 保留 kloop：同步批并发；后台 agent/program 每 session 8 | native 压测或失控实例证明需排队策略时 |
+| Agent 并发上限 | exact 2.1.220 profile 测不出;逆向源码里 cc 的 `AgentTool` 与 `Read` 共用同一个 10 | **✅ Plan 154(2026-09-16)**:批内统一 `MAX_CONCURRENT_TOOL_CALLS` = 10(cc / deepseek-harness 同值),`run_agent` 与其他工具同一个上限;后台 agent/program 每 session 8 不变 | 已完成 |
 | agent 类型 per-type effort/max_turns | cc 单家 | plan 17 片 2 未做节 | 有真实 agent 类型库再说 |
 
 ### 6. code mode——✅ 无挂账(plan 24/27 全清)

@@ -110,3 +110,109 @@ offload 的设计意图是"别让一个结果撑爆上下文";在多结果的情
 5. **两处聚合点都设防**:`agent.rs:836` 与 `:1036` 两条路径各有一条测试。
 6. **未超预算时零行为变化**:一轮两条小结果,history 内容与改动前逐字节相同。
 7. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自单独取退出码)。
+
+## ✅ 已完成(2026-09-16;提交 SHA 以本条所在提交为准)
+
+开工时用户只说了一句「看参考项目」,三个待定的点全部由参考实现回答,没有一个靠拍脑袋:
+
+| 参考 | 并发上限 | 一轮总预算 |
+|---|---|---|
+| **cc** | `toolOrchestration.ts:9` 统一 **10**(env `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`),滚动池 `all(gens, cap)` | `applyToolResultBudget` / `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` = **200 000**,单条 `DEFAULT_MAX_RESULT_SIZE_CHARS` = 50 000 → **4:1** |
+| **deepseek-harness** | `agent-loop/src/constants.ts:6` 统一 **10**,bounded rolling pool(槽位空出时重新分类后续调用) | 无轮预算,每个工具自己 bounded(`ItemRetainer`/`TextRetainer`) |
+| **grok-build** | 普通工具**没有**全局上限;只给 media-gen 按工具名设额(image 8 / video 4),且不排队是**拒绝**(前 K 个跑,尾部 error tool_result;超 2× 判 spam 整批重采样 + 提醒) | 无 |
+| **codex** | 无批上限,`tools/parallel.rs` 的 `RwLock<()>` 只做并/串互斥 | 无 |
+
+由此定下并落地的三条:
+
+1. **统一上限 10,不分类。** 开工前我提过"进程类(只读 bash)/纯读类/起 agent 类分三档",
+   **参考里没有先例**:cc 的 `AgentTool.isConcurrencySafe()`(`AgentTool.tsx:1467`)也返回
+   `true`,子 agent 和 `read_file` 共用同一个 10;grok 唯一分类的那次分的不是成本类别,
+   是"少数极贵的工具各自一个名额",kloop 没有 `image_gen` 那种量级的工具。实现是
+   `dispatch_tools` 的 safe 分支里一个 batch-局部 `Semaphore`,**批不切小**(分组语义与
+   `ToolSearch` 排序屏障原样),`join_all` 仍按请求顺序返回,完成的调用立刻放permit
+   —— 上限数的是"真在跑的",不是"占着槽等人收结果的"。等 permit 期间被取消的调用不会
+   执行:`run_one` 先看到 cancelled token,直接 settle 成 interrupted。
+2. **轮预算 = 4 × 单条 cap = 128 000 字符**,照 cc 的比例。落在 `History::record`。
+3. **按大小降序贪心 spill,回预算内即停**(cc 的 `selectFreshToReplace` 同款);
+   **落盘失败回退内联**(cc 的 `if (replacement === null) continue` 同款),单条 cap 那条路
+   没有这个选项,继续截断。两种取舍的理由都写进了 `enforce_round_budget` / `spill` 的注释。
+
+**参考里没有、但实现时必须补的一条**:结果太小时,spill 会让一轮**变大**——preview
+(head 1500 + tail 500)加上指针那段话本身就有两千多字符,一轮 80 条 1800 字符的结果
+(144 000 > 预算)如果照 largest-first 一路 spill 下去,换来的是 80 个指针、总量涨到二十万。
+所以每次 spill 后比一次长度:指针不比原文短就把文件删掉、结果放回内联,并**就此停手**
+(结果是按大小降序走的,后面的只会更不划算)。cc 的 `selectFreshToReplace` 没有这道门
+——它按"减去整条大小"估算,选完就 persist——因为它的单条阈值是 50 000、预览 2 000,
+两者差 25 倍,小结果进不了那条路;kloop 的比值窄得多,这道门是必需的。
+
+**plan 第四节的"两处聚合点"是错的,已在实现里消解。** `agent.rs:1036` 的
+`dispatch_structured_tools` 只**返回**结果,它和普通路径最后都汇到 `agent.rs` 那一句
+`history.record(Message::tool_results(results))` —— 生产里把工具结果写进 history 的地方
+**只有这一处**(另一处 `rollout.rs` 是 resume 时给孤儿 tool_use 补 `interrupted`)。预算做进
+`record`(单条 spill 已经在那里)就天然覆盖两条路,不需要两处设防;`a_wide_round_lands_under_budget_on_both_dispatch_paths`
+仍按验收把两条路各跑一遍,钉住这个结构。
+
+**cc 有一半复杂度 kloop 不需要**:它的 `seenIds`/`replacements` 冻结 + 写进 transcript,
+是因为它在**组请求时**才替换,同一条结果每轮重算,不冻结就掉 prompt cache。kloop 在
+`record` 当场落盘、一次写死,天然稳定,这套状态机整个不用要。
+
+顺带把 `spill` 拆成 `spill_to_disk`(`io::Result`,只管写盘与指针)+ 自由函数 `preview`,
+两条 spill 路径共用同一段 head/tail,失败与成功的文本到指针为止逐字相同。
+
+测试(全部有 negative control):
+- `a_concurrent_batch_runs_at_most_the_call_limit_at_once` —— 25 个只读外部调用,
+  `ConcurrencyProbe` 记录峰值;把 permit 数换成 `Semaphore::MAX_PERMITS` 后断言 25 ≠ 10 失败。
+  同一条测试断言顺序仍是 t0..t24。
+- `tool_search_still_splits_the_batch_it_sits_between` —— 屏障两侧不合批(第一条阻塞时
+  第二条永远起不来),**同测试内**带负对照:去掉中间的 `tool_search`,同样两条调用峰值为 2。
+- `a_wide_round_spills_its_largest_results_until_it_is_under_budget` —— 十条结果 175 000 字符,
+  只有最大的两条(且不在请求序的前两位)落盘,其余八条逐字未动,总量回到预算内;
+  去掉 `enforce_round_budget` 调用即失败。
+- `a_round_under_budget_is_recorded_verbatim` —— 整对象相等,且 offload 目录**不存在**。
+- `a_round_of_results_too_small_to_shrink_is_left_alone` —— 80 条 1800 字符(144 000 超预算),
+  一条都不落盘、整对象相等、offload 目录里 0 个文件;去掉长度比较那道门即失败。
+- `a_spill_that_cannot_reach_disk_stays_inline_for_the_round_budget_only` —— 在 offload 目录
+  的位置放一个文件让 `create_dir_all` 失败:轮预算那一轮整体逐字保留,单条超 cap 的那条
+  仍带 `offload to disk failed ... output truncated`。
+- `a_wide_round_lands_under_budget_on_both_dispatch_paths` —— agent 层,ordinary 与
+  structured 两条 dispatch 路径各一轮六条。
+
+`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace`
+各自单独取退出码,全绿。README 的赌注 1、赌注 3 与"Parallel sub-agents"三节同步;
+`docs/capability-report.md` 销掉两笔账(工具结果分档预算、Agent 并发上限)。
+
+**非目标全部守住**:offload 形态、沙箱 carve-out、`OFFLOAD_CAP_CHARS`、并发分组规则与
+`is_concurrency_safe`(含只读 bash 算安全)一行未动;没做工具级重试,没碰 plan 151。
+
+## 已知边界:轮预算能 spill 掉"读回 offload 文件"的那次读
+
+收尾时用户问"`read_file` 的 30 000 字符合理吗",顺着查出来的一条**本次改动新开的门**,
+记在这里,当前不修。
+
+`OFFLOAD_CAP_CHARS` 的注释写着它的存在理由:读回一个 spill 文件的回复**不能再次 spill**,
+否则模型拿到的是同一份内容换个路径的预览,"逃生口在恰好需要它的尺寸上失效"。plan 111
+删掉 `read_offloaded` 之后,这条不变量的担保人就是 `READ_CONTENT_CHARS = 30_000 < 32_000`
+—— 而这是一条**单条结果**的保证。
+
+轮预算是按**一轮**算的,于是:`read_file(off-0007.txt)` 只要和另外四个 ~30 000 字符的读
+同轮(5 × 30 000 = 150 000 > 128 000),就可能被选中落盘,模型在"我要读那个文件"的地方
+拿到 `off-0012.txt` 的又一个指针。
+
+**当前不修,理由三条**:(a) 要凑够五个满额结果同轮,且被读回的那个恰好排进最大的几条;
+(b) 模型能自救——用更窄的 `offset` 重读,或直接 grep;(c) 轮预算本来就是"这一轮太占上下文"
+的判断,一轮 150 000 字符确实该瘦身,给某个工具开豁免是收益不明的复杂度。
+
+**真要修的话形状是现成的**:cc 的 `enforceToolResultBudget` 带一个 `skipToolNames`,
+给"自己已经 bounded 的工具"(`maxResultSizeChars: Infinity`)豁免于轮预算 —— kloop 对应的
+就是 `read_file`,它的 `READ_CONTENT_CHARS` 正是那种自我约束。触发条件:真见到一次模型
+读 offload 文件却拿回指针。
+
+顺带记下同一次问答里查清的两条,供将来动 `READ_CONTENT_CHARS` 时用:
+**(a) 30 000 不是选出来的,是 32 000 减 2 000**,而那条"全局低于 offload 阈值"的不变量
+其实只有"读 offload 文件"这一条路径需要——窄化成"目标在 offload 目录内时才封顶",
+读上限就能往上走。cc 就不立这条:Read 上限 25 000 token(≈100 000 字符)、persist 阈值
+50 000,**大读取允许落盘换预览**,对文件读取来说这特别便宜(模型手里已经有路径)。
+**(b) cc 超限是抛错不是截断**,而且有实验记录(`FileReadTool/limits.ts` 头部,#21841,
+2026-03):试过改截断,tool 错误率下降但平均 token 上升(抛错回 ~100 字节,截断回 25K
+token),于是回退。kloop 现在是截断。
+动这个数之前先读 plan 106 片 16——它证明这类改动的收益落在 1.8 倍的运行方差里,量不出来。

@@ -10,6 +10,22 @@ validate five architectural bets before committing to a larger agent design.
    session store when recorded; the history keeps a head/tail preview plus the
    spilled file's **absolute path** and character count.
 
+   **One round of results has its own cap.** A per-result cap only ever judges
+   one call, so ten results of 31999 chars each pass it untouched and put
+   ~320000 chars into one round. `ROUND_OFFLOAD_CAP_CHARS` (4 × the per-result
+   cap = 128000) bounds a round's tool results *together*: over budget, the
+   round spills its largest results — largest first, stopping the moment it is
+   back under — through the same preview-plus-path shape. This is cc's
+   `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200000 over a 50000 per-result cap),
+   same 4:1 ratio and same largest-first selection. A spill that cannot reach
+   disk leaves its result **inline and whole**: it was under the per-result cap,
+   so destroying content to defend a context budget is the worse trade, and the
+   budget deliberately loses when the disk does. A per-result spill has no such
+   option and still truncates. A result smaller than the preview-plus-path that
+   would replace it is left alone and stops the pass — a round that is over
+   budget only by having many small results has no spill that helps, and paying
+   context for pointers instead of content would be the worst of both.
+
    **There is no reader tool.** The artifact is an ordinary file, so the ordinary
    tools open it — which is cc's shape: it hands back an `outputFile` path and
    the model reads it with `Read`/`Bash`, and its own `Read` has no raw mode
@@ -55,6 +71,13 @@ validate five architectural bets before committing to a larger agent design.
    consecutive safe calls run as one concurrent batch, everything else runs
    sequentially. Built-ins answer from the one `Builtin` enum (below), so the
    verdict is a written judgement rather than whatever the default arm was.
+   A batch is never split to bound it — grouping and the `tool_search` ordering
+   barrier stay exactly as classified — but at most `MAX_CONCURRENT_TOOL_CALLS`
+   (10) of a batch run at once, so a round of 50 read-only `bash` calls is 10
+   processes at a time, not 50. One number for every tool, as in cc
+   (`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`, 10) and deepseek-harness
+   (`DEFAULT_MAX_PARALLEL_TOOL_CALLS`, 10); results still come back in request
+   order.
 4. **Sub-agents recurse into the same `run_turn` loop** (depth capped at 1;
    `Pin<Box<dyn Future>>` breaks the type recursion).
 5. **Provider seam.** Internals speak Anthropic Messages shape only; adapters
@@ -1796,7 +1819,9 @@ unknown rather than weakening kloop's safety policy to manufacture fixtures.
 
 The `run_agent` tool dispatches concurrently (cc shape): `is_concurrency_safe`
 marks `run_agent` unconditionally safe, so consecutive run_agent calls in one response
-run as parallel sub-agents inside the ordinary concurrent batch. Results stay
+run as parallel sub-agents inside the ordinary concurrent batch — under the same
+`MAX_CONCURRENT_TOOL_CALLS` as every other tool, which is also cc's shape (its
+`AgentTool` shares the one cap with `Read`). Results stay
 paired to their `tool_use_id`s in request order; one sub-agent failing (bad
 input, error, panic) becomes its own `is_error` tool_result without sinking
 the batch. Sub-agents' own writes are still gated individually — hooks and

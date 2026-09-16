@@ -94,6 +94,21 @@ use kloop_protocol::ToolResultContent;
 /// Default for `Config.defer_threshold` (`KLOOP_DEFER_THRESHOLD` overrides).
 pub const TOOL_DEFER_THRESHOLD: usize = 30;
 
+/// Most calls that may be running at once inside one concurrent batch. The
+/// batch is not split to enforce it: grouping stays "consecutive calls of the
+/// same concurrency safety", with `tool_search` as the ordering barrier
+/// ([`Builtin::concurrency_safe`]), and this only bounds how many of a group
+/// run at the same moment.
+///
+/// One number for every tool, as in cc (`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`,
+/// default 10) and deepseek-harness (`DEFAULT_MAX_PARALLEL_TOOL_CALLS`, also
+/// 10). Splitting it by cost class — `read_file` against read-only `bash`
+/// against `run_agent` — has no precedent in either: cc runs sub-agents under
+/// this same one cap. The one reference that does split (grok) gives a private
+/// budget to a handful of individually expensive tools (image/video
+/// generation), which is a different mechanism for a tool kloop does not have.
+pub const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
 /// An external provider of tools (Web tools, an MCP server, or another CLI
 /// adapter). Core only knows this seam; transport and network implementations
 /// live outside core. Implementations expose unique tool names; MCP adapters
@@ -691,9 +706,10 @@ pub(crate) fn normalize_tool_uses(
 }
 
 /// Execute one round of tool calls. Consecutive concurrency-safe calls run as
-/// one concurrent batch (join_all); everything else runs sequentially. Every
-/// tool_use always gets a paired tool_result: cancellation patches the
-/// remaining calls with is_error "interrupted" results so history stays legal.
+/// one concurrent batch, at most [`MAX_CONCURRENT_TOOL_CALLS`] of them at a
+/// time; everything else runs sequentially. Every tool_use always gets a paired
+/// tool_result: cancellation patches the remaining calls with is_error
+/// "interrupted" results so history stays legal.
 pub async fn dispatch_tools(
     tool_uses: Vec<(String, String, Value)>,
     ctx: &ToolCtx,
@@ -722,14 +738,30 @@ pub async fn dispatch_tools(
         if ctx.cancel.is_cancelled() {
             results.extend(batch.iter().map(|(id, _, _)| interrupted(id)));
         } else if safe {
+            // One permit per call in flight. join_all still yields results in
+            // request order, and a finished call drops its permit at once, so
+            // the cap counts calls that are actually running rather than slots
+            // held by results waiting to be collected. A call that waits for a
+            // permit through a cancellation never reaches its executor:
+            // `run_one` observes the cancelled token first and settles as
+            // interrupted.
+            let limiter = tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS);
             let futs = batch.iter().map(|(id, name, input)| {
-                run_one(
+                let call = run_one(
                     id.clone(),
                     name.clone(),
                     input.clone(),
                     ctx.clone(),
                     expected_program_source(name),
-                )
+                );
+                let limiter = &limiter;
+                async move {
+                    let _permit = limiter
+                        .acquire()
+                        .await
+                        .expect("the batch limiter outlives its batch and is never closed");
+                    call.await
+                }
             });
             results.extend(futures::future::join_all(futs).await);
         } else {
@@ -2001,6 +2033,98 @@ mod tests {
                     "echoed {}",
                     input["text"].as_str().unwrap_or("?")
                 )))
+            })
+        }
+    }
+
+    /// Read-only external source that counts how many of its calls overlap.
+    /// Each call registers and then blocks on `gate` until the test releases
+    /// it, so the peak is whatever the dispatcher allowed to run at once
+    /// rather than a timing artifact of how fast the calls returned.
+    struct ConcurrencyProbe {
+        started: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl ConcurrencyProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(ConcurrencyProbe {
+                started: Default::default(),
+                active: Default::default(),
+                peak: Default::default(),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+
+        /// Let `calls` blocked calls finish. Permits granted before a call
+        /// arrives wait for it.
+        fn release(&self, calls: usize) {
+            self.gate.add_permits(calls);
+        }
+
+        /// Hand the runtime back until `want` calls have started. Callers wrap
+        /// this in a timeout: it never returns on its own if the dispatcher
+        /// refuses to start that many.
+        async fn wait_for_started(&self, want: usize) {
+            while self.started() < want {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Hand the runtime back long enough for the dispatcher to start
+        /// everything it is willing to start.
+        async fn settle(&self) {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn calls(&self, count: usize) -> Vec<(String, String, Value)> {
+            (0..count)
+                .map(|n| (format!("t{n}"), "probe__wait".into(), json!({"n": n})))
+                .collect()
+        }
+    }
+
+    impl ToolSource for ConcurrencyProbe {
+        fn defs(&self) -> Arc<[ToolDef]> {
+            Arc::from(vec![ToolDef {
+                name: "probe__wait".into(),
+                description: "blocks until the test releases it".into(),
+                schema: json!({"type": "object"}),
+            }])
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            true
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            input: &'a Value,
+        ) -> Pin<Box<dyn Future<Output = Result<SourceOutput>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                self.gate
+                    .acquire()
+                    .await
+                    .expect("the probe gate is never closed")
+                    .forget();
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(SourceOutput::text(format!("probe {}", input["n"])))
             })
         }
     }
@@ -3582,6 +3706,114 @@ mod tests {
         })
         .await
         .expect("PowerShell gate waiter ignored cancellation");
+    }
+
+    fn result_ids(results: &[ContentBlock]) -> Vec<String> {
+        results
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.clone(),
+                other => panic!("expected tool result, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A batch is never split to enforce the cap, so a round of 25 read-only
+    /// calls is still one batch — but only [`MAX_CONCURRENT_TOOL_CALLS`] of
+    /// them ever run at once, and the results still come back in request order.
+    #[tokio::test]
+    async fn a_concurrent_batch_runs_at_most_the_call_limit_at_once() {
+        let probe = ConcurrencyProbe::new();
+        let sources: Vec<Arc<dyn ToolSource>> = vec![probe.clone()];
+        let ctx = test_ctx_with_sources(0, "concurrency-cap", sources);
+        let calls = MAX_CONCURRENT_TOOL_CALLS * 2 + 5;
+        let uses = probe.calls(calls);
+        let dispatch = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { dispatch_tools(uses, &ctx).await }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.wait_for_started(MAX_CONCURRENT_TOOL_CALLS),
+        )
+        .await
+        .expect("the batch never reached the concurrency limit");
+        probe.settle().await;
+        assert_eq!(probe.started(), MAX_CONCURRENT_TOOL_CALLS);
+
+        probe.release(calls);
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+            .await
+            .expect("the batch stalled behind the limiter")
+            .expect("dispatch task panicked");
+        assert_eq!(probe.peak(), MAX_CONCURRENT_TOOL_CALLS);
+        assert_eq!(
+            result_ids(&results),
+            (0..calls).map(|n| format!("t{n}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// `tool_search` is an ordering barrier: the read-only calls around it must
+    /// stay in separate batches, so a following call cannot start until the
+    /// preceding one has finished. The same two calls without it do overlap —
+    /// that half is the negative control for the first.
+    #[tokio::test]
+    async fn tool_search_still_splits_the_batch_it_sits_between() {
+        let probe = ConcurrencyProbe::new();
+        let sources: Vec<Arc<dyn ToolSource>> = vec![probe.clone()];
+        let ctx = test_ctx_with_sources(0, "concurrency-barrier", sources);
+        let uses = vec![
+            ("t0".into(), "probe__wait".into(), json!({"n": 0})),
+            (
+                "search".into(),
+                "tool_search".into(),
+                json!({"query": "probe", "max_results": 1}),
+            ),
+            ("t1".into(), "probe__wait".into(), json!({"n": 1})),
+        ];
+        let dispatch = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { dispatch_tools(uses, &ctx).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), probe.wait_for_started(1))
+            .await
+            .expect("the first call never started");
+        probe.settle().await;
+        assert_eq!(
+            probe.started(),
+            1,
+            "the call after tool_search joined the batch before it"
+        );
+
+        probe.release(2);
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+            .await
+            .expect("the barred batch stalled")
+            .expect("dispatch task panicked");
+        assert_eq!(probe.peak(), 1);
+        assert_eq!(result_ids(&results), vec!["t0", "search", "t1"]);
+
+        let overlapping = ConcurrencyProbe::new();
+        let sources: Vec<Arc<dyn ToolSource>> = vec![overlapping.clone()];
+        let ctx = test_ctx_with_sources(0, "concurrency-no-barrier", sources);
+        let uses = overlapping.calls(2);
+        let dispatch = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { dispatch_tools(uses, &ctx).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            overlapping.wait_for_started(2),
+        )
+        .await
+        .expect("two read-only calls with nothing between them did not overlap");
+        overlapping.release(2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+            .await
+            .expect("the unbarred batch stalled")
+            .expect("dispatch task panicked");
+        assert_eq!(overlapping.peak(), 2);
     }
 
     #[tokio::test]

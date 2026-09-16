@@ -149,6 +149,24 @@ SDK 子进程 / 真 Codex / 真 Claude Code，加 continuable child 的 send_mes
 list_agents），以及 hooks 不发明自己的协议、直接跑 Claude Code 与 Codex 的 `hooks.json` 并共享一份
 hook-protocol 的做法。
 
+**并发批上限与"一轮结果"预算的四方对照**(2026-09-16 补,plan 154 开工时用户要求"看参考项目"
+后逐个读的;此前本文只记了 cc 的"只读批并发上限 10",太窄,导致我据此提了一个四家都没有的分档方案)：
+
+| 参考 | 批内并发上限 | 一轮结果的总预算 |
+|---|---|---|
+| **cc** | `src/services/tools/toolOrchestration.ts:9` `getMaxToolUseConcurrency()` 统一 **10**,env `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` 可改;`all(gens, cap)` 滚动池。**不分类**——`AgentTool.tsx:1467` 的 `isConcurrencySafe()` 返回 `true`,子 agent 和 `Read` 共用这一个 10 | **有**。`src/utils/toolResultStorage.ts` 的 `enforceToolResultBudget`/`applyToolResultBudget`,限额 `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` = 200 000(`src/constants/toolLimits.ts:48`),单条 `DEFAULT_MAX_RESULT_SIZE_CHARS` = 50 000 → **4:1**。注释写的动机与 kloop 遇到的一模一样:"prevents N parallel tools from each hitting the per-tool max and collectively producing e.g. 10 × 40K" |
+| **deepseek-harness** | `packages/core/agent-loop/src/constants.ts:6` `DEFAULT_MAX_PARALLEL_TOOL_CALLS` = **10**,config 可改;bounded rolling pool,**槽位空出时重新分类**后续调用(注册表可能已变) | **无**。每个工具自己 bounded(`packages/util/output-retention` 的 `ItemRetainer`/`TextRetainer`) |
+| **grok-build** | 普通工具**没有**全局上限;只有 `xai-grok-tools/src/media_gen_limits.rs` 给 media-gen **按工具名**设额(image 8 / video 4),而且**不是排队是拒绝**:前 K 个照跑、尾部回 error tool_result 告诉模型"一步最多 K 个";`total >= 2 * max` 判 spam,整批丢弃重采样并塞一句提醒 | **无** |
+| **codex** | 无批上限。`core/src/tools/parallel.rs` 的 `parallel_execution: Arc<RwLock<()>>` 只做并行/串行互斥 | **无**(有单条 `unified_exec` 的 `DEFAULT_MAX_OUTPUT_TOKENS` = 10 000) |
+
+三条可直接复用的结论:**(a) 上限是一个数管所有工具**,两家生产实现同值 10,没有一家按"进程/纯读/起 agent"
+分成本档;grok 那次分的是"少数单次调用极贵的工具各自一个名额",是另一个机制。**(b) 轮预算的可移植量是
+比值不是绝对值**(cc 是 4:1,kloop 单条 cap 32 000 → 128 000)。**(c) 超预算时按结果大小降序贪心、回到
+预算内即停**(`selectFreshToReplace`),**落盘失败则保留内联、预算失守**(`if (replacement === null) continue`)
+——后者与 dsh 的"spill 失败就保留内联、不让工具失败"是同一条边界,两家独立同解。kloop 不需要抄的是
+cc 的 `seenIds`/`replacements` 冻结 + 写 transcript:那是因为 cc 在**组请求时**才替换、每轮重算,不冻结
+就掉 prompt cache;kloop 在 `History::record` 当场落盘、一次写死,天然稳定。
+
 **`present` 工具:看过,当前不做,条件记在这里**(2026-09-15 追记)。dsh 的
 `packages/fs/tool-present` 让模型在写完文件后、最终回复前声明交付物:
 `present({files: [{path, description?}]})`,只记路径与描述、**不复制内容**,做 metadata

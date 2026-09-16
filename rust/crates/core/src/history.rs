@@ -36,7 +36,25 @@ const TAIL_CHARS: usize = 500;
 /// byte-identical preview under a fresh path, the escape failing at exactly the
 /// size that needs it. `read_file`'s budget (`READ_CONTENT_CHARS`) is the one
 /// that has to respect this today.
+///
+/// **That guarantee is per result, not per round.** A read-back that shares a
+/// round with four other large results can still be spilled by
+/// [`ROUND_OFFLOAD_CAP_CHARS`] below, handing the model a second pointer where
+/// it asked for the file. Known and accepted: the recourse is a narrower
+/// `offset`, and the shape of a fix if it is ever seen for real is cc's
+/// `skipToolNames` — a round budget that skips tools which bound themselves.
 pub const OFFLOAD_CAP_CHARS: usize = 32_000;
+
+/// Char budget for one round's tool results taken *together*.
+/// [`OFFLOAD_CAP_CHARS`] only ever judges one result, so ten results of 31 999
+/// chars each pass it untouched and put ~320 000 chars (~80 000 tokens) into
+/// the context in a single round — the hole cc's per-message budget exists to
+/// close (`MAX_TOOL_RESULTS_PER_MESSAGE_CHARS`, 200 000 chars over a 50 000
+/// per-result cap; the comment there names the same "10 × 40K in one turn"
+/// shape). Same 4:1 ratio here. The two caps answer two different questions:
+/// lowering this one would spill results that are individually fine, and
+/// lowering that one would spill results no round ever had a problem with.
+pub const ROUND_OFFLOAD_CAP_CHARS: usize = 4 * OFFLOAD_CAP_CHARS;
 
 /// Append-only conversation history. Oversized tool results are offloaded to
 /// disk at record time; the history keeps a preview plus the file's path, which
@@ -134,6 +152,7 @@ impl History {
                 *text = self.offload_text(content);
             }
         }
+        self.enforce_round_budget(&mut msg);
         let boundary = self
             .rollout
             .as_ref()
@@ -495,14 +514,99 @@ impl History {
         self.usage_anchor = None;
     }
 
+    /// Bound one round's tool results *together*. Each result has already
+    /// passed the per-result cap above; this spills the largest of what is
+    /// left — largest first, stopping the moment the round is back under
+    /// budget, which is cc's `selectFreshToReplace` — because a round of ten
+    /// just-under-cap results is exactly the shape a per-result cap cannot see.
+    ///
+    /// **A spill that cannot reach disk leaves its result inline, in full.**
+    /// The result was under the per-result cap, so the model can still use it;
+    /// truncating it would destroy content to defend a budget that is about
+    /// context size, not correctness, and the failure is the disk's, not the
+    /// result's. The budget therefore loses whenever the offload store does —
+    /// deliberately, and the same way cc's per-message budget loses when its
+    /// own persist fails.
+    fn enforce_round_budget(&self, msg: &mut Message) {
+        let mut results: Vec<(usize, usize)> = msg
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| match block {
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Text(text),
+                    ..
+                } => Some((index, text.chars().count())),
+                ContentBlock::ToolResult { .. }
+                | ContentBlock::Text { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolUse { .. } => None,
+            })
+            .collect();
+        let mut total: usize = results.iter().map(|(_, chars)| chars).sum();
+        if total <= ROUND_OFFLOAD_CAP_CHARS {
+            return;
+        }
+        results.sort_by_key(|&(_, chars)| std::cmp::Reverse(chars));
+        for (index, chars) in results {
+            if total <= ROUND_OFFLOAD_CAP_CHARS {
+                return;
+            }
+            // Every index came from exactly this pattern a moment ago.
+            let ContentBlock::ToolResult {
+                content: ToolResultContent::Text(text),
+                ..
+            } = &mut msg.content[index]
+            else {
+                continue;
+            };
+            let content = std::mem::take(text);
+            match self.spill_to_disk(&content) {
+                Ok((pointer, _)) if pointer.chars().count() < chars => {
+                    total = total - chars + pointer.chars().count();
+                    *text = pointer;
+                }
+                // Spilling this one would make the round *bigger*: a preview
+                // plus a path costs more than the result it replaces. Results
+                // come largest first, so nothing left can do better either —
+                // undo the write and stop. A round that is over budget purely
+                // by having many small results has no spill that helps, and
+                // spending the context on pointers instead of content would be
+                // the worst of both.
+                Ok((_, path)) => {
+                    let _ = std::fs::remove_file(path);
+                    *text = content;
+                    return;
+                }
+                Err(_) => *text = content,
+            }
+        }
+    }
+
     fn spill(&mut self, content: &str) -> String {
+        match self.spill_to_disk(content) {
+            Ok((pointer, _)) => pointer,
+            // Unlike a round-budget spill this one has no inline fallback: the
+            // result is over the per-result cap, which is the size no single
+            // result may enter the history at. Truncation is what is left.
+            Err(e) => format!(
+                "{preview}\n[offload to disk failed ({e}); output truncated]",
+                preview = preview(content)
+            ),
+        }
+    }
+
+    /// Write the whole result to the offload store and return what the model
+    /// sees instead — the head/tail preview plus the file's path — together
+    /// with that path, so a caller that decides against the trade can take the
+    /// file back out. `Err` means nothing was written and the caller still
+    /// holds the only copy.
+    fn spill_to_disk(&self, content: &str) -> std::io::Result<(String, PathBuf)> {
         let id = format!("off-{:04}", NEXT_OFFLOAD_ID.fetch_add(1, Ordering::Relaxed));
-        let head: String = content.chars().take(HEAD_CHARS).collect();
-        let tail_rev: Vec<char> = content.chars().rev().take(TAIL_CHARS).collect();
-        let tail: String = tail_rev.into_iter().rev().collect();
         let path = self.offload_dir.join(format!("{id}.txt"));
-        let write =
-            std::fs::create_dir_all(&self.offload_dir).and_then(|_| std::fs::write(&path, content));
+        std::fs::create_dir_all(&self.offload_dir).and_then(|()| std::fs::write(&path, content))?;
         // cc's shape: hand over a path and let the general tools work on it, rather
         // than mint an opaque id for a reader that exists only to dereference it.
         // The advice is to extract *in place* — cc reads a 2 MB spec with
@@ -511,18 +615,26 @@ impl History {
         // context. Sandboxed bash can read this directory (the private state root
         // is denied for its credential, with the offload store carved back out)
         // but still cannot write it.
-        let pointer = match write {
-            Ok(()) => format!(
-                "[full output saved to {path} ({chars} chars). Query it in place instead of \
-                 reading it back: bash with `python3 -c '...'` over that path, printing only the \
-                 fields you need, so only what you extract enters the context]",
-                chars = content.chars().count(),
-                path = path.display(),
-            ),
-            Err(e) => format!("[offload to disk failed ({e}); output truncated]"),
-        };
-        format!("{head}\n…[truncated]…\n{tail}\n{pointer}")
+        let pointer = format!(
+            "{preview}\n[full output saved to {path} ({chars} chars). Query it in place instead \
+             of reading it back: bash with `python3 -c '...'` over that path, printing only the \
+             fields you need, so only what you extract enters the context]",
+            preview = preview(content),
+            chars = content.chars().count(),
+            path = path.display(),
+        );
+        Ok((pointer, path))
     }
+}
+
+/// The head and tail a spilled result keeps in the history, with the middle
+/// marked as dropped. Shared by both spill outcomes so a failed offload reads
+/// the same as a successful one up to the pointer.
+fn preview(content: &str) -> String {
+    let head: String = content.chars().take(HEAD_CHARS).collect();
+    let tail_rev: Vec<char> = content.chars().rev().take(TAIL_CHARS).collect();
+    let tail: String = tail_rev.into_iter().rev().collect();
+    format!("{head}\n…[truncated]…\n{tail}")
 }
 
 #[derive(Debug)]
@@ -774,6 +886,181 @@ mod tests {
         assert!(!content.contains("id=off-"), "{content}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One round's tool results, in request order.
+    fn tool_results(results: &[(&str, String)]) -> Message {
+        Message::tool_results(
+            results
+                .iter()
+                .map(|(id, content)| ContentBlock::ToolResult {
+                    tool_use_id: (*id).into(),
+                    content: content.clone().into(),
+                    is_error: false,
+                })
+                .collect(),
+        )
+    }
+
+    fn recorded_text(h: &History, index: usize) -> String {
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[index] else {
+            panic!("expected tool result");
+        };
+        content.as_text().into_owned()
+    }
+
+    /// Ten results that each clear the per-result cap put 175 000 chars into
+    /// one round. The two largest go to disk — largest first, not first-come —
+    /// and the round stops spilling the moment it is back under budget.
+    #[test]
+    fn a_wide_round_spills_its_largest_results_until_it_is_under_budget() {
+        let dir = temp_dir("round-budget");
+        let mut h = History::new(dir.clone());
+        let round: Vec<(&str, String)> = vec![
+            ("c", "c".repeat(30_000)),
+            ("s0", "0".repeat(5_000)),
+            ("a", "a".repeat(31_000)),
+            ("s1", "1".repeat(5_000)),
+            ("d", "d".repeat(29_500)),
+            ("s2", "2".repeat(5_000)),
+            ("b", "b".repeat(30_500)),
+            ("s3", "3".repeat(5_000)),
+            ("e", "e".repeat(29_000)),
+            ("s4", "4".repeat(5_000)),
+        ];
+        assert!(
+            round
+                .iter()
+                .all(|(_, text)| text.chars().count() < OFFLOAD_CAP_CHARS)
+        );
+        h.record(tool_results(&round));
+
+        // Every result is still there, in request order.
+        let ids: Vec<&str> = h.messages()[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                other => panic!("expected tool result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["c", "s0", "a", "s1", "d", "s2", "b", "s3", "e", "s4"]
+        );
+
+        // Only the two largest were spilled, and each is a pointer to its own
+        // file holding the whole result.
+        for (index, id) in [(2, "a"), (6, "b")] {
+            let text = recorded_text(&h, index);
+            assert!(text.contains("Query it in place"), "{id}: {text}");
+            let path = dir.join(format!("{}.txt", pointer_id(&text)));
+            let original = &round.iter().find(|(name, _)| *name == id).unwrap().1;
+            assert_eq!(&std::fs::read_to_string(&path).unwrap(), original);
+        }
+        for (index, (id, original)) in round.iter().enumerate() {
+            if index == 2 || index == 6 {
+                continue;
+            }
+            assert_eq!(
+                &recorded_text(&h, index),
+                original,
+                "{id} was not left alone"
+            );
+        }
+
+        let total: usize = (0..round.len())
+            .map(|index| recorded_text(&h, index).chars().count())
+            .sum();
+        assert!(total <= ROUND_OFFLOAD_CAP_CHARS, "{total}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Over budget purely by count: 80 results of 1 800 chars each. Every one
+    /// of them is smaller than the preview-plus-path that would replace it, so
+    /// spilling would cost context rather than save it. The round stays inline
+    /// and the store keeps nothing.
+    #[test]
+    fn a_round_of_results_too_small_to_shrink_is_left_alone() {
+        let dir = temp_dir("round-budget-small");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut h = History::new(dir.clone());
+        let round: Vec<(String, String)> = (0..80)
+            .map(|n| (format!("t{n}"), "s".repeat(1_800)))
+            .collect();
+        let round: Vec<(&str, String)> = round
+            .iter()
+            .map(|(id, text)| (id.as_str(), text.clone()))
+            .collect();
+        let total: usize = round.iter().map(|(_, text)| text.chars().count()).sum();
+        assert!(total > ROUND_OFFLOAD_CAP_CHARS, "{total}");
+
+        let msg = tool_results(&round);
+        h.record(msg.clone());
+        assert_eq!(h.messages(), [msg].as_slice());
+        assert_eq!(
+            std::fs::read_dir(&dir).map(Iterator::count).unwrap_or(0),
+            0,
+            "a spill that could not help was left on disk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A round under budget is recorded byte for byte, and nothing reaches the
+    /// offload store — the directory is not even created.
+    #[test]
+    fn a_round_under_budget_is_recorded_verbatim() {
+        let dir = temp_dir("round-budget-under");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut h = History::new(dir.clone());
+        let round = vec![
+            ("t1", "a".repeat(31_000)),
+            ("t2", "b".repeat(31_000)),
+            ("t3", "c".repeat(31_000)),
+        ];
+        let msg = tool_results(&round);
+        h.record(msg.clone());
+
+        assert_eq!(h.messages(), [msg].as_slice());
+        assert!(
+            !dir.exists(),
+            "an under-budget round touched the offload store"
+        );
+    }
+
+    /// Two budgets, two answers when the disk says no. A round-budget spill
+    /// keeps its result inline in full — it was under the per-result cap, so
+    /// losing content to defend a context budget would be the worse trade. A
+    /// per-result spill has no such option and still truncates.
+    #[test]
+    fn a_spill_that_cannot_reach_disk_stays_inline_for_the_round_budget_only() {
+        let dir = temp_dir("round-budget-no-disk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.parent().expect("temp dir has a parent")).unwrap();
+        // A file where the offload directory should be: create_dir_all fails.
+        std::fs::write(&dir, "not a directory").unwrap();
+
+        let mut h = History::new(dir.clone());
+        let round = vec![
+            ("t1", "a".repeat(31_000)),
+            ("t2", "b".repeat(31_000)),
+            ("t3", "c".repeat(31_000)),
+            ("t4", "d".repeat(31_000)),
+            ("t5", "e".repeat(31_000)),
+        ];
+        let msg = tool_results(&round);
+        h.record(msg.clone());
+        assert_eq!(h.messages(), [msg].as_slice());
+
+        h.record(tool_result("z".repeat(OFFLOAD_CAP_CHARS + 1_000)));
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[1].content[0] else {
+            panic!("expected tool result");
+        };
+        let truncated = content.as_text();
+        assert!(truncated.contains("offload to disk failed"), "{truncated}");
+        assert!(truncated.contains("output truncated"), "{truncated}");
+        assert!(truncated.chars().count() < OFFLOAD_CAP_CHARS, "{truncated}");
+        let _ = std::fs::remove_file(dir);
     }
 
     #[test]

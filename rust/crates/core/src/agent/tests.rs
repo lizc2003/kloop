@@ -19,6 +19,10 @@ use kloop_provider::MockTurn;
 fn kloop_core_offload_cap() -> usize {
     crate::history::OFFLOAD_CAP_CHARS
 }
+
+fn kloop_core_round_cap() -> usize {
+    crate::history::ROUND_OFFLOAD_CAP_CHARS
+}
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
 use serde_json::json;
@@ -161,6 +165,131 @@ fn structured_config(
     cfg.max_rounds = Some(10);
     cfg.local_agent = cfg.local_agent.child("agent-99".parse().unwrap());
     (Arc::new(cfg), seen)
+}
+
+/// Read-only source whose every call returns a result just under the
+/// per-result cap — the shape the round budget exists for, and the one the
+/// per-result cap alone never sees.
+struct BulkSource;
+
+impl ToolSource for BulkSource {
+    fn defs(&self) -> Arc<[ToolDef]> {
+        Arc::from(vec![ToolDef {
+            name: "bulk__result".into(),
+            description: "Returns a result just under the per-result cap".into(),
+            schema: json!({"type": "object"}),
+        }])
+    }
+
+    fn is_readonly(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        _tool: &'a str,
+        _input: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<SourceOutput>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(SourceOutput::text("x".repeat(kloop_core_offload_cap() - 1))) })
+    }
+}
+
+/// Run one round of six just-under-cap tool calls and hand back the tool
+/// results as they were recorded. `schema` picks the dispatch path: `None` is
+/// the ordinary one, `Some` the structured one, which routes its non-synthetic
+/// calls through a second entry point.
+async fn wide_round_results(tag: &str, schema: Option<Value>) -> Vec<ContentBlock> {
+    let calls: Vec<AssistantBlock> = (0..6)
+        .map(|n| tool_use_named(&format!("b{n}"), "bulk__result", json!({})))
+        .collect();
+    let finish = match &schema {
+        Some(_) => tool_use_named("s1", "structured_output", json!({"ok": true})),
+        None => AssistantBlock::Text {
+            text: "done".into(),
+        },
+    };
+    let provider = Provider::mock(vec![calls, vec![finish]]);
+    let sources: Vec<Arc<dyn ToolSource>> = vec![Arc::new(BulkSource)];
+    let cfg = crate::tools::testutil::TestConfig::new(tag)
+        .provider(provider)
+        .tool_sources(sources)
+        .build();
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("read six things"));
+    let cancel = CancellationToken::new();
+    let outcome = match schema {
+        Some(schema) => run_structured_turn(&cfg, &mut history, &ui, &cancel, 0, schema).await,
+        None => run_turn(&cfg, &mut history, &ui, &cancel, 0).await,
+    };
+    assert_eq!(outcome.reason, EndReason::Completed, "{tag}");
+    let results = history
+        .messages()
+        .iter()
+        .find(|message| {
+            matches!(
+                message.content.first(),
+                Some(ContentBlock::ToolResult { tool_use_id, .. }) if tool_use_id == "b0"
+            )
+        })
+        .unwrap_or_else(|| panic!("{tag}: the round's tool results were never recorded"))
+        .content
+        .clone();
+    let _ = std::fs::remove_dir_all(&cfg.offload_dir);
+    results
+}
+
+/// The round budget lives in `History::record`, which is the single place a
+/// round's tool results enter the history — the ordinary dispatch path and the
+/// structured one both end there. This pins that: neither path can put six
+/// just-under-cap results (192 000 chars) into one round.
+#[tokio::test]
+async fn a_wide_round_lands_under_budget_on_both_dispatch_paths() {
+    for (tag, schema) in [
+        ("round-budget-ordinary", None),
+        (
+            "round-budget-structured",
+            Some(json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            })),
+        ),
+    ] {
+        let results = wide_round_results(tag, schema).await;
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                other => panic!("{tag}: expected tool result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["b0", "b1", "b2", "b3", "b4", "b5"], "{tag}");
+        let texts: Vec<String> = results
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content.as_text().into_owned(),
+                other => panic!("{tag}: expected tool result, got {other:?}"),
+            })
+            .collect();
+        let total: usize = texts.iter().map(|text| text.chars().count()).sum();
+        assert!(total <= kloop_core_round_cap(), "{tag}: {total} chars");
+        // Some of the round went to disk and some stayed inline: the budget
+        // spilled what it had to and stopped, rather than spilling the round.
+        assert!(
+            texts.iter().any(|text| text.contains("Query it in place")),
+            "{tag}: nothing was offloaded"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.chars().count() == kloop_core_offload_cap() - 1),
+            "{tag}: every result was offloaded"
+        );
+    }
 }
 
 struct BarrierSource {
