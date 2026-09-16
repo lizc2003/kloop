@@ -12,6 +12,9 @@
 三件都很小(各自估计几十到一两百行),共同点是:不需要任何架构决定、不推翻任何已有裁决、
 不引入新依赖。
 
+**2026-09-16:四件全部完成**(四次提交)。第四件是问过用户之后加进来的,它**不满足**上面
+那句"很小、不引入新依赖"——它是这批里最大的一件。
+
 ---
 
 ## 一、`bash` 少一个 `description` ✅(2026-09-16,提交 SHA 以本条所在提交为准)
@@ -202,7 +205,7 @@ raw 里数)、`FileObservation::first_unread_unit`(coalesce 过的区间,第一�
 
 ---
 
-## 四、可能的第四件,要先问用户
+## 四、第四件:`read_file` 读图只管字节、不管像素 ✅(2026-09-16,提交 SHA 以本条所在提交为准)
 
 **`read_file` 读图片只管字节、不管像素。** `core/src/image.rs:16` 写得很坦白:
 "Oversized images are refused, not resized — client-side downscaling is deferred
@@ -213,6 +216,60 @@ grok 在客户端处理这件事(`compress_image_for_conversation` /
 
 **这条要不要做,取决于用户实际是否给 kloop 看图。** 如果基本不看,`deferred` 这个状态是
 对的,不要动——那句注释已经把取舍写清楚了。**开工时问一句**,要做再加进本 plan 当第四件。
+
+### ✅ 问了,用户先问"参考项目是怎么做的",看完答"做"
+
+**五家参考全都做,而且形状一致**(三层常量:解压炸弹守卫 → 像素/边长预算 → 字节预算 +
+质量阶梯)。cc `imageResizer.ts`(sharp,3.75 MB raw / 2000 px / JPEG 80-60-40-20);
+grok `read_file/image.rs`(768 KiB base64 / 面积 1.05 Mpx / 边 2000 / 下限 128 / ×3/4 阶梯);
+codex `utils/image`(按 32×32 patch 算,2048 边 / 2500 patch,并向模型发
+`<image_resize_notice>`);codewhale `read_media.rs`(detail 参数 + crop + 平面图/照片分类,
+降级过的原图存盘);dsh `attachment-local`(2048² 总像素 / 4 MiB,prompt 里写明"Normalized
+copy … may be resized")。
+
+### 动手前查了官方文档,两个数改了设计
+
+按仓库纪律(不能凭记忆答 API limit)拉了 `build-with-claude/vision`,**两条推翻了我原本的
+判断**:
+
+1. **超限的图 API 自己会降采样,不是拒绝**(high-resolution tier:长边 2576 px / 4784
+   visual token;patch 是 **28×28**,不是 codex 的 32×32)。所以客户端降采样**省不到
+   token**——token 账 API 已经封顶了。它省的是**请求字节**(kloop 每轮重发整段历史)。
+2. **单图上限是 10 MB base64(Claude API 直连)/ 5 MB(Bedrock、Google Cloud)**,不是我
+   以为的"kloop 的 5 MiB raw 已经超了"。5 MiB raw ≈ 6.7 MB base64,直连没问题,Bedrock/
+   Vertex 会超。取 3.75 MiB raw(= cap × 3/4)让一种编码在所有路线上都安全。
+
+两条**真的把它从"省钱"变成"正确性"**的规则:单图 **8000×8000** 直接拒;**一个请求里超过
+20 个 image block 时,对所有图套用更严的逐图尺寸限制**,文档给的办法就是"把每张图缩到两边
+都不超过 2000 px"——这正是 cc 和 grok 都落在 2000 的原因。
+
+### 落点
+
+`core/src/image.rs`:`prepare_image_from_bytes` 返回 block + `Resized`(原尺寸/新尺寸);
+`image_block_from_bytes` 变成它的薄包装,`notebook.rs` 和 TUI 粘贴白拿降采样。
+`WIRE_TARGET_BYTES` = 3.75 MiB、`MAX_WIRE_DIMENSION` = 2000、`MIN_WIRE_DIMENSION` = 256、
+JPEG 阶梯 80/60/40/20、`MAX_DECODE_PIXELS` = 64 Mpx、`MAX_DECODE_ALLOC_BYTES` = 256 MiB。
+**PNG 每一级先试、合就留**,不像 grok 那样"取更小的"——kloop 看的绝大多数是截图,而文档
+明确警告重 JPEG 压缩会让文字难认;照片的 PNG 本来就不合,自己会落到 JPEG 那级。
+`fs.rs` 的 read_file 在降采样时追加一条 `<system-reminder>` 报出两个尺寸(模型接下来要读
+像素,它报的坐标是降采样后那份的)。
+
+**依赖没有想象中贵**:`image` 0.25 早就在树里(`arboard` 的依赖,只开了 png+tiff),
+这次只是补上 jpeg/gif/webp 三个解码 feature,不是新引一个 crate。
+
+### 非目标(做了但要写清没做什么)
+
+- **5 MiB 读上限不动**。超过 5 MiB 的图仍然是拒绝,不是"读进来再压小"。抬这条线是
+  plan 61 的裁决,不属于本件。
+- **不加 `detail` / `crop` 参数**(codewhale 有),也不存降级前的原图。没有痛感。
+- **不碰 GIF 动画**。API 本来就只用第一帧,现状注释已经说对了。
+
+### 验收
+
+六条新测试(`image.rs` 五条 + `fs.rs` 一条):字节像素都够小时**逐字节原样送出**(整对象
+断言);**字节小、像素大**的那张被降采样(并先断言它确实在字节预算内——否则这条测试证明
+的是字节上限而不是像素预算);**永不放大**且比例不变;68 字节的 PNG 声称 40000×40000 时
+**在解码前**被守卫挡掉;**头读不出来就照旧原样送**;read_file 的降采样通知整串相等。
 
 ## 五、非目标
 

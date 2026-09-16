@@ -36,6 +36,10 @@ anyhow = "1"
 # image[tiff]); `png` encodes the raw RGBA it returns into bytes core validates.
 arboard = "3"
 png = "0.17"
+# Pixel-aware image preparation (plan 156 item 4): decode dimensions, downscale,
+# re-encode. Already in the tree as arboard's dependency — this adds the decoder
+# features (jpeg/gif/webp) the wire formats need, not a new crate.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 # Image input (plan 29): standard base64 for the wire `data` field. 3rd
 # function dependency (after similar, serde_yaml_ng); base64 is an unambiguous
 # standard codec, so a crate beats hand-rolling it. Already in the tree

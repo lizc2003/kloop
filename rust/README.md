@@ -3012,6 +3012,39 @@ nor a supported image is a clean error.
 # "look at logo.png and describe it" → the model calls read_file(logo.png)
 ```
 
+**Pixels, not just bytes (Plan 156).** A byte cap alone does not bound an image:
+a high-compression JPEG can be 500 KB and 6000×4000. What that costs is not model
+tokens — the API downscales an oversized image itself and caps the visual-token
+bill — but request bytes, and kloop re-sends the whole conversation every turn.
+Two documented API rules make it a correctness matter too: an image over
+8000×8000 is rejected outright, and a request carrying more than 20 image blocks
+applies a stricter per-image dimension limit to *all* of them, the documented
+remedy being to keep every image within 2000 px. So `core/src/image.rs` now
+measures before it sends:
+
+- **Untouched when it already fits.** Within 3.75 MiB raw (3/4 of the cap, so the
+  base64 stays inside the tightest documented per-image ceiling — 5 MB on Amazon
+  Bedrock and Google Cloud; the Claude API direct allows 10 MB) *and* within
+  2000 px on both sides, the source bytes go out byte-identical.
+- **Otherwise a ladder**: fit inside a 2000 px box (never upscaling, aspect ratio
+  preserved, Lanczos3), then try PNG and keep it if it fits, else descend a JPEG
+  quality ladder (80/60/40/20). Still too big, drop the long edge to 3/4 and
+  repeat, down to a 256 px floor, then refuse. PNG is tried first at every rung
+  rather than taking whichever is smaller: kloop's images are overwhelmingly
+  screenshots, and the API's own guidance is that heavy JPEG compression makes
+  text hard to read. A photo's PNG won't fit and falls to JPEG on its own.
+- **Decompression-bomb guards** run on the header, before any pixel buffer is
+  allocated: 64 megapixels and a 256 MiB decode allocation ceiling. A 68-byte PNG
+  is free to claim 40000×40000; this is what stops it.
+- **A downscale is never silent.** `read_file` appends a `<system-reminder>`
+  naming both sizes, because the model is about to read pixels and any coordinate
+  it reports comes off the copy it was actually shown.
+- Bytes that sniff as an image but have no readable header keep the pre-pixel
+  behaviour — sent as they are rather than refused.
+
+The 5 MiB *read* ceiling is unchanged: a larger file is still refused rather than
+read and shrunk. Raising it is Plan 61's decision, not this one's.
+
 - **`tool_result` content is `string | array`** (`ToolResultContent`): text
   results stay a bare string (old sessions round-trip unchanged); an image
   result carries a block array — exactly Anthropic's own `tool_result.content`

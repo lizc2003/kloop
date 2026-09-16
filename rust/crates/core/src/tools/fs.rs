@@ -31,9 +31,11 @@ use crate::file_state::FileState;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
 use crate::file_state::normalize_absolute_path;
+use kloop_protocol::ContentBlock;
+
 use crate::image::MAX_IMAGE_BYTES;
 use crate::image::detect_media_type;
-use crate::image::image_block_from_bytes;
+use crate::image::prepare_image_from_bytes;
 use crate::text_edit::apply_text_edit;
 
 /// How many redundant rereads of one path pass between advisories.
@@ -361,14 +363,33 @@ pub(super) async fn read_file_tool(
         });
     }
 
-    // An image file returns a single image block (validated for format and the
-    // 5 MiB cap); offset/limit are line concepts and simply do not apply.
+    // An image file returns a single image block (validated for format, the
+    // 5 MiB cap, and the wire's pixel budget); offset/limit are line concepts
+    // and simply do not apply.
     if detect_media_type(&bytes).is_some() {
-        let block = image_block_from_bytes(&bytes)
-            .with_context(|| format!("read_file: cannot read image {path}"))?;
+        let image_bytes = bytes.clone();
+        let display_path = path.to_string();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_image_from_bytes(&image_bytes)
+                .with_context(|| format!("read_file: cannot read image {display_path}"))
+        })
+        .await
+        .with_context(|| format!("read_file: image worker failed for {path}"))??;
+        let mut blocks = vec![prepared.block];
+        // Never downscale silently: the model is about to read pixels, and any
+        // coordinate it reports comes off the copy it was actually shown.
+        if let Some(resized) = prepared.resized {
+            let (from_width, from_height) = resized.from;
+            let (to_width, to_height) = resized.to;
+            blocks.push(ContentBlock::Text {
+                text: format!(
+                    "<system-reminder>This image was downscaled from {from_width}x{from_height} to {to_width}x{to_height} before it was sent. Any pixel coordinate you read off it refers to the downscaled copy.</system-reminder>"
+                ),
+            });
+        }
         let observation = FileObservation::full_with_identity(&bytes, &metadata, identity);
         return Ok(ReadFileOutput {
-            content: ToolResultContent::Blocks(vec![block]),
+            content: ToolResultContent::Blocks(blocks),
             state_update: FileStateUpdate::Observe {
                 path: key,
                 observation,
@@ -2104,6 +2125,52 @@ mod tests {
                 source: ImageSource::Base64 { media_type, .. },
             }] if media_type == "image/png"
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A screenshot-shaped image that is small in bytes but over the wire's
+    /// pixel budget comes back downscaled, and the model is told so in the same
+    /// result — a silent downscale would have it reporting coordinates off a
+    /// copy it does not know it is looking at.
+    #[tokio::test]
+    async fn read_file_downscales_a_pixel_oversized_image_and_says_so() {
+        let buffer = image::RgbImage::from_fn(2100, 1400, |x, y| {
+            image::Rgb([(x / 256) as u8, (y / 256) as u8, 128])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(buffer)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = temp_bytes("readimg-big", &png);
+        let ctx = test_ctx(0, "readimg-big");
+        let results = dispatch_tools(
+            vec![(
+                "t".into(),
+                "read_file".into(),
+                json!({"path": path.to_str().unwrap()}),
+            )],
+            &ctx,
+        )
+        .await;
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &results[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!is_error);
+        let ToolResultContent::Blocks(blocks) = content else {
+            panic!("expected image blocks, got {content:?}");
+        };
+        let [ContentBlock::Image { .. }, ContentBlock::Text { text }] = blocks.as_slice() else {
+            panic!("expected an image block followed by the notice, got {blocks:?}");
+        };
+        assert_eq!(
+            text,
+            "<system-reminder>This image was downscaled from 2100x1400 to 2000x1333 \
+             before it was sent. Any pixel coordinate you read off it refers to the \
+             downscaled copy.</system-reminder>"
+        );
         let _ = std::fs::remove_file(path);
     }
 

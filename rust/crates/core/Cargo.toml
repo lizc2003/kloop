@@ -27,6 +27,7 @@ libc = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+image = { workspace = true }
 serde_yaml_ng = { workspace = true }
 sha2 = { workspace = true }
 similar = { workspace = true }
