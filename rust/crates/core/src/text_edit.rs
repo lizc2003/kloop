@@ -105,6 +105,29 @@ pub(crate) fn apply_text_edit(
     }
 }
 
+/// The 1-based line the first match of `old` starts on, under the same
+/// exact-first-then-logical-LF matching [`apply_text_edit`] itself uses.
+/// `None` when nothing matches — that is a different failure with its own
+/// message, and this is only ever an addition to someone else's.
+///
+/// Counting newlines in the logical view is counting them in the raw text: the
+/// view replaces each CRLF with one LF and touches nothing else.
+pub(crate) fn first_match_line(current: &str, old: &str) -> Option<usize> {
+    if old.is_empty() {
+        return None;
+    }
+    if let Some(index) = current.find(old) {
+        return Some(current[..index].matches('\n').count() + 1);
+    }
+    let (logical, _) = logical_lf_view(current);
+    let logical_old = normalize_newlines(old);
+    if logical_old.is_empty() {
+        return None;
+    }
+    let index = logical.find(&logical_old)?;
+    Some(logical[..index].matches('\n').count() + 1)
+}
+
 fn logical_lf_view(raw: &str) -> (String, Vec<usize>) {
     let bytes = raw.as_bytes();
     let mut logical = String::with_capacity(raw.len());
@@ -231,6 +254,21 @@ mod tests {
     fn unmatched_bytes_and_lone_carriage_returns_are_preserved() {
         let outcome = apply_text_edit("left\ra\r\nb\nright", "a\nb", "A\nB", false);
         assert_eq!(outcome.updated.as_deref(), Some("left\rA\r\nB\nright"));
+    }
+
+    /// The line a refusal reports follows the same matching the edit would
+    /// have done, so a CRLF file does not report a line the model cannot find.
+    #[test]
+    fn first_match_line_follows_exact_then_logical_matching() {
+        assert_eq!(first_match_line("a\nb\nc\n", "a"), Some(1));
+        assert_eq!(first_match_line("a\nb\nc\n", "c"), Some(3));
+        // LF needle over CRLF text: matched through the logical view, and the
+        // line counted there is the line in the raw text.
+        assert_eq!(first_match_line("a\r\nb\r\nc\r\n", "b\nc"), Some(2));
+        // First match wins, which is what replace_all reports.
+        assert_eq!(first_match_line("x\ny\nx\n", "x"), Some(1));
+        assert_eq!(first_match_line("a\nb\n", "missing"), None);
+        assert_eq!(first_match_line("a\nb\n", ""), None);
     }
 
     #[test]

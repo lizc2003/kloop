@@ -129,7 +129,7 @@ read deny 加进来它一声不吭**。
 
 ---
 
-## 三、edit 被拒时不告诉你该读哪一段
+## 三、edit 被拒时不告诉你该读哪一段 ✅(2026-09-16,提交 SHA 以本条所在提交为准)
 
 ### 现状
 
@@ -166,6 +166,39 @@ read deny 加进来它一声不吭**。
    既有的 `existing_write_requires_a_complete_fresh_read_and_refreshes_state`
    (`fs.rs:2422`)等测试一条不改。
 4. `old_string` 不存在时的报错不变(别把两类错误混成一句)。
+
+### ✅ 做完了什么(plan 给的那句提示词是错的,换掉了)
+
+**plan 建议的 `read_file(path, offset=<N-20>, limit=60)` 照着做解不开锁。** 这一件明确
+"不动资格判定",而资格要的是 `is_complete()`——`ReadCoverage::recompute_complete` 只认
+"合并后是一条从 0 覆盖到 total 的区间"。读 old_string 周围那 60 行,覆盖率还是残的,
+再 edit 还是同一句拒绝。模型多走一轮,回到原地。
+
+改成报两件事:**old_string 落在第几行**(定位,plan 要的那个数)+ **第一行还没读过的行**
+(offset,能真正合拢覆盖率的那次读)。后者往下靠 `read_file` 自己的续读提示接力,
+和截断读是同一套idiom:
+
+> `edit_file: must read the entire file /x/y.rs before modifying it (old_string is at
+> line 33 of 41; call read_file with offset=11 to continue)`
+
+**不给 `limit`**(验收第 1 条写了"含 offset 与 limit 的具体数值"):给了就把这次读截在
+半路,覆盖率照样合不拢。不给 limit = 读到 EOF(仍受 `READ_CONTENT_CHARS` 预算,截断时
+read_file 自己会给下一个 offset)。
+
+落点四处:`text_edit::first_match_line`(与 `apply_text_edit` 同一套 exact-first →
+logical-LF 匹配,CRLF 文件不会报一个模型找不到的行号;行号在 logical view 里数就是在
+raw 里数)、`FileObservation::first_unread_unit`(coalesce 过的区间,第一个洞的起点)、
+`fs.rs` 的 `unread_edit_hint` + 给 `validate_observation_metadata` 加一个
+**只在那两种"读一下就能解开"的判定上才调用**的 `unread_hint` 闭包(另外两个调用点传
+`|| None`;Stale 那条不碰——它要的是重读,不是补读)。
+
+验收逐条:①②在 `unread_edit_names_the_line_and_the_read_that_clears_it` 里整对象断言
+(不是 contains);③资格判定一行没动,既有 fs 测试一条没改;④old_string 不存在时
+**不加任何括号**,报错与改动前逐字相同。**另外加了一条 plan 没要求但更重要的**:照着提示
+读完之后那次 edit **真的成功**——否则这条提示只是把模型送回同一堵墙。
+
+顺带记一个坑:失败的 edit 会**撤销**已有观察,所以同一个测试里连着三次拒绝,第三次的
+判定是"从没读过"而不是"读得不全"。
 
 ---
 

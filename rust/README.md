@@ -1427,6 +1427,12 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   dominant) EOLs in replacement text, and leaves all unmatched bytes—including
   mixed EOLs and isolated `\r`—unchanged. Executor and approval preview use this one
   helper, so duplicate/`replace_all` decisions and shown bytes cannot drift.
+  When it refuses for coverage (Plan 156), the message names the line `old_string`
+  lands on and the offset of the first line the session has *not* read — the read
+  that closes the gap, not a window around the match, because a complete read is
+  still what qualifies. `read_file`'s own continue hints carry it from there. The
+  eligibility rule is unchanged, and an `old_string` that is nowhere in the file adds
+  nothing to the message: that is a different failure with its own.
 - Mutation preflight binds either the existing direct parent or the nearest existing
   ancestor after pre-hooks but before permission. Original spelling and the frozen
   effective target both reach the gate; approval itself has no directory side

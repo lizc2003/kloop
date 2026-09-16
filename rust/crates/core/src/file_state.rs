@@ -389,6 +389,25 @@ impl FileObservation {
         self.coverage.complete
     }
 
+    /// The first unit (line, or notebook cell) this session has NOT put in
+    /// front of the model, 1-based — the offset a read must start from to close
+    /// the coverage gap from the front. `None` once coverage is complete.
+    ///
+    /// The ranges are sorted and coalesced, so the first gap ends the walk.
+    pub(crate) fn first_unread_unit(&self) -> Option<u64> {
+        if self.coverage.complete {
+            return None;
+        }
+        let mut covered_through = 0;
+        for range in &self.coverage.ranges {
+            if range.start > covered_through {
+                break;
+            }
+            covered_through = covered_through.max(range.end);
+        }
+        (covered_through < self.coverage.total_units).then_some(covered_through + 1)
+    }
+
     /// The one range THIS read established, before any merge with what the
     /// session already knew — a fresh observation carries either that or, for a
     /// read that landed past EOF, nothing at all.
@@ -593,6 +612,44 @@ mod tests {
             observation: FileObservation::from_read(b"a\nb\nc\nd\n", &metadata, 4, 2..4, false),
         });
         assert!(state.observation(&path).unwrap().is_complete());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The offset a refusal hands back: the first line still missing from the
+    /// front, so reading from there closes the gap in one call. A hole before
+    /// what has been read wins over a later one, and complete coverage has no
+    /// offset to give.
+    #[test]
+    fn first_unread_unit_is_the_front_of_the_gap() {
+        let bytes = b"a\nb\nc\nd\n";
+        let (path, metadata) = temp_file("first-unread", bytes);
+        let state = FileState::default();
+
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(bytes, &metadata, 4, 0..2, false),
+        });
+        assert_eq!(
+            state.observation(&path).unwrap().first_unread_unit(),
+            Some(3)
+        );
+
+        // A middle page leaves the hole at the front, not after it.
+        state.apply(FileStateUpdate::Clear { path: path.clone() });
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(bytes, &metadata, 4, 2..4, false),
+        });
+        assert_eq!(
+            state.observation(&path).unwrap().first_unread_unit(),
+            Some(1)
+        );
+
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(bytes, &metadata, 4, 0..2, false),
+        });
+        assert_eq!(state.observation(&path).unwrap().first_unread_unit(), None);
         let _ = std::fs::remove_file(path);
     }
 
