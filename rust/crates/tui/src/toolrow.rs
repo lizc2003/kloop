@@ -95,10 +95,13 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
                 .get("background")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let detail = if bg {
-                format!("$ {cmd}  (background)")
-            } else {
-                format!("$ {cmd}")
+            let background = if bg { "  (background)" } else { "" };
+            // The model's own one-line summary leads, so a row truncated to a
+            // narrow terminal still says what the call is for; the command
+            // itself follows it and is what shows when there is no summary.
+            let detail = match s("description") {
+                summary if summary.is_empty() => format!("$ {cmd}{background}"),
+                summary => format!("{summary}  $ {cmd}{background}"),
             };
             ("Bash".into(), detail)
         }
@@ -410,6 +413,45 @@ mod tests {
             60,
         );
         assert_eq!(text(&lines[0]), "✓ Bash $ sleep 9  (background)");
+    }
+
+    /// A raw `find … -exec` is what the user must otherwise parse; when the
+    /// model wrote a summary the row leads with it and keeps the command
+    /// after it. Without one the row is exactly what it always was.
+    #[test]
+    fn bash_row_leads_with_the_description_when_there_is_one() {
+        let described = tool_cell_lines(
+            "bash",
+            r#"{"command":"find . -name '*.tmp' -delete","description":"Delete temp files"}"#,
+            ToolStatus::Ok,
+            None,
+            80,
+        );
+        assert_eq!(
+            text(&described[0]),
+            "✓ Bash Delete temp files  $ find . -name '*.tmp' -delete"
+        );
+
+        let background = tool_cell_lines(
+            "bash",
+            r#"{"command":"sleep 9","background":true,"description":"Wait a bit"}"#,
+            ToolStatus::Ok,
+            None,
+            80,
+        );
+        assert_eq!(
+            text(&background[0]),
+            "✓ Bash Wait a bit  $ sleep 9  (background)"
+        );
+
+        let plain = tool_cell_lines(
+            "bash",
+            r#"{"command":"find . -name '*.tmp' -delete"}"#,
+            ToolStatus::Ok,
+            None,
+            80,
+        );
+        assert_eq!(text(&plain[0]), "✓ Bash $ find . -name '*.tmp' -delete");
     }
 
     #[test]

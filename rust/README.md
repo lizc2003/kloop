@@ -1620,6 +1620,13 @@ omitted. stdout precedes stderr in the canonical result, followed by
 `[exit status N]` or `[killed by signal]`; an empty successful run returns
 `(no output)`.
 
+`bash` also takes an optional `description` (Plan 156) under the same display-only
+contract as `run_agent`/`run_program`: at most 200 Unicode characters, nonblank,
+single-line, control-character-free, and rejected before anything is spawned.
+It never reaches the shell and never changes the result — the transcript
+row leads with it and keeps the command after it, so a row truncated to a narrow
+terminal still says what a long one-liner is for.
+
 Every spawn owns a complete process tree: a dedicated process group on Unix or
 a fixed pair of dedicated Job Objects on native Windows. Windows creates the root
 suspended, assigns it to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, and resumes it

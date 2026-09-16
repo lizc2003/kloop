@@ -3708,6 +3708,34 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
+    /// `description` is display metadata and nothing else: the same command
+    /// with a label and without one produces the same result byte for byte,
+    /// and an unusable label is refused before the command runs instead of
+    /// being silently dropped.
+    #[tokio::test]
+    async fn bash_description_is_display_only() {
+        let ctx = test_ctx(1, "bash-description");
+        let plain = run_tool("bash", bash_input("printf DESCRIBED"), &ctx).await;
+        let labelled = run_tool(
+            "bash",
+            json!({"command": "printf DESCRIBED", "description": "Print the sentinel"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(plain, labelled);
+
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "printf NEVER", "description": "   "}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            ("bash: description must not be empty".to_string(), true)
+        );
+    }
+
     struct PendingApprover {
         entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }

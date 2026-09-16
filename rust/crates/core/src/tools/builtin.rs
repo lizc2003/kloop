@@ -710,6 +710,7 @@ fn bash_def() -> ToolDef {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},
+                "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes the command or result."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
                 "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-N id and output file path (default false)"},
                 "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
@@ -1012,6 +1013,33 @@ mod tests {
         for builtin in ALL {
             assert_eq!(builtin.def(&cx).name, builtin.name());
         }
+    }
+
+    /// `description` is one contract, not three: every tool that takes a
+    /// display label advertises the same constraints the shared validator
+    /// enforces, and only the prose naming that tool's own effects differs.
+    #[test]
+    fn display_description_is_one_schema_contract() {
+        let cx = DefCx::default();
+        let constraints = |builtin: Builtin| {
+            let mut field = builtin.def(&cx).schema["properties"]["description"].clone();
+            field
+                .as_object_mut()
+                .expect("a display description field is an object")
+                .remove("description");
+            field
+        };
+        assert_eq!(
+            constraints(Builtin::Bash),
+            json!({
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS,
+                "pattern": ".*\\S.*"
+            })
+        );
+        assert_eq!(constraints(Builtin::Bash), constraints(Builtin::RunAgent));
+        assert_eq!(constraints(Builtin::Bash), constraints(Builtin::RunProgram));
     }
 
     /// The panel falls back to a tool's own name for anything it does not

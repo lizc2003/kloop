@@ -89,6 +89,7 @@ ConPTY,配 `windows-sandbox-service`),它走的是 restricted token 一路;macOS
 | 后台完成/失败/取消通知、下一 step 回灌、session 清理 | cc 单家 | **✅ Plan 51（2026-07-30）**：shell + agent/program 共享外部 lifecycle，不合并内部 registry | 已完成 |
 | Windows Git Bash / foreground PowerShell / Job containment | kloop native safety surface | **✅ Plan 62（2026-08-05）+ corrective**：冻结可信 executable、显式 frozen catalog、PowerShellOpaque final-status/session gate、whole-tree cleanup | corrective 原生 Windows 已复跑通过；Windows filesystem/network sandbox 仍未实现 |
 | HeadTailBuffer / 进程表 LRU | codex 单家 | 挂账"小卫生件" | 有痛感整段抄 |
+| `bash` 缺 display `description` | cc `Bash` 有、kloop 无 | **✅ Plan 156(2026-09-16)**:补上,沿用 `run_agent`/`run_program` 同一套 display-only 约束(200 Unicode 字符、非空白、单行、无控制字符),不进 shell、不改结果;TUI 行以它开头、命令原文跟在后面 | 已完成 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
 | 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
 | model-visible LSP / language-server client | cc 条件分支 | **Plan 57 保留 unknown**：env gate 单独开启仍未注册，正常发现链还依赖 enabled plugin；kloop 不加推测性 client | 取得权威 hermetic enabled-plugin profile 与完整 stdio lifecycle 时 |

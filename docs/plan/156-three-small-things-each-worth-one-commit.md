@@ -14,7 +14,7 @@
 
 ---
 
-## 一、`bash` 少一个 `description`
+## 一、`bash` 少一个 `description` ✅(2026-09-16,提交 SHA 以本条所在提交为准)
 
 ### 现状
 
@@ -52,6 +52,24 @@ cc 2.1.220 的 `Bash` 属性集是
 2. **它不改变执行**:同一条命令带与不带 description,`dispatch_tools` 的结果逐字节相同。
 3. TUI 有 description 时显示它、没有时回落到命令原文,两种都有测试。
 4. 顺手在 `capability-report` 第 4 节补这笔账并当场销账(✅ + 本 plan 编号)。
+
+### ✅ 做完了什么
+
+`builtin.rs` 的 `bash_def` 加 `description`,逐字段抄 `run_agent` 的那一条;`bash.rs` 的
+`BashInput` 加上同名字段(`deny_unknown_fields` 否则直接拒),约束走既有的
+`optional_display_description`,**没有新发明一套**。`toolrow.rs` 的 bash 行改成
+"description 在前、`$ 命令` 在后",没有 description 时和以前逐字节一样。
+
+三条测试:`display_description_is_one_schema_contract`(bash / run_agent / run_program
+三个 schema 的该字段**去掉散文后整对象相等**,这样将来谁改松一个 `maxLength` 就会红)、
+`bash_description_is_display_only`(带与不带 description 的 `run_tool` 返回值整对象相等;
+空白 description 在 spawn 之前被拒)、`bash_row_leads_with_the_description_when_there_is_one`。
+
+**一条既有测试要改**:`background_field_is_strict_and_old_name_fails_closed` 原本拿
+`description` 当"未知字段"的样本——它现在是已知字段了。换成 `timeout`(cc 的拼法,
+单位不同,静默忽略会按错的单位跑),严格性的守卫没有变弱。
+
+README 的 "Foreground bash lifecycle" 一节和 `capability-report` 第 4 节各补一条。
 
 ---
 

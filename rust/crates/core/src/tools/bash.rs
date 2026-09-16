@@ -91,6 +91,11 @@ static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 #[serde(deny_unknown_fields)]
 struct BashInput {
     command: String,
+    /// Display-only, same contract as run_agent's: the UI reads it off the raw
+    /// call and nothing in here does. Declared so `deny_unknown_fields` accepts
+    /// it; its constraints are checked in `parse_bash_input`.
+    #[serde(default, rename = "description")]
+    _description: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -121,6 +126,7 @@ fn parse_bash_input(input: &Value) -> Result<BashInput> {
     if input.get("run_in_background").is_some() {
         bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
     }
+    super::optional_display_description(input, "bash")?;
     serde_json::from_value(input.clone()).context("bash: invalid input")
 }
 
@@ -2605,14 +2611,16 @@ Wait-Process -Id $grandchild.Id
         assert!(old_error);
         assert!(old.contains("use background instead"), "{old}");
 
+        // cc spells the budget `timeout`; kloop only answers to `timeout_ms`,
+        // and a silently ignored unit would run under the wrong one.
         let (unknown, unknown_error) = run_tool(
             "bash",
-            json!({"command": "printf should-not-run", "description": "legacy"}),
+            json!({"command": "printf should-not-run", "timeout": 5000}),
             &ctx,
         )
         .await;
         assert!(unknown_error);
-        assert!(unknown.contains("unknown field `description`"), "{unknown}");
+        assert!(unknown.contains("unknown field `timeout`"), "{unknown}");
 
         let (wrong_type, wrong_type_error) = run_tool(
             "bash",
