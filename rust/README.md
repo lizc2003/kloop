@@ -1408,8 +1408,9 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   while an isolated `\r` remains content. On Unix, regular files with multiple hard
   links are rejected because pathname sensitivity cannot safely classify another
   name for the same inode.
-- Only a complete range that reaches the model in a final successful `tool_result`
-  qualifies an existing file for mutation. Preview reads, errors, permission
+- Only a range that reaches the model in a final successful `tool_result` qualifies
+  an existing file for mutation: a complete one for `write_file`/`notebook_edit`,
+  any one at all for `edit_file` (Plan 155). Preview reads, errors, permission
   rejection, post-hook cancellation, restored sessions, sub-agents, and separate
   worktrees do not inherit authority. Observations include stable file identity, so
   delete/recreate cannot inherit old coverage even when bytes and metadata resemble
@@ -1421,18 +1422,24 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   show that plan during approval, and create them only after approval while holding
   the effective-target path lock. Replacing an existing file still requires a
   complete fresh read.
-- **edit_file** requires an existing, complete, fresh UTF-8 target of at most 5 MiB.
+- **edit_file** requires an existing, fresh UTF-8 target of at most 5 MiB that this
+  session has read at least once — any range, including one that never showed the
+  `old_string` (Plan 155, overturning Plan 49's complete-read rule for this one
+  tool). What keeps a narrow read honest is that `old_string` must still match the
+  bytes on disk uniquely, which is where every reference implementation draws the
+  line or looser; freshness is untouched, so an external change still refuses.
   Raw exact matching wins. Only when raw matches are absent does LF input match CRLF
   text; the helper maps logical offsets back to raw byte ranges, restores local (or
   dominant) EOLs in replacement text, and leaves all unmatched bytes—including
   mixed EOLs and isolated `\r`—unchanged. Executor and approval preview use this one
   helper, so duplicate/`replace_all` decisions and shown bytes cannot drift.
-  When it refuses for coverage (Plan 156), the message names the line `old_string`
-  lands on and the offset of the first line the session has *not* read — the read
-  that closes the gap, not a window around the match, because a complete read is
-  still what qualifies. `read_file`'s own continue hints carry it from there. The
-  eligibility rule is unchanged, and an `old_string` that is nowhere in the file adds
-  nothing to the message: that is a different failure with its own.
+  When it refuses an unread target (Plan 156), the message names the line `old_string`
+  lands on and one read that clears it — a 60-line window starting 20 lines ahead of
+  the match, which both qualifies the file and shows the model what it is about to
+  change. That window is only useful advice under Plan 155; while a complete read was
+  the rule, the hint had to point at the first *unread* line instead. An `old_string`
+  that is nowhere in the file adds nothing to the message: that is a different failure
+  with its own.
 - Mutation preflight binds either the existing direct parent or the nearest existing
   ancestor after pre-hooks but before permission. Original spelling and the frozen
   effective target both reach the gate; approval itself has no directory side

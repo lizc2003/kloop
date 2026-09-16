@@ -1197,7 +1197,7 @@ fn commit_mutation(
                         file_identity(&target.file)?,
                         tool,
                         display_path,
-                        false,
+                        ReadRequirement::CompleteFile,
                         || None,
                     )?;
                     let snapshot = fingerprint_file(&mut target.file).with_context(|| {
@@ -1208,7 +1208,7 @@ fn commit_mutation(
                         &snapshot.version,
                         tool,
                         display_path,
-                        false,
+                        ReadRequirement::CompleteFile,
                     )?;
                     (
                         Some(snapshot.metadata.permissions()),
@@ -1244,12 +1244,18 @@ fn commit_mutation(
                 identity,
                 tool,
                 display_path,
-                false,
-                || unread_edit_hint(&mut target.file, &old, expected),
+                ReadRequirement::AnyRead,
+                || unread_edit_hint(&mut target.file, &old),
             )?;
             let snapshot = read_bounded(&mut target.file, MAX_IMAGE_BYTES)
                 .with_context(|| format!("edit_file: cannot read {display_path}"))?;
-            validate_observation_version(expected, &snapshot.version, tool, display_path, false)?;
+            validate_observation_version(
+                expected,
+                &snapshot.version,
+                tool,
+                display_path,
+                ReadRequirement::AnyRead,
+            )?;
             let current = String::from_utf8(snapshot.bytes).map_err(|_| {
                 anyhow::anyhow!("edit_file: {display_path} is not valid UTF-8 text")
             })?;
@@ -1289,12 +1295,18 @@ fn commit_mutation(
                 file_identity(&target.file)?,
                 tool,
                 display_path,
-                true,
+                ReadRequirement::CompleteNotebook,
                 || None,
             )?;
             let snapshot = read_bounded(&mut target.file, notebook::MAX_NOTEBOOK_BYTES)
                 .context("Notebook file is unavailable; read it again before editing it.")?;
-            validate_observation_version(expected, &snapshot.version, tool, display_path, true)?;
+            validate_observation_version(
+                expected,
+                &snapshot.version,
+                tool,
+                display_path,
+                ReadRequirement::CompleteNotebook,
+            )?;
             let mutation = notebook::apply_edit(&snapshot.bytes, &request)?;
             (
                 mutation.bytes,
@@ -1333,64 +1345,93 @@ fn parenthesized(hint: impl FnOnce() -> Option<String>) -> String {
     hint().map_or_else(String::new, |hint| format!(" ({hint})"))
 }
 
-/// What `edit_file` can add to a "read it first" refusal: where the
-/// replacement would land, and the read that closes the coverage gap.
+/// How much of the target one mutation demands the session have already read.
 ///
-/// The offset is the first line the session has NOT seen, not the line
-/// `old_string` sits on — the eligibility rule is still a complete read, so a
-/// window around the match would be refused all over again. From there
-/// `read_file`'s own continue hints carry it to the end, exactly as they do
-/// for any truncated read.
+/// Freshness is a separate question and no variant relaxes it: the observed
+/// version and identity must still match what is on disk.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadRequirement {
+    /// `write_file` replaces every byte, so it demands having seen every byte.
+    CompleteFile,
+    /// `notebook_edit` is cell-aware, so a raw read of the same bytes does not
+    /// qualify, and its refusals keep their own wording.
+    CompleteNotebook,
+    /// `edit_file`: one read of the path is the whole entrance fee (plan 155).
+    /// A narrow read qualifies the file, including for an `old_string` outside
+    /// the range that was read. What keeps the edit honest is `old_string`
+    /// matching uniquely against the bytes on disk, not how much of those bytes
+    /// the session has seen — and every reference implementation draws the line
+    /// here or looser (plan 155, third section).
+    AnyRead,
+}
+
+impl ReadRequirement {
+    fn notebook(self) -> bool {
+        matches!(self, Self::CompleteNotebook)
+    }
+
+    fn complete(self) -> bool {
+        matches!(self, Self::CompleteFile | Self::CompleteNotebook)
+    }
+}
+
+/// Lines of lead-in the unread-edit hint asks for ahead of the match, and the
+/// size of the window it asks for. One read of that window both qualifies the
+/// file and puts the edit site in front of the model, which is only true
+/// because `edit_file` qualifies on any read.
+const UNREAD_HINT_LEAD_IN: usize = 20;
+const UNREAD_HINT_LIMIT: usize = 60;
+
+/// What `edit_file` can add to a "read it first" refusal: where the replacement
+/// would land, and one read that both clears the refusal and shows the model
+/// what it is about to change.
+///
+/// Plan 156 pointed this at the first *unread* line instead, because under the
+/// complete-read rule a window around the match would be refused all over
+/// again. Plan 155 removed that rule for `edit_file`, so the window is now both
+/// the shorter read and the useful one.
 ///
 /// Silent (`None`) when the file cannot be read or `old_string` is not in it:
 /// a missing `old_string` is a different failure and keeps its own message.
-fn unread_edit_hint(
-    file: &mut std::fs::File,
-    old: &str,
-    expected: Option<&FileObservation>,
-) -> Option<String> {
+fn unread_edit_hint(file: &mut std::fs::File, old: &str) -> Option<String> {
     let snapshot = read_bounded(file, MAX_IMAGE_BYTES).ok()?;
     let current = std::str::from_utf8(&snapshot.bytes).ok()?;
     let line = crate::text_edit::first_match_line(current, old)?;
-    let total = current.split('\n').count() as u64;
-    let offset = expected
-        .and_then(FileObservation::first_unread_unit)
-        .unwrap_or(1)
-        .min(total.max(1));
+    let total = current.split('\n').count();
+    let offset = line.saturating_sub(UNREAD_HINT_LEAD_IN).max(1);
     Some(format!(
-        "old_string is at line {line} of {total}; call read_file with offset={offset} to continue"
+        "old_string is at line {line} of {total}; call read_file with offset={offset}, limit={UNREAD_HINT_LIMIT}"
     ))
 }
 
-/// `unread_hint` is consulted only on the two verdicts a read can clear, so a
-/// caller that knows where the model should read (only `edit_file` does) can
-/// say so without any caller re-deriving the verdict. It never changes who
-/// passes — the eligibility rule is untouched, only what a refusal says.
+/// `unread_hint` is consulted only on the never-read verdict. That is the one
+/// verdict a read can clear for the only tool that supplies a hint: `edit_file`
+/// asks for [`ReadRequirement::AnyRead`], so it never reaches the incomplete
+/// branch, and the tools that do reach it supply no hint.
 fn validate_observation_metadata<'a>(
     expected: Option<&'a FileObservation>,
     metadata: &std::fs::Metadata,
     identity: FileIdentity,
     tool: &str,
     path: &str,
-    require_notebook: bool,
+    requirement: ReadRequirement,
     unread_hint: impl FnOnce() -> Option<String>,
 ) -> Result<&'a FileObservation> {
     let Some(expected) = expected else {
-        if require_notebook {
+        if requirement.notebook() {
             bail!("File has not been read yet. Read it first before writing to it.");
         }
         let hint = parenthesized(unread_hint);
         bail!("{tool}: must read {path} before modifying the existing file{hint}");
     };
-    if require_notebook && !expected.is_notebook() {
+    if requirement.notebook() && !expected.is_notebook() {
         bail!("File has not been read as a complete notebook. Read it first before writing to it.");
     }
-    if !expected.is_complete() {
-        let hint = parenthesized(unread_hint);
-        bail!("{tool}: must read the entire file {path} before modifying it{hint}");
+    if requirement.complete() && !expected.is_complete() {
+        bail!("{tool}: must read the entire file {path} before modifying it");
     }
     if expected.identity() != identity || !expected.version().metadata_matches(metadata) {
-        if require_notebook {
+        if requirement.notebook() {
             bail!(
                 "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it."
             );
@@ -1405,10 +1446,10 @@ fn validate_observation_version(
     current: &FileVersion,
     tool: &str,
     path: &str,
-    require_notebook: bool,
+    requirement: ReadRequirement,
 ) -> Result<()> {
     if expected.version() != current {
-        if require_notebook {
+        if requirement.notebook() {
             bail!(
                 "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it."
             );
@@ -3305,10 +3346,11 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    /// The refusal names the line the replacement lands on and the read that
-    /// would clear it. The offset is the first *unread* line, not a window
-    /// around the match: eligibility is still a complete read, so a window
-    /// would be refused all over again.
+    /// The refusal names the line the replacement lands on and one read that
+    /// clears it: a window around the match, which is advice worth following
+    /// only because `edit_file` now qualifies on any read (plan 155). Under the
+    /// complete-read rule this same window was refused all over again, which is
+    /// why plan 156 had to point at the first unread line instead.
     #[tokio::test]
     async fn unread_edit_names_the_line_and_the_read_that_clears_it() {
         let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
@@ -3316,7 +3358,6 @@ mod tests {
         let target = path.to_str().unwrap();
         let ctx = test_ctx(0, "edit-unread-hint");
 
-        // Never read: the whole file is the gap, so the read starts at line 1.
         let (out, is_error) = run_tool(
             "edit_file",
             json!({"path": target, "old_string": "line 33", "new_string": "line 33!"}),
@@ -3328,28 +3369,7 @@ mod tests {
             (
                 format!(
                     "edit_file: must read {target} before modifying the existing file \
-                     (old_string is at line 33 of 41; call read_file with offset=1 to continue)"
-                ),
-                true
-            )
-        );
-
-        // Read the first ten lines: the gap now starts at line 11, and that is
-        // the offset — not 13, which is where `old_string` sits.
-        let (_, is_error) = run_tool("read_file", json!({"path": target, "limit": 10}), &ctx).await;
-        assert!(!is_error);
-        let (out, is_error) = run_tool(
-            "edit_file",
-            json!({"path": target, "old_string": "line 33", "new_string": "line 33!"}),
-            &ctx,
-        )
-        .await;
-        assert_eq!(
-            (out, is_error),
-            (
-                format!(
-                    "edit_file: must read the entire file {target} before modifying it \
-                     (old_string is at line 33 of 41; call read_file with offset=11 to continue)"
+                     (old_string is at line 33 of 41; call read_file with offset=13, limit=60)"
                 ),
                 true
             )
@@ -3357,8 +3377,6 @@ mod tests {
 
         // Absent old_string is a different failure: the refusal says only what
         // it always said, and never turns into "not found" ahead of its turn.
-        // (A refused edit revokes the partial observation, so this one is back
-        // to the never-read verdict.)
         let (out, is_error) = run_tool(
             "edit_file",
             json!({"path": target, "old_string": "nowhere", "new_string": "x"}),
@@ -3373,16 +3391,17 @@ mod tests {
             )
         );
 
-        // The file is untouched by every one of those refusals.
+        // The file is untouched by both refusals.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 
-        // And the advice works: the two reads coalesce into complete coverage,
-        // so the same edit goes through. Without this the hint would be a
-        // suggestion that leads straight back to the same refusal.
-        let (_, is_error) = run_tool("read_file", json!({"path": target, "limit": 10}), &ctx).await;
-        assert!(!is_error);
-        let (_, is_error) =
-            run_tool("read_file", json!({"path": target, "offset": 11}), &ctx).await;
+        // And the advice works in exactly the one read it asks for. Without
+        // this the hint would be a suggestion that leads back to the refusal.
+        let (_, is_error) = run_tool(
+            "read_file",
+            json!({"path": target, "offset": 13, "limit": 60}),
+            &ctx,
+        )
+        .await;
         assert!(!is_error);
         let (out, is_error) = run_tool(
             "edit_file",
@@ -3396,6 +3415,166 @@ mod tests {
             body.replace("line 33\n", "line 33!\n")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Plan 155 overturns plan 49's complete-read rule for `edit_file` alone:
+    /// one narrow read qualifies the path, including for an `old_string` the
+    /// read never showed, and including every match of a `replace_all` that
+    /// straddles what was read. Uniqueness against the bytes on disk is what
+    /// keeps that honest, so the entrance fee for a file too large to read in
+    /// one call is one read, not one read per `READ_CONTENT_CHARS` of it.
+    #[tokio::test]
+    async fn a_narrow_read_qualifies_an_edit_anywhere_in_the_file() {
+        let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let path = temp_file("edit-narrow-read", &body);
+        let target = path.to_str().unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "edit-narrow-read");
+
+        let (_, is_error) = run_tool("read_file", json!({"path": target, "limit": 10}), &ctx).await;
+        assert!(!is_error);
+        assert!(!ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "line 33", "new_string": "line 33!"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            body.replace("line 33\n", "line 33!\n")
+        );
+        // The success refreshes the observation to a complete one, so the
+        // entrance fee is paid once per file per session, not once per edit.
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `replace_all` asks no more of coverage than a single edit does: the
+    /// matches on either side of what was read all go through. Plan 155 planned
+    /// the opposite (all matches covered, or fall back to a complete read), and
+    /// that rule died with the coverage check it was guarding.
+    #[tokio::test]
+    async fn replace_all_spans_read_and_unread_lines() {
+        let body: String = (1..=40)
+            .map(|n| {
+                if n == 5 || n == 35 {
+                    "token\n".to_string()
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect();
+        let path = temp_file("edit-replace-all-span", &body);
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-replace-all-span");
+
+        let (_, is_error) = run_tool("read_file", json!({"path": target, "limit": 10}), &ctx).await;
+        assert!(!is_error);
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({
+                "path": target,
+                "old_string": "token",
+                "new_string": "TOKEN",
+                "replace_all": true
+            }),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (format!("edited {target} (2 replacement(s))"), false)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            body.replace("token\n", "TOKEN\n")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The line plan 155 must not cross: relaxing *eligibility* leaves
+    /// *freshness* exactly where it was. A narrow read is now enough to qualify
+    /// a path, and it is still not enough to edit bytes that changed since.
+    #[tokio::test]
+    async fn a_narrow_read_does_not_survive_an_external_change() {
+        let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let path = temp_file("edit-narrow-stale", &body);
+        let target = path.to_str().unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "edit-narrow-stale");
+
+        let (_, is_error) = run_tool("read_file", json!({"path": target, "limit": 10}), &ctx).await;
+        assert!(!is_error);
+        let changed = format!("external\n{body}");
+        std::fs::write(&path, &changed).unwrap();
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "line 33", "new_string": "line 33!"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: {target} changed since it was read; read it again before modifying it"
+                ),
+                true
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The constraint at the capture of `expected` in [`mutate_file`], now that
+    /// a partial observation can authorize an edit: two edits based on one
+    /// narrow read must not both commit. The version check is what stops the
+    /// second, so eligibility never had to carry it.
+    #[test]
+    fn one_partial_read_cannot_authorize_two_edits() {
+        let dir = std::env::temp_dir().join(format!("kloop-double-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let expected =
+            super::FileObservation::from_read(b"alpha\nbeta\n", &metadata, 3, 0..1, true);
+        assert!(!expected.is_complete());
+
+        let prepared =
+            super::prepare_mutation(&dir, &path, "edit_file", path.to_str().unwrap()).unwrap();
+        let edit = |old: &str, new: &str| super::Mutation::Edit {
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+        };
+        super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap()),
+            Some(&expected),
+            edit("beta", "BETA"),
+            super::CommitFault::None,
+        )
+        .unwrap();
+        let error = match super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap()),
+            Some(&expected),
+            edit("alpha", "ALPHA"),
+            super::CommitFault::None,
+        ) {
+            Ok(_) => panic!("stale second edit unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("changed since it was read"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nBETA\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

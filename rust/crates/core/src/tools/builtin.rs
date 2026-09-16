@@ -814,7 +814,7 @@ fn write_file_def() -> ToolDef {
 fn edit_file_def() -> ToolDef {
     ToolDef {
         name: "edit_file".into(),
-        description: "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The entire file must have been freshly read in this session. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory.".into(),
+        description: "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The file must have been read in this session — any range qualifies — and must not have changed since. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory.".into(),
         schema: json!({
             "type": "object",
             "properties": {

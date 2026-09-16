@@ -120,3 +120,68 @@ cc 没有这笔开销。plan 49 第 44 行白纸黑字记着这是**有意**的�
    如实写下来并考虑撤销**——plan 49 那条裁决的可解释性是有价值的,不该用一个收益存疑的
    改动去换。
 8. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自单独取退出码)。
+
+## ✅ 已完成(2026-09-16;提交 SHA 以本条所在提交为准)
+
+**第五节那个问题:推翻了。** 用户同意,理由比 plan 摆的多一条——plan 拿"可解释性"当保留理由,
+但完整读买到的安全性比看起来少:`edit_file` 早就强制 `old_string` **唯一**(`fs.rs:1262`),
+"没看全文、改到两个长得一样的地方里错的那个"这个主要风险是唯一性挡住的,不是完整读挡住的。
+完整读剩下的价值是"让模型看见周边语境",那是质量诉求,工具层强制不了。
+
+**但形状不是 plan 设计的那个。** 用户一句「看参考项目」,照教训 143 先回源,五家的资格规则:
+
+| 项目 | edit 的资格 | 新鲜度靠什么 |
+|---|---|---|
+| cc 2.1.220 | **读过一次**(任意 offset/limit);`validateInput` 连这个都不要求,`call()` 才要求 `lastRead` 存在(`FileEditTool.ts:449`) | mtime > 读取时刻 → 拒;full read 时 content 相等可豁免(Windows 误报) |
+| codewhale | **读过一次**(任意范围,`require_fresh_file_read`,`tools/spec.rs:997`) | 整文件 snapshot 相等 |
+| deepseek-harness | **observed 过一次**(`fs-observation-policy` 的 `editIntent`) | 观察到的 version 做 CAS |
+| grok-build | **无**——`skip_read_before_edit` 的注释写着 "Deprecated runtime no-op"(`search_replace/mod.rs:102`),只剩配置期"toolset 里得有个 Read 工具"的要求 | 全靠 `old_string` 精确匹配 + no-match 时的 user-edit 提示 |
+| codex | **无** | patch 的 context 行自己就是校验 |
+
+**没有一家实现区间资格。** plan 第四节把"放宽"等同于"缩小粒度"(整文件 → 区间),那是个很自然
+但零参考支持的中间态;三家选的是更粗的"存在性"。于是落地成 `ReadRequirement`
+(`CompleteFile` / `CompleteNotebook` / `AnyRead`)——`edit_file` 只要求该路径有一份观察,
+`write_file` 与 `notebook_edit` 一个字节没动。
+
+**这个粒度让第六节四个坑里的三个直接消失**:行形/字形换算不用做(字节形区间只出现在
+`full_with_identity` 里,而它恒为 `complete`,走短路)、`DEFAULT_MAX_RANGES` 的有损记录不用
+容忍、`replace_all` 的"全覆盖才放行"这条规则随它要守的检查一起没了(新增
+`replace_all_spans_read_and_unread_lines` 钉死跨区间放行)。第一个坑(并发资格捕获)查完
+发现**本来就不用动**:`fs.rs:609` 捕获的是等锁**之前**的观察,第二个并发 edit 手里那份
+`version` 在第一个提交后必然不匹配,`validate_observation_version` 拦掉——新增
+`one_partial_read_cannot_authorize_two_edits` 用**残缺**观察复现了这条。
+
+**没跟到最松的那一档。** grok/codex 那条路(什么都不要求)会拆掉新鲜度的比较基准;
+"读过一次"正是**保住新鲜度的最小资格**,cc 的 `call()` 里 `!lastRead` 仍然抛错,理由一样。
+验收第 3 条(新鲜度不能破)由 `a_narrow_read_does_not_survive_an_external_change` 守住。
+
+**提示词切回 plan 原本的形状。** 资格放宽之后,"读 `old_string` 周围那 60 行"第一次成为
+**照做就能解锁**的建议,所以 plan 156 那条"第一行还没读过的行"的形状(教训 148(a) 的产物)
+退役:现在报 `offset=N-20, limit=60`(`UNREAD_HINT_LEAD_IN` / `UNREAD_HINT_LIMIT`),
+验收第 2 条到此成立。`file_state.rs` 的 `first_unread_unit` 随之删掉(只有那个提示在用)。
+
+**验收第 7 条,量了一遍**(148 个 `.rs`,55 个超 `READ_CONTENT_CHARS` = 30 000,仍是 37%):
+
+| 文件 | 字符 | 旧:读满要几次 | 旧:入场费 |
+|---|---|---|---|
+| `core/src/tools/mod.rs` | 166 140 | 6 | ~41.5k tok |
+| `core/src/permissions.rs` | 165 177 | 6 | ~41.3k tok |
+| `tui/src/app.rs` | 156 320 | 6 | ~39.1k tok |
+
+"改三个大文件各一处":**18 次读 / ~122k token → 3 次读 / ~1.8k token**(每处一个 60 行窗口)。
+plan 第一节估的 17 次 / 12 万 token 核对无误。
+
+**plan 没算到的第二笔账**:失败的 mutation 会 eagerly `Clear` 观察
+(`fs.rs:693`,"只有最终成功的 tool_result 才把授权装回去")。旧规则下一次 `old_string`
+不唯一的失败 edit 要**再付 6 次读**才能重试;新规则下付 1 次。这笔比 plan 认下的折扣
+("每文件每会话首次编辑")更频繁。
+
+**改了什么**:`fs.rs`(`ReadRequirement` + 三处调用点 + 新提示词)、`file_state.rs`(删
+`first_unread_unit` 及其测试)、`builtin.rs`/`mod.rs`(工具描述:"The entire file must have been
+freshly read" → "any range qualifies")、`README.md` 三处。**测试**:改写 1 条、新增 4 条;
+negative control 跑过——把 `AnyRead` 换回 `CompleteFile`,4 条新测试全红。
+fmt / clippy `-D warnings` / `cargo test --workspace` 各自单独取退出码,全绿。
+
+**非目标照旧没动**:`write_file` / `notebook_edit` 的完整读要求(验收第 5 条,
+`existing_write_requires_a_complete_fresh_read_and_refreshes_state` 原样通过)、
+stale-recover、`READ_CONTENT_CHARS`、`old_string`/`new_string` 形态。
