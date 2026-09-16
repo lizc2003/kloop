@@ -3029,8 +3029,9 @@ Rust 1.96.1 with rustfmt and clippy; CI's stable matrix explicitly invokes
 Ratatui 0.30.2 with its explicit `crossterm_0_29` integration, Crossterm 0.29.0
 (`event-stream` retained), `unicode-width` 0.2.2, and
 `unicode-segmentation` 1.13.3. The Unix-only real-binary PTY harness uses
-vt100 0.16.2; portable-pty, vt100, tempfile, and its fixture wiremock remain dev
-edges rather than production or Windows dependencies.
+vt100 0.16.2; portable-pty, vt100, tempfile, insta 1 (whole-screen baselines),
+and its fixture wiremock remain dev edges rather than production or Windows
+dependencies.
 
 ```sh
 # usage summary of every flag
@@ -3352,11 +3353,25 @@ Every session is saved and resumable — see Session persistence above.
 - **kloop TUI PTY (Unix only)** — `cargo test -p kloop --test tui_pty --
   --nocapture` launches the real default binary in a sealed `portable-pty`, serves
   deterministic loopback OpenAI-compatible SSE, answers every split/multiple CPR
-  query, and feeds raw output incrementally to a zero-history `vt100` parser. Seven
+  query, and feeds raw output incrementally to a zero-history `vt100` parser. Ten
   tests cover boot/bracketed-paste/no alternate screen, shrink/grow resize with
   continued CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
-  restoration, and exact UTF-8 input through grapheme edits. Captured request
-  projections exclude headers/Authorization and raw ANSI is bounded fail-closed.
+  restoration, exact UTF-8 input through grapheme edits, and three pure-layout
+  scenarios (a markdown reply with a list and a code block, a tool call with its
+  result, a result past the preview cap). Captured request projections exclude
+  headers/Authorization and raw ANSI is bounded fail-closed. Five of the ten also
+  assert the whole settled screen against a checked-in `insta` baseline (plan
+  149), six baselines in all, each bound to its own `rows×cols`: `stable_text()`
+  emits size, cursor and screen text with the per-run noise normalized away —
+  mock port and sandbox path by literal substitution, elapsed readouts by an
+  anchored `<elapsed>` token (the turn-end rule is rebuilt to the width it
+  occupies, so `0s` and `10s` produce the same line), the spinner frozen by
+  `KLOOP_NO_ANIM`, and the workspace placed under `$HOME` so the banner prints a
+  fixed-width `~/workspace` instead of a temp path that resizes its box. Baseline
+  frames are taken with `wait_for_quiescent`, which waits for the screen to stop
+  being written to rather than for one string to appear; the point assertions
+  stay, because they say what the test means and the baseline says what the
+  screen holds. `cargo insta review` accepts an intended change.
 
 Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
 rounds. Plan 63 acceptance also runs the real stdio binary for an exact native

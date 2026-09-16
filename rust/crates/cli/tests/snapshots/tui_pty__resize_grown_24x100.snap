@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: settled.stable_text()
+---
+[24x100 cursor=21,72]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+╭───────────────────────╮
+│ >_ kloop              │
+│ model   tui-pty-model │
+│ cwd     ~/workspace   │
+│ mode    manual        │
+╰───────────────────────╯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+› rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
+────────────────────────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

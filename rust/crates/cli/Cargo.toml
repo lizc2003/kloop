@@ -33,6 +33,7 @@ libc = { workspace = true }
 rustix = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+insta = { workspace = true }
 portable-pty = { workspace = true }
 tempfile = { workspace = true }
 vt100 = { workspace = true }

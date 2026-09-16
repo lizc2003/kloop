@@ -11,11 +11,19 @@ use tokio::sync::Mutex;
 
 use tui_pty_support::ChatFixture;
 use tui_pty_support::PtyHarness;
+use tui_pty_support::PtyOptions;
 use tui_pty_support::contains_bytes;
 use tui_pty_support::find_bytes;
 use tui_pty_support::sse_text;
+use tui_pty_support::sse_tool_call;
 
 static PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// How long the screen must stay untouched before a frame counts as final.
+/// The predicate a test waits on is satisfied by a transitional frame — the
+/// repaint behind it is still in flight — and that frame is the wrong one to
+/// put in a baseline.
+const QUIET: Duration = Duration::from_millis(250);
 
 const CTRL_C: &[u8] = b"\x03";
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
@@ -135,6 +143,16 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
     assert_eq!(harness.pty_size()?, (16, 60));
     assert!(shrunk.cursor.0 < shrunk.rows && shrunk.cursor.1 < shrunk.cols);
     assert_eq!(shrunk.count("[manual]"), 1);
+    // The spot checks above say the cursor and the badge survived the shrink.
+    // The baseline says what the other 959 cells hold: where the banner wrapped,
+    // how the 70-column input rewrapped, whether the footer kept its row.
+    let settled = harness.wait_for_quiescent(
+        "shrunk screen settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 16 && frame.cols == 60,
+    )?;
+    insta::assert_snapshot!("resize_shrunk_16x60", settled.stable_text());
 
     let shrunk_cpr = shrunk.cpr_count;
     harness.resize(24, 100)?;
@@ -148,6 +166,13 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
     assert_eq!(harness.pty_size()?, (24, 100));
     assert!(grown.cursor.0 < grown.rows && grown.cursor.1 < grown.cols);
     assert_eq!(grown.count("[manual]"), 1);
+    let settled = harness.wait_for_quiescent(
+        "grown screen settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 24 && frame.cols == 100,
+    )?;
+    insta::assert_snapshot!("resize_grown_24x100", settled.stable_text());
 
     graceful_exit(&mut harness)?;
     Ok(())
@@ -189,6 +214,16 @@ async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Res
     })?;
     assert_eq!(final_frame.count("Type a message"), 1);
     assert_eq!(final_frame.count("[manual]"), 1);
+    // Two commits have scrolled the first turn away; what is left is the seam
+    // between them. Counting "Type a message" cannot see a stray blank row or a
+    // line of the previous turn left behind by the clear — the baseline can.
+    let settled = harness.wait_for_quiescent(
+        "second turn settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.contains("SECOND_TAIL") && frame.contains("Type a message"),
+    )?;
+    insta::assert_snapshot!("two_turn_overflow_14x80", settled.stable_text());
 
     let raw = harness.raw_since(mark);
     // Bug #1 (plan 99): a full-height inline commit must NOT drive DECSTBM scroll
@@ -368,6 +403,135 @@ async fn unicode_input_round_trips_through_real_binary_editing() -> Result<()> {
         request.user_texts.last().map(String::as_str),
         Some(expected)
     );
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Whole-screen layout baselines (plan 149).
+//
+// The tests above assert terminal-protocol facts: no alternate screen, no
+// scroll region, a CPR that gets answered. These assert the other half — what
+// the screen actually looks like once a turn has landed. They drive the real
+// binary the same way, but every one of them ends on one `insta` baseline of
+// the settled frame, so a regression in wrapping, indentation, alignment or
+// spacing has somewhere to show up. `cargo insta review` accepts a new one.
+// ---------------------------------------------------------------------------
+
+fn spawn_with_files(
+    fixture: &ChatFixture,
+    rows: u16,
+    cols: u16,
+    files: &[(&str, &str)],
+) -> Result<PtyHarness> {
+    PtyHarness::spawn_with_options(
+        Path::new(env!("CARGO_BIN_EXE_kloop")),
+        &fixture.uri(),
+        rows,
+        cols,
+        &PtyOptions {
+            files,
+            ..PtyOptions::default()
+        },
+    )
+}
+
+/// Send one message and return the screen once it has stopped moving.
+fn one_turn(harness: &mut PtyHarness, message: &str, tail: &str) -> Result<String> {
+    harness.write(message.as_bytes())?;
+    harness.write(ENTER)?;
+    harness.wait_for("turn completes", Duration::from_secs(8), |frame| {
+        frame.contains(tail) && !frame.contains("Working") && frame.contains("Type a message")
+    })?;
+    let settled =
+        harness.wait_for_quiescent("screen settles", Duration::from_secs(3), QUIET, |frame| {
+            frame.contains(tail) && frame.contains("Type a message")
+        })?;
+    Ok(settled.stable_text())
+}
+
+/// Markdown structure: an ordered list, a nested bullet under one of its items,
+/// a fenced code block, and prose around them. The `markdown` unit tests check
+/// the lines this produces; only the whole screen shows how those lines sit
+/// against each other once wrapped to 80 columns and drawn under the banner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn markdown_reply_with_a_list_and_a_code_block_fills_the_screen() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let reply = concat!(
+        "Two things to change, then a check:\n\n",
+        "1. Move the guard above the early return.\n",
+        "2. Keep the counter monotonic:\n",
+        "   - never reset it on reconnect\n",
+        "   - let it wrap at `u32::MAX`\n\n",
+        "```rust\n",
+        "fn bump(counter: &mut u32) {\n",
+        "    *counter = counter.wrapping_add(1);\n",
+        "}\n",
+        "```\n\n",
+        "That is MARKDOWN_TAIL.",
+    );
+    let fixture = ChatFixture::start(vec![sse_text(reply)]).await;
+    let mut harness = spawn(&fixture, 24, 80)?;
+    wait_for_boot(&mut harness)?;
+
+    let screen = one_turn(&mut harness, "what should I change?", "MARKDOWN_TAIL")?;
+    insta::assert_snapshot!("markdown_list_and_code_24x80", screen);
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// One tool call and its result. `read_file` is read-only, so the gate lets it
+/// through without a prompt and the turn runs end to end: a tool row, its
+/// preview, then the model's closing text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tool_call_and_its_result_fill_the_screen() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![
+        sse_tool_call(
+            "call-read-1",
+            "read_file",
+            &serde_json::json!({"path": "notes.txt"}),
+        ),
+        sse_text("The file says TOOLROW_TAIL."),
+    ])
+    .await;
+    let mut harness = spawn_with_files(&fixture, 24, 80, &[("notes.txt", "alpha\nbeta\ngamma\n")])?;
+    wait_for_boot(&mut harness)?;
+
+    let screen = one_turn(&mut harness, "read notes.txt", "TOOLROW_TAIL")?;
+    insta::assert_snapshot!("tool_call_and_result_24x80", screen);
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// A result longer than the preview cap. The transcript must show the first few
+/// lines and say how much it dropped, rather than letting a long file push the
+/// composer off the bottom — the "…more" hint is exactly the kind of detail a
+/// `contains()` check never looks at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_tool_result_is_truncated_on_screen() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let long_file = (1..=20)
+        .map(|line| format!("line {line:02} of the long file"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixture = ChatFixture::start(vec![
+        sse_tool_call(
+            "call-read-2",
+            "read_file",
+            &serde_json::json!({"path": "long.txt"}),
+        ),
+        sse_text("Read it: TRUNCATED_TAIL."),
+    ])
+    .await;
+    let mut harness = spawn_with_files(&fixture, 24, 80, &[("long.txt", &long_file)])?;
+    wait_for_boot(&mut harness)?;
+
+    let screen = one_turn(&mut harness, "read long.txt", "TRUNCATED_TAIL")?;
+    insta::assert_snapshot!("long_tool_result_truncated_24x80", screen);
 
     graceful_exit(&mut harness)?;
     Ok(())

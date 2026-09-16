@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: screen
+---
+[24x80 cursor=21,2]
+
+
+
+
+╭───────────────────────╮
+│ >_ kloop              │
+│ model   tui-pty-model │
+│ cwd     ~/workspace   │
+│ mode    manual        │
+╰───────────────────────╯
+
+> read notes.txt
+✓ Read notes.txt
+  └ 1 alpha
+    2 beta
+    3 gamma
+    4
+The file says TOOLROW_TAIL.
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

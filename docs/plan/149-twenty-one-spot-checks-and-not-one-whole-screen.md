@@ -115,3 +115,67 @@ AGENTS.md 明写"**测试整对象断言优先**"。这块是全仓最该整对�
    改回来即绿。红不了说明规范化把有效信息也抹掉了,基线是废的。
 5. 仓库完成标准照旧:`cargo fmt --all --check`、`cargo clippy --workspace --all-targets
    --all-features -D warnings`、`cargo test --workspace` 各自单独取退出码,全为 0。
+
+## ✅ 已完成(2026-09-16;提交 SHA 以本条所在提交为准)
+
+**第四节那个问题,用户拍了 `insta`**(理由问下来是"接受基线要看一眼 diff")。全 workspace
+第一次引入它,只挂在 `crates/cli` 的 `cfg(unix)` dev-dependencies 上,默认 features
+(彩色 diff 正是它的价值;serde/glob/redaction 三个 feature 都没要——一帧就是纯文本,
+它的每跑必变项在 harness 里用已知值做字面替换,比 regex filter 准)。
+
+### harness 加了什么(`crates/cli/tests/tui_pty_support/mod.rs`)
+
+1. **`FrameSnapshot::stable_text()`**:`[{rows}x{cols} cursor=r,c]` 一行头 + 整屏文本。
+   刻意不复用 `debug_dump()`——后者带 `cpr_count`/`raw_len`,那是给人看失败用的计数器,
+   每跑必变。行尾空格 trim,尾部全空行折叠(屏幕高度固定,所以折掉的行数可反推)。
+2. **四类规范化**,对应第三节第 2 条:
+   - **端口与临时路径**:`redaction_table()` 字面替换,**按长度降序**——macOS 的
+     `/var` 是 `/private/var` 的符号链接,两种写法都要收,先收短的会把长的切成半截;
+   - **耗时**:`normalize_elapsed()` 只认两个锚点(`── Worked for ` 和
+     ` · esc to interrupt)`),回复正文里出现 `30s` 不受影响。turn-end 那条横线
+     **按它原本占的宽度重建**——它用 `─` 填满整行,`0s` 和 `10s` 差一个 `─`,
+     光把数字换成 `<elapsed>` 还是两条不同的线;
+   - **spinner**:harness 本来就设了 `KLOOP_NO_ANIM`,退化成静止 `●`,无需额外处理;
+   - **cwd**:workspace 挪进 `$HOME` 下,banner 打 `~/workspace`。这是第五节"尺寸必须
+     绑定"的延伸——banner 的框按最宽字段撑开,临时路径每次长度不同,框宽就跟着变。
+     顺带 canonicalize 了 sandbox 根:子进程的 `current_dir()` 回来是解析过的
+     `/private/var/…`,不 canonicalize 的话未解析的 `$HOME` 压根不是它的前缀,
+     `display_cwd` 的 `~` 收缩不会发生。
+3. **`wait_for_quiescent(idle)`**:`TerminalState` 加 `last_write`,等的是"最后一次
+   写入之后 N 毫秒无新字节"。`wait_for` 抽出共同的 `wait_until`,语义一字未改。
+   不是固定 sleep,仍走 reader 已经在 notify 的那个 condvar。
+4. **`PtyOptions { args, files }` + `spawn_with_options`**:工具场景得有东西可读;
+   `sse_tool_call()` 发 openai-compat 的 `tool_calls` delta。`spawn` / `spawn_with_args`
+   签名不动。
+5. 三个纯函数(`normalize_elapsed` / `is_elapsed` / `redaction_table`)各自带单测,
+   其中一条锁的就是"同一条 turn-end 线,`0s` 与 `12m30s` 规范化后逐字相同、且宽度不变"。
+
+### 六张基线(五个测试,均在 `tests/snapshots/`)
+
+| 基线 | 尺寸 | 管住什么 |
+|---|---|---|
+| `resize_shrunk_16x60` / `resize_grown_24x100` | 16×60 / 24×100 | 缩放前后整屏,含 70 列输入的重新折行 |
+| `two_turn_overflow_14x80` | 14×80 | 两次提交之后剩下的接缝 |
+| `markdown_list_and_code_24x80` | 24×80 | 有序列表 + 嵌套项 + 代码块(新增场景) |
+| `tool_call_and_result_24x80` | 24×80 | 一行工具调用 + 结果预览(新增场景) |
+| `long_tool_result_truncated_24x80` | 24×80 | 超过 `PREVIEW_MAX_LINES` 的截断提示(新增场景) |
+
+**原有 21 处点断言一条没删**,9 个既有测试全部仍绿。工具场景用 `read_file`——它是只读的,
+按 `permissions` 的 `read_only_calls_skip_the_approver` 直接放行,不会卡在授权弹层上。
+
+### 验证
+
+1. 9 个既有测试 + 3 个新测试 + harness 的 5 个单测 = `--test tui_pty` 15 passed;
+   `plain_pty` 2 个仍绿。
+2. **同一条命令连跑三次,基线零 diff**(三次都是 12 passed、`*.snap.new` 数为 0)。
+3. **negative control**:把 `tui/src/markdown.rs:44` 的 `CODE_INDENT` 从 `"  "` 改成
+   `"    "`,`markdown_list_and_code_24x80` 一张变红、其余 11 个仍绿;改回即全绿。
+   规范化没有把有效信息抹掉。
+4. `cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features
+   -D warnings`、`cargo test --workspace` 各自单独跑并当场取退出码,全为 0。
+
+### 一个开工时没预料到的点
+
+第五节列了五个坑,真正绊人的是没列的那个:**规范化一个被宽度填充的行,只换里面的数字是不够的**。
+turn-end 横线填满整行,elapsed 变长一个字符、`─` 就少一个——`<elapsed>` 替换完两行仍不相等。
+凡是"某字段 + 填充到固定宽度"的行,规范化必须重建整行,不能只替换字段。已记为 HANDOFF 教训 142。

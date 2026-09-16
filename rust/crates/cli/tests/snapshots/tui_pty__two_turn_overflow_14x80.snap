@@ -1,0 +1,19 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: settled.stable_text()
+---
+[14x80 cursor=11,2]
+FIRST-OVERFLOW-35
+
+FIRST_OVERFLOW_TAIL
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+
+> second turn
+SECOND_TAIL
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

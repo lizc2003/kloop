@@ -158,6 +158,38 @@ pub fn sse_text(text: &str) -> String {
     format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
+/// One SSE turn that calls a built-in tool, for scenarios that need a tool row
+/// on screen. `arguments` is serialized the way a provider sends it: a JSON
+/// string inside the delta, not a nested object.
+pub fn sse_tool_call(id: &str, name: &str, arguments: &Value) -> String {
+    let delta = serde_json::json!({
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "id": id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments.to_string()},
+        }]}}]
+    });
+    let finish = serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    });
+    let usage = serde_json::json!({
+        "choices": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    });
+    format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+}
+
+/// What a spawn varies beyond size. [`PtyHarness::spawn`] and
+/// [`PtyHarness::spawn_with_args`] stay the short forms for the common cases.
+#[derive(Default)]
+pub struct PtyOptions<'a> {
+    pub args: &'a [&'a str],
+    /// Seeded into the workspace before the binary starts, as (path relative to
+    /// the workspace, contents) — a tool scenario needs something to act on.
+    pub files: &'a [(&'a str, &'a str)],
+}
+
 #[derive(Clone, Debug)]
 pub struct FrameSnapshot {
     pub rows: u16,
@@ -167,6 +199,8 @@ pub struct FrameSnapshot {
     pub bracketed_paste: bool,
     pub cpr_count: usize,
     pub raw_len: usize,
+    /// Literal per-run values to replace before the frame becomes a baseline.
+    redactions: Arc<Vec<(String, String)>>,
 }
 
 impl FrameSnapshot {
@@ -176,6 +210,36 @@ impl FrameSnapshot {
 
     pub fn count(&self, needle: &str) -> usize {
         self.text.matches(needle).count()
+    }
+
+    /// The whole screen as one assertable string, for an `insta` baseline.
+    ///
+    /// Deliberately not [`Self::debug_dump`]: that one is a diagnostic for a
+    /// human reading a failure, and carries `cpr_count`/`raw_len` — counters
+    /// that differ every run and would make a baseline flap. This carries only
+    /// what a user could see: the size, the cursor, and the screen text, with
+    /// the values that are new on every run normalized away.
+    pub fn stable_text(&self) -> String {
+        let mut screen = self.text.clone();
+        for (from, to) in self.redactions.iter() {
+            screen = screen.replace(from.as_str(), to);
+        }
+        let mut out = format!(
+            "[{}x{} cursor={},{}]\n",
+            self.rows, self.cols, self.cursor.0, self.cursor.1
+        );
+        let mut lines: Vec<String> = screen
+            .lines()
+            .map(|line| normalize_elapsed(line.trim_end()))
+            .collect();
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
     }
 
     fn debug_dump(&self) -> String {
@@ -188,6 +252,52 @@ impl FrameSnapshot {
         }
         dump
     }
+}
+
+/// The stand-in for any wall-clock readout in a baseline.
+const ELAPSED: &str = "<elapsed>";
+
+/// `8s`, `1m05s`, `2h03m` — the shapes `anim::format_elapsed` produces.
+fn is_elapsed(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_digit())
+        && text.ends_with(['s', 'm'])
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
+}
+
+/// Replace an elapsed readout on one screen line with [`ELAPSED`].
+///
+/// Both call sites are anchored on their surrounding text rather than on a
+/// bare number, so a model reply that happens to say `30s` is left alone.
+///
+/// The turn-end rule needs more than a substitution: it pads with `─` out to
+/// the transcript width, so `0s` and `10s` differ by a dash even after the
+/// number is replaced. Rebuilding it to the width it already occupies is what
+/// makes the two produce the same line.
+fn normalize_elapsed(line: &str) -> String {
+    const RULE: &str = "── Worked for ";
+    const INTERRUPT: &str = " · esc to interrupt)";
+
+    if let Some(rest) = line.strip_prefix(RULE)
+        && let Some((elapsed, fill)) = rest.split_once(' ')
+        && is_elapsed(elapsed)
+        && !fill.is_empty()
+        && fill.chars().all(|c| c == '─')
+    {
+        let label = format!("{RULE}{ELAPSED} ");
+        let dashes = line.chars().count().saturating_sub(label.chars().count());
+        return format!("{label}{}", "─".repeat(dashes));
+    }
+
+    if let Some(tail) = line.find(INTERRUPT)
+        && let Some(open) = line[..tail].rfind('(')
+        && is_elapsed(&line[open + 1..tail])
+    {
+        return format!("{}({ELAPSED}{}", &line[..open], &line[tail..]);
+    }
+
+    line.to_string()
 }
 
 #[derive(Default)]
@@ -221,10 +331,14 @@ struct TerminalState {
     cpr_count: usize,
     error: Option<String>,
     reader_done: bool,
+    redactions: Arc<Vec<(String, String)>>,
+    /// When the last byte arrived, so a caller can wait for the screen to stop
+    /// moving rather than for one string to appear.
+    last_write: Instant,
 }
 
 impl TerminalState {
-    fn new(rows: u16, cols: u16) -> Self {
+    fn new(rows: u16, cols: u16, redactions: Arc<Vec<(String, String)>>) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
             scanner: CprScanner::default(),
@@ -232,6 +346,8 @@ impl TerminalState {
             cpr_count: 0,
             error: None,
             reader_done: false,
+            redactions,
+            last_write: Instant::now(),
         }
     }
 
@@ -246,10 +362,12 @@ impl TerminalState {
             bracketed_paste: screen.bracketed_paste(),
             cpr_count: self.cpr_count,
             raw_len: self.raw.len(),
+            redactions: Arc::clone(&self.redactions),
         }
     }
 
     fn push_raw(&mut self, byte: u8) {
+        self.last_write = Instant::now();
         if self.raw.len() < RAW_LIMIT {
             self.raw.push(byte);
         } else if self.error.is_none() {
@@ -284,15 +402,52 @@ impl PtyHarness {
         cols: u16,
         args: &[&str],
     ) -> Result<Self> {
+        Self::spawn_with_options(
+            program,
+            base_url,
+            rows,
+            cols,
+            &PtyOptions {
+                args,
+                ..PtyOptions::default()
+            },
+        )
+    }
+
+    pub fn spawn_with_options(
+        program: &Path,
+        base_url: &str,
+        rows: u16,
+        cols: u16,
+        options: &PtyOptions<'_>,
+    ) -> Result<Self> {
         let sandbox = tempfile::tempdir().context("create PTY sandbox")?;
-        let home = sandbox.path().join("home");
-        let xdg_config = sandbox.path().join("xdg-config");
-        let xdg_cache = sandbox.path().join("xdg-cache");
-        let workspace = sandbox.path().join("workspace");
+        // macOS hands out temp dirs under `/var`, a symlink to `/private/var`,
+        // and the child's own `current_dir()` comes back resolved. An
+        // unresolved `$HOME` would then not be a prefix of it, so canonicalize
+        // once here and derive every path the child sees from that.
+        let root = std::fs::canonicalize(sandbox.path()).context("canonicalize PTY sandbox")?;
+        let home = root.join("home");
+        let xdg_config = root.join("xdg-config");
+        let xdg_cache = root.join("xdg-cache");
+        // The workspace lives inside `$HOME` so the session banner contracts it
+        // to `~/workspace`. A temp path is a different length on every run, and
+        // the banner's box is sized to its widest field — left alone, the box
+        // would change width from one run to the next.
+        let workspace = home.join("workspace");
         for directory in [&home, &xdg_config, &xdg_cache, &workspace] {
             std::fs::create_dir_all(directory)
                 .with_context(|| format!("create {}", directory.display()))?;
         }
+        for (relative, contents) in options.files {
+            let file = workspace.join(relative);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            std::fs::write(&file, contents).with_context(|| format!("seed {}", file.display()))?;
+        }
+        let redactions = Arc::new(redaction_table(base_url, sandbox.path(), &root));
 
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -303,7 +458,7 @@ impl PtyHarness {
             })
             .context("open PTY")?;
         let mut command = CommandBuilder::new(program);
-        command.args(args);
+        command.args(options.args);
         command.env_clear();
         command.cwd(&workspace);
         command.env("HOME", &home);
@@ -329,8 +484,10 @@ impl PtyHarness {
         let writer: SharedWriter = Arc::new(Mutex::new(
             pair.master.take_writer().context("take PTY writer")?,
         ));
-        let terminal: SharedTerminal =
-            Arc::new((Mutex::new(TerminalState::new(rows, cols)), Condvar::new()));
+        let terminal: SharedTerminal = Arc::new((
+            Mutex::new(TerminalState::new(rows, cols, redactions)),
+            Condvar::new(),
+        ));
         let reader_terminal = Arc::clone(&terminal);
         let reader_writer = Arc::clone(&writer);
         let reader_handle = thread::Builder::new()
@@ -467,6 +624,37 @@ impl PtyHarness {
         timeout: Duration,
         predicate: impl Fn(&FrameSnapshot) -> bool,
     ) -> Result<FrameSnapshot> {
+        self.wait_until(description, timeout, |frame, _quiet| predicate(frame))
+    }
+
+    /// Wait until `predicate` holds *and* nothing has been written for `idle`.
+    ///
+    /// [`Self::wait_for`] returns the first frame where a string is present,
+    /// which is the wrong frame for a baseline: the repaint that follows it is
+    /// still in flight, so the screen captured is a transitional one. This
+    /// waits for the screen to stop moving instead — on the same condvar the
+    /// reader already notifies, not on a fixed sleep.
+    pub fn wait_for_quiescent(
+        &mut self,
+        description: &str,
+        timeout: Duration,
+        idle: Duration,
+        predicate: impl Fn(&FrameSnapshot) -> bool,
+    ) -> Result<FrameSnapshot> {
+        let idle = scaled_timeout(idle);
+        self.wait_until(description, timeout, move |frame, quiet| {
+            quiet >= idle && predicate(frame)
+        })
+    }
+
+    /// The shared poll loop: `ready` sees each frame plus how long the screen
+    /// has been still.
+    fn wait_until(
+        &mut self,
+        description: &str,
+        timeout: Duration,
+        ready: impl Fn(&FrameSnapshot, Duration) -> bool,
+    ) -> Result<FrameSnapshot> {
         let deadline = Instant::now() + scaled_timeout(timeout);
         loop {
             let (state_lock, changed) = &*self.terminal;
@@ -475,7 +663,7 @@ impl PtyHarness {
                 bail!("{description}: {error}\n{}", state.snapshot().debug_dump());
             }
             let snapshot = state.snapshot();
-            if predicate(&snapshot) {
+            if ready(&snapshot, state.last_write.elapsed()) {
                 return Ok(snapshot);
             }
             let raw_summary = bounded_raw_summary(&state.raw);
@@ -562,6 +750,22 @@ impl Drop for PtyHarness {
     }
 }
 
+/// The literal values a frame carries that are new on every run: the mock
+/// provider's port and the sandbox's temp path (both spellings of it on macOS,
+/// resolved and not). Longest first, so `/private/var/…` is consumed before the
+/// `/var/…` that is its suffix-sharing sibling.
+fn redaction_table(base_url: &str, sandbox: &Path, root: &Path) -> Vec<(String, String)> {
+    let mut table = vec![(base_url.to_string(), "http://mock-provider".to_string())];
+    for path in [root, sandbox] {
+        let text = path.display().to_string();
+        if !table.iter().any(|(from, _)| *from == text) {
+            table.push((text, "/sandbox".to_string()));
+        }
+    }
+    table.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    table
+}
+
 pub fn scaled_timeout(timeout: Duration) -> Duration {
     if std::env::var_os("CI").is_some() {
         timeout.saturating_mul(4)
@@ -622,6 +826,48 @@ mod tests {
         let mut scanner = CprScanner::default();
         let stream = b"plain\x1b[31m\x1b[6nmore\x1b[6n";
         assert_eq!(stream.iter().filter(|byte| scanner.feed(**byte)).count(), 2);
+    }
+
+    /// The turn-end rule pads to the full width, so a longer elapsed eats a
+    /// dash. Both spellings must normalize to the same line, at the same width.
+    #[test]
+    fn a_turn_end_rule_normalizes_the_same_whatever_the_elapsed() {
+        let short = format!("── Worked for 0s {}", "─".repeat(63));
+        let long = format!("── Worked for 12m30s {}", "─".repeat(59));
+        assert_eq!(short.chars().count(), 80);
+        assert_eq!(long.chars().count(), 80);
+        assert_eq!(normalize_elapsed(&short), normalize_elapsed(&long));
+        assert_eq!(normalize_elapsed(&short).chars().count(), 80);
+    }
+
+    /// Both replacements are anchored on the text around them, so a reply that
+    /// happens to mention a duration keeps it — the point of a baseline is that
+    /// the model's own words reach it unchanged.
+    #[test]
+    fn only_anchored_elapsed_readouts_are_replaced() {
+        assert_eq!(
+            normalize_elapsed("● Working (8s · esc to interrupt)"),
+            "● Working (<elapsed> · esc to interrupt)"
+        );
+        let prose = "the retry backs off after 30s and gives up";
+        assert_eq!(normalize_elapsed(prose), prose);
+        let not_a_rule = "── Worked for ever ───";
+        assert_eq!(normalize_elapsed(not_a_rule), not_a_rule);
+    }
+
+    #[test]
+    fn the_redaction_table_consumes_the_longer_temp_path_first() {
+        let table = redaction_table(
+            "http://127.0.0.1:53421",
+            Path::new("/var/folders/ab/T/.tmp123"),
+            Path::new("/private/var/folders/ab/T/.tmp123"),
+        );
+        let mut text = "cwd /private/var/folders/ab/T/.tmp123/workspace via http://127.0.0.1:53421"
+            .to_string();
+        for (from, to) in &table {
+            text = text.replace(from, to);
+        }
+        assert_eq!(text, "cwd /sandbox/workspace via http://mock-provider");
     }
 
     #[test]

@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: screen
+---
+[24x80 cursor=21,2]
+
+
+╭───────────────────────╮
+│ >_ kloop              │
+│ model   tui-pty-model │
+│ cwd     ~/workspace   │
+│ mode    manual        │
+╰───────────────────────╯
+
+> read long.txt
+✓ Read long.txt
+  └ 1 line 01 of the long file
+    2 line 02 of the long file
+    3 line 03 of the long file
+    4 line 04 of the long file
+    5 line 05 of the long file
+    … full result in session
+Read it: TRUNCATED_TAIL.
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

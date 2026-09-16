@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: screen
+---
+[24x80 cursor=21,2]
+│ model   tui-pty-model │
+│ cwd     ~/workspace   │
+│ mode    manual        │
+╰───────────────────────╯
+
+> what should I change?
+Two things to change, then a check:
+
+1. Move the guard above the early return.
+2. Keep the counter monotonic:
+   - never reset it on reconnect
+   - let it wrap at u32::MAX
+
+  fn bump(counter: &mut u32) {
+      *counter = counter.wrapping_add(1);
+  }
+
+That is MARKDOWN_TAIL.
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

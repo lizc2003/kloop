@@ -108,6 +108,15 @@ windows-sys = { version = "0.52", features = [
 ] }
 
 # test-only
+# Whole-screen TUI baselines (plan 149): the PTY tests assert a normalized frame
+# against a checked-in `.snap` instead of spot-checking a few needles. Taken for
+# `cargo insta review` — a TUI baseline changes often and on purpose, so the
+# friction of accepting a new one has to be low enough that people update it and
+# high enough that they look at the diff first. Default features only: the
+# colour diff is the whole point, and the serde/glob/redaction extras are not
+# needed — a frame is plain text, and its per-run noise is normalized in the
+# harness against the values it already knows (port, sandbox path).
+insta = { version = "1" }
 portable-pty = "0.9"
 tempfile = "3"
 vt100 = "0.16.2"
