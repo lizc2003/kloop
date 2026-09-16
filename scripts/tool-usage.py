@@ -38,6 +38,10 @@ rollout 是 append-only 的 jsonl，一行一条 `message`，`tool_use` 和 `too
                    给了，说明模型不走默认路径，针对默认值的优化没有意义。
   重复率           同一个目标被读/搜了几次。往返花在哪里，这一栏通常比上限那栏重要：
                    30 000 时代仍是 70%，而上限只咬 1.5%。
+  区间重叠         `--overlap`：这次读的行区间与本会话已读区间相交吗？相交 ⟹ 那些行
+                   还在上下文里，这次是冗余重读。**压缩边界会清空**，因为压缩把旧结果
+                   换走了，此时重读正当——不清空，31.1% 里有一半是冤枉的（真值 13.8%）。
+                   plan 151 的判定就是这一栏。
 
 **必读的陷阱**：语料是本机 dogfood，几乎总是偏向最近那几次任务。脚本会打印项目桶
 分布——一个桶占九成以上时，结论只对那一类工作负载成立，别当成通用结论。
@@ -130,6 +134,65 @@ def has_more(text: str) -> bool:
     return "to continue]" in text or "truncated within line" in text
 
 
+def report_overlap(tool: str, since: str | None) -> None:
+    """read_file 专用：这次读的行区间，和本会话已经读过的区间相交吗？
+
+    相交 ⟹ 那些行**还在模型的上下文里**，这次读是冗余的。三分之一的读取落在这
+    一档，但其中约一半由压缩解释得通（压缩把旧结果换走了，重读是正当的），所以
+    压缩边界必须清空区间集合——不清空会把正当行为算成打转。plan 151 的判定就是
+    这一栏，它的验收也拿这个数复算。
+    """
+    fresh = paged = overlap = 0
+    worst: collections.Counter = collections.Counter()
+    for path in sorted(ROLLOUTS.glob("*/sessions/*.jsonl")):
+        if since and path.stem[:8] <= since:
+            continue
+        seen: dict[str, list[tuple[int, int]]] = collections.defaultdict(list)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if item.get("type") == "compacted":
+                seen.clear()
+                continue
+            if item.get("type") != "message":
+                continue
+            for block in item.get("content") or []:
+                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                    continue
+                if block.get("name") != tool:
+                    continue
+                args = block.get("input") or {}
+                target = args.get("path")
+                start = positive_count(args.get("offset")) or 1
+                span = positive_count(args.get("limit"))
+                end = start + span if span else 1 << 30
+                before = seen[target]
+                if not before:
+                    fresh += 1
+                elif any(start < r[1] and r[0] < end for r in before):
+                    overlap += 1
+                    worst[target] += 1
+                else:
+                    paged += 1
+                before.append((start, end))
+    total = fresh + paged + overlap
+    if not total:
+        print(f"\n区间重叠: 语料里没有带 path 的 {tool} 调用")
+        return
+    print(f"\n区间重叠（压缩边界清零后）: {total} 次 {tool}")
+    print(f"  首次读这个目标  : {fresh} ({fresh * 100 / total:.1f}%)")
+    print(f"  读了新区间      : {paged} ({paged * 100 / total:.1f}%)")
+    print(f"  **重读已读过的** : {overlap} ({overlap * 100 / total:.1f}%)")
+    for target, count in worst.most_common(5):
+        print(f"    {count:>4}  {target}")
+
+
 def count_lines(text: str) -> int:
     return sum(1 for line in text.split("\n") if NUMBERED_LINE.match(line))
 
@@ -149,6 +212,11 @@ def main() -> None:
     parser.add_argument("--marker", help="tool_result 里的固定文本，统计命中率")
     parser.add_argument("--key", help="按哪个入参算重复率（默认自动挑第一个字符串参数）")
     parser.add_argument("--lines-vs", help="拿这个数值入参和结果里的编号行数对比")
+    parser.add_argument(
+        "--overlap",
+        action="store_true",
+        help="按 offset/limit 算行区间，统计重读已读区间的比例（压缩边界清零）",
+    )
     args = parser.parse_args()
 
     if not ROLLOUTS.is_dir():
@@ -198,6 +266,9 @@ def main() -> None:
 
     if args.lines_vs:
         report_lines_vs(ok, args.lines_vs)
+
+    if args.overlap:
+        report_overlap(args.tool, args.since)
 
     if args.marker:
         hit = [r for r in ok if args.marker in r[3]]

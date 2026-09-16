@@ -13,7 +13,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 |---|---|---|---|
 | ~~**149** 二十一次抽查,没有一次整屏~~ ✅ | TUI 测试从点断言升到整屏基线 | 中 | 2026-09-16 完成。用户拍了 `insta`(全仓第一次引入,dev-only)。六张整屏基线、`wait_for_quiescent`、四类规范化,negative control 过 |
 | ~~**150** git 在逐字节抄,APFS 本可以一次克隆~~ ⛔ | worktree 改 `--no-checkout` + `clonefile` CoW | 中 | **2026-09-16 撤销**。前置问题有答案了:`worktree.rs:290-293` 的 base 只有 `HEAD` 和 `origin/HEAD` 两种,**都是提交**,没有"以当前文件为准"那一档;`Fresh` 那条差得更远,CoW 过去会把 local-vs-origin 的全部差异伪装成未提交改动,撞死 plan 56 钉在 base commit 上的 provenance 与删除判定。成本(每棵树重写 139 MB parity fixtures)是真的,但该走 sparse-checkout,要另立 plan |
-| **151** 模型在原地打转,没有人发现 | 重复工具调用 advisory + 每工具 cooperative 超时 | 小 | 两件事语义无关,可能该拆成两次提交 |
+| **151** 模型在原地打转,没有人发现 | read_file 重读 advisory + 每工具 cooperative 超时 | 小 | **2026-09-16 判定改写过,开工前先读第二节**:原方案按 `(tool, args)` 计数,拿本机语料重放 5 139 次调用**触发 0 次**,是死代码;真信号是 read_file 的行区间重叠(压缩边界清零后 13.8%,`scripts/tool-usage.py --overlap` 可复算)。grep 的判定另算、本 plan 不做。两件拆两次提交,已定不用问 |
 | **152** grep 找得到那个词,找不到那个定义 | tree-sitter 符号索引(新 crate) | 大 | **建议挂着**。唯一新增子系统,收益最不确定;等一次"模型因为找不到定义而改错地方"的真实案例 |
 | **153** 四个挂点看不见的时刻 | hooks 补 `permission_denied`/`pre_compact`/`post_compact`/`session_end` | 小 | **建议只做其中那笔旧账**(subagent 的 `agent_type` matcher);四个新挂点是从别人项目倒推的,不是从使用里长出来的 |
 | ~~**154** 一条结果有上限,一轮结果没有~~ ✅ | 并发批加上限 + 一轮工具结果的总预算 | 中 | 2026-09-16 完成。用户一句「看参考项目」把三个待定点全部交给参考回答:统一 `MAX_CONCURRENT_TOOL_CALLS` = 10(cc/deepseek 同值,**不分类**)、`ROUND_OFFLOAD_CAP_CHARS` = 4 × 单条 cap、按大小降序贪心 spill + 落盘失败回退内联。plan 说的「两处聚合点」不存在,教训 143 |
