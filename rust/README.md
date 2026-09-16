@@ -1488,6 +1488,39 @@ The period is measured, not chosen: replaying 1 691 real `read_file` calls,
 `grep` has no equivalent rule — the same pattern against a different path is a
 new result, not a reread — and deliberately gets none.
 
+### Per-call tool budgets (Plan 151)
+
+Every tool call runs under a budget declared by the tool itself — a `Builtin`
+arm, or `ToolSource::call_timeout` for an external source — rather than by a
+table of names in the dispatcher, so a budget cannot silently stop applying
+because a name was misspelled. The default is **no budget**: a tool waiting on a
+person or running a whole sub-agent has no deadline anyone could pick for it.
+What carries one:
+
+| tool | budget | why |
+|---|---|---|
+| `bash` | its own `timeout_ms` (default 60 s) + 30 s | the inner bound kills the process tree, which a cancellation cannot, so the outer one only catches a `bash` that failed to stop itself — and never overrides the value the model asked for |
+| `read_file` / `grep` / `glob` | 60 s | a floor under a wedged mount, not a budget real work meets: across 742 calls that had a round to themselves these peaked at 0.03 s, 4.65 s and 0.05 s |
+| any external source tool | 300 s, source-overridable | the hole this exists for — before it, an MCP server that stopped answering hung the session with no bound at all |
+| everything else | none | `run_agent`, `run_program`, `workflow`, `ask_user_question`, plan mode and the local state tools |
+
+The budget is armed around the executor, **after** the permission gate: a human
+deciding whether to approve a call is not the tool hanging, and this repo's own
+logs show approval waits are by far the slowest thing a call does (`skill` at
+3 304 s). On expiry the call's own cancellation token — a child of the turn's, so
+an interrupted turn still behaves exactly as before — is cancelled first and the
+call is given until the budget, capped at 5 s, to settle; only a call still
+running after that has its future dropped. Cancelling first is what lets a tool
+kill its process, remove its temp file and release its lock; dropping second is
+what actually ends a hang, and for an external source it is the only mechanism
+available, since that seam passes no token.
+
+The model is told the truth about both: `timed out after 60s … Nothing killed
+it: a tool that does not honour cancellation may still be running in the
+background`. One timeout never fails the rest of its concurrent batch, and a
+call that finished despite the cancellation keeps its real result rather than
+being overwritten with a timeout.
+
 ### Notebook cells (Plan 57)
 
 A lowercase `.ipynb` path passed to `read_file` is rendered cell-by-cell rather

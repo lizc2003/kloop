@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -357,5 +358,278 @@ async fn the_advisory_is_recorded_as_part_of_the_tool_result() {
         advisories[0].contains("3 reads of this file have now done that"),
         "{}",
         advisories[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plan 151, second half: every call runs under a budget its own tool declares.
+//
+// The hole was narrow and real: `bash` kills its own process tree at
+// `timeout_ms` and hooks have their own limit, but an external `ToolSource` —
+// an MCP server, a web provider — had no bound at all, so one that stopped
+// answering hung the session. The budget is declared by the tool (a `Builtin`
+// arm, or `ToolSource::call_timeout`) rather than by a table of names in the
+// dispatcher, and the default is no budget: a tool waiting on a person or
+// running a whole sub-agent has no deadline anyone could pick for it.
+
+/// A source tool that never returns, and counts how many calls are inside it.
+/// It observes no cancellation at all — which is the case that matters, since
+/// the seam hands a source no token and a wedged server would not read one.
+struct HungSource {
+    budget: Duration,
+    entered: Arc<AtomicUsize>,
+}
+
+impl super::ToolSource for HungSource {
+    fn defs(&self) -> Arc<[kloop_protocol::ToolDef]> {
+        Arc::from(vec![
+            kloop_protocol::ToolDef {
+                name: "hung__wait".into(),
+                description: "never returns".into(),
+                schema: json!({"type": "object"}),
+            },
+            kloop_protocol::ToolDef {
+                name: "hung__answer".into(),
+                description: "returns at once".into(),
+                schema: json!({"type": "object"}),
+            },
+        ])
+    }
+
+    fn is_readonly(&self, _tool: &str) -> bool {
+        true
+    }
+
+    fn call_timeout(&self, _tool: &str) -> Option<Duration> {
+        Some(self.budget)
+    }
+
+    fn call<'a>(
+        &'a self,
+        tool: &'a str,
+        _input: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<super::SourceOutput>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if tool == "hung__answer" {
+                return Ok(super::SourceOutput::text("answered".into()));
+            }
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("the hung tool never returns")
+        })
+    }
+}
+
+fn hung_ctx(tag: &str, budget: Duration) -> (super::ToolCtx, Arc<AtomicUsize>) {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(HungSource {
+        budget,
+        entered: Arc::clone(&entered),
+    });
+    let ctx = super::testutil::test_ctx_with_sources(
+        0,
+        &format!("plan151-{tag}"),
+        vec![source as Arc<dyn super::ToolSource>],
+    );
+    (ctx, entered)
+}
+
+/// A tool that never stops gets its future dropped, and the model is told so in
+/// words that do not claim anything was killed — because nothing was. This is
+/// the whole point of the second half: before it, this call never returned.
+#[tokio::test]
+async fn a_tool_that_never_returns_times_out_and_says_it_may_still_be_running() {
+    let (ctx, entered) = hung_ctx("hung", Duration::from_millis(40));
+    let (out, is_error) = run_tool("hung__wait", json!({}), &ctx).await;
+
+    assert!(is_error, "{out}");
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        out,
+        "hung__wait: timed out after 40ms. The call was asked to cancel and this \
+         result is what it settled to. Nothing killed it: a tool that does not honour \
+         cancellation may still be running in the background, and its side effects \
+         may still land."
+    );
+}
+
+/// The budget cancels before it drops. A tool that watches its token settles
+/// under its own power and hands back a real verdict, which is why the future
+/// is not simply raced: dropping it at the instant the budget expires would
+/// have stranded the cleanup this asserts ran.
+#[tokio::test]
+async fn the_call_is_cancelled_first_and_allowed_to_settle() {
+    struct Settling {
+        saw_cancel: Arc<AtomicUsize>,
+        cleaned_up: Arc<AtomicUsize>,
+    }
+
+    impl super::ToolSource for Settling {
+        fn defs(&self) -> Arc<[kloop_protocol::ToolDef]> {
+            Arc::from(vec![kloop_protocol::ToolDef {
+                name: "settling__work".into(),
+                description: "stops when asked".into(),
+                schema: json!({"type": "object"}),
+            }])
+        }
+
+        fn is_readonly(&self, _tool: &str) -> bool {
+            true
+        }
+
+        fn call_timeout(&self, _tool: &str) -> Option<Duration> {
+            Some(Duration::from_millis(40))
+        }
+
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<super::SourceOutput>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                // Stands in for a tool that does watch its token: it notices,
+                // unwinds, and reports. The seam passes no token today, so the
+                // test models the shape rather than borrowing one.
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                self.saw_cancel.fetch_add(1, Ordering::SeqCst);
+                self.cleaned_up.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("settling__work: stopped on request")
+            })
+        }
+    }
+
+    let saw_cancel = Arc::new(AtomicUsize::new(0));
+    let cleaned_up = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(Settling {
+        saw_cancel: Arc::clone(&saw_cancel),
+        cleaned_up: Arc::clone(&cleaned_up),
+    });
+    let ctx = super::testutil::test_ctx_with_sources(
+        0,
+        "plan151-settling",
+        vec![source as Arc<dyn super::ToolSource>],
+    );
+
+    let (out, is_error) = run_tool("settling__work", json!({}), &ctx).await;
+    assert!(is_error, "{out}");
+    // The cleanup ran to completion before the result came back — the budget
+    // waited for it rather than dropping the future at expiry.
+    assert_eq!(
+        (
+            saw_cancel.load(Ordering::SeqCst),
+            cleaned_up.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
+    assert!(
+        out.starts_with("settling__work: timed out after 40ms."),
+        "{out}"
+    );
+}
+
+/// One timeout does not take its batch down with it. The dispatcher runs
+/// consecutive read-only calls concurrently under `MAX_CONCURRENT_TOOL_CALLS`
+/// permits; a hung call holds a permit for its budget and no longer, so the
+/// others neither fail nor queue behind it.
+#[tokio::test]
+async fn one_timeout_does_not_fail_the_rest_of_the_batch() {
+    let (ctx, entered) = hung_ctx("batch", Duration::from_millis(40));
+    let calls = vec![
+        ("a".to_string(), "hung__answer".to_string(), json!({})),
+        ("b".to_string(), "hung__wait".to_string(), json!({})),
+        ("c".to_string(), "hung__answer".to_string(), json!({})),
+    ];
+
+    let results: Vec<(String, bool)> = super::dispatch_tools(calls, &ctx)
+        .await
+        .into_iter()
+        .map(|block| match block {
+            kloop_protocol::ContentBlock::ToolResult {
+                content, is_error, ..
+            } => (content.as_text().into_owned(), is_error),
+            other => panic!("expected a tool result, got {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    assert_eq!(results[0], ("answered".to_string(), false));
+    assert_eq!(results[2], ("answered".to_string(), false));
+    assert!(results[1].1, "{:?}", results[1]);
+    assert!(results[1].0.contains("timed out after"), "{:?}", results[1]);
+}
+
+/// `bash` already kills its own process tree at `timeout_ms`, and that bound is
+/// the model's to choose. The outer one is derived from it rather than
+/// replacing it, so it can only ever catch a `bash` that failed to stop itself.
+#[test]
+fn bash_keeps_the_timeout_the_model_asked_for() {
+    let budget = |input| super::Builtin::Bash.timeout(&input);
+    let grace = super::BASH_TIMEOUT_GRACE;
+
+    // The model's value wins, whatever it is — high or low.
+    assert_eq!(
+        budget(json!({"command": "sleep 1", "timeout_ms": 5_000})),
+        Some(Duration::from_secs(5) + grace)
+    );
+    assert_eq!(
+        budget(json!({"command": "sleep 1", "timeout_ms": 900_000})),
+        Some(Duration::from_secs(900) + grace)
+    );
+    // No value: bash's own default, not some new number.
+    assert_eq!(
+        budget(json!({"command": "sleep 1"})),
+        Some(Duration::from_secs(60) + grace)
+    );
+    // Strictly above the inner bound in every case, so the killing one wins.
+    for timeout_ms in [1_u64, 1_000, 60_000, 900_000] {
+        let outer = budget(json!({"command": "x", "timeout_ms": timeout_ms})).unwrap();
+        assert!(outer > Duration::from_millis(timeout_ms), "{timeout_ms}");
+    }
+}
+
+/// The conservative default, asserted as the whole table rather than by
+/// spot-check: a tool that waits on a person or runs a whole sub-agent must not
+/// acquire a deadline because someone added a variant and reached for a number.
+#[test]
+fn only_the_tools_that_can_be_bounded_carry_a_budget() {
+    use super::Builtin;
+
+    let bounded: Vec<&str> = super::builtin::ALL
+        .iter()
+        .filter(|tool| tool.timeout(&json!({"command": "x"})).is_some())
+        .map(|tool| tool.name())
+        .collect();
+    assert_eq!(bounded, vec!["bash", "read_file", "grep", "glob"]);
+    assert_eq!(
+        Builtin::ReadFile.timeout(&json!({})),
+        Some(super::READ_ONLY_TOOL_TIMEOUT)
+    );
+    // And a source that declares nothing gets the external default — the bucket
+    // the mechanism was built for, where "no bound at all" was the old answer.
+    struct Quiet;
+    impl super::ToolSource for Quiet {
+        fn defs(&self) -> Arc<[kloop_protocol::ToolDef]> {
+            Arc::from(Vec::<kloop_protocol::ToolDef>::new())
+        }
+        fn is_readonly(&self, _tool: &str) -> bool {
+            false
+        }
+        fn call<'a>(
+            &'a self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<super::SourceOutput>> + Send + 'a>,
+        > {
+            unreachable!("never called")
+        }
+    }
+    assert_eq!(
+        super::ToolSource::call_timeout(&Quiet, "anything"),
+        Some(super::EXTERNAL_TOOL_TIMEOUT)
     );
 }

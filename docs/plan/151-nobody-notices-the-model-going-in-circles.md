@@ -1,8 +1,8 @@
 # Plan 151 — 模型在原地打转,没有人发现
 
-> **2026-09-16 开工时,用户问"你推荐呢",于是把语料又量了三个 plan 没算过的数,
-> 判定认下来了、但第二节改了三处。改动与证据见第二节开头的"三处改写"。
-> 第一件(重读提醒)已完成。**
+> **2026-09-16 完成,两次提交。**第一件(重读提醒)开工前用户问"你推荐呢",量完三个
+> plan 没算过的数后改了三处判定(第二节"三处改写");第二件(每工具超时)按教训 143
+> 先读了 cc/dsh 的取值,又改了两处(第二节"两处改写")。收尾见第七节。
 
 > 来源:2026-09-15,借鉴项目调研后按 macOS-only 前提重排的第三条。两件都来自
 > `refs/deepseek-harness` 的 `packages/guard/*`(见 `refs/README.md` 2026-09-15 节),
@@ -115,6 +115,40 @@
 - 错误信息要诚实:**说明工具可能仍在后台跑**。一个不理会取消的工具,这套机制停不住它,
   dsh 自己也这么写在文档里。不要在措辞上假装它被杀死了。
 
+#### 两处改写(2026-09-16,实现时)
+
+1. **"等取消 settle"不能只等——还得兜底丢掉。**plan 写的是"绝不撕掉 future"。可是
+   **`ToolSource` 这条路上根本没有 cancel token**(`fn call(&self, tool, input)`,没有
+   signal 参数),而外部 source 恰恰是第一节点名的那个洞。只取消不丢,挂住的 MCP 一样
+   停不下来,整件事对它的主目标无效。改成两段:**先取消并等**(会看 token 的工具自己
+   停稳,进程杀掉、临时文件删掉、锁放掉——这半段是 plan 的原意,必须保留);**等不到就丢**
+   (Rust 里丢 future 本身就是取消,`Drop` 会把 in-flight 请求解开——这是 TS 那边**做不到**
+   的事,所以 dsh 的文档只能停在"必须遵循 signal")。settle 窗口 `CANCEL_SETTLE_GRACE`
+   = 5s,按 budget 取 min。
+   **给 ToolSource 加 cancel token 是另一件事**,加了也仍然需要这一段兜底,没在本次做。
+2. **计时挂在 `execute_tool` 外面,不是 `run_gated` 外面。**budget 是给干活的,不是给
+   等人的:pre-tool hook 和**权限审批**都在 `run_gated` 里,一条 `ask` 规则下等人 90 秒的
+   `read_file` 会被 60s 的 budget 砍成 timeout。量出来这不是假想——本机语料里最慢的调用
+   就是审批等待(`skill` 3 304s、`write_file` 211s)。
+
+**档位的依据**(教训 143:补参数前先读参考里的那一处)。两个参考都读了,**都和 plan 的
+"外部给一个较长的"对不上,而且对不上的方向相反**:
+
+| | 外部工具超时 |
+|---|---|
+| **cc** | `DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000`(≈27.8 小时,**等于没有**),`MCP_TOOL_TIMEOUT` 环境变量可覆盖。(`MCP_TIMEOUT_MS = 30_000` 是**连接**超时,不是工具调用) |
+| **dsh** | 只有**声明了 `timeoutMs` 的工具**才受管,未声明的原样放行;它只给两个 web 工具声明了 30s |
+| **kloop** | `EXTERNAL_TOOL_TIMEOUT = 300s`,`ToolSource::call_timeout` 可按工具覆盖 |
+
+dsh 的核心设计决定是"**预算声明在工具自身,不在插件里的名字表**"(原文:消除拼错名称
+导致策略不生效的问题)——这条照抄了:built-in 的预算在 `Builtin::timeout` 的穷尽 match 里,
+外部的在 `ToolSource::call_timeout` 上。"保守默认"也照抄:没声明就不管。
+
+只读那档(60s)是量出来的,而且量出来**基本不会响**:742 次"整轮只有它一个"的调用里
+`read_file` 最大 0.03s、`glob` 0.05s、`grep` 4.65s。dsh 明确不给 grep/glob 预算,理由
+同此。留着只因为机制已经在了、多一行不要钱。**量的时候有个坑**:同批并发的调用共用一个
+结果时间戳(= 批里最慢那个),不拆开看会读成"grep 跑了 6 450 秒"。
+
 ## 三、坑
 
 - **计数放哪儿**。放 `ToolCtx` 里会随每轮重建;应该挂在会话级(`agent` 侧)并通过 ctx 借用。
@@ -181,13 +215,18 @@
 
 ### 每工具超时
 
-10. 一个故意挂住的工具到点后:模型收到 timeout 错误,且错误文本**明说该工具可能仍在后台跑**。
-11. **取消先 settle**:断言 cancel token 已触发且工具的清理路径跑完,再有错误返回——
-    不是到点就丢掉 future。
-12. **并发批不连坐**:一批并发只读调用里一个超时,其余的结果正常返回——注意这里的批量语义
-    在 plan 154 之后多了一层:批内并发有上限 `MAX_CONCURRENT_TOOL_CALLS`(10),一个调用
-    挂住会占着一个 permit,别让超时机制和限流互相等。
-13. **不覆盖显式选择**:`bash` 带 `timeout_ms` 参数时,用模型给的值,不是新的统一上限。
+10. ✅ 一个**永不返回、且不看任何 token**的 source 工具到点后:模型收到 timeout 错误,
+    错误文本整串断言,**明说该工具可能仍在后台跑**。
+    `a_tool_that_never_returns_times_out_and_says_it_may_still_be_running`
+11. ✅ **取消先 settle**:工具的清理路径跑完之后才有错误返回——到点就丢 future 的实现
+    会在这条上挂。`the_call_is_cancelled_first_and_allowed_to_settle`
+12. ✅ **并发批不连坐**:`answer / wait / answer` 三个并发只读调用,中间那个超时,
+    两边整对象相等地正常返回。`one_timeout_does_not_fail_the_rest_of_the_batch`
+13. ✅ **不覆盖显式选择**:`bash` 的预算 = 模型给的 `timeout_ms` + grace,四个取值都断言,
+    并断言外层**严格大于**内层(杀进程树的那个必须先赢)。
+    `bash_keeps_the_timeout_the_model_asked_for`
+    - 外加一条 plan 没写的:**整张表**断言(只有 `bash`/`read_file`/`grep`/`glob` 有预算),
+      免得以后加一个变体顺手填个数字。`only_the_tools_that_can_be_bounded_carry_a_budget`
 
 14. 仓库完成标准照旧(fmt / clippy -D warnings / test,各自取退出码)。两次提交各自全绿。
 15. **判定要有语料背书**,分开核两个数(原文把这两个混成一个,见第二节第 3 条):
@@ -196,9 +235,11 @@
       不是 234,那是重叠;也不是 7,那是带用户消息清零的旧方案。
     ✅ 实测对上。
 
-## 七、✅ 第一件完成(2026-09-16)
+## 七、✅ 完成(2026-09-16,两次提交)
 
-**重读提醒**已落地,提交号见本条所在提交。落点:
+### 第一件:重读提醒
+
+落点:
 
 - `file_state.rs`:`Inner` 多一张 `context_reads` 表(与 `observations` 同键、不同寿命),
   `note_context_read` 一次调用完成"版本对不上就清零 → 严格相交判定 → 记下区间 → 返回第几次
@@ -220,3 +261,19 @@
    是既有约束的推论。新起一套跟踪会白白重建这三条性质。
 2. **提醒文本里别用序数词。**第一版写 `the {rereads}th time`,3 出来是 `3th`。改成
    "{rereads} reads of this file have now done that",顺带不用管 1st/2nd/3rd。
+
+### 第二件:每工具 cooperative 超时
+
+落点:`Builtin::timeout`(穷尽 match,与 `concurrency_safe` 同一处)、
+`ToolSource::call_timeout`(默认 `EXTERNAL_TOOL_TIMEOUT`)、`tools/mod.rs` 的
+`CallDeadline`(`arm` 两段:取消 → settle 窗口 → 丢)、`bash::foreground_timeout`
+(把 `timeout_ms` 的默认值收成一处,外层预算从它派生而不是第二次读同一个字段)。
+
+`CallDeadline::expired` 还有第二个用处:`run_one` 的 select 里,取消分支和已完成的
+`gated` 在每次超时都同时就绪,不看这个标志的话"模型听到 interrupted 还是 timeout"由
+select 随机决定。这正是 dsh 文档里那句"把 `timeoutOf` 限定到 `TOOL_TIMEOUT`,避免嵌套的
+外层截止时间被误读为本插件的超时"——同一个问题,Rust 这边的形状是子 token + 一个标志。
+
+**没做、留给以后的**:给 `ToolSource::call` 加 cancel token(现在这条路上没有 signal,
+外部工具只能靠丢 future 停);超时不可配置(cc 有 `MCP_TOOL_TIMEOUT` 环境变量,kloop 走
+常量 + 每个 source 覆盖)。两件都不影响本 plan 的验收。

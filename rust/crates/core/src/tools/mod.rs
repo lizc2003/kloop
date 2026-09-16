@@ -72,6 +72,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -110,6 +111,57 @@ pub const TOOL_DEFER_THRESHOLD: usize = 30;
 /// budget to a handful of individually expensive tools (image/video
 /// generation), which is a different mechanism for a tool kloop does not have.
 pub const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
+/// How long a read-only built-in may run before its deadline asks it to stop.
+///
+/// Measured, and measured as never firing: across 742 real calls that had a
+/// sampling round to themselves, `read_file` peaked at 0.03s, `glob` at 0.05s
+/// and `grep` at 4.65s. (Calls that shared a round look far slower, but a batch
+/// shares one result timestamp with the slowest call in it — a trap worth
+/// naming here, because it reads as a 6 450-second grep.) So this is not a
+/// budget real work runs into; it is a floor under a wedged network mount,
+/// which a local corpus has nothing to say about. deepseek-harness declines to
+/// give grep/glob a budget at all for exactly that reason. It is kept because
+/// once the mechanism exists one more row costs nothing — but if it ever fires
+/// on real work, the bug is here, not in the tool.
+const READ_ONLY_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default budget for a call into an external source — an MCP server, a web
+/// provider — which a source may replace ([`ToolSource::call_timeout`]).
+///
+/// This is the hole the mechanism exists for. A built-in that hangs is a kloop
+/// bug; an MCP server that stops answering is an ordinary Tuesday, and before
+/// this it hung the session with no bound at all. The references bracket the
+/// answer rather than supply it: cc's default MCP *tool* timeout is
+/// `100_000_000` ms — 27.8 hours, effectively none, overridable through
+/// `MCP_TOOL_TIMEOUT` — while deepseek-harness declares 30s, but only on its
+/// two web tools, and passes every undeclared tool through untouched. Five
+/// minutes sits between them: an order of magnitude above dsh's web budget, and
+/// short enough that one wedged server costs a few minutes instead of a session.
+const EXTERNAL_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Headroom between `bash`'s own `timeout_ms` and the outer deadline. The inner
+/// bound must always win: it kills the process tree, which a cancellation
+/// cannot, and it is the number the model asked for. Thirty seconds is enough
+/// for process-tree teardown on a loaded machine.
+const BASH_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a call that has been asked to cancel gets to actually stop before
+/// its future is dropped. Capped at the budget itself, so a small budget is not
+/// dwarfed by its own settle window.
+const CANCEL_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// The budget for one call, from whoever owns the tool: the built-in table, or
+/// the source that advertised it. An unknown name gets none — it fails on the
+/// next line anyway, and a deadline is not how that should be reported.
+fn call_timeout(name: &str, input: &Value, ctx: &ToolCtx) -> Option<Duration> {
+    match Builtin::from_name(name) {
+        Some(builtin) => builtin.timeout(input),
+        None => {
+            find_source(&ctx.cfg.tool_sources, name).and_then(|source| source.call_timeout(name))
+        }
+    }
+}
 
 /// An external provider of tools (Web tools, an MCP server, or another CLI
 /// adapter). Core only knows this seam; transport and network implementations
@@ -239,6 +291,17 @@ pub trait ToolSource: Send + Sync {
             .find(|def| def.name == tool)
             .cloned()
             .map(|def| (def, self.definition_generation(tool)))
+    }
+    /// How long one call into this source may run before the dispatcher cancels
+    /// it and reports a timeout. `None` waits forever, which is what the seam
+    /// did before there was a budget at all.
+    ///
+    /// Declared here rather than in a table keyed by tool name, following
+    /// deepseek-harness: a name table is one typo away from silently not
+    /// applying. A source that knows one of its tools is legitimately slow — a
+    /// build, a long query — raises it for that tool by name.
+    fn call_timeout(&self, _tool: &str) -> Option<Duration> {
+        Some(EXTERNAL_TOOL_TIMEOUT)
     }
     /// Monotonic live-readiness revision. Static sources remain at zero.
     fn readiness_revision(&self, _tool: &str) -> u64 {
@@ -1089,6 +1152,7 @@ async fn run_gated(
     expected_program_source: Option<SourceCallBinding>,
     foreground_shell_started: &AtomicBool,
     local_send_committed: &AtomicBool,
+    deadline: &CallDeadline,
 ) -> Result<ToolExecution> {
     reject_unavailable(name, input, ctx)?;
     // Freeze the workspace before validating a deferred capability. A stale
@@ -1118,19 +1182,27 @@ async fn run_gated(
     if foreground_shell {
         foreground_shell_started.store(true, Ordering::Release);
     }
-    let execution = execute_tool(
-        name,
-        input,
-        PreparedExecution {
-            read: prepared.read.as_ref(),
-            mutation: prepared.mutation.as_ref(),
-            source: gate.expected,
-            local_send_committed,
-        },
-        ctx,
-        &workspace,
-    )
-    .await;
+    let executed = deadline
+        .arm(
+            &ctx.cancel,
+            execute_tool(
+                name,
+                input,
+                PreparedExecution {
+                    read: prepared.read.as_ref(),
+                    mutation: prepared.mutation.as_ref(),
+                    source: gate.expected,
+                    local_send_committed,
+                },
+                ctx,
+                &workspace,
+            ),
+        )
+        .await;
+    // Dropped without stopping. There is no verdict to report and no aftermath
+    // to release; `report_timeout` replaces this text with the honest one.
+    let execution = executed
+        .unwrap_or_else(|| ToolExecution::from_result(Err(anyhow!("{name}: did not stop"))));
     if foreground_shell {
         foreground_shell_started.store(false, Ordering::Release);
     }
@@ -1139,6 +1211,67 @@ async fn run_gated(
     drop(powershell_guard);
     run_post_tool_hook(name, input, &execution, ctx).await;
     Ok(execution)
+}
+
+/// One call's time budget, and whether it ran out.
+///
+/// Armed around the executor alone, not around the whole gated run. The budget
+/// is for the work: pre-tool hooks, and above all a human deciding whether to
+/// approve the call, are not the tool hanging. A read a reviewer took two
+/// minutes over must not come back to the model as a timeout — and in this
+/// repo's own logs the slowest calls by far are exactly that wait (`skill` at
+/// 3 304s, `write_file` at 211s), so this is not a hypothetical ordering.
+struct CallDeadline {
+    budget: Option<Duration>,
+    expired: AtomicBool,
+}
+
+impl CallDeadline {
+    fn new(name: &str, input: &Value, ctx: &ToolCtx) -> Self {
+        Self {
+            budget: call_timeout(name, input, ctx),
+            expired: AtomicBool::new(false),
+        }
+    }
+
+    /// Run `work` under the budget, in two stages, and answer `None` if it never
+    /// stopped.
+    ///
+    /// **Cancel first, and wait.** A tool that watches its token unwinds and
+    /// hands back a real verdict — its process killed, its temp file removed,
+    /// its lock released. Tearing the future up at the instant the budget
+    /// expires would strand exactly those.
+    ///
+    /// **Then drop.** Waiting forever for a tool that is not listening is the
+    /// hang this whole mechanism exists to end, and for the bucket that
+    /// motivated it there is nothing else available: a `ToolSource` call gets no
+    /// token at this seam, so dropping its future IS its cancellation — Rust
+    /// unwinds the in-flight request through `Drop`, which the TypeScript
+    /// harness this design comes from cannot do at any price. That is why the
+    /// order matters rather than the choice: whoever can stop cleanly does, and
+    /// only whoever cannot gets dropped.
+    async fn arm<T>(&self, cancel: &CancellationToken, work: impl Future<Output = T>) -> Option<T> {
+        let Some(budget) = self.budget else {
+            return Some(work.await);
+        };
+        let mut work = std::pin::pin!(work);
+        tokio::select! {
+            done = &mut work => return Some(done),
+            _ = tokio::time::sleep(budget) => {}
+        }
+        self.expired.store(true, Ordering::Release);
+        cancel.cancel();
+        // A call given 50ms to work gets 50ms to stop; one given five minutes
+        // gets the full window. Scaling the smaller case is what keeps a test
+        // that arms a millisecond budget from waiting seconds to observe it.
+        tokio::time::timeout(budget.min(CANCEL_SETTLE_GRACE), work)
+            .await
+            .ok()
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
 }
 
 /// What a finished call leaves for its caller to release once the final
@@ -1207,6 +1340,36 @@ fn append_notice(result: &mut ContentBlock, notice: &str) {
     }
 }
 
+/// Replace a timed-out call's verdict with one that says so.
+///
+/// Only when the call settled as a failure. A tool that honoured the
+/// cancellation and still finished its work did the work, and handing the model
+/// a timeout instead of the answer it has would be a lie that costs a round.
+///
+/// The wording is the honest part. This budget cancels; it does not kill. A
+/// tool that ignores its token is running still, and the model is told that
+/// rather than left to assume the process is gone — deepseek-harness documents
+/// the same limitation for the same mechanism.
+fn report_timeout(result: &mut ContentBlock, name: &str, deadline: Duration) {
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = result
+    else {
+        return;
+    };
+    if !*is_error {
+        return;
+    }
+    // `{:?}` on a Duration prints "60s" / "40ms" rather than rounding a
+    // sub-second budget to the "0s" that `as_secs` would.
+    *content = ToolResultContent::Text(format!(
+        "{name}: timed out after {deadline:?}. The call was asked to cancel and this \
+         result is what it settled to. Nothing killed it: a tool that does not honour \
+         cancellation may still be running in the background, and its side effects \
+         may still land."
+    ));
+}
+
 async fn run_one(
     id: String,
     name: String,
@@ -1214,6 +1377,16 @@ async fn run_one(
     ctx: ToolCtx,
     expected_program_source: Option<SourceCallBinding>,
 ) -> ContentBlock {
+    // This call's own cancellation scope. Cancelling the parent still reaches
+    // it, so an interrupted turn behaves exactly as before; what the child buys
+    // is the other direction — the deadline can stop THIS call without
+    // cancelling the rest of the batch, and the two are told apart by which
+    // token fired rather than by a timer race.
+    let call_cancel = ctx.cancel.child_token();
+    let ctx = ToolCtx {
+        cancel: call_cancel.clone(),
+        ..ctx
+    };
     let event_input = agent_message::event_input(&name, &input);
     ctx.ui.emit(&Event::ItemStarted {
         id: id.clone(),
@@ -1234,6 +1407,7 @@ async fn run_one(
     // during a post-hook, finish the paired queued result instead of reporting
     // `interrupted` after the recipient mailbox already changed.
     let local_send_committed = AtomicBool::new(false);
+    let deadline = CallDeadline::new(&name, &input, &ctx);
     let mut gated = Box::pin(run_gated(
         &name,
         &input,
@@ -1241,10 +1415,18 @@ async fn run_one(
         expected_program_source,
         &foreground_shell_started,
         &local_send_committed,
+        &deadline,
     ));
     let gated_result = tokio::select! {
         _ = ctx.cancel.cancelled() => {
-            if foreground_shell_started.load(Ordering::Acquire)
+            // `deadline.expired` is what keeps our own cancellation from being
+            // read as the turn's. Without it this branch and the finished
+            // `gated` are both ready at every timeout, and whichever select
+            // picks decides whether the model hears "interrupted" or "timed
+            // out" — the same scoping deepseek-harness needs so a nested outer
+            // deadline reads as ordinary upstream cancellation.
+            if deadline.expired()
+                || foreground_shell_started.load(Ordering::Acquire)
                 || local_send_committed.load(Ordering::Acquire)
             {
                 Some(gated.await)
@@ -1255,6 +1437,13 @@ async fn run_one(
         result = &mut gated => Some(result),
     };
     let (mut result, aftermath) = settle_execution(&id, gated_result);
+    if deadline.expired() {
+        report_timeout(
+            &mut result,
+            &name,
+            deadline.budget.expect("a budget expired"),
+        );
+    }
     // The model has a successful Read/Write/Edit only once the final tool_result
     // exists. Executor-local reads and work canceled while a post-hook runs do
     // not create write authority. Mutation executors clear authority before

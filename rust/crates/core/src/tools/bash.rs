@@ -99,6 +99,24 @@ struct BashInput {
     disable_sandbox: bool,
 }
 
+/// The foreground budget this call runs under: the model's `timeout_ms` when it
+/// gave one, else 60s. The one place that number is decided, because the outer
+/// per-call deadline has to sit strictly above it — a bound derived from a
+/// second reading of the same field would drift away from the one that actually
+/// kills the process tree.
+///
+/// A malformed input parses as the default; the executor rejects it a moment
+/// later with a real message, and a deadline is not where that gets reported.
+pub(super) fn foreground_timeout(input: &Value) -> Duration {
+    let timeout_ms = parse_bash_input(input)
+        .ok()
+        .and_then(|parsed| parsed.timeout_ms)
+        .unwrap_or(DEFAULT_FOREGROUND_TIMEOUT_MS);
+    Duration::from_millis(timeout_ms)
+}
+
+const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 60_000;
+
 fn parse_bash_input(input: &Value) -> Result<BashInput> {
     if input.get("run_in_background").is_some() {
         bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
@@ -214,7 +232,7 @@ pub(super) async fn bash_tool(
     if ctx.cancel.is_cancelled() {
         bail!("interrupted");
     }
-    let timeout_ms = parsed.timeout_ms.unwrap_or(60_000);
+    let timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_FOREGROUND_TIMEOUT_MS);
     // A remembered escalation is consent to run this command uncontained, so
     // the contained attempt is skipped rather than run and thrown away. It is
     // the expensive half — the run that compiles the test binary, binds the

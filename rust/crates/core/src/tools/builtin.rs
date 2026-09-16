@@ -13,10 +13,14 @@
 //! MCP tools, so it stays a name match — with a guard test over
 //! [`builtin_tool_names`] so a new variant still cannot be forgotten there.
 
+use std::time::Duration;
+
 use kloop_protocol::ToolDef;
 use serde_json::Value;
 use serde_json::json;
 
+use super::BASH_TIMEOUT_GRACE;
+use super::READ_ONLY_TOOL_TIMEOUT;
 use super::agent_message;
 use super::codemode;
 use super::plan_mode;
@@ -461,6 +465,74 @@ impl Builtin {
     /// parsed argv is a known read-only command — the same decomposition the
     /// permission gate uses, because safe-to-parallelize and safe-to-run are
     /// two verdicts over one analysis.
+    /// The wall-clock budget for one call, or `None` for a tool that has no
+    /// useful bound.
+    ///
+    /// The budget is declared by the tool, not by a name table in the
+    /// dispatcher — deepseek-harness's `timeout-policy` note is explicit about
+    /// why ("超时放在工具定义上……消除了拼错名称导致策略不生效的问题"), and it is the
+    /// same reason [`Self::concurrency_safe`] lives here. The default is
+    /// conservative for the same reason it is there: a tool waiting on a person
+    /// or running a whole sub-agent has no deadline anyone can pick for it, and
+    /// a wrong one turns working behaviour into an error.
+    ///
+    /// Cooperative, and only cooperative: reaching the budget cancels the
+    /// call's token and waits for it to settle. Nothing here kills anything, so
+    /// a tool that ignores cancellation is bounded by this in name only — which
+    /// is what the model is told when it fires.
+    pub(crate) fn timeout(self, input: &Value) -> Option<Duration> {
+        match self {
+            // Self-bounded, and its own bound is the real one: it kills the
+            // process tree, which a cancellation cannot. The outer deadline
+            // sits strictly above the model's `timeout_ms` so it can only ever
+            // catch a `bash` that failed to stop itself.
+            Self::Bash => Some(super::bash::foreground_timeout(input) + BASH_TIMEOUT_GRACE),
+            // Self-bounded the same way, through the same executor.
+            Self::PowerShell => None,
+            // Read-only and local. See [`READ_ONLY_TOOL_TIMEOUT`]: this is a
+            // floor under a wedged mount, not a budget real work runs into.
+            Self::ReadFile | Self::Grep | Self::Glob => Some(READ_ONLY_TOOL_TIMEOUT),
+            // Waiting is the job. A deadline here is not a guard, it is a bug:
+            // a sub-agent, a program, a workflow and a question to the human all
+            // legitimately outlast any number this file could name, and
+            // `wait_for_activity` and `bash_output` carry their own `timeout_ms`.
+            Self::RunAgent
+            | Self::RunProgram
+            | Self::Workflow
+            | Self::WaitForActivity
+            | Self::BashOutput
+            | Self::AskUserQuestion
+            | Self::EnterPlanMode
+            | Self::ExitPlanMode => None,
+            // Local state, and mutations that hold a path lock or shell out to
+            // git. None of them has ever hung, and none of them has a number
+            // anyone could defend; the conservative default applies.
+            Self::WriteFile
+            | Self::EditFile
+            | Self::NotebookEdit
+            | Self::StopBash
+            | Self::StopAgent
+            | Self::StopProgram
+            | Self::StopWorkflow
+            | Self::SendMessage
+            | Self::ListAgents
+            | Self::TaskCreate
+            | Self::TaskGet
+            | Self::TaskUpdate
+            | Self::TaskList
+            | Self::TaskClear
+            | Self::CronCreate
+            | Self::CronDelete
+            | Self::CronList
+            | Self::ScheduleWakeup
+            | Self::ToolSearch
+            | Self::CallTool
+            | Self::EnterWorktree
+            | Self::ExitWorktree
+            | Self::Skill => None,
+        }
+    }
+
     pub(crate) fn concurrency_safe(self, input: &Value) -> bool {
         match self {
             Self::ReadFile | Self::Grep | Self::Glob => true,
