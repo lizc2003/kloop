@@ -1363,6 +1363,53 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// A read deny alone is a `mv` away from being bypassed: denies match by
+    /// path, so a shell that can still *write* inside the denied tree moves the
+    /// file out and reads it under its new name. The pairing is two hand-written
+    /// lines in `build_sandbox`; this is the invariant that keeps a third read
+    /// deny from being added without its write half.
+    #[test]
+    fn every_read_deny_is_covered_by_a_write_deny() {
+        if kloop_core::sandbox::availability().is_err()
+            || matches!(
+                std::env::var("KLOOP_SANDBOX").ok().as_deref(),
+                Some("off") | Some("0") | Some("false")
+            )
+        {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kloop-deny-pairing-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let config_path = base.join("home/.kloop/config.toml");
+        let private_state_root = config_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&private_state_root).unwrap();
+        let config = UserConfig::from_parts(config_path, toml::Table::new());
+        let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
+        let args = crate::args::parse_args(&[]).unwrap();
+        let offload = private_state_root.join("projects/v1/p1_test/offload");
+        let policy = build_sandbox(&args, &private_state_root, &runtime, &offload, |_| {})
+            .unwrap()
+            .unwrap();
+
+        assert!(!policy.denied_read_paths.is_empty());
+        let uncovered: Vec<&std::path::PathBuf> = policy
+            .denied_read_paths
+            .iter()
+            .filter(|read| {
+                !policy
+                    .denied_write_paths
+                    .iter()
+                    .any(|write| read.starts_with(write))
+            })
+            .collect();
+        assert_eq!(
+            uncovered,
+            Vec::<&std::path::PathBuf>::new(),
+            "read-denied paths with no write deny over them: a `mv` out of the tree reads them"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn native_skills_snapshot_omits_commands_and_bodies() {
         let base = std::env::temp_dir().join(format!("kloop-native-skills-{}", std::process::id()));

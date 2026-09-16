@@ -198,9 +198,6 @@ impl SandboxPolicy {
         policy
     }
 
-    /// Add a file the model-facing shell must never read. Keep literal and
-    /// canonical spellings: macOS aliases `/tmp` and symlinked paths otherwise
-    /// leave a second name for the same credential file.
     /// Re-allow reads under `path` even though a denied ancestor covers it.
     /// Read-only: the write deny on that ancestor is untouched.
     pub fn with_allowed_read_path(&self, path: &Path) -> Self {
@@ -209,6 +206,13 @@ impl SandboxPolicy {
         policy
     }
 
+    /// Add a file the model-facing shell must never read. Keep literal and
+    /// canonical spellings: macOS aliases `/tmp` and symlinked paths otherwise
+    /// leave a second name for the same credential file.
+    ///
+    /// Pair it with [`Self::with_denied_write_path`] over the same tree. A deny
+    /// is matched by path, so a file the shell can still move out of the denied
+    /// tree is readable again under its new name (`mv x y && cat y`).
     pub fn with_denied_read_path(&self, path: &Path) -> Self {
         let mut policy = self.clone();
         push_path_aliases(&mut policy.denied_read_paths, path);

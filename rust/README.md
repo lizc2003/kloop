@@ -275,7 +275,10 @@ Consequences worth knowing:
   sandbox alone would not have been enough, because the permission gate refuses
   first. The carve-out is read-only: writes stay denied with the rest of the
   store, and the deny/allow pair is emitted in that order because seatbelt takes
-  the last matching rule. In-process readers are unaffected (`read_file`,
+  the last matching rule. Read and write are denied *together* on purpose, and a
+  test holds that pairing for every denied path: denies match by path, so a shell
+  that could still write inside the tree would move a file out and read it under
+  its new name. In-process readers are unaffected (`read_file`,
   `bash_output`), and a background shell's output file is opened by the parent
   and inherited as a descriptor;
 - `--resume`/`--fork` stay inside the current project. An id that belongs to

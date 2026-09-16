@@ -73,7 +73,7 @@ README 的 "Foreground bash lifecycle" 一节和 `capability-report` 第 4 节�
 
 ---
 
-## 二、"deny read 必须配 deny write"没有测试守着
+## 二、"deny read 必须配 deny write"没有测试守着 ✅(2026-09-16,提交 SHA 以本条所在提交为准)
 
 ### 现状
 
@@ -105,6 +105,27 @@ agent 就能把文件移出被 deny 的路径再读。grok 记录过这个绕过
 2. **它真的能红**:临时把 `startup.rs:805` 那行 `with_denied_write_path` 删掉,测试必须失败。
    红不了就说明断言没咬住。
 3. 不改任何生产行为——sandbox 相关的既有测试一条不动。
+
+### ✅ 做完了什么(以及 plan 这一节的前提说错了一半)
+
+**"没有任何测试守着"不对。** `startup.rs` 里早就有
+`sandbox_denies_private_state_tree_reads_and_writes`,它两条 deny 都断言了,验收第 2 条
+(删掉 `:805` 那行必须红)在动手之前就已经满足。真正缺的是 plan 那句"将来有人只加一条
+read deny 就会留洞"——**那条既有测试点名断言 `private_state_root` 这一个路径,第二个
+read deny 加进来它一声不吭**。
+
+所以按"测试路径"补的是那条**普遍**不变量:`every_read_deny_is_covered_by_a_write_deny`——
+`build_sandbox` 构出的 policy 里,每个 `denied_read_paths` 条目都要能在 `denied_write_paths`
+里找到覆盖它的祖先(`Path::starts_with`,按 component 比,`/a/bc` 不会被 `/a/b` 蒙混)。
+断言的是 uncovered 列表整个等于空,失败时直接把漏掉的路径打出来。
+
+负对照跑过:临时删掉 `startup.rs:805`,新测试红,报出那两个别名路径
+(`/var/...` 与 canonical 的 `/private/var/...`,`push_path_aliases` 两条都会进列表)。
+
+没动任何生产行为。**顺手修了一处文档错位**:`sandbox/mod.rs` 里
+"Add a file the model-facing shell must never read…" 这段注释挂在了
+`with_allowed_read_path` 头上——它显然是 `with_denied_read_path` 的,后者反而裸着。
+归位,并在里面写清这个配对为什么必须成对(`mv x y && cat y`)。
 
 ---
 
