@@ -1,5 +1,11 @@
 # Plan 153 — 四个挂点看不见的时刻
 
+> **2026-09-16:只做了第三节那笔旧账**(agent_type matcher),一次提交,提交 SHA 以本条
+> 所在提交为准。**第二节那四个新挂点没做,仍然挂着**,等第一个真实需求——它们是从借鉴
+> 项目倒推的,不是从使用里长出来的(第五节的建议,用户拍板照办)。验收按第七节
+> 「若只做旧账」那两条,外加用户加的一条(配了 matcher 却被忽略的那个 case 现在必须
+> 真的不触发)。
+
 > 来源:2026-09-15,借鉴项目调研后按 macOS-only 前提重排的第五条。参考 codex 的
 > `codex-rs/hooks`(9 类事件,hook 可以是 MCP tool,带 `output_spill`)与 grok 的
 > 16 事件 macro 表驱动。见 `refs/README.md` 2026-09-15 节。
@@ -33,11 +39,69 @@
 `stop_failure`/`stop_cancelled`(grok 有)先不做——kloop 的取消语义和它不是一回事,
 硬抄会引入两个含义不清的事件。
 
-## 三、顺带清一笔旧账
+## 三、顺带清一笔旧账 ✅(2026-09-16)
 
 能力报告第 9 节第三行:**subagent 事件的 `agent_type` matcher**,标注是"plan 17 残留小账/顺手"。
 现在 `HookDef.matcher` 只对工具名做精确匹配(`hooks.rs:255`),子 agent 事件没法按类型筛。
 这一条和上面四个挂点改的是同一个文件的同一片区域,一起做,一次 commit。
+
+### ✅ 做完了什么
+
+**一处开工前的更正**:plan(和开工时的描述)都把这条说成"配了 matcher 既不报错也不筛"。
+不对——`startup.rs` 的 `load_hooks` 有一道 `if !event.is_tool_event() { bail! }`,`turnmatcher`
+那条测试正锁着它。**从配置文件这条路,子 agent hook 配了 matcher 会直接报错,装都装不进
+`Hooks`**;`run_event` 那个 fail-open 的 `if let (Some(matcher), Some(tool))` 只在有人直接构造
+`HookDef`(库的 embedder、或测试)时才够得着。所以这笔账是"配不上",不是"配了不生效",
+而且**放开配置校验本身也是这次的工作量之一**,plan 没写。
+
+三段改动:
+
+1. **类型从目录送到挂点**。`agent_type` 只活在 live Agent 目录里(`register_child` 写进
+   `LiveEntry`),挂点上原来只有 `agent` 标签(`agent-N`,一个进程级自增的**启动序号**,
+   按它筛等于按启动顺序筛)。加 `LiveAgentDirectory::agent_type` → `LocalAgentContext::agent_type`
+   → `Config::agent_type`,`run_turn_with_options` 在子 agent 分支读一次,两个挂点共用。
+2. **matcher 按它筛**。`run_event` 的第二个参数从 `tool_name` 改名 `subject`;
+   `HookEvent::is_tool_event` 换成 `matcher_subject() -> Option<&'static str>`(工具名 /
+   agent 类型 / 无),配置校验和错误文案都走它。
+3. **无类型的子 agent 报 `DEFAULT_AGENT_TYPE = "default"`**,见下。
+
+### 无类型子 agent 怎么办:四家参考 2:2,拍了后一条
+
+开工前照教训 143 把四家都读了(codewhale 没有子 agent hook):
+
+| 参考 | 无类型时送进 matcher 的值 | 配了 matcher 的 hook |
+|---|---|---|
+| **cc** | `agentType ?? ''`(`hooks.ts:3833`) | **触发** —— 空串 falsy,`matchQuery ? filter : all`(`:1817`)整个筛选被跳过 |
+| **grok** | `None` —— `match_value()` 结尾 `.filter(\|v\| !v.is_empty())`(`event.rs:610`) | **触发** —— `matcher_allows` 的 `_ => true`,注释明写 fail-open,还有测试 `subagent_match_value_is_none_when_type_empty` |
+| **codex** | **不可能为空** —— `agent_role.unwrap_or(DEFAULT_ROLE_NAME)`(`hook_runtime.rs:1048`),值是 `"default"` | **不触发**,除非 matcher 写 `default`/`*` |
+| **dsh** | **不可能为空** —— 常量 `SUBAGENT_TYPE = 'general-purpose'`(`hooks-claude-code/src/index.ts:304`) | **不触发**,注释明写具体 kind 如 `code-reviewer` 不 fire |
+
+分歧不在"触发还是跳过",在**要不要让"没类型"这件事存在**。拍了 codex/dsh 那条:给一个
+可被点名的默认类型名。理由:(a) 这笔账的起因就是"配了却不按预期生效",fail-open 会留一个
+小号同类陷阱(配 `matcher = "reviewer"`,一个无类型子 agent 照样触发);(b) `hooks.rs` 顶部
+那条 fail-open 讲的是"hook 脚本坏了不许 brick agent",说的是**执行故障**,matcher 筛不中不是
+故障,不该共用那条理由;(c) 默认名能表达"只筛无类型那批",fail-open 表达不了;(d) 名字进
+payload,于是它是自我说明的,不是只存在于代码里的魔法串。
+
+### 验收(第七节「若只做旧账」+ 用户加的一条)
+
+1. ✅ **按类型筛**:`subagent_matcher_filters_by_agent_type` —— matcher `reviewer`,
+   `reviewer` 触发、`explorer` 不触发;`matcher = "default"` 选中无类型那批、不选中有类型的。
+2. ✅ **配了 matcher 却被忽略的那个 case 现在真的不触发**:同一个测试里,无类型子 agent
+   遇到 `matcher = "reviewer"` 不触发(旧实现会触发)。
+3. ✅ **payload 字节**:`every_event_payload_is_pinned` 用整对象断言把六个事件全钉住,
+   四个主 agent 事件与改动前逐字节相同(`hooks.rs:138` 那条约束)。
+4. ✅ **端到端**:`subagent_hooks_carry_the_registered_agent_type` —— 真 `register_child(Some("reviewer"))`
+   + 真 `run_turn`,matcher 命中的 hook 拿到 `agent_type: "reviewer"`,另一类型的 hook 不跑。
+   负对照验过:把 `agent.rs` 那条线断掉(传 `None`)这条测试变红。
+5. ✅ 配置侧:`load_hooks_full_round_trip` 收了一条 `subagent_stop` + `matcher`;
+   `turnmatcher`(`pre_turn` + matcher)仍然拒。
+6. ✅ fmt / clippy -D warnings / test 各自单独取退出码,均为 0。
+
+**payload 变了一处(有意)**:两个子 agent 事件新增 `agent_type` 字段。第六节"不动现有六个
+事件的 payload 字节"那条写在"加四个新挂点"的语境里,本次只做旧账;而没有这个字段,
+`default` 这个名字就只存在于文档里,没配 matcher 的 hook 也分不出类型——四家参考都把它放在
+payload 里。主 agent 的字节一个没动。
 
 ## 四、坑
 

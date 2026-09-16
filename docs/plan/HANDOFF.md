@@ -15,7 +15,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 | ~~**150** git 在逐字节抄,APFS 本可以一次克隆~~ ⛔ | worktree 改 `--no-checkout` + `clonefile` CoW | 中 | **2026-09-16 撤销**。前置问题有答案了:`worktree.rs:290-293` 的 base 只有 `HEAD` 和 `origin/HEAD` 两种,**都是提交**,没有"以当前文件为准"那一档;`Fresh` 那条差得更远,CoW 过去会把 local-vs-origin 的全部差异伪装成未提交改动,撞死 plan 56 钉在 base commit 上的 provenance 与删除判定。成本(每棵树重写 139 MB parity fixtures)是真的,但该走 sparse-checkout,要另立 plan |
 | ~~**151** 模型在原地打转,没有人发现~~ ✅ | read_file 重读 advisory + 每工具 cooperative 超时 | 小 | 2026-09-16 完成,两次提交。**第一件**:用户问「你推荐呢」→ 量了三个新数 → 判定认下、改三处(去掉用户消息清零、3/5/8 改成「第 3 次之后每 3 次」、清零按 `FileVersion` 而非工具名),教训 145/146。**第二件**:照教训 143 先读了 cc(MCP 工具超时 ≈27.8 小时 = 等于没有)和 dsh(只管声明了预算的工具)的取值,又改两处——取消之后还得兜底丢 future(ToolSource 那条路**没有 cancel token**),计时挂 `execute_tool` 外面而不是 `run_gated` 外面(否则砍掉等人审批的调用),教训 147 |
 | **152** grep 找得到那个词,找不到那个定义 | tree-sitter 符号索引(新 crate) | 大 | **建议挂着**。唯一新增子系统,收益最不确定;等一次"模型因为找不到定义而改错地方"的真实案例 |
-| **153** 四个挂点看不见的时刻 | hooks 补 `permission_denied`/`pre_compact`/`post_compact`/`session_end` | 小 | **建议只做其中那笔旧账**(subagent 的 `agent_type` matcher);四个新挂点是从别人项目倒推的,不是从使用里长出来的 |
+| **153** 四个挂点看不见的时刻 | hooks 补 `permission_denied`/`pre_compact`/`post_compact`/`session_end` | 小 | **2026-09-16 只做了第三节那笔旧账 ✅**(`agent_type` matcher,一次提交):类型从 live Agent 目录送到两个子 agent 挂点,matcher 按类型筛,无类型的报 `default`(codex/dsh 的形状,cc/grok 那条 fail-open 路线不选)。**四个新挂点仍然挂着**,等第一个真实需求。开工前的描述有一处不成立:子 agent 事件配 matcher 此前是**报错**(`startup.rs` 有校验),不是静默不筛,教训 151 |
 | ~~**154** 一条结果有上限,一轮结果没有~~ ✅ | 并发批加上限 + 一轮工具结果的总预算 | 中 | 2026-09-16 完成。用户一句「看参考项目」把三个待定点全部交给参考回答:统一 `MAX_CONCURRENT_TOOL_CALLS` = 10(cc/deepseek 同值,**不分类**)、`ROUND_OFFLOAD_CAP_CHARS` = 4 × 单条 cap、按大小降序贪心 spill + 落盘失败回退内联。plan 说的「两处聚合点」不存在,教训 143 |
 | ~~**155** 改大文件的一行,先付六次读~~ ✅ | `edit_file` 的资格从"读过全文"放宽到"读过一次" | 中 | 2026-09-16 完成。plan 49 那条裁决**推翻了**(用户同意;完整读买到的安全性比看起来少——"改到两个长得一样的地方里错的那个"是 `old_string` **唯一性**挡住的)。但**形状不是 plan 设计的那个**:用户一句「看参考项目」→ 五家里**没有一家实现区间资格**,cc/codewhale/dsh 都只要"读过一次"、grok 把 `skip_read_before_edit` 退成 "Deprecated runtime no-op"、codex 什么都不要求。于是 `ReadRequirement::{CompleteFile,CompleteNotebook,AnyRead}`,第六节四个坑里三个直接消失。实测 18 次读 / ~122k tok → 3 次读 / ~1.8k tok,教训 150 |
 | ~~**156** 三件小事,各值一次提交~~ ✅ | `bash` 补 `description`;沙箱 deny 配对加回归测试;edit 拒绝时报出该读哪一段 | 小 | 2026-09-16 完成,三次提交(三件都做了)。**第二件的前提说错了一半**:既有测试早就断言了那两条 deny,缺的是"普遍不变量"而不是"任何测试";**第三件 plan 给的提示词是错的**,照着读解不开锁,换成"第一行没读过的行"并加了一条"照提示读完 edit 真的成功"的测试,教训 148。第四件(图片按像素降采样)问了用户,**做了**——查官方 vision 文档时两个数推翻了原判断,见教训 149 |
@@ -1116,3 +1116,31 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    本轮资格一放宽,plan 155 原本的 `offset=N-20, limit=60` 第一次成为照做就能解锁的建议,
    于是 156 的形状连同它依赖的 `first_unread_unit` 一起删掉。**一条提示词的正确性依赖当时的
    资格规则;规则变了,提示词必须跟着变,而不是两种形状各留一半。**
+
+151. 来自 Plan 153 第三节(subagent 的 `agent_type` matcher)。**"这条配置配了不生效"和"这条
+   配置根本配不上"是两个不同的 bug,在两个不同的文件里,修法也不同——判断属于哪一个,必须
+   同时读**配置装载**和**运行时消费**两处,只读运行时会把一道已经存在的门当成不存在。**本次
+   交接把这笔账描述成 fail-open 的静默无操作:`run_event` 的 `if let (Some(matcher), Some(tool))`
+   在子 agent 事件上拿不到 `tool`,于是"配了 matcher 既不报错也不筛"。运行时那半句是对的,
+   "不报错"那半句不是——`startup.rs` 的 `load_hooks` 有一道 `if !event.is_tool_event() { bail! }`,
+   还有一条 `turnmatcher` 测试正锁着它。生产里的真实症状是**装不进去**,而不是装进去了不干活;
+   于是"放开配置校验"成了这次的工作量之一,而它在 plan 里一个字都没有。判据:**说一个配置项
+   静默失效之前,先 grep 它的字面量,看装载侧有没有先把它拦下来**——一条没有装载侧证据的
+   "静默失效"结论,通常是把库 API 的可达性当成了产品的可达性(`HookDef` 字段是 pub,embedder
+   和测试确实够得着,但用户够不着)。同批的两条:**(a) 参考项目在一个问题上二比二时,分歧
+   往往不在那个问题本身,而在"要不要让这个问题存在"。**"无类型的子 agent 遇到配了 matcher 的
+   hook,该触发还是该跳过"——cc(空串 falsy 跳过整个筛选)和 grok(`match_value` 把空串变
+   `None`,`matcher_allows` 的 `_ => true`)都选触发;codex(`agent_role.unwrap_or(DEFAULT_ROLE_NAME)`)
+   和 dsh(常量 `SUBAGENT_TYPE`)压根不让"无类型"到达 matcher,一律给个可被点名的默认名。
+   后一条不是在回答这个问题,是在拒绝让问题出现,而且白送一个前者写不出来的能力:
+   `matcher = "default"` 能**单独**选中无类型那批。**一般形态:当一个 `Option<T>` 要喂给一个
+   筛选器/分派表时,先问能不能在上游给 None 一个名字;能的话,下游所有"这个分支算匹配还是
+   不匹配"的纠结一次性消失。** 顺带一条与本仓库有关的:kloop 现有的 `if let (Some(a), Some(b))`
+   就是 grok `matcher_allows` 的逐字形状,**撞形状不等于抄过,也不等于那条语义被想过**。
+   **(b) plan 的"非目标"是带语境的,引用它之前先看它写在哪一节的隔壁。**第六节"不动现有六个
+   事件的 payload 字节"那条,整节讲的都是"加四个新挂点时别碰旧的";本次只做第三节的旧账,
+   而旧账本身要求 payload 多一个 `agent_type` 字段(不然 `default` 这个名字只存在于文档里,
+   没配 matcher 的 hook 也分不出类型,四家参考也都把它放在 payload 里)。**"非目标"是在回答
+   "做 X 的时候别顺手做 Y",不是在回答"任何时候都不许做 Y"**;真正不能动的那条(主 agent 的
+   字节与 cc 一致)在 `hooks.rs:138` 的注释里,它有理由、有出处,和这条泛泛的清单条目不是
+   一个量级。

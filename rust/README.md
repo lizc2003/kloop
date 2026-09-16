@@ -1314,13 +1314,15 @@ External command hooks fire at six points: before/after a turn
 [[hooks]]
 event = "pre_tool"            # pre_turn|post_turn|pre_tool|post_tool|subagent_start|subagent_stop
 command = ["./guard.sh"]      # argv, not a shell string
-matcher = "bash"              # tool events only: exact tool-name filter
+matcher = "bash"              # exact filter: tool name on tool events,
+                              # agent type on subagent_start/subagent_stop
 timeout_ms = 5000             # optional, default 10000
 ```
 
 The event arrives as one line of JSON on the hook's stdin: `event` and
-`session_id` always, plus `tool_name`/`tool_input` on tool events and
-`tool_result`/`is_error` on `post_tool`. Exit code 0 allows; exit code **2
+`session_id` always, plus `tool_name`/`tool_input` on tool events,
+`tool_result`/`is_error` on `post_tool`, and `agent`/`agent_type` on the
+sub-agent events. Exit code 0 allows; exit code **2
 blocks** on the "start"/pre events — `pre_turn`, `pre_tool`, `subagent_start`
 (cc's convention — a block must be an explicit signal): a blocked `pre_tool`
 call never runs and the model gets an is_error tool_result (`blocked by hook:
@@ -1342,6 +1344,16 @@ file, omitted for an in-memory sub-agent) and its `last_assistant_message`
 (the result) — enough for an audit or notification hook. A sub-agent's
 `pre_tool` / `post_tool` additionally carry an `agent` field (`agent-N`);
 main-agent tool events omit it, so their payload is byte-identical to before.
+
+A `matcher` on `subagent_start` / `subagent_stop` filters by **agent type** —
+the `agent_type` `run_agent` dispatched to, not the `agent-N` label, which is
+only a spawn counter. A sub-agent started without a type (`run_agent` omitted
+`agent_type`, or a `fork` skill spawned it) reports the type `default`, so
+`matcher = "reviewer"` does **not** fire for it and `matcher = "default"`
+selects exactly those. Naming that case rather than treating it as "no value"
+is deliberate: it is what codex and deepseek-harness do, and it keeps a
+configured matcher from silently ceasing to apply. The type is in the payload
+as `agent_type`, so a hook reads the name instead of learning it here.
 
 Ordering with permissions: `pre_tool` hooks run **before** the permission
 gate — hooks are automation policy, the permission prompt is the human's

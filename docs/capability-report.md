@@ -354,7 +354,7 @@ codex 拉取式增量观察。
 |---|---|---|---|
 | stdout 结构化 JSON 协议(decision/updatedInput/additionalContext) | cc 单家 | 备选池;裸文本可向后兼容升级 | 写复杂 hook 的痛感 |
 | 更多挂点(cc 10 事件面)/ 并行执行 | cc 单家 | 备选池 | 同上 |
-| subagent 事件 agent_type matcher | — | plan 17 残留小账 | 顺手 |
+| ~~subagent 事件 agent_type matcher~~ | — | **✅ Plan 153 第三节(2026-09-16)**:类型从 live Agent 目录送到 `subagent_start`/`subagent_stop`,`matcher` 按类型精确筛;无类型的子 agent 报 `default`(codex/dsh 的形状),不再让配了 matcher 的 hook 对所有类型照常触发;配置侧同步放开(此前 `matcher` 在子 agent 事件上直接报错,根本配不出来) | 已完成 |
 
 ### 10. 上下文工程(指令文件/caching/deferred)——✅
 

@@ -799,12 +799,98 @@ async fn subagent_turn_routes_to_subagent_hooks() {
             .trim(),
     )
     .unwrap();
-    assert_eq!(payload["agent"], "agent-7");
     assert_eq!(
-        payload["agent_transcript_path"],
-        session.to_string_lossy().as_ref()
+        payload,
+        json!({
+            "event": "subagent_stop",
+            "session_id": "parent-sess",
+            "agent": "agent-7",
+            // This Config is built by hand and never registered in the live
+            // directory, so the type is the name an untyped sub-agent reports.
+            "agent_type": crate::hooks::DEFAULT_AGENT_TYPE,
+            "agent_transcript_path": session.to_string_lossy(),
+            "last_assistant_message": "sub answer",
+        })
     );
-    assert_eq!(payload["last_assistant_message"], "sub answer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan 153: the agent TYPE reaches the sub-agent hook points, and a matcher
+/// filters on it. The type lives only in the live Agent directory — the label
+/// ("agent-N") is a spawn counter — so this covers the whole path from
+/// `register_child` to the hook's stdin.
+#[tokio::test]
+async fn subagent_hooks_carry_the_registered_agent_type() {
+    use crate::hooks::{DEFAULT_TIMEOUT_MS, HookDef, HookEvent, Hooks};
+    let dir = std::env::temp_dir().join(format!("kloop-subtype-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.display();
+    let hook = |event, matcher: &str, script: String| HookDef {
+        event,
+        command: crate::hooks::test_shell_command(&script),
+        matcher: Some(matcher.into()),
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    };
+    let hooks = Hooks {
+        defs: vec![
+            hook(
+                HookEvent::SubagentStop,
+                "reviewer",
+                format!("cat > {d}/matched"),
+            ),
+            hook(
+                HookEvent::SubagentStop,
+                "explorer",
+                format!("touch {d}/other-type"),
+            ),
+        ],
+    };
+
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+        text: "reviewed".into(),
+    }]]);
+    let mut cfg = compaction_cfg(provider, 200_000, "subtype").test_clone();
+    cfg.local_agent = cfg.local_agent.child("agent-8".parse().unwrap());
+    cfg.session_id = "parent-sess".into();
+    cfg.hooks = Arc::new(hooks);
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let _lease = cfg
+        .local_agent
+        .register_child(
+            Arc::clone(&cfg.inbox),
+            Some("reviewer"),
+            "typed child",
+            ui.clone(),
+        )
+        .unwrap();
+
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("review this"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 1).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+
+    let payload: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(dir.join("matched"))
+            .expect("the matching hook ran")
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "event": "subagent_stop",
+            "session_id": "parent-sess",
+            "agent": "agent-8",
+            "agent_type": "reviewer",
+            "last_assistant_message": "reviewed",
+        })
+    );
+    assert!(
+        !dir.join("other-type").exists(),
+        "a hook matching another agent type must not fire"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

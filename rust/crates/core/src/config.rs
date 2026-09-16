@@ -435,6 +435,12 @@ impl Config {
         self.local_agent.agent_label()
     }
 
+    /// The agent type this sub-agent was dispatched to, for hook matchers.
+    /// None on the main agent and on a sub-agent started without one.
+    pub fn agent_type(&self) -> Option<String> {
+        self.local_agent.agent_type()
+    }
+
     fn base_workspace_at(&self, workspace_epoch: u64) -> EffectiveWorkspace {
         EffectiveWorkspace {
             identity: self.permissions.identity().clone(),

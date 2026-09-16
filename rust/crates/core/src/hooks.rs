@@ -22,6 +22,18 @@ use crate::agent::Ui;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
+/// The `agent_type` a sub-agent reports when it was started without one
+/// (`run_agent` omitted `agent_type`, or a `fork` skill spawned it). Codex
+/// (`DEFAULT_ROLE_NAME` = "default") and deepseek-harness (`SUBAGENT_TYPE` =
+/// "general-purpose") both substitute a real name here instead of letting
+/// "no type" reach the matcher; cc and grok instead treat it as "no value"
+/// and fire every hook, matcher or not. The name is deliberate: a matcher
+/// never silently stops applying, and `matcher = "default"` selects exactly
+/// the untyped sub-agents — which the fail-open shape cannot express. It is
+/// also in the payload, so a hook reads the name instead of learning it from
+/// documentation.
+pub const DEFAULT_AGENT_TYPE: &str = "default";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEvent {
     PreTurn,
@@ -62,8 +74,18 @@ impl HookEvent {
         }
     }
 
-    pub fn is_tool_event(self) -> bool {
-        matches!(self, HookEvent::PreTool | HookEvent::PostTool)
+    /// What a `matcher` on this event is compared against, as it reads in a
+    /// config error; None on the events that have no such subject, where a
+    /// matcher is a config error rather than a filter that quietly never
+    /// applies. Tool events match the tool name and sub-agent events match the
+    /// agent type — the split cc (`hooks.ts:1779`), codex
+    /// (`HOOK_EVENT_NAMES_WITH_MATCHERS`) and grok (`match_value`) all make.
+    pub fn matcher_subject(self) -> Option<&'static str> {
+        match self {
+            HookEvent::PreTool | HookEvent::PostTool => Some("tool name"),
+            HookEvent::SubagentStart | HookEvent::SubagentStop => Some("agent type"),
+            HookEvent::PreTurn | HookEvent::PostTurn => None,
+        }
     }
 
     /// Events on which exit code 2 is an explicit block (the rest fail open).
@@ -81,8 +103,10 @@ pub struct HookDef {
     pub event: HookEvent,
     /// argv; not passed through a shell.
     pub command: Vec<String>,
-    /// Exact tool-name filter; None matches every tool. Only meaningful on
-    /// tool events (config loading rejects it elsewhere).
+    /// Exact filter on the event's matcher subject — the tool name on
+    /// pre_tool/post_tool, the agent type on subagent_start/subagent_stop
+    /// (see [`HookEvent::matcher_subject`]). None matches every subject;
+    /// config loading rejects a matcher on the events that have none.
     pub matcher: Option<String>,
     pub timeout_ms: u64,
 }
@@ -197,19 +221,30 @@ impl Hooks {
     }
 
     /// A sub-agent's turn is starting (its counterpart to pre_turn). Fires only
-    /// for sub-agents; `agent` is the label ("agent-N"). Can block like
-    /// pre_turn — a policy hook may refuse to let a sub-agent run.
-    pub async fn subagent_start(&self, session_id: &str, agent: &str, ui: &dyn Ui) -> HookDecision {
+    /// for sub-agents; `agent` is the label ("agent-N"), `agent_type` the type
+    /// `run_agent` dispatched to (None becomes [`DEFAULT_AGENT_TYPE`], which is
+    /// what a matcher sees). Can block like pre_turn — a policy hook may refuse
+    /// to let a sub-agent run.
+    pub async fn subagent_start(
+        &self,
+        session_id: &str,
+        agent: &str,
+        agent_type: Option<&str>,
+        ui: &dyn Ui,
+    ) -> HookDecision {
+        let agent_type = agent_type.unwrap_or(DEFAULT_AGENT_TYPE);
         let event = json!({
             "event": "subagent_start",
             "session_id": session_id,
             "agent": agent,
+            "agent_type": agent_type,
         });
-        self.run_event(HookEvent::SubagentStart, None, &event, ui)
+        self.run_event(HookEvent::SubagentStart, Some(agent_type), &event, ui)
             .await
     }
 
     /// A sub-agent's turn has ended (its counterpart to post_turn). Carries the
+    /// agent type a matcher filters on (see [`Hooks::subagent_start`]), the
     /// sub-agent's own transcript path (its session file, plan 17 slice 3; None
     /// when the sub-agent ran in-memory) and its final assistant message, so an
     /// audit/notification hook gets the record and the result. Context-only,
@@ -218,21 +253,24 @@ impl Hooks {
         &self,
         session_id: &str,
         agent: &str,
+        agent_type: Option<&str>,
         agent_transcript_path: Option<&Path>,
         last_assistant_message: &str,
         ui: &dyn Ui,
     ) -> Vec<String> {
+        let agent_type = agent_type.unwrap_or(DEFAULT_AGENT_TYPE);
         let mut event = json!({
             "event": "subagent_stop",
             "session_id": session_id,
             "agent": agent,
+            "agent_type": agent_type,
             "last_assistant_message": last_assistant_message,
         });
         if let Some(path) = agent_transcript_path {
             event["agent_transcript_path"] = json!(path.to_string_lossy());
         }
         match self
-            .run_event(HookEvent::SubagentStop, None, &event, ui)
+            .run_event(HookEvent::SubagentStop, Some(agent_type), &event, ui)
             .await
         {
             HookDecision::Allow { context } => context,
@@ -240,10 +278,16 @@ impl Hooks {
         }
     }
 
+    /// `subject` is what a `matcher` is compared against on this event (see
+    /// [`HookEvent::matcher_subject`]); it is Some on every event that accepts
+    /// one, so a configured matcher always decides. The None arm therefore
+    /// only covers pre_turn/post_turn, where config loading rejects matchers
+    /// outright — a `HookDef` built directly in code can still reach it, and
+    /// there an inapplicable matcher fails open.
     async fn run_event(
         &self,
         event: HookEvent,
-        tool_name: Option<&str>,
+        subject: Option<&str>,
         payload: &Value,
         ui: &dyn Ui,
     ) -> HookDecision {
@@ -252,8 +296,8 @@ impl Hooks {
             if def.event != event {
                 continue;
             }
-            if let (Some(matcher), Some(tool)) = (&def.matcher, tool_name)
-                && matcher != tool
+            if let (Some(matcher), Some(subject)) = (&def.matcher, subject)
+                && matcher != subject
             {
                 continue;
             }
@@ -702,7 +746,9 @@ mod tests {
             )],
         };
         let ui = note_ui();
-        let decision = hooks.subagent_start("s-1", "agent-1", &ui).await;
+        let decision = hooks
+            .subagent_start("s-1", "agent-1", Some("reviewer"), &ui)
+            .await;
         assert_eq!(
             decision,
             HookDecision::Block {
@@ -730,6 +776,7 @@ mod tests {
             .subagent_stop(
                 "parent",
                 "agent-1",
+                Some("reviewer"),
                 Some(&transcript),
                 "the sub-agent's answer",
                 &ui,
@@ -745,6 +792,7 @@ mod tests {
                 "event": "subagent_stop",
                 "session_id": "parent",
                 "agent": "agent-1",
+                "agent_type": "reviewer",
                 "agent_transcript_path": "/tmp/sessions/parent-agent-1.jsonl",
                 "last_assistant_message": "the sub-agent's answer",
             })
@@ -766,11 +814,218 @@ mod tests {
         };
         let ui = note_ui();
         hooks
-            .subagent_stop("parent", "agent-1", None, "answer", &ui)
+            .subagent_stop("parent", "agent-1", Some("reviewer"), None, "answer", &ui)
             .await;
         let event: Value =
             serde_json::from_str(std::fs::read_to_string(&capture).unwrap().trim()).unwrap();
         assert_eq!(event.get("agent_transcript_path"), None);
         let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Every event's stdin payload, pinned whole. The four main-agent events
+    /// must stay byte-identical to what cc/codex send — that is what
+    /// `with_agent` exists for — so any added field has to fail here. The two
+    /// sub-agent events are kloop's own shape and carry `agent_type`, the
+    /// subject their matcher filters on.
+    #[tokio::test]
+    async fn every_event_payload_is_pinned() {
+        let capture =
+            std::env::temp_dir().join(format!("kloop-hook-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_file(&capture);
+        let hook = |event: HookEvent| sh(event, &format!("cat > {}", capture.display()));
+        let taken = || -> Value {
+            let raw = std::fs::read_to_string(&capture).expect("the hook captured a payload");
+            std::fs::remove_file(&capture).unwrap();
+            serde_json::from_str(raw.trim()).unwrap()
+        };
+        let ui = note_ui();
+        let hooks = Hooks {
+            defs: vec![
+                hook(HookEvent::PreTurn),
+                hook(HookEvent::PostTurn),
+                hook(HookEvent::PreTool),
+                hook(HookEvent::PostTool),
+                hook(HookEvent::SubagentStart),
+                hook(HookEvent::SubagentStop),
+            ],
+        };
+        let input = json!({"command": "ls"});
+
+        hooks.pre_turn("s-1", &ui).await;
+        assert_eq!(taken(), json!({"event": "pre_turn", "session_id": "s-1"}));
+
+        hooks.post_turn("s-1", &ui).await;
+        assert_eq!(taken(), json!({"event": "post_turn", "session_id": "s-1"}));
+
+        hooks.pre_tool("s-1", "", "bash", &input, &ui).await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "pre_tool",
+                "session_id": "s-1",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+            })
+        );
+
+        hooks.pre_tool("s-1", "agent-3", "bash", &input, &ui).await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "pre_tool",
+                "session_id": "s-1",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "agent": "agent-3",
+            })
+        );
+
+        hooks
+            .post_tool("s-1", "", "bash", &input, "out", false, &ui)
+            .await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "post_tool",
+                "session_id": "s-1",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": "out",
+                "is_error": false,
+            })
+        );
+
+        hooks
+            .post_tool("s-1", "agent-3", "bash", &input, "out", true, &ui)
+            .await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "post_tool",
+                "session_id": "s-1",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": "out",
+                "is_error": true,
+                "agent": "agent-3",
+            })
+        );
+
+        hooks
+            .subagent_start("s-1", "agent-3", Some("explorer"), &ui)
+            .await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "subagent_start",
+                "session_id": "s-1",
+                "agent": "agent-3",
+                "agent_type": "explorer",
+            })
+        );
+
+        // No type is not "no value": it is the DEFAULT_AGENT_TYPE name, and the
+        // hook reads it from the payload rather than from documentation.
+        hooks.subagent_start("s-1", "agent-4", None, &ui).await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "subagent_start",
+                "session_id": "s-1",
+                "agent": "agent-4",
+                "agent_type": "default",
+            })
+        );
+
+        hooks
+            .subagent_stop("s-1", "agent-4", None, None, "done", &ui)
+            .await;
+        assert_eq!(
+            taken(),
+            json!({
+                "event": "subagent_stop",
+                "session_id": "s-1",
+                "agent": "agent-4",
+                "agent_type": "default",
+                "last_assistant_message": "done",
+            })
+        );
+    }
+
+    /// The plan 17 debt: a matcher on a sub-agent event filters by agent TYPE.
+    /// The type never used to reach `run_event`, so a configured matcher fired
+    /// for every type — a filter that was neither an error nor a filter.
+    #[tokio::test]
+    async fn subagent_matcher_filters_by_agent_type() {
+        let marker =
+            std::env::temp_dir().join(format!("kloop-hook-subtype-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let fired = || {
+            let hit = marker.exists();
+            let _ = std::fs::remove_file(&marker);
+            hit
+        };
+        let touch = format!("touch {}", marker.display());
+        let ui = note_ui();
+        let hooks = Hooks {
+            defs: vec![HookDef {
+                matcher: Some("reviewer".into()),
+                ..sh(HookEvent::SubagentStart, &touch)
+            }],
+        };
+
+        hooks
+            .subagent_start("s-1", "agent-1", Some("reviewer"), &ui)
+            .await;
+        assert!(fired(), "the named type fires");
+
+        hooks
+            .subagent_start("s-1", "agent-2", Some("explorer"), &ui)
+            .await;
+        assert!(!fired(), "another type must not fire");
+
+        // The case the old code got wrong: no type at all used to fire every
+        // matcher. It is DEFAULT_AGENT_TYPE now, which "reviewer" does not select.
+        hooks.subagent_start("s-1", "agent-3", None, &ui).await;
+        assert!(
+            !fired(),
+            "an untyped sub-agent must not fire a typed matcher"
+        );
+
+        // ...and that name is selectable, which is the reason for naming it.
+        let hooks = Hooks {
+            defs: vec![HookDef {
+                matcher: Some(DEFAULT_AGENT_TYPE.into()),
+                ..sh(HookEvent::SubagentStop, &touch)
+            }],
+        };
+        hooks
+            .subagent_stop("s-1", "agent-3", None, None, "done", &ui)
+            .await;
+        assert!(fired(), "matcher = default selects the untyped sub-agents");
+
+        hooks
+            .subagent_stop("s-1", "agent-1", Some("reviewer"), None, "done", &ui)
+            .await;
+        assert!(
+            !fired(),
+            "a typed sub-agent must not fire matcher = default"
+        );
+    }
+
+    #[test]
+    fn only_tool_and_subagent_events_take_a_matcher() {
+        assert_eq!(HookEvent::PreTool.matcher_subject(), Some("tool name"));
+        assert_eq!(HookEvent::PostTool.matcher_subject(), Some("tool name"));
+        assert_eq!(
+            HookEvent::SubagentStart.matcher_subject(),
+            Some("agent type")
+        );
+        assert_eq!(
+            HookEvent::SubagentStop.matcher_subject(),
+            Some("agent type")
+        );
+        assert_eq!(HookEvent::PreTurn.matcher_subject(), None);
+        assert_eq!(HookEvent::PostTurn.matcher_subject(), None);
     }
 }

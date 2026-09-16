@@ -212,9 +212,9 @@ fn load_hooks(root: &toml::Table) -> Result<Vec<HookDef>> {
                 let m = v
                     .as_str()
                     .with_context(|| format!("hooks[{i}].matcher must be a string"))?;
-                if !event.is_tool_event() {
+                if event.matcher_subject().is_none() {
                     bail!(
-                        "hooks[{i}]: matcher is only valid for pre_tool/post_tool, not {}",
+                        "hooks[{i}]: matcher is only valid for pre_tool/post_tool (tool name) and subagent_start/subagent_stop (agent type), not {}",
                         event.name()
                     );
                 }
@@ -1832,6 +1832,11 @@ timeout_ms = 5000
 [[hooks]]
 event = "post_turn"
 command = ["notify-send"]
+
+[[hooks]]
+event = "subagent_stop"
+command = ["./audit.sh"]
+matcher = "reviewer"
 "#,
         );
         assert_eq!(
@@ -1847,6 +1852,15 @@ command = ["notify-send"]
                     event: HookEvent::PostTurn,
                     command: vec!["notify-send".into()],
                     matcher: None,
+                    timeout_ms: kloop_core::hooks::DEFAULT_TIMEOUT_MS,
+                },
+                // On a sub-agent event the matcher is the agent TYPE, not a
+                // tool name; it used to be rejected here, so the filter plan 17
+                // asked for could not be configured at all.
+                HookDef {
+                    event: HookEvent::SubagentStop,
+                    command: vec!["./audit.sh".into()],
+                    matcher: Some("reviewer".into()),
                     timeout_ms: kloop_core::hooks::DEFAULT_TIMEOUT_MS,
                 },
             ]

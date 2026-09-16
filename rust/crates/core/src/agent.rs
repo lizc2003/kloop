@@ -216,11 +216,20 @@ async fn run_turn_with_options(
     // sub-agent's turn boundary is its own event, carrying its transcript and
     // result). The main agent keeps the plain turn hooks.
     let agent = cfg.agent_label();
+    // The type run_agent dispatched to, read once from the live directory: a
+    // sub-agent registers before its turn task is spawned and its lease outlives
+    // the turn, so both hook points see the same value. The label ("agent-N") is
+    // a spawn counter, never the type.
+    let agent_type = if agent.is_empty() {
+        None
+    } else {
+        cfg.agent_type()
+    };
     let start = if agent.is_empty() {
         cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await
     } else {
         cfg.hooks
-            .subagent_start(&cfg.session_id, agent, ui.as_ref())
+            .subagent_start(&cfg.session_id, agent, agent_type.as_deref(), ui.as_ref())
             .await
     };
     match start {
@@ -265,6 +274,7 @@ async fn run_turn_with_options(
             .subagent_stop(
                 &cfg.session_id,
                 agent,
+                agent_type.as_deref(),
                 transcript.as_deref(),
                 &outcome.final_text,
                 ui.as_ref(),

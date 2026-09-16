@@ -77,6 +77,15 @@ impl LocalAgentContext {
         self.current.display_label()
     }
 
+    /// This agent's registered type — the `agent_type` `run_agent` dispatched
+    /// to. None for the main agent, for a sub-agent started without one, and
+    /// for an agent that was never registered (Configs built directly in
+    /// tests). Hook matchers read it through `hooks::DEFAULT_AGENT_TYPE`
+    /// rather than treating None as "no opinion".
+    pub fn agent_type(&self) -> Option<String> {
+        self.directory.agent_type(&self.current)
+    }
+
     pub fn register_child(
         &self,
         inbox: Arc<Inbox>,
@@ -294,6 +303,17 @@ impl LiveAgentDirectory {
             ui,
             armed: true,
         })
+    }
+
+    /// The registered type of one live agent; None when it has no type or is
+    /// no longer in the directory.
+    fn agent_type(&self, id: &LocalAgentId) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(id)
+            .and_then(|entry| entry.agent_type.clone())
     }
 
     fn send(
