@@ -32,6 +32,16 @@ ancestor is untouched")说明这个配对是有意的。**唯一值得补的是�
 再说"TUI 测试没有虚拟终端解析"(实际在 `tui_pty_support/mod.rs`,不在 `tui_pty.rs`)。
 接手 149-153 时**不要按文件名推断现状**,plan 里写的行号都是读完文件之后记的。
 
+**这一批之外,2026-09-17 立了又停的一条**:plan 157(`read_file` 的 PDF 原生分页读取)。
+调研做完、路线摆到两条(document wire + 切页 / 渲染成图),问用户走哪条时答案是
+「目前不需要支持 PDF」,**一行代码没写**。查清的事实全留在
+`docs/plan/157-a-pdf-wire-nobody-needs-yet.md`,`docs/capability-report.md` 第 85 行与
+第四节 T0 行已销账。别再重推的一点:**plan 49:185 挂的两个技术前置条件——精确 fixture、
+canonical wire 可表达——今天都已成立**(fixture 一直在
+`refs/claude-code-2.1.220/fixtures/normalized/read-special-contract-1.json`;Anthropic 官方文档
+明写 `tool_result.content` 可以直接放 document block)。拦住它的是第三个从来没写进那条裁决的
+条件:有没有人真的要读 PDF。教训 152。
+
 ## 〇之二、上一批:plan 138–142(2026-09-11 排定,已全部完成)
 
 plan 136 的全仓通读(12.5 万行)把当时不该混进清账的条目挂成非目标;用户要求把它们排成
@@ -1144,3 +1154,20 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    "做 X 的时候别顺手做 Y",不是在回答"任何时候都不许做 Y"**;真正不能动的那条(主 agent 的
    字节与 cc 一致)在 `hooks.rs:138` 的注释里,它有理由、有出处,和这条泛泛的清单条目不是
    一个量级。
+
+152. 来自 Plan 157(一条还没有人需要的 PDF wire)。**一条"为什么不做"的裁决,原文往往是
+   条件式的,下游转述会把它压成结论式的;引用它之前先回原文,逐个条件重验一遍。**
+   plan 49:185 写的是"PDF 只有在精确 fixture 和 kloop canonical provider wire 都可表达时才对齐",
+   两个**条件**;而 `capability-report.md` 第 85 行的转述是"不在 canonical provider wire 未统一时
+   伪兼容",一个**结论**。照转述读,这条能力像是被"wire 统一不了"卡死的;回原文逐条验,
+   两个条件今天其实**都已成立**——精确 fixture 一直躺在 corpus 里(`read-special-contract-1`
+   录着整份 PDF 那条的 document block),Anthropic 官方文档也明写 `tool_result.content` 可以
+   直接放 document block,连 cc 那种"再挂一条附加 user message"的结构都不需要。真正拦住它的
+   是第三个从来没写进那条裁决的条件——**有没有需求**,而那个条件恰好写在另一份文档的
+   "触发条件"列里。判据:**看到"因为 X 所以不做",先确认 X 是不是当初真的写下的那句话,
+   再确认 X 今天还成不成立;两关都过了,才轮到讨论怎么做。** 同批一条(教训 143 的又一例):
+   **参考实现的同一个功能可能有两条形状完全不同的路,按某个入参分岔;只读其中一条,
+   会把整个功能的形状判错。** cc 的 Read 读 PDF:没给 `pages` 是把整份 PDF 字节当 document
+   block 发,给了 `pages` 是 `pdftoppm` 渲染成 JPEG —— 一条是 wire,一条是渲染器。把两条合起来
+   描述成"切页之后原样发 PDF 字节",得到的是一条 cc 里根本不存在的路。**读参考实现时,
+   先在入口处把分支数清点完,再去读任何一条分支的实现。**
