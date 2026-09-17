@@ -125,11 +125,14 @@ pub enum Cell {
     /// Note, which collapses to one truncated line).
     System(String),
     /// The opening session banner (plan 38 slice 6): a rounded box with the
-    /// brand title plus the model, cwd, branch, and starting mode. Built once in
-    /// `run` with display-ready strings (the git/env reads happen there, keeping
-    /// the renderer pure) and prepended to the transcript, so it is the first
-    /// thing that scrolls into scrollback.
+    /// brand title plus the build's version, the model, cwd, branch, and
+    /// starting mode. Built once in `run` with display-ready strings (the
+    /// git/env reads happen there, keeping the renderer pure) and prepended to
+    /// the transcript, so it is the first thing that scrolls into scrollback.
     SessionHeader {
+        /// `v0.1.0 (2319ea3)` — the caller's build stamp (plan 161), passed in
+        /// rather than read here so tests can pin it.
+        version: String,
         model: String,
         cwd: String,
         branch: Option<String>,

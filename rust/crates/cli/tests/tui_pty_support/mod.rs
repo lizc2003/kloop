@@ -468,6 +468,9 @@ impl PtyHarness {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("KLOOP_NO_ANIM", "1");
+        // The banner carries the build stamp (plan 161), which moves with every
+        // commit — pin it so the checked-in frames stay a fact about layout.
+        command.env("KLOOP_VERSION", "v0.0.0 (0000000)");
         command.env("KLOOP_PROVIDER", "openai-compat");
         command.env("OPENAI_API_KEY", "synthetic-tui-pty-key");
         command.env("OPENAI_MODEL", "tui-pty-model");

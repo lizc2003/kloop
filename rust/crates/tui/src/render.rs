@@ -549,12 +549,14 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             }
         }
         Cell::SessionHeader {
+            version,
             model,
             cwd,
             branch,
             mode,
         } => {
             lines.extend(session_header_lines(
+                version,
                 model,
                 cwd,
                 branch.as_deref(),
@@ -567,10 +569,12 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The opening session banner (plan 38 slice 6): a rounded box (`╭─╮ │ ╰─╯`) in
-/// the brand colour, titled `>_ kloop`, listing the model, cwd, branch (omitted
-/// off a repo), and starting mode as dim-label / default-value rows. The box
-/// width fits the content, capped so it never spans an ultra-wide terminal.
+/// the brand colour, titled `>_ kloop` with the build stamp beside it, listing
+/// the model, cwd, branch (omitted off a repo), and starting mode as dim-label
+/// / default-value rows. The box width fits the content, capped so it never
+/// spans an ultra-wide terminal.
 fn session_header_lines(
+    version: &str,
     model: &str,
     cwd: &str,
     branch: Option<&str>,
@@ -585,16 +589,25 @@ fn session_header_lines(
     }
     fields.push(("mode", mode));
 
-    // Inner width = the widest of the title and the label+value rows, capped to
-    // the terminal (minus the two border columns) and MAX_W.
+    // The build stamp rides on the title row (plan 161) rather than claiming a
+    // label row of its own: it identifies the binary, not the session, and the
+    // banner already costs five rows of a first screen.
     let title = ">_ kloop";
+    let stamp = (!version.is_empty()).then(|| format!("  {version}"));
+    let title_w = display_width(title) + stamp.as_deref().map_or(0, display_width);
+
+    // Inner width = the widest of the title and the label+value rows, capped to
+    // what the terminal leaves after a row's chrome, and to MAX_W.
     let content_w = fields
         .iter()
         .map(|(_, v)| LABEL_W + display_width(v))
-        .chain(std::iter::once(display_width(title)))
+        .chain(std::iter::once(title_w))
         .max()
         .unwrap_or(0);
-    let cap = width.saturating_sub(2).clamp(1, MAX_W);
+    // A row costs four columns of chrome, not two: `│ ` … ` │`. Subtracting only
+    // the borders let a box that fills the cap overflow its terminal by the two
+    // padding columns and wrap (visible once the title row got longer, plan 161).
+    let cap = width.saturating_sub(4).clamp(1, MAX_W);
     let inner = content_w.min(cap);
 
     let brand = Style::new().fg(BRAND);
@@ -604,15 +617,17 @@ fn session_header_lines(
         format!("╭{}╮", "─".repeat(inner + 2)),
         brand,
     )));
-    // Title row (bold brand), one space of padding inside the border.
-    lines.push(boxed_row(
-        vec![Span::styled(
-            truncate(title, inner),
-            brand.add_modifier(Modifier::BOLD),
-        )],
-        inner,
-        brand,
-    ));
+    // Title row (bold brand), one space of padding inside the border. A stamp
+    // cut in half would name a commit that is not the one this was built from,
+    // so a box too narrow for the whole of it drops it instead of truncating.
+    let mut title_spans = vec![Span::styled(
+        truncate(title, inner),
+        brand.add_modifier(Modifier::BOLD),
+    )];
+    if let Some(stamp) = stamp.filter(|_| inner >= title_w) {
+        title_spans.push(Span::styled(stamp, DIM));
+    }
+    lines.push(boxed_row(title_spans, inner, brand));
     // Field rows: dim label column, default-weight value.
     for (label, value) in fields {
         let label_span = Span::styled(format!("{label:<LABEL_W$}"), DIM);
@@ -2266,10 +2281,12 @@ mod tests {
     }
 
     /// The session banner (plan 38 slice 6): a rounded brand-coloured box titled
-    /// `>_ kloop`, one dim-label row per field, branch present when on a repo.
+    /// `>_ kloop` with the build stamp beside the title (plan 161), one
+    /// dim-label row per field, branch present when on a repo.
     #[test]
     fn session_header_renders_a_branded_box_with_fields() {
         let lines = session_header_lines(
+            "v0.1.0 (2319ea3)",
             "claude-sonnet-4-6",
             "~/work/kloop",
             Some("main"),
@@ -2286,6 +2303,7 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts[1].contains(">_ kloop"), "{texts:?}");
+        assert!(texts[1].contains("v0.1.0 (2319ea3)"), "{texts:?}");
         let has = |k: &str, v: &str| texts.iter().any(|t| t.contains(k) && t.contains(v));
         assert!(has("model", "claude-sonnet-4-6"), "{texts:?}");
         assert!(has("cwd", "~/work/kloop"), "{texts:?}");
@@ -2305,7 +2323,7 @@ mod tests {
     /// `branch = None`); the other rows still render.
     #[test]
     fn session_header_omits_branch_off_a_repo() {
-        let texts: Vec<String> = session_header_lines("m", "/tmp/x", None, "plan", 80)
+        let texts: Vec<String> = session_header_lines("v0.1.0", "m", "/tmp/x", None, "plan", 80)
             .iter()
             .map(line_text)
             .collect();
@@ -2317,6 +2335,22 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("plan")), "{texts:?}");
+    }
+
+    /// A terminal too narrow for the whole build stamp drops it rather than
+    /// cutting it (plan 161): half a sha names a different commit. The title
+    /// itself stays, and the box does not grow past the terminal.
+    #[test]
+    fn session_header_drops_the_build_stamp_before_truncating_it() {
+        let texts: Vec<String> =
+            session_header_lines("v0.1.0 (2319ea3)", "m", "/x", None, "plan", 20)
+                .iter()
+                .map(line_text)
+                .collect();
+        assert!(texts[1].contains(">_ kloop"), "{texts:?}");
+        assert!(!texts[1].contains("v0.1.0"), "{texts:?}");
+        assert!(!texts[1].contains("2319"), "{texts:?}");
+        assert!(texts.iter().all(|t| display_width(t) <= 20), "{texts:?}");
     }
 
     /// The `+N -M` diff summary counts `+`/`-` lines (green/red) and is absent
@@ -2344,6 +2378,7 @@ mod tests {
         app.cells.insert(
             0,
             Cell::SessionHeader {
+                version: "v0.1.0 (2319ea3)".into(),
                 model: "sonnet-5".into(),
                 cwd: "~/work/kloop".into(),
                 branch: Some("main".into()),

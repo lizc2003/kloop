@@ -3,10 +3,10 @@ source: crates/cli/tests/tui_pty.rs
 expression: screen
 ---
 [24x80 cursor=21,2]
-│ model   tui-pty-model │
-│ cwd     ~/workspace   │
-│ mode    manual        │
-╰───────────────────────╯
+│ model   tui-pty-model      │
+│ cwd     ~/workspace        │
+│ mode    manual             │
+╰────────────────────────────╯
 
 > what should I change?
 Two things to change, then a check:

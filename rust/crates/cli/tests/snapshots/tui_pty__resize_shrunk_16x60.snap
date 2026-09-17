@@ -8,12 +8,12 @@ expression: settled.stable_text()
 
 
 
-╭───────────────────────╮
-│ >_ kloop              │
-│ model   tui-pty-model │
-│ cwd     ~/workspace   │
-│ mode    manual        │
-╰───────────────────────╯
+╭────────────────────────────╮
+│ >_ kloop  v0.0.0 (0000000) │
+│ model   tui-pty-model      │
+│ cwd     ~/workspace        │
+│ mode    manual             │
+╰────────────────────────────╯
 ────────────────────────────────────────────────────────────
 › rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
   rrrrrrrrrrrr

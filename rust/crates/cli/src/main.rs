@@ -47,6 +47,7 @@ use crate::args::CliArgs;
 use crate::args::list_sessions;
 use crate::args::open_history;
 use crate::args::parse_args;
+use crate::args::version_string;
 use crate::provider_config::ResolvedProviderSettings;
 use crate::startup::RuntimeSettings;
 use crate::startup::build_sandbox;
@@ -565,6 +566,7 @@ async fn run_tui(
         session_id,
         pending_images,
         worktree,
+        &version_string(),
     )
     .await?;
     Ok(ExitCode::SUCCESS)

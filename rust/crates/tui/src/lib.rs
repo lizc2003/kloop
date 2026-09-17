@@ -118,12 +118,15 @@ enum WorkerMsg {
 /// Run the TUI until the user quits. `make_config` is called once with the
 /// TUI's approver (the y/a/p/n popup) and note sink, so the caller can wire
 /// them into `Permissions` without this crate knowing about rule loading.
+/// `version` is the caller's build stamp for the banner (plan 161) — the binary
+/// knows which commit it came from, this crate does not.
 pub async fn run(
     make_config: impl FnOnce(Arc<dyn Approver>, Arc<dyn Questioner>, NoteFn) -> Result<Config>,
     history: History,
     session_id: String,
     pending_images: Vec<ContentBlock>,
     worktree: Option<String>,
+    version: &str,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let channel_ui = Arc::new(ChannelUi::new(event_tx.clone()));
@@ -179,6 +182,7 @@ pub async fn run(
     app.cells.insert(
         0,
         Cell::SessionHeader {
+            version: version.to_string(),
             model: cfg.provider_route.primary_model().to_string(),
             cwd: display_cwd(&effective_cwd),
             branch: effective_branch,

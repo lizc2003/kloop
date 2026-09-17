@@ -725,8 +725,15 @@ being cut at the right edge; past 10 rows it stops and says how many lines it
 dropped (the body of an HTTP error is only bounded at 64 KiB upstream).
 
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
-box): `>_ kloop` over the model, cwd, git branch, and starting mode, then it
-scrolls into scrollback as the conversation grows. Colour uses a restrained
+box): `>_ kloop` — with the build stamp dim beside the title, `v0.1.0 (2319ea3)`
+(plan 161) — over the model, cwd, git branch, and starting mode, then it
+scrolls into scrollback as the conversation grows. The stamp is the crate
+version plus the commit `crates/cli/build.rs` embedded at compile time, so a
+running kloop says which source it was built from; the sha names the commit the
+build sat on, not a claim that the tree was clean. Outside a checkout there is
+no commit and the stamp is the bare version; `KLOOP_BUILD_SHA` (at build time)
+and `KLOOP_VERSION` (at run time) override it. A box too narrow for the whole
+stamp drops it rather than showing half a sha, which would name another commit. Colour uses a restrained
 palette: a vivid **cyan-blue** RGB accent (`#4fb3c8`) marks kloop itself (the
 banner, working spinner, and mode badge), ANSI **cyan** marks input/selection/
 status (the `›` prompt, running tool marks, and approval action bar),
@@ -3587,8 +3594,10 @@ Every session is saved and resumable — see Session persistence above.
   mock port and sandbox path by literal substitution, elapsed readouts by an
   anchored `<elapsed>` token (the turn-end rule is rebuilt to the width it
   occupies, so `0s` and `10s` produce the same line), the spinner frozen by
-  `KLOOP_NO_ANIM`, and the workspace placed under `$HOME` so the banner prints a
-  fixed-width `~/workspace` instead of a temp path that resizes its box. Baseline
+  `KLOOP_NO_ANIM`, the banner's build stamp pinned to `v0.0.0 (0000000)` by
+  `KLOOP_VERSION` so a commit does not move every frame, and the workspace placed
+  under `$HOME` so the banner prints a fixed-width `~/workspace` instead of a temp
+  path that resizes its box. Baseline
   frames are taken with `wait_for_quiescent`, which waits for the screen to stop
   being written to rather than for one string to appear; the point assertions
   stay, because they say what the test means and the baseline says what the

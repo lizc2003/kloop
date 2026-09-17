@@ -278,6 +278,25 @@ pub(crate) fn help_text() -> &'static str {
      Cwd selects the workspace; it is never an automatic config source.\n"
 }
 
+/// What this build calls itself, for the session banner: the crate version plus
+/// the commit `build.rs` stamped in (`v0.1.0 (2319ea3)`). Built outside a
+/// checkout there is no commit and it degrades to `v0.1.0`. `KLOOP_VERSION`
+/// replaces the whole string — the PTY screen baselines pin it, so a checked-in
+/// frame does not move with every commit.
+pub(crate) fn version_string() -> String {
+    match std::env::var("KLOOP_VERSION") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => format_version(env!("CARGO_PKG_VERSION"), option_env!("KLOOP_BUILD_SHA")),
+    }
+}
+
+fn format_version(pkg: &str, sha: Option<&str>) -> String {
+    match sha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sha) => format!("v{pkg} ({sha})"),
+        None => format!("v{pkg}"),
+    }
+}
+
 fn session_line(path: &Path) -> String {
     let id = session_id_of(path);
     let origin = match session_origin(path) {
@@ -488,6 +507,16 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The build stamp (plan 161): the commit rides in parentheses after the
+    /// crate version, and a build with no commit to name says just the version
+    /// instead of `v0.1.0 ()`.
+    #[test]
+    fn version_names_the_commit_only_when_the_build_stamped_one() {
+        assert_eq!(format_version("0.1.0", Some("2319ea3")), "v0.1.0 (2319ea3)");
+        assert_eq!(format_version("0.1.0", None), "v0.1.0");
+        assert_eq!(format_version("0.1.0", Some("  ")), "v0.1.0");
     }
 
     /// The all-false / all-None default, so each case below asserts the whole
