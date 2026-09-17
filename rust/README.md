@@ -684,11 +684,18 @@ the input — while every finalized cell scrolls up into the terminal's **native
 scrollback**, so the mouse wheel, text selection, and Cmd+F reach history
 directly (the UI keeps no scroll of its own). Tool calls render as
 human-readable rows (plan 38 slice 2, `crates/tui/src/toolrow.rs`): a
-status-marked verb and its key argument — `● Bash $ ls -la` (running, cyan),
-`✓ Read src/main.rs`, `✓ Grep TODO in src`, `✗ Write notes.txt` (failed, red),
-`✓ Enter worktree feature-x`, an MCP `server__tool` verbatim — over a few lines
-of the result indented under a `└` gutter (double-limited by lines and chars,
-control chars sanitized, the rest left in history/offload). Every built-in has a
+status-marked verb and its key argument — `● Bash` (running, cyan) over the
+model's one-line summary, `✓ Read src/main.rs`, `✓ Grep TODO in src`,
+`✗ Write notes.txt` (failed, red), `✓ Enter worktree feature-x`, an MCP
+`server__tool` verbatim — over a few lines of the result indented under a `└`
+gutter (double-limited by lines and chars, control chars sanitized, the rest
+left in history/offload). A shell tool (`bash`, `powershell`) puts the command
+it runs on a **row of its own** between the two (`  $ ls -la`, `  PS> …`): on
+the header it shared the width with the model's summary and lost its tail to
+truncation exactly when it was longest. Whitespace inside a row (a heredoc's
+newlines, a tab) collapses to a space rather than vanishing and gluing the two
+sides together. A call whose arguments are still streaming has no command yet,
+so it gets no command row. Every built-in has a
 row of its own; the raw-name-plus-JSON fallback is for source tools, and a guard
 test over the catalog keeps it that way. `edit_file` shows a one-line `- old` /
 `+ new` diff from its input instead. Permission prompts, model questions, and the
@@ -825,8 +832,10 @@ Streaming deltas are drained in batches so a burst of tokens redraws once, not
 per token.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
-(see below); **Esc** interrupts the running turn and clears the input line when
-idle; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
+(see below); **Esc** clears the composer, and only reaches the running turn once
+there is nothing left to clear (a half-written message survives a press aimed at
+the turn, at the price of a second press — an attached image counts as a draft);
+the status line and footer name whichever of the two the next press will do; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
 to exit" hint, the second quits, any other key disarms) — the same everywhere,
 including inside a choice panel, so it is the single quit path (Ctrl+D is
 disabled); Ctrl+R (idle) opens the rewind picker (see
@@ -859,7 +868,9 @@ highlighted completion.
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,
 history recall, draft restore, and steering expand that exact payload once, while
-identical text typed by the user remains literal. Bracketed paste canonicalizes
+identical text typed by the user remains literal. The label is a **composer**
+affordance only — once the turn is sent, the transcript echoes the expanded text
+in full (the same text a resumed session replays out of history). Bracketed paste canonicalizes
 CRLF and CR line endings to the Composer's LF logical newline at the TUI ingress;
 other characters, surrounding spaces, and trailing newlines are preserved (no
 trim). The cursor cannot enter an atom; adjacent Backspace/Delete removes it
@@ -895,7 +906,9 @@ another position are rejected instead of editing the wrong token.
 
 While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
-"shimmer" light band sweeping the verb, and `(elapsed · esc to interrupt)`. The
+"shimmer" light band sweeping the verb, and `(elapsed · esc to interrupt)` —
+or `(elapsed · esc to clear input)` while a draft sits in the composer, since
+that is what the key would actually do. The
 **footer** carries the mode badge and key hints on the left and the **system
 status** — model name and a context gauge (`model · N% ctx`, refreshed at the end
 of every agent round from the same usage accounting `/cost` reads, so a
@@ -3404,7 +3417,8 @@ KLOOP_SANDBOX=off cargo run                        # remove OS fs/network sandbo
 ```
 
 Interrupting a running turn patches history so it stays legal either way. In
-the TUI, Esc interrupts and Ctrl+C (two taps) exits (see the TUI section). In
+the TUI, Esc interrupts once the composer is empty and Ctrl+C (two taps) exits
+(see the TUI section). In
 `--plain`, one Ctrl+C cancels any running operation, waits for that repair, and
 then exits; `exit` and `/exit` also quit. As in a conventional line-based REPL,
 an actual stdin EOF ends input, but it is not advertised as an application key.

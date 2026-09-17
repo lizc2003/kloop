@@ -507,6 +507,35 @@ async fn one_tool_call_and_its_result_fill_the_screen() -> Result<()> {
     Ok(())
 }
 
+/// A shell call, whose command gets a row of its own under the header (plan
+/// 160). The summary and the command are each long enough that the old
+/// one-row header would have truncated the command away entirely; `seq` is on
+/// the read-only argv list, so the gate lets the turn run without a prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_command_gets_a_row_of_its_own() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![
+        sse_tool_call(
+            "call-bash-1",
+            "bash",
+            &serde_json::json!({
+                "command": "seq 1 3 && echo alpha && echo beta && echo gamma",
+                "description": "Check that the counter and the three echoes agree",
+            }),
+        ),
+        sse_text("They agree. BASHROW_TAIL."),
+    ])
+    .await;
+    let mut harness = spawn(&fixture, 24, 80)?;
+    wait_for_boot(&mut harness)?;
+
+    let screen = one_turn(&mut harness, "count to three", "BASHROW_TAIL")?;
+    insta::assert_snapshot!("bash_command_row_24x80", screen);
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
 /// The route picker's last stage, whole screen. Which levels it lists is unit
 /// tested; what seven rows of label-plus-detail actually look like stacked above
 /// the composer — and that `unset` and `none` read as the different things they

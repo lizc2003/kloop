@@ -800,10 +800,21 @@ pub fn has_activity_line(app: &App) -> bool {
     app.ctrl_c_exit_armed || (app.running && !app.interaction_active())
 }
 
+/// What Esc does from here, so the two hint lines never advertise a key that
+/// would do something else: a draft in the composer is cleared first, and only
+/// an empty composer lets Esc reach the running turn.
+fn esc_action(app: &App) -> &'static str {
+    if app.composer.is_blank() {
+        "esc to interrupt"
+    } else {
+        "esc to clear input"
+    }
+}
+
 /// The dynamic "what's happening now" line, shown at the BOTTOM of the
 /// transcript (just above the composer) where it is most prominent — the eye
 /// lands here, not on the footer (plan 38 slice 5). Running: an animated spinner
-/// + a shimmering verb + `(elapsed · esc to interrupt)`. `None` when idle.
+/// + a shimmering verb + `(elapsed · what esc does)`. `None` when idle.
 pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
     if app.ctrl_c_exit_armed {
         // Unmissable, right above the composer where Ctrl+C was pressed.
@@ -823,8 +834,9 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
     let secs = hud.elapsed.map(|d| d.as_secs()).unwrap_or(0);
     spans.push(Span::styled(
         format!(
-            " ({} · esc to interrupt)",
-            crate::anim::format_elapsed(secs)
+            " ({} · {})",
+            crate::anim::format_elapsed(secs),
+            esc_action(app)
         ),
         DIM,
     ));
@@ -848,7 +860,7 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     // the hints stay dim so only the badge draws the eye.
     let badge = format!("[{}]  ", app.mode.label());
     let mut hints = if app.running {
-        "esc to interrupt · Ctrl+C to exit".to_string()
+        format!("{} · Ctrl+C to exit", esc_action(app))
     } else {
         "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
     };
@@ -2576,8 +2588,11 @@ mod tests {
                 "> do the thing",
                 // Human-readable tool rows (plan 38 slice 2): verb + argument,
                 // status-marked (● running / ✓ ok / ✗ fail).
-                "✓ Bash $ ls",
-                "● Bash $ ",
+                "✓ Bash",
+                "  $ ls",
+                // Arguments still streaming: no command row at all, rather than
+                // an empty one.
+                "● Bash",
                 "[compacting history]",
                 "done. all good",
             ]
@@ -2955,7 +2970,7 @@ mod tests {
     }
 
     #[test]
-    fn long_tool_rows_truncate_the_header_to_one_line() {
+    fn long_tool_rows_truncate_to_one_line_each() {
         let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(100));
         let cells = vec![Cell::Tool {
             name: "bash".into(),
@@ -2964,9 +2979,10 @@ mod tests {
             output: None,
         }];
         let lines = transcript_lines(&cells, 20);
-        assert_eq!(lines.len(), 1);
-        let text = line_text(&lines[0]);
-        assert!(text.starts_with("✗ Bash $ x"), "{text}");
+        assert_eq!(lines.len(), 2, "header + command, neither of them wrapping");
+        assert_eq!(line_text(&lines[0]), "✗ Bash");
+        let text = line_text(&lines[1]);
+        assert!(text.starts_with("  $ x"), "{text}");
         assert!(text.ends_with('…'));
     }
 }

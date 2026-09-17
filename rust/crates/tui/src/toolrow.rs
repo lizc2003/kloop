@@ -1,9 +1,10 @@
 //! Human-readable tool rows for the transcript (plan 38 slice 2).
 //!
-//! A tool call renders as a status-marked header — `● Bash $ ls -la`,
-//! `Read src/main.rs`, `Write notes.txt (12 lines)`, `Grep TODO in src`, an MCP
-//! `server__tool` verbatim — over a preview of its result indented under a `└`
-//! gutter (double-limited by lines and chars, the rest left in the session).
+//! A tool call renders as a status-marked header — `● Bash`, `Read src/main.rs`,
+//! `Write notes.txt (12 lines)`, `Grep TODO in src`, an MCP `server__tool`
+//! verbatim — over a preview of its result indented under a `└` gutter
+//! (double-limited by lines and chars, the rest left in the session). A shell
+//! tool puts the command it runs on a row of its own between the two.
 //! `edit_file` shows a one-line `- old` / `+ new` diff from its input instead.
 //!
 //! Pure formatting from `(name, input-json, status, output)` to styled lines, so
@@ -30,6 +31,9 @@ const PREVIEW_MAX_CHARS: usize = 400;
 /// Left gutter width so the preview lines up under the header's label column.
 const GUTTER: &str = "  └ ";
 const GUTTER_CONT: &str = "    ";
+/// The shell-command row sits between the header and the preview, its prompt in
+/// the `└` column so a screen of shell calls reads as one list.
+const COMMAND_GUTTER: &str = "  ";
 
 /// The full display of one tool cell: the header row plus its preview/diff.
 pub fn tool_cell_lines(
@@ -41,6 +45,11 @@ pub fn tool_cell_lines(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines = vec![header_line(name, input, status, width)];
+    // The command a shell tool runs gets a row of its own: sharing the header
+    // with the model's summary truncated it away exactly when it was longest.
+    if let Some(command) = tool_command(name, input) {
+        lines.push(command_line(&command, width));
+    }
     // An edit shows the change it is making (from its input); every other tool
     // previews its result.
     if name == "edit_file" {
@@ -89,23 +98,10 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match name {
-        "bash" => {
-            let cmd = s("command");
-            let bg = v
-                .get("background")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let background = if bg { "  (background)" } else { "" };
-            // The model's own one-line summary leads, so a row truncated to a
-            // narrow terminal still says what the call is for; the command
-            // itself follows it and is what shows when there is no summary.
-            let detail = match s("description") {
-                summary if summary.is_empty() => format!("$ {cmd}{background}"),
-                summary => format!("{summary}  $ {cmd}{background}"),
-            };
-            ("Bash".into(), detail)
-        }
-        "powershell" => ("PowerShell".into(), format!("PS> {}", s("command"))),
+        // The header carries the model's one-line summary (empty is fine); the
+        // command itself is [`tool_command`]'s row underneath.
+        "bash" => ("Bash".into(), s("description")),
+        "powershell" => ("PowerShell".into(), String::new()),
         "read_file" => ("Read".into(), path_of(&v)),
         "write_file" => {
             let n = v
@@ -245,15 +241,51 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
     }
 }
 
+/// The shell line a `bash` / `powershell` call runs, prompt included; `None` for
+/// every other tool. Kept out of [`tool_label`] so the command owns a full-width
+/// row of its own instead of competing with the summary for the header.
+fn tool_command(name: &str, input: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    // A call still streaming its arguments has no command yet; an empty `$ ` row
+    // would be a row that says nothing.
+    let command = v.get("command").and_then(Value::as_str)?;
+    match name {
+        "bash" => {
+            let background = if v
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "  (background)"
+            } else {
+                ""
+            };
+            Some(format!("$ {command}{background}"))
+        }
+        "powershell" => Some(format!("PS> {command}")),
+        _ => None,
+    }
+}
+
+/// The shell-command row: dim, indented to the preview's gutter, one line.
+fn command_line(command: &str, width: usize) -> Line<'static> {
+    let content_w = width.saturating_sub(display_width(COMMAND_GUTTER)).max(1);
+    Line::from(vec![
+        Span::raw(COMMAND_GUTTER.to_string()),
+        Span::styled(truncate(&clean(command), content_w), DIM),
+    ])
+}
+
 /// A one-line `verb detail` preview of a tool call, for the folded sub-agent row
-/// (which shows the latest call inline rather than a full cell).
+/// (which shows the latest call inline rather than a full cell). One row is all
+/// there is here, so a shell command joins the line instead of taking its own.
 pub fn tool_preview(name: &str, input: &str) -> String {
     let (verb, detail) = tool_label(name, input);
-    if detail.is_empty() {
-        verb
-    } else {
-        format!("{verb} {detail}")
-    }
+    [verb, detail, tool_command(name, input).unwrap_or_default()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The `- old` / `+ new` first-line diff of an edit, from its input.
@@ -350,12 +382,14 @@ fn first_line(text: &str) -> &str {
     text.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
 }
 
-/// Make a snippet safe for a single transcript row: tabs (read_file numbers its
-/// lines `{n}\t{line}`, and code indents with them) collapse to a space instead
-/// of ratatui's zero-width overlap, and any other control char is dropped.
+/// Make a snippet safe for a single transcript row: every whitespace char (tabs,
+/// which `read_file` numbers its lines with and code indents with; newlines,
+/// which a heredoc command is full of) collapses to a space instead of ratatui's
+/// zero-width overlap or — for a newline — silently gluing the two sides
+/// together. Any other control char is dropped.
 fn clean(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '\t' { ' ' } else { c })
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !c.is_control())
         .collect()
 }
@@ -380,7 +414,7 @@ mod tests {
             None,
             40,
         );
-        assert_eq!(texts(&lines), vec!["● Bash $ ls -la"]);
+        assert_eq!(texts(&lines), vec!["● Bash", "  $ ls -la"]);
         // Running mark is cyan (status indicator), verb bold.
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
         assert!(
@@ -400,7 +434,10 @@ mod tests {
             None,
             60,
         );
-        assert_eq!(texts(&lines), vec!["● PowerShell PS> Write-Output '你好'"]);
+        assert_eq!(
+            texts(&lines),
+            vec!["● PowerShell", "  PS> Write-Output '你好'"]
+        );
     }
 
     #[test]
@@ -412,14 +449,17 @@ mod tests {
             Some("bg-1 started"),
             60,
         );
-        assert_eq!(text(&lines[0]), "✓ Bash $ sleep 9  (background)");
+        assert_eq!(
+            texts(&lines[..2]),
+            vec!["✓ Bash", "  $ sleep 9  (background)"]
+        );
     }
 
-    /// A raw `find … -exec` is what the user must otherwise parse; when the
-    /// model wrote a summary the row leads with it and keeps the command
-    /// after it. Without one the row is exactly what it always was.
+    /// A raw `find … -exec` is what the user must otherwise parse; the model's
+    /// summary heads the row and the command keeps a full-width row of its own
+    /// underneath, described or not.
     #[test]
-    fn bash_row_leads_with_the_description_when_there_is_one() {
+    fn bash_row_leads_with_the_description_and_keeps_the_command_below() {
         let described = tool_cell_lines(
             "bash",
             r#"{"command":"find . -name '*.tmp' -delete","description":"Delete temp files"}"#,
@@ -428,8 +468,11 @@ mod tests {
             80,
         );
         assert_eq!(
-            text(&described[0]),
-            "✓ Bash Delete temp files  $ find . -name '*.tmp' -delete"
+            texts(&described),
+            vec![
+                "✓ Bash Delete temp files",
+                "  $ find . -name '*.tmp' -delete"
+            ]
         );
 
         let background = tool_cell_lines(
@@ -440,8 +483,8 @@ mod tests {
             80,
         );
         assert_eq!(
-            text(&background[0]),
-            "✓ Bash Wait a bit  $ sleep 9  (background)"
+            texts(&background),
+            vec!["✓ Bash Wait a bit", "  $ sleep 9  (background)"]
         );
 
         let plain = tool_cell_lines(
@@ -451,7 +494,49 @@ mod tests {
             None,
             80,
         );
-        assert_eq!(text(&plain[0]), "✓ Bash $ find . -name '*.tmp' -delete");
+        assert_eq!(
+            texts(&plain),
+            vec!["✓ Bash", "  $ find . -name '*.tmp' -delete"]
+        );
+    }
+
+    /// The long command used to lose its tail to the header's truncation and its
+    /// newlines to `clean`, which glued `EOF` onto the next line's first word.
+    /// Now it owns the full width, and a newline reads as the space it is.
+    #[test]
+    fn a_heredoc_command_keeps_full_width_and_does_not_glue_its_lines() {
+        let lines = tool_cell_lines(
+            "bash",
+            r#"{"command":"cat > go.mod <<'EOF'\nmodule check451b\nEOF","description":"Experiment: ClientCode survives the 451 rename"}"#,
+            ToolStatus::Ok,
+            None,
+            60,
+        );
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "✓ Bash Experiment: ClientCode survives the 451 rename",
+                "  $ cat > go.mod <<'EOF' module check451b EOF",
+            ]
+        );
+    }
+
+    /// The folded sub-agent row has one line for everything, so there the
+    /// command joins the summary instead of taking a row of its own.
+    #[test]
+    fn folded_preview_keeps_summary_and_command_on_one_line() {
+        assert_eq!(
+            tool_preview(
+                "bash",
+                r#"{"command":"sleep 9","background":true,"description":"Wait a bit"}"#
+            ),
+            "Bash Wait a bit $ sleep 9  (background)"
+        );
+        assert_eq!(tool_preview("bash", r#"{"command":"ls"}"#), "Bash $ ls");
+        assert_eq!(
+            tool_preview("read_file", r#"{"path":"src/main.rs"}"#),
+            "Read src/main.rs"
+        );
     }
 
     #[test]
@@ -515,10 +600,10 @@ mod tests {
             Some(&out),
             40,
         );
-        // Header + PREVIEW_MAX_LINES preview + a "more" hint.
-        assert_eq!(text(&lines[0]), "✓ Bash $ seq 20");
-        assert_eq!(text(&lines[1]), "  └ line 1");
-        assert_eq!(lines.len(), 1 + PREVIEW_MAX_LINES + 1);
+        // Header + command + PREVIEW_MAX_LINES preview + a "more" hint.
+        assert_eq!(texts(&lines[..2]), vec!["✓ Bash", "  $ seq 20"]);
+        assert_eq!(text(&lines[2]), "  └ line 1");
+        assert_eq!(lines.len(), 2 + PREVIEW_MAX_LINES + 1);
         assert_eq!(text(lines.last().unwrap()), "    … full result in session");
     }
 
@@ -531,10 +616,10 @@ mod tests {
             Some("command failed: exit 1"),
             40,
         );
-        assert_eq!(text(&lines[0]), "✗ Bash $ false");
-        assert_eq!(text(&lines[1]), "  └ command failed: exit 1");
+        assert_eq!(texts(&lines[..2]), vec!["✗ Bash", "  $ false"]);
+        assert_eq!(text(&lines[2]), "  └ command failed: exit 1");
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
-        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Red));
+        assert_eq!(lines[2].spans[1].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -546,7 +631,11 @@ mod tests {
             Some("   \n"),
             40,
         );
-        assert_eq!(lines.len(), 1, "blank output shows no preview rows");
+        assert_eq!(
+            texts(&lines),
+            vec!["✓ Bash", "  $ true"],
+            "blank output shows no preview rows"
+        );
     }
 
     #[test]
@@ -750,8 +839,9 @@ mod tests {
             None,
             20,
         );
-        let t = text(&lines[0]);
-        assert!(t.starts_with("✓ Bash $ echo"), "{t}");
+        let t = text(&lines[1]);
+        assert!(t.starts_with("  $ echo"), "{t}");
         assert!(t.ends_with('…'), "truncated: {t}");
+        assert_eq!(display_width(&t), 20, "the command row fills the width");
     }
 }

@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: screen
+---
+[24x80 cursor=21,2]
+
+╭───────────────────────╮
+│ >_ kloop              │
+│ model   tui-pty-model │
+│ cwd     ~/workspace   │
+│ mode    manual        │
+╰───────────────────────╯
+
+> count to three
+✓ Bash Check that the counter and the three echoes agree
+  $ seq 1 3 && echo alpha && echo beta && echo gamma
+  └ 1
+    2
+    3
+    alpha
+    beta
+    … full result in session
+They agree. BASHROW_TAIL.
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

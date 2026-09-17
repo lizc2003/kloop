@@ -1326,14 +1326,18 @@ impl App {
             return Command::PasteClipboardImage;
         }
         match (key.code, ctrl) {
-            // Esc interrupts a running turn (CC parity, the advertised key);
-            // idle it clears the composer. A confirm popup / rewind picker
-            // capture Esc before this (they return early at the top of on_key).
+            // Esc clears what the user typed, and only reaches the running turn
+            // once there is nothing left to clear — a draft is work, and losing
+            // it to a keypress aimed at the turn is the expensive mistake of the
+            // two. A confirm popup / rewind picker capture Esc before this (they
+            // return early at the top of on_key); an open completion menu is
+            // closed by `after_edit` below.
             (KeyCode::Esc, _) => {
-                if self.running {
+                if !self.composer.is_blank() {
+                    self.composer.clear();
+                } else if self.running {
                     return Command::Interrupt;
                 }
-                self.composer.clear();
             }
             (KeyCode::Char('r'), true) => {
                 // Rewind (plan 18) is idle-only: a running turn owns History, so
@@ -1475,9 +1479,11 @@ impl App {
         if self.composer.is_blank() {
             return Command::None;
         }
-        // The compact display text (placeholders intact) — shown in the
-        // transcript and used for slash detection; the submission carries the
-        // expanded text.
+        // The compact display text (placeholders intact) — what slash detection
+        // reads, and the echo for a slash command. Every other transcript cell
+        // echoes the EXPANDED text: a `[Pasted #1: …]` label is a composer
+        // affordance, and once the turn is sent the transcript has to show what
+        // was actually sent (which is also what a resumed session replays).
         let display = self.composer.text().trim().to_string();
         // A slash command runs only when idle; it records no user message, but
         // it is echoed like one: `/compact` can work for a minute, and without
@@ -1499,7 +1505,7 @@ impl App {
             // the image attached. No new turn starts.
             return match self.composer.submit_text() {
                 Some(text) => {
-                    self.cells.push(Cell::User(display));
+                    self.cells.push(Cell::User(text.trim().to_string()));
                     Command::Steer(text)
                 }
                 None => Command::None,
@@ -1513,8 +1519,9 @@ impl App {
             .collect();
         let sub = self.composer.submit().expect("checked not blank");
         self.submit_images = sub.images;
-        if !display.is_empty() {
-            self.cells.push(Cell::User(display));
+        let echo = sub.text.trim().to_string();
+        if !echo.is_empty() {
+            self.cells.push(Cell::User(echo));
         }
         // Each attached image replays as a placeholder line, like a resumed one.
         for label in &labels {
@@ -3367,18 +3374,64 @@ mod tests {
         assert_eq!(app.composer.text(), "v");
     }
 
-    /// Esc interrupts a running turn (the advertised key) and clears the input
-    /// line when idle.
+    /// Esc clears the draft first and only reaches the running turn once the
+    /// composer is empty — a half-written message survives a press aimed at the
+    /// turn, at the price of a second press.
     #[test]
-    fn esc_interrupts_running_and_clears_input_idle() {
+    fn esc_clears_the_draft_before_it_interrupts() {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
         // Idle: Esc clears the line.
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert_eq!(app.composer.text(), "");
-        // Running: Esc interrupts.
+        // Running with a draft: the first Esc only clears it.
         app.running = true;
+        type_str(&mut app, "next turn's message");
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.composer.text(), "");
+        // Empty: Esc interrupts.
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
+        // An attached image is a draft too, so it is what the first Esc drops.
+        app.attach_image(
+            "shot.png".into(),
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "aGk=".into(),
+                },
+            },
+        );
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert!(app.composer.attachments().is_empty());
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
+    }
+
+    /// A large paste is a `[Pasted #1: …]` label while it sits in the composer,
+    /// but the transcript echoes what was actually sent — the same text a
+    /// resumed session replays from history.
+    #[test]
+    fn a_pasted_block_is_echoed_in_full_not_as_its_placeholder() {
+        let pasted = "line\n".repeat(20);
+        let mut app = App::new("s".into());
+        type_str(&mut app, "look at ");
+        app.paste_text(&pasted);
+        assert!(
+            app.composer.text().contains("[Pasted #1:"),
+            "the composer still shows the compact label: {:?}",
+            app.composer.text()
+        );
+
+        let expanded = format!("look at {pasted}");
+        assert_eq!(app.on_enter(), Command::Submit(expanded.clone()));
+        assert_eq!(app.cells, vec![Cell::User(expanded.trim().to_string())]);
+
+        // Steering echoes it in full too.
+        app.paste_text(&pasted);
+        assert_eq!(app.on_enter(), Command::Steer(pasted.clone()));
+        assert_eq!(
+            app.cells.last(),
+            Some(&Cell::User(pasted.trim().to_string()))
+        );
     }
 
     /// Ctrl+C is the same two-tap quit inside a popup as in the main input —
