@@ -1,6 +1,10 @@
 # Plan 67 — `read_file` 纯 Rust PDF 分页读取
 
-> 状态：⏸ 已暂停（2026-08-07；接入前先评估 Hayro 对 release 可执行文件体积的影响）
+> 状态：**⛔ 已停（2026-09-17）,不要实施。**用户判「目前不需要支持 PDF」。
+> 理由与 2026-09-17 重新调研出的事实见文末「⛔ 停」一节——**那一节改变了本计划的技术前提**,
+> 重启时先读它再读上面的设计。
+>
+> 此前状态：⏸ 已暂停（2026-08-07；接入前先评估 Hayro 对 release 可执行文件体积的影响）
 >
 > 依赖：Plan 29（canonical image blocks 与三条 provider rail）、Plan 49 / Plan 61（descriptor-bound Read 与 staged file observation）、Plan 57（多块媒体结果预算）
 
@@ -153,3 +157,103 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 - 不改变 protocol、rollout 格式或三条 provider rail 的媒体模型。
 - `spawn_blocking`、semaphore、尺寸 / 输出预算和 `catch_unwind` 只限制 kloop 可控的并发与结果规模。
 - Hayro 仍在主进程解析不可信压缩流，缺少可取消的 CPU / 内存上限，因此不能宣称形成了恶意 PDF 炸弹的隔离边界；若将来需要该承诺，应另做带 OS CPU / 内存限制的隔离 worker。
+
+## ⛔ 停(2026-09-17)
+
+用户判「目前不需要支持 PDF」,本计划到此停,一行代码没写,`tools/fs.rs` 的拒绝点原样保留。
+`docs/capability-report.md` 第 85 行的触发条件写的就是"真实 PDF 需求",这次的答案是**没有**。
+
+停之前照 `docs/plan/49-file-search-parity.md:185` 重新查了一轮(那条裁决是**条件式**的:
+"PDF 只有在精确 fixture 和 kloop canonical provider wire 都可表达时才对齐")。
+结论是**两个条件今天都已成立**,而本计划第二节和「非目标」是在它们都不成立的前提下写的。
+下面是查清的事实,重启时不必重查。
+
+### 一、本计划选的路线(乙)不再是唯一可行的那条
+
+第二节选纯 Rust 渲染成 PNG、「非目标」里明写"不做 provider document blocks",
+那是 2026-08-07 的信息。2026-09-17 复核:
+
+- **Anthropic 官方文档(Handle tool calls)明写** `tool_result` 的 `content` 可以用
+  `text` / `image` / **`document`** / `search_result` 四种。也就是说**整份 PDF 字节可以直接放进
+  kloop 现有的 `ToolResultContent::Blocks`**,既不需要新造"附带一条 user message"的机制,
+  也不需要渲染器。
+- 三条 rail 的落地形状都查到了:
+
+  | rail | 形状 |
+  |---|---|
+  | Anthropic(`provider/src/anthropic.rs:64` `messages_value`,serde 原样序列化) | `{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":…}}` |
+  | OpenAI chat/completions(`openai.rs:30` `image_url_part` 的邻居) | `{"type":"file","file":{"filename":…,"file_data":"data:application/pdf;base64,…"}}`,不支持 `detail`;`tool` 角色不能带文件,要像图片一样挪到尾随 user message |
+  | OpenAI Responses(`responses.rs:38` `input_image_item` 的邻居) | `{"type":"input_file","filename":…,"file_data":"data:application/pdf;base64,…"}` |
+
+- 规范上限:Anthropic 请求总体 **32 MB**、**每请求 600 页**(上下文窗口不足 1M 时 **100 页**),
+  标准 PDF 不能加密;OpenAI **单文件 < 50 MB、一次请求所有文件合计 50 MB**,需 vision 模型。
+  两家都是服务端把**每页转成图并把该页抽出的文本一并喂给模型**——
+  所以走 document 这条,模型拿到的东西**严格优于**本地渲染出来的纯像素。
+
+于是路线不再是一条而是两条,**重启时要先重选**:
+
+- **(甲) document wire + 切页**:给 `ContentBlock` 加 `Document` 变体,三条 rail 各译一次;
+  `pages` 用一个纯 Rust 切页依赖(`lopdf` 一类,开工时确认)把选中页切成一份更小的 PDF。
+  保住文本层,不引渲染器,Windows 面不掉。代价:多一个依赖;且要为 OpenAI-compat 那条
+  rail(base_url 可任意指,`cli/src/provider_config.rs:43`)定一条裁决——对端不认
+  `type:"file"` 时报不支持还是降级。
+- **(乙) 本计划原方案**:纯 Rust 渲染 PNG。零 wire 改动,三条 rail 今天就能走,
+  但丢掉文本层、每页按图计费,并且**暂停原因(Hayro 对 release 体积的影响)依然没评估**。
+
+2026-09-17 的推荐是**甲**:精确 fixture 只覆盖它(见下);它保住文本层;它不引新的渲染依赖。
+
+### 二、精确 fixture 一直都在,而且判的是整份那条
+
+`refs/claude-code-2.1.220/fixtures/normalized/read-special-contract-1.json`(profile `scripted-allow-cli`):
+
+- `toolu_plan49_read_pdf_default` → tool result 只有一行
+  `"PDF file read: <WORKSPACE>/special/sample.pdf (592 bytes)"`,外加一条
+  `media_type: "application/pdf"` 的 document block。
+- `toolu_plan49_read_pdf_page` → 采集机上没装 pdftoppm,**录到的是那条 "pdftoppm is not installed" 错误**。
+
+即:plan 49 的"精确 fixture"条件,**整份那条满足,分页那条只有一条环境缺失的报错**。
+
+### 三、cc 的 PDF 有两条路,按 `pages` 分岔(别按单条描述设计)
+
+`refs/claude-code/packages/builtin-tools/src/tools/FileReadTool/FileReadTool.ts:902-1022`:
+
+| 入参 | 走哪条 | 送给模型的是什么 |
+|---|---|---|
+| 给了 `pages` | `extractPDFPages`(`src/utils/pdf.ts`)→ `pdftoppm -jpeg -r 100` → 每张过 `maybeResizeAndDownsampleImageBuffer` | 一组 JPEG image block,挂在一条附加 user message 上(`isMeta`) |
+| 没给 `pages` | `getPDFPageCount`(`pdfinfo`)守 10 页 → `readPDF` | 整份 PDF 字节,`{type:"document",…,"media_type":"application/pdf"}`,tool result 本身只有一行 `PDF file read: <path> (<size>)` |
+
+**分页那条是渲染器,不是切页器——cc 从不发一份"只含选中页的小 PDF"。**
+
+常量(`refs/claude-code/src/constants/apiLimits.ts`,行号已复核):`:54` `PDF_TARGET_RAW_SIZE = 20 MB`、
+`:59` `API_PDF_MAX_PAGES = 100`、`:65` `PDF_EXTRACT_SIZE_THRESHOLD = 3 MB`、
+`:71` `PDF_MAX_EXTRACT_SIZE = 100 MB`、`:77` `PDF_MAX_PAGES_PER_READ = 20`、
+`:83` `PDF_AT_MENTION_INLINE_THRESHOLD = 10`;`src/utils/pdfUtils.ts:59-61` 的 `isPDFSupported()`
+就一句「模型名里不含 `claude-3-haiku`」——**它依赖的是模型原生读 PDF,不是自己 OCR**。
+
+一个反常值得记:`FileReadTool.ts:967-985` 的 `shouldExtractPages`(体积 > 3 MB 或模型不支持)
+跑完 `extractPDFPages` 之后**只打了 telemetry,结果没被用**;模型支持时仍落到 `readPDF` 整份发。
+即"3 MB 以上改走渲染"那句注释在这个版本里对第一方**不成立**。照注释抄会抄错。
+
+### 四、kloop 现状与重启时还欠的四件
+
+现状:`rust/crates/core/src/tools/fs.rs:400` 按 `%PDF-` 魔数**或** `.pdf` 扩展名拒绝,
+`:406` 的错误信息是 "use a PDF extraction tool or convert selected pages to images first";
+守门测试是 `fs.rs:2085` `read_empty_pdf_and_character_budget_are_explicit`(`:2107` 断言那句话)。
+**那句"convert selected pages to images first"是 kloop 自己给用户的绕行建议,不是任何参考实现的做法**,
+设计新形状时不要拿它当依据。
+
+重启时还欠:
+
+1. **先重选路线**(甲/乙),别默认沿用本计划第二节。
+2. 走甲的话:**切页依赖选型**(纯 Rust、能按页子集重写 PDF、许可证可接受);
+   走乙的话:**Hayro 对 release 体积的影响仍然没评估**,那是 2026-08-07 暂停的原因。
+3. **OpenAI-compat rail 的裁决**:对端不认 `type:"file"` 时的行为,得先问用户。
+4. **parity corpus 两行要改,而且是生成物**:`refs/claude-code-2.1.220/tool-matrix.json:121` 和 `:527`
+   的 notes 由 `build_matrix.py:404` / `:631` 生成,`verify.py` 有 `verify_matrix_is_generated()`,
+   **手改 JSON 会被拦下**,要改生成器再重跑。`:527` 现在的理由原文是 "rather than granting write
+   authority over bytes the model did not see exactly or adding a PDF wire"——加了 wire 之后
+   这半句就不成立了。验收要把 **`verify.py --corpus-only` 跑绿列进去,而且早跑**(它会
+   `subprocess` 拉 cargo,不是秒级);教训 139/140 记着这道门红了将近四周没人发现。
+   另外 `static-evidence.jsonl` 的 `kloop-read-tests` 按**行号区间**锚在 `tools/fs.rs`,
+   `verify_repo_location`(`verify.py:7466`)只校验区间落在文件内,fs.rs 变长不会红,
+   但区间指向的内容会悄悄漂移,改完顺手核一眼。

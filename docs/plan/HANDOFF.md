@@ -32,15 +32,20 @@ ancestor is untouched")说明这个配对是有意的。**唯一值得补的是�
 再说"TUI 测试没有虚拟终端解析"(实际在 `tui_pty_support/mod.rs`,不在 `tui_pty.rs`)。
 接手 149-153 时**不要按文件名推断现状**,plan 里写的行号都是读完文件之后记的。
 
-**这一批之外,2026-09-17 立了又停的一条**:plan 157(`read_file` 的 PDF 原生分页读取)。
-调研做完、路线摆到两条(document wire + 切页 / 渲染成图),问用户走哪条时答案是
-「目前不需要支持 PDF」,**一行代码没写**。查清的事实全留在
-`docs/plan/157-a-pdf-wire-nobody-needs-yet.md`,`docs/capability-report.md` 第 85 行与
-第四节 T0 行已销账。别再重推的一点:**plan 49:185 挂的两个技术前置条件——精确 fixture、
-canonical wire 可表达——今天都已成立**(fixture 一直在
-`refs/claude-code-2.1.220/fixtures/normalized/read-special-contract-1.json`;Anthropic 官方文档
-明写 `tool_result.content` 可以直接放 document block)。拦住它的是第三个从来没写进那条裁决的
-条件:有没有人真的要读 PDF。教训 152。
+**这一批之外,2026-09-17 停掉的一条**:**Plan 67**(`read_file` PDF 分页读取)。
+它 2026-08-07 起就是 ⏸ 暂停,这次重新调研完、路线摆到两条(document wire + 切页 / 渲染成图),
+问用户走哪条时答案是「目前不需要支持 PDF」,**一行代码没写**。查清的事实全部并进
+`docs/plan/67-pdf-native-read.md` 文末的「⛔ 停」一节,`docs/capability-report.md` 第 85 行与
+第四节 T0 行已销账。三点别再重推:
+
+- **plan 49:185 挂的两个技术前置条件——精确 fixture、canonical wire 可表达——今天都已成立**
+  (fixture 一直在 `refs/claude-code-2.1.220/fixtures/normalized/read-special-contract-1.json`;
+  Anthropic 官方文档明写 `tool_result.content` 可以直接放 document block)。拦住它的是第三个
+  从来没写进那条裁决的条件:有没有人真的要读 PDF。
+- 因此 **Plan 67 第二节选的乙路(纯 Rust 渲染 PNG)不再是唯一可行的那条**,重启时先重选路线;
+  它「非目标」里那句"不做 provider document blocks"是 2026-08-07 的信息。
+- **Plan 67 这次差点被重复立一遍**(一份 plan 157 写出来又删掉):它从来没进过本文件,也没进过
+  capability-report——那两处只写"PDF 原生分页读取仍待实现",不点 plan 号。教训 152。
 
 ## 〇之二、上一批:plan 138–142(2026-09-11 排定,已全部完成)
 
@@ -1155,7 +1160,7 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    字节与 cc 一致)在 `hooks.rs:138` 的注释里,它有理由、有出处,和这条泛泛的清单条目不是
    一个量级。
 
-152. 来自 Plan 157(一条还没有人需要的 PDF wire)。**一条"为什么不做"的裁决,原文往往是
+152. 来自 2026-09-17 停掉 PDF 那次(结论并进 Plan 67)。**一条"为什么不做"的裁决,原文往往是
    条件式的,下游转述会把它压成结论式的;引用它之前先回原文,逐个条件重验一遍。**
    plan 49:185 写的是"PDF 只有在精确 fixture 和 kloop canonical provider wire 都可表达时才对齐",
    两个**条件**;而 `capability-report.md` 第 85 行的转述是"不在 canonical provider wire 未统一时
@@ -1170,4 +1175,12 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    会把整个功能的形状判错。** cc 的 Read 读 PDF:没给 `pages` 是把整份 PDF 字节当 document
    block 发,给了 `pages` 是 `pdftoppm` 渲染成 JPEG —— 一条是 wire,一条是渲染器。把两条合起来
    描述成"切页之后原样发 PDF 字节",得到的是一条 cc 里根本不存在的路。**读参考实现时,
-   先在入口处把分支数清点完,再去读任何一条分支的实现。**
+   先在入口处把分支数清点完,再去读任何一条分支的实现。** 同批还有一条,代价最实:
+   **这件事已经有一份 plan(67,⏸ 暂停于 2026-08-07),我没看见,又写了一份 157,发现后删掉。**
+   原因不是 plan 67 藏起来了,是**它只活在 `docs/plan/` 里**:HANDOFF 不收录它,
+   capability-report 的 T0 行和差距表也只写"PDF 原生分页读取仍待实现"、**不点 plan 号**,
+   于是任何人顺着这两份"该做什么"的索引走,都走不到那份已经写好的设计上(只有
+   68/69/70/78/81 这些不相干的 plan 顺带提过"不触碰 Plan 67 的 PDF 工作")。判据两条:
+   **(a) 要立一个新 plan 号之前,先 `ls docs/plan/` 按主题扫一遍文件名,别只信 HANDOFF 的待办表——
+   那张表只覆盖"最近一批",不覆盖历史上暂停的那些;(b) 销账文档里写下一个待办时,
+   如果它已经有 plan 文件,就把 plan 号写进去**,否则这份索引下次还会把同一件事指成"没人做过"。

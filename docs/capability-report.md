@@ -82,7 +82,7 @@ ConPTY,配 `windows-sandbox-service`),它走的是 restricted token 一路;macOS
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | **⛔ Plan 157（2026-09-17）停**：用户判目前不需要。plan 49:185 的两个技术前置条件复核后**都已成立**——精确 fixture 在（`read-special-contract-1` 的整份 PDF 那条）；canonical wire 也能表达（Anthropic 允许 document block 直接进 `tool_result.content`，OpenAI 两条 rail 各有 `file`/`input_file`）。别再从「wire 表达不了」这个过期前提重推，查清的事实在 `docs/plan/157-a-pdf-wire-nobody-needs-yet.md` | 真实 PDF 需求（2026-09-17 问过，答案是没有） |
+| PDF 读入 | 双家(cc Read 判 MIME;codex view_image 族) | **⛔ Plan 67（2026-09-17）停**：用户判目前不需要。plan 49:185 的两个技术前置条件复核后**都已成立**——精确 fixture 在（`read-special-contract-1` 的整份 PDF 那条）；canonical wire 也能表达（Anthropic 允许 document block 直接进 `tool_result.content`，OpenAI 两条 rail 各有 `file`/`input_file`）。别再从「wire 表达不了」这个过期前提重推，查清的事实在 `docs/plan/67-pdf-native-read.md` 文末「⛔ 停」一节 | 真实 PDF 需求（2026-09-17 问过，答案是没有） |
 | 交互 stdin(write_stdin) | codex 单家,cc 明确不做 | **⛔ plan 30 判不做**(REPL 逃逸不过门)；Plan 76 的 TUI PTY 仅为测试 harness，不是 production process channel | 真痛感再重启,连 PTY 一起 |
 | 自动后台化 / stall 探测 | cc 单家 | Plan 51 保留 intentional-diff：精确 gate/时钟未形成可运行 fixture，kloop 坚持显式后台与前台 no-survivor | 新证据或 dogfood 痛感 |
 | model-visible Monitor（逐 stdout 行 / WebSocket frame） | cc 单家、server flag 默认关 | Plan 51 明确不伪造；`tengu_amber_sentinel` 真 profile 不可由本地 harness 权威开启，matrix 保留 `unknown` | 官方暴露该 profile 或出现逐事件 watch 需求 |
@@ -436,7 +436,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 
 ## 四、补齐路线图(按序挑,顺序可按意愿调)
 
-- **T0 下一产品切片**：暂无。原队首 `read_file` PDF 原生分页读取 **⛔ 2026-09-17 停**（用户判「目前不需要支持 PDF」，Plan 157；拦住它的不是技术前置，是需求）。session-scoped Task graph/TUI 已由 **Plan 71–74（2026-08-11）** 完成：五工具、稳定 ID/DAG、无 owner、root-owned/result-only child 边界、revisioned snapshot、atomic rollover/clear fence 与 TUI-only live panel；旧 `todo_write` 已删除。
+- **T0 下一产品切片**：暂无。原队首 `read_file` PDF 原生分页读取 **⛔ 2026-09-17 停**（用户判「目前不需要支持 PDF」，**Plan 67**；拦住它的不是技术前置，是需求）。session-scoped Task graph/TUI 已由 **Plan 71–74（2026-08-11）** 完成：五工具、稳定 ID/DAG、无 owner、root-owned/result-only child 边界、revisioned snapshot、atomic rollover/clear fence 与 TUI-only live panel；旧 `todo_write` 已删除。
 - **T0 架构与 correctness**：Plan 61–66 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，Plan 66 已把后台资源名与 ID 域分开。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
 - **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
