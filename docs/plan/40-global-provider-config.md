@@ -13,6 +13,8 @@
 
 采用 Codex 风格子集，并用 `wire_api` 明确 kloop 的三条 adapter：
 
+> **2026-09-17:下面这段 schema 里 `wire_api` 的 `anthropic` 已更名为 `messages`,其余不变。原因与改动范围见文末「后续变更」。**
+
 ```toml
 model = "gpt-5.6-sol"
 model_provider = "gw_router"
@@ -82,3 +84,39 @@ model = "gpt-5.6-sol" # 可选 profile 默认
 - 本机迁移：`~/.kloop/config.toml` 已原子创建为 0600、`~/.kloop` 为 0700；launcher 不再 source env.local；global env.local 已删除，repo 专项 env.local 改 0600。
 - 验证：fmt、clippy `-D warnings`、全 workspace tests 全绿；clean-env headless 回 `GLOBAL_CONFIG_OK`；app-server `model/list`/`config/read` 回 `openaiResponses / gpt-5.6-sol` 且无 key/base；clean-env 真 TUI 回 `NATIVE_CONFIG` 并干净退出；真实模型读取 fake `.kloop/secret.txt` 得 `BLOCKED`，sentinel 未外泄；真实 seatbelt symlink read-deny 测试通过。
 - 提交：本次（plan 40，见 git log）。
+
+## 后续变更
+
+### ✅ 2026-09-17 — `wire_api = "anthropic"` 更名为 `"messages"`(提交 SHA 以本条所在提交为准)
+
+> 来源:用户让我审他自己的 `~/.kloop/config.toml`,顺着 `wire_api` 有哪些取值问到命名,
+> 原话「是不是叫 messages, chatcompletions 更好」。拍板:改 `anthropic` → `messages`,
+> `chat`/`responses` 不动。
+
+**为什么改。** 三个取值本来混着两个维度:`anthropic` 是厂商,`chat`/`responses` 是端点。
+而字段名 `wire_api` 问的是这条线上跑什么协议,答案本就该是端点——厂商信息已经由 profile id
+和 `base_url` 表达了。内部枚举 `ProviderApiFamily` 一直是按端点命名的
+(`AnthropicMessages`/`OpenAiChatCompletions`/`OpenAiResponses`),配置值反而偏离了内部真相。
+
+还消掉一处两义:`anthropic` 此前同时是 `wire_api` 的取值、和 env-only 路径里
+`KLOOP_PROVIDER` 的内建 provider id 别名(`provider_config.rs` 的 `env_only_file`)。
+后者保留不动——在那里它确实指厂商加默认 base;前者改名后一词一义。
+
+**为什么 `chat` 不跟着改成 `chat_completions`。** OpenAI 那条线只有一个 chat 端点、
+没有歧义可消,而 `chat`/`responses` 是从 codex 继承下来的写法(`anthropic` 是后加的,
+维度混用正是这么来的)。留下 `chat` 之后规则依然自洽:**取端点路径的主段名**——
+`/v1/messages` → `messages`,`/chat/completions` → `chat`,`/responses` → `responses`;
+将来若加 Gemini 就是 `generate_content`。
+
+**不影响已有会话。** rollout/receipt 里存的是 `provider_id` 加 `api_family` 枚举
+(序列化为 `anthropic_messages`),`wire_api` 的配置字符串只在启动解析时存在、不进持久化,
+所以这次改名不会重演 plan 132(改 provider 名导致历史会话打不开)。
+
+**改了哪些。** `parse_wire` 的 match 臂与它的 fail-closed 错误信息;`cache`/`thinking`
+只对该 rail 合法的那条错误信息;`/provider` 列表的 `api_family_label`(否则配置里写
+`messages`、`/provider` 显示 `anthropic`,等于把不一致挪了个地方);README 的 schema 注释;
+本 plan 与 HANDOFF 的对应描述。`Rail::Anthropic`、`ProviderApiFamily::AnthropicMessages`、
+协议字段 `apiFamily: "anthropic_messages"` 都不动——它们是内部名和 wire 协议,不是用户配置。
+
+kloop 只有一个使用者,破坏性成本约等于零,没有做别名兼容:旧值 `anthropic` 现在 fail closed,
+错误信息直接列出三个合法值。

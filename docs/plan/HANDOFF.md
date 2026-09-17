@@ -837,7 +837,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
   4 斜杠菜单+@补全、5 动画状态行+HUD+按需渲染、6 会话头+配色+diff 升级。详见 plan 38 文件切片路线图。
 - **plan 39(✅ 完成,2026-07-24；历史 native protocol 1.0 记录，已由 Plan 92 protocol 2.0 supersede；Plan 63在旧协议内原位替换approval schema,原生协议大工程继续)** 目标:kloop 定义原生 agent 协议替换 codex 引擎(app 专用分支适配)。**切片 0** 把 core 宽 `Ui` 收敛成 `emit(&Event)` 单事件流；**切片 1** 把 server/headless 换成标准 JSON-RPC 2.0 v1、版本握手、五类 item、数字 turn id、统一四档审批和 `app-server` 入口；该处v1 version继续保留，Plan 63因此前无人使用而原位删除`acceptAlways`并加入Once/WorkspaceSession/Project，不做兼容层。**切片 2** 已补 `thread/start` per-thread canonical cwd/model(项目 instructions/skills/permissions/sandbox/hooks/agent types/program limits 全按 thread cwd 构建,不碰进程 cwd),并在 `桌面前端仓库` `kloop` 分支 commit `f660aca1` 完成真实 Tauri worker + `src/kloop/` adapter/UI/capability gates。app 只保留 live text/image/Stop/tool/approval,延期面不发旧 RPC；SSO/LoginDialog/AccessGuard 按明确授权绕过。审查补洞:wire item id 进入 session timeline 前加 turn scope；`system`/`note`/`thread/cleared` 不再吞；subAgent completion 保留 task；采样已有可见 delta 后断流会补 ItemCompleted 且不自动 retry,避免半截 item + 重复回答。**切片 3A engine** 已把 rollout 扩成 messages/runtime/terminals 分层快照并持久化 partial assistant，原生 server 已有 `thread/list|read|resume|fork`、分页、runtime 保真、legacy 显式 cwd 迁移和 running-turn fork 拒绝；kloop fmt/clippy/test、mock 协议与真 key read-back 均过。**切片 4** 已补 `model/list`、安全 allowlist `config/read`、metadata-only `skills/list`、immutable `mcpServerStatus/list`，Desktop `kloop@934e325d` 接通 model picker、原生 slash skill 与只读 MCP connector；写入与 personalization 在 UI/TS/Rust 三层 fail-closed。响应、stderr、mock reader、未知参数、旧 editor 复用五条旁路均有安全回归；真协议/skill/Tauri Eval 和两仓全质量门已过。**后续**:切片 3 还需 Desktop 会话 UI + `rollback|compact/start|name/set|goal/*|archive|search`；切片 5 做 reasoning/diff/plan/review 打磨。详见 plan 39 完成记录。
 
-- **plan 40(✅ 完成,2026-07-24)** 全局 provider 配置：`~/.kloop/config.toml` 采用 Codex 风格 model/profile 子集并以 `wire_api=anthropic|chat|responses` 路由三 adapter；provider env 只作覆盖兼容。一个 resolved settings 贯通 TUI/plain/headless/app-server/model-list/config-read。该 plan 当时仍保留 project `.kloop/config.toml` 管 cwd policy；这一层已被 plan 46 整体删除。安全面补 global config 0600/拒 symlink、read_file/grep/glob/bash 敏感读取封堵、canonical/symlink/case alias、子 shell key env scrub、seatbelt credential read deny、HTTP 错误 key 脱敏。真实 gateway 已在清 provider env 下通过 headless/TUI，launcher 不再 source env.local。详见 plan 40 完成记录。
+- **plan 40(✅ 完成,2026-07-24)** 全局 provider 配置：`~/.kloop/config.toml` 采用 Codex 风格 model/profile 子集并以 `wire_api=messages|chat|responses` 路由三 adapter(该取值 2026-09-17 由 `anthropic` 更名为 `messages`,见 plan 40「后续变更」)；provider env 只作覆盖兼容。一个 resolved settings 贯通 TUI/plain/headless/app-server/model-list/config-read。该 plan 当时仍保留 project `.kloop/config.toml` 管 cwd policy；这一层已被 plan 46 整体删除。安全面补 global config 0600/拒 symlink、read_file/grep/glob/bash 敏感读取封堵、canonical/symlink/case alias、子 shell key env scrub、seatbelt credential read deny、HTTP 错误 key 脱敏。真实 gateway 已在清 provider env 下通过 headless/TUI，launcher 不再 source env.local。详见 plan 40 完成记录。
 - **plan 41(✅ 完成,2026-07-24)** TUI 品牌主色去粉红：`BRAND` 从 ANSI magenta 改为低饱和青蓝 `#6c9aa6`，只影响会话头、working spinner 与 mode 徽标；cyan 用户·状态语义及代码块 magenta keyword 不变。RGB/语义分槽回归测试、README、plan 38 均已同步；fmt/clippy/test/mock 全绿。详见 plan 41 完成记录。
 - **plan 42(✅ 完成,2026-07-24)** TUI 品牌色增强醒目度：用户在并排预览中选择右侧后，`BRAND` 从 `#6c9aa6` 提亮为鲜明青蓝 `#4fb3c8`；覆盖范围与其余语义色不变。RGB 测试、README、plan 38 与 HANDOFF 已同步；fmt/clippy/test/mock 全绿。详见 plan 42 完成记录。
 - **plan 44(✅ 完成,2026-07-24)** Web 工具契约显式落位 core tools：新增 `core/src/tools/web.rs` 归属工具名、描述和 schema；`kloop-web` 去掉 protocol 依赖，只保留 fetch/search 网络操作；CLI 将两层绑定为原有 `ToolSource`。工具可见条件、权限/并发/deferred 和网络行为不变。详见 plan 44 完成记录。
@@ -1184,3 +1184,19 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    **(a) 要立一个新 plan 号之前,先 `ls docs/plan/` 按主题扫一遍文件名,别只信 HANDOFF 的待办表——
    那张表只覆盖"最近一批",不覆盖历史上暂停的那些;(b) 销账文档里写下一个待办时,
    如果它已经有 plan 文件,就把 plan 号写进去**,否则这份索引下次还会把同一件事指成"没人做过"。
+
+153. **配置的取值要和字段名问的那个问题同维度,并且跟内部枚举对齐。** `wire_api` 的三个取值
+   曾是 `anthropic|chat|responses`:一个厂商、两个端点,混着两个维度。字段名问的是"这条线上
+   跑什么协议",答案本就该是端点;厂商由 profile id 和 `base_url` 表达,不该在这里再说一遍。
+   内部枚举 `ProviderApiFamily` 一直是 `AnthropicMessages|OpenAiChatCompletions|OpenAiResponses`
+   ——**配置值偏离了内部真相,这是最硬的判据**,比"读起来顺"可靠。2026-09-17 改成
+   `messages|chat|responses`,规则是**取端点路径的主段名**(`/v1/messages`、`/chat/completions`、
+   `/responses`),将来加 Gemini 就是 `generate_content`。两条衍生判据:**(a) 同一个词在两处当
+   不同意思用,就是命名出问题的信号**——`anthropic` 当时既是 `wire_api` 取值、又是
+   `KLOOP_PROVIDER` 的内建 provider id 别名,后者保留(那里它确实指厂商加默认 base),前者改名
+   后一词一义;**(b) 改用户可见的取值时,把同源的展示标签一起改**——`/provider` 的
+   `api_family_label` 也返回这三个词,只改解析不改标签,等于把不一致挪个地方。这次动不了的是
+   `Rail::Anthropic`、`ProviderApiFamily::AnthropicMessages` 和协议字段
+   `apiFamily: "anthropic_messages"`:内部名和 wire 协议不是用户配置。**改名前先确认它不进
+   持久化**:rollout/receipt 存的是 `provider_id` 加 `api_family` 枚举,`wire_api` 字符串只在
+   启动解析时存在,所以没有重演教训 132(改 provider 名导致历史会话打不开)。

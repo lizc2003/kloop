@@ -3207,7 +3207,7 @@ cargo run -- --mock
 #   model_provider = "gw_router"     # initial provider profile
 #
 #   [model_providers.gw_router]
-#   wire_api = "responses"             # responses | chat | anthropic
+#   wire_api = "responses"             # responses | chat | messages
 #   base_url = "https://example/v1"
 #   http_headers = { Authorization = "Bearer ..." }
 #   default_model = "gpt-5.6-sol"

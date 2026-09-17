@@ -75,7 +75,7 @@ fn effort_label(effort: Option<kloop_protocol::ReasoningEffort>) -> &'static str
 
 fn api_family_label(family: kloop_protocol::ProviderApiFamily) -> &'static str {
     match family {
-        kloop_protocol::ProviderApiFamily::AnthropicMessages => "anthropic",
+        kloop_protocol::ProviderApiFamily::AnthropicMessages => "messages",
         kloop_protocol::ProviderApiFamily::OpenAiChatCompletions => "chat",
         kloop_protocol::ProviderApiFamily::OpenAiResponses => "responses",
         kloop_protocol::ProviderApiFamily::Mock => "mock",

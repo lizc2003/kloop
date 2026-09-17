@@ -461,7 +461,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         }
     };
     if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
-        bail!("model_providers.{id}: cache/thinking are only valid for anthropic wire_api");
+        bail!("model_providers.{id}: cache/thinking are only valid for messages wire_api");
     }
     let context_window = optional_integer(
         spec,
@@ -547,10 +547,10 @@ fn parse_headers(id: &str, value: Option<&Value>, wire: Rail) -> Result<BTreeMap
 
 fn parse_wire(raw: &str, id: &str) -> Result<Rail> {
     match raw {
-        "anthropic" => Ok(Rail::Anthropic),
+        "messages" => Ok(Rail::Anthropic),
         "chat" => Ok(Rail::OpenAiChat),
         "responses" => Ok(Rail::OpenAiResponses),
-        _ => bail!("model_providers.{id}.wire_api must be anthropic | chat | responses"),
+        _ => bail!("model_providers.{id}.wire_api must be messages | chat | responses"),
     }
 }
 
@@ -673,7 +673,7 @@ mod tests {
 model_provider = "anthropic-a"
 
 [model_providers.anthropic-a]
-wire_api = "anthropic"
+wire_api = "messages"
 base_url = "https://anthropic-a.example"
 http_headers = { x-api-key = "a-key" }
 default_model = "claude-a"
@@ -706,7 +706,7 @@ models = ["chat-a", "shared"]
 model_provider = "responses-b"
 
 [model_providers.anthropic-a]
-wire_api = "anthropic"
+wire_api = "messages"
 base_url = "https://anthropic-a.example"
 http_headers = { x-api-key = "a-key" }
 default_model = "claude-a"
@@ -856,6 +856,31 @@ http_headers = { Authorization = "Bearer key" }
         }
     }
 
+    /// `wire_api` names the endpoint, not the vendor — the axis
+    /// `ProviderApiFamily` uses. An unknown wire fails closed, and the refusal
+    /// names every legal spelling rather than just rejecting the bad one.
+    #[test]
+    fn wire_api_names_the_endpoint_and_an_unknown_one_fails_closed() {
+        let profile = |wire: &str| {
+            format!(
+                "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"{wire}\"\n\
+                 http_headers = {{ x-api-key = \"k\" }}\ndefault_model = \"m\"\nmodels = [\"m\"]\n"
+            )
+        };
+        assert_eq!(
+            resolve(Some(&profile("vendor")), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "model_providers.x.wire_api must be messages | chat | responses"
+        );
+        let resolved = resolve(Some(&profile("messages")), &env(&[])).unwrap();
+        assert_eq!(
+            resolved.catalog().descriptors()[0].api_family,
+            ProviderApiFamily::AnthropicMessages
+        );
+    }
+
     #[test]
     fn errors_never_echo_credentials() {
         for raw in [
@@ -879,7 +904,7 @@ model_provider = "anthropic-a"
 effort = "max"
 
 [model_providers.anthropic-a]
-wire_api = "anthropic"
+wire_api = "messages"
 http_headers = { x-api-key = "a-key" }
 default_model = "claude-a"
 models = ["claude-a"]
@@ -945,7 +970,7 @@ effort = "xhigh"
 model_provider = "anthropic-a"
 
 [model_providers.anthropic-a]
-wire_api = "anthropic"
+wire_api = "messages"
 http_headers = { x-api-key = "a-key" }
 default_model = "claude-a"
 models = ["claude-a"]
