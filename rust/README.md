@@ -832,10 +832,13 @@ Streaming deltas are drained in batches so a burst of tokens redraws once, not
 per token.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
-(see below); **Esc** clears the composer, and only reaches the running turn once
-there is nothing left to clear (a half-written message survives a press aimed at
-the turn, at the price of a second press — an attached image counts as a draft);
-the status line and footer name whichever of the two the next press will do; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
+(see below); **Esc** is about the composer first: while it holds anything (text
+or an attached image) Esc is a **two-tap clear** — the first press arms a "press
+esc again to clear input" hint, the second clears, any other key disarms, the
+same shape as Ctrl+C. Only once there is nothing left to lose does Esc reach the
+running turn, where it interrupts on the **first** press (nothing to confirm).
+So a half-written message cannot be dropped by a single key aimed at the turn,
+and the status line and footer name whichever of the two the next press will do; **Ctrl+C** is a two-tap exit (the first press arms a "press Ctrl+C again
 to exit" hint, the second quits, any other key disarms) — the same everywhere,
 including inside a choice panel, so it is the single quit path (Ctrl+D is
 disabled); Ctrl+R (idle) opens the rewind picker (see
@@ -907,8 +910,11 @@ another position are rejected instead of editing the wrong token.
 While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a
 "shimmer" light band sweeping the verb, and `(elapsed · esc to interrupt)` —
-or `(elapsed · esc to clear input)` while a draft sits in the composer, since
-that is what the key would actually do. The
+or `(elapsed · esc esc to clear input)` while a draft sits in the composer,
+since that is what the key would actually do. Between the two taps the row is
+replaced by the unmissable `press esc again to clear input`, in the same slot
+Ctrl+C's `press Ctrl+C again to exit` uses (and it shows when idle too, where
+there is no activity row otherwise). The
 **footer** carries the mode badge and key hints on the left and the **system
 status** — model name and a context gauge (`model · N% ctx`, refreshed at the end
 of every agent round from the same usage accounting `/cost` reads, so a
@@ -3417,8 +3423,8 @@ KLOOP_SANDBOX=off cargo run                        # remove OS fs/network sandbo
 ```
 
 Interrupting a running turn patches history so it stays legal either way. In
-the TUI, Esc interrupts once the composer is empty and Ctrl+C (two taps) exits
-(see the TUI section). In
+the TUI, Esc interrupts once the composer is empty (while it is not, Esc is the
+two-tap clear) and Ctrl+C (two taps) exits (see the TUI section). In
 `--plain`, one Ctrl+C cancels any running operation, waits for that repair, and
 then exits; `exit` and `/exit` also quit. As in a conventional line-based REPL,
 an actual stdin EOF ends input, but it is not advertised as an application key.

@@ -797,7 +797,7 @@ fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
 pub fn has_activity_line(app: &App) -> bool {
     // A choice panel says what it is waiting for in its own header, so the
     // activity row would only repeat it — and the panel needs the rows more.
-    app.ctrl_c_exit_armed || (app.running && !app.interaction_active())
+    app.ctrl_c_exit_armed || app.esc_clear_armed || (app.running && !app.interaction_active())
 }
 
 /// What Esc does from here, so the two hint lines never advertise a key that
@@ -807,7 +807,7 @@ fn esc_action(app: &App) -> &'static str {
     if app.composer.is_blank() {
         "esc to interrupt"
     } else {
-        "esc to clear input"
+        "esc esc to clear input"
     }
 }
 
@@ -819,6 +819,10 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
     if app.ctrl_c_exit_armed {
         // Unmissable, right above the composer where Ctrl+C was pressed.
         return Some(Line::from("press Ctrl+C again to exit".to_string()));
+    }
+    // Same slot, same shape: the draft is still there until the second press.
+    if app.esc_clear_armed {
+        return Some(Line::from("press esc again to clear input".to_string()));
     }
     if app.interaction_active() || !app.running {
         return None;

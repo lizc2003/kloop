@@ -510,6 +510,11 @@ pub struct App {
     /// Ctrl+C is a two-tap quit (CC parity): the first press arms this and shows
     /// a hint; the next Ctrl+C quits, any other key disarms it.
     pub ctrl_c_exit_armed: bool,
+    /// Esc on a non-empty composer is a two-tap clear, the same shape: the first
+    /// press arms this and shows a hint, the next Esc clears, any other key
+    /// disarms it. An empty composer needs no confirmation, so Esc goes straight
+    /// through to the running turn.
+    pub esc_clear_armed: bool,
     /// The open completion popup (slash `/` or file `@`), or None. At most one is
     /// open at a time; it floats above the composer and captures navigation /
     /// accept / cancel keys (plan 38 slice 4).
@@ -567,6 +572,7 @@ impl App {
             provider_picker: None,
             mode: Mode::default(),
             ctrl_c_exit_armed: false,
+            esc_clear_armed: false,
             popup: None,
             commands: Vec::new(),
             cwd: String::new(),
@@ -1278,6 +1284,10 @@ impl App {
         // key disarms. Handle it before routing so all three agree (CC parity —
         // Esc does interrupt/dismiss, Ctrl+C exits). Ctrl+D stays immediate.
         let was_armed = std::mem::take(&mut self.ctrl_c_exit_armed);
+        // Both two-tap arms disarm on any key, so both are taken up front — every
+        // branch below (including the ones that return early) is "any other key"
+        // for the arm it does not own.
+        let esc_was_armed = std::mem::take(&mut self.esc_clear_armed);
         if ctrl && key.code == KeyCode::Char('c') {
             if was_armed {
                 return Command::Quit;
@@ -1326,14 +1336,19 @@ impl App {
             return Command::PasteClipboardImage;
         }
         match (key.code, ctrl) {
-            // Esc clears what the user typed, and only reaches the running turn
-            // once there is nothing left to clear — a draft is work, and losing
-            // it to a keypress aimed at the turn is the expensive mistake of the
-            // two. A confirm popup / rewind picker capture Esc before this (they
+            // Esc is about the composer first: a draft is work, so dropping it
+            // takes two taps with a hint in between (the Ctrl+C shape), and Esc
+            // reaches the running turn only once there is nothing left to lose —
+            // where it needs no confirmation and interrupts on the first press.
+            // A confirm popup / rewind picker capture Esc before this (they
             // return early at the top of on_key); an open completion menu is
             // closed by `after_edit` below.
             (KeyCode::Esc, _) => {
                 if !self.composer.is_blank() {
+                    if !esc_was_armed {
+                        self.esc_clear_armed = true;
+                        return Command::None;
+                    }
                     self.composer.clear();
                 } else if self.running {
                     return Command::Interrupt;
@@ -3374,24 +3389,39 @@ mod tests {
         assert_eq!(app.composer.text(), "v");
     }
 
-    /// Esc clears the draft first and only reaches the running turn once the
-    /// composer is empty — a half-written message survives a press aimed at the
-    /// turn, at the price of a second press.
+    /// Esc is a two-tap clear while the composer holds anything (CC parity: the
+    /// first press arms a hint, the second clears, any other key disarms), and a
+    /// one-tap interrupt once it is empty — there is nothing left to confirm.
     #[test]
-    fn esc_clears_the_draft_before_it_interrupts() {
+    fn esc_is_a_two_tap_clear_then_a_one_tap_interrupt() {
         let mut app = App::new("s".into());
         type_str(&mut app, "draft");
-        // Idle: Esc clears the line.
+        // Idle with a draft: the first Esc only arms.
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert!(app.esc_clear_armed);
+        assert_eq!(app.composer.text(), "draft", "still there after one tap");
+        // Any other key disarms, so the next Esc is a first tap again.
+        app.on_key(80, key(KeyCode::Char('x')));
+        assert!(!app.esc_clear_armed, "a non-Esc key disarms");
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.composer.text(), "draftx");
+        // Second tap clears.
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert_eq!(app.composer.text(), "");
-        // Running with a draft: the first Esc only clears it.
+        assert!(!app.esc_clear_armed, "clearing disarms");
+
+        // Empty composer: Esc interrupts on the first press, no hint in between.
         app.running = true;
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
+        // A draft over a running turn is still the composer's two taps; only
+        // then does Esc reach the turn.
         type_str(&mut app, "next turn's message");
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert_eq!(app.composer.text(), "");
-        // Empty: Esc interrupts.
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
-        // An attached image is a draft too, so it is what the first Esc drops.
+
+        // An attached image is a draft too, so it is what the two taps drop.
         app.attach_image(
             "shot.png".into(),
             ContentBlock::Image {
@@ -3402,8 +3432,29 @@ mod tests {
             },
         );
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert!(app.composer.attachments().is_empty());
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
+    }
+
+    /// The two arms are independent but both disarm on any key, so they can
+    /// never be lit at once and neither swallows the other's first tap.
+    #[test]
+    fn the_esc_and_ctrl_c_arms_disarm_each_other() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "draft");
+        app.on_key(80, key(KeyCode::Esc));
+        assert!(app.esc_clear_armed);
+        // Ctrl+C disarms Esc and arms itself; the draft is untouched.
+        assert_eq!(app.on_key(80, ctrl('c')), Command::None);
+        assert!(!app.esc_clear_armed);
+        assert!(app.ctrl_c_exit_armed);
+        assert_eq!(app.composer.text(), "draft");
+        // And back: Esc disarms Ctrl+C rather than quitting, and only arms.
+        assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
+        assert!(!app.ctrl_c_exit_armed);
+        assert!(app.esc_clear_armed);
+        assert_eq!(app.composer.text(), "draft");
     }
 
     /// A large paste is a `[Pasted #1: …]` label while it sits in the composer,

@@ -71,7 +71,7 @@ history 取文本 push `Cell::User`,那是**展开后的全文**。同一条用�
 
 ---
 
-## 三、esc:有文本时清文本,没文本时才 cancel ✅
+## 三、esc:有草稿时两下清草稿,空的时候才是 cancel ✅
 
 ### 现状
 
@@ -86,16 +86,31 @@ history 取文本 push `Cell::User`,那是**展开后的全文**。同一条用�
 草稿还在、turn 被打断——或者反过来,想清草稿结果打断了 turn。两件事共用一个键,而且顺序
 是错的:**草稿是花过力气的,turn 再起一次就有**。
 
+### 裁决(用户当场纠正了第一版)
+
+第一版做成了「有草稿 → 一下 esc 清掉」。用户指出 cc 不是这样:
+**有草稿时第一下 esc 只提示,第二下才清;空的时候 esc 直接 cancel。**
+这条更对——清掉草稿本身也是个不可撤销的破坏性动作,和退出一样值一次确认;
+而中断一个 turn 没什么可失去的,不该多要一下。
+
 ### 做了什么
 
-- `!composer.is_blank()` 时只清 composer;空了,esc 才走 `Command::Interrupt`。
-  `is_blank()` 本来就把附件算进去,所以贴上的图片也算草稿,第一下 esc 一起清掉。
-- 两行提示同步改成动态(`render.rs::esc_action`):草稿在时说 `esc to clear input`,
-  空了才说 `esc to interrupt`。**提示不能说一个按下去会干别的事的键。**
+- 新增 `esc_clear_armed`,形状逐条抄 `ctrl_c_exit_armed`:第一下 arm 并显示提示,
+  第二下才清,任何别的键 disarm。两个 arm 都在 `on_key` 开头 `mem::take`,
+  所以每个分支(包括提前 return 的那些)对自己不拥有的那个 arm 都自动是「别的键」,
+  两个提示不可能同时亮。
+- `is_blank()` 本来就把附件算进去,所以贴上的图片也算草稿,同样两下。
+- composer 空了,esc **第一下**就 `Command::Interrupt`,不 arm。
+- 提示三处同步(`render.rs`):arm 着的时候 activity 行整行换成
+  `press esc again to clear input`(和 Ctrl+C 用同一个槽位,空闲时也显示);
+  没 arm 时草稿在说 `esc esc to clear input`、空了说 `esc to interrupt`。
+  **提示不能说一个按下去会干别的事的键。**
+- 代价说清楚:turn 跑着又有草稿时,中断要按三下(两下清草稿、一下中断)。
+  这是「esc 的含义由 composer 决定」这条规则的直接推论,不是遗漏。
 
 ---
 
-## ✅ 验收(2026-09-17,一次提交)
+## ✅ 验收(2026-09-17,两次提交:第二次是用户纠正第三条之后)
 
 `cargo fmt` + `cargo clippy --all-targets --all-features`(零警告)+ `cargo test` 全绿
 (34 个 test target)。新增/改写的测试:
@@ -108,7 +123,8 @@ history 取文本 push `Cell::User`,那是**展开后的全文**。同一条用�
 | `render::long_tool_rows_truncate_to_one_line_each` | 两行各自不折行 |
 | `render::transcript_renders_all_cell_kinds` | 参数还在流式的调用**没有**命令行 |
 | `app::a_pasted_block_is_echoed_in_full_not_as_its_placeholder` | composer 里是标签、transcript 里是全文;steering 同样 |
-| `app::esc_clears_the_draft_before_it_interrupts` | 空闲清、running 有草稿先清、空了才 Interrupt、附件也算草稿 |
+| `app::esc_is_a_two_tap_clear_then_a_one_tap_interrupt` | 第一下只 arm、别的键 disarm、第二下才清;空 composer 一下就 Interrupt;附件同样两下 |
+| `app::the_esc_and_ctrl_c_arms_disarm_each_other` | 两个 arm 互相 disarm,不可能同时亮,谁也不吞掉对方的第一下 |
 | `tui_pty::a_shell_command_gets_a_row_of_its_own` | **新整屏基线** `bash_command_row_24x80`:真二进制跑一条 `seq`,header + 命令行 + 预览 |
 
 README 同步五处:工具行形状、esc 语义(TUI 段 + 中断段)、粘贴标签的作用域、状态行文案。
