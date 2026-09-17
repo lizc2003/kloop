@@ -15,6 +15,7 @@ use toml::Value;
 use url::Url;
 
 use kloop_core::provider_route::FrozenProviderRoute;
+use kloop_core::provider_route::ModelKnowledge;
 use kloop_core::provider_route::ProviderCatalog;
 use kloop_core::provider_route::ProviderCatalogEntry;
 use kloop_protocol::ProviderApiFamily;
@@ -118,6 +119,9 @@ struct Profile {
 struct GlobalFile {
     initial_provider: String,
     profiles: BTreeMap<String, Profile>,
+    /// The `[models."<id>"]` tables: what is true about a model, as opposed to
+    /// what the user picked. Keyed by model id and shared across providers.
+    model_knowledge: BTreeMap<String, ModelKnowledge>,
 }
 
 pub(crate) fn load(mock: bool, table: &toml::Table) -> Result<ResolvedProviderSettings> {
@@ -166,9 +170,6 @@ fn resolve_table(
             "initial model '{initial_model}' is not in provider '{initial_provider}' models allowlist"
         );
     }
-    // Read before the loop below moves the profiles out.
-    let initial_context_window = profile.context_window;
-
     let mut entries = Vec::with_capacity(file.profiles.len());
     for (id, profile) in file.profiles {
         let selected = id == initial_provider;
@@ -212,12 +213,37 @@ fn resolve_table(
             endpoint_fingerprint,
             default_model: profile.model,
             models: profile.models,
+            context_window: profile.context_window,
             availability,
             default_effort,
             factory,
         });
     }
-    let catalog = Arc::new(ProviderCatalog::new(entries).map_err(anyhow::Error::msg)?);
+    let catalog = Arc::new(
+        ProviderCatalog::new(entries)
+            .map_err(anyhow::Error::msg)?
+            .with_model_knowledge(file.model_knowledge),
+    );
+    // A declared effort set is a claim the user made after testing; contradicting
+    // it is a config mistake, and finding it at startup beats finding it in a 400
+    // halfway through the first turn.
+    if let Some(effort) = catalog.default_effort(&initial_provider)
+        && !catalog.effort_supported(&initial_model, effort)
+    {
+        let declared = catalog
+            .declared_efforts(&initial_model)
+            .unwrap_or_default()
+            .iter()
+            .map(|level| level.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "effort '{}' is not among the efforts declared for model '{initial_model}' \
+             (declared: {declared})",
+            effort.as_str()
+        );
+    }
+    let initial_context_window = catalog.effective_window(&initial_provider, &initial_model);
     let initial_route = catalog
         .initial_route(&initial_provider, Some(&initial_model))
         .map_err(anyhow::Error::new)?;
@@ -288,6 +314,7 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
     Ok(GlobalFile {
         initial_provider: id.clone(),
         profiles: BTreeMap::from([(id, profile)]),
+        model_knowledge: BTreeMap::new(),
     })
 }
 
@@ -372,7 +399,75 @@ fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
     Ok(GlobalFile {
         initial_provider,
         profiles,
+        model_knowledge: parse_model_knowledge(table)?,
     })
+}
+
+/// The `[models."<id>"]` tables. Every field is optional: a model kloop has
+/// never been told about simply has no entry, which is the normal case and not
+/// an error — the conservative default window and an unrestricted effort set
+/// apply, and the provider still gets to refuse.
+fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKnowledge>> {
+    let Some(models) = table.get("models") else {
+        return Ok(BTreeMap::new());
+    };
+    let models = models.as_table().context("models must be a table")?;
+    let mut knowledge = BTreeMap::new();
+    for (id, value) in models {
+        let id = nonempty(id, "models key")?;
+        let spec = value
+            .as_table()
+            .with_context(|| format!("models.{id} must be a table"))?;
+        for key in spec.keys() {
+            if !matches!(key.as_str(), "context_window" | "efforts") {
+                bail!("models.{id} has unknown key '{key}'");
+            }
+        }
+        let context_window = optional_integer(
+            spec,
+            "context_window",
+            &format!("models.{id}.context_window"),
+        )?;
+        knowledge.insert(
+            id.clone(),
+            ModelKnowledge {
+                context_window,
+                efforts: parse_efforts(spec, &id)?,
+            },
+        );
+    }
+    Ok(knowledge)
+}
+
+/// `None` is "not declared" and means every level is allowed. An empty array is
+/// rejected rather than read as "supports nothing": it is far more likely a slip,
+/// and a model that should do no reasoning is spelled `["none"]`.
+fn parse_efforts(spec: &toml::Table, id: &str) -> Result<Option<Vec<ReasoningEffort>>> {
+    let Some(value) = spec.get("efforts") else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .with_context(|| format!("models.{id}.efforts must be an array of effort levels"))?;
+    if items.is_empty() {
+        bail!(
+            "models.{id}.efforts must not be empty (omit the key to declare nothing, \
+             or write [\"none\"] for a model that does no reasoning)"
+        );
+    }
+    let mut efforts = Vec::new();
+    for item in items {
+        let raw = item
+            .as_str()
+            .with_context(|| format!("models.{id}.efforts must contain only strings"))?;
+        let effort = raw
+            .parse::<ReasoningEffort>()
+            .map_err(|e| anyhow!("models.{id}.efforts: {e}"))?;
+        if !efforts.contains(&effort) {
+            efforts.push(effort);
+        }
+    }
+    Ok(Some(efforts))
 }
 
 fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
@@ -399,7 +494,12 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         id,
     )?;
     let model = required_string(spec, "model", &format!("providers.{id}.model"))?;
-    let models = required_string_array(spec, "models", &format!("providers.{id}.models"))?;
+    // Omitting `models` is the single-model case spelled once: the catalog is
+    // just `model` itself. Writing it out is for providers that route to several.
+    let models = match spec.get("models") {
+        Some(_) => required_string_array(spec, "models", &format!("providers.{id}.models"))?,
+        None => vec![model.clone()],
+    };
     if !models.iter().any(|candidate| candidate == &model) {
         bail!("providers.{id}.model '{model}' is not in models allowlist");
     }
@@ -832,6 +932,86 @@ http_headers = { Authorization = "Bearer key" }
             resolved.catalog().descriptors()[0].api_family,
             ProviderApiFamily::AnthropicMessages
         );
+    }
+
+    fn with_knowledge(gateway: &str, models: &str) -> String {
+        format!(
+            "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
+             http_headers = {{ Authorization = \"Bearer k\" }}\n\
+             model = \"m\"\n{gateway}\n{models}"
+        )
+    }
+
+    /// The budget is the smaller of what the model can take and what the gateway
+    /// will give. The conservative default is deliberately NOT a third number in
+    /// that `min`: if it were, declaring a real 1M window would still compact at
+    /// 200k and the declaration would be silently pointless.
+    #[test]
+    fn the_effective_window_is_the_smaller_of_the_model_and_the_gateway() {
+        let window = |gateway: &str, models: &str| {
+            resolve(Some(&with_knowledge(gateway, models)), &env(&[]))
+                .unwrap()
+                .initial_context_window()
+        };
+        let declared = "[models.m]\ncontext_window = 400000\n";
+
+        assert_eq!(window("context_window = 258400", declared), Some(258_400));
+        assert_eq!(window("", declared), Some(400_000));
+        assert_eq!(window("context_window = 258400", ""), Some(258_400));
+        // Neither declared: the caller falls back on its own, so this stays None.
+        assert_eq!(window("", ""), None);
+    }
+
+    /// `efforts` is a claim the user made after testing, so it is checked at
+    /// startup rather than at the first 400. Not declaring it is not the same as
+    /// declaring nothing, and `none` is the "do not reason" switch rather than a
+    /// capability level, so it is never refused.
+    #[test]
+    fn declared_efforts_gate_the_configured_effort_at_startup() {
+        let with_effort = |effort: &str, models: &str| {
+            let raw = format!(
+                "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
+                 http_headers = {{ Authorization = \"Bearer k\" }}\n\
+                 model = \"m\"\neffort = \"{effort}\"\n{models}"
+            );
+            resolve(Some(&raw), &env(&[])).map(|_| ())
+        };
+        let narrow = "[models.m]\nefforts = [\"low\", \"high\"]\n";
+
+        assert_eq!(
+            with_effort("max", narrow).unwrap_err().to_string(),
+            "effort 'max' is not among the efforts declared for model 'm' (declared: low, high)"
+        );
+        assert!(with_effort("high", narrow).is_ok());
+        // Undeclared model: nothing to check against, the provider still refuses.
+        assert!(with_effort("max", "").is_ok());
+        // `none` turns reasoning off and is never gated by the list.
+        assert!(with_effort("none", narrow).is_ok());
+    }
+
+    #[test]
+    fn model_knowledge_fails_closed_on_empty_and_malformed_declarations() {
+        let error = |models: &str| {
+            resolve(Some(&with_knowledge("", models)), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            error("[models.m]\nefforts = []\n"),
+            "models.m.efforts must not be empty (omit the key to declare nothing, \
+             or write [\"none\"] for a model that does no reasoning)"
+        );
+        assert_eq!(
+            error("[models.m]\nefforts = [\"sky-high\"]\n"),
+            "models.m.efforts: unknown effort 'sky-high' \
+             (known: none, low, medium, high, xhigh, max)"
+        );
+        assert_eq!(
+            error("[models.m]\nwindow = 1\n"),
+            "models.m has unknown key 'window'"
+        );
+        assert!(error("[models.m]\ncontext_window = 0\n").contains("positive token count"));
     }
 
     #[test]

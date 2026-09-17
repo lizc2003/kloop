@@ -23,6 +23,10 @@ pub struct ProviderCatalogEntry {
     pub endpoint_fingerprint: String,
     pub default_model: String,
     pub models: Vec<String>,
+    /// What this gateway caps the context at, when it caps it lower than the
+    /// model itself. Only the gateway operator knows this — it is configuration,
+    /// not a fact about the model.
+    pub context_window: Option<u64>,
     pub availability: ProviderAvailabilityCode,
     /// The configured effort this provider starts a session at. It seeds
     /// [`SessionProviderState`]; `/effort` then owns the value for the rest of
@@ -34,13 +38,27 @@ pub struct ProviderCatalogEntry {
 struct CatalogEntry {
     descriptor: ProviderDescriptor,
     endpoint_fingerprint: String,
+    context_window: Option<u64>,
     default_effort: Option<ReasoningEffort>,
     factory: ProviderFactory,
     provider: OnceLock<Result<Arc<Provider>, ProviderAvailabilityCode>>,
 }
 
+/// What is true about a model rather than chosen by the user: how much context
+/// it takes and which reasoning levels it accepts. It is knowledge, written once
+/// and then left alone, which is why it lives in its own `[models."<id>"]` table
+/// instead of being repeated inside every provider that can route to the model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelKnowledge {
+    pub context_window: Option<u64>,
+    /// Absent means "not declared", which is not the same as "supports nothing":
+    /// an undeclared model accepts every level and lets the provider refuse.
+    pub efforts: Option<Vec<ReasoningEffort>>,
+}
+
 pub struct ProviderCatalog {
     entries: BTreeMap<String, CatalogEntry>,
+    model_knowledge: BTreeMap<String, ModelKnowledge>,
 }
 
 impl fmt::Debug for ProviderCatalog {
@@ -91,6 +109,7 @@ impl ProviderCatalog {
                     CatalogEntry {
                         descriptor,
                         endpoint_fingerprint,
+                        context_window: entry.context_window,
                         default_effort: entry.default_effort,
                         factory: entry.factory,
                         provider: OnceLock::new(),
@@ -101,7 +120,63 @@ impl ProviderCatalog {
                 return Err(format!("duplicate provider id '{id}'"));
             }
         }
-        Ok(Self { entries: catalog })
+        Ok(Self {
+            entries: catalog,
+            model_knowledge: BTreeMap::new(),
+        })
+    }
+
+    /// Attach the `[models."<id>"]` table. Separate from `new` so every existing
+    /// construction site keeps working with an empty knowledge base — an unknown
+    /// model is the normal case, not an error.
+    pub fn with_model_knowledge(mut self, knowledge: BTreeMap<String, ModelKnowledge>) -> Self {
+        self.model_knowledge = knowledge;
+        self
+    }
+
+    /// The window to budget compaction against for one (provider, model) pair.
+    /// The model says what it can take, the gateway says what it will give, and
+    /// the smaller of the two wins. `None` means neither was declared, so the
+    /// caller falls back to its own conservative default — the fallback must not
+    /// take part in the `min`, or declaring a real 1M window would still compact
+    /// at the default.
+    pub fn effective_window(&self, provider_id: &str, model: &str) -> Option<u64> {
+        let gateway = self
+            .entries
+            .get(provider_id)
+            .and_then(|entry| entry.context_window);
+        let declared = self
+            .model_knowledge
+            .get(model)
+            .and_then(|knowledge| knowledge.context_window);
+        match (declared, gateway) {
+            (Some(model_window), Some(cap)) => Some(model_window.min(cap)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether this model accepts that reasoning level. An undeclared model
+    /// accepts everything (the provider still gets to refuse), and `none` is
+    /// always accepted because it is the "do not reason" switch rather than a
+    /// capability level — on the Messages rail it is the only way to turn
+    /// thinking off at all.
+    pub fn effort_supported(&self, model: &str, effort: ReasoningEffort) -> bool {
+        if effort == ReasoningEffort::None {
+            return true;
+        }
+        match self
+            .model_knowledge
+            .get(model)
+            .and_then(|knowledge| knowledge.efforts.as_deref())
+        {
+            Some(declared) => declared.contains(&effort),
+            None => true,
+        }
+    }
+
+    pub fn declared_efforts(&self, model: &str) -> Option<&[ReasoningEffort]> {
+        self.model_knowledge.get(model)?.efforts.as_deref()
     }
 
     pub fn from_provider(
@@ -121,6 +196,7 @@ impl ProviderCatalog {
             endpoint_fingerprint,
             default_model: default_model.clone(),
             models,
+            context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(move || {
@@ -1058,6 +1134,7 @@ mod tests {
             endpoint_fingerprint: format!("mock:{id}"),
             default_model: default_model.into(),
             models: models.iter().map(|model| (*model).to_string()).collect(),
+            context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),

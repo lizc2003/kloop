@@ -93,6 +93,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
             key.as_str(),
             "provider"
                 | "providers"
+                | "models"
                 | "permissions"
                 | "mcp"
                 | "web"

@@ -225,18 +225,39 @@ fork:
 
 Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary — nine sections, with an `<analysis>` scratchpad the canonicalizer drops before the summary reaches context, plus a pointer to the session transcript so a dropped detail can be fetched instead of re-derived — canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a recent tail verbatim (`KEEP_RECENT_TOKENS`) (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. A summary request that is itself rejected as too large — the case that used to end the turn, since reactive compaction resends nearly the whole history — drops the oldest slice of what it was going to summarize and retries; the abandoned messages are announced by a `DROPPED_PREFIX` marker at the head of the rebuilt history, and the size that was refused becomes a ceiling on the planning window for the rest of the session (a configured window is a claim, a rejection is a measurement). Failed or cancelled summary requests otherwise leave history untouched.
 
-The usable window resolves in three steps: `KLOOP_CONTEXT_WINDOW` (a token
-count, or `off` to disable compaction) wins, then the selected provider's
-`context_window` key, then 200000. A provider block should declare its model's
-real window — the default has to stay safe for the smallest model anyone routes
-to, and a window set too low is invisible: it just compacts earlier than it had
-to. The env var still wins so a wrong provider value can be corrected without
-editing the block.
+The usable window is decided by two different kinds of statement. What the model
+can take is a **fact** about the model, written once in its own `[models."<id>"]`
+table and shared by every provider that routes to it. What the gateway will
+actually hand out is **configuration**, and only the operator knows it, so it
+stays on the provider block. The budget is the smaller of the two:
 
 ```toml
 [providers.gw_router]
-context_window = 258400
+context_window = 258400        # what this gateway caps at
+
+[models."gpt-5.6-sol"]
+context_window = 400000        # what the model itself takes
 ```
+
+`KLOOP_CONTEXT_WINDOW` (a token count, or `off` to disable compaction) overrides
+both, and a number the environment names is pinned: a `/provider` switch leaves
+it alone. Otherwise the budget is re-derived for the new (provider, model) pair
+on every switch — carrying the old number across would mean a smaller window is
+only discovered by being rejected. When neither side declares anything, 200000
+applies. **That default is a floor for the undeclared case, never a third term in
+the `min`** — if it took part, declaring a real 1M window would still compact at
+200000. A window set too low is invisible (it just compacts earlier than it had
+to); a window set too high costs one rejected request before the measured ceiling
+takes over.
+
+`[models."<id>"]` may also declare `efforts`, the reasoning levels that model
+accepts. Omitting the key declares nothing and every level is allowed — the
+provider still gets to refuse. Declaring it makes the check local: a configured
+`effort` outside the list fails at startup, and `/effort` refuses on the spot
+instead of spending a request to find out. An empty array is rejected rather than
+read as "supports nothing" (write `["none"]` for that), and `none` is never
+gated — it is the switch that turns reasoning off, and on the Messages rail it is
+the only way to do so.
 
 ## Session persistence (Phase 2, second slice)
 
@@ -3211,6 +3232,11 @@ cargo run -- --mock
 #   http_headers = { Authorization = "Bearer ..." }
 #   model = "gpt-5.6-sol"               # this provider's default model
 #   models = ["gpt-5.6-sol", "gpt-5.6-mini"]   # optional; omitted = just `model`
+#   context_window = 258400             # optional; what this gateway caps at
+#
+#   [models."gpt-5.6-sol"]              # facts about the model, not settings
+#   context_window = 400000
+#   efforts = ["low", "high", "xhigh", "max"]
 #
 # Every configured profile declares a stable id, API family, default model, and
 # ordered model allowlist. Unselected profiles may be unavailable because their

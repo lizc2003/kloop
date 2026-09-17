@@ -242,6 +242,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
         Ok(Config {
             provider_catalog,
             provider_route,
+            context_budget: kloop_core::config::ContextBudgetSource::Pinned,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),
@@ -372,6 +373,7 @@ fn switch_factory(
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), format!("{id}-other")],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -419,6 +421,7 @@ fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> Co
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(vec![vec![text("answer")]]))),
@@ -685,6 +688,7 @@ fn worktree_factory(
         Ok(Config {
             provider_catalog,
             provider_route,
+            context_budget: kloop_core::config::ContextBudgetSource::Pinned,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),
@@ -1172,6 +1176,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "a-other".into()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1182,6 +1187,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "b-other".into()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1319,6 +1325,7 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: anthropic_model.clone(),
                 models: vec![anthropic_model.clone()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1339,6 +1346,7 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1357,6 +1365,7 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: Some(responses_effort),
                 factory: Arc::new(move || {
@@ -3637,6 +3646,7 @@ async fn real_effort_sweep_contract() {
                 endpoint_fingerprint: Provider::endpoint_fingerprint_for(api_family, &base),
                 default_model: model.clone(),
                 models: vec![model.clone()],
+                context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 // The sweep sets every level explicitly; starting from "no field
                 // sent" keeps the first turn a clean control.

@@ -324,6 +324,7 @@ mod tests {
         Config {
             provider_catalog,
             provider_route,
+            context_budget: kloop_core::config::ContextBudgetSource::Pinned,
             system: "test".into(),
             project_instructions: None,
             max_rounds: Some(10),

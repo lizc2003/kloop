@@ -1022,6 +1022,81 @@ mod tests {
     /// stretch of the session ran at. Recording only the opening value would be
     /// worse than recording none: it states an answer with confidence and is
     /// wrong the moment `/effort` is used.
+    /// A model that declares its levels is taken at its word: `/effort` refuses
+    /// an undeclared level on the spot instead of letting the turn find out from
+    /// a 400. `none` is the "do not reason" switch, never gated by the list.
+    #[tokio::test]
+    async fn effort_refuses_a_level_the_active_model_does_not_declare() {
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        let catalog = Arc::new(
+            crate::provider_route::ProviderCatalog::new(vec![
+                crate::provider_route::ProviderCatalogEntry {
+                    id: "responses".into(),
+                    api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+                    endpoint_fingerprint: "responses:test".into(),
+                    default_model: "m1".into(),
+                    models: vec!["m1".into()],
+                    context_window: None,
+                    availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+                    default_effort: None,
+                    factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
+                },
+            ])
+            .unwrap()
+            .with_model_knowledge(std::collections::BTreeMap::from([(
+                "m1".to_string(),
+                crate::provider_route::ModelKnowledge {
+                    context_window: None,
+                    efforts: Some(vec![
+                        kloop_protocol::ReasoningEffort::Low,
+                        kloop_protocol::ReasoningEffort::High,
+                    ]),
+                },
+            )])),
+        );
+        let state =
+            crate::provider_route::SessionProviderState::new(catalog, "responses", None).unwrap();
+        let cancel = CancellationToken::new();
+        let refused = run_with_provider_state(
+            "/effort max",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        assert!(!refused.route_changed);
+        assert_eq!(
+            refused.output,
+            "effort not changed: 'max' is not among the efforts declared for model 'm1' (low, high)"
+        );
+        assert_eq!(state.effort(), None);
+
+        let accepted = run_with_provider_state(
+            "/effort high",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        assert!(accepted.route_changed);
+        // `none` is the switch that turns reasoning off, not a capability level.
+        let off = run_with_provider_state(
+            "/effort none",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        assert!(off.route_changed);
+    }
+
     #[tokio::test]
     async fn effort_changes_land_on_the_route_timeline() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
@@ -1034,6 +1109,7 @@ mod tests {
                     endpoint_fingerprint: "responses:test".into(),
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
+                    context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
@@ -1114,6 +1190,7 @@ mod tests {
                     endpoint_fingerprint: "responses:test".into(),
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
+                    context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),

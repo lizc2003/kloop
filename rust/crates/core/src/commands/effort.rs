@@ -43,6 +43,27 @@ pub fn run(
     if state.effort() == target {
         return SlashResult::message(format!("{}\n{USAGE}", status_line(state)));
     }
+    // A declared `efforts` list is a claim the user made after testing the model;
+    // refusing here costs one line, while letting it through costs a request that
+    // comes back 400 halfway into the turn. An undeclared model accepts anything.
+    let model = &state.active_route().model;
+    if let Some(effort) = target
+        && !state.catalog().effort_supported(model, effort)
+    {
+        let declared = state
+            .catalog()
+            .declared_efforts(model)
+            .unwrap_or_default()
+            .iter()
+            .map(|level| level.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return SlashResult::message(format!(
+            "effort not changed: '{}' is not among the efforts declared for model \
+             '{model}' ({declared})",
+            effort.as_str()
+        ));
+    }
     // A revision can only follow one, and setting the effort before the first
     // turn is the normal way to start a session — so open the timeline here if
     // sampling has not already done it. Guarded on emptiness rather than left to

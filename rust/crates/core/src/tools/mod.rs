@@ -1841,6 +1841,7 @@ pub(crate) mod testutil {
             Arc::new(Config {
                 provider_catalog,
                 provider_route,
+                context_budget: crate::config::ContextBudgetSource::Pinned,
                 system: "test".into(),
                 project_instructions: None,
                 max_rounds: self.max_rounds,

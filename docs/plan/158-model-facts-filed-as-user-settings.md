@@ -78,7 +78,7 @@ context_window = 262144
 
 ## 三、六项改动
 
-### 1. `[models."<id>"]` 知识段 + 三源取 min
+### 1. `[models."<id>"]` 知识段 + 三源取 min ✅
 
 新的顶层键 `models`(和 provider 下那个 `models` 数组同名但不同层,一个是知识表、一个是
 目录;如果觉得会混,开工时可以换个名,但**别叫 `model_info`**——那是 codex 的内部结构名)。
@@ -161,7 +161,7 @@ let initial_model = rail_model.or(KLOOP_MODEL).unwrap_or(profile.model);
 但要在实现时确认旧会话打不开时的表现是**明确报错或落到默认**,不是 panic。plan 132 已经
 定过"记录的 provider 连参考都不是,重开一律用当前默认",可以顺着那条路。
 
-### 6. `/provider` 切换后重算压缩预算
+### 6. `/provider` 切换后重算压缩预算 ✅
 
 现在 `cfg.context_window` 在启动时定死(`startup.rs` 里
 `runtime.context_window_env.unwrap_or_else(|| provider.initial_context_window()...)`),
@@ -208,6 +208,30 @@ let initial_model = rail_model.or(KLOOP_MODEL).unwrap_or(profile.model);
 
 `with_test_models` 的签名顺势从 `(primary, fallback)` 改成 `(&[&str])`——"允许这些模型,
 第一个是 primary",不再暗示第二个模型有特殊角色。
+
+## 四之三、✅ 第二阶段完成记录(2026-09-17,提交 SHA 以本条所在提交为准)
+
+第 1/6 项已落地,全部六项完成。fmt / clippy `-D warnings` / `cargo test`(34 个
+`test result: ok`)/ `--mock --headless` 全绿。
+
+**本 plan §3.1 有一处措辞是错的,实现时纠正了**:那里写"窗口 = min(模型的, 网关的, 200k
+兜底)"。兜底**不能**参与 min——参与的话,声明一个真实的 1M 窗口仍然会在 200k 压缩,声明就
+白写了。正确的规则是:两边都没声明时才落到兜底,声明了就在声明的那些里取 min。代码和
+README 按后者写,并且有一条测试专门钉死四种组合。
+
+另外三件：
+
+1. **`clone_with_provider_route` 本来就是 `/provider` 的重建点**(`tui/src/lib.rs` 的
+   `route_changed` 分支),所以第 6 项比 plan 估计的轻得多——不需要把 `context_window` 从
+   `Config` 挪进 `SessionProviderState`,只要让 Config 多记一条"这个预算能不能被重算":
+   新增 `ContextBudgetSource::{Pinned, Catalog { fallback }}`。`KLOOP_CONTEXT_WINDOW` 命名过
+   的数是用户的,切换不许动;其余每次切换按新的 (provider, model) 重新推导。
+2. **`models` 可省略这条语法糖此前并没有实现**,是写验收测试时被测试逼出来的:`parse_profile`
+   一直用 `required_string_array`。现在省略 `models` 等于目录只有 `model` 自己,单模型 provider
+   不必再把模型名写两遍。
+3. **`/effort` 的校验读 `state.catalog()` 而不是 `cfg.provider_catalog`。** 生产里两者是同一个,
+   但活跃的 `SessionProviderState` 才是权威——测试里 `cfg` 和 `state` 可以各带一个 catalog,
+   照 `cfg` 读会校验到一个不是当前在用的目录上。
 
 ## 五、验收
 

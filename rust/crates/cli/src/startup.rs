@@ -996,6 +996,16 @@ pub(crate) fn config_from_settings(
                 .initial_context_window()
                 .or(Some(DEFAULT_CONTEXT_WINDOW))
         }),
+        // A number the env named is the user's, and a `/provider` switch must not
+        // move it; anything else is derived per (provider, model) and re-derived
+        // on every switch.
+        context_budget: if runtime.context_window_env.is_some() {
+            kloop_core::config::ContextBudgetSource::Pinned
+        } else {
+            kloop_core::config::ContextBudgetSource::Catalog {
+                fallback: Some(DEFAULT_CONTEXT_WINDOW),
+            }
+        },
         permissions,
         questioner,
         file_state: Default::default(),

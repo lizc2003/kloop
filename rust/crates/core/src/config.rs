@@ -265,6 +265,18 @@ pub struct EffectiveWorkspace {
 
 /// Everything a turn needs to run. Construction (env parsing, provider
 /// selection) is the caller's concern — see the CLI crate.
+/// Where the session's context budget comes from. A `/provider` switch may
+/// re-derive a catalog-derived budget for the new (provider, model) pair, but
+/// must leave a number the environment named alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextBudgetSource {
+    /// `KLOOP_CONTEXT_WINDOW` named it, including `off`.
+    Pinned,
+    /// Derived from the catalog; `fallback` applies when neither the model nor
+    /// the gateway declares a window.
+    Catalog { fallback: Option<u64> },
+}
+
 ///
 /// `Clone` is a plain field-by-field copy: every shared service stays shared
 /// (the `Arc`s are cloned, not rebuilt), so a clone belongs to the same session
@@ -311,6 +323,9 @@ pub struct Config {
     pub sessions_dir: PathBuf,
     /// Usable context window in tokens; None disables compaction entirely.
     pub context_window: Option<u64>,
+    /// Where `context_window` came from, which decides whether a `/provider`
+    /// switch is allowed to move it.
+    pub context_budget: ContextBudgetSource,
     /// Tool-execution gate; the Arc is shared into sub-agent configs so the
     /// session approval cache is inherited.
     pub permissions: Arc<Permissions>,
@@ -528,8 +543,19 @@ impl Config {
     }
 
     pub fn clone_with_provider_route(&self, provider_route: FrozenProviderRoute) -> Self {
+        // The budget belongs to the (provider, model) pair, not to the session:
+        // switching to a provider with a smaller window and keeping the old
+        // number means the overflow is only discovered by being rejected.
+        let context_window = match self.context_budget {
+            ContextBudgetSource::Pinned => self.context_window,
+            ContextBudgetSource::Catalog { fallback } => self
+                .provider_catalog
+                .effective_window(provider_route.provider_id(), provider_route.primary_model())
+                .or(fallback),
+        };
         Self {
             provider_route,
+            context_window,
             ..self.clone()
         }
     }
@@ -817,5 +843,85 @@ mod subagent_contract_tests {
 
     fn agent_id() -> kloop_protocol::LocalAgentId {
         "agent-7".parse().unwrap()
+    }
+}
+
+/// The compaction budget belongs to the (provider, model) pair, not to the
+/// session: `/provider` rebuilds the Config, and if the budget did not move with
+/// it, switching to a smaller window would only be discovered by being rejected.
+#[cfg(test)]
+mod context_budget_tests {
+    use super::*;
+    use crate::provider_route::ModelKnowledge;
+    use crate::provider_route::ProviderCatalogEntry;
+    use kloop_provider::Provider;
+    use std::collections::BTreeMap;
+
+    fn catalog() -> Arc<ProviderCatalog> {
+        let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
+        let entry = |id: &str, gateway: Option<u64>| ProviderCatalogEntry {
+            id: id.into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            endpoint_fingerprint: fingerprint.clone(),
+            default_model: format!("{id}-model"),
+            models: vec![format!("{id}-model")],
+            context_window: gateway,
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+            default_effort: None,
+            factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+        };
+        Arc::new(
+            ProviderCatalog::new(vec![
+                entry("wide", Some(1_000_000)),
+                entry("narrow", Some(258_400)),
+                entry("bare", None),
+            ])
+            .unwrap()
+            .with_model_knowledge(BTreeMap::from([(
+                "wide-model".to_string(),
+                ModelKnowledge {
+                    context_window: Some(400_000),
+                    efforts: None,
+                },
+            )])),
+        )
+    }
+
+    #[test]
+    fn switching_provider_re_derives_the_budget_unless_the_env_pinned_it() {
+        let catalog = catalog();
+        let route = |id: &str| catalog.initial_route(id, None).unwrap();
+
+        let mut cfg = crate::tools::testutil::TestConfig::new("context-budget")
+            .build()
+            .test_clone();
+        cfg.provider_catalog = Arc::clone(&catalog);
+        cfg.provider_route = route("wide");
+        cfg.context_budget = ContextBudgetSource::Catalog {
+            fallback: Some(200_000),
+        };
+        cfg.context_window = catalog.effective_window("wide", "wide-model");
+
+        // The model takes 400k, the gateway would allow 1M: the model is the cap.
+        assert_eq!(cfg.context_window, Some(400_000));
+        // Switching carries the budget to the new pair rather than keeping 400k.
+        assert_eq!(
+            cfg.clone_with_provider_route(route("narrow"))
+                .context_window,
+            Some(258_400)
+        );
+        // Neither side declares anything for `bare`, so the fallback applies —
+        // it is a floor for the undeclared case, never a third term in the min.
+        assert_eq!(
+            cfg.clone_with_provider_route(route("bare")).context_window,
+            Some(200_000)
+        );
+        // A number the environment named survives the switch untouched.
+        cfg.context_budget = ContextBudgetSource::Pinned;
+        assert_eq!(
+            cfg.clone_with_provider_route(route("narrow"))
+                .context_window,
+            Some(400_000)
+        );
     }
 }
