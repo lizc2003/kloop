@@ -1024,7 +1024,8 @@ mod tests {
     /// wrong the moment `/effort` is used.
     /// A model that declares its levels is taken at its word: `/effort` refuses
     /// an undeclared level on the spot instead of letting the turn find out from
-    /// a 400. `none` is the "do not reason" switch, never gated by the list.
+    /// a 400. `none` is in the list or it is not — it gets no exemption, while
+    /// `unset` never reaches the check at all because it sends no field.
     #[tokio::test]
     async fn effort_refuses_a_level_the_active_model_does_not_declare() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
@@ -1084,8 +1085,8 @@ mod tests {
         )
         .await;
         assert!(accepted.route_changed);
-        // `none` is the switch that turns reasoning off, not a capability level.
-        let off = run_with_provider_state(
+        // `none` is an ordinary level here: the list left it out, so it is out.
+        let refused_none = run_with_provider_state(
             "/effort none",
             &mut history,
             &cfg,
@@ -1094,7 +1095,19 @@ mod tests {
             &cancel,
         )
         .await;
-        assert!(off.route_changed);
+        assert!(!refused_none.route_changed);
+        // `unset` is not a level — it sends no field, so no list can gate it.
+        let unset = run_with_provider_state(
+            "/effort unset",
+            &mut history,
+            &cfg,
+            &state,
+            &SilentUi,
+            &cancel,
+        )
+        .await;
+        assert!(unset.route_changed);
+        assert_eq!(state.effort(), None);
     }
 
     #[tokio::test]

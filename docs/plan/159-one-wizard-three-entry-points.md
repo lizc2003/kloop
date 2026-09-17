@@ -61,9 +61,10 @@ provider 的 `default_effort`,再没有就落 `unset`。
   `deepseek-v4-flash-0731` 实测:不发 effort 字段时模型照样推理(`reasoning_tokens: 64`),
   `effort: "none"` 才真的归零(`reasoning_tokens: 0`,输出连 reasoning block 都没有)。把
   "不发字段"和"发 none"画等号,是把一个真实存在的第三态抹掉。
-- **`none` 永远在列表里**,即使 `[models."<id>"].efforts` 没列它。它是"别推理"的开关而不是
-  能力档位,`provider_config.rs` 的 `effort_supported` 已经对它直接放行;在 Messages rail 上
-  它还是关掉 thinking 的唯一途径。
+- **`none` 没有特殊待遇**,和别的档位一样:声明了 `efforts` 就按声明列,没列 `none` 就不列。
+  (最初设计过"`none` 永远在列表里",2026-09-17 推翻——它在 `chat`/`responses` 两条 rail 上是
+  普通 wire 值,模型可以拒绝,豁免它等于放过列表本来要挡的那个值。见 plan 158 §四之四。)
+  `unset` 则始终在列表里:它不是档位,发的是"没有 effort 字段",没有列表能约束它。
 
 其余档位**只列该模型声明过的**(plan 158 的 `[models."<id>"].efforts`)。这让知识段有了第二个
 用途,也让"声明写漏了"这件事从"某天 `/effort xhigh` 莫名被拒"变成"列表里肉眼可见地少一行",

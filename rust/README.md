@@ -255,9 +255,13 @@ accepts. Omitting the key declares nothing and every level is allowed — the
 provider still gets to refuse. Declaring it makes the check local: a configured
 `effort` outside the list fails at startup, and `/effort` refuses on the spot
 instead of spending a request to find out. An empty array is rejected rather than
-read as "supports nothing" (write `["none"]` for that), and `none` is never
-gated — it is the switch that turns reasoning off, and on the Messages rail it is
-the only way to do so.
+read as "supports nothing" — write `["none"]` for that. **A declared list means
+exactly that list, `none` included**: on the two OpenAI rails `none` leaves kloop
+as an ordinary wire value (`"effort": "none"`) that a model can reject like any
+other, so exempting it would wave through the one value the list was written to
+exclude. A model that should be allowed to stop reasoning lists `none`.
+`/effort unset` is a different thing and no list gates it — it sends no effort
+field at all, so there is nothing for a model to accept or reject.
 
 ## Session persistence (Phase 2, second slice)
 

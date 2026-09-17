@@ -963,9 +963,9 @@ http_headers = { Authorization = "Bearer key" }
     }
 
     /// `efforts` is a claim the user made after testing, so it is checked at
-    /// startup rather than at the first 400. Not declaring it is not the same as
-    /// declaring nothing, and `none` is the "do not reason" switch rather than a
-    /// capability level, so it is never refused.
+    /// startup rather than at the first 400. Declaring nothing means no limit;
+    /// declaring a list means exactly that list, `none` included — on the OpenAI
+    /// rails it is an ordinary wire value a model can reject.
     #[test]
     fn declared_efforts_gate_the_configured_effort_at_startup() {
         let with_effort = |effort: &str, models: &str| {
@@ -985,8 +985,12 @@ http_headers = { Authorization = "Bearer key" }
         assert!(with_effort("high", narrow).is_ok());
         // Undeclared model: nothing to check against, the provider still refuses.
         assert!(with_effort("max", "").is_ok());
-        // `none` turns reasoning off and is never gated by the list.
-        assert!(with_effort("none", narrow).is_ok());
+        // `none` gets no exemption: a list that leaves it out leaves it out.
+        assert_eq!(
+            with_effort("none", narrow).unwrap_err().to_string(),
+            "effort 'none' is not among the efforts declared for model 'm' (declared: low, high)"
+        );
+        assert!(with_effort("none", "[models.m]\nefforts = [\"none\", \"low\"]\n").is_ok());
     }
 
     #[test]

@@ -95,10 +95,10 @@ context_window = 262144
   误拦合法的(`medium` 是一等档位,`/effort` 的错误信息里就列着),而且会把"没声明"
   报成"不支持",是句假话。
 - **`efforts = []` 拒绝解析**,当手滑处理。要表达"别推理"就写 `["none"]`。
-- **`none` 不受 `efforts` 约束**,任何模型都放行。它在 messages rail 上根本不是一个
-  effort 值——`provider/src/lib.rs:525` 把它翻译成 `thinking: {type: "disabled"}`,
-  是**关闭思考的唯一开关**。被 `efforts` 排除掉的话,没写 `efforts` 的 anthropic 模型
-  就关不掉 thinking 了。
+- ~~**`none` 不受 `efforts` 约束**,任何模型都放行。~~ **⛔ 这条已被推翻(2026-09-17,
+  见 §四之四)**。当时的理由是"`none` 在 messages rail 上不是 effort 值",但那只覆盖三条 rail
+  里的一条:`chat` 和 `responses` 会把它当普通 wire 值发出去(`"effort": "none"`),模型完全
+  可以拒绝。**现在的规则是:声明了就是那些,`none` 不例外。**
 - **兜底常量不是知识**。`DEFAULT_CONTEXT_WINDOW = 200_000`(`startup.rs`)保留,它的注释
   已经写明定位("has to be safe for the smallest model anyone routes to")——它不声称
   任何模型是 200k,只保证什么都没写时不炸。
@@ -232,6 +232,41 @@ README 按后者写,并且有一条测试专门钉死四种组合。
 3. **`/effort` 的校验读 `state.catalog()` 而不是 `cfg.provider_catalog`。** 生产里两者是同一个,
    但活跃的 `SessionProviderState` 才是权威——测试里 `cfg` 和 `state` 可以各带一个 catalog,
    照 `cfg` 读会校验到一个不是当前在用的目录上。
+
+## 四之四、✅ `none` 的豁免被推翻(2026-09-17,提交 SHA 以本条所在提交为准)
+
+> 来源:用户读完实现后问「如果 efforts 没有 none,会允许 none 吗?」——当时的答案是"允许",
+> 查下来这个豁免的理由站不住。用户拍板:**「缺省包含,如果用户列举了,没有 none,就不允许
+> none」**。
+
+**当时错在哪。** §3.1 写的理由是"`none` 在 messages rail 上不是一个 effort 值,而是
+`thinking: {type:"disabled"}`"。这句本身没错,但它只覆盖三条 rail 里的一条:
+
+| rail | `none` 怎么走 | 模型能拒绝吗 |
+|---|---|---|
+| `messages` | 翻译成 thinking disabled,**不发 effort 字段** | 不能 |
+| `chat` | `"reasoning_effort": "none"` | **能** |
+| `responses` | `"reasoning": {"effort":"none", …}` | **能** |
+
+在 OpenAI 那两条 rail 上 `none` 就是个普通 wire 值。于是豁免它的后果正好相反:**谁的
+`efforts` 不写 `none` 恰恰是因为实测它被拒,kloop 反而会放行这个已知会失败的值**——放过的
+正是这份清单写出来要挡的那一个。
+
+顺带,"messages rail 上是关掉 thinking 的唯一开关"也不准确:provider 配置里还有
+`thinking = "off"`。`none` 只是**运行时**关掉它的唯一途径。
+
+**现在的规则,一句话且零例外:**
+
+> 不声明 `efforts` = 不设限(六档全放行);声明了 = 就是那些,`none` 不例外。
+
+想让某个模型能停止推理,就把 `none` 写进它的列表。中途我提过一个"按 rail 区分"的方案
+(messages 放行、OpenAI 两条受约束),被用户否掉——它需要 `effort_supported` 多知道一个
+rail、签名和两处调用点都要改,而换来的只是省掉在列表里多打五个字符。**一个不需要解释的
+规则,胜过一个正确但要解释的例外。**
+
+**`unset` 不在此列,而且不需要特例撑着**:它在 `/effort` 里是 `target: None`,压根不进
+`effort_supported`——发出去的是"没有 effort 字段",没有值可供模型接受或拒绝。这一条现在有
+测试钉着(`/effort none` 被拒的同时 `/effort unset` 通过)。
 
 ## 五、验收
 

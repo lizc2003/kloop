@@ -156,15 +156,17 @@ impl ProviderCatalog {
         }
     }
 
-    /// Whether this model accepts that reasoning level. An undeclared model
-    /// accepts everything (the provider still gets to refuse), and `none` is
-    /// always accepted because it is the "do not reason" switch rather than a
-    /// capability level — on the Messages rail it is the only way to turn
-    /// thinking off at all.
+    /// Whether this model accepts that reasoning level. Declaring nothing means
+    /// no limit — every level passes and the provider still gets to refuse.
+    /// Declaring a list means exactly that list, **`none` included**: on the two
+    /// OpenAI rails `none` is an ordinary wire value (`"effort": "none"`) that a
+    /// model can reject like any other, so exempting it would wave through the
+    /// one value the list was written to exclude. One rule, no exceptions —
+    /// a model that should be allowed to stop reasoning lists `none`.
+    ///
+    /// `/effort unset` is a different thing and never reaches here: it sends no
+    /// effort field at all, so there is nothing for a model to accept or reject.
     pub fn effort_supported(&self, model: &str, effort: ReasoningEffort) -> bool {
-        if effort == ReasoningEffort::None {
-            return true;
-        }
         match self
             .model_knowledge
             .get(model)
