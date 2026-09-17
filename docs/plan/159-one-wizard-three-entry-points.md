@@ -102,6 +102,39 @@ picker 走完发 `/provider <id> <model> <effort>` 一条。**不要发 `/provid
 - `/model` 进 slash 补全菜单与 `/help`。
 - fmt / clippy `-D warnings` / `cargo test` / `--mock --headless` 全绿;README 的命令一节同步。
 
+## 六、附录:2026-09-17 的实测数据(§3.2 的依据)
+
+对 `deepseek-v4-flash-0731`(走 gw-cn 的 responses 端点)实测。**这些是那一天、那个网关、
+那个模型的测量,不是普适事实**——换模型或换网关要重测,别当常量用。
+
+**(a) 哪些档位不被拒。** `cargo test -p kloop-provider --test effort_probe -- --ignored --nocapture`
+(env:`KLOOP_PROVIDER=openai-responses` + `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`),
+七行全是 `ACCEPTED`——包括 `max`。**"不被拒"是这个探针能回答的全部**,它不报告档位有没有生效。
+探针档间 sleep 45 秒(被限流的代理会对每行返 429,那就什么都测不出来),跑完约 5 分半。
+
+**(b) 有没有生效。** 同一道简单题,直接打 `/v1/responses` 看 `usage`:
+
+| effort | reasoning_tokens | output |
+|---|---:|---|
+| (不发字段) | 64 | reasoning+message |
+| `none` | **0** | **message** |
+| low / medium / high / xhigh / max | 53~110 | reasoning+message |
+
+**`none` 是真开关**(归零,连 reasoning block 都不再产生),而**"不发字段" ≠ `none`**——这就是
+§3.2 要求 `unset` 独立成项的实测依据。中间几档在这道题上没拉开差距,因为题太简单。
+
+**(c) 档位之间有没有区分度。** 换一道真需要算的题(求 n! 恰好 100 个尾零),跑两轮:
+
+| effort | 第一轮 | 第二轮 |
+|---|---:|---:|
+| low | 509 | 691 |
+| high | 1166 | 1629 |
+| max | **5418** | **665** |
+
+`low → high` 两轮都稳定翻倍以上,**档位确实生效**;但 `max` 两轮差了八倍。n=2 下不了强结论,
+够说明的是 **`max` 的成本不可预测**——如果将来要给 effort 那一级的 detail 写一句人话,`max`
+那行值得提这一点。
+
 ## 五、非目标
 
 - **不改 `choice.rs` 的渲染模型。** plan 104 定的内联面板照用,本 plan 只多喂一级数据。
