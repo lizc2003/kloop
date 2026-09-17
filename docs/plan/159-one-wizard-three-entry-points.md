@@ -103,7 +103,7 @@ picker 走完发 `/provider <id> <model> <effort>` 一条。**不要发 `/provid
 - `/model` 进 slash 补全菜单与 `/help`。
 - fmt / clippy `-D warnings` / `cargo test` / `--mock --headless` 全绿;README 的命令一节同步。
 
-## 四之二、✅ 2026-09-17 完成(提交 25e6c1c)
+## 四之二、✅ 2026-09-17 完成(提交 a8aabd7)
 
 验收全过,外加两处 plan 没写到的:
 
