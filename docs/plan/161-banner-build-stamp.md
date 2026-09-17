@@ -64,6 +64,15 @@ build script。剔掉是安全的:`refs/heads/main` 与 `packed-refs` 这两种�
 自然改挂 `packed-refs`。linked worktree 里 `HEAD` 在自己的 gitdir、refs 在 common dir,
 所以 ref 用 `--git-common-dir` 解析。
 
+### 七、`-V`/`--version`(用户追加)
+
+横幅之外再给一个不用起会话就能问的入口,输出与横幅同一条串:`kloop v0.1.0 (2319ea3)`。
+和 `--help`/`--list-sessions` 一样是 **local fast path**——在解析 provider 凭据、加载 runtime、
+连 MCP 之前就返回,配置坏了也答得出来。
+
+**不占 `-v`**:小写那个字母读起来是 verbose,留给将来;`-v` 仍然落在未知参数那条错误上,
+并有一条测试钉住这件事。
+
 ## 顺带修掉的一个真 bug:框比终端宽 2 列
 
 `cap = width.saturating_sub(2)` 只减了两条竖线,可一行的 chrome 是**四列**(`│ ` … ` │`)。
@@ -80,8 +89,9 @@ build script。剔掉是安全的:`refs/heads/main` 与 `packed-refs` 这两种�
 - `app.rs` / `lib.rs`:`Cell::SessionHeader` 加 `version` 字段,`run()` 加参数,
   main.rs 在调用点传 `version_string()`。
 - `tui_pty_support`:被测二进制注入 `KLOOP_VERSION=v0.0.0 (0000000)`。
+- `CliArgs` 加 `version: bool`,`-V`/`--version` 在 main.rs 的 help 分支旁边退出。
 
-## ✅ 验收(2026-09-17,一次提交;提交号以本条所在提交为准)
+## ✅ 验收(2026-09-17,两次提交:第二次是用户要的 `--version`;提交号以本条所在提交为准)
 
 `cargo fmt` + `cargo clippy --workspace --all-targets --all-features -D warnings`(零警告)
 + `cargo test --workspace` 全绿。另外用 `strings` 核过 debug 二进制里确实嵌着当前 HEAD 的
@@ -93,5 +103,9 @@ build script。剔掉是安全的:`refs/heads/main` 与 `packed-refs` 这两种�
 | `render::session_header_renders_a_branded_box_with_fields` | 戳在标题行上,和 `>_ kloop` 同一行 |
 | `render::session_header_drops_the_build_stamp_before_truncating_it` | 窄终端整条丢掉而不是截半个 sha;框不超过终端宽度(cap 修正的回归) |
 | `tui_pty` 六张整屏基线 | 真二进制跑出来的横幅新宽度 |
+| `args::parse_args_version_flag` | `-V` 与 `--version` 两种拼法都只动 version 一个字段;`-v` 仍是未知参数 |
+| `args::parse_args_help_flag` | usage 文本里点名 `-V, --version` |
 
-README 同步两处:横幅段(戳的含义、两个 env、窄屏行为)、整屏基线的规范化清单。
+README 同步三处:横幅段(戳的含义、两个 env、窄屏行为)、整屏基线的规范化清单、
+local fast path 段(`--version` 与不占 `-v`)。实跑核过 `kloop --version` / `-V` 输出
+`kloop v0.1.0 (36fd556)`,`-v` 报未知参数。

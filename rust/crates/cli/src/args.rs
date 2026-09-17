@@ -56,6 +56,9 @@ pub(crate) struct CliArgs {
     pub(crate) mock: bool,
     /// `-h`/`--help`: print the usage summary and exit.
     pub(crate) help: bool,
+    /// `-V`/`--version`: print the build stamp and exit. `-v` stays free for a
+    /// future verbose flag, which is what the lowercase letter reads as.
+    pub(crate) version: bool,
     /// `--permission-mode <mode>`: the gating mode for this session. `manual`
     /// (the default when the flag is omitted — ask for anything unvouched-for),
     /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
@@ -99,6 +102,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     let mut parsed = CliArgs {
         mock: false,
         help: false,
+        version: false,
         permission_mode: Mode::Manual,
         list_sessions: false,
         all: false,
@@ -116,6 +120,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => parsed.help = true,
+            "-V" | "--version" => parsed.version = true,
             "--mock" => parsed.mock = true,
             "--permission-mode" => {
                 let raw = match args.get(i + 1) {
@@ -200,7 +205,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-h/--help | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions [--all])"
+                "unknown argument '{other}' (-h/--help | -V/--version | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions [--all])"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -273,6 +278,7 @@ pub(crate) fn help_text() -> &'static str {
      \n\
      OTHER:\n\
      \x20   -h, --help            show this help and exit\n\
+     \x20   -V, --version         show the version and build commit, then exit\n\
      \n\
      All persistent runtime/provider configuration: ~/.kloop/config.toml (KLOOP_* / provider env may override).\n\
      Cwd selects the workspace; it is never an automatic config source.\n"
@@ -525,6 +531,7 @@ mod tests {
         CliArgs {
             mock: false,
             help: false,
+            version: false,
             permission_mode: Mode::Manual,
             list_sessions: false,
             all: false,
@@ -763,6 +770,26 @@ mod tests {
         );
     }
 
+    /// `-V`/`--version` is its own exit path, and neither spelling touches any
+    /// other field. `-v` is NOT it: the lowercase letter stays unparsed so a
+    /// later verbose flag can have it.
+    #[test]
+    fn parse_args_version_flag() {
+        for spelling in ["-V", "--version"] {
+            assert_eq!(
+                parse_args(&strings(&[spelling])).unwrap(),
+                CliArgs {
+                    version: true,
+                    ..base()
+                }
+            );
+        }
+        assert!(
+            parse_args(&strings(&["-v"])).is_err(),
+            "-v is not --version"
+        );
+    }
+
     #[test]
     fn parse_args_help_flag() {
         assert_eq!(
@@ -789,6 +816,7 @@ mod tests {
             "--serve",
             "-c, --continue",
             "-r, --resume",
+            "-V, --version",
         ] {
             assert!(help.contains(needle), "help missing {needle}");
         }

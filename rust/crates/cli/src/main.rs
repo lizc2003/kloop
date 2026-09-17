@@ -264,6 +264,12 @@ async fn main() -> Result<ExitCode> {
         print!("{}", args::help_text());
         return Ok(ExitCode::SUCCESS);
     }
+    // Same one line the banner shows, so "which build is this" has an answer
+    // that does not require starting a session (plan 161).
+    if args.version {
+        println!("kloop {}", version_string());
+        return Ok(ExitCode::SUCCESS);
+    }
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     // Session storage resolves before the user config is parsed: `--list-sessions`
     // must keep working when `~/.kloop/config.toml` is broken, so the store needs

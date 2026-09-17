@@ -3236,8 +3236,12 @@ mode already covers the programmatic side): `--permission-prompt-tool`
 delegation, `--input-format stream-json`, budget/goal guardrails,
 `--output-schema`. See `docs/plan/33-exec-mode.md`.
 
-`--help` and `--list-sessions` are local fast paths: they return before provider
-credential resolution, runtime loading, and MCP connection. They remain usable with a
+`--help`, `-V`/`--version`, and `--list-sessions` are local fast paths: they
+return before provider credential resolution, runtime loading, and MCP
+connection. `--version` prints the same stamp the banner carries
+(`kloop v0.1.0 (2319ea3)`, plan 161), so "which build is this" is answerable
+without starting a session; `-v` is deliberately not an alias, leaving the
+lowercase letter for a future verbose flag. They remain usable with a
 missing key or malformed provider config. The headless, provider, and compaction
 contract regressions added in Plan 84 use only local fixtures; the retired claw-code
 snapshot is not a runtime dependency.
