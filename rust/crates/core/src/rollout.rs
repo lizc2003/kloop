@@ -569,7 +569,6 @@ impl Rollout {
                 "mock",
             ),
             primary_model: "mock".into(),
-            fallback_model: None,
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         };
@@ -878,12 +877,7 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
                 .rev()
                 .find(|route| route.boundary < boundary)
                 .ok_or_else(|| invalid("provider usage precedes the initial route".into()))?;
-            let model_matches = match record.attempt_kind {
-                kloop_protocol::ProviderAttemptKind::Primary => record.model == route.primary_model,
-                kloop_protocol::ProviderAttemptKind::Fallback => {
-                    route.fallback_model.as_deref() == Some(record.model.as_str())
-                }
-            };
+            let model_matches = record.model == route.primary_model;
             if record.route_revision != route.revision
                 || record.provider_id != route.provider_id
                 || record.api_family != route.api_family
@@ -1773,7 +1767,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             route_revision: 1,
             model: "mock".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: crate::usage::UsageOperation::Sampling,
             usage: kloop_protocol::Usage {
                 input_tokens,
@@ -1796,7 +1789,6 @@ mod tests {
                 "mock",
             ),
             primary_model: "mock".into(),
-            fallback_model: None,
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
@@ -1841,7 +1833,6 @@ mod tests {
                         "mock",
                     ),
                     model: "mock".into(),
-                    attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
                 },
             ),
             Message::tool_results(vec![tool_result("t1")]),
@@ -1882,7 +1873,6 @@ mod tests {
                 "apiFamily": "mock",
                 "routeRevision": 1,
                 "model": "mock",
-                "attemptKind": "primary",
                 "operation": "sampling",
                 "usage": {
                     "input_tokens": 120,
@@ -2697,7 +2687,6 @@ mod tests {
             provider,
             "chat-model",
             vec!["chat-model".into()],
-            None,
         )
         .unwrap();
         let route = catalog.initial_route("chat", Some("chat-model")).unwrap();
@@ -2729,7 +2718,6 @@ mod tests {
                 "mock",
             ),
             model: "mock".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
         };
         let assistant = Message::assistant_from_provider(
             vec![ContentBlock::Thinking {
@@ -3197,7 +3185,6 @@ mod tests {
                 "mock",
             ),
             model: "mock".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
         };
         rollout
             .append_message(&Message::assistant_from_provider(

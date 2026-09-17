@@ -386,7 +386,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             route_revision: 1,
             model: "primary".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: UsageOperation::Sampling,
             usage: Usage::default(),
         });
@@ -407,7 +406,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             route_revision: 1,
             model: "fallback".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Fallback,
             operation: UsageOperation::Compaction,
             usage: Usage {
                 input_tokens: 10,
@@ -452,7 +450,6 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 route_revision: 1,
                 model: "primary".into(),
-                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
                 operation: UsageOperation::Sampling,
                 usage,
             });
@@ -515,7 +512,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             route_revision: 1,
             model: "model".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: UsageOperation::Sampling,
             usage: Usage {
                 input_tokens: 1,
@@ -1038,7 +1034,6 @@ mod tests {
                     endpoint_fingerprint: "responses:test".into(),
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
-                    fallback_model: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
@@ -1119,7 +1114,6 @@ mod tests {
                     endpoint_fingerprint: "responses:test".into(),
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
-                    fallback_model: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),

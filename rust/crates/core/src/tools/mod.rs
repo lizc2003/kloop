@@ -1828,7 +1828,6 @@ pub(crate) mod testutil {
                     self.provider,
                     self.primary_model,
                     self.allowed_models,
-                    None,
                 )
                 .expect("test provider route is valid");
             let (offload_dir, sessions_dir) = match self.dirs {

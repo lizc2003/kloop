@@ -66,7 +66,6 @@ impl ResolvedProviderSettings {
             Provider::mock(Vec::new()),
             "mock",
             vec!["mock".into()],
-            None,
         )
         .expect("built-in mock catalog is valid");
         Self {
@@ -103,9 +102,8 @@ struct Profile {
     wire: Rail,
     base_url: String,
     headers: BTreeMap<String, String>,
-    default_model: String,
+    model: String,
     models: Vec<String>,
-    fallback_model: Option<String>,
     cache: bool,
     thinking: ThinkingMode,
     effort: Option<ReasoningEffort>,
@@ -118,11 +116,7 @@ struct Profile {
 }
 
 struct GlobalFile {
-    initial_model: Option<String>,
     initial_provider: String,
-    /// Root `effort`: the rail-agnostic level a session starts at, overriding
-    /// the selected profile's own `effort` (same key, wider scope).
-    initial_effort: Option<ReasoningEffort>,
     profiles: BTreeMap<String, Profile>,
 }
 
@@ -166,8 +160,7 @@ fn resolve_table(
     };
     let initial_model = rail_model
         .or(nonempty_env(env, "KLOOP_MODEL")?)
-        .or(file.initial_model)
-        .unwrap_or_else(|| profile.default_model.clone());
+        .unwrap_or_else(|| profile.model.clone());
     if !profile.models.iter().any(|model| model == &initial_model) {
         bail!(
             "initial model '{initial_model}' is not in provider '{initial_provider}' models allowlist"
@@ -176,7 +169,6 @@ fn resolve_table(
     // Read before the loop below moves the profiles out.
     let initial_context_window = profile.context_window;
 
-    let root_effort = file.initial_effort;
     let mut entries = Vec::with_capacity(file.profiles.len());
     for (id, profile) in file.profiles {
         let selected = id == initial_provider;
@@ -192,7 +184,7 @@ fn resolve_table(
         let wire = profile.wire;
         let cache = profile.cache;
         let thinking = profile.thinking;
-        let default_effort = selected_effort(&profile, selected, root_effort, env)?;
+        let default_effort = selected_effort(&profile, selected, env)?;
         let factory = Arc::new(move || {
             let key = credential
                 .clone()
@@ -218,9 +210,8 @@ fn resolve_table(
             id,
             api_family,
             endpoint_fingerprint,
-            default_model: profile.default_model,
+            default_model: profile.model,
             models: profile.models,
-            fallback_model: profile.fallback_model,
             availability,
             default_effort,
             factory,
@@ -239,13 +230,14 @@ fn resolve_table(
 }
 
 fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
-    let id = nonempty_env(env, "KLOOP_PROVIDER")?
-        .context("no provider configured: set KLOOP_PROVIDER or declare model_provider in ~/.kloop/config.toml")?;
+    let id = nonempty_env(env, "KLOOP_PROVIDER")?.context(
+        "no provider configured: set KLOOP_PROVIDER or declare provider in ~/.kloop/config.toml",
+    )?;
     let wire = match id.as_str() {
         "anthropic" => Rail::Anthropic,
         "openai" | "openai-compat" => Rail::OpenAiChat,
         "openai-responses" => Rail::OpenAiResponses,
-        _ => bail!("provider '{id}' requires a declared model_providers profile"),
+        _ => bail!("provider '{id}' requires a declared providers profile"),
     };
     let model = match wire {
         Rail::Anthropic => nonempty_env(env, "ANTHROPIC_MODEL")?,
@@ -283,9 +275,8 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         wire,
         base_url,
         headers,
-        default_model: model.clone(),
-        models: vec![model.clone()],
-        fallback_model: None,
+        model: model.clone(),
+        models: vec![model],
         cache: wire == Rail::Anthropic,
         thinking: ThinkingMode::Unset,
         // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
@@ -295,9 +286,7 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         context_window: None,
     };
     Ok(GlobalFile {
-        initial_model: Some(model),
         initial_provider: id.clone(),
-        initial_effort: None,
         profiles: BTreeMap::from([(id, profile)]),
     })
 }
@@ -317,20 +306,19 @@ fn selected_base(
     Ok(profile.base_url.clone())
 }
 
-/// The effort this provider starts a session at: `KLOOP_EFFORT` beats the root
-/// root `effort`, which beats the profile's own `effort`. Like the
-/// base URL and credential overrides, the two global sources apply only to the
-/// selected provider — they must not silently retarget the others. Only the
-/// spelling is checked (at parse time): which levels are legal belongs to the
-/// model, not the wire, and the provider names its own supported set on refusal.
+/// The effort this provider starts a session at: `KLOOP_EFFORT` beats the
+/// profile's own `effort`. Like the base URL and credential overrides, the env
+/// source applies to the selected provider only — it must not silently retarget
+/// the others. Only the spelling is checked (at parse time): which levels are
+/// legal belongs to the model, not the wire, and the provider names its own
+/// supported set on refusal.
 fn selected_effort(
     profile: &Profile,
     selected: bool,
-    root: Option<ReasoningEffort>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<ReasoningEffort>> {
     Ok(if selected {
-        parse_effort_env(env)?.or(root).or(profile.effort)
+        parse_effort_env(env)?.or(profile.effort)
     } else {
         profile.effort
     })
@@ -365,33 +353,24 @@ fn selected_credential(
 }
 
 fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
-    let initial_model = optional_string(table, "model", "model")?;
-    let initial_effort = optional_string(table, "effort", "effort")?
-        .map(|raw| {
-            raw.parse::<ReasoningEffort>()
-                .map_err(|e| anyhow!("effort: {e}"))
-        })
-        .transpose()?;
-    let initial_provider = optional_string(table, "model_provider", "model_provider")?
-        .context("model_provider is required")?;
+    let initial_provider =
+        optional_string(table, "provider", "provider")?.context("provider is required")?;
     let providers = table
-        .get("model_providers")
+        .get("providers")
         .and_then(Value::as_table)
-        .context("model_providers must be a table")?;
+        .context("providers must be a table")?;
     let mut profiles = BTreeMap::new();
     for (id, value) in providers {
         let spec = value
             .as_table()
-            .with_context(|| format!("model_providers.{id} must be a table"))?;
+            .with_context(|| format!("providers.{id} must be a table"))?;
         profiles.insert(id.clone(), parse_profile(id, spec)?);
     }
     if !profiles.contains_key(&initial_provider) {
-        bail!("model_provider '{initial_provider}' has no matching model_providers profile");
+        bail!("provider '{initial_provider}' has no matching providers profile");
     }
     Ok(GlobalFile {
-        initial_model,
         initial_provider,
-        initial_effort,
         profiles,
     })
 }
@@ -404,78 +383,62 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "wire_api"
                 | "base_url"
                 | "http_headers"
-                | "default_model"
+                | "model"
                 | "models"
-                | "fallback_model"
                 | "cache"
                 | "thinking"
                 | "effort"
                 | "context_window"
         ) {
-            bail!("model_providers.{id} has unknown key '{key}'");
+            bail!("providers.{id} has unknown key '{key}'");
         }
     }
-    let _display_name = optional_string(spec, "name", &format!("model_providers.{id}.name"))?;
+    let _display_name = optional_string(spec, "name", &format!("providers.{id}.name"))?;
     let wire = parse_wire(
-        &required_string(spec, "wire_api", &format!("model_providers.{id}.wire_api"))?,
+        &required_string(spec, "wire_api", &format!("providers.{id}.wire_api"))?,
         id,
     )?;
-    let default_model = required_string(
-        spec,
-        "default_model",
-        &format!("model_providers.{id}.default_model"),
-    )?;
-    let models = required_string_array(spec, "models", &format!("model_providers.{id}.models"))?;
-    if !models.iter().any(|model| model == &default_model) {
-        bail!("model_providers.{id}.default_model '{default_model}' is not in models allowlist");
+    let model = required_string(spec, "model", &format!("providers.{id}.model"))?;
+    let models = required_string_array(spec, "models", &format!("providers.{id}.models"))?;
+    if !models.iter().any(|candidate| candidate == &model) {
+        bail!("providers.{id}.model '{model}' is not in models allowlist");
     }
-    let fallback_model = optional_string(
-        spec,
-        "fallback_model",
-        &format!("model_providers.{id}.fallback_model"),
-    )?;
-    if let Some(fallback) = fallback_model.as_ref()
-        && !models.iter().any(|model| model == fallback)
-    {
-        bail!("model_providers.{id}.fallback_model '{fallback}' is not in models allowlist");
-    }
-    let base_url = optional_string(spec, "base_url", &format!("model_providers.{id}.base_url"))?
+    let base_url = optional_string(spec, "base_url", &format!("providers.{id}.base_url"))?
         .unwrap_or_else(|| wire.default_base().to_string());
-    let base_url = validate_base_url(&base_url, &format!("model_providers.{id}.base_url"))?;
-    let cache = optional_bool(spec, "cache", &format!("model_providers.{id}.cache"))?
+    let base_url = validate_base_url(&base_url, &format!("providers.{id}.base_url"))?;
+    let cache = optional_bool(spec, "cache", &format!("providers.{id}.cache"))?
         .unwrap_or(wire == Rail::Anthropic);
-    let effort = optional_string(spec, "effort", &format!("model_providers.{id}.effort"))?
+    let effort = optional_string(spec, "effort", &format!("providers.{id}.effort"))?
         .map(|raw| {
             raw.parse::<ReasoningEffort>()
-                .map_err(|e| anyhow!("model_providers.{id}.effort: {e}"))
+                .map_err(|e| anyhow!("providers.{id}.effort: {e}"))
         })
         .transpose()?;
     let thinking = match spec.get("thinking") {
         None => ThinkingMode::Unset,
         Some(Value::String(raw)) => {
-            parse_thinking_string(raw, &format!("model_providers.{id}.thinking"))?
+            parse_thinking_string(raw, &format!("providers.{id}.thinking"))?
         }
         Some(Value::Integer(raw)) if *raw > 0 => ThinkingMode::Budget(*raw as u64),
         Some(_) => {
-            bail!("model_providers.{id}.thinking must be 'off', 'adaptive', or a positive integer")
+            bail!("providers.{id}.thinking must be 'off', 'adaptive', or a positive integer")
         }
     };
     if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
-        bail!("model_providers.{id}: cache/thinking are only valid for messages wire_api");
+        bail!("providers.{id}: cache/thinking are only valid for messages wire_api");
     }
     let context_window = optional_integer(
         spec,
         "context_window",
-        &format!("model_providers.{id}.context_window"),
+        &format!("providers.{id}.context_window"),
     )?;
     let headers = parse_headers(id, spec.get("http_headers"), wire)?;
     Ok(Profile {
         wire,
         base_url,
         headers,
-        default_model,
+        model,
         models,
-        fallback_model,
         cache,
         thinking,
         effort,
@@ -515,7 +478,7 @@ fn parse_headers(id: &str, value: Option<&Value>, wire: Rail) -> Result<BTreeMap
     };
     let table = value
         .as_table()
-        .with_context(|| format!("model_providers.{id}.http_headers must be a table"))?;
+        .with_context(|| format!("providers.{id}.http_headers must be a table"))?;
     for (header, value) in table {
         let folded = header.to_ascii_lowercase();
         let allowed = match wire {
@@ -523,24 +486,21 @@ fn parse_headers(id: &str, value: Option<&Value>, wire: Rail) -> Result<BTreeMap
             Rail::OpenAiChat | Rail::OpenAiResponses => folded == "authorization",
         };
         if !allowed {
-            bail!("model_providers.{id}.http_headers contains unsupported header '{header}'");
+            bail!("providers.{id}.http_headers contains unsupported header '{header}'");
         }
-        let value = value.as_str().with_context(|| {
-            format!("model_providers.{id}.http_headers.{header} must be a string")
-        })?;
-        let value = nonempty(
-            value,
-            &format!("model_providers.{id}.http_headers.{header}"),
-        )?;
+        let value = value
+            .as_str()
+            .with_context(|| format!("providers.{id}.http_headers.{header} must be a string"))?;
+        let value = nonempty(value, &format!("providers.{id}.http_headers.{header}"))?;
         if headers.insert(folded, value).is_some() {
-            bail!("model_providers.{id}.http_headers contains a duplicate header");
+            bail!("providers.{id}.http_headers contains a duplicate header");
         }
     }
     if wire != Rail::Anthropic
         && let Some(value) = headers.get("authorization")
         && bearer_from_header(value).is_none()
     {
-        bail!("model_providers.{id}.http_headers.Authorization must use Bearer authentication");
+        bail!("providers.{id}.http_headers.Authorization must use Bearer authentication");
     }
     Ok(headers)
 }
@@ -550,7 +510,7 @@ fn parse_wire(raw: &str, id: &str) -> Result<Rail> {
         "messages" => Ok(Rail::Anthropic),
         "chat" => Ok(Rail::OpenAiChat),
         "responses" => Ok(Rail::OpenAiResponses),
-        _ => bail!("model_providers.{id}.wire_api must be messages | chat | responses"),
+        _ => bail!("providers.{id}.wire_api must be messages | chat | responses"),
     }
 }
 
@@ -670,30 +630,29 @@ mod tests {
     }
 
     const CATALOG: &str = r#"
-model_provider = "anthropic-a"
+provider = "anthropic-a"
 
-[model_providers.anthropic-a]
+[providers.anthropic-a]
 wire_api = "messages"
 base_url = "https://anthropic-a.example"
 http_headers = { x-api-key = "a-key" }
-default_model = "claude-a"
+model = "claude-a"
 models = ["claude-a", "claude-b", "claude-a"]
-fallback_model = "claude-b"
 cache = false
 thinking = "adaptive"
 
-[model_providers.responses-b]
+[providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
 http_headers = { Authorization = "Bearer b-key" }
-default_model = "gpt-a"
+model = "gpt-a"
 models = ["gpt-a", "gpt-b"]
 effort = "high"
 
-[model_providers.chat-c]
+[providers.chat-c]
 wire_api = "chat"
 base_url = "https://chat-c.example/v1"
-default_model = "chat-a"
+model = "chat-a"
 models = ["chat-a", "shared"]
 "#;
 
@@ -703,21 +662,21 @@ models = ["chat-a", "shared"]
     #[test]
     fn context_window_comes_from_the_selected_provider_only() {
         let table: toml::Table = r#"
-model_provider = "responses-b"
+provider = "responses-b"
 
-[model_providers.anthropic-a]
+[providers.anthropic-a]
 wire_api = "messages"
 base_url = "https://anthropic-a.example"
 http_headers = { x-api-key = "a-key" }
-default_model = "claude-a"
+model = "claude-a"
 models = ["claude-a"]
 context_window = 111000
 
-[model_providers.responses-b]
+[providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
 http_headers = { Authorization = "Bearer b-key" }
-default_model = "gpt-a"
+model = "gpt-a"
 models = ["gpt-a"]
 context_window = 258400
 "#
@@ -753,13 +712,13 @@ context_window = 258400
         ] {
             let table: toml::Table = format!(
                 r#"
-model_provider = "responses-b"
+provider = "responses-b"
 
-[model_providers.responses-b]
+[providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
 http_headers = {{ Authorization = "Bearer b-key" }}
-default_model = "gpt-a"
+model = "gpt-a"
 models = ["gpt-a"]
 {raw}
 "#
@@ -782,7 +741,6 @@ models = ["gpt-a"]
         let descriptors = settings.catalog().descriptors();
         assert_eq!(descriptors.len(), 3);
         assert_eq!(descriptors[0].models, ["claude-a", "claude-b"]);
-        assert_eq!(descriptors[0].fallback_model.as_deref(), Some("claude-b"));
         assert_eq!(
             descriptors[1].availability,
             ProviderAvailabilityCode::MissingCredential
@@ -829,31 +787,26 @@ models = ["gpt-a"]
     }
 
     #[test]
-    fn rejects_legacy_profile_model_and_invalid_membership() {
-        let legacy = r#"
-model_provider = "x"
-[model_providers.x]
+    fn rejects_retired_default_model_key_and_invalid_membership() {
+        let retired = r#"
+provider = "x"
+[providers.x]
 wire_api = "responses"
-model = "old"
+default_model = "old"
 http_headers = { Authorization = "Bearer key" }
 "#;
         assert!(
-            resolve(Some(legacy), &env(&[]))
+            resolve(Some(retired), &env(&[]))
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("unknown key 'model'")
+                .contains("unknown key 'default_model'")
         );
 
-        for field in [
-            "default_model = \"missing\"\nmodels = [\"a\"]",
-            "default_model = \"a\"\nmodels = [\"a\"]\nfallback_model = \"missing\"",
-        ] {
-            let raw = format!(
-                "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nhttp_headers = {{ Authorization = \"Bearer key\" }}\n{field}\n"
-            );
-            assert!(resolve(Some(&raw), &env(&[])).is_err());
-        }
+        let outside_allowlist = "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\n\
+             http_headers = { Authorization = \"Bearer key\" }\n\
+             model = \"missing\"\nmodels = [\"a\"]\n";
+        assert!(resolve(Some(outside_allowlist), &env(&[])).is_err());
     }
 
     /// `wire_api` names the endpoint, not the vendor — the axis
@@ -863,8 +816,8 @@ http_headers = { Authorization = "Bearer key" }
     fn wire_api_names_the_endpoint_and_an_unknown_one_fails_closed() {
         let profile = |wire: &str| {
             format!(
-                "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"{wire}\"\n\
-                 http_headers = {{ x-api-key = \"k\" }}\ndefault_model = \"m\"\nmodels = [\"m\"]\n"
+                "provider = \"x\"\n[providers.x]\nwire_api = \"{wire}\"\n\
+                 http_headers = {{ x-api-key = \"k\" }}\nmodel = \"m\"\nmodels = [\"m\"]\n"
             )
         };
         assert_eq!(
@@ -872,7 +825,7 @@ http_headers = { Authorization = "Bearer key" }
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
-            "model_providers.x.wire_api must be messages | chat | responses"
+            "providers.x.wire_api must be messages | chat | responses"
         );
         let resolved = resolve(Some(&profile("messages")), &env(&[])).unwrap();
         assert_eq!(
@@ -885,8 +838,8 @@ http_headers = { Authorization = "Bearer key" }
     fn errors_never_echo_credentials() {
         for raw in [
             "secret = \"SENTINEL\"\n",
-            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"bad\"\nhttp_headers = { Authorization = \"Bearer SENTINEL\" }\ndefault_model = \"m\"\nmodels = [\"m\"]\n",
-            "model_provider = \"x\"\n[model_providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nhttp_headers = { Authorization = \"Bearer key\" }\ndefault_model = \"m\"\nmodels = [\"m\"]\n",
+            "provider = \"x\"\n[providers.x]\nwire_api = \"bad\"\nhttp_headers = { Authorization = \"Bearer SENTINEL\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
+            "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nhttp_headers = { Authorization = \"Bearer key\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
         ] {
             let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
             assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
@@ -894,41 +847,40 @@ http_headers = { Authorization = "Bearer key" }
     }
 
     /// `effort` is a per-provider default on every rail now (not responses
-    /// only), the root `effort` and `KLOOP_EFFORT` override it
-    /// for the *selected* provider only, and every source is checked against
-    /// the rail that would have to send it.
+    /// only), and `KLOOP_EFFORT` overrides it for the *selected* provider only.
+    /// There is no scope above the profile: effort belongs to the provider that
+    /// has to send it.
     #[test]
-    fn effort_resolves_env_over_root_over_profile_for_the_selected_provider() {
+    fn effort_resolves_env_over_profile_for_the_selected_provider() {
         const WITH_EFFORT: &str = r#"
-model_provider = "anthropic-a"
-effort = "max"
+provider = "anthropic-a"
 
-[model_providers.anthropic-a]
+[providers.anthropic-a]
 wire_api = "messages"
 http_headers = { x-api-key = "a-key" }
-default_model = "claude-a"
+model = "claude-a"
 models = ["claude-a"]
 effort = "low"
 
-[model_providers.responses-b]
+[providers.responses-b]
 wire_api = "responses"
 http_headers = { Authorization = "Bearer b-key" }
-default_model = "gpt-a"
+model = "gpt-a"
 models = ["gpt-a"]
 effort = "none"
 "#;
-        // Root beats the selected profile; an unselected profile keeps its own.
-        let rooted = resolve(Some(WITH_EFFORT), &env(&[])).unwrap();
+        // Every profile keeps its own; nothing above it can retarget them.
+        let configured = resolve(Some(WITH_EFFORT), &env(&[])).unwrap();
         assert_eq!(
-            rooted.catalog().default_effort("anthropic-a"),
-            Some(ReasoningEffort::Max)
+            configured.catalog().default_effort("anthropic-a"),
+            Some(ReasoningEffort::Low)
         );
         assert_eq!(
-            rooted.catalog().default_effort("responses-b"),
+            configured.catalog().default_effort("responses-b"),
             Some(ReasoningEffort::None)
         );
 
-        // The environment beats the root key, and follows the selection.
+        // The environment beats the selected profile, and follows the selection.
         let from_env = resolve(
             Some(WITH_EFFORT),
             &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_EFFORT", "high")]),
@@ -949,12 +901,12 @@ effort = "none"
     #[test]
     fn effort_rejects_only_unknown_spellings() {
         const XHIGH_ON_RESPONSES: &str = r#"
-model_provider = "responses-b"
+provider = "responses-b"
 
-[model_providers.responses-b]
+[providers.responses-b]
 wire_api = "responses"
 http_headers = { Authorization = "Bearer b-key" }
-default_model = "gpt-a"
+model = "gpt-a"
 models = ["gpt-a"]
 effort = "xhigh"
 "#;
@@ -967,12 +919,12 @@ effort = "xhigh"
         );
 
         const TYPO: &str = r#"
-model_provider = "anthropic-a"
+provider = "anthropic-a"
 
-[model_providers.anthropic-a]
+[providers.anthropic-a]
 wire_api = "messages"
 http_headers = { x-api-key = "a-key" }
-default_model = "claude-a"
+model = "claude-a"
 models = ["claude-a"]
 effort = "sky-high"
 "#;
@@ -981,7 +933,7 @@ effort = "sky-high"
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
-            "model_providers.anthropic-a.effort: unknown effort 'sky-high' \
+            "providers.anthropic-a.effort: unknown effort 'sky-high' \
              (known: none, low, medium, high, xhigh, max)"
         );
         assert_eq!(

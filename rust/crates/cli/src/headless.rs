@@ -318,7 +318,6 @@ mod tests {
                 provider,
                 "mock",
                 vec!["mock".into()],
-                None,
             )
             .unwrap();
         let inbox = Arc::new(kloop_core::inbox::Inbox::default());

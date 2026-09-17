@@ -410,7 +410,6 @@ struct Turn<'a> {
     enclosing_execution: Option<&'a ExecutionRef>,
     /// The complete route, frozen once. Every round, compaction and child
     /// admission in this operation derives attempts from this same snapshot.
-    frozen_route: crate::provider_route::FrozenProviderRoute,
     active_attempt: FrozenProviderAttempt,
     /// Per rail, not per build: the Responses/Chat cap is four times the
     /// Anthropic one, and a round that may produce four times the output has to
@@ -640,32 +639,12 @@ impl Turn<'_> {
             Sampled::Partial { error, blocks } => {
                 Err(self.resume_after_partial(error, blocks, round))
             }
-            Sampled::Terminal(error) => Err(RoundStep::Stop(Ending {
+            Sampled::Terminal(error) | Sampled::Failed(error) => Err(RoundStep::Stop(Ending {
                 reason: EndReason::Error(TurnError::ProviderFailure(error)),
                 text: None,
                 rounds: round,
                 structured: None,
             })),
-            Sampled::Failed(error) => {
-                if self.active_attempt.identity().attempt_kind
-                    == kloop_protocol::ProviderAttemptKind::Primary
-                    && let Some(fallback) = self.frozen_route.fallback_attempt()
-                {
-                    self.ui.emit(&Event::Note(format!(
-                        "sampling failed on {}; switching to fallback model {}: {error}",
-                        self.active_attempt.model(),
-                        fallback.model()
-                    )));
-                    self.active_attempt = fallback;
-                    return Err(RoundStep::Retry);
-                }
-                Err(RoundStep::Stop(Ending {
-                    reason: EndReason::Error(TurnError::ProviderFailure(error)),
-                    text: None,
-                    rounds: round,
-                    structured: None,
-                }))
-            }
         }
     }
 
@@ -903,7 +882,6 @@ async fn turn_rounds(
             };
         }
     };
-    let frozen_route = cfg.provider_route.clone();
     let mut turn = Turn {
         cfg,
         history,
@@ -912,8 +890,7 @@ async fn turn_rounds(
         depth,
         options,
         enclosing_execution,
-        active_attempt: frozen_route.primary_attempt(),
-        frozen_route,
+        active_attempt: cfg.provider_route.primary_attempt(),
         growth: compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens()),
         stream_text: depth == 0,
         tools,

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
-use kloop_protocol::ProviderAttemptKind;
 use kloop_provider::Provider;
 
 fn label(level: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
@@ -71,7 +70,7 @@ async fn probe_effort_levels() {
                 base: base.clone(),
             },
         });
-        let attempt = provider.attempt_identity("probe", 1, &model, ProviderAttemptKind::Primary);
+        let attempt = provider.attempt_identity("probe", 1, &model);
         let mut rx = provider.stream_attempt(
             &attempt,
             level,

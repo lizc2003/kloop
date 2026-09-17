@@ -802,7 +802,6 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "wire-model".into(),
-                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         );
         let mut seeded = seed();

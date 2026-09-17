@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
-use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::ProviderAvailabilityCode;
 use kloop_protocol::ProviderDescriptor;
 use kloop_protocol::ProviderResponseProvenance;
@@ -24,7 +23,6 @@ pub struct ProviderCatalogEntry {
     pub endpoint_fingerprint: String,
     pub default_model: String,
     pub models: Vec<String>,
-    pub fallback_model: Option<String>,
     pub availability: ProviderAvailabilityCode,
     /// The configured effort this provider starts a session at. It seeds
     /// [`SessionProviderState`]; `/effort` then owns the value for the rest of
@@ -80,19 +78,11 @@ impl ProviderCatalog {
                     "provider '{id}' default model '{default_model}' is not in its models allowlist"
                 ));
             }
-            if let Some(fallback) = entry.fallback_model.as_ref()
-                && !models.contains(fallback)
-            {
-                return Err(format!(
-                    "provider '{id}' fallback model '{fallback}' is not in its models allowlist"
-                ));
-            }
             let descriptor = ProviderDescriptor {
                 id: id.clone(),
                 api_family: entry.api_family,
                 default_model,
                 models,
-                fallback_model: entry.fallback_model,
                 availability: entry.availability,
             };
             if catalog
@@ -119,7 +109,6 @@ impl ProviderCatalog {
         provider: Provider,
         default_model: impl Into<String>,
         models: Vec<String>,
-        fallback_model: Option<String>,
     ) -> Result<(Arc<Self>, FrozenProviderRoute), String> {
         let id = id.into();
         let default_model = default_model.into();
@@ -132,7 +121,6 @@ impl ProviderCatalog {
             endpoint_fingerprint,
             default_model: default_model.clone(),
             models,
-            fallback_model,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(move || {
@@ -160,7 +148,6 @@ impl ProviderCatalog {
             .ok_or_else(|| SwitchError::UnknownProvider(receipt.provider_id.clone()))?;
         if entry.descriptor.api_family != receipt.api_family
             || entry.endpoint_fingerprint != receipt.endpoint_fingerprint
-            || entry.descriptor.fallback_model != receipt.fallback_model
             || !entry
                 .descriptor
                 .models
@@ -243,7 +230,6 @@ impl ProviderCatalog {
             endpoint_fingerprint: entry.endpoint_fingerprint.clone(),
             primary_model: model.to_string(),
             allowed_models: entry.descriptor.models.clone(),
-            fallback_model: entry.descriptor.fallback_model.clone(),
             provider,
         })
     }
@@ -275,10 +261,6 @@ pub(crate) fn validate_timeline(
             || receipt.provider_id.trim().is_empty()
             || receipt.endpoint_fingerprint.trim().is_empty()
             || receipt.primary_model.trim().is_empty()
-            || receipt
-                .fallback_model
-                .as_deref()
-                .is_some_and(|fallback| fallback.trim().is_empty())
         {
             return Err(SwitchError::InvalidTimeline);
         }
@@ -373,12 +355,7 @@ pub fn validate_provenance(
     if origin_line_boundary.is_some_and(|boundary| source.origin_boundary != boundary) {
         return Err(ProvenanceMismatch::OriginNotOnItsLine);
     }
-    let model_matches = match source.attempt_kind {
-        ProviderAttemptKind::Primary => source.model == route.primary_model,
-        ProviderAttemptKind::Fallback => {
-            route.fallback_model.as_deref() == Some(source.model.as_str())
-        }
-    };
+    let model_matches = source.model == route.primary_model;
     if source.provider_id != route.provider_id
         || source.api_family != route.api_family
         || source.endpoint_fingerprint != route.endpoint_fingerprint
@@ -437,7 +414,6 @@ struct ResolvedRoute {
     endpoint_fingerprint: String,
     primary_model: String,
     allowed_models: Vec<String>,
-    fallback_model: Option<String>,
     provider: Arc<Provider>,
 }
 
@@ -745,7 +721,6 @@ impl fmt::Debug for FrozenProviderRoute {
             .field("provider_id", &self.route.provider_id)
             .field("api_family", &self.route.api_family)
             .field("primary_model", &self.route.primary_model)
-            .field("fallback_model", &self.route.fallback_model)
             .finish()
     }
 }
@@ -825,26 +800,11 @@ impl FrozenProviderRoute {
         &self.route.allowed_models
     }
 
-    pub fn fallback_model(&self) -> Option<&str> {
-        self.route.fallback_model.as_deref()
-    }
-
     pub fn primary_attempt(&self) -> FrozenProviderAttempt {
-        self.attempt(
-            self.route.primary_model.clone(),
-            ProviderAttemptKind::Primary,
-        )
+        self.attempt(self.route.primary_model.clone())
     }
 
-    pub fn fallback_attempt(&self) -> Option<FrozenProviderAttempt> {
-        self.route
-            .fallback_model
-            .as_ref()
-            .filter(|model| **model != self.route.primary_model)
-            .map(|model| self.attempt(model.clone(), ProviderAttemptKind::Fallback))
-    }
-
-    fn attempt(&self, model: String, attempt_kind: ProviderAttemptKind) -> FrozenProviderAttempt {
+    fn attempt(&self, model: String) -> FrozenProviderAttempt {
         FrozenProviderAttempt {
             identity: ProviderAttemptIdentity {
                 route_revision: self.revision,
@@ -852,7 +812,6 @@ impl FrozenProviderRoute {
                 api_family: self.route.api_family,
                 endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
                 model,
-                attempt_kind,
             },
             effort: self.effort,
             provider: Arc::clone(&self.route.provider),
@@ -860,16 +819,10 @@ impl FrozenProviderRoute {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_models(&self, primary: &str, fallback: Option<&str>) -> Self {
+    pub(crate) fn with_test_models(&self, models: &[&str]) -> Self {
         let mut route = self.route.clone();
-        route.primary_model = primary.to_string();
-        route.allowed_models = vec![primary.to_string()];
-        route.fallback_model = fallback.map(str::to_string);
-        if let Some(fallback) = fallback
-            && !route.allowed_models.iter().any(|model| model == fallback)
-        {
-            route.allowed_models.push(fallback.to_string());
-        }
+        route.primary_model = models[0].to_string();
+        route.allowed_models = models.iter().map(|model| model.to_string()).collect();
         Self::new(self.revision, route, self.effort)
     }
 
@@ -916,7 +869,6 @@ impl FrozenProviderRoute {
             api_family: self.route.api_family,
             endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
             primary_model: self.route.primary_model.clone(),
-            fallback_model: self.route.fallback_model.clone(),
             effort: self.effort,
             continuity,
         }
@@ -982,7 +934,6 @@ impl FrozenProviderAttempt {
             api_family: self.identity.api_family,
             endpoint_fingerprint: self.identity.endpoint_fingerprint.clone(),
             model: self.identity.model.clone(),
-            attempt_kind: self.identity.attempt_kind,
         }
     }
 }
@@ -1107,7 +1058,6 @@ mod tests {
             endpoint_fingerprint: format!("mock:{id}"),
             default_model: default_model.into(),
             models: models.iter().map(|model| (*model).to_string()).collect(),
-            fallback_model: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1129,7 +1079,6 @@ mod tests {
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: format!("mock:{provider_id}"),
             primary_model: model.into(),
-            fallback_model: None,
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }

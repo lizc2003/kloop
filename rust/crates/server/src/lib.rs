@@ -235,7 +235,6 @@ impl ServerConfig {
             kloop_provider::Provider::mock(Vec::new()),
             "mock",
             vec!["mock".into()],
-            None,
         )
         .expect("built-in server provider catalog is valid");
         Self {

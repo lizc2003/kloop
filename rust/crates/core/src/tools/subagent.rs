@@ -1844,7 +1844,7 @@ mod tests {
         }];
         let base = with_provider(test_ctx(0, "atype"), provider);
         let mut cfg = base.cfg.test_clone();
-        cfg.set_test_route_models("mock", Some("cheap-model"));
+        cfg.set_test_route_models(&["mock", "cheap-model"]);
         cfg.agent_types = Arc::new(types);
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
@@ -1887,7 +1887,7 @@ mod tests {
             }])]);
         let base = with_provider(test_ctx(0, "run-agent-model-override"), provider);
         let mut cfg = base.cfg.test_clone();
-        cfg.set_test_route_models("parent-model", Some("child-model"));
+        cfg.set_test_route_models(&["parent-model", "child-model"]);
         let ctx = ToolCtx {
             cfg: Arc::new(cfg),
             ..base
@@ -2464,7 +2464,6 @@ mod tests {
                         api_family: kloop_protocol::ProviderApiFamily::Mock,
                         endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                         model: "mock".into(),
-                        attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
                     },
                 ),
             ],

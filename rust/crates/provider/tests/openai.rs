@@ -708,12 +708,7 @@ async fn chat_carries_the_session_id_as_prompt_cache_key() {
         let server = MockServer::start().await;
         mount_sse(&server, sse_body(&[], /*done*/ true)).await;
         let provider = Arc::new(openai(&server));
-        let attempt = provider.attempt_identity(
-            "chat",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("chat", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             None,
@@ -745,12 +740,7 @@ async fn effort_maps_to_reasoning_effort_field() {
         let server = MockServer::start().await;
         mount_sse(&server, sse_body(&[], /*done*/ true)).await;
         let provider = Arc::new(openai(&server));
-        let attempt = provider.attempt_identity(
-            "chat",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("chat", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             effort,

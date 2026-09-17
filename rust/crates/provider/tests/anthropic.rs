@@ -242,12 +242,7 @@ async fn session_id_rides_the_gateway_header_without_touching_the_body() {
         let server = MockServer::start().await;
         mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
         let provider = Arc::new(anthropic(&server));
-        let attempt = provider.attempt_identity(
-            "test",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("test", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             None,
@@ -825,12 +820,7 @@ async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
         let server = MockServer::start().await;
         mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
         let provider = Arc::new(anthropic(&server));
-        let attempt = provider.attempt_identity(
-            "anthropic",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("anthropic", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             effort,
@@ -863,12 +853,7 @@ async fn effort_none_overrides_a_configured_thinking_mode() {
         cache: false,
         thinking: ThinkingMode::Adaptive,
     });
-    let attempt = provider.attempt_identity(
-        "anthropic",
-        1,
-        "test-model",
-        kloop_protocol::ProviderAttemptKind::Primary,
-    );
+    let attempt = provider.attempt_identity("anthropic", 1, "test-model");
     let mut rx = provider.stream_attempt(
         &attempt,
         Some(ReasoningEffort::None),

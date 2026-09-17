@@ -208,7 +208,6 @@ fn mock_route() -> kloop_core::provider_route::FrozenProviderRoute {
         Provider::mock(Vec::new()),
         "mock",
         vec!["mock".into(), "model-a".into(), "model-b".into()],
-        None,
     )
     .unwrap()
     .1
@@ -236,7 +235,6 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
                 Provider::mock(turns.clone()),
                 model.clone(),
                 vec![model],
-                None,
             )
             .map_err(anyhow::Error::msg)?;
         let questions = questioner.is_some();
@@ -328,7 +326,6 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
                 ]),
                 cfg.provider_route.primary_model(),
                 cfg.provider_route.allowed_models().to_vec(),
-                cfg.provider_route.fallback_model().map(str::to_string),
             )
             .map_err(anyhow::Error::msg)?;
         cfg.provider_catalog = provider_catalog;
@@ -375,7 +372,6 @@ fn switch_factory(
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), format!("{id}-other")],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -423,7 +419,6 @@ fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> Co
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(vec![vec![text("answer")]]))),
@@ -683,7 +678,6 @@ fn worktree_factory(
                 Provider::mock(turns.clone()),
                 "mock",
                 vec!["mock".into()],
-                None,
             )
             .map_err(anyhow::Error::msg)?;
         let questions = questioner.is_some();
@@ -834,7 +828,6 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         Provider::mock(Vec::new()),
         "model-default",
         vec!["model-default".into(), "thread-model".into()],
-        None,
     )
     .unwrap()
     .0;
@@ -1179,7 +1172,6 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "a-other".into()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1190,7 +1182,6 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "b-other".into()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1328,7 +1319,6 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: anthropic_model.clone(),
                 models: vec![anthropic_model.clone()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1349,7 +1339,6 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1368,7 +1357,6 @@ async fn real_three_rail_route_switch_contract() {
                 ),
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: Some(responses_effort),
                 factory: Arc::new(move || {
@@ -1874,7 +1862,6 @@ async fn thread_read_strips_reasoning_replay_secrets() {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 model: "mock".into(),
-                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         ))
         .unwrap();
@@ -3650,7 +3637,6 @@ async fn real_effort_sweep_contract() {
                 endpoint_fingerprint: Provider::endpoint_fingerprint_for(api_family, &base),
                 default_model: model.clone(),
                 models: vec![model.clone()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 // The sweep sets every level explicitly; starting from "no field
                 // sent" keeps the first turn a clean control.

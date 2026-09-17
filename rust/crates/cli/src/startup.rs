@@ -974,7 +974,6 @@ pub(crate) fn config_from_settings(
             Provider::mock(mock_demo_turns()),
             "mock",
             vec!["mock".into()],
-            None,
         )
         .map_err(anyhow::Error::msg)?
     } else {

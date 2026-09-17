@@ -168,12 +168,7 @@ async fn prompt_cache_key_is_sent_when_bound_and_omitted_otherwise() {
         )
         .await;
         let provider = Arc::new(responses(&server));
-        let attempt = provider.attempt_identity(
-            "test",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("test", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             None,
@@ -271,12 +266,7 @@ async fn effort_maps_to_reasoning_field() {
             key: "test-key".into(),
             base: server.uri(),
         });
-        let attempt = provider.attempt_identity(
-            "responses",
-            1,
-            "test-model",
-            kloop_protocol::ProviderAttemptKind::Primary,
-        );
+        let attempt = provider.attempt_identity("responses", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
             effort,

@@ -2,7 +2,6 @@ use std::fmt;
 
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
-use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::Usage;
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +19,6 @@ pub struct ProviderUsageRecord {
     pub api_family: ProviderApiFamily,
     pub route_revision: u64,
     pub model: String,
-    pub attempt_kind: ProviderAttemptKind,
     pub operation: UsageOperation,
     pub usage: Usage,
 }
@@ -36,7 +34,6 @@ impl ProviderUsageRecord {
             api_family: attempt.api_family,
             route_revision: attempt.route_revision,
             model: attempt.model.clone(),
-            attempt_kind: attempt.attempt_kind,
             operation,
             usage,
         }
@@ -162,7 +159,6 @@ mod tests {
             api_family: ProviderApiFamily::Mock,
             route_revision: 1,
             model: model.into(),
-            attempt_kind: ProviderAttemptKind::Primary,
             operation: UsageOperation::Sampling,
             usage,
         }

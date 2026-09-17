@@ -44,7 +44,6 @@ fn mock_ignores_home_config_and_runtime_environment() {
         .env("KLOOP_PROGRAM_MEMORY_MB", "not-a-count")
         .env("KLOOP_CONTEXT_WINDOW", "not-a-count")
         .env("KLOOP_DEFER_THRESHOLD", "not-a-count")
-        .env("KLOOP_FALLBACK_MODEL", "SENTINEL-FALLBACK")
         .env("KLOOP_SANDBOX", "off")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

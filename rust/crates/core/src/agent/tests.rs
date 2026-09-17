@@ -51,7 +51,6 @@ fn mock_assistant(content: Vec<ContentBlock>, model: &str) -> Message {
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
             model: model.into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
         },
     )
 }
@@ -1132,19 +1131,18 @@ async fn reactive_noop_does_not_retry_after_overflow() {
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
-/// A fallback model remains the active model for reactive compaction.
+/// Reactive compaction runs on the attempt that is active after retries.
 #[tokio::test]
-async fn reactive_compaction_uses_the_active_fallback_model() {
+async fn reactive_compaction_uses_the_active_attempt() {
     let (provider, seen) = Provider::mock_recording(vec![
         MockTurn::Error("primary 1".into()),
         MockTurn::Error("primary 2".into()),
-        MockTurn::Error("primary 3".into()),
         MockTurn::Overflow,
-        MockTurn::Blocks(text("fallback summary")),
-        MockTurn::Blocks(text("fallback answer")),
+        MockTurn::Blocks(text("compacted summary")),
+        MockTurn::Blocks(text("answer after compaction")),
     ]);
-    let mut cfg = compaction_cfg(provider, 200_000, "reactive-fallback").test_clone();
-    cfg.set_test_route_models("mock", Some("mock-fallback"));
+    let mut cfg = compaction_cfg(provider, 200_000, "reactive-compaction").test_clone();
+    cfg.set_test_route_models(&["mock"]);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1157,12 +1155,15 @@ async fn reactive_compaction_uses_the_active_fallback_model() {
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
     assert_eq!(outcome.reason, EndReason::Completed);
-    assert_eq!(outcome.final_text, "fallback answer");
+    assert_eq!(outcome.final_text, "answer after compaction");
     let seen = seen.lock().unwrap();
-    assert_eq!(seen[3].model, "mock-fallback");
-    assert_eq!(seen[4].model, "mock-fallback");
+    // The overflow, the compaction it triggers and the retry all run on the
+    // one attempt that is active after the retries.
+    assert_eq!(seen[2].model, "mock");
+    assert_eq!(seen[3].model, "mock");
+    assert_eq!(seen[4].model, "mock");
     assert!(
-        seen[4]
+        seen[3]
             .system
             .starts_with("You summarize an in-progress coding-agent session")
     );
@@ -1391,19 +1392,18 @@ async fn failures_and_missing_usage_do_not_create_records() {
 }
 
 #[tokio::test]
-async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() {
+async fn retries_record_only_the_terminal_response() {
     let provider = Provider::mock_scripted(vec![
         MockTurn::Error("primary one".into()),
         MockTurn::Error("primary two".into()),
-        MockTurn::Error("primary three".into()),
         MockTurn::Response {
-            blocks: text("fallback answer"),
+            blocks: text("answer after retries"),
             outcome: AssistantOutcome::EndTurn,
             usage: usage(7),
         },
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "usage-fallback").test_clone();
-    cfg.set_test_route_models("primary", Some("fallback"));
+    cfg.set_test_route_models(&["primary"]);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1414,54 +1414,16 @@ async fn retry_and_fallback_record_only_the_terminal_response_on_actual_model() 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(
         history.messages()[1].provider_provenance,
-        Some(cfg.provider_route.fallback_attempt().unwrap().provenance(2),)
+        Some(cfg.provider_route.primary_attempt().provenance(2),)
     );
     assert_eq!(
         history.provider_usage().records(),
         &[ProviderUsageRecord::from_attempt(
-            cfg.provider_route.fallback_attempt().unwrap().identity(),
+            cfg.provider_route.primary_attempt().identity(),
             UsageOperation::Sampling,
             usage(7),
         )]
     );
-}
-
-#[tokio::test]
-async fn fallback_fails_closed_on_incompatible_reasoning_history() {
-    let (provider, seen) = Provider::mock_recording(vec![
-        MockTurn::Error("primary one".into()),
-        MockTurn::Error("primary two".into()),
-        MockTurn::Error("primary three".into()),
-        MockTurn::Blocks(text("must not run on fallback")),
-    ]);
-    let mut cfg = compaction_cfg(provider, 200_000, "reasoning-fallback-seal").test_clone();
-    cfg.set_test_route_models("primary", Some("fallback"));
-    let cfg = Arc::new(cfg);
-    let ui: Arc<dyn Ui> = Arc::new(NullUi);
-    let mut history = History::new(cfg.offload_dir.clone());
-    history.record(Message::user_text("old request"));
-    history.record_provider_assistant(
-        vec![ContentBlock::Thinking {
-            thinking: "summary".into(),
-            signature: "opaque".into(),
-        }],
-        &cfg.provider_route.primary_attempt(),
-    );
-    history.record(Message::user_text("new request"));
-
-    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
-
-    let EndReason::Error(TurnError::ProviderFailure(failure)) = outcome.reason else {
-        panic!("expected typed replay failure")
-    };
-    assert_eq!(
-        failure.kind(),
-        &kloop_provider::ProviderFailureKind::Protocol
-    );
-    assert!(failure.to_string().contains("not authorized"));
-    assert_eq!(seen.lock().unwrap().len(), 3);
-    assert_eq!(history.messages().len(), 3);
-    assert!(history.provider_usage().records().is_empty());
 }
 
 #[tokio::test]
@@ -1496,7 +1458,7 @@ async fn empty_end_turn_completes_without_recording_empty_assistant() {
         outcome: AssistantOutcome::EndTurn,
     }]);
     let mut cfg = compaction_cfg(provider, 200_000, "empty-end-turn").test_clone();
-    cfg.set_test_route_models("mock", Some("must-not-fallback"));
+    cfg.set_test_route_models(&["mock"]);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -1511,7 +1473,7 @@ async fn empty_end_turn_completes_without_recording_empty_assistant() {
 }
 
 #[tokio::test]
-async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
+async fn semantic_error_outcomes_record_content_without_retry() {
     let cases = [
         (
             AssistantOutcome::Refused,
@@ -1535,7 +1497,7 @@ async fn semantic_error_outcomes_record_content_without_retry_or_fallback() {
             MockTurn::Blocks(text("must not retry")),
         ]);
         let mut cfg = compaction_cfg(provider, 200_000, &format!("semantic-{index}")).test_clone();
-        cfg.set_test_route_models("mock", Some("must-not-fallback"));
+        cfg.set_test_route_models(&["mock"]);
         let cfg = Arc::new(cfg);
         let ui: Arc<dyn Ui> = Arc::new(NullUi);
         let mut history = History::new(cfg.offload_dir.clone());
@@ -1734,50 +1696,7 @@ async fn context_size_is_published_each_round_and_only_at_depth_zero() {
     );
 }
 
-/// After the primary model exhausts its retries, the turn continues on
-/// the fallback model instead of surfacing an error.
-#[tokio::test]
-async fn fallback_model_takes_over_after_retries() {
-    use kloop_provider::MockTurn;
-    struct NoteUi(std::sync::Mutex<Vec<String>>);
-    impl Ui for NoteUi {
-        fn emit(&self, ev: &Event) {
-            if let Event::Note(s) = ev {
-                self.0.lock().unwrap().push(s.to_string());
-            }
-        }
-    }
-
-    let provider = Provider::mock_scripted(vec![
-        MockTurn::Error("boom 1".into()),
-        MockTurn::Error("boom 2".into()),
-        MockTurn::Error("boom 3".into()),
-        MockTurn::Blocks(text("answer from fallback")),
-    ]);
-    let mut cfg = compaction_cfg(provider, 200_000, "fallback").test_clone();
-    cfg.set_test_route_models("mock", Some("mock-fallback"));
-    let cfg = Arc::new(cfg);
-    let note_ui = Arc::new(NoteUi(std::sync::Mutex::new(Vec::new())));
-    let ui: Arc<dyn Ui> = note_ui.clone();
-    let cancel = CancellationToken::new();
-    let mut history = History::new(cfg.offload_dir.clone());
-    history.record(Message::user_text("hello"));
-
-    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-
-    assert_eq!(outcome.reason, EndReason::Completed);
-    assert_eq!(outcome.final_text, "answer from fallback");
-    let notes = note_ui.0.lock().unwrap();
-    assert!(
-        notes
-            .iter()
-            .any(|n| n.contains("switching to fallback model mock-fallback")),
-        "expected a fallback-switch note, got {notes:?}"
-    );
-}
-
-/// Transient provider errors are retried in place; the turn still
-/// completes without any fallback configured.
+/// Transient provider errors are retried in place and the turn still completes.
 #[tokio::test]
 async fn retry_recovers_from_transient_errors() {
     use kloop_provider::MockTurn;
@@ -1868,7 +1787,7 @@ async fn partial_stream_seals_the_open_item_then_continues_from_it() {
         MockTurn::Blocks(text(" and the rest")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "partial-stream").test_clone();
-    cfg.set_test_route_models("mock", Some("must-not-run-after-visible-output"));
+    cfg.set_test_route_models(&["mock"]);
     let cfg = Arc::new(cfg);
     let event_ui = Arc::new(EventUi(std::sync::Mutex::new(Vec::new())));
     let ui: Arc<dyn Ui> = event_ui.clone();
@@ -2045,7 +1964,7 @@ async fn complete_tool_block_seals_retry_without_dispatching_it() {
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "tool-seals-retry").test_clone();
-    cfg.set_test_route_models("mock", Some("must-not-fallback"));
+    cfg.set_test_route_models(&["mock"]);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -2076,7 +1995,7 @@ async fn subagent_internal_delta_seals_then_continues_in_its_own_history() {
         MockTurn::Blocks(text(" and the rest")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "subagent-seals-retry").test_clone();
-    cfg.set_test_route_models("mock", Some("must-not-fallback"));
+    cfg.set_test_route_models(&["mock"]);
     cfg.local_agent = cfg.local_agent.child("agent-98".parse().unwrap());
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -2122,13 +2041,13 @@ async fn subagent_internal_delta_seals_then_continues_in_its_own_history() {
 }
 
 #[tokio::test]
-async fn non_retryable_failure_does_not_retry_or_fallback() {
+async fn non_retryable_failure_does_not_retry() {
     let (provider, seen) = Provider::mock_recording(vec![
         MockTurn::Failure(ProviderFailure::protocol("malformed provider frame")),
         MockTurn::Blocks(text("must not retry")),
     ]);
     let mut cfg = compaction_cfg(provider, 200_000, "terminal-failure").test_clone();
-    cfg.set_test_route_models("mock", Some("must-not-fallback"));
+    cfg.set_test_route_models(&["mock"]);
     let cfg = Arc::new(cfg);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -2178,7 +2097,7 @@ async fn retry_after_overrides_local_backoff_without_real_waiting() {
 /// Three failures with no fallback exhaust the retry budget and surface
 /// the error.
 #[tokio::test]
-async fn retries_exhausted_without_fallback_error_out() {
+async fn retries_exhausted_error_out() {
     use kloop_provider::MockTurn;
     let provider = Provider::mock_scripted(vec![
         MockTurn::Error("down 1".into()),

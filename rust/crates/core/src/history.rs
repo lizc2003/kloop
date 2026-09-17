@@ -16,7 +16,6 @@ use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
-use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::ProviderRouteReceipt;
 use kloop_protocol::ProviderRouteSource;
 use kloop_protocol::ReasoningContinuity;
@@ -196,7 +195,6 @@ impl History {
                 || existing.api_family != route.api_family()
                 || existing.endpoint_fingerprint != route.endpoint_fingerprint()
                 || existing.primary_model != route.primary_model()
-                || existing.fallback_model.as_deref() != route.fallback_model()
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -735,8 +733,7 @@ fn provider_request_view(
         // different route. Both are recorded, both are visible in the
         // transcript, and refusing the second would leave a reopened session
         // able to open but unable to take a turn.
-        let sanctioned_switch = attempt.identity().attempt_kind == ProviderAttemptKind::Primary
-            && source.route_revision < active.revision
+        let sanctioned_switch = source.route_revision < active.revision
             && routes[source_index + 1..].iter().any(|route| {
                 matches!(
                     route.source,
@@ -1113,7 +1110,6 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
                 endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "wire-model".into(),
-                attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             },
         );
 
@@ -1198,7 +1194,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             route_revision: 1,
             model: "mock".into(),
-            attempt_kind: kloop_protocol::ProviderAttemptKind::Primary,
             operation: crate::usage::UsageOperation::Sampling,
             usage: kloop_protocol::Usage {
                 input_tokens: 1,
@@ -1321,16 +1316,15 @@ mod tests {
         use kloop_provider::Provider;
 
         let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
-        let entry = |id: &str, fallback: Option<&str>| ProviderCatalogEntry {
+        let entry = |id: &str, second_model: Option<&str>| ProviderCatalogEntry {
             id: id.into(),
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: fingerprint.clone(),
             default_model: format!("{id}-model"),
-            models: fallback.map_or_else(
+            models: second_model.map_or_else(
                 || vec![format!("{id}-model")],
-                |fallback| vec![format!("{id}-model"), fallback.to_string()],
+                |second| vec![format!("{id}-model"), second.to_string()],
             ),
-            fallback_model: fallback.map(str::to_string),
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1398,11 +1392,6 @@ mod tests {
             ]
         );
         assert_eq!(history.messages(), canonical.as_slice());
-        let fallback_error = history
-            .provider_request_view(&route_b.fallback_attempt().unwrap())
-            .unwrap_err();
-        assert!(fallback_error.to_string().contains("not authorized"));
-
         history.switch_provider(&state, 2, "a", None).unwrap();
         let view_a = history
             .provider_request_view(&state.freeze().primary_attempt())
@@ -1435,7 +1424,6 @@ mod tests {
                     endpoint_fingerprint: source_fingerprint,
                     default_model: "source-model".into(),
                     models: vec!["source-model".into()],
-                    fallback_model: None,
                     availability: ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1446,7 +1434,6 @@ mod tests {
                     endpoint_fingerprint: chat_fingerprint,
                     default_model: "chat-model".into(),
                     models: vec!["chat-model".into()],
-                    fallback_model: None,
                     availability: ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(move || Ok(chat_provider())),
@@ -1502,7 +1489,6 @@ mod tests {
             endpoint_fingerprint: fingerprint.clone(),
             default_model: format!("{id}-model"),
             models: vec![format!("{id}-model")],
-            fallback_model: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1551,7 +1537,6 @@ mod tests {
             endpoint_fingerprint: fingerprint.clone(),
             default_model: format!("{id}-model"),
             models: vec![format!("{id}-model")],
-            fallback_model: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),

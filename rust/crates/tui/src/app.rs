@@ -2770,7 +2770,6 @@ mod tests {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 default_model: "a1".into(),
                 models: vec!["a1".into(), "a2".into()],
-                fallback_model: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             },
         ]));
@@ -2804,7 +2803,6 @@ mod tests {
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             default_model: "a1".into(),
             models: vec!["a1".into(), "a2".into()],
-            fallback_model: None,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
         };
         app.apply(AgentEvent::ProviderChanged(

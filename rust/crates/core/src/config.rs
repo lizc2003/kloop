@@ -547,18 +547,16 @@ impl Config {
     pub(crate) fn set_test_provider(&mut self, provider: kloop_provider::Provider) {
         let model = self.provider_route.primary_model().to_string();
         let models = self.provider_route.allowed_models().to_vec();
-        let fallback = self.provider_route.fallback_model().map(str::to_string);
-        let (catalog, route) = crate::provider_route::ProviderCatalog::from_provider(
-            "test", provider, model, models, fallback,
-        )
-        .expect("test provider route is valid");
+        let (catalog, route) =
+            crate::provider_route::ProviderCatalog::from_provider("test", provider, model, models)
+                .expect("test provider route is valid");
         self.provider_catalog = catalog;
         self.provider_route = route;
     }
 
     #[cfg(test)]
-    pub(crate) fn set_test_route_models(&mut self, primary: &str, fallback: Option<&str>) {
-        self.provider_route = self.provider_route.with_test_models(primary, fallback);
+    pub(crate) fn set_test_route_models(&mut self, models: &[&str]) {
+        self.provider_route = self.provider_route.with_test_models(models);
     }
 
     pub fn set_max_rounds(&mut self, max_rounds: Option<usize>) {

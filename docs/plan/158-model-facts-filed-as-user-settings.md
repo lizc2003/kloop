@@ -106,7 +106,7 @@ context_window = 262144
 校验:provider 的 `effort`(以及 `KLOOP_EFFORT`、`/effort`)要落在该模型的 `efforts` 里,
 不相容**启动时**或命令当场 fail closed,不要等服务端 400。
 
-### 2. `model_providers` → `providers`,`model_provider` → `provider`
+### 2. `model_providers` → `providers`,`model_provider` → `provider` ✅
 
 理由:内部代码里模型 provider 就叫 `Provider`(`ProviderCatalog`/`provider_route`/
 `FrozenProviderRoute`),而搜索那边叫 `SearchBackend`、**不叫 provider**——配置跟内部真相
@@ -114,7 +114,7 @@ context_window = 262144
 
 `[web] search_provider` 不动:它有限定词,不冲突。
 
-### 3. `default_model` → `model`
+### 3. `default_model` → `model` ✅
 
 **这是把 plan 92 改过的名字改回去,两边理由都要留在文档里**,否则下一个人顺着 plan 92 读
 会以为是疏漏、再翻一次(plan 67 那条教训就是这么来的)。
@@ -128,7 +128,7 @@ context_window = 262144
 连带:`rejects_legacy_profile_model_and_invalid_membership` 这条测试要**反过来**——
 profile 里的 `model` 变成合法键,`default_model` 变成 unknown key。
 
-### 4. 删顶层 `model` 和顶层 `effort`
+### 4. 删顶层 `model` 和顶层 `effort` ✅
 
 顶层 `model` 不只是冗余,是**耦合陷阱**:它只对选中的 provider 生效且必须在其 allowlist 里,
 所以改 `provider` 却忘了改 `model`,启动直接炸。删掉之后顶层只剩 `provider` 一个选择器,
@@ -141,7 +141,7 @@ let initial_model = rail_model.or(KLOOP_MODEL).unwrap_or(profile.model);
 顶层 `effort` 同理删掉,effort 跟着 provider 走。`KLOOP_EFFORT` 与 `/effort` 保留——env 和
 命令是临时覆盖的正当位置,配置文件不是。
 
-### 5. 删 `fallback_model`
+### 5. 删 `fallback_model` ✅
 
 它现在的语义(`agent.rs:649`):一个 turn 内 primary 返回 `Sampled::Failed` 时换成 fallback
 重试这一轮,之后 `active_attempt` 一直是 fallback;作用域是 `Turn`,下一 turn 回到 primary。
@@ -184,6 +184,30 @@ let initial_model = rail_model.or(KLOOP_MODEL).unwrap_or(profile.model);
 
 一次做完也行,但别把第 6 项和改名混在同一个 diff 里——它俩一个是机械替换、一个需要想清楚,
 混在一起 review 不动。
+
+## 四之二、✅ 第一阶段完成记录(2026-09-17,提交 SHA 以本条所在提交为准)
+
+第 2/3/4/5 项已落地,fmt / clippy `-D warnings` / `cargo test`(34 个 `test result: ok`,
+零 failure)/ `--mock --headless` 全绿。开工时没预料到的五件：
+
+1. **`ProviderAttemptKind` 整个枚举删掉了,不只是 `Fallback` 变体。** 删掉 fallback 之后它
+   只剩 `Primary` 一个变体——单变体枚举不携带任何信息,连同 `ProviderAttemptIdentity`、
+   `ProviderResponseProvenance`、`ProviderUsageRecord` 三处的 `attempt_kind` 字段一起去掉。
+   rollout 里 `attemptKind` 那一项也从 usage fixture 中消失。
+2. **`Sampled::Terminal` 与 `Sampled::Failed` 的 match arm 删掉 fallback 后逐字相同**,
+   合并成一条。**注意**:这说明这两个变体在唯一的消费点上行为已经一致,区分只剩在 stream 层
+   的重试分类里——要不要合并枚举本身没有动,留给以后。
+3. **`Turn.frozen_route` 成了死字段**,被 clippy 抓出来。它唯一的读者就是 `fallback_attempt()`。
+4. **重试上限吃得下两次瞬时错误,第三次就耗尽。** 两条测试原本写三次 `MockTurn::Error`,
+   靠 fallback 接手才 Completed;删掉 fallback 后它们开始报错。改成两次——这也说明
+   **fallback 此前在掩盖"重试已经耗尽"这件事**。
+5. **一条测试整条删掉:`fallback_fails_closed_on_incompatible_reasoning_history`。** 它测的是
+   "一个 turn 内换模型后 reasoning 不能重放",而 fallback 是一个 turn 内换模型的**唯一**机制,
+   场景随之不复存在(跨 turn 的那条路由 `history.rs` 的 switch 测试覆盖)。另删
+   `fallback_model_takes_over_after_retries`,它断言的 Note 文案已不存在。
+
+`with_test_models` 的签名顺势从 `(primary, fallback)` 改成 `(&[&str])`——"允许这些模型,
+第一个是 primary",不再暗示第二个模型有特殊角色。
 
 ## 五、验收
 

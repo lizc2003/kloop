@@ -541,16 +541,7 @@ pub struct ProviderDescriptor {
     pub api_family: ProviderApiFamily,
     pub default_model: String,
     pub models: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_model: Option<String>,
     pub availability: ProviderAvailabilityCode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderAttemptKind {
-    Primary,
-    Fallback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,7 +552,6 @@ pub struct ProviderAttemptIdentity {
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
     pub model: String,
-    pub attempt_kind: ProviderAttemptKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,8 +585,6 @@ pub struct ProviderRouteReceipt {
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
     pub primary_model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_model: Option<String>,
     /// The reasoning effort this route samples at. Absent means no effort field
     /// is sent at all, which is a different state from any named level — and the
     /// one that makes a transcript readable months later, because effort decides
@@ -634,7 +622,6 @@ pub struct ProviderResponseProvenance {
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
     pub model: String,
-    pub attempt_kind: ProviderAttemptKind,
 }
 
 impl ProviderResponseProvenance {
@@ -644,7 +631,6 @@ impl ProviderResponseProvenance {
             && self.api_family == attempt.api_family
             && self.endpoint_fingerprint == attempt.endpoint_fingerprint
             && self.model == attempt.model
-            && self.attempt_kind == attempt.attempt_kind
     }
 
     pub fn exact_replay_compatible(&self, attempt: &ProviderAttemptIdentity) -> bool {
@@ -1175,7 +1161,6 @@ mod tests {
                 api_family: ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "model-a".into(),
-                attempt_kind: ProviderAttemptKind::Primary,
             }),
             injected: None,
         };
@@ -1285,7 +1270,6 @@ mod tests {
                 api_family: ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
                 model: "model-a".into(),
-                attempt_kind: ProviderAttemptKind::Primary,
             },
         );
 

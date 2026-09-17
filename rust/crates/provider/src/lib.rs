@@ -39,7 +39,6 @@ use kloop_protocol::Message;
 use kloop_protocol::OPENAI_MAX_OUTPUT_TOKENS;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
-use kloop_protocol::ProviderAttemptKind;
 use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::ReasoningEffort;
 use kloop_protocol::ToolDef;
@@ -341,7 +340,6 @@ impl Provider {
         provider_id: impl Into<String>,
         route_revision: u64,
         model: impl Into<String>,
-        attempt_kind: ProviderAttemptKind,
     ) -> ProviderAttemptIdentity {
         ProviderAttemptIdentity {
             route_revision,
@@ -349,14 +347,13 @@ impl Provider {
             api_family: self.api_family(),
             endpoint_fingerprint: self.endpoint_fingerprint(),
             model: model.into(),
-            attempt_kind,
         }
     }
 
     /// Fixture helper for constructing a provider-produced message without a
     /// rollout. Production messages are bound by `History` from a frozen attempt.
     pub fn response_provenance(&self, model: &str) -> ProviderResponseProvenance {
-        let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
+        let attempt = self.attempt_identity("test", 1, model);
         ProviderResponseProvenance {
             route_revision: attempt.route_revision,
             origin_boundary: 1,
@@ -364,7 +361,6 @@ impl Provider {
             api_family: attempt.api_family,
             endpoint_fingerprint: attempt.endpoint_fingerprint,
             model: attempt.model,
-            attempt_kind: attempt.attempt_kind,
         }
     }
 
@@ -437,7 +433,7 @@ impl Provider {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> ProviderStream {
-        let attempt = self.attempt_identity("test", 1, model, ProviderAttemptKind::Primary);
+        let attempt = self.attempt_identity("test", 1, model);
         self.stream_attempt(
             &attempt, None, /*cache_key*/ None, system, messages, tools,
         )
@@ -751,7 +747,7 @@ mod tests {
             injected: None,
         };
         let provider = Provider::mock(Vec::new());
-        let attempt = provider.attempt_identity("test", 1, "model-a", ProviderAttemptKind::Primary);
+        let attempt = provider.attempt_identity("test", 1, "model-a");
         let exact = provider.response_provenance("model-a");
         assert!(
             provider
@@ -786,8 +782,7 @@ mod tests {
     #[test]
     fn final_reasoning_guard_rejects_nested_or_chat_reasoning() {
         let mock = Provider::mock(Vec::new());
-        let mock_attempt =
-            mock.attempt_identity("test", 1, "model-a", ProviderAttemptKind::Primary);
+        let mock_attempt = mock.attempt_identity("test", 1, "model-a");
         let nested = Message::assistant(vec![kloop_protocol::ContentBlock::ToolResult {
             tool_use_id: "nested".into(),
             content: kloop_protocol::ToolResultContent::Blocks(vec![
@@ -807,8 +802,7 @@ mod tests {
             key: "unused".into(),
             base: "https://chat.invalid".into(),
         };
-        let chat_attempt =
-            chat.attempt_identity("chat", 1, "chat-model", ProviderAttemptKind::Primary);
+        let chat_attempt = chat.attempt_identity("chat", 1, "chat-model");
         let chat_reasoning = Message::assistant_from_provider(
             vec![kloop_protocol::ContentBlock::Thinking {
                 thinking: "must be removed by core".into(),
@@ -841,10 +835,9 @@ mod tests {
                 api_family: ProviderApiFamily::OpenAiResponses,
                 endpoint_fingerprint: "responses-fingerprint".into(),
                 model: "model-a".into(),
-                attempt_kind: ProviderAttemptKind::Primary,
             },
         );
-        let attempt = chat.attempt_identity("chat", 2, "chat-model", ProviderAttemptKind::Primary);
+        let attempt = chat.attempt_identity("chat", 2, "chat-model");
 
         assert!(
             chat.validate_reasoning_replay(&attempt, &[foreign])

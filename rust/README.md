@@ -234,7 +234,7 @@ to. The env var still wins so a wrong provider value can be corrected without
 editing the block.
 
 ```toml
-[model_providers.gw_router]
+[providers.gw_router]
 context_window = 258400
 ```
 
@@ -368,8 +368,8 @@ migrated and safely resumable.
 
 A session that is opened again — `--continue`, `--resume`, `--fork`,
 `thread/resume`, `thread/fork` — starts on the route a brand-new session would
-start on: `model_provider`/`model` and their env overrides as they read right
-now. A `/provider` switch is a decision about a running conversation, so it lives
+start on: `provider` and the selected profile's `model`, plus their env
+overrides as they read right now. A `/provider` switch is a decision about a running conversation, so it lives
 as long as that session does and does not outlive it; an in-process rewind is not
 a reopen, and carries the live route onto the branch rather than restoring the
 one recorded at the cut. When the route a session opens on differs from the one
@@ -3203,16 +3203,14 @@ cargo run -- --mock
 # directory must have no group/other access (kloop creates it as 0700), and the
 # file must be mode 0600:
 #
-#   model = "gpt-5.6-sol"             # initial model, must be allowlisted
-#   model_provider = "gw_router"     # initial provider profile
+#   provider = "gw_router"           # the only top-level selector: which one
 #
-#   [model_providers.gw_router]
+#   [providers.gw_router]
 #   wire_api = "responses"             # responses | chat | messages
 #   base_url = "https://example/v1"
 #   http_headers = { Authorization = "Bearer ..." }
-#   default_model = "gpt-5.6-sol"
-#   models = ["gpt-5.6-sol", "gpt-5.6-mini"]
-#   fallback_model = "gpt-5.6-mini"     # optional, in models only
+#   model = "gpt-5.6-sol"               # this provider's default model
+#   models = ["gpt-5.6-sol", "gpt-5.6-mini"]   # optional; omitted = just `model`
 #
 # Every configured profile declares a stable id, API family, default model, and
 # ordered model allowlist. Unselected profiles may be unavailable because their
@@ -3222,19 +3220,21 @@ cargo run -- --mock
 
 # Environment variables only select a new session's initial catalog route; they
 # cannot inject an undeclared provider or model. Provider selection:
-# KLOOP_PROVIDER > model_provider. Model order:
-# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > top-level model > profile default,
-# but every result must occur in that profile's models allowlist. Credentials and
+# KLOOP_PROVIDER > provider. Model order:
+# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > the profile's own model, but every
+# result must occur in that profile's models allowlist. There is no scope above
+# the profile for either model or effort: both belong to the provider that has
+# to send them. Credentials and
 # base URL env overrides apply to the selected profile only; unselected profiles
 # remain bounded-unavailable when their configured credential is absent.
 #
 # ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
 # selected profile. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
-# settings. KLOOP_EFFORT (or the top-level effort key, or a profile's own effort
-# key — same word at three scopes, in that precedence, valid on every wire_api)
+# settings. KLOOP_EFFORT (or the selected profile's own effort key — the env var
+# wins, and both are valid on every wire_api)
 # seeds the session reasoning effort that /effort then owns. Only the spelling is checked: which
-# levels a model takes is the model's own contract, stated in its own error. KLOOP_FALLBACK_MODEL is not a runtime selector.
+# levels a model takes is the model's own contract, stated in its own error.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
 # Output caps are rail-local and not user config, because the rails disagree

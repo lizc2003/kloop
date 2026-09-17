@@ -91,10 +91,8 @@ fn validate_root(table: &toml::Table) -> Result<()> {
     for key in table.keys() {
         if !matches!(
             key.as_str(),
-            "model"
-                | "model_provider"
-                | "effort"
-                | "model_providers"
+            "provider"
+                | "providers"
                 | "permissions"
                 | "mcp"
                 | "web"
@@ -151,8 +149,7 @@ mod tests {
     fn root_accepts_provider_and_runtime_sections() {
         let table = parse_root(
             r#"
-model = "m"
-model_provider = "openai"
+provider = "openai"
 [permissions]
 allow = ["bash(cargo test *)"]
 [web]
@@ -173,7 +170,7 @@ max_agents = 3
 "#,
         )
         .unwrap();
-        assert_eq!(table["model"].as_str(), Some("m"));
+        assert_eq!(table["provider"].as_str(), Some("openai"));
         assert!(table.contains_key("permissions"));
         assert!(table.contains_key("mcp"));
     }
